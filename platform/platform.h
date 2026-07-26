@@ -4,167 +4,167 @@
 #include <stdint.h>
 #include <stdbool.h>
 
-// プラットフォーム抽象化レイヤー
-// Windows, Linux, macOSで共通のインターフェース
+// The platform abstraction layer.
+// One interface shared by Windows, Linux and macOS.
 
-// 不透明なウィンドウハンドル型
+// An opaque window handle.
 typedef struct PlatformWindow PlatformWindow;
 
-// フレームバッファのコールバック関数型
-// ユーザーコードが毎フレーム呼ばれ、ピクセルデータを更新する
-// pixels: canonical BGRA 形式の32bitピクセル配列 (u32 0xAARRGGBB / メモリ [B,G,R,A], width * height)
-// width, height: フレームバッファのサイズ
-// userdata: プラットフォーム初期化時に渡したユーザーデータ
+// The framebuffer callback type.
+// Called once per frame so that user code can update the pixel data.
+// pixels: a 32-bit pixel array in canonical BGRA (u32 0xAARRGGBB / memory [B,G,R,A], width * height)
+// width, height: the framebuffer size
+// userdata: the user data handed to the platform at initialisation
 typedef void (*FrameCallback)(uint32_t* pixels, int width, int height, void* userdata);
 
-// プラットフォームの初期化
-// 成功時はtrue、失敗時はfalseを返す
+// Initialise the platform.
+// Returns true on success, false on failure.
 bool platform_init(void);
 
-// ウィンドウを作成
-// width, height: ウィンドウサイズ (ピクセル)
-// title: ウィンドウタイトル
-// callback: 毎フレーム呼ばれる描画コールバック関数
-// userdata: コールバックに渡されるユーザーデータ
-// 戻り値: ウィンドウハンドル（失敗時はNULL）
+// Create a window.
+// width, height: the window size in pixels
+// title: the window title
+// callback: the draw callback invoked once per frame
+// userdata: the user data passed to the callback
+// Returns: the window handle, or NULL on failure
 PlatformWindow* platform_create_window(int width, int height, const char* title,
                                        FrameCallback callback, void* userdata);
 
-// 既存ウィンドウを本物のフルスクリーンにする（TASK-100.1）。
-// facade の Window.createFullscreen が create 後に呼ぶ。macOS は NSWindow の
-// toggleFullScreen:（緑ボタンと同じネイティブフルスクリーン。既にフルスクリーンなら no-op）。
+// Turn an already-created window into a real fullscreen window.
+// The facade's Window.createFullscreen calls this right after create. On macOS this is NSWindow's
+// toggleFullScreen: (the same as the green button; a no-op when the window is already fullscreen).
 void platform_enter_fullscreen(PlatformWindow* window);
 
 // ========================================
-// 透過 / borderless ウィンドウ + 対話的ドラッグ移動 (TASK-104)
+// Transparent / borderless windows and interactive drag-to-move
 // ========================================
 //
-// デスクトップマスコット等の「背後が透けて枠の無い浮遊ウィンドウ」を作るための拡張。
-// 透過は fb の alpha を honor する（透過時のみ premultiplied alpha 前提。不透明時は従来どおり
-// alpha 無視）。ドラッグ移動は OS の対話的ウィンドウ移動へ委譲する（Wayland のように
-// クライアントが絶対位置を設定できない環境でも成立させるため。macOS は
-// performWindowDragWithEvent:）。詳細設計は docs/plans/transparent-window-plan.md。
+// An extension for the floating, frameless windows that let the desktop show through (a desktop mascot,
+// say). Transparency honours the framebuffer alpha (premultiplied alpha is assumed while transparent;
+// when opaque, alpha is ignored as before). Drag-to-move is delegated to the OS's interactive window
+// move, so that it also works where a client cannot set an absolute position, as on Wayland; on macOS
+// it is performWindowDragWithEvent:.
 
-// ウィンドウ生成オプション（bit flags）。opts==NULL は既定（不透明・タイトル付き）と同義。
-// x/y は PLATFORM_WINDOW_POSITION が立っているときだけ参照する（未設定時は center 等の従来配置）。
+// Window creation options (bit flags). opts==NULL means the default (opaque, with a title bar).
+// x/y are read only when PLATFORM_WINDOW_POSITION is set (otherwise the usual placement, centred).
 typedef struct PlatformWindowOptions {
-    uint32_t flags;     // PLATFORM_WINDOW_* の OR
-    uint32_t reserved;  // 将来拡張用（0 埋め。非 0 は NULL）
-    int32_t x;          // OS 画面座標（TASK-117）
+    uint32_t flags;     // an OR of PLATFORM_WINDOW_*
+    uint32_t reserved;  // reserved for future use (zero-filled; a non-zero value returns NULL)
+    int32_t x;          // OS screen coordinates
     int32_t y;
 } PlatformWindowOptions;
 
-#define PLATFORM_WINDOW_TRANSPARENT (1u << 0)  // fb の alpha を honor（背後が透ける）
-#define PLATFORM_WINDOW_BORDERLESS  (1u << 1)  // タイトルバー・枠なし（borderless）
-#define PLATFORM_WINDOW_POSITION    (1u << 2)  // x/y を初期位置として適用（TASK-117）
-#define PLATFORM_WINDOW_FRAMEBUFFER_PHYSICAL (1u << 3)  // opt-in 物理 fb（TASK-156.1）。未設定=.logical
+#define PLATFORM_WINDOW_TRANSPARENT (1u << 0)  // honour the framebuffer alpha (the desktop shows through)
+#define PLATFORM_WINDOW_BORDERLESS  (1u << 1)  // no title bar and no frame (borderless)
+#define PLATFORM_WINDOW_POSITION    (1u << 2)  // apply x/y as the initial position
+#define PLATFORM_WINDOW_FRAMEBUFFER_PHYSICAL (1u << 3)  // opt in to a physical framebuffer; unset = .logical
 
-// 現在のウィンドウ geometry（TASK-117）。サイズは content/client、位置は OS 画面座標。
-// flags に PLATFORM_GEOMETRY_POSITION_VALID が無いとき x/y は未定義（位置非対応/取得不能）。
+// The current window geometry. The size is the content/client area; the position is in OS screen coordinates.
+// When flags lacks PLATFORM_GEOMETRY_POSITION_VALID, x/y are undefined (position unsupported, or unreadable).
 typedef struct PlatformWindowGeometry {
     int32_t x;
     int32_t y;
     uint32_t width;
     uint32_t height;
-    uint32_t flags; // PLATFORM_GEOMETRY_* の OR
+    uint32_t flags; // an OR of PLATFORM_GEOMETRY_*
 } PlatformWindowGeometry;
 
 #define PLATFORM_GEOMETRY_POSITION_VALID (1u << 0)
 
-// options 付きでウィンドウを作成する（既存 platform_create_window の拡張版）。
-// opts==NULL は既定動作（platform_create_window と同義）。unknown flags / reserved!=0 は
-// NULL を返す（silent 無視しない。facade 側で error.Unsupported に変換される）。
-// 関数シグネチャは不変。位置指定は PLATFORM_WINDOW_POSITION が立っている場合だけ参照する。
+// Create a window with options (an extension of platform_create_window).
+// opts==NULL behaves exactly like platform_create_window. Unknown flags or reserved!=0 return NULL
+// rather than being ignored silently (the facade turns that into error.Unsupported).
+// The function signature is fixed. The position is read only when PLATFORM_WINDOW_POSITION is set.
 PlatformWindow* platform_create_window_ex(int width, int height, const char* title,
                                           FrameCallback callback, void* userdata,
                                           const PlatformWindowOptions* opts);
 
-// 現在のウィンドウ geometry を取得する（TASK-117）。window/out が NULL なら no-op。
-// 失敗時も out をゼロ埋めし、クラッシュしない（position は VALID 無し）。
+// Read the current window geometry. A NULL window or a NULL out is a no-op.
+// On failure out is zero-filled and nothing crashes (the position is reported as not VALID).
 void platform_get_window_geometry(PlatformWindow* window, PlatformWindowGeometry* out);
 
-// 表示中のウィンドウタイトルを更新する（イベント時のみ）。
+// Update the title of a visible window (event time only).
 void platform_set_title(PlatformWindow* window, const char* title);
 
-// 直近のポインタ押下から OS の対話的ウィンドウ移動を開始する（実移動は OS 側）。
-// アプリは「掴む領域で mouse_down を受けたら」これを呼ぶ。macOS は保持した直近の左ボタン
-// mouse-down NSEvent を performWindowDragWithEvent: に渡し、呼び出し時に保持 event をクリアする
-// （one-shot。保持 event が無ければ no-op）。呼び出し頻度: mouse_down 起点のイベント時のみ。
+// Start the OS's interactive window move from the most recent pointer press (the OS performs the move).
+// An application calls this when it receives a mouse_down inside the region the user can grab. macOS
+// hands the retained most recent left-button mouse-down NSEvent to performWindowDragWithEvent: and
+// clears the retained event (one-shot; a no-op if nothing is retained). Called only on a mouse_down.
 void platform_begin_window_drag(PlatformWindow* window);
 
-// 常に最前面（always-on-top）を設定する。macOS は NSWindow.level を切替える。イベント時のみ。
+// Set always-on-top. macOS switches NSWindow.level. Event time only.
 void platform_set_always_on_top(PlatformWindow* window, bool on);
 
-// クリック透過（per-pixel）を設定する。ON のとき、直近表示フレームの alpha==0 の画素上の
-// クリックは背後のアプリへ抜け、alpha>0（不透明な絵の本体）上のクリックだけが window に届く。
-// マスコット本体をドラッグしつつ透明な余白はデスクトップへ抜けさせるための機能。イベント時のみ。
+// Set per-pixel click-through. While on, a click over a pixel whose alpha is 0 in the most recently presented
+// frame passes through to the application behind, and only a click over alpha>0 (the visible artwork) reaches
+// the window: a mascot can be dragged while its transparent margin falls through. Event time only.
 void platform_set_click_through(PlatformWindow* window, bool on);
 
-// Dock アイコン / メニューバーの表示を切替える（アプリ全体。window 非依存）。
-// visible=false で NSApplicationActivationPolicyAccessory（常駐アプリらしくする）。
+// Show or hide the Dock icon and the menu bar (application-wide, not per window).
+// visible=false selects NSApplicationActivationPolicyAccessory (behaving like a background app).
 void platform_set_dock_visible(bool visible);
 
-// 終了メニューをポップアップする（右クリック等から。1 項目「終了」の native メニュー）。
-// 「終了」が選ばれたら window のイベントキューに QUIT を積む（モーダル。選択なしは何もしない）。
+// Pop up a quit menu (from a right click, say: a native menu with the single item "Quit").
+// Choosing it pushes QUIT onto the window's event queue (modal; choosing nothing does nothing).
 void platform_show_quit_menu(PlatformWindow* window);
 
-// メインイベントループを開始（ブロッキング）
-// ウィンドウが閉じられるまで戻らない
+// Start the main event loop (blocking).
+// Does not return until the window is closed.
 void platform_run(PlatformWindow* window);
 
-// ウィンドウを破棄
+// Destroy a window.
 void platform_destroy_window(PlatformWindow* window);
 
-// プラットフォームのクリーンアップ
+// Clean up the platform.
 void platform_shutdown(void);
 
 // ========================================
-// 手動描画用API（コールバック方式と共存可能）
+// The manual drawing API (it can coexist with the callback style)
 // ========================================
 
-// イベントをポーリング（ノンブロッキング）
-// ウィンドウが閉じられていなければtrue、閉じられたらfalseを返す
-// この関数を呼び出すことで、OSのイベントが処理される
+// Poll events (non-blocking).
+// Returns true while the window is open, and false once it has been closed.
+// Calling this is what makes OS events be processed.
 bool platform_poll_events(PlatformWindow* window);
 
-// 高精度モノトニック時刻を取得（秒単位、double型）
+// Read a high-resolution monotonic time (in seconds, as a double).
 //
-// 特性:
-// - モノトニック: 時刻は単調増加し、決して逆戻りしない
-// - 調整なし（RAW）: NTP等のシステム時刻調整の影響を受けない
-// - 高精度: マイクロ秒以下の精度（プラットフォーム依存）
+// Properties:
+// - Monotonic: the time only increases and never goes backwards
+// - Unadjusted (RAW): unaffected by NTP and other system clock adjustments
+// - High resolution: sub-microsecond, depending on the platform
 //   * Windows: ~100ns (QueryPerformanceCounter)
 //   * macOS: ~1ns (CLOCK_UPTIME_RAW)
 //   * Linux: ~1ns (CLOCK_MONOTONIC_RAW)
 //
-// 戻り値:
-// - システム起動またはプロセス開始からの経過時間（秒）
-// - 絶対値は意味を持たない（時刻差分の計算にのみ使用）
+// Returns:
+// - The seconds elapsed since system boot or process start
+// - The absolute value carries no meaning (use it only to compute differences)
 //
-// 用途:
-// - フレーム間隔の計測: dt = current_time - last_time
-// - アニメーション制御
-// - ベンチマーク、プロファイリング
+// Uses:
+// - Measuring a frame interval: dt = current_time - last_time
+// - Driving animation
+// - Benchmarking and profiling
 //
-// 注意:
-// - この時刻はシステムの壁時計（wall clock）とは無関係
-// - ネットワーク同期が必要な場合は別途サーバー時刻管理が必要
-// - 長時間実行時、システム時刻とのずれが蓄積する可能性がある
+// Notes:
+// - This clock has nothing to do with the system wall clock
+// - Network synchronisation needs separate server-side time management
+// - Over a long run the drift against the system clock can accumulate
 double platform_get_time(void);
 
-// フレームバッファへのアクセスを開始
-// out_width, out_height: フレームバッファのサイズが返される
-// 戻り値: ピクセルバッファへのポインタ（canonical BGRA, u32 0xAARRGGBB, 32bit）
-//   - NULL は「今は描画可能な frame slot が無い」retry 可能状態を表しうる（frame slot unavailable）。
-//     caller はそのフレームの描画を skip し、pollEvents 等を回して次の機会を待てる
-//     （macOS backend は現状 NULL を返さないが、Wayland 等の 1級 backend は frame callback / busy buffer 律速で NULL を返す）。
-//   - device lost / window 破棄などの fatal は NULL とは別経路で扱う方針（詳細は docs/adr/005）。
-// 注意: platform_unlock_framebuffer()を呼ぶまでバッファを保持
+// Begin accessing the framebuffer.
+// out_width, out_height: receive the framebuffer size
+// Returns: a pointer to the pixel buffer (canonical BGRA, u32 0xAARRGGBB, 32-bit)
+//   - NULL can mean "there is no drawable frame slot right now": a retryable state (frame slot unavailable).
+//     The caller may skip drawing that frame, run pollEvents and wait for the next opportunity
+//     (the macOS backend never returns NULL today; a first-class backend such as Wayland does, paced by its frame callback and by busy buffers).
+//   - Fatal conditions such as a lost device or a destroyed window are handled apart from this NULL (see docs/adr/005).
+// Note: the buffer stays held until platform_unlock_framebuffer() is called.
 uint32_t* platform_lock_framebuffer(PlatformWindow* window, int* out_width, int* out_height);
 
-// TASK-156.1: logical/framebuffer size + content_scale + scale_epoch の current/latched metrics。
-// platform_lock_framebuffer_ex が lock + scale latch + metrics copy の原子単位。
-// 既存 platform_lock_framebuffer は ex の width/height 投影 wrapper（signature 不変）。
+// The current and latched metrics: the logical and framebuffer size, content_scale and scale_epoch.
+// platform_lock_framebuffer_ex is the atomic unit of lock + scale latch + metrics copy.
+// platform_lock_framebuffer is a width/height projection of ex (its signature is unchanged).
 typedef struct PlatformFramebufferMetrics {
     uint32_t logical_width;
     uint32_t logical_height;
@@ -179,67 +179,67 @@ bool platform_get_framebuffer_metrics(
 uint32_t* platform_lock_framebuffer_ex(
     PlatformWindow* window, PlatformFramebufferMetrics* out);
 
-// フレームバッファへのアクセスを終了
-// platform_lock_framebuffer()とペアで使用
+// Finish accessing the framebuffer.
+// Pairs with platform_lock_framebuffer().
 void platform_unlock_framebuffer(PlatformWindow* window);
 
 // ========================================
-// カーソル制御API (TASK-75.1)
+// The cursor API
 // ========================================
 
-// システムカーソルの形状。M1 スコープは 3 種のみ
-// （TASK-75 の設計でツール識別はソフトオーバーレイに委ね、OS ハードカーソルは
-//  precision point 用に crosshair/default/hidden の 3 種だけを使うと確定済み）。
+// The shape of the system cursor. There are only three: identifying the current tool is left to a soft
+// overlay drawn by the application, so the hard OS cursor serves the precision point alone and needs
+// no more than crosshair, default and hidden.
 typedef enum {
-    PLATFORM_CURSOR_DEFAULT = 0,   // 標準の矢印
-    PLATFORM_CURSOR_CROSSHAIR = 1, // 十字（キャンバス等の精密操作向け）
-    PLATFORM_CURSOR_HIDDEN = 2,    // 非表示（ソフトオーバーレイ描画時などに使用）
+    PLATFORM_CURSOR_DEFAULT = 0,   // the standard arrow
+    PLATFORM_CURSOR_CROSSHAIR = 1, // a crosshair (for precise work, on a canvas say)
+    PLATFORM_CURSOR_HIDDEN = 2,    // hidden (while the application draws a soft overlay, say)
 } PlatformCursorShape;
 
-// カーソル形状を設定する。
-// 呼び出し頻度: ツール切替・キー入力等のイベント時のみを想定（毎フレーム呼ばない）。
-// shape は PlatformCursorShape の値（enum 型でなく int で受ける。実装は platform_set_cursor 参照）。
-// 未知の値は PLATFORM_CURSOR_DEFAULT にフォールバックする。
-// backend 対応状況: macOS は NSCursor へ即時反映。Linux/Windows は現状 no-op（TASK-75.2/75.3 で実装予定）。
+// Set the cursor shape.
+// Call frequency: event time only (a tool change, a key press). Never once per frame.
+// shape holds a PlatformCursorShape value but is taken as an int rather than as the enum type
+// (see the implementation of platform_set_cursor).
+// An unknown value falls back to PLATFORM_CURSOR_DEFAULT. On macOS it reaches NSCursor immediately.
 void platform_set_cursor(PlatformWindow* window, int shape);
 
 // ========================================
-// ライブリサイズ再描画コールバック (TASK-23.1)
+// The live-resize redraw callback
 // ========================================
 //
-// OS のモーダル/ネストした event-tracking ループ（枠ドラッグ中）から、app へ
-// 「今 1 フレーム描いてほしい」とだけ通知する opt-in 機構。pixels は渡さない
-// （app が普段どおり lockFramebuffer → draw → present を回す）。
-// cb == NULL で登録解除。単一ウィンドウ前提。
+// An opt-in way for the OS's modal, nested event-tracking loop (while the frame is being dragged) to
+// tell the application "draw one frame now", and nothing more. No pixels are handed over: the
+// application runs its usual lockFramebuffer → draw → present.
+// cb == NULL unregisters. A single window is assumed.
 
 typedef void (*PlatformRedrawCallback)(void* userdata);
 void platform_set_redraw_callback(PlatformWindow* window, PlatformRedrawCallback cb, void* userdata);
 
-// 画面を更新（present = 直近 lock したフレームを表示キューへ submit する）
-// platform_lock_framebuffer()で書き込んだ内容を表示キューへ送る
+// Present: submit the frame most recently locked to the display queue.
+// What was written through platform_lock_framebuffer() is sent to the display queue.
 //
-// 動作:
-// - この関数は基本的に非ブロックの submit（display refresh までは待たない）。ただし resource pressure や
-//   inflight 枠の都合で短時間 block する可能性は許容する（下記 Metal を参照）
-// - frame 確定点として扱う（TASK-32 harness はこの時点で frame を確定する）
-// - present 後の pixels は backend / WindowServer / GPU 所有となり、caller は次の lock まで触らない
+// Behaviour:
+// - This is fundamentally a non-blocking submit (it does not wait for display refresh); blocking
+//   briefly under resource pressure or a full set of inflight slots is allowed (see Metal below)
+// - It is the frame commit point (the harness commits its frame here)
+// - After a present the pixels belong to the backend / WindowServer / GPU, and the caller does not touch them until the next lock
 //
-// frame pacing / tearing（backend の support tier に依る・TASK-34）:
-// - 1級 backend（Metal / D3D11-DXGI / Wayland）は fifo で display refresh に同期し tearing 回避を保証対象とする
-//   * Metal は inflight 上限（triple slot + semaphore, TASK-36）に達すると、submit が次フレーム枠の空きまで
-//     短時間 block しうる（= fifo pacing。display refresh 律速）。lockFramebuffer は non-null 互換を維持する
-// - best-effort backend（macOS CALayer objc/swift / X11 / GDI）は厳密な vsync / tearing 回避を保証しない
+// Frame pacing and tearing (this depends on the backend's support tier):
+// - A first-class backend (Metal / D3D11-DXGI / Wayland) is fifo, synchronised to display refresh, and treats avoiding tearing as a guarantee
+//   * Once Metal reaches its inflight limit (a triple slot plus a semaphore), the submit can block
+//     briefly until the next frame slot frees up (that is fifo pacing, paced by display refresh); lockFramebuffer keeps returning non-null
+// - A best-effort backend (macOS CALayer objc/swift / X11 / GDI) guarantees neither strict vsync nor freedom from tearing
 //
-// 注意:
-// - ゲームループのレート制御は呼び出し側の責任（platform_get_time()とsleep()、または将来の beginFrame/waitFrame）
-// - present / lockFramebuffer / frame pacing 契約の正は docs/adr/002（改訂）と docs/adr/005
+// Notes:
+// - Rate control of a game loop is the caller's responsibility (platform_get_time() and sleep(), or a future beginFrame/waitFrame)
+// - The authority on the present / lockFramebuffer / frame pacing contracts is docs/adr/002 (revised) and docs/adr/005
 void platform_present(PlatformWindow* window);
 
 // ========================================
-// イベント処理API
+// The event API
 // ========================================
 
-// イベントタイプ
+// Event types
 typedef enum {
     PLATFORM_EVENT_NONE = 0,
     PLATFORM_EVENT_QUIT,
@@ -249,19 +249,19 @@ typedef enum {
     PLATFORM_EVENT_MOUSE_DOWN,
     PLATFORM_EVENT_MOUSE_UP,
     PLATFORM_EVENT_MOUSE_SCROLL,
-    PLATFORM_EVENT_CHAR_INPUT,   // 確定テキスト文字 (TASK-22。末尾追加=後方互換)
-    PLATFORM_EVENT_GAMEPAD_CONNECTED,    // ゲームパッド接続 (TASK-80.1。実消費は TASK-80.2。末尾追加=後方互換)
-    PLATFORM_EVENT_GAMEPAD_DISCONNECTED, // ゲームパッド切断
-    PLATFORM_EVENT_COMPOSITION,  // IME composition 状態変化 (TASK-79.6.1。末尾追加=後方互換)
-    PLATFORM_EVENT_MENU_COMMAND, // native メニュー選択 (TASK-97.3。末尾追加=後方互換。payload=数値 Command ID)
-    PLATFORM_EVENT_FILE_DROP,    // OS ファイル drag & drop (TASK-113.4。末尾追加=後方互換。inline path)
+    PLATFORM_EVENT_CHAR_INPUT,   // a committed text character (appended at the end, so backwards compatible)
+    PLATFORM_EVENT_GAMEPAD_CONNECTED,    // a gamepad was connected (appended at the end, so backwards compatible)
+    PLATFORM_EVENT_GAMEPAD_DISCONNECTED, // a gamepad was disconnected
+    PLATFORM_EVENT_COMPOSITION,  // the IME composition state changed (appended at the end, so backwards compatible)
+    PLATFORM_EVENT_MENU_COMMAND, // a native menu selection (appended at the end; the payload is a numeric Command id)
+    PLATFORM_EVENT_FILE_DROP,    // an OS file drag and drop (appended at the end; the path is inline)
 } PlatformEventType;
 
-// file drop path 上限（macOS PATH_MAX=1024。超過は reject。TASK-113.4）
+// The upper bound on a dropped file path (macOS PATH_MAX=1024; anything longer is rejected)
 #define PLATFORM_FILE_DROP_PATH_BYTES 1024
 #define PLATFORM_FILE_DROP_MAX_PATHS 1
 
-// IME composition phase（TASK-79.6.1。Zig CompositionPhase と値一致）
+// The IME composition phase (the values match Zig's CompositionPhase)
 typedef enum {
     PLATFORM_COMPOSITION_PHASE_START = 0,
     PLATFORM_COMPOSITION_PHASE_UPDATE = 1,
@@ -269,28 +269,28 @@ typedef enum {
     PLATFORM_COMPOSITION_PHASE_CANCEL = 3,
 } PlatformCompositionPhase;
 
-// マウスボタン (物理ボタン基準: NSEvent.buttonNumber と一致)
-// C enum はストレージ型未指定 = int 幅。Zig 側は enum(c_int) で受ける。
+// Mouse buttons (physical buttons, matching NSEvent.buttonNumber)
+// A C enum has no specified storage type, so it is int wide; the Zig side takes it as enum(c_int).
 typedef enum {
-    PLATFORM_MOUSE_BUTTON_NONE = 0xFF,    // MOUSE_MOVE で button フィールドが意味を持たない時
+    PLATFORM_MOUSE_BUTTON_NONE = 0xFF,    // when the button field is meaningless, as in MOUSE_MOVE
     PLATFORM_MOUSE_BUTTON_LEFT = 0,
     PLATFORM_MOUSE_BUTTON_RIGHT = 1,
     PLATFORM_MOUSE_BUTTON_MIDDLE = 2,
 } PlatformMouseButton;
 
-// PlatformMouseButton の bit-mask 版 (LSB-first: 0x01=left, 0x02=right, 0x04=middle)
+// The bit-mask form of PlatformMouseButton (LSB first: 0x01=left, 0x02=right, 0x04=middle)
 typedef enum {
     PLATFORM_MOUSE_BUTTON_FLAG_LEFT   = 0x01,
     PLATFORM_MOUSE_BUTTON_FLAG_RIGHT  = 0x02,
     PLATFORM_MOUSE_BUTTON_FLAG_MIDDLE = 0x04,
 } PlatformMouseButtonFlags;
 
-// キーコード
-// 物理キーボードの位置に基づいた仮想キーコード
+// Key codes
+// Virtual key codes based on the physical position on the keyboard
 typedef enum {
     PLATFORM_KEY_UNKNOWN = -1,
 
-    // 印字可能文字（ASCII互換）
+    // printable characters (ASCII compatible)
     PLATFORM_KEY_SPACE = 32,
     PLATFORM_KEY_0 = 48,
     PLATFORM_KEY_1 = 49,
@@ -329,7 +329,7 @@ typedef enum {
     PLATFORM_KEY_Y = 89,
     PLATFORM_KEY_Z = 90,
 
-    // 編集キー
+    // editing keys
     PLATFORM_KEY_TAB = 258,
     PLATFORM_KEY_BACKSPACE = 259,
     PLATFORM_KEY_INSERT = 260,
@@ -339,7 +339,7 @@ typedef enum {
     PLATFORM_KEY_HOME = 269,
     PLATFORM_KEY_END = 270,
 
-    // 特殊キー
+    // special keys
     PLATFORM_KEY_ESCAPE = 256,
     PLATFORM_KEY_ENTER = 257,
     PLATFORM_KEY_LEFT = 263,
@@ -347,7 +347,7 @@ typedef enum {
     PLATFORM_KEY_UP = 265,
     PLATFORM_KEY_DOWN = 266,
 
-    // ファンクションキー（F1-F20）
+    // function keys (F1-F20)
     PLATFORM_KEY_F1 = 290,
     PLATFORM_KEY_F2 = 291,
     PLATFORM_KEY_F3 = 292,
@@ -369,7 +369,7 @@ typedef enum {
     PLATFORM_KEY_F19 = 308,
     PLATFORM_KEY_F20 = 309,
 
-    // テンキー（numeric keypad）
+    // the numeric keypad
     PLATFORM_KEY_KP_0 = 320,
     PLATFORM_KEY_KP_1 = 321,
     PLATFORM_KEY_KP_2 = 322,
@@ -388,7 +388,7 @@ typedef enum {
     PLATFORM_KEY_KP_ENTER = 335,
     PLATFORM_KEY_KP_EQUAL = 336,
 
-    // モディファイアキー（単独入力用）
+    // modifier keys (for pressing them on their own)
     PLATFORM_KEY_LEFT_SHIFT = 340,
     PLATFORM_KEY_LEFT_CONTROL = 341,
     PLATFORM_KEY_LEFT_ALT = 342,
@@ -398,13 +398,13 @@ typedef enum {
     PLATFORM_KEY_RIGHT_ALT = 346,
     PLATFORM_KEY_RIGHT_SUPER = 347,       // Command (macOS) / Windows key
 
-    // その他のキー
+    // other keys
     PLATFORM_KEY_CAPS_LOCK = 280,
     PLATFORM_KEY_PRINT_SCREEN = 283,
     PLATFORM_KEY_PAUSE = 284,
 } PlatformKeyCode;
 
-// モディファイアキー
+// Modifier keys
 typedef enum {
     PLATFORM_MOD_SHIFT = 0x01,
     PLATFORM_MOD_CTRL = 0x02,
@@ -412,7 +412,7 @@ typedef enum {
     PLATFORM_MOD_CMD = 0x08,  // macOS Command, Windows Super
 } PlatformModifierFlags;
 
-// イベント構造体
+// The event struct
 typedef struct PlatformEvent {
     PlatformEventType type;
 
@@ -423,41 +423,41 @@ typedef struct PlatformEvent {
             uint32_t modifiers;
         } keyboard;
         struct {
-            // x, y: window contentRect 左上原点・window logical 単位 (view.bounds と同単位)
-            // floor 整数化済み。framebuffer/canvas 変換は caller 責任。
-            // ボタン押下中はウィンドウ外でも座標を clamp せず負値もそのまま渡す。
+            // x, y: the origin is the top-left of the window contentRect, in window logical units (the same
+            // units as view.bounds), already floored to integers; converting to framebuffer or canvas coordinates is the caller's job.
+            // While a button is held, coordinates outside the window are passed through unclamped, negative values included.
             int32_t x, y;
-            PlatformMouseButton button;   // MOUSE_DOWN / MOUSE_UP のみ valid、MOUSE_MOVE では PLATFORM_MOUSE_BUTTON_NONE
-            uint8_t buttons_mask;         // 現在押されているボタンの bitmask (post-state, & 0x07 でマスク済み)
+            PlatformMouseButton button;   // valid for MOUSE_DOWN / MOUSE_UP only; PLATFORM_MOUSE_BUTTON_NONE on MOUSE_MOVE
+            uint8_t buttons_mask;         // a bitmask of the buttons currently held (post-state, already masked with & 0x07)
             uint32_t modifiers;
         } mouse;
         struct {
-            int32_t x, y;                 // window 座標 (mouse と同じ単位)
-            float dx, dy;                 // 単位は window 座標と同じ (line 単位の場合は scrollerLineHeight 倍済み)
-            bool is_precise;              // true: トラックパッド (連続値), false: ホイール (line→window-units 変換済み)
+            int32_t x, y;                 // window coordinates (the same units as mouse)
+            float dx, dy;                 // the same units as window coordinates (line units are already scaled by scrollerLineHeight)
+            bool is_precise;              // true: a trackpad (continuous); false: a wheel (already converted from lines to window units)
             uint8_t buttons_mask;         // post-state
             uint32_t modifiers;
         } scroll;
         struct {
-            uint32_t codepoint;           // 確定文字の Unicode スカラー値 (UTF-32)。TASK-22
+            uint32_t codepoint;           // the Unicode scalar value of the committed character (UTF-32)
             uint32_t modifiers;
         } character;
         struct {
-            int32_t index;                // PLATFORM_MAX_GAMEPADS 範囲の pad index
-            char name[33];                 // NUL 終端デバイス名 (32 bytes + NUL。32超は切り詰め)。
-                                            // CONNECTED のみ有効、DISCONNECTED は空文字。TASK-80.1
+            int32_t index;                // a pad index within the PLATFORM_MAX_GAMEPADS range
+            char name[33];                 // a NUL-terminated device name (32 bytes + NUL; anything longer is truncated).
+                                            // Set on CONNECTED only; empty on DISCONNECTED.
         } gamepad;
         struct {
-            uint32_t revision;            // snapshot 突合用。setMarkedText/unmark/insert 毎に増分
+            uint32_t revision;            // for matching a snapshot; incremented on every setMarkedText/unmark/insert
             uint8_t phase;                // PlatformCompositionPhase
-            uint32_t cursor;              // preedit 内 UTF-8 バイトオフセット（caret）
-        } composition;                    // TASK-79.6.1。本文は platform_get_composition_snapshot
+            uint32_t cursor;              // the UTF-8 byte offset within the preedit (the caret)
+        } composition;                    // the text itself comes from platform_get_composition_snapshot
         struct {
-            uint32_t command_id;          // app の CommandId（数値）。TASK-97.3
+            uint32_t command_id;          // the application's CommandId (numeric)
         } menu;
-        // TASK-113.4: OS ファイル drop。bytes[0..len] が UTF-8 パス本体（NUL 終端は契約しない）。
-        // queue に積まれた PlatformEvent 自体がパス所有者。drag 用の解放関数は追加しない。
-        // count は 0 または 1（MVP は単一ファイル。複数同時 drop はイベント全体を reject）。
+        // An OS file drop. bytes[0..len] is the UTF-8 path itself (NUL termination is not part of the contract).
+        // The PlatformEvent queued here owns the path; no separate free function is added for a drag.
+        // count is 0 or 1 (a single file; a simultaneous multi-file drop rejects the whole event).
         struct {
             uint32_t count;
             struct {
@@ -468,16 +468,16 @@ typedef struct PlatformEvent {
     } payload;
 } PlatformEvent;
 
-// TASK-135: file_drop イベントの struct 充填を objc/swift/metal で共有する contract ヘルパー。
-// Swift の C importer は入れ子配列を持つ匿名構造体（file_drop.paths[].bytes）をフィールドとして
-// import できないため、Swift/Metal backend はこの C ヘルパー経由でしか file_drop を構築できない。
-// objc backend も同じ関数を使い、契約（単一 file・空/上限超/NUL は reject）を単一ソース化する。
-// utf8[0..len) を検証し、成功時 ev を FILE_DROP で埋めて true、reject 時 false（ev 不変）を返す。
-// 呼び出し側は ev をゼロ初期化して渡す（Swift の PlatformEvent() / objc の memset。string.h 非依存）。
+// A contract helper, shared by objc/swift/metal, that fills in a file_drop event struct.
+// Swift's C importer cannot import an anonymous struct holding a nested array (file_drop.paths[].bytes)
+// as a field, so the Swift and Metal backends can only build a file_drop through this C helper; objc uses
+// the same function, which single-sources the contract (a single file; empty, over-long or NUL-containing
+// paths are rejected). It validates utf8[0..len), fills ev as a FILE_DROP and returns true on success, or
+// returns false with ev untouched. The caller passes a zero-initialised ev (Swift PlatformEvent(), objc memset; no string.h).
 static inline bool platform_fill_file_drop_event(PlatformEvent* ev, const char* utf8, uint32_t len) {
     if (len == 0 || len > PLATFORM_FILE_DROP_PATH_BYTES) return false;
     for (uint32_t i = 0; i < len; i++) {
-        if (utf8[i] == 0) return false; // NUL 含有は reject（契約）
+        if (utf8[i] == 0) return false; // a NUL inside the path is rejected (the contract)
     }
     ev->type = PLATFORM_EVENT_FILE_DROP;
     ev->payload.file_drop.count = 1;
@@ -488,39 +488,39 @@ static inline bool platform_fill_file_drop_event(PlatformEvent* ev, const char* 
     return true;
 }
 
-// IME composition snapshot のメタ（本文は caller の buf へ UTF-8 で書く。TASK-79.6.1）
+// The metadata of an IME composition snapshot (the text goes into the caller's buf, as UTF-8)
 typedef struct PlatformCompositionMeta {
     uint32_t revision;
-    uint32_t cursor;   // preedit 内 UTF-8 バイトオフセット
-    uint32_t len;      // buf に書いたバイト数（cap で切り詰め済み。NUL 非付与）
+    uint32_t cursor;   // the UTF-8 byte offset within the preedit
+    uint32_t len;      // the bytes written into buf (already truncated to cap; no NUL appended)
 } PlatformCompositionMeta;
 
-// 現在の preedit 本文を buf に書く。戻り値 = 書いたバイト数（0 = 空/未 composition）。
-// meta は常に埋める（空時は revision/cursor/len = 0）。非 macOS / 未対応 backend は常に 0。
-// cap==0 または buf==NULL でも meta は埋める（本文は書かない）。
+// Write the current preedit text into buf. Returns the bytes written (0 = empty, or not composing).
+// meta is always filled in (revision/cursor/len = 0 when empty). A non-macOS or unsupported backend always returns 0.
+// meta is filled in even when cap==0 or buf==NULL (only the text is not written).
 uint32_t platform_get_composition_snapshot(PlatformWindow* window, char* buf, uint32_t cap, PlatformCompositionMeta* meta);
 
-// IME 候補窓の基準 caret rect を設定する。座標は framebuffer pixel・window content 左上原点。
-// backend は firstRectForCharacterRange の問い合わせ時に backing scale を適用する。
+// Set the caret rect the IME candidate window is anchored to, in framebuffer pixels with the origin at the window content's top-left.
+// The backend applies the backing scale when it answers firstRectForCharacterRange.
 void platform_set_composition_rect(PlatformWindow* window, int32_t x, int32_t y, int32_t w, int32_t h);
 
-// テキスト編集ウィジェットのフォーカス有無を platform へ伝える（TASK-142）。
-// active=false の間は keyDown を inputContext(IME) へ渡さないので、IME 有効中でも
-// 修飾なし英字キーが marked text に吸われず facade key_down が届く（ショートカット維持）。
-// 未呼び出しのアプリは従来どおり常時 IME 経路（後方互換）。false 遷移時は保留 composition を破棄する。
+// Tell the platform whether a text editing widget currently has focus.
+// While active=false, keyDown is not handed to the inputContext (the IME), so even with an IME enabled an
+// unmodified letter key is not swallowed into marked text and reaches the facade as key_down (shortcuts keep working).
+// An application that never calls this keeps the always-IME path. A transition to false discards any pending composition.
 void platform_set_text_input_active(PlatformWindow* window, bool active);
 
 // ========================================
-// IME document access（TASK-79.6.3。確定済みテキストの再変換）
+// IME document access (reconverting already-committed text)
 // ========================================
 //
-// NSTextInputClient の selectedRange / attributedSubstring / insertText(replacementRange:) が
-// 参照する document を app が供給する。range は **UTF-16 code unit** 単位（NSString/NSRange と同契約）。
-// location == UINT64_MAX は NSNotFound sentinel。
+// The application supplies the document that NSTextInputClient's selectedRange, attributedSubstring and
+// insertText(replacementRange:) refer to. A range is in **UTF-16 code units** (the same contract as
+// NSString/NSRange). location == UINT64_MAX is the NSNotFound sentinel.
 //
-// callback は **同期呼び出し専用**。get_substring が返す UTF-8 ポインタは当該 callback 復帰まで
-// 有効な借用（native は復帰直後に NSString へコピーする）。callback 未登録時は従来どおり
-// selectedRange=NSNotFound / attributedSubstring=nil / insertText→char_input を維持する。
+// The callbacks are **for synchronous calls only**. The UTF-8 pointer returned by get_substring is borrowed
+// only until that callback returns (the native side copies it into an NSString right afterwards). With no
+// callbacks registered, selectedRange=NSNotFound / attributedSubstring=nil / insertText→char_input holds.
 
 typedef struct PlatformTextInputRange {
     uint64_t location;
@@ -550,41 +550,41 @@ typedef struct PlatformTextInputDocumentCallbacks {
     PlatformTextInputReplaceTextFn replace_text;
 } PlatformTextInputDocumentCallbacks;
 
-// callbacks==NULL で登録解除（pending replacement range も破棄）。単一 window 前提。
+// callbacks==NULL unregisters (and discards any pending replacement range). A single window is assumed.
 void platform_set_text_input_document_access(
     PlatformWindow* window,
     const PlatformTextInputDocumentCallbacks* callbacks,
     void* userdata);
 
-// イベント取得API（1つずつ）
-// ウィンドウのイベントキューから1つイベントを取得する
-// イベントがあればtrue、ないならfalseを返す
+// Take one event at a time.
+// Pops a single event from the window's event queue.
+// Returns true if there was one, false if there was not.
 bool platform_get_event(PlatformWindow* window, PlatformEvent* event);
 
-// イベントキューの観測カウンタ (累積値、snapshot 取得)
-// example での合体動作・溢れ検知に使う。
+// Counters observed on the event queue (cumulative values, read as a snapshot).
+// Used by the examples to watch merging and to detect overflow.
 typedef struct PlatformEventStats {
-    uint64_t mouse_move_merge_count;    // mouse_move を末尾合体した累積回数
-    uint64_t mouse_scroll_merge_count;  // mouse_scroll を末尾合体した累積回数
-    uint64_t event_drop_count;          // キュー満杯で捨てた累積回数
+    uint64_t mouse_move_merge_count;    // how many times a mouse_move was merged into the tail
+    uint64_t mouse_scroll_merge_count;  // how many times a mouse_scroll was merged into the tail
+    uint64_t event_drop_count;          // how many events were dropped because the queue was full
 } PlatformEventStats;
 
-// イベントキューのカウンタ snapshot を取得
+// Take a snapshot of the event queue counters
 void platform_get_event_stats(PlatformWindow* window, PlatformEventStats* out);
 
 // ========================================
-// ゲームパッド入力 (TASK-80.1。ADR-009。実消費は TASK-80.2)
+// Gamepad input (ADR-009)
 // ========================================
 //
-// 設計の正は core/platform_types.zig 側の GamepadButton/GamepadButtons/GamepadState と
-// docs/adr/009_gamepad-input.md。button の bit 位置は下記 enum の宣言順（a=bit0 … guide=bit14）と
-// Zig 側 GamepadButtons のフィールド順を一致させる。トリガーは axis のみで公開する（ボタンとしては
-// 公開しない）。stick/trigger は raw 値（deadzone 未適用）。
+// The authority on the design is GamepadButton/GamepadButtons/GamepadState in core/platform_types.zig
+// together with docs/adr/009_gamepad-input.md. A button's bit position follows the declaration order of
+// the enum below (a=bit0 … guide=bit14) and matches the field order of GamepadButtons on the Zig side.
+// Triggers are exposed as axes only, never as buttons. Sticks and triggers carry raw values (no deadzone).
 //
-// 本タスク（80.1）はこの型・プロトタイプの宣言のみを確定する。呼び出しコードは存在しないため、
-// macOS の .m/.swift 実装ファイルへの変更は不要（未使用の extern 宣言は link 要求を発生させない）。
+// The macOS backends implement this behind `VP_ENABLE_GAMEPAD`, which build.zig passes only to an
+// executable that uses a gamepad.
 
-// PlatformGamepadState.buttons_mask の bit-mask 版
+// The bit-mask form of PlatformGamepadState.buttons_mask
 typedef enum {
     PLATFORM_GAMEPAD_BUTTON_A = 0x0001,
     PLATFORM_GAMEPAD_BUTTON_B = 0x0002,
@@ -594,115 +594,115 @@ typedef enum {
     PLATFORM_GAMEPAD_BUTTON_RIGHT_SHOULDER = 0x0020,
     PLATFORM_GAMEPAD_BUTTON_BACK = 0x0040,
     PLATFORM_GAMEPAD_BUTTON_START = 0x0080,
-    PLATFORM_GAMEPAD_BUTTON_LEFT_STICK = 0x0100,   // スティック押し込み（クリック）
+    PLATFORM_GAMEPAD_BUTTON_LEFT_STICK = 0x0100,   // pressing the stick in (a click)
     PLATFORM_GAMEPAD_BUTTON_RIGHT_STICK = 0x0200,
     PLATFORM_GAMEPAD_BUTTON_DPAD_UP = 0x0400,
     PLATFORM_GAMEPAD_BUTTON_DPAD_DOWN = 0x0800,
     PLATFORM_GAMEPAD_BUTTON_DPAD_LEFT = 0x1000,
     PLATFORM_GAMEPAD_BUTTON_DPAD_RIGHT = 0x2000,
-    PLATFORM_GAMEPAD_BUTTON_GUIDE = 0x4000,        // Xbox ボタン相当（ホームボタン）
+    PLATFORM_GAMEPAD_BUTTON_GUIDE = 0x4000,        // the Xbox button (the home button)
 } PlatformGamepadButtonFlags;
 
-// 同時サポートするゲームパッド数
+// How many gamepads are supported at once
 #define PLATFORM_MAX_GAMEPADS 4
 
-// ゲームパッドの正規化済みポーリング状態
+// The normalised, pollable state of a gamepad
 typedef struct PlatformGamepadState {
-    uint32_t buttons_mask;              // PlatformGamepadButtonFlags の bit-or
-    float left_stick_x, left_stick_y;   // -1.0..1.0（raw値。deadzone 未適用）
+    uint32_t buttons_mask;              // a bit-or of PlatformGamepadButtonFlags
+    float left_stick_x, left_stick_y;   // -1.0..1.0 (raw; no deadzone applied)
     float right_stick_x, right_stick_y; // -1.0..1.0
-    float left_trigger, right_trigger;  // 0.0..1.0（raw値。トリガーは axis のみで公開）
+    float left_trigger, right_trigger;  // 0.0..1.0 (raw; triggers are exposed as axes only)
 } PlatformGamepadState;
 
-// 指定 index のゲームパッド状態を取得する（ポーリング。実装は TASK-80.2）。
-// 戻り値: 接続されていれば true（out_state 書込み済み）、未接続/index範囲外は false。
+// Read the state of the gamepad at the given index (polling).
+// Returns: true when it is connected (out_state has been written); false when disconnected or out of range.
 bool platform_get_gamepad_state(PlatformWindow* window, int index, PlatformGamepadState* out_state);
 
 // ========================================
-// native メニュー (TASK-97.3。ADR 契約は core/command_types.zig の Command)
+// Native menus (the ADR contract is Command in core/command_types.zig)
 // ========================================
 //
-// C ABI 契約:
-// - 登録は PlatformMenuItem 配列 + count 明示（sentinel 終端は使わない）。
-// - 文字列は UTF-8 NUL 終端で**呼び出し中のみ有効**（backend が copy する）。
-// - 階層は MVP ではトップメニュー 1 段 + 項目のみ（submenu なし。separator は kind で表現）。
-// - メニューバーはアプリ単位のため window 引数は無視し、最後の登録が全体を差し替える。
-// - 実装は macOS objc/swift/metal backend。`#if defined(VP_ENABLE_MENU)` 条件コンパイル
-//   （TASK-80.2 gamepad opt-in と同型。共有 TU は platform_macos_menu.m。TASK-122）。
-//   非使用 exe はメニューシンボル参照ゼロ。
+// The C ABI contract:
+// - Registration takes an array of PlatformMenuItem plus an explicit count (no sentinel terminator).
+// - Strings are UTF-8, NUL-terminated, and **valid only for the duration of the call** (the backend copies them).
+// - The hierarchy is one level of top menu plus its items (no submenus; a separator is expressed through kind).
+// - The menu bar belongs to the application, so the window argument is ignored and the last registration replaces the whole bar.
+// - Implemented by the macOS objc/swift/metal backends, compiled conditionally on `#if defined(VP_ENABLE_MENU)`
+//   (the same shape as the gamepad opt-in; the shared translation unit is platform_macos_menu.m).
+//   An executable that does not use menus references no menu symbol at all.
 
 #define PLATFORM_MENU_KIND_NORMAL    0
 #define PLATFORM_MENU_KIND_SEPARATOR 1
 
 typedef struct PlatformMenuItem {
-    uint32_t command_id;       // separator は 0
+    uint32_t command_id;       // 0 for a separator
     uint8_t kind;              // PLATFORM_MENU_KIND_*
-    const char* top_menu;      // トップメニュー名（例 "File"）。NUL 終端・呼び出し中のみ有効
-    const char* label;         // 項目ラベル。separator は空文字可。NUL 終端・呼び出し中のみ有効
-    int32_t shortcut_key;      // PlatformKeyCode。ショートカット無しは -1
-    uint32_t shortcut_mods;    // PlatformModifierFlags。shortcut_key < 0 のとき無視
+    const char* top_menu;      // the top menu name (for example "File"); NUL-terminated, valid only during the call
+    const char* label;         // the item label; may be empty for a separator; NUL-terminated, valid only during the call
+    int32_t shortcut_key;      // a PlatformKeyCode; -1 for no shortcut
+    uint32_t shortcut_mods;    // PlatformModifierFlags; ignored when shortcut_key < 0
     uint8_t enabled;           // 0/1
-    uint8_t checked;           // 0/1（トグル項目）
+    uint8_t checked;           // 0/1 (a toggle item)
 } PlatformMenuItem;
 
-// このビルドで native メニューが利用可能か（VP_ENABLE_MENU かつ macOS native 実装あり）。
+// Whether native menus are available in this build (VP_ENABLE_MENU plus a macOS native implementation).
 bool platform_menu_available(void);
 
-// メニューバーを items[0..count) で差し替える（最後の登録が全体）。window は契約上無視。
+// Replace the menu bar with items[0..count) (the last registration is the whole bar). window is ignored by contract.
 void platform_register_menu(PlatformWindow* window, const PlatformMenuItem* items, uint32_t count);
 
-// 登録済み項目の enabled/checked を command_id 照合で更新する（構造は変えない）。
+// Update enabled/checked on the registered items, matched by command_id (the structure is left alone).
 void platform_update_menu(PlatformWindow* window, const PlatformMenuItem* items, uint32_t count);
 
-// 登録済みメニューを破棄する（mainMenu を空に戻す）。
+// Destroy the registered menu (returning mainMenu to empty).
 void platform_destroy_menu(PlatformWindow* window);
 
 // ========================================
-// ファイル選択ダイアログ (TASK-24)
+// File selection dialogs
 // ========================================
 //
-// ネイティブのファイル選択ダイアログを同期モーダルで表示する（app-modal、
-// ウィンドウ非依存）。呼び出しスレッド（メインスレッド）をブロックし、ユーザーが
-// ダイアログを閉じるまで戻らない。フレームバッファ lock 中には呼ばないこと。
+// Show a native file selection dialog synchronously and modally (application-modal, not tied to a
+// window). It blocks the calling thread (the main thread) and does not return until the user dismisses
+// the dialog. Never call it while the framebuffer is locked.
 
-// 保存ダイアログのオプション
+// Options for the save dialog
 typedef struct PlatformSaveDialogOptions {
-    const char* default_name;  // 初期ファイル名 (NULL 可)
-    const char* allowed_ext;   // 拡張子フィルタ 例 "png" (NULL = 任意)
+    const char* default_name;  // the initial file name (may be NULL)
+    const char* allowed_ext;   // an extension filter, for example "png" (NULL = anything)
 } PlatformSaveDialogOptions;
 
-// 読み込みダイアログのオプション
+// Options for the open dialog
 typedef struct PlatformOpenDialogOptions {
-    const char* allowed_ext;   // 拡張子フィルタ 例 "png" (NULL = 任意)
+    const char* allowed_ext;   // an extension filter, for example "png" (NULL = anything)
 } PlatformOpenDialogOptions;
 
-// 保存先をユーザーに選ばせる。
-// 戻り値: 選択された絶対パス（NUL 終端、malloc 済み）。caller は platform_free_path() で解放。
-//         キャンセル / エラー時は NULL。
+// Let the user choose where to save.
+// Returns: the chosen absolute path (NUL-terminated, malloc'd). The caller frees it with platform_free_path().
+//          NULL on cancel or on error.
 char* platform_save_file_dialog(const PlatformSaveDialogOptions* opts);
 
-// 開くファイルをユーザーに選ばせる（単一選択・ファイルのみ）。
-// 戻り値: 選択された絶対パス（NUL 終端、malloc 済み）。caller は platform_free_path() で解放。
-//         キャンセル / エラー時は NULL。
+// Let the user choose a file to open (a single selection, files only).
+// Returns: the chosen absolute path (NUL-terminated, malloc'd). The caller frees it with platform_free_path().
+//          NULL on cancel or on error.
 char* platform_open_file_dialog(const PlatformOpenDialogOptions* opts);
 
-// platform_*_file_dialog() が返したパス文字列を解放する。NULL 安全。
+// Free a path string returned by platform_*_file_dialog(). NULL safe.
 void platform_free_path(char* path);
 
 // ========================================
-// OS テキストクリップボード (TASK-120 / TASK-161)
+// The OS text clipboard
 // ========================================
 //
-// UTF-8 テキストのみ。画像・RTF・複合形式は対象外。
-// 実装は macOS の 3 backend（objc / swift / metal）が NSPasteboard を提供する。
-// （objc: platform_macos.m / swift+metal: platform_macos_shared.swift。backend 排他リンク。）
+// UTF-8 text only. Images, RTF and compound formats are out of scope.
+// The implementation is NSPasteboard, provided by all three macOS backends (objc / swift / metal).
+// (objc: platform_macos.m; swift and metal: platform_macos_shared.swift. The backends link exclusively.)
 
-// OS clipboard へ UTF-8 テキストを書き込む（len はバイト長。NUL 終端不要）。
+// Write UTF-8 text to the OS clipboard (len is a byte length; no NUL termination needed).
 void platform_set_clipboard_text(const char* utf8, uint32_t len);
 
-// OS clipboard から UTF-8 テキストを caller 所有 buffer へ読む。
-// 成功時 true（空文字列含む。*out_len にバイト長）。未対応・文字列無し・失敗は false。
-// cap 超過時は UTF-8 コードポイント境界で切り詰める。
+// Read UTF-8 text from the OS clipboard into a caller-owned buffer.
+// Returns true on success (an empty string included; *out_len holds the byte length). Unsupported, no
+// string present, or a failure returns false. Anything past cap is truncated at a UTF-8 code point boundary.
 bool platform_get_clipboard_text(char* out, uint32_t cap, uint32_t* out_len);
 
 #endif // PLATFORM_H

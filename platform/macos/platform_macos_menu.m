@@ -1,14 +1,14 @@
 // ========================================
-// native メニュー共有実装 (TASK-122。NSMenu / target-action)
+// The shared native menu implementation (NSMenu plus target-action)
 // ========================================
 //
-// TASK-97.3 の objc 実装を抽出。objc/swift/metal から同一 translation unit をリンクする。
-// opt-in: build_helpers が enable_menu=true のときだけ本ファイルをコンパイルし
-// `-DVP_ENABLE_MENU` を渡す。非使用 exe は本 TU 自体をリンクしない（nm で symbol ゼロ）。
-// NSMenu は AppKit 既リンクのため追加 framework は不要。
+// objc, swift and metal all link this same translation unit.
+// Opt-in: build_helpers compiles this file only when enable_menu=true, passing
+// `-DVP_ENABLE_MENU`. An executable that does not use menus never links this TU (nm shows no symbol).
+// NSMenu needs no extra framework, since AppKit is linked already.
 //
-// ホットパス宣言: 構築・再構築は初期登録/構造変更時のみ。keyEquivalent 判定は keyDown 時のみ。
-// menu command は選択時のみ。frame 毎・RT 経路には入らない。
+// Hot path declaration: building and rebuilding happen only on the first registration or a structural
+// change; keyEquivalent matching only on a keyDown; a menu command only on a selection. None of it is per frame or real time.
 
 #import <Cocoa/Cocoa.h>
 #include "platform.h"
@@ -28,15 +28,15 @@ static PlatformWindow* g_menu_event_window = NULL;
 - (void)onMenuCommand:(id)sender {
     NSMenuItem* item = (NSMenuItem*)sender;
     if (!g_menu_event_window) return;
-    // EventQueue は backend 固有。共有 TU は bridge 経由で command を渡すだけ。
+    // The EventQueue is backend specific. The shared TU only hands the command over through the bridge.
     platform_menu_enqueue_command(g_menu_event_window, (uint32_t)item.tag);
 }
 @end
 
 static MenuTarget* g_menu_target = nil;
 
-// KeyCode → NSMenuItem.keyEquivalent。物理キーコードは渡せないため文字/unichar へ写す。
-// 変換不能キーは keyEquivalent なし（ショートカット無しのメニュー項目）+ warn。
+// KeyCode → NSMenuItem.keyEquivalent. A physical key code cannot be passed, so it maps to a character (a unichar).
+// A key that cannot be converted gets no keyEquivalent (a menu item without a shortcut) plus a warning.
 static BOOL menuKeyEquivalentForKey(int32_t key, NSString** out_eq) {
     if (key >= PLATFORM_KEY_A && key <= PLATFORM_KEY_Z) {
         char c = (char)('a' + (key - PLATFORM_KEY_A));
@@ -118,8 +118,8 @@ static void menuApplyItemState(NSMenuItem* item, const PlatformMenuItem* src) {
     [item setState:(src->checked != 0) ? NSControlStateValueOn : NSControlStateValueOff];
 }
 
-/// UTF-8 → NSString。不正列（途中切断含む）で stringWithUTF8String: が nil を返す場合は
-/// 空文字へ落として項目欠落・不正 NSMenuItem を防ぐ（TASK-97.3 codex 指摘）。
+/// UTF-8 → NSString. When stringWithUTF8String: returns nil for an invalid sequence (a truncated one
+/// included), this falls back to an empty string, so no item goes missing and no invalid NSMenuItem is built.
 static NSString* menuNSStringOrEmpty(const char* utf8, const char* field) {
     if (!utf8 || utf8[0] == '\0') return @"";
     NSString* s = [NSString stringWithUTF8String:utf8];
@@ -161,13 +161,13 @@ bool platform_menu_available(void) {
 void platform_register_menu(PlatformWindow* window, const PlatformMenuItem* items, uint32_t count) {
     @autoreleasepool {
         if (!g_menu_target) g_menu_target = [[MenuTarget alloc] init];
-        // メニューバーはアプリ単位。最後の登録の window を event 配送先にする。
+        // The menu bar belongs to the application, so events go to the window of the last registration.
         if (window) g_menu_event_window = window;
 
-        // 手動イベントポンプ（nextEventMatchingMask 直呼び）では finishLaunching が
-        // 呼ばれず、setMainMenu してもメニューバーに装着されない（2026-07-17 実機で
-        // 「native=1 なのにメニューバー非表示」として発覚）。menu 利用アプリに限り
-        // ここで一度だけ launched 状態にする（非 menu アプリの挙動は不変）。
+        // Under a manual event pump (calling nextEventMatchingMask directly) finishLaunching is never
+        // called, and setMainMenu does not attach the bar to the menu bar. Only for an application that
+        // uses menus, the launched state is set once here (the behaviour of a non-menu application is
+        // unchanged).
         static bool s_menu_finish_launching_done = false;
         if (!s_menu_finish_launching_done) {
             s_menu_finish_launching_done = true;
@@ -175,11 +175,11 @@ void platform_register_menu(PlatformWindow* window, const PlatformMenuItem* item
         }
 
         NSMenu* mainMenu = [[NSMenu alloc] initWithTitle:@"MainMenu"];
-        // AppKit は mainMenu の先頭項目を「アプリ名メニュー」スロットに使う。先頭に
-        // アプリメニューを置かないと、最初の登録メニュー（File）がアプリ名の下に
-        // 飲み込まれて見えなくなる。Quit はアプリ側の未保存確認フローを飛ばさないよう
-        // NSApp terminate: ではなく performClose:（first responder = key window の
-        // 既存 windowShouldClose → quit イベント経路）に流す。
+        // AppKit puts the first item of mainMenu into the "application name menu" slot. Without an
+        // application menu in front, the first registered menu (File) is swallowed under the application
+        // name and becomes invisible. Quit goes through performClose: (first responder = the key window,
+        // reaching the existing windowShouldClose → quit event path) rather than NSApp terminate:, so that
+        // the application's unsaved-changes flow is not skipped.
         {
             NSMenuItem* app_item = [[NSMenuItem alloc] initWithTitle:@"" action:nil keyEquivalent:@""];
             NSMenu* app_menu = [[NSMenu alloc] initWithTitle:@""];
@@ -197,7 +197,7 @@ void platform_register_menu(PlatformWindow* window, const PlatformMenuItem* item
                 const PlatformMenuItem* src = &items[i];
                 NSString* top = menuNSStringOrEmpty(src->top_menu, "top_menu");
                 if (top.length == 0) {
-                    // 空/不正 UTF-8 のトップ名は "Menu" にフォールバック（項目は捨てない）
+                    // An empty or invalid UTF-8 top-level name falls back to "Menu" (the items are kept)
                     if (src->top_menu && src->top_menu[0] != '\0') {
                         NSLog(@"[video-proto] menu: empty/invalid top_menu — fallback to \"Menu\"");
                     }
@@ -220,7 +220,7 @@ void platform_update_menu(PlatformWindow* window, const PlatformMenuItem* items,
             const PlatformMenuItem* src = &items[i];
             if (src->kind == PLATFORM_MENU_KIND_SEPARATOR) continue;
             if (src->command_id == 0) continue;
-            // 全トップメニューを走査して tag=command_id の項目を更新
+            // Walk every top menu and update the item whose tag is command_id
             for (NSMenuItem* top in g_menu_main.itemArray) {
                 NSMenu* sub = top.submenu;
                 if (!sub) continue;
@@ -244,8 +244,8 @@ void platform_destroy_menu(PlatformWindow* window) {
 }
 
 void platform_menu_window_will_destroy(PlatformWindow* window) {
-    // 対象が現在の配送先のときだけ外す（他 window の登録は温存）。
-    // 以後の MenuTarget action は g_menu_event_window==NULL で enqueue を破棄する。
+    // Detach only when the target is the current delivery window (a registration by another window is kept).
+    // From then on a MenuTarget action sees g_menu_event_window==NULL and discards the enqueue.
     if (window && g_menu_event_window == window) {
         g_menu_event_window = NULL;
     }

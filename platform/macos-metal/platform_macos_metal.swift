@@ -1,51 +1,51 @@
 import Cocoa
 import MetalKit
 
-// Metal最適化版の backend 実装（Swift。TASK-140 で共有コードを platform_macos_shared.swift へ分離）
-// 型定義 (PlatformEvent, PlatformEventType, PlatformKeyCode, PLATFORM_* 定数,
-//        FrameCallback typealias など) は bridging header (-import-objc-header
-//        platform/platform.h) 経由で C ヘッダから自動取得する。
+// The Metal-optimised backend, in Swift (the shared code lives in platform_macos_shared.swift)
+// The type definitions (PlatformEvent, PlatformEventType, PlatformKeyCode, the PLATFORM_* constants,
+//        the FrameCallback typealias and so on) come from the C header automatically, through the
+//        bridging header (-import-objc-header platform/platform.h).
 //
-// 本ファイルは PlatformBackendView に適合する MetalFramebufferView（MTKView + triple-slot ring）と
-// MetalRenderer、makePlatformBackendView() ファクトリのみを持つ。C ABI・イベントキュー・IME 状態・
-// ウィンドウ生成骨格は platform_macos_shared.swift 側。
+// This file holds only the MetalFramebufferView that conforms to PlatformBackendView (an MTKView plus
+// a triple-slot ring), MetalRenderer, and the makePlatformBackendView() factory. The C ABI, the event
+// queue, the IME state and the window creation skeleton are in platform_macos_shared.swift.
 //
-// TASK-113.4 / TASK-135: OS ファイル drag & drop（file URL のみ）を objc backend と同一契約で実装。
-// MetalFramebufferView が NSDraggingDestination を実装し、単一 file URL を PLATFORM_EVENT_FILE_DROP
-// として event_queue へ inline copy で投入する（複数/非ファイル/空/上限超/NUL は reject）。
-// struct 充填は platform.h の共有ヘルパー platform_fill_file_drop_event（objc/swift/metal 単一ソース）。
+// OS file drag and drop (file URLs only) is implemented on the same contract as the objc backend.
+// MetalFramebufferView implements NSDraggingDestination and puts a single file URL onto the
+// event_queue as a PLATFORM_EVENT_FILE_DROP by inline copy (several, non-file, empty, over-limit or NUL-containing paths are rejected).
+// Filling the struct is platform.h's shared helper platform_fill_file_drop_event (one source for objc/swift/metal).
 //
 // ========================================
-// 1級 frame pacing 契約（ADR-005 / TASK-36）
+// The first-class frame pacing contract (ADR-005)
 // ========================================
-// この backend は ADR-005 の 1級 backend frame pacing 契約に適合する:
+// This backend meets the first-class backend frame pacing contract of ADR-005:
 //
-// - drawable lifecycle: drawable / renderPassDescriptor の取得・present は MTKView の正規 draw
-//   サイクル（draw(in:)）内だけで行う。手動描画は presentManual() が view.draw() を起動して
-//   draw(in:) を 1 回呼ぶ。draw サイクル外で currentDrawable を触らないので CAMetalLayerDrawable
-//   lifecycle 警告が出ない。
+// - drawable lifecycle: acquiring and presenting the drawable and the renderPassDescriptor happen
+//   only inside MTKView's proper draw cycle (draw(in:)). Manual drawing has presentManual() start
+//   view.draw(), which calls draw(in:) once. currentDrawable is never touched outside a draw cycle,
+//   so no CAMetalLayerDrawable lifecycle warning appears.
 //
-// - inflight ownership: CPU pixels + texture を slotCount(=3) の ring で持ち、DispatchSemaphore
-//   (value=slotCount-1=2) で最大 inflight を 2 に制限する。present のたびに wait()、command buffer
-//   の completion handler で signal()。present された slot は GPU 完了まで backend 所有。
+// - inflight ownership: the CPU pixels and the texture are held in a ring of slotCount(=3), and a
+//   DispatchSemaphore (value=slotCount-1=2) caps the inflight count at 2. Every present wait()s, and
+//   the command buffer's completion handler signal()s. A presented slot belongs to the backend until the GPU is done.
 //
-// - 再利用安全の不変条件（per-slot フラグ無しで成立。Apple 標準 triple-buffer idiom）:
-//   API は「lockFramebuffer → caller が書込 → present(submit)」の順。slot k(=f%slotCount) の前回
-//   使用は f-slotCount。slot のテクスチャは present 内で texture.replace される直前に semaphore.wait()
-//   を通る。semaphore=slotCount-1 と Metal 単一 command queue の in-order completion により、wait()
-//   通過時には f-(slotCount-1) 以前が完了済み = slot k(前回使用 f-slotCount)は free。CPU バッファ自体は
-//   texture.replace が同期コピーなので present 後すぐ再利用可能。
-//   semaphore 値が slotCount-1 を超えると前回使用フレーム完了を保証できず hazard になる。
+// - The invariant that makes reuse safe (it holds without a per-slot flag; the standard Apple triple-buffer idiom):
+//   the API order is "lockFramebuffer → the caller writes → present (submit)". Slot k(=f%slotCount) was
+//   last used at f-slotCount. A slot's texture passes semaphore.wait() immediately before texture.replace
+//   inside present. With semaphore=slotCount-1 and the in-order completion of Metal's single command
+//   queue, everything up to f-(slotCount-1) has finished by the time wait() returns, so slot k (last used
+//   at f-slotCount) is free. The CPU buffer itself is reusable right after a present, since texture.replace copies synchronously.
+//   A semaphore value above slotCount-1 could not guarantee the previous frame had finished, which would be a hazard.
 //
-// - fifo pacing: commandBuffer.present(drawable)（次 vsync 表示）+ CAMetalLayer.displaySyncEnabled
-//   + 上記 inflight cap。busy loop でも ~60fps（display refresh）に張り付く。
+// - fifo pacing: commandBuffer.present(drawable) (displayed at the next vsync) plus
+//   CAMetalLayer.displaySyncEnabled plus the inflight cap above. Even a busy loop sticks at ~60fps (display refresh).
 //
-// - lockFramebuffer() は non-null 互換を維持する（frame slot は ring + semaphore で常に確保できる）。
-//   null による frame availability gating / beginFrame・waitFrame / fatal 状態分離は本タスク対象外で、
-//   ADR-005 の follow-up 方針（TASK-38）に委ねる。
+// - lockFramebuffer() keeps returning non-null (a frame slot is always available, through the ring plus the semaphore).
+//   Gating frame availability through null, beginFrame/waitFrame, and separating out a fatal state are
+//   not part of this backend and are left to the follow-up direction of ADR-005.
 let IMPLEMENTATION_TYPE = "Metal Optimized (Swift)"
 
-// Metal Shading Language シェーダーコード（文字列インライン）
+// The Metal Shading Language shader source (inline, as a string)
 let SHADER_CODE = """
 #include <metal_stdlib>
 using namespace metal;
@@ -56,7 +56,7 @@ struct VertexOut {
 };
 
 vertex VertexOut vertexShader(uint vertexId [[vertex_id]]) {
-    // 全画面クワッドを生成（-1, -1から1, 1）
+    // Build a full-screen quad (from -1, -1 to 1, 1)
     float4 positions[4] = {
         float4(-1.0, -1.0, 0.0, 1.0),
         float4(1.0, -1.0, 0.0, 1.0),
@@ -83,13 +83,13 @@ fragment float4 fragmentShader(VertexOut in [[stage_in]],
                                      address::clamp_to_edge,
                                      filter::nearest);
 
-    // テクスチャをサンプリングして表示
+    // Sample the texture and display it
     float4 color = framebufferTexture.sample(textureSampler, in.texCoord);
     return color;
 }
 """
 
-// Metal用レンダラー
+// The renderer for Metal
 class MetalRenderer: NSObject, MTKViewDelegate {
     private var device: MTLDevice
     private var commandQueue: MTLCommandQueue?
@@ -100,33 +100,33 @@ class MetalRenderer: NSObject, MTKViewDelegate {
     private var callback: FrameCallback?
     private var userdata: UnsafeMutableRawPointer?
 
-    // drawableSizeWillChange → view 側の pending 記録のみ（resource 再確保は次 lock）。
+    // drawableSizeWillChange only records a pending value on the view side (resources are reallocated on the next lock).
     weak var metricsOwner: MetalFramebufferView?
 
     // ========================================
-    // Triple-slot frame ring（ADR-005 1級 frame pacing / inflight ownership）
+    // The triple-slot frame ring (the first-class frame pacing and inflight ownership of ADR-005)
     // ========================================
-    // 各 slot = CPU pixels バッファ + Metal texture。caller は currentSlotIndex の slot へ書き、
-    // present が submit して index を (idx+1)%slotCount へ前進させる。
-    // inflight ownership と再利用安全条件はファイル冒頭コメント参照。
+    // Each slot is a CPU pixel buffer plus a Metal texture. The caller writes into the slot at
+    // currentSlotIndex, and present submits it and advances the index to (idx+1)%slotCount.
+    // Inflight ownership and the conditions for safe reuse are in the comment at the top of this file.
     private let slotCount = 3
     private var slotBuffers: [UnsafeMutablePointer<UInt32>] = []
     private var slotTextures: [MTLTexture?] = []
     private var currentSlotIndex = 0
-    private var lastSubmittedSlot = -1  // TASK-104: click-through hitTest が読む直近表示済み slot（-1=未 submit）
+    private var lastSubmittedSlot = -1  // the most recently displayed slot, read by the click-through hitTest (-1 = nothing submitted yet)
 
-    // inflight 上限 = slotCount - 1（= 2）。display sync(fifo) の pacing を司る。
-    // present のたびに wait()、command buffer の completion handler で signal()。
+    // The inflight cap = slotCount - 1 (= 2). It governs the pacing of display sync (fifo).
+    // Every present wait()s, and the command buffer's completion handler signal()s.
     private let inflightSemaphore = DispatchSemaphore(value: 2)
 
-    // manual present（present() → view.draw() 起点）であることを draw(in:) に伝えるフラグ。
+    // The flag telling draw(in:) that this is a manual present (starting from present() → view.draw()).
     private var manualPresentPending = false
 
-    // パフォーマンス測定
+    // performance measurement
     private var lastFrameTime: CFAbsoluteTime
     private var frameCount: Int
     private var totalFrameTime: Double
-    // FPS ログは VP_METAL_FPS_LOG=1 のときのみ（既定=無出力。TASK-158）
+    // The FPS log is printed only with VP_METAL_FPS_LOG=1 (silent by default)
     private let fpsLogEnabled: Bool
 
     init(device: MTLDevice, width: Int, height: Int, callback: FrameCallback?, userdata: UnsafeMutableRawPointer?) {
@@ -136,16 +136,16 @@ class MetalRenderer: NSObject, MTKViewDelegate {
         self.callback = callback
         self.userdata = userdata
 
-        // パフォーマンス測定の初期化
+        // Initialise the performance measurement
         self.lastFrameTime = CFAbsoluteTimeGetCurrent()
         self.frameCount = 0
         self.totalFrameTime = 0.0
-        // env は初期化時に1回だけ読む（フレーム毎の getenv を避ける）
+        // The env var is read once at initialisation (avoiding a getenv per frame)
         self.fpsLogEnabled = ProcessInfo.processInfo.environment["VP_METAL_FPS_LOG"] == "1"
 
         super.init()
 
-        // slotCount 個の CPU バッファを確保（ゼロ初期化）
+        // Allocate slotCount CPU buffers (zero-filled)
         let bufferSize = width * height
         for _ in 0..<slotCount {
             let buf = UnsafeMutablePointer<UInt32>.allocate(capacity: bufferSize)
@@ -153,12 +153,12 @@ class MetalRenderer: NSObject, MTKViewDelegate {
             slotBuffers.append(buf)
         }
 
-        // メタルコマンドキューを作成
+        // Create the Metal command queue
         self.commandQueue = device.makeCommandQueue()
 
-        // slotCount 個のテクスチャを作成（各 slot に 1 枚。inflight 中の再利用を避ける）
+        // Create slotCount textures (one per slot, so none is reused while inflight)
         let descriptor = MTLTextureDescriptor()
-        descriptor.pixelFormat = .bgra8Unorm // canonical BGRA: メモリ [B,G,R,A] = u32 0xAARRGGBB（drawable と同形式）
+        descriptor.pixelFormat = .bgra8Unorm // canonical BGRA: memory [B,G,R,A] = u32 0xAARRGGBB (the same format as the drawable)
         descriptor.width = width
         descriptor.height = height
         descriptor.usage = [.shaderRead, .renderTarget]
@@ -167,7 +167,7 @@ class MetalRenderer: NSObject, MTKViewDelegate {
             slotTextures.append(device.makeTexture(descriptor: descriptor))
         }
 
-        // パイプラインステートを作成
+        // Create the pipeline state
         setupRenderPipeline()
 
         NSLog("[\(IMPLEMENTATION_TYPE)] Metal device: \(device.name), Framebuffer initialized: \(width)x\(height)")
@@ -191,39 +191,39 @@ class MetalRenderer: NSObject, MTKViewDelegate {
         }
     }
 
-    // TASK-156.5: pending 新寸法/scale の記録のみ。CPU buffer/texture 再確保は次 lock。
+    // Only the new pending size and scale are recorded. The CPU buffer and the texture are reallocated on the next lock.
     func mtkView(_ view: MTKView, drawableSizeWillChange size: CGSize) {
         metricsOwner?.notePendingDrawableChange(size: size)
     }
 
-    // MTKView の正規 draw サイクル。drawable / renderPassDescriptor の取得・present は
-    // 必ずこの中だけで行う（draw サイクル外で currentDrawable を触ると CAMetalLayerDrawable
-    // lifecycle 警告が出るため）。manual present（view.draw() 起点）と callback/display-link
-    // 起点の双方から同じ submitFrame() helper へ流す。
+    // MTKView's proper draw cycle. Acquiring and presenting the drawable and the renderPassDescriptor
+    // must happen only in here (touching currentDrawable outside a draw cycle produces a
+    // CAMetalLayerDrawable lifecycle warning). Both a manual present (started by view.draw()) and the
+    // callback / display-link path flow into the same submitFrame() helper.
     func draw(in view: MTKView) {
         let isManual = manualPresentPending
         manualPresentPending = false
 
         if isManual {
-            // manual mode: caller が lockFramebuffer() で得た現在 slot を既に書き込み済み。
+            // manual mode: the caller has already written into the current slot obtained from lockFramebuffer().
             if submitFrame(view: view, slotIndex: currentSlotIndex) {
                 currentSlotIndex = (currentSlotIndex + 1) % slotCount
             }
         } else if let callback = callback {
-            // callback/display-link 経路（Zig facade は callback=nil なので未使用。objc/swift 対称性のため維持）。
+            // The callback / display-link path (unused by the Zig facade, whose callback is nil; kept for symmetry with objc and swift).
             callback(slotBuffers[currentSlotIndex], Int32(width), Int32(height), userdata)
             if submitFrame(view: view, slotIndex: currentSlotIndex) {
                 currentSlotIndex = (currentSlotIndex + 1) % slotCount
             }
-            // TASK-104: callback 経路でも click-through を更新（objc/swift 対称。無効時は即 return）
+            // Update click-through on the callback path too (symmetrical with objc and swift; returns immediately while disabled)
             (view as? MetalFramebufferView)?.refreshClickThrough()
         }
-        // 上記いずれでもない（callback=nil かつ manual でない起動）は何もしない。
-        // manual mode は isPaused=true なので display-link 由来の空 draw は来ない。
+        // Neither of the above (callback=nil and not manual) does nothing.
+        // In manual mode isPaused=true, so no empty draw arrives from the display link.
     }
 
-    // 指定 slot を GPU へ submit する共通経路。manual / callback 双方から呼ぶ。
-    // 戻り値: 実際に submit したら true（呼び出し側が slot index を前進させる）。
+    // The shared path that submits the given slot to the GPU. Called from both manual and callback.
+    // Returns: true once it really submitted (then the caller advances the slot index).
     @discardableResult
     private func submitFrame(view: MTKView, slotIndex: Int) -> Bool {
         guard let pipelineState = self.pipelineState,
@@ -232,12 +232,12 @@ class MetalRenderer: NSObject, MTKViewDelegate {
             return false
         }
 
-        // ① inflight 枠を確保。最大 inflight = slotCount-1 に制限し、display sync(fifo) の
-        //    pacing を成立させる（busy loop でも unbounded submit にならない）。
+        // 1. Take an inflight slot. Capping the inflight count at slotCount-1 is what makes the pacing of
+        //    display sync (fifo) work (even a busy loop cannot submit without bound).
         inflightSemaphore.wait()
 
-        // ② drawable / renderPassDescriptor は MTKView の draw サイクル内でのみ有効。
-        //    取れない場合は確保した inflight 枠を戻して skip する。
+        // 2. The drawable and the renderPassDescriptor are valid only inside MTKView's draw cycle.
+        //    When they cannot be obtained, the inflight slot taken above is returned and this is skipped.
         guard let drawable = view.currentDrawable,
               let renderPassDescriptor = view.currentRenderPassDescriptor,
               let commandBuffer = commandQueue.makeCommandBuffer(),
@@ -246,22 +246,22 @@ class MetalRenderer: NSObject, MTKViewDelegate {
             return false
         }
 
-        // ③ CPU pixels → texture へ転送（managed storage への同期コピー）。
-        //    この slot のテクスチャは前回使用(slotCount フレーム前)が完了済みなので再利用安全
-        //    （不変条件はファイル冒頭コメント参照）。
+        // 3. Transfer the CPU pixels into the texture (a synchronous copy into managed storage).
+        //    This slot's texture is safe to reuse, because its previous use (slotCount frames ago) has finished
+        //    (the invariant is in the comment at the top of this file).
         let region = MTLRegionMake2D(0, 0, width, height)
         let bytesPerRow = width * MemoryLayout<UInt32>.size
         texture.replace(region: region, mipmapLevel: 0, withBytes: slotBuffers[slotIndex], bytesPerRow: bytesPerRow)
-        lastSubmittedSlot = slotIndex // TASK-104: click-through hitTest 用（直近表示中の CPU buffer）
+        lastSubmittedSlot = slotIndex // for the click-through hitTest (the CPU buffer currently displayed)
 
         renderEncoder.setRenderPipelineState(pipelineState)
         renderEncoder.setFragmentTexture(texture, index: 0)
         renderEncoder.drawPrimitives(type: .triangleStrip, vertexStart: 0, vertexCount: 4)
         renderEncoder.endEncoding()
 
-        // ④ present(drawable): 次の display refresh で表示（fifo）。
+        // 4. present(drawable): displayed at the next display refresh (fifo).
         commandBuffer.present(drawable)
-        // ⑤ 完了時に inflight 枠を解放。self / slot を捕捉せず semaphore のみ（retain cycle 回避）。
+        // 5. Release the inflight slot on completion. Only the semaphore is captured, not self or the slot (avoiding a retain cycle).
         commandBuffer.addCompletedHandler { [inflightSemaphore] _ in
             inflightSemaphore.signal()
         }
@@ -271,8 +271,8 @@ class MetalRenderer: NSObject, MTKViewDelegate {
         return true
     }
 
-    // 60 フレームごとに FPS をログ出力（fifo pacing の検証用に ~60fps 張り付きを観測できる）。
-    // 出力は fpsLogEnabled（VP_METAL_FPS_LOG=1）のときのみ。計測ロジック自体は常時走らせる。
+    // Log the FPS every 60 frames (so that sticking at ~60fps can be observed when checking fifo pacing).
+    // It prints only while fpsLogEnabled (VP_METAL_FPS_LOG=1); the measurement itself always runs.
     private func updatePerfStats() {
         frameCount += 1
         let now = CFAbsoluteTimeGetCurrent()
@@ -297,7 +297,7 @@ class MetalRenderer: NSObject, MTKViewDelegate {
         }
     }
 
-    // 手動描画用のヘルパーメソッド
+    // The helper methods for manual drawing
     func getWidth() -> Int {
         return width
     }
@@ -310,37 +310,37 @@ class MetalRenderer: NSObject, MTKViewDelegate {
         return slotBuffers[currentSlotIndex]
     }
 
-    // TASK-104: click-through 用に直近表示中フレームの alpha を読む（best-effort）。
-    // 未 submit（-1）は不透明扱い（255）で抜けさせない。範囲外は 0（抜けさせる）。
+    // Read the alpha of the most recently displayed frame, for click-through (best-effort).
+    // Nothing submitted yet (-1) counts as opaque (255) and does not fall through. Out of range gives 0 (it does).
     func sampleAlpha(x: Int, y: Int) -> UInt8 {
         if x < 0 || y < 0 || x >= width || y >= height { return 0 }
-        if lastSubmittedSlot < 0 { return 255 } // 初回 present 前は不透明扱い（ゼロ buffer を読まない）
+        if lastSubmittedSlot < 0 { return 255 } // Before the first present it counts as opaque (the zeroed buffer is never read)
         let pixel = slotBuffers[lastSubmittedSlot][y * width + x]
         return UInt8((pixel >> 24) & 0xFF)
     }
 
-    // 手動描画の present。drawable を直接触らず、MTKView の draw サイクルを起動するだけ。
-    // 実際の upload / encode / present は draw(in:) → submitFrame() 内で行う。
+    // The manual present. It does not touch the drawable but merely starts MTKView's draw cycle.
+    // The actual upload, encode and present happen inside draw(in:) → submitFrame().
     func presentManual(view: MTKView) {
         manualPresentPending = true
         view.draw()
     }
 
-    // TASK-23 / TASK-156.5: 新サイズへ slot buffers/textures を two-phase で再確保する。
-    // 単位は framebuffer pixels（.physical では物理寸法。.logical では logical=fb）。
-    // setFrameSize（.logical）/ applyLatchedMetricsIfNeeded（.physical）から呼ばれ、
-    // present(submitFrame) とは同一メインスレッドで直列なので非並行。
-    // - 旧 CPU buffer: submitFrame で texture.replace により同期コピー済み → GPU は非同期参照しない → 解放安全。
-    // - 旧 texture: inflight command buffer が ARC で完了まで保持 → 配列から外しても安全。
-    // 戻り値: サイズが実際に変わって再確保した場合 true（TASK-23.1 redraw 発火判定用）。
+    // Reallocate the slot buffers and textures for a new size, in two phases.
+    // The unit is framebuffer pixels (physical under .physical; logical == fb under .logical).
+    // It is called from setFrameSize (.logical) and applyLatchedMetricsIfNeeded (.physical), and runs
+    // serially on the same main thread as present (submitFrame), so there is no concurrency.
+    // - The old CPU buffer: submitFrame already copied it synchronously through texture.replace, so the GPU holds no asynchronous reference and freeing it is safe.
+    // - The old texture: an inflight command buffer retains it through ARC until completion, so removing it from the array is safe.
+    // Returns: true when the size really changed and everything was reallocated (which decides whether the redraw fires).
     @discardableResult
     func resize(width w0: Int, height h0: Int) -> Bool {
         let w = max(1, w0)
         let h = max(1, h0)
-        if w == width && h == height { return false } // 変化なし
+        if w == width && h == height { return false } // unchanged
         let newSize = w * h
 
-        // phase 1: 新リソースを確保
+        // phase 1: allocate the new resources
         var newBuffers: [UnsafeMutablePointer<UInt32>] = []
         for _ in 0..<slotCount {
             let buf = UnsafeMutablePointer<UInt32>.allocate(capacity: newSize)
@@ -357,7 +357,7 @@ class MetalRenderer: NSObject, MTKViewDelegate {
         for _ in 0..<slotCount {
             newTextures.append(device.makeTexture(descriptor: descriptor))
         }
-        // texture 確保失敗時は新 CPU buffer を解放して旧状態を維持する（two-phase: 全部揃った時だけ swap）
+        // When allocating a texture fails, the new CPU buffer is freed and the old state kept (two-phase: swap only once everything is in place)
         if newTextures.contains(where: { $0 == nil }) {
             for buf in newBuffers {
                 buf.deinitialize(count: newSize)
@@ -366,7 +366,7 @@ class MetalRenderer: NSObject, MTKViewDelegate {
             return false
         }
 
-        // phase 2: 旧 CPU buffer を解放して swap（texture は ARC に任せる）
+        // phase 2: free the old CPU buffers and swap (the textures are left to ARC)
         let oldSize = width * height
         for buf in slotBuffers {
             buf.deinitialize(count: oldSize)
@@ -377,16 +377,16 @@ class MetalRenderer: NSObject, MTKViewDelegate {
         width = w
         height = h
         currentSlotIndex = 0
-        lastSubmittedSlot = -1 // TASK-104: 新規ゼロ buffer を「表示済み」と誤読しないよう次 submit まで不透明扱い
+        lastSubmittedSlot = -1 // A freshly zeroed buffer must not be misread as "displayed", so it counts as opaque until the next submit
         return true
     }
 }
 
-// カスタムMTKView + NSTextInputClient（TASK-79.6.1 IME）
+// A custom MTKView plus NSTextInputClient (the IME)
 class MetalFramebufferView: MTKView, NSTextInputClient, PlatformBackendView {
     private var metalRenderer: MetalRenderer?
 
-    // TASK-156.5: logical / framebuffer 分離 + scale latch（objc Framebuffer と同型）
+    // logical and framebuffer sizes kept apart, plus the scale latch (the same shape as objc's Framebuffer)
     private var logicalWidth: Int = 1
     private var logicalHeight: Int = 1
     private var physicalMode: Bool = false
@@ -397,39 +397,39 @@ class MetalFramebufferView: MTKView, NSTextInputClient, PlatformBackendView {
     private var pendingLogicalWidth: Int = 1
     private var pendingLogicalHeight: Int = 1
 
-    // マウスイベント用 (TASK-21.1)。back-ref 設定時に imeState へも伝播する。
+    // For mouse events. Setting the back-reference propagates it to imeState as well.
     weak var platformWindow: PlatformWindowHandle? {
         didSet { imeState.platformWindow = platformWindow }
     }
     private var customTrackingArea: NSTrackingArea?
 
-    // IME 状態は共有 PlatformIMEState に集約（TASK-140）。NSTextInputClient / カスタム IME メソッドを転送する。
+    // The IME state is gathered into the shared PlatformIMEState; NSTextInputClient and the custom IME methods forward to it.
     let imeState = PlatformIMEState()
 
-    // カーソル制御用 (TASK-75.1)
-    private var currentCursorShape: PlatformCursorShape = PLATFORM_CURSOR_DEFAULT  // 直近に要求された形状
-    private var cursorHiddenByThisView: Bool = false  // このviewが [NSCursor hide] を所有中か（グローバル参照カウントAPIの多重呼び出し防止）
-    private var mouseInsideView: Bool = false         // マウスが現在 view 内にあるか（view外では set/hide を保留する）
+    // for cursor control
+    private var currentCursorShape: PlatformCursorShape = PLATFORM_CURSOR_DEFAULT  // the most recently requested shape
+    private var cursorHiddenByThisView: Bool = false  // whether this view owns the [NSCursor hide] (the API is a global reference count, so it must not be called twice)
+    private var mouseInsideView: Bool = false         // whether the mouse is inside the view right now (set and hide are held back while it is outside)
 
-    // ライブリサイズ再描画 (TASK-23.1)。CADisplayLink 用 FrameCallback とは別 field。
+    // Live-resize redraw. A separate field from the FrameCallback used by CADisplayLink.
     private var redrawCallback: PlatformRedrawCallback?
     private var redrawUserdata: UnsafeMutableRawPointer?
 
-    // 透過ウィンドウ / クリック透過 / 対話的ドラッグ (TASK-104)
+    // Transparent windows, click-through and interactive dragging
     private var transparentMode: Bool = false
     private var clickThrough: Bool = false
-    private var clickThroughState: Bool = false // 直近設定した ignoresMouseEvents 値（変化時のみ再設定）
+    private var clickThroughState: Bool = false // the ignoresMouseEvents value set most recently (only reapplied when it changes)
     private var lastMouseDownEvent: NSEvent?
 
     override init(frame: CGRect, device: MTLDevice?) {
         let metalDevice = device ?? MTLCreateSystemDefaultDevice()
         super.init(frame: frame, device: metalDevice)
 
-        // IME 状態に host view を渡す（fb サイズは setupRenderer で更新。TASK-140）
+        // Hand the host view to the IME state (the framebuffer size is updated in setupRenderer)
         imeState.hostView = self
 
-        // デリゲートは後で設定
-        // TASK-135: OS ファイル drag & drop（file URL のみ。objc backend 先行の横展開）
+        // The delegate is set later
+        // OS file drag and drop (file URLs only, following the objc backend)
         self.registerForDraggedTypes([.fileURL])
     }
 
@@ -437,7 +437,7 @@ class MetalFramebufferView: MTKView, NSTextInputClient, PlatformBackendView {
         fatalError("init(coder:) has not been implemented")
     }
 
-    // MARK: - PlatformBackendView (TASK-140)
+    // MARK: - PlatformBackendView
 
     var nativeView: NSView { return self }
     var implementationType: String { return IMPLEMENTATION_TYPE }
@@ -445,29 +445,29 @@ class MetalFramebufferView: MTKView, NSTextInputClient, PlatformBackendView {
     var height: Int { return metalRenderer?.getHeight() ?? 0 }
     var initialFramebuffer: UnsafeMutablePointer<UInt32>? { return metalRenderer?.getCurrentBuffer() }
 
-    // present: 既存 presentManual(view:) + refreshClickThrough を行い、次の書込バッファを返す。
-    // size 引数は互換のため受けるが renderer の内部サイズを使う（引数は無視）。
+    // present: does the existing presentManual(view:) plus refreshClickThrough, and returns the next buffer to write into.
+    // The size argument is taken for compatibility but ignored; the renderer's internal size is used.
     func present(framebuffer: UnsafeMutablePointer<UInt32>, width: Int, height: Int) -> UnsafeMutablePointer<UInt32>? {
         guard let renderer = metalRenderer else { return nil }
-        // 手動で描画
+        // Draw manually
         renderer.presentManual(view: self)
-        // TASK-104: クリック透過のカーソル位置判定を更新（clickThrough 無効時は即 return）
+        // Update the cursor-position test for click-through (returns immediately while clickThrough is off)
         refreshClickThrough()
-        // present 後の現在 slot（submit で前進済み）の CPU バッファを返す
+        // Return the CPU buffer of the current slot after the present (submit has already advanced it)
         return renderer.getCurrentBuffer()
     }
 
     func prepareForDestroy() {
-        // delegate を解除 (callback から view への参照を断つ)
+        // Detach the delegate (cutting the callback's reference to the view)
         self.delegate = nil
     }
 
     func startPresentation() {
-        // Metal は isPaused / display-link 設定をファクトリで済ませているため no-op。
-        // 手動 present 経路は present() が view.draw() で 1 フレームずつ駆動する。
+        // A no-op for Metal, since isPaused and the display-link settings are made in the factory.
+        // On the manual present path, present() drives one frame at a time through view.draw().
     }
 
-    // MARK: - NSTextInputClient 転送（共有 PlatformIMEState へ委譲。TASK-140）
+    // MARK: - NSTextInputClient forwarding (delegated to the shared PlatformIMEState)
 
     func copyCompositionSnapshot(buf: UnsafeMutablePointer<CChar>?, cap: UInt32, meta: UnsafeMutablePointer<PlatformCompositionMeta>?) -> UInt32 {
         return imeState.copyCompositionSnapshot(buf: buf, cap: cap, meta: meta)
@@ -508,9 +508,9 @@ class MetalFramebufferView: MTKView, NSTextInputClient, PlatformBackendView {
 
     override var acceptsFirstResponder: Bool { true }
 
-    // MARK: - NSDraggingDestination / file drop (TASK-135。ホットパス: イベント時のみ)
-    // objc backend（platform/macos/platform_macos.m）と同一契約。struct 充填・長さ/NUL 検証は
-    // platform.h の共有ヘルパー platform_fill_file_drop_event（共有ヘルパー enqueueFileDropIfValid 経由）。
+    // MARK: - NSDraggingDestination / file drop (hot path: event time only)
+    // The same contract as the objc backend (platform/macos/platform_macos.m). Filling the struct and
+    // validating the length and NULs are platform.h's shared helper platform_fill_file_drop_event (reached through the shared enqueueFileDropIfValid).
 
     override func draggingEntered(_ sender: any NSDraggingInfo) -> NSDragOperation {
         let pb = sender.draggingPasteboard
@@ -524,14 +524,14 @@ class MetalFramebufferView: MTKView, NSTextInputClient, PlatformBackendView {
     override func performDragOperation(_ sender: any NSDraggingInfo) -> Bool {
         guard let handle = platformWindow else { return false }
         let pb = sender.draggingPasteboard
-        // MVP は単一ファイルのみ。複数同時 drop はイベント全体を reject。
+        // A single file only. A simultaneous multi-file drop rejects the whole event.
         guard let urls = pb.readObjects(forClasses: [NSURL.self], options: [.urlReadingFileURLsOnly: true]) as? [URL],
               urls.count == 1 else { return false }
         return enqueueFileDropIfValid(handle: handle, url: urls[0])
     }
 
     deinit {
-        // カーソルを hide したまま破棄されると OS カーソルが消えたままになる (TASK-75.1 codex レビュー指摘)。
+        // Being destroyed while the cursor is hidden would leave the OS cursor gone for good.
         if cursorHiddenByThisView {
             NSCursor.unhide()
             cursorHiddenByThisView = false
@@ -546,7 +546,7 @@ class MetalFramebufferView: MTKView, NSTextInputClient, PlatformBackendView {
         pendingLogicalHeight = logicalHeight
         hasPendingResize = false
         scaleEpoch = 0
-        // 初期 scale: window 未接続なので mainScreen。未取得・非対応は 1.0。
+        // The initial scale: no window is attached yet, so mainScreen is used. Unavailable or unsupported gives 1.0.
         var scale: CGFloat = 1.0
         if let screen = NSScreen.main {
             let s = screen.backingScaleFactor
@@ -566,17 +566,17 @@ class MetalFramebufferView: MTKView, NSTextInputClient, PlatformBackendView {
         renderer.metricsOwner = self
         metalRenderer = renderer
         self.delegate = renderer
-        // IME firstRect の pixel→bounds 換算に使う fb サイズを反映（TASK-140）
+        // Apply the framebuffer size used to convert the IME firstRect from pixels into bounds
         imeState.updateFramebufferSize(width: fw, height: fh)
         NSLog("[\(IMPLEMENTATION_TYPE)] Framebuffer metrics: logical=\(logicalWidth)x\(logicalHeight) fb=\(fw)x\(fh) scale=\(String(format: "%.2f", Double(scale))) physical=\(physical ? 1 : 0)")
     }
 
-    // TASK-156.5: mtkView drawableSizeWillChange からの pending 記録（resource は触らない）。
+    // The pending record coming from mtkView drawableSizeWillChange (no resource is touched).
     func notePendingDrawableChange(size: CGSize) {
         _ = size
         refreshPendingContentScale()
-        // 寸法の pending は setFrameSize（logical points）が一次情報源。
-        // ここでは scale の取りこぼし対策のみ（applyLatched が次 lock で再確認する）。
+        // For the size, setFrameSize (in logical points) is the primary source.
+        // Here only a missed scale change is caught (applyLatched re-checks on the next lock).
     }
 
     func refreshPendingContentScale() {
@@ -617,7 +617,7 @@ class MetalFramebufferView: MTKView, NSTextInputClient, PlatformBackendView {
 
         if sizeChanging {
             if !renderer.resize(width: fw, height: fh) {
-                // OOM / texture 失敗: 旧状態維持。pending は残して次 lock で再試行。
+                // OOM or a failed texture: the old state is kept. The pending value stays for the next lock to retry.
                 return
             }
             platformWindow?.currentFramebuffer = renderer.getCurrentBuffer()
@@ -663,7 +663,7 @@ class MetalFramebufferView: MTKView, NSTextInputClient, PlatformBackendView {
         }
     }
 
-    // NSView がリサイズ時に呼ぶ。.physical は pending のみ、.logical は即 resize（objc と同型）。
+    // Called by NSView on a resize. .physical only records the pending value, .logical resizes at once (the same shape as objc).
     override func setFrameSize(_ newSize: NSSize) {
         super.setFrameSize(newSize)
         if physicalMode {
@@ -693,14 +693,14 @@ class MetalFramebufferView: MTKView, NSTextInputClient, PlatformBackendView {
         }
     }
 
-    // ライブリサイズ再描画コールバック登録 (TASK-23.1)。cb==nil で解除。
+    // Register the live-resize redraw callback. cb==nil unregisters.
     func setRedrawCallback(_ cb: PlatformRedrawCallback?, userdata: UnsafeMutableRawPointer?) {
         redrawCallback = cb
         redrawUserdata = userdata
     }
 
     // ========================================
-    // マウスイベント関連 (TASK-21.1)
+    // Mouse events
     // ========================================
 
     override func acceptsFirstMouse(for event: NSEvent?) -> Bool {
@@ -713,10 +713,10 @@ class MetalFramebufferView: MTKView, NSTextInputClient, PlatformBackendView {
             self.removeTrackingArea(ta)
             customTrackingArea = nil
         }
-        // .cursorUpdate: マウス再入時に cursorUpdate(with:) を呼んでもらい、OS がウィンドウ切替等で
-        // カーソルをリセットしても復帰できるようにする (TASK-75.1)。
-        // .mouseEnteredAndExited: view 内外を追跡し、hidden の所有権解除（exited）と形状の適用（entered）を
-        // 行う（codex レビュー: hide/unhide は view 内にいる時のみ行う）。
+        // .cursorUpdate: have cursorUpdate(with:) called when the mouse re-enters, so the cursor recovers
+        // even after the OS resets it on a window switch.
+        // .mouseEnteredAndExited: track entering and leaving the view, releasing ownership of hidden (exited)
+        // and applying the shape (entered). Hiding and unhiding happen only while inside the view.
         let opts: NSTrackingArea.Options = [.mouseMoved, .cursorUpdate, .mouseEnteredAndExited, .activeInKeyWindow, .inVisibleRect]
         let ta = NSTrackingArea(rect: .zero, options: opts, owner: self, userInfo: nil)
         self.addTrackingArea(ta)
@@ -724,24 +724,24 @@ class MetalFramebufferView: MTKView, NSTextInputClient, PlatformBackendView {
     }
 
     // ========================================
-    // カーソル制御 (TASK-75.1)
+    // Cursor control
     // ========================================
     //
-    // 方針: NSCursor.hide/unhide はプロセス全体の参照カウント API のため、view が「今 hide を
-    // 所有しているか」を cursorHiddenByThisView で厳密に管理する（hide は false→true 遷移時のみ、
-    // unhide は true→false 遷移時のみ呼ぶ）。加えて set/hide の実適用は mouseInsideView が true の
-    // 間だけ行い、view 外にいる間に来た setCursor はまだ反映せず形状のみ保存する。
+    // The policy: NSCursor.hide/unhide is a process-wide reference-counted API, so cursorHiddenByThisView
+    // tracks strictly whether this view currently owns the hide (hide only on a false→true transition,
+    // unhide only on true→false). On top of that, set and hide are really applied only while
+    // mouseInsideView is true; a setCursor arriving while the mouse is outside merely stores the shape.
 
-    // currentCursorShape に対応する NSCursor を返す（PLATFORM_CURSOR_HIDDEN はここでは扱わない）。
-    // 未対応形状は arrow にフォールバックする。
+    // Return the NSCursor matching currentCursorShape (PLATFORM_CURSOR_HIDDEN is not handled here).
+    // An unsupported shape falls back to the arrow.
     private func nsCursor(for shape: PlatformCursorShape) -> NSCursor {
         switch shape {
         case PLATFORM_CURSOR_CROSSHAIR: return .crosshair
-        default: return .arrow // PLATFORM_CURSOR_DEFAULT および未対応形状のフォールバック
+        default: return .arrow // PLATFORM_CURSOR_DEFAULT, and the fallback for an unsupported shape
         }
     }
 
-    // mouseInsideView 前提で currentCursorShape を実際に適用する（hide 所有権の遷移も含む）。
+    // Really apply currentCursorShape, assuming mouseInsideView (including the transfer of hide ownership).
     private func applyCursorShapeIfInside() {
         guard mouseInsideView else { return }
         if currentCursorShape == PLATFORM_CURSOR_HIDDEN {
@@ -758,20 +758,20 @@ class MetalFramebufferView: MTKView, NSTextInputClient, PlatformBackendView {
         }
     }
 
-    // platform_set_cursor から呼ばれる。形状を保存し、view 内にいれば即時反映する。
+    // Called from platform_set_cursor. Stores the shape and applies it at once while inside the view.
     func setCursorShape(_ shape: PlatformCursorShape) {
         currentCursorShape = shape
         applyCursorShapeIfInside()
     }
 
-    // マウスが view に再入した (TASK-75.1)。現在の形状を反映する。
+    // The mouse re-entered the view. Apply the current shape.
     override func mouseEntered(with event: NSEvent) {
         mouseInsideView = true
         applyCursorShapeIfInside()
     }
 
-    // マウスが view から出た (TASK-75.1)。hide を所有中なら必ず解放する
-    // （view 外で OS カーソルが消えたままになるのを防ぐ。codex レビュー指摘）。
+    // The mouse left the view. Whenever this view owns the hide, it must release it
+    // (otherwise the OS cursor stays gone while outside the view).
     override func mouseExited(with event: NSEvent) {
         mouseInsideView = false
         if cursorHiddenByThisView {
@@ -780,10 +780,10 @@ class MetalFramebufferView: MTKView, NSTextInputClient, PlatformBackendView {
         }
     }
 
-    // AppKit がトラッキングエリア再入時に呼ぶ。他アプリ切替等で OS がカーソルをリセットしても復帰する。
+    // Called by AppKit when the tracking area is re-entered. The cursor recovers even after the OS reset it on an application switch.
     override func cursorUpdate(with event: NSEvent) {
-        // cursorUpdate は tracking rect 内でのみ呼ばれる（.cursorUpdate）ので view 内扱いにする。
-        // mouseEntered 未発火・順序差・window 切替後の cursor reset 復帰でも形状を反映するため（codex レビュー指摘）。
+        // cursorUpdate is only called inside the tracking rect (.cursorUpdate), so this counts as being inside the view.
+        // That applies the shape even when mouseEntered did not fire, when the order differs, or when recovering from a cursor reset after a window switch.
         mouseInsideView = true
         applyCursorShapeIfInside()
     }
@@ -813,7 +813,7 @@ class MetalFramebufferView: MTKView, NSTextInputClient, PlatformBackendView {
             dx *= SCROLL_LINE_TO_POINTS
             dy *= SCROLL_LINE_TO_POINTS
         }
-        // raw physical unit（facade が latched scale で論理化）
+        // raw physical units (the facade turns them into logical ones with the latched scale)
         dx *= Float(scale)
         dy *= Float(scale)
         var ev = PlatformEvent()
@@ -829,33 +829,33 @@ class MetalFramebufferView: MTKView, NSTextInputClient, PlatformBackendView {
         handle.event_queue.push(ev)
     }
 
-    // TASK-104: 透過モード（isOpaque）/ クリック透過（per-pixel hitTest）/ beginDrag 用 event。
+    // Transparent mode (isOpaque), click-through (a per-pixel hitTest), and the event kept for beginDrag.
     override var isOpaque: Bool {
         return !transparentMode
     }
-    // TASK-104: クリック透過（per-pixel）。present 毎に現在のカーソル位置の alpha を見て
-    // `window.ignoresMouseEvents` をトグルする（NSView.hitTest では背後の別アプリへ抜けないため）。
-    // alpha は renderer が持つ直近表示 slot から読む。ホットパス宣言: present 毎だが 1 画素サンプルのみ。
+    // Per-pixel click-through. On every present the alpha under the current cursor position toggles
+    // `window.ignoresMouseEvents` (NSView.hitTest alone would not let it through to an application behind).
+    // The alpha is read from the renderer's most recently displayed slot. Hot path declaration: once per present, but only one pixel sample.
     func refreshClickThrough() {
         guard clickThrough, let win = window, let r = metalRenderer else { return }
         let screenPt = NSEvent.mouseLocation
         let winPt = win.convertPoint(fromScreen: screenPt)
-        let local = convert(winPt, from: nil) // window → view（非 flipped = 左下原点）
+        let local = convert(winPt, from: nil) // window → view (not flipped: the origin is bottom-left)
         let b = bounds
         let w = r.getWidth()
         let h = r.getHeight()
-        var passThrough = true // カーソルが window 外/未確定なら抜けさせる
+        var passThrough = true // let it fall through when the cursor is outside the window or unknown
         if b.width > 0 && b.height > 0 &&
            local.x >= 0 && local.x < b.width && local.y >= 0 && local.y < b.height {
             var px = Int(local.x / b.width * CGFloat(w))
-            var py = Int((1.0 - local.y / b.height) * CGFloat(h)) // top-left 原点へ
-            if px >= w { px = w - 1 } // 右端/下端の丸め込み clamp（下端1px落ち防止）
+            var py = Int((1.0 - local.y / b.height) * CGFloat(h)) // to a top-left origin
+            if px >= w { px = w - 1 } // clamp what rounding at the right and bottom edges would push out (it would drop the last row)
             if py >= h { py = h - 1 }
             if px < 0 { px = 0 }
             if py < 0 { py = 0 }
             passThrough = (r.sampleAlpha(x: px, y: py) == 0)
         }
-        if passThrough != clickThroughState { // 値が変わったときだけ WindowServer 状態を書く
+        if passThrough != clickThroughState { // only write the WindowServer state when the value has changed
             win.ignoresMouseEvents = passThrough
             clickThroughState = passThrough
         }
@@ -866,7 +866,7 @@ class MetalFramebufferView: MTKView, NSTextInputClient, PlatformBackendView {
     func setClickThrough(_ on: Bool) {
         clickThrough = on
         if !on {
-            window?.ignoresMouseEvents = false // 無効化時は受け取りへ戻す
+            window?.ignoresMouseEvents = false // go back to receiving events when it is turned off
             clickThroughState = false
         }
     }
@@ -877,11 +877,11 @@ class MetalFramebufferView: MTKView, NSTextInputClient, PlatformBackendView {
     }
 
     override func mouseDown(with event: NSEvent) {
-        lastMouseDownEvent = event // TASK-104: beginDrag 用に保持
+        lastMouseDownEvent = event // kept for beginDrag
         enqueueMouseEvent(type: PLATFORM_EVENT_MOUSE_DOWN, button: buttonFromEvent(event), from: event)
     }
     override func mouseUp(with event: NSEvent) {
-        lastMouseDownEvent = nil // TASK-104: up で stale 破棄
+        lastMouseDownEvent = nil // discard the stale event on up
         enqueueMouseEvent(type: PLATFORM_EVENT_MOUSE_UP, button: buttonFromEvent(event), from: event)
     }
     override func mouseDragged(with event: NSEvent) {
@@ -914,11 +914,11 @@ class MetalFramebufferView: MTKView, NSTextInputClient, PlatformBackendView {
 }
 
 // ========================================
-// backend ファクトリ (TASK-140)
+// The backend factory
 // ========================================
-// 共有 createWindowImpl から呼ばれ、Metal backend の view を生成する。Metal device 生成・
-// framebufferOnly/enableSetNeedsDisplay・透過 clearColor・isPaused・displaySyncEnabled・renderer
-// セットアップはここで行う（旧 createWindowImpl の metal 分岐相当。frame pacing 契約は不変）。
+// Called from the shared createWindowImpl, it creates the view of the Metal backend. Creating the
+// Metal device, framebufferOnly/enableSetNeedsDisplay, the transparent clearColor, isPaused,
+// displaySyncEnabled and the renderer setup all happen here (the frame pacing contract is unchanged).
 func makePlatformBackendView(
     frame: NSRect,
     width: Int,
@@ -928,7 +928,7 @@ func makePlatformBackendView(
     transparent: Bool,
     physical: Bool
 ) -> (any PlatformBackendView)? {
-    // Metal用ビューを作成
+    // Create the view for Metal
     guard let metalDevice = MTLCreateSystemDefaultDevice() else {
         NSLog("[\(IMPLEMENTATION_TYPE)] Failed to create Metal device")
         return nil
@@ -937,21 +937,21 @@ func makePlatformBackendView(
     let metalView = MetalFramebufferView(frame: frame, device: metalDevice)
     metalView.framebufferOnly = false
     metalView.enableSetNeedsDisplay = false
-    // TASK-104: Metal の透過（drawable の alpha を保持し CAMetalLayer で背後合成）
+    // Metal transparency (the drawable's alpha is kept and CAMetalLayer composites what is behind)
     if transparent {
-        metalView.setTransparentMode(true) // isOpaque override が false を返す
+        metalView.setTransparentMode(true) // the isOpaque override returns false
         metalView.layer?.isOpaque = false
-        metalView.clearColor = MTLClearColorMake(0, 0, 0, 0) // 透明クリア
+        metalView.clearColor = MTLClearColorMake(0, 0, 0, 0) // a transparent clear
     }
-    // 手動描画経路（callback=nil。Zig facade の lockFramebuffer→present 経路）では display-link を止め、
-    // present() が view.draw() で 1 フレームずつ駆動する。callback 経路（objc/swift 対称・未使用）は
-    // 従来どおり display-link 駆動のため isPaused=false にする。
+    // On the manual drawing path (callback=nil, the Zig facade's lockFramebuffer→present path) the
+    // display link is stopped and present() drives one frame at a time through view.draw(). The callback
+    // path (symmetrical with objc and swift, and unused) keeps isPaused=false and is display-link driven.
     metalView.isPaused = (callback == nil)
-    // fifo（display refresh 同期）の意図をコード上で明示する。macOS では CAMetalLayer の既定が true
-    // なので必須の挙動変更ではないが、ADR-005 の 1級 backend 契約を明文化する。
+    // This states the intent of fifo (synchronised to display refresh) in the code. On macOS CAMetalLayer
+    // defaults to true, so it changes no behaviour, but it makes the first-class backend contract of ADR-005 explicit.
     (metalView.layer as? CAMetalLayer)?.displaySyncEnabled = true
 
-    // レンダラーをセットアップ（.physical 時は物理サイズで CPU buffer / texture を確保）
+    // Set up the renderer (under .physical the CPU buffer and the texture are allocated at the physical size)
     metalView.setupRenderer(width: width, height: height, callback: callback, userdata: userdata, physical: physical)
 
     return metalView

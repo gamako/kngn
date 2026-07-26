@@ -15,19 +15,19 @@
 #include <string.h>
 #include <time.h>
 
-// CALayer最適化版の実装
+// The CALayer-optimised implementation
 #define IMPLEMENTATION_TYPE "CALayer Optimized"
 
-// 前方宣言
+// Forward declarations
 @class FramebufferView;
 
 // ========================================
-// イベントキュー / PlatformWindow 定義 (FramebufferView の @implementation から参照される)
+// The event queue and PlatformWindow definitions (referenced from FramebufferView's @implementation)
 // ========================================
 
 #define EVENT_QUEUE_SIZE 256
 
-// モディファイアキーを抽出
+// Extract the modifier keys
 static uint32_t extractModifiers(NSEventModifierFlags nsModifiers) {
     uint32_t mods = 0;
     if (nsModifiers & NSEventModifierFlagShift)   mods |= PLATFORM_MOD_SHIFT;
@@ -37,7 +37,7 @@ static uint32_t extractModifiers(NSEventModifierFlags nsModifiers) {
     return mods;
 }
 
-// イベントキュー構造体
+// The event queue struct
 typedef struct {
     int index;
     uint32_t generation;
@@ -47,15 +47,15 @@ typedef struct {
 typedef struct {
     PlatformEvent events[EVENT_QUEUE_SIZE];
     uint32_t slot_generation[EVENT_QUEUE_SIZE];
-    int head;  // 次に書き込む位置
-    int tail;  // 次に読む位置
-    // 観測カウンタ (累積値、example で差分監視に使う)
+    int head;  // where the next write goes
+    int tail;  // where the next read comes from
+    // observation counters (cumulative; the examples watch the difference)
     uint64_t mouse_move_merge_count;
     uint64_t mouse_scroll_merge_count;
     uint64_t event_drop_count;
 } EventQueue;
 
-// プラットフォームウィンドウ構造体
+// The platform window struct
 struct PlatformWindow {
     NSWindow* window;
     FramebufferView* view;
@@ -64,11 +64,11 @@ struct PlatformWindow {
     bool quit_requested;
 };
 
-// 前方宣言 (定義は下記マウス入力ヘルパーの後。ゲームパッド connect/disconnect ハンドラから使う)。
+// Forward declaration (defined below, after the mouse input helpers; used by the gamepad connect/disconnect handlers).
 static EventQueueToken queue_push(EventQueue* q, const PlatformEvent* ev);
 static bool queue_mark_none(EventQueue* q, EventQueueToken token);
 
-// close ボタンは native window を閉じず、quit request として consumer へ渡す。
+// The close button does not close the native window but passes a quit request to the consumer.
 @interface QuitWindowDelegate : NSObject <NSWindowDelegate>
 @property(nonatomic, assign) PlatformWindow* platformWindow;
 @end
@@ -101,7 +101,7 @@ static void key_trace(const char* fmt, ...) {
     va_end(args);
 }
 
-// TASK-159 診断: IME / document access の実測トレース（既定 OFF。VP_IME_TRACE=1 で有効）。
+// Diagnostics: a trace of IME and document access as it happens (off by default; VP_IME_TRACE=1 enables it).
 static void ime_trace(const char* fmt, ...) {
     if (!g_ime_trace_enabled) return;
     va_list args;
@@ -124,7 +124,7 @@ static void ime_range_desc(NSRange r, char* out, size_t cap) {
 static void ime_preview_utf8(const char* s, char* out, size_t cap) {
     if (!out || cap == 0) return;
     if (!s) { out[0] = '\0'; return; }
-    // 先頭 20 文字程度（UTF-8 バイトを粗く制限。診断用）。
+    // Roughly the first 20 characters (a crude limit in UTF-8 bytes, for diagnostics).
     size_t n = strlen(s);
     if (n > 60) n = 60;
     if (n >= cap) n = cap - 1;
@@ -133,25 +133,25 @@ static void ime_preview_utf8(const char* s, char* out, size_t cap) {
 }
 
 // ========================================
-// ゲームパッド入力 (TASK-80.2。ADR-009)
+// Gamepad input (ADR-009)
 // ========================================
 //
-// opt-in（TASK-80.2 opt-in 化）: GameController framework は audio と同じ opt-in link 方式で、
-// ゲームパッドを使う exe（examples/22_gamepad）だけが build.zig から `-DVP_ENABLE_GAMEPAD` を渡す
-// （build_helpers/platform.zig の compilePlatformLayer 参照）。非 opt-in exe はこのブロック全体が
-// コンパイル対象外になり GameController のシンボルを一切参照しない（`otool -L` にも出ない）。
+// Opt-in: the GameController framework uses the same opt-in linking as audio, and only an executable
+// that uses a gamepad (examples/22_gamepad) gets `-DVP_ENABLE_GAMEPAD` from build.zig
+// (see compilePlatformLayer in build_helpers/platform.zig). In an executable without the opt-in this
+// whole block is not compiled and no GameController symbol is referenced at all (nor shown by `otool -L`).
 #if defined(VP_ENABLE_GAMEPAD)
 //
-// GCController ↔ index (0..PLATFORM_MAX_GAMEPADS-1) のマッピングを保持する。ARC のため
-// 強参照配列でよい（GCController 自体は GameController framework が connect している間保持する）。
-// 単一 window 前提（既存コードと同じ）なので、connect/disconnect イベントは
-// 「現在アクティブな window」(最後に create された window) の event_queue へ push する。
+// Holds the mapping from GCController to an index (0..PLATFORM_MAX_GAMEPADS-1). Under ARC a strong
+// array is fine (the GameController framework retains the GCController itself while it is connected).
+// A single window is assumed (as in the rest of the code), so a connect/disconnect event is pushed
+// onto the event_queue of the "currently active window" (the window created last).
 
 static GCController* g_gamepad_slots[PLATFORM_MAX_GAMEPADS];
 static PlatformWindow* g_gamepad_event_window = NULL;
 static BOOL g_gamepad_observers_installed = NO;
 
-// 追跡中の controller の slot index。未追跡なら -1。
+// The slot index of a tracked controller, or -1 when it is not tracked.
 static int gamepadFindSlot(GCController* controller) {
     for (int i = 0; i < PLATFORM_MAX_GAMEPADS; i++) {
         if (g_gamepad_slots[i] == controller) return i;
@@ -159,7 +159,7 @@ static int gamepadFindSlot(GCController* controller) {
     return -1;
 }
 
-// 空きスロットの index。無ければ -1（上限超は無視）。
+// The index of a free slot, or -1 when there is none (anything over the limit is ignored).
 static int gamepadFindFreeSlot(void) {
     for (int i = 0; i < PLATFORM_MAX_GAMEPADS; i++) {
         if (g_gamepad_slots[i] == nil) return i;
@@ -167,7 +167,7 @@ static int gamepadFindFreeSlot(void) {
     return -1;
 }
 
-// PlatformEvent.payload.gamepad.name（32byte+NUL固定）へ UTF-8 文字列を切り詰めコピーする。
+// Copy a UTF-8 string, truncated, into PlatformEvent.payload.gamepad.name (a fixed 32 bytes plus NUL).
 static void gamepadCopyName(PlatformEvent* ev, NSString* name) {
     memset(ev->payload.gamepad.name, 0, sizeof(ev->payload.gamepad.name));
     const char* utf8 = [name UTF8String];
@@ -175,13 +175,13 @@ static void gamepadCopyName(PlatformEvent* ev, NSString* name) {
     strncpy(ev->payload.gamepad.name, utf8, sizeof(ev->payload.gamepad.name) - 1);
 }
 
-// GCController 接続を取り込む。extendedGamepad 非対応（micro gamepad 等）・追跡済み・上限超は無視する。
+// Take in a GCController connection. Anything without extendedGamepad (a micro gamepad, say), already tracked, or over the limit is ignored.
 static void gamepadHandleConnect(GCController* controller) {
-    if (!controller.extendedGamepad) return; // 標準レイアウト非対応は対象外
-    if (gamepadFindSlot(controller) >= 0) return; // 追跡済み（defensive）
-    if (!g_gamepad_event_window) return; // window 未生成中は無視
+    if (!controller.extendedGamepad) return; // not the standard layout, so out of scope
+    if (gamepadFindSlot(controller) >= 0) return; // already tracked (defensive)
+    if (!g_gamepad_event_window) return; // no window has been created yet
     int idx = gamepadFindFreeSlot();
-    if (idx < 0) return; // PLATFORM_MAX_GAMEPADS 台超は無視
+    if (idx < 0) return; // more than PLATFORM_MAX_GAMEPADS pads
     g_gamepad_slots[idx] = controller;
 
     PlatformEvent ev;
@@ -192,7 +192,7 @@ static void gamepadHandleConnect(GCController* controller) {
     queue_push(&g_gamepad_event_window->event_queue, &ev);
 }
 
-// GCController 切断を取り込む。未追跡なら無視する。
+// Take in a GCController disconnection. An untracked one is ignored.
 static void gamepadHandleDisconnect(GCController* controller) {
     int idx = gamepadFindSlot(controller);
     if (idx < 0) return;
@@ -206,11 +206,11 @@ static void gamepadHandleDisconnect(GCController* controller) {
     queue_push(&g_gamepad_event_window->event_queue, &ev);
 }
 
-// GCControllerDidConnect/DidDisconnect の Notification 監視を 1 プロセス 1 回だけ設置する。
-// queue に [NSOperationQueue mainQueue] を明示指定し main thread 配信を強制する（queue:nil だと
-// 「通知を post したスレッドで同期実行」になり main thread 保証が無いため。codex レビュー指摘）。
-// これにより event_queue / g_gamepad_slots への書き込みが pollEvents 等の main thread 経路と
-// 同じスレッドに揃い、lock 無しでも race しない。
+// Install the GCControllerDidConnect/DidDisconnect notification observers exactly once per process.
+// [NSOperationQueue mainQueue] is passed explicitly to force delivery on the main thread (with
+// queue:nil the observer runs synchronously on whichever thread posted the notification, which
+// guarantees nothing). That keeps writes to event_queue and g_gamepad_slots on the same thread as
+// pollEvents and the rest of the main thread path, so there is no race even without a lock.
 static void gamepadInstallObserversIfNeeded(void) {
     if (g_gamepad_observers_installed) return;
     g_gamepad_observers_installed = YES;
@@ -228,10 +228,10 @@ static void gamepadInstallObserversIfNeeded(void) {
     }];
 }
 
-// window の create/destroy に合わせて「アクティブ window」を切替える。既に他 window から引き継いだ
-// slot（前 window の生存中に接続済みだった controller）は新 window へ connected event を再送し、
-// 未追跡のコントローラは通常の connect 処理で取り込む（codex レビュー指摘: window 再生成時に
-// 既接続 controller の connected event が新 window に届かない問題への対応）。
+// Switch the "active window" as windows are created and destroyed. A slot inherited from another
+// window (a controller that connected while the previous window was alive) has its connected event
+// resent to the new window, and an untracked controller is taken in by the ordinary connect path
+// (without this, a controller that was already connected gets no connected event on the new window).
 static void gamepadAttachWindow(PlatformWindow* window) {
     g_gamepad_event_window = window;
     gamepadInstallObserversIfNeeded();
@@ -245,7 +245,7 @@ static void gamepadAttachWindow(PlatformWindow* window) {
         queue_push(&window->event_queue, &ev);
     }
     for (GCController* controller in [GCController controllers]) {
-        gamepadHandleConnect(controller); // 未追跡のみ実際に処理する（gamepadFindSlot でスキップ）
+        gamepadHandleConnect(controller); // only an untracked one is really processed (gamepadFindSlot skips the rest)
     }
 }
 
@@ -257,7 +257,7 @@ static void gamepadDetachWindow(PlatformWindow* window) {
 #endif // VP_ENABLE_GAMEPAD
 
 #if defined(VP_ENABLE_MENU)
-// 共有 menu TU からの bridge。objc EventQueue へ MENU_COMMAND を積む。
+// The bridge from the shared menu TU. Pushes a MENU_COMMAND onto the objc EventQueue.
 void platform_menu_enqueue_command(PlatformWindow* window, uint32_t command_id) {
     if (!window) return;
     PlatformEvent ev;
@@ -269,21 +269,21 @@ void platform_menu_enqueue_command(PlatformWindow* window, uint32_t command_id) 
 #endif
 
 // ========================================
-// マウス入力ヘルパー (TASK-21.1)
+// Mouse input helpers
 // ========================================
 
-// non-precise scroll の line→points 変換係数 (経験則)
-// example_07 でログ確認しつつ調整可能。
+// The line→points factor for a non-precise scroll (a rule of thumb)
+// It can be tuned while watching the log in example_07.
 static const float SCROLL_LINE_TO_POINTS = 16.0f;
 
-// キュー末尾の最新イベントへのポインタ。空なら NULL。
+// A pointer to the newest event at the tail of the queue, or NULL when it is empty.
 static PlatformEvent* queue_peek_tail(EventQueue* q) {
     if (q->head == q->tail) return NULL;
     int prev = (q->head - 1 + EVENT_QUEUE_SIZE) % EVENT_QUEUE_SIZE;
     return &q->events[prev];
 }
 
-// mouse_move の末尾合体 (buttons_mask + modifiers 同一の時のみ)。合体時 true。
+// Merge a mouse_move into the tail (only when buttons_mask and modifiers match). True once merged.
 static bool try_merge_mouse_move(EventQueue* q, const PlatformEvent* ev) {
     PlatformEvent* tail = queue_peek_tail(q);
     if (!tail || tail->type != PLATFORM_EVENT_MOUSE_MOVE) return false;
@@ -295,7 +295,7 @@ static bool try_merge_mouse_move(EventQueue* q, const PlatformEvent* ev) {
     return true;
 }
 
-// mouse_scroll の末尾合体 (is_precise + buttons_mask + modifiers 同一)。合体時 true。
+// Merge a mouse_scroll into the tail (only when is_precise, buttons_mask and modifiers match). True once merged.
 static bool try_merge_mouse_scroll(EventQueue* q, const PlatformEvent* ev) {
     PlatformEvent* tail = queue_peek_tail(q);
     if (!tail || tail->type != PLATFORM_EVENT_MOUSE_SCROLL) return false;
@@ -310,7 +310,7 @@ static bool try_merge_mouse_scroll(EventQueue* q, const PlatformEvent* ev) {
     return true;
 }
 
-// キューに push (満杯なら drop カウンタを増やして捨てる)。成功時は slot token を返す。
+// Push onto the queue (when full, bump the drop counter and discard). Returns the slot token on success.
 static EventQueueToken queue_push(EventQueue* q, const PlatformEvent* ev) {
     EventQueueToken invalid = { .index = -1, .generation = 0, .valid = false };
     int next_head = (q->head + 1) % EVENT_QUEUE_SIZE;
@@ -333,24 +333,24 @@ static bool queue_mark_none(EventQueue* q, EventQueueToken token) {
     return true;
 }
 
-// NSEvent の locationInWindow を view 内の左上原点・raw physical pixel へ変換 (floor 整数化)。
-// scale は current native backing scale。負値・ウィンドウ外も clamp しない（従来どおり）。
+// Convert an NSEvent's locationInWindow into raw physical pixels with the origin at the view's top-left (floored to an integer).
+// scale is the current native backing scale. Negative values and positions outside the window are not clamped.
 static void event_location_to_platform_raw_coords(NSEvent* event, NSView* view, CGFloat scale, int32_t* out_x, int32_t* out_y) {
     NSPoint windowPt = event.locationInWindow;
     NSPoint viewPt = [view convertPoint:windowPt fromView:nil];
     CGFloat viewHeight = view.bounds.size.height;
     CGFloat s = (scale > 0.0) ? scale : 1.0;
     *out_x = (int32_t)floor(viewPt.x * s);
-    *out_y = (int32_t)floor((viewHeight - viewPt.y) * s);  // Y フリップ
+    *out_y = (int32_t)floor((viewHeight - viewPt.y) * s);  // flip Y
 }
 
-// 現在押下中のボタン bitmask (& 0x07 で X1/X2 を除外)。
+// The bitmask of the buttons currently held (& 0x07 excludes X1/X2).
 static uint8_t pressed_buttons_mask(void) {
     return (uint8_t)([NSEvent pressedMouseButtons] & 0x07);
 }
 
-// NSEvent.buttonNumber から PlatformMouseButton へ (物理ボタン基準)。
-// Control+左クリックも buttonNumber=0 のままなので button=LEFT。
+// From NSEvent.buttonNumber to PlatformMouseButton (by physical button).
+// Control plus a left click also keeps buttonNumber=0, so button=LEFT.
 static PlatformMouseButton button_from_event(NSEvent* event) {
     switch (event.buttonNumber) {
         case 0: return PLATFORM_MOUSE_BUTTON_LEFT;
@@ -361,14 +361,14 @@ static PlatformMouseButton button_from_event(NSEvent* event) {
 }
 
 // ========================================
-// CALayer最適化版の実装
+// The CALayer-optimised implementation
 // ========================================
 
-// IME composition 固定バッファ（preedit UTF-8。TASK-79.6.1）
+// The fixed buffer for an IME composition (the preedit, as UTF-8)
 #define COMPOSITION_UTF8_CAP 1024
 
-/// s[0..len] のうち cap バイト以内に収まる最長の UTF-8 codepoint 境界プレフィックス長。
-/// cap を超える場合は continuation (0b10xxxxxx) を含む途中切断を避け、完全な codepoint だけ残す。
+/// The longest prefix of s[0..len] that fits within cap bytes and ends on a UTF-8 code point boundary.
+/// Past cap this avoids cutting inside a continuation byte (0b10xxxxxx), keeping only whole code points.
 static size_t utf8SafePrefixLen(const char* s, size_t len, size_t cap) {
     size_t i = 0;
     while (i < len && i < cap) {
@@ -378,23 +378,23 @@ static size_t utf8SafePrefixLen(const char* s, size_t len, size_t cap) {
         else if ((c & 0xE0) == 0xC0) need = 2;
         else if ((c & 0xF0) == 0xE0) need = 3;
         else if ((c & 0xF8) == 0xF0) need = 4;
-        else break; // 不正 lead: 手前まで
+        else break; // an invalid lead byte: stop before it
         if (i + need > cap || i + need > len) break;
         i += need;
     }
     return i;
 }
 
-// カスタムNSView - CALayerベースの高速描画 + NSTextInputClient（TASK-79.6.1 IME）
+// A custom NSView: fast CALayer-based drawing plus NSTextInputClient (the IME)
 @interface FramebufferView : NSView <NSTextInputClient, NSDraggingDestination> {
-    int width;   // framebuffer pixel width（.logical では logical と同値）
+    int width;   // the framebuffer pixel width (equal to the logical one under .logical)
     int height;  // framebuffer pixel height
     int logicalWidth;
     int logicalHeight;
     BOOL physicalMode;
-    CGFloat contentScale;        // latched（lock で commit 済み。present / lock snapshot 用）
-    CGFloat pendingContentScale; // 検出済み current negotiated scale（metrics query / 入力 raw 用）
-    uint64_t scaleEpoch;         // latched epoch。buffer/scale と原子的にだけ +1
+    CGFloat contentScale;        // latched (committed by lock; used by present and the lock snapshot)
+    CGFloat pendingContentScale; // the detected current negotiated scale (for a metrics query and for raw input)
+    uint64_t scaleEpoch;         // the latched epoch, incremented only atomically with the buffer and scale
     BOOL hasPendingResize;
     int pendingLogicalWidth;
     int pendingLogicalHeight;
@@ -402,66 +402,66 @@ static size_t utf8SafePrefixLen(const char* s, size_t len, size_t cap) {
     FrameCallback callback;
     void* userdata;
 
-    // ダブルバッファリング（ポインタスワップ方式）
+    // Double buffering (by swapping pointers)
     uint32_t* buffer0;
     uint32_t* buffer1;
-    uint32_t* currentBuffer;  // コールバックが書き込むバッファ
-    uint32_t* displayBuffer;  // 画面に表示中のバッファ
+    uint32_t* currentBuffer;  // the buffer the callback writes into
+    uint32_t* displayBuffer;  // the buffer currently on screen
 
-    // レイヤー
+    // the layer
     CALayer* contentLayer;
 
-    // CGオブジェクト（初期化時に作成して再利用）
+    // the CG objects (created at initialisation and reused)
     CGColorSpaceRef colorSpace;
     CGDataProviderRef provider0;
     CGDataProviderRef provider1;
 
-    // パフォーマンス測定
+    // performance measurement
     CFAbsoluteTime lastFrameTime;
     int frameCount;
     double totalFrameTime;
 
-    // マウスイベント用 (TASK-21.1)
-    PlatformWindow* platformWindow;  // 非所有の生ポインタ。destroy 時に NULL 化される
+    // for mouse events
+    PlatformWindow* platformWindow;  // an unowned raw pointer, set to NULL on destroy
     NSTrackingArea* trackingArea;
 
-    // カーソル制御用 (TASK-75.1)
-    PlatformCursorShape currentCursorShape;  // 直近に要求された形状（既定 PLATFORM_CURSOR_DEFAULT）
-    BOOL cursorHiddenByThisView;             // このviewが [NSCursor hide] を所有中か（グローバル参照カウントAPIの多重呼び出し防止）
-    BOOL mouseInsideView;                    // マウスが現在 view 内にあるか（view外では set/hide を保留する）
+    // for cursor control
+    PlatformCursorShape currentCursorShape;  // the most recently requested shape (PLATFORM_CURSOR_DEFAULT by default)
+    BOOL cursorHiddenByThisView;             // whether this view owns the [NSCursor hide] (the API is a global reference count, so it must not be called twice)
+    BOOL mouseInsideView;                    // whether the mouse is inside the view right now (set and hide are held back while it is outside)
 
-    // ライブリサイズ再描画 (TASK-23.1)。FrameCallback とは別。未登録時は NULL。
+    // live-resize redraw, distinct from FrameCallback. NULL while nothing is registered.
     PlatformRedrawCallback redrawCallback;
     void* redrawUserdata;
 
-    // IME composition 状態 (TASK-79.6.1)。本文は snapshot API、変化は PLATFORM_EVENT_COMPOSITION。
+    // The IME composition state. The text comes from the snapshot API, a change from PLATFORM_EVENT_COMPOSITION.
     NSMutableString* markedText;
-    NSRange imeSelectedRange; // markedText 内の選択（UTF-16 単位）
+    NSRange imeSelectedRange; // the selection within markedText (in UTF-16 units)
 
-    // テキスト入力フォーカス制御 (TASK-142)。imeControlled=NO の間は従来どおり常時 IME 経路
-    // （後方互換）。app が platform_set_text_input_active を一度でも呼ぶと controlled=YES になり、
-    // 以後は imeActive のときだけ keyDown を inputContext へ渡す。
+    // Text input focus control. While imeControlled=NO everything goes through the IME as before
+    // (backwards compatible). Once the application calls platform_set_text_input_active even once,
+    // controlled becomes YES and from then on keyDown reaches the inputContext only while imeActive.
     BOOL imeControlled;
     BOOL imeActive;
     char compositionUtf8[COMPOSITION_UTF8_CAP];
     uint32_t compositionLen;
     uint32_t compositionRevision;
-    uint32_t compositionCursor; // preedit 内 UTF-8 バイトオフセット
-    NSRect compositionRectPixels; // framebuffer pixel・content 左上原点
+    uint32_t compositionCursor; // the UTF-8 byte offset within the preedit
+    NSRect compositionRectPixels; // framebuffer pixels, origin at the content's top-left
     BOOL compositionRectSet;
 
-    // IME document access (TASK-79.6.3)。callback 未登録時は従来どおり NSNotFound/nil/char_input。
+    // IME document access. With no callback registered it stays NSNotFound/nil/char_input, as before.
     PlatformTextInputDocumentCallbacks docAccessCallbacks;
     void* docAccessUserdata;
     BOOL docAccessEnabled;
     BOOL hasPendingReplacement;
     NSRange pendingReplacement;
 
-    // 透過ウィンドウ / クリック透過 / 対話的ドラッグ (TASK-104)
-    BOOL transparentMode;      // YES で CGImage を premultiplied alpha 化し fb の alpha を honor
-    BOOL clickThrough;         // YES で透明画素上のクリックを背後へ抜けさせる（per-pixel）
-    BOOL clickThroughState;    // 直近設定した ignoresMouseEvents 値（変化時のみ再設定するためのキャッシュ）
-    NSEvent* lastMouseDownEvent; // 直近の左ボタン mouse-down（beginDrag 用に retain。one-shot で消費）
+    // Transparent windows, click-through and interactive dragging
+    BOOL transparentMode;      // YES makes the CGImage premultiplied alpha and honours the framebuffer alpha
+    BOOL clickThrough;         // YES lets a click over a transparent pixel fall through to what is behind (per pixel)
+    BOOL clickThroughState;    // the ignoresMouseEvents value set most recently (cached so it is only reapplied when it changes)
+    NSEvent* lastMouseDownEvent; // the most recent left-button mouse-down (retained for beginDrag; consumed one-shot)
 }
 - (id)initWithFrame:(NSRect)frame width:(int)w height:(int)h
            callback:(FrameCallback)cb userdata:(void*)ud
@@ -472,36 +472,36 @@ static size_t utf8SafePrefixLen(const char* s, size_t len, size_t cap) {
 - (void)displayLinkFired:(CADisplayLink*)link;
 - (void)dealloc;
 
-// 手動描画用のアクセサメソッド
+// The accessors for manual drawing
 - (int)getWidth;
 - (int)getHeight;
 - (uint32_t*)getCurrentBuffer;
 - (void)presentManual;
 
-// destroy 時に呼ぶ。view の back-reference を無効化する。
+// Called on destroy. Invalidates the view's back-reference.
 - (void)clearPlatformWindow;
 
-// カーソル形状を設定する (TASK-75.1)。platform_set_cursor から呼ばれる。
+// Set the cursor shape. Called from platform_set_cursor.
 - (void)setCursorShape:(PlatformCursorShape)shape;
 
-// ライブリサイズ再描画コールバック登録 (TASK-23.1)。cb==NULL で解除。
+// Register the live-resize redraw callback. cb==NULL unregisters.
 - (void)setRedrawCallback:(PlatformRedrawCallback)cb userdata:(void*)ud;
 
-// composition snapshot（platform_get_composition_snapshot から呼ぶ）
+// the composition snapshot (called from platform_get_composition_snapshot)
 - (uint32_t)copyCompositionSnapshot:(char*)buf cap:(uint32_t)cap meta:(PlatformCompositionMeta*)meta;
 - (void)setCompositionRectPixelsX:(int32_t)x y:(int32_t)y w:(int32_t)w h:(int32_t)h;
 
-// IME document access (TASK-79.6.3)。callbacks==NULL で解除。
+// IME document access. callbacks==NULL unregisters.
 - (void)setTextInputDocumentAccess:(const PlatformTextInputDocumentCallbacks*)callbacks userdata:(void*)ud;
 
-// 透過ウィンドウ関連 (TASK-104)
+// transparent window support
 - (void)setTransparentMode:(BOOL)on;
 - (void)setClickThrough:(BOOL)on;
 - (void)refreshClickThrough;
 - (NSEvent *)takeLastMouseDownEvent;
 
-// TASK-156.1: scale latch / metrics
-// fillMetrics:forQuery: YES=current query（pending scale）、NO=latched snapshot（lock 後）
+// scale latch and metrics
+// fillMetrics:forQuery: YES = the current query (the pending scale), NO = the latched snapshot (after a lock)
 - (void)fillMetrics:(PlatformFramebufferMetrics*)out forQuery:(BOOL)forQuery;
 - (void)applyLatchedMetricsIfNeeded;
 - (CGFloat)nativeEventScale;
@@ -524,7 +524,7 @@ static size_t utf8SafePrefixLen(const char* s, size_t len, size_t cap) {
         pendingLogicalWidth = w;
         pendingLogicalHeight = h;
         scaleEpoch = 0;
-        // 初期 scale: window 未接続なので mainScreen。未取得・非対応は 1.0。
+        // The initial scale: no window is attached yet, so mainScreen is used. Unavailable or unsupported gives 1.0.
         CGFloat scale = 1.0;
         NSScreen* screen = [NSScreen mainScreen];
         if (screen) {
@@ -555,7 +555,7 @@ static size_t utf8SafePrefixLen(const char* s, size_t len, size_t cap) {
         redrawUserdata = NULL;
         markedText = [[NSMutableString alloc] init];
         imeSelectedRange = NSMakeRange(0, 0);
-        imeControlled = NO;   // TASK-142: 未制御=従来どおり常時 IME 経路
+        imeControlled = NO;   // uncontrolled: everything goes through the IME, as before
         imeActive = NO;
         compositionLen = 0;
         compositionRevision = 0;
@@ -568,26 +568,26 @@ static size_t utf8SafePrefixLen(const char* s, size_t len, size_t cap) {
         docAccessEnabled = NO;
         hasPendingReplacement = NO;
         pendingReplacement = NSMakeRange(NSNotFound, 0);
-        transparentMode = NO;   // TASK-104: 既定は不透明（従来挙動と bit 一致）
+        transparentMode = NO;   // opaque by default (bit-identical to the previous behaviour)
         clickThrough = NO;
-        clickThroughState = NO; // 初期 ignoresMouseEvents=NO と一致
+        clickThroughState = NO; // matching the initial ignoresMouseEvents=NO
         lastMouseDownEvent = nil;
 
-        // ダブルバッファを確保（ページアラインメント推奨）
-        // .logical: 従来どおり logical_w * logical_h。.physical のみ物理寸法。
+        // Allocate the double buffer (page alignment is preferable)
+        // .logical: logical_w * logical_h, as before. Only .physical uses the physical size.
         buffer0 = (uint32_t*)calloc((size_t)width * (size_t)height, sizeof(uint32_t));
         buffer1 = (uint32_t*)calloc((size_t)width * (size_t)height, sizeof(uint32_t));
         currentBuffer = buffer0;
         displayBuffer = buffer1;
 
-        // CGオブジェクトを初期化時に作成（再利用するため）
-        // EXPERIMENT: DeviceRGB は広色域ディスプレイで毎フレーム ColorSync 変換を誘発する
-        // （.physical で実測。sample プロファイルで vImage 色変換が支配的と判明）。
-        // 実際の画面の色空間に合わせて変換を回避できるか試す。
+        // Create the CG objects at initialisation, so they can be reused
+        // DeviceRGB provokes a ColorSync conversion every frame on a wide-gamut display
+        // (measured under .physical, where a sample profile showed the vImage colour conversion dominating).
+        // Matching the screen's actual colour space avoids that conversion.
         NSColorSpace *screenCS = [NSScreen mainScreen].colorSpace;
         colorSpace = screenCS ? CGColorSpaceRetain(screenCS.CGColorSpace) : CGColorSpaceCreateDeviceRGB();
 
-        // buffer0用のCGDataProviderを作成
+        // Create the CGDataProvider for buffer0
         provider0 = CGDataProviderCreateWithData(
             NULL,
             buffer0,
@@ -595,7 +595,7 @@ static size_t utf8SafePrefixLen(const char* s, size_t len, size_t cap) {
             NULL
         );
 
-        // buffer1用のCGDataProviderを作成
+        // Create the CGDataProvider for buffer1
         provider1 = CGDataProviderCreateWithData(
             NULL,
             buffer1,
@@ -603,14 +603,14 @@ static size_t utf8SafePrefixLen(const char* s, size_t len, size_t cap) {
             NULL
         );
 
-        // レイヤーバックドビューに設定
+        // Make it a layer-backed view
         [self setWantsLayer:YES];
 
-        // コンテンツレイヤーを作成（frame は常に logical points）
+        // Create the content layer (its frame is always in logical points)
         contentLayer = [CALayer layer];
         contentLayer.frame = CGRectMake(0, 0, logicalWidth, logicalHeight);
         contentLayer.opaque = YES;
-        contentLayer.geometryFlipped = YES;  // Y軸反転を一度だけ設定
+        contentLayer.geometryFlipped = YES;  // Flip the Y axis, once
         [self.layer addSublayer:contentLayer];
         contentLayer.magnificationFilter = kCAFilterNearest;
         contentLayer.minificationFilter = kCAFilterNearest;
@@ -618,12 +618,12 @@ static size_t utf8SafePrefixLen(const char* s, size_t len, size_t cap) {
             contentLayer.contentsScale = contentScale;
         }
 
-        // パフォーマンス測定の初期化
+        // Initialise the performance measurement
         lastFrameTime = CFAbsoluteTimeGetCurrent();
         frameCount = 0;
         totalFrameTime = 0.0;
 
-        // TASK-113.4: OS ファイル drag & drop（file URL のみ。objc backend 先行）
+        // OS file drag and drop (file URLs only; the objc backend leads)
         [self registerForDraggedTypes:@[NSPasteboardTypeFileURL]];
 
         NSLog(@"[%s] Framebuffer initialized: logical=%dx%d fb=%dx%d scale=%.2f physical=%d",
@@ -632,7 +632,7 @@ static size_t utf8SafePrefixLen(const char* s, size_t len, size_t cap) {
     return self;
 }
 
-// TASK-113.4: NSDraggingDestination（ホットパス: イベント時のみ）
+// NSDraggingDestination (hot path: event time only)
 - (NSDragOperation)draggingEntered:(id<NSDraggingInfo>)sender {
     NSPasteboard* pb = [sender draggingPasteboard];
     NSArray* urls = [pb readObjectsForClasses:@[[NSURL class]]
@@ -648,22 +648,22 @@ static size_t utf8SafePrefixLen(const char* s, size_t len, size_t cap) {
     NSPasteboard* pb = [sender draggingPasteboard];
     NSArray* urls = [pb readObjectsForClasses:@[[NSURL class]]
                                       options:@{NSPasteboardURLReadingFileURLsOnlyKey: @YES}];
-    // MVP は単一ファイルのみ。複数同時 drop はイベント全体を reject。
+    // A single file only. A simultaneous multi-file drop rejects the whole event.
     if (urls == nil || urls.count != 1) return NO;
     NSURL* url = urls[0];
     if (![url isFileURL]) return NO;
     NSString* path = [url path];
     if (path == nil) return NO;
     NSData* utf8Data = [path dataUsingEncoding:NSUTF8StringEncoding];
-    if (utf8Data == nil) return NO; // 不正 UTF-8（変換不能）
+    if (utf8Data == nil) return NO; // invalid UTF-8 (cannot be converted)
     NSUInteger len = [utf8Data length];
     if (len > UINT32_MAX) return NO;
 
-    // 長さ/NUL 検証・struct 充填は共有ヘルパー（objc/swift/metal 単一ソース。TASK-135）。
+    // Validating the length and NULs, and filling the struct, live in the shared helper (a single source for objc/swift/metal).
     PlatformEvent ev;
     memset(&ev, 0, sizeof(ev));
     if (!platform_fill_file_drop_event(&ev, (const char*)[utf8Data bytes], (uint32_t)len)) return NO;
-    // inline copy 完了。NSString/NSURL の寿命に依存しない。
+    // The inline copy is done; nothing depends on the lifetime of the NSString or NSURL any more.
     queue_push(&platformWindow->event_queue, &ev);
     return YES;
 }
@@ -687,26 +687,26 @@ static size_t utf8SafePrefixLen(const char* s, size_t len, size_t cap) {
 
     CFAbsoluteTime frameStartTime = CFAbsoluteTimeGetCurrent();
 
-    // ユーザーのコールバックを呼び出してピクセルデータを生成
+    // Call the user's callback to produce the pixel data
     if (callback) {
         CFAbsoluteTime callbackStart = CFAbsoluteTimeGetCurrent();
         callback(currentBuffer, width, height, userdata);
         CFAbsoluteTime callbackEnd = CFAbsoluteTimeGetCurrent();
 
-        // バッファをスワップ（ゼロコピー）
+        // Swap the buffers (zero copy)
         uint32_t* temp = currentBuffer;
         currentBuffer = displayBuffer;
         displayBuffer = temp;
 
-        // 表示するバッファに対応するCGDataProviderを選択
+        // Pick the CGDataProvider that matches the buffer being displayed
         CFAbsoluteTime renderStart = CFAbsoluteTimeGetCurrent();
         CGDataProviderRef provider = (displayBuffer == buffer0) ? provider0 : provider1;
 
-        // CGImageを作成（毎フレーム必要）
-        // TASK-104: 透過モードは premultiplied alpha で fb の alpha を honor。既定は従来どおり alpha skip。
+        // Create the CGImage (needed every frame)
+        // In transparent mode, premultiplied alpha honours the framebuffer alpha; by default alpha is skipped, as before.
         CGBitmapInfo bitmapInfo = (transparentMode
             ? (kCGImageAlphaPremultipliedFirst | kCGBitmapByteOrder32Little)
-            : (kCGImageAlphaNoneSkipFirst | kCGBitmapByteOrder32Little)); // canonical BGRA: メモリ [B,G,R,A] = u32 0xAARRGGBB
+            : (kCGImageAlphaNoneSkipFirst | kCGBitmapByteOrder32Little)); // canonical BGRA: memory [B,G,R,A] = u32 0xAARRGGBB
         CGImageRef image = CGImageCreate(
             width,
             height,
@@ -721,24 +721,24 @@ static size_t utf8SafePrefixLen(const char* s, size_t len, size_t cap) {
             kCGRenderingIntentDefault
         );
 
-        // レイヤーのcontentsに設定（変換なしで高速）
+        // Set it as the layer's contents (fast, with no conversion)
         contentLayer.contents = (__bridge id)image;
 
-        // CGImageを解放
+        // Release the CGImage
         CGImageRelease(image);
 
-        // TASK-104: callback/display-link 経路でも click-through を更新（無効時は即 return）
+        // Update click-through on the callback and display-link path too (returns immediately while disabled)
         [self refreshClickThrough];
 
         CFAbsoluteTime renderEnd = CFAbsoluteTimeGetCurrent();
 
-        // パフォーマンス測定
+        // performance measurement
         frameCount++;
         double frameTime = frameStartTime - lastFrameTime;
         totalFrameTime += frameTime;
         lastFrameTime = frameStartTime;
 
-        // 60フレームごとに統計を出力
+        // Print the statistics every 60 frames
         if (frameCount % 60 == 0) {
             double avgFrameTime = totalFrameTime / 60.0;
             double fps = 1.0 / avgFrameTime;
@@ -756,7 +756,7 @@ static size_t utf8SafePrefixLen(const char* s, size_t len, size_t cap) {
 - (void)dealloc {
     [self stopDisplayLink];
 
-    // カーソルを hide したまま破棄されると OS カーソルが消えたままになる (TASK-75.1 codex レビュー指摘)。
+    // Being destroyed while the cursor is hidden would leave the OS cursor gone for good.
     if (cursorHiddenByThisView) {
         [NSCursor unhide];
         cursorHiddenByThisView = NO;
@@ -764,17 +764,17 @@ static size_t utf8SafePrefixLen(const char* s, size_t len, size_t cap) {
 
     markedText = nil;
 
-    // CGオブジェクトを解放
+    // Release the CG objects
     if (provider0) CGDataProviderRelease(provider0);
     if (provider1) CGDataProviderRelease(provider1);
     if (colorSpace) CGColorSpaceRelease(colorSpace);
 
-    // バッファを解放
+    // Free the buffers
     if (buffer0) free(buffer0);
     if (buffer1) free(buffer1);
 }
 
-// 手動描画用のアクセサメソッド実装
+// The implementation of the manual drawing accessors
 - (int)getWidth {
     return width;
 }
@@ -788,18 +788,18 @@ static size_t utf8SafePrefixLen(const char* s, size_t len, size_t cap) {
 }
 
 - (void)presentManual {
-    // バッファをスワップ（ゼロコピー）
+    // Swap the buffers (zero copy)
     uint32_t* temp = currentBuffer;
     currentBuffer = displayBuffer;
     displayBuffer = temp;
 
-    // 表示するバッファに対応するCGDataProviderを選択
+    // Pick the CGDataProvider that matches the buffer being displayed
     CGDataProviderRef provider = (displayBuffer == buffer0) ? provider0 : provider1;
 
-    // CGImageを作成（TASK-104: 透過モードは premultiplied alpha で alpha を honor）
+    // Create the CGImage (in transparent mode, premultiplied alpha honours the alpha)
     CGBitmapInfo bitmapInfo = (transparentMode
         ? (kCGImageAlphaPremultipliedFirst | kCGBitmapByteOrder32Little)
-        : (kCGImageAlphaNoneSkipFirst | kCGBitmapByteOrder32Little)); // canonical BGRA: メモリ [B,G,R,A] = u32 0xAARRGGBB
+        : (kCGImageAlphaNoneSkipFirst | kCGBitmapByteOrder32Little)); // canonical BGRA: memory [B,G,R,A] = u32 0xAARRGGBB
     CGImageRef image = CGImageCreate(
         width,
         height,
@@ -814,27 +814,27 @@ static size_t utf8SafePrefixLen(const char* s, size_t len, size_t cap) {
         kCGRenderingIntentDefault
     );
 
-    // レイヤーのcontentsに設定
+    // Set it as the layer's contents
     contentLayer.contents = (__bridge id)image;
 
-    // CGImageを解放
+    // Release the CGImage
     CGImageRelease(image);
 
-    // TASK-104: クリック透過のカーソル位置判定を更新（clickThrough 無効時は即 return）
+    // Update the cursor-position test for click-through (returns immediately while clickThrough is off)
     [self refreshClickThrough];
 }
 
 - (BOOL)isOpaque {
-    return transparentMode ? NO : YES; // TASK-104: 透過モードは非不透明
+    return transparentMode ? NO : YES; // transparent mode is not opaque
 }
 
-// TASK-104: クリック透過（per-pixel）。NSView.hitTest で nil を返しても背後の別アプリへは
-// イベントが抜けない（それは window-level の ignoresMouseEvents）。そこで present 毎に現在の
-// カーソル位置の alpha を見て `window.ignoresMouseEvents` をトグルする: 透明画素(alpha==0)上なら
-// クリックが背後へ抜け、不透明な本体上なら window が受ける（ドラッグ/右クリックが効く）。
-// present はアプリの main loop が毎フレーム回すためカーソルが本体へ戻れば次フレームで復帰する。
-// ホットパス宣言: present 毎（フレーム毎）だが 1 画素サンプル + 座標変換 + プロパティ設定のみ。
-// 座標変換の除算はフレーム毎に定数回（per-pixel ループではない）。alloc なし。性能規約の全画素ループ対象外。
+// Per-pixel click-through. Returning nil from NSView.hitTest does not let the event through to another
+// application behind (that is the window-level ignoresMouseEvents). So on every present the alpha under
+// the current cursor position decides whether `window.ignoresMouseEvents` is toggled: over a transparent
+// pixel (alpha==0) the click falls through, over the opaque artwork the window gets it (dragging and right
+// clicks work), and since the main loop presents every frame it recovers as soon as the cursor returns.
+// Hot path declaration: once per present (per frame), but only one pixel sample, a coordinate conversion and a property write.
+// The division in the conversion happens a constant number of times per frame (it is not a per-pixel loop), and nothing is allocated, so the all-pixel loop rules do not apply.
 - (void)refreshClickThrough {
     if (!clickThrough) return;
     NSWindow* win = self.window;
@@ -843,28 +843,28 @@ static size_t utf8SafePrefixLen(const char* s, size_t len, size_t cap) {
     if (!buf) return;
     NSPoint screenPt = [NSEvent mouseLocation];
     NSPoint winPt = [win convertPointFromScreen:screenPt];
-    NSPoint local = [self convertPoint:winPt fromView:nil]; // window → view（非 flipped = 左下原点）
+    NSPoint local = [self convertPoint:winPt fromView:nil]; // window → view (not flipped: the origin is bottom-left)
     NSRect b = self.bounds;
-    BOOL passThrough = YES; // カーソルが window 外/未確定なら抜けさせる
-    // カーソルが view 矩形の内側にあるときだけ alpha を見る（外は passThrough=YES のまま）
+    BOOL passThrough = YES; // let it fall through when the cursor is outside the window or unknown
+    // only look at the alpha while the cursor is inside the view rect (outside it stays passThrough=YES)
     if (b.size.width > 0 && b.size.height > 0 &&
         local.x >= 0 && local.x < b.size.width && local.y >= 0 && local.y < b.size.height) {
         int px = (int)(local.x / b.size.width * (CGFloat)width);
-        int py = (int)((1.0 - local.y / b.size.height) * (CGFloat)height); // top-left 原点へ
-        if (px >= width) px = width - 1; // 右端/下端の丸め込みで範囲外になるのを clamp（下端1px落ち防止）
+        int py = (int)((1.0 - local.y / b.size.height) * (CGFloat)height); // to a top-left origin
+        if (px >= width) px = width - 1; // clamp what rounding at the right and bottom edges would push out of range (it would drop the last row)
         if (py >= height) py = height - 1;
         if (px < 0) px = 0;
         if (py < 0) py = 0;
-        uint8_t alpha = (uint8_t)(buf[py * width + px] >> 24); // canonical BGRA: 上位8bit=alpha
+        uint8_t alpha = (uint8_t)(buf[py * width + px] >> 24); // canonical BGRA: the top 8 bits are alpha
         passThrough = (alpha == 0);
     }
-    if (passThrough != clickThroughState) { // 値が変わったときだけ WindowServer 状態を書く
+    if (passThrough != clickThroughState) { // only write the WindowServer state when the value has changed
         win.ignoresMouseEvents = passThrough;
         clickThroughState = passThrough;
     }
 }
 
-// TASK-104: 透過/クリック透過モードの設定（platform_create_window_ex / platform_set_click_through から）。
+// Configure transparency and click-through (called from platform_create_window_ex and platform_set_click_through).
 - (void)setTransparentMode:(BOOL)on {
     transparentMode = on;
     contentLayer.opaque = on ? NO : YES;
@@ -873,14 +873,14 @@ static size_t utf8SafePrefixLen(const char* s, size_t len, size_t cap) {
 - (void)setClickThrough:(BOOL)on {
     clickThrough = on;
     if (!on && self.window) {
-        self.window.ignoresMouseEvents = NO; // 無効化時は必ず受け取りへ戻す
+        self.window.ignoresMouseEvents = NO; // when it is turned off, always go back to receiving events
         clickThroughState = NO;
     }
 }
 
-// TASK-104: 直近の左ボタン mouse-down NSEvent を beginDrag 用に取り出して消費する（one-shot）。
-// 呼び出し時点で保持をクリアし、同じ event を再利用しない（performWindowDragWithEvent: 後に
-// mouse-up が届かない場合があるため、mouse-up 破棄だけに頼らない）。無ければ nil。
+// Take and consume the most recent left-button mouse-down NSEvent for beginDrag (one-shot).
+// The retained event is cleared at the moment of the call, so the same event is never reused (a
+// mouse-up sometimes never arrives after performWindowDragWithEvent:, so discarding on mouse-up alone is not enough). nil when there is none.
 - (NSEvent *)takeLastMouseDownEvent {
     NSEvent* ev = lastMouseDownEvent;
     lastMouseDownEvent = nil;
@@ -888,26 +888,26 @@ static size_t utf8SafePrefixLen(const char* s, size_t len, size_t cap) {
 }
 
 // ========================================
-// リサイズ (TASK-23)
+// Resizing
 // ========================================
 
-// 新サイズへフレームバッファ/プロバイダを two-phase で再確保する。
-// 新リソースの確保に成功してから旧リソースを破棄する（失敗時は旧サイズを維持）。
-// .logical: 単位は logical points（mouse 座標と同一）。lock 中には呼ばれない（イベントポンプ中に発火）。
-// .physical の pending apply は applyLatchedMetricsIfNeeded が物理寸法で呼ぶ。
+// Reallocate the framebuffer and the providers for a new size, in two phases.
+// The old resources are destroyed only once the new ones have been allocated (on failure the old size is kept).
+// .logical: the unit is logical points (the same as mouse coordinates). It is never called while locked (it fires during the event pump).
+// A pending .physical apply is made by applyLatchedMetricsIfNeeded, in physical units.
 - (BOOL)resizeBuffersTo:(int)w height:(int)h {
-    if (!buffer0 || !buffer1) return NO; // init 途中（super の setFrameSize）では何もしない
+    if (!buffer0 || !buffer1) return NO; // do nothing during init (super's setFrameSize)
     if (w < 1) w = 1;
     if (h < 1) h = 1;
-    if (w == width && h == height) return YES; // 変化なし
+    if (w == width && h == height) return YES; // unchanged
 
-    // phase 1: 新リソースを確保（成功するまで旧リソースには触れない）
+    // phase 1: allocate the new resources (the old ones are untouched until this succeeds)
     uint32_t* nb0 = (uint32_t*)calloc((size_t)w * h, sizeof(uint32_t));
     uint32_t* nb1 = (uint32_t*)calloc((size_t)w * h, sizeof(uint32_t));
     if (!nb0 || !nb1) {
         if (nb0) free(nb0);
         if (nb1) free(nb1);
-        return NO; // OOM: 旧サイズ維持
+        return NO; // out of memory: keep the old size
     }
     CGDataProviderRef np0 = CGDataProviderCreateWithData(NULL, nb0, (size_t)w * h * sizeof(uint32_t), NULL);
     CGDataProviderRef np1 = CGDataProviderCreateWithData(NULL, nb1, (size_t)w * h * sizeof(uint32_t), NULL);
@@ -916,12 +916,12 @@ static size_t utf8SafePrefixLen(const char* s, size_t len, size_t cap) {
         if (np1) CGDataProviderRelease(np1);
         free(nb0);
         free(nb1);
-        return NO; // 旧サイズ維持
+        return NO; // keep the old size
     }
 
-    // phase 2: 旧リソースを破棄して swap。
-    // layer.contents は旧 buffer を参照する CGImage を保持しているので、先に外して
-    // use-after-free を避ける（次の present で新 image を貼る）。
+    // phase 2: destroy the old resources and swap.
+    // layer.contents holds a CGImage that refers to the old buffer, so it is detached first to avoid
+    // using freed memory (the next present attaches the new image).
     contentLayer.contents = nil;
     CGDataProviderRelease(provider0);
     CGDataProviderRelease(provider1);
@@ -937,7 +937,7 @@ static size_t utf8SafePrefixLen(const char* s, size_t len, size_t cap) {
     width = w;
     height = h;
     if (!physicalMode) {
-        // .logical: framebuffer == logical。layer frame も同寸法（従来どおり）。
+        // .logical: framebuffer == logical, and the layer frame has the same size (as before).
         logicalWidth = w;
         logicalHeight = h;
         contentLayer.frame = CGRectMake(0, 0, w, h);
@@ -945,8 +945,8 @@ static size_t utf8SafePrefixLen(const char* s, size_t len, size_t cap) {
     return YES;
 }
 
-// TASK-156.1: pending logical size / scale を lock 境界で latch。
-// scale_epoch は buffer 再確保・scale 適用が成功したときだけ +1（OOM 時は旧 3 値+旧 epoch を維持）。
+// Latch the pending logical size and scale at the lock boundary.
+// scale_epoch is incremented only when reallocating the buffer and applying the scale both succeed (on OOM the old three values and the old epoch are kept).
 - (void)refreshPendingContentScale {
     if (!self.window) return;
     CGFloat live = self.window.backingScaleFactor;
@@ -955,14 +955,14 @@ static size_t utf8SafePrefixLen(const char* s, size_t len, size_t cap) {
 }
 
 - (void)applyLatchedMetricsIfNeeded {
-    // lock 時に live backingScaleFactor を再確認（通知取りこぼし対策）。epoch はまだ増やさない。
+    // Re-read the live backingScaleFactor at lock time (in case a notification was missed). The epoch is not incremented yet.
     [self refreshPendingContentScale];
 
     const CGFloat newScale = (pendingContentScale > 0.0) ? pendingContentScale : 1.0;
     const BOOL scaleChanging = fabs(newScale - contentScale) > 1e-6;
 
     if (!physicalMode) {
-        // .logical: buffer 寸法は触らず。scale が変わったときだけ epoch と latched scale を原子 commit。
+        // .logical: the buffer size is left alone. Only when the scale changes are the epoch and the latched scale committed atomically.
         if (scaleChanging) {
             contentScale = newScale;
             scaleEpoch += 1;
@@ -987,11 +987,11 @@ static size_t utf8SafePrefixLen(const char* s, size_t len, size_t cap) {
 
     if (sizeChanging) {
         if (![self resizeBuffersTo:fw height:fh]) {
-            // OOM: 旧 buffer / 旧 latched scale / 旧 epoch を維持（pending は残して次 lock で再試行）
+            // out of memory: keep the old buffer, the old latched scale and the old epoch (the pending value stays for the next lock to retry)
             return;
         }
     }
-    // 成功時のみ logical・latched scale・epoch をまとめて commit
+    // only on success are the logical size, the latched scale and the epoch committed together
     logicalWidth = lw;
     logicalHeight = lh;
     if (scaleChanging) scaleEpoch += 1;
@@ -1001,8 +1001,8 @@ static size_t utf8SafePrefixLen(const char* s, size_t len, size_t cap) {
     contentLayer.contentsScale = contentScale;
 }
 
-// forQuery=YES: current negotiated（pending scale）。lock 前の contentScale()/入力正規化用。
-// forQuery=NO: latched snapshot（buffer/scale/epoch が同一 frame に属する）。lock_ex 用。
+// forQuery=YES: the current negotiated value (the pending scale), for contentScale() and input normalisation before a lock.
+// forQuery=NO: the latched snapshot (buffer, scale and epoch all belong to the same frame), for lock_ex.
 - (void)fillMetrics:(PlatformFramebufferMetrics*)out forQuery:(BOOL)forQuery {
     if (!out) return;
     if (forQuery) [self refreshPendingContentScale];
@@ -1027,7 +1027,7 @@ static size_t utf8SafePrefixLen(const char* s, size_t len, size_t cap) {
         s = self.window.backingScaleFactor;
         if (s <= 0.0) s = 1.0;
     }
-    // pending のみ更新。epoch / latched scale / buffer は次の lock 成功時に原子 commit。
+    // Only the pending value is updated. The epoch, the latched scale and the buffer are committed atomically on the next successful lock.
     if (fabs(s - pendingContentScale) > 1e-6) {
         pendingContentScale = s;
         if (physicalMode && redrawCallback) {
@@ -1036,9 +1036,9 @@ static size_t utf8SafePrefixLen(const char* s, size_t len, size_t cap) {
     }
 }
 
-// NSView がリサイズ時に呼ぶ。新しい logical サイズに合わせて fb を再確保する。
-// サイズが実際に変わったときだけ redraw callback を発火する（TASK-23.1。
-// AppKit の live-resize tracking run loop 中でも CATransaction commit により画面反映される）。
+// Called by NSView on a resize. Reallocates the framebuffer for the new logical size.
+// The redraw callback fires only when the size really changed (a CATransaction commit puts it on
+// screen even inside AppKit's live-resize tracking run loop).
 - (void)setFrameSize:(NSSize)newSize {
     [super setFrameSize:newSize];
     if (physicalMode) {
@@ -1050,7 +1050,7 @@ static size_t utf8SafePrefixLen(const char* s, size_t len, size_t cap) {
             pendingLogicalWidth = nw;
             pendingLogicalHeight = nh;
             hasPendingResize = YES;
-            // buffer は次 lock で apply。redraw で app に lock を促す。
+            // the buffer is applied on the next lock; the redraw prompts the application to lock
             if (redrawCallback) redrawCallback(redrawUserdata);
         }
         return;
@@ -1070,17 +1070,17 @@ static size_t utf8SafePrefixLen(const char* s, size_t len, size_t cap) {
 }
 
 // ========================================
-// NSTextInputClient / IME composition (TASK-79.6.1)
+// NSTextInputClient and IME composition
 // ========================================
-// keyDown は poll ループで物理 key_down を積んだ後 interpretKeyEvents: に渡し、
-// insertText: が char_input の唯一の生成元になる（旧 event.characters 直読みは廃止）。
+// keyDown pushes the physical key_down in the poll loop and then hands the event to
+// interpretKeyEvents:, making insertText: the only source of char_input.
 
 - (BOOL)acceptsFirstResponder {
     return YES;
 }
 
 - (uint32_t)copyCompositionSnapshot:(char*)buf cap:(uint32_t)cap meta:(PlatformCompositionMeta*)meta {
-    // latest-wins: 常に現在 preedit。event.revision は取りこぼし検知用（過去 revision は取れない）。
+    // latest-wins: always the current preedit. event.revision only detects a missed update (an older revision cannot be read).
     if (meta) {
         meta->revision = compositionRevision;
         meta->cursor = compositionCursor;
@@ -1090,7 +1090,7 @@ static size_t utf8SafePrefixLen(const char* s, size_t len, size_t cap) {
         if (meta) meta->len = 0;
         return 0;
     }
-    // UTF-8 codepoint 境界で切断（codex 修正 A）
+    // cut on a UTF-8 code point boundary
     uint32_t n = (uint32_t)utf8SafePrefixLen(compositionUtf8, compositionLen, cap);
     memcpy(buf, compositionUtf8, n);
     if (meta) {
@@ -1100,7 +1100,7 @@ static size_t utf8SafePrefixLen(const char* s, size_t len, size_t cap) {
     return n;
 }
 
-/// markedText → compositionUtf8 / compositionCursor を同期する。
+/// Synchronise markedText into compositionUtf8 / compositionCursor.
 - (void)syncCompositionBufferFromMarked {
     const char* utf8 = [markedText UTF8String];
     if (!utf8) {
@@ -1109,11 +1109,11 @@ static size_t utf8SafePrefixLen(const char* s, size_t len, size_t cap) {
         return;
     }
     size_t raw_len = strlen(utf8);
-    // 固定バッファへ UTF-8 境界で truncate（codex 修正 A）
+    // truncate into the fixed buffer on a UTF-8 boundary
     size_t len = utf8SafePrefixLen(utf8, raw_len, COMPOSITION_UTF8_CAP);
     memcpy(compositionUtf8, utf8, len);
     compositionLen = (uint32_t)len;
-    // selectedRange.location は UTF-16 単位。UTF-8 オフセットへ変換する。
+    // selectedRange.location is in UTF-16 units, so convert it to a UTF-8 offset.
     NSUInteger loc = imeSelectedRange.location;
     if (loc > markedText.length) loc = markedText.length;
     NSString* prefix = [markedText substringToIndex:loc];
@@ -1135,12 +1135,12 @@ static size_t utf8SafePrefixLen(const char* s, size_t len, size_t cap) {
     key_trace("composition phase=%u revision=%u cursor=%u", phase, compositionRevision, compositionCursor);
 }
 
-/// insertText の文字列を codepoint 分解して CHAR_INPUT を積む（制御/private-use 除外）。
-/// Cmd/Ctrl 押下中は char_input を出さない（キーバインド経由 insertText の誤印字防止。codex 修正 B）。
+/// Split the insertText string into code points and push CHAR_INPUT (excluding control and private-use characters).
+/// No char_input is emitted while Cmd or Ctrl is held (which would print a character for an insertText coming from a key binding).
 - (void)pushCharInputsFromString:(NSString*)str {
     if (!platformWindow || !str) return;
     uint32_t char_mods = extractModifiers([NSEvent modifierFlags]);
-    // printable フィルタと同列の invariant: cmd/ctrl 付きは印字しない
+    // the same invariant as the printable filter: nothing with cmd or ctrl is printed
     if (char_mods & (PLATFORM_MOD_CMD | PLATFORM_MOD_CTRL)) return;
     NSUInteger clen = str.length;
     for (NSUInteger ci = 0; ci < clen;) {
@@ -1191,8 +1191,8 @@ static size_t utf8SafePrefixLen(const char* s, size_t len, size_t cap) {
 }
 
 - (NSRange)resolveReplacementRange:(NSRange)replacementRange {
-    // 優先順: 明示（length>0）→ pending → 明示（length==0 / caret）→ selected。
-    // TASK-159: insertText が caret 零長を明示しても、再変換 latch 済み pending を優先する。
+    // Priority: explicit (length>0) → pending → explicit (length==0, a caret) → selected.
+    // Even when insertText states a zero-length caret, a pending range latched for reconversion wins.
     if (replacementRange.location != NSNotFound && replacementRange.length > 0) {
         return replacementRange;
     }
@@ -1249,7 +1249,7 @@ static size_t utf8SafePrefixLen(const char* s, size_t len, size_t cap) {
                   prev, ex, path, fin, pend);
         [self clearPendingReplacementWithReason:"insertText"];
         if (useRange.location == NSNotFound) return;
-        // UTF-8 変換失敗は拒否（buffer 不変・char_input も出さない）
+        // A failed UTF-8 conversion is rejected (the buffer is untouched and no char_input is emitted)
         if (!str) str = @"";
         NSData* data = [str dataUsingEncoding:NSUTF8StringEncoding allowLossyConversion:NO];
         if (!data && str.length > 0) return;
@@ -1280,17 +1280,17 @@ static size_t utf8SafePrefixLen(const char* s, size_t len, size_t cap) {
     char before[64], after[64], repl[64], sel[64], prev[80];
     if (hasPendingReplacement) ime_range_desc(pendingReplacement, before, sizeof(before));
     else snprintf(before, sizeof(before), "none");
-    // TASK-159: 有効な replacementRange は同一 reconversion/composition で一度だけ latch する。
-    // 後続の NSNotFound / caret 零長では上書きしない。
+    // A valid replacementRange is latched exactly once per reconversion or composition.
+    // A later NSNotFound or zero-length caret does not overwrite it.
     //
-    // pending 破棄条件（空 setMarkedText は cancel ではない — 日本語 IM 再変換は
-    // setMarkedText(" ", range) → setMarkedText("") → setMarkedText(候補) → insertText
-    // の列で来る。空 mark で pending を消すと insertText が caret 純挿入になり二重化する）:
-    //   - insertText で消費した直後
-    //   - unmarkText（ESC 等）
-    //   - setTextInputActive:NO / document access 解除 / window destroy 経路
-    // 安全弁: 新規の有効 replacementRange は hasPending==NO のときだけ latch
-    // （消費・破棄後の次セッション開始）。空 mark や NSNotFound 更新では破棄しない。
+    // When the pending range is discarded (an empty setMarkedText is not a cancel: Japanese input reconversion
+    // arrives as setMarkedText(" ", range) → setMarkedText("") → setMarkedText(candidate) → insertText, and
+    // dropping the pending range on the empty mark would turn insertText into a plain caret insertion, duplicating the text):
+    //   - right after insertText consumed it
+    //   - unmarkText (ESC and the like)
+    //   - setTextInputActive:NO, unregistering document access, or destroying the window
+    // The safety valve: a new valid replacementRange is latched only while hasPending==NO
+    // (the start of the next session, after the previous one was consumed or discarded). An empty mark or an NSNotFound update discards nothing.
     if (replacementRange.location != NSNotFound && !hasPendingReplacement) {
         hasPendingReplacement = YES;
         pendingReplacement = replacementRange;
@@ -1312,8 +1312,8 @@ static size_t utf8SafePrefixLen(const char* s, size_t len, size_t cap) {
     if (markedText.length == 0) {
         compositionLen = 0;
         compositionCursor = 0;
-        // TASK-159: 空 mark は preedit 表示のクリアのみ。pending は保持する。
-        // CANCEL phase も出さない（真の cancel は unmarkText）。
+        // An empty mark only clears the preedit display; the pending range is kept.
+        // No CANCEL phase is emitted either (a real cancel is unmarkText).
         char keep[64];
         if (hasPendingReplacement) ime_range_desc(pendingReplacement, keep, sizeof(keep));
         else snprintf(keep, sizeof(keep), "none");
@@ -1347,20 +1347,20 @@ static size_t utf8SafePrefixLen(const char* s, size_t len, size_t cap) {
     return markedText.length > 0;
 }
 
-// TASK-142: keyDown を IME(inputContext) へ渡すべきか。未制御=従来どおり常時 YES。
+// Whether keyDown should go to the IME (inputContext). Uncontrolled means always YES, as before.
 - (BOOL)imeRouteEnabled {
     return imeControlled ? imeActive : YES;
 }
 
-// TASK-142: テキスト編集フォーカスの有無を app から受ける。実効経路が YES→NO へ変わるとき
-// （未制御=常時 YES からの初回 inactive も含む）保留 composition を破棄する。
+// Receive the presence of text editing focus from the application. When the effective path goes
+// YES→NO (the first inactive from uncontrolled, i.e. always-YES, included) a pending composition is discarded.
 - (void)setTextInputActive:(BOOL)active {
-    BOOL wasRouting = [self imeRouteEnabled];     // 変更前の実効経路（未制御なら YES）
+    BOOL wasRouting = [self imeRouteEnabled];     // the effective path before the change (YES while uncontrolled)
     imeControlled = YES;
-    imeActive = active;                           // 変更後の実効経路 = active
+    imeActive = active;                           // the effective path after the change = active
     if (wasRouting && !active) {
-        [self unmarkText];                        // markedText クリア + CANCEL phase + pending 破棄
-        [[self inputContext] discardMarkedText];  // IME の変換セッションも破棄（候補窓を閉じる）
+        [self unmarkText];                        // clear markedText, emit the CANCEL phase and discard the pending range
+        [[self inputContext] discardMarkedText];  // discard the IME's conversion session too (closing the candidate window)
         [self clearPendingReplacementWithReason:"setTextInputActive_false"];
     }
 }
@@ -1470,8 +1470,8 @@ static size_t utf8SafePrefixLen(const char* s, size_t len, size_t cap) {
 
 - (NSRect)firstRectForCharacterRange:(NSRange)range actualRange:(NSRangePointer)actualRange {
     if (actualRange) *actualRange = range;
-    // app の framebuffer pixel rect を view point へ換算する。fb は Retina backing ではなく
-    // contentLayer が bounds 全面へ拡縮表示するため、換算は bounds 比（mouse 変換の逆写像と同型）。
+    // Convert the application's framebuffer pixel rect into view points. The framebuffer is not a Retina
+    // backing: contentLayer scales it across the whole of bounds, so the conversion is the bounds ratio (the inverse of the mouse conversion).
     NSRect r;
     if (compositionRectSet && compositionRectPixels.size.width > 0 && compositionRectPixels.size.height > 0) {
         const NSRect bounds = self.bounds;
@@ -1487,7 +1487,7 @@ static size_t utf8SafePrefixLen(const char* s, size_t len, size_t cap) {
         h = MIN(h, MAX(0.0, bounds.size.height - top));
         r = NSMakeRect(x, bounds.size.height - top - h, w, h);
     } else {
-        // 未供給/0 サイズは既存 MVP 固定 rect fallback。
+        // Nothing supplied, or a zero size, falls back to the existing fixed rect.
         r = NSMakeRect(20.0, self.bounds.size.height - 48.0, 1.0, 18.0);
     }
     r = [self convertRect:r toView:nil];
@@ -1501,7 +1501,7 @@ static size_t utf8SafePrefixLen(const char* s, size_t len, size_t cap) {
 }
 
 - (void)doCommandBySelector:(SEL)selector {
-    // 未処理 command を吸収してビープ抑止。BACKSPACE/ENTER 等の物理キーは key_down 経路で既に届く。
+    // Absorb an unhandled command to suppress the beep. A physical key such as BACKSPACE or ENTER already arrives through the key_down path.
     key_trace("doCommandBySelector=%s", selector ? sel_getName(selector) : "(null)");
 }
 
@@ -1514,30 +1514,30 @@ static size_t utf8SafePrefixLen(const char* s, size_t len, size_t cap) {
 }
 
 // ========================================
-// マウスイベント関連 (TASK-21.1)
+// Mouse events
 // ========================================
 
 - (void)clearPlatformWindow {
     platformWindow = NULL;
 }
 
-// 非アクティブ window への最初のクリックでも mouseDown: を受け取る
+// Receive mouseDown: even for the first click on an inactive window
 - (BOOL)acceptsFirstMouse:(NSEvent *)event {
     (void)event;
     return YES;
 }
 
-// NSTrackingArea を view サイズに合わせて再構築
+// Rebuild the NSTrackingArea to match the view size
 - (void)updateTrackingAreas {
     [super updateTrackingAreas];
     if (trackingArea) {
         [self removeTrackingArea:trackingArea];
         trackingArea = nil;
     }
-    // NSTrackingCursorUpdate: マウスが再入した際に cursorUpdate: を呼んでもらい、OS が
-    // ウィンドウ切替等でカーソルをリセットしても復帰できるようにする (TASK-75.1)。
-    // NSTrackingMouseEnteredAndExited: view 内外を追跡し、hidden の所有権解除（mouseExited）と
-    // 形状の適用（mouseEntered）を行う（codex レビュー: hide/unhide は view 内にいる時のみ行う）。
+    // NSTrackingCursorUpdate: have cursorUpdate: called when the mouse re-enters, so the cursor
+    // recovers even after the OS resets it (on a window switch, say).
+    // NSTrackingMouseEnteredAndExited: track entering and leaving the view, releasing ownership of
+    // hidden (mouseExited) and applying the shape (mouseEntered). Hiding and unhiding happen only while inside the view.
     NSTrackingAreaOptions opts = NSTrackingMouseMoved
                                 | NSTrackingCursorUpdate
                                 | NSTrackingMouseEnteredAndExited
@@ -1551,17 +1551,17 @@ static size_t utf8SafePrefixLen(const char* s, size_t len, size_t cap) {
 }
 
 // ========================================
-// カーソル制御 (TASK-75.1)
+// Cursor control
 // ========================================
 //
-// 方針: NSCursor hide/unhide はプロセス全体の参照カウント API のため、view が「今 hide を
-// 所有しているか」を cursorHiddenByThisView で厳密に管理する（hide は false→true 遷移時のみ、
-// unhide は true→false 遷移時のみ呼ぶ）。加えて set/hide の実適用は mouseInsideView が true の
-// 間だけ行い、view 外にいる間に来た setCursor はまだ反映せず形状のみ保存する（マウスが view 外
-// にある状態で誤って全体のカーソルを hide/変形させないため）。
+// The policy: NSCursor hide/unhide is a process-wide reference-counted API, so cursorHiddenByThisView
+// tracks strictly whether this view currently owns the hide (hide only on a false→true transition,
+// unhide only on true→false). On top of that, set and hide are really applied only while
+// mouseInsideView is true; a setCursor arriving while the mouse is outside merely stores the shape
+// (so the cursor of the whole system is never hidden or reshaped by mistake while the mouse is elsewhere).
 
-// currentCursorShape に対応する NSCursor を返す（PLATFORM_CURSOR_HIDDEN はここでは扱わない）。
-// 未対応形状は arrow にフォールバックする。
+// Return the NSCursor matching currentCursorShape (PLATFORM_CURSOR_HIDDEN is not handled here).
+// An unsupported shape falls back to the arrow.
 - (NSCursor *)nsCursorForShape:(PlatformCursorShape)shape {
     switch (shape) {
         case PLATFORM_CURSOR_CROSSHAIR:
@@ -1572,7 +1572,7 @@ static size_t utf8SafePrefixLen(const char* s, size_t len, size_t cap) {
     }
 }
 
-// mouseInsideView 前提で currentCursorShape を実際に適用する（hide 所有権の遷移も含む）。
+// Really apply currentCursorShape, assuming mouseInsideView (including the transfer of hide ownership).
 - (void)applyCursorShapeIfInside {
     if (!mouseInsideView) return;
     if (currentCursorShape == PLATFORM_CURSOR_HIDDEN) {
@@ -1589,21 +1589,21 @@ static size_t utf8SafePrefixLen(const char* s, size_t len, size_t cap) {
     }
 }
 
-// platform_set_cursor から呼ばれる。形状を保存し、view 内にいれば即時反映する。
+// Called from platform_set_cursor. Stores the shape and applies it at once while inside the view.
 - (void)setCursorShape:(PlatformCursorShape)shape {
     currentCursorShape = shape;
     [self applyCursorShapeIfInside];
 }
 
-// マウスが view に再入した (TASK-75.1)。現在の形状を反映する。
+// The mouse re-entered the view. Apply the current shape.
 - (void)mouseEntered:(NSEvent *)event {
     (void)event;
     mouseInsideView = YES;
     [self applyCursorShapeIfInside];
 }
 
-// マウスが view から出た (TASK-75.1)。hide を所有中なら必ず解放する
-// （view 外で OS カーソルが消えたままになるのを防ぐ。codex レビュー指摘）。
+// The mouse left the view. Whenever this view owns the hide, it must release it
+// (otherwise the OS cursor stays gone while outside the view).
 - (void)mouseExited:(NSEvent *)event {
     (void)event;
     mouseInsideView = NO;
@@ -1613,16 +1613,16 @@ static size_t utf8SafePrefixLen(const char* s, size_t len, size_t cap) {
     }
 }
 
-// AppKit がトラッキングエリア再入時に呼ぶ。他アプリ切替等で OS がカーソルをリセットしても復帰する。
+// Called by AppKit when the tracking area is re-entered. The cursor recovers even after the OS reset it on an application switch.
 - (void)cursorUpdate:(NSEvent *)event {
     (void)event;
-    // cursorUpdate は tracking rect 内でのみ呼ばれる（NSTrackingCursorUpdate）ので view 内扱いにする。
-    // mouseEntered 未発火・順序差・window 切替後の cursor reset 復帰でも形状を反映するため（codex レビュー指摘）。
+    // cursorUpdate is only called inside the tracking rect (NSTrackingCursorUpdate), so this counts as being inside the view.
+    // That applies the shape even when mouseEntered did not fire, when the order differs, or when recovering from a cursor reset after a window switch.
     mouseInsideView = YES;
     [self applyCursorShapeIfInside];
 }
 
-// 共通: mouse_down / mouse_up / mouse_move (button 押下中含む) を enqueue
+// Shared: enqueue mouse_down / mouse_up / mouse_move (including a move with a button held)
 - (void)enqueueMouseEvent:(PlatformEventType)type withButton:(PlatformMouseButton)btn from:(NSEvent*)event {
     if (!platformWindow) return;
     int32_t x, y;
@@ -1640,7 +1640,7 @@ static size_t utf8SafePrefixLen(const char* s, size_t len, size_t cap) {
     queue_push(q, &ev);
 }
 
-// scrollWheel: は別 payload なので個別実装
+// scrollWheel: has its own payload, so it is implemented separately
 - (void)scrollWheel:(NSEvent *)event {
     if (!platformWindow) return;
     int32_t x, y;
@@ -1654,7 +1654,7 @@ static size_t utf8SafePrefixLen(const char* s, size_t len, size_t cap) {
         dx *= SCROLL_LINE_TO_POINTS;
         dy *= SCROLL_LINE_TO_POINTS;
     }
-    // raw physical unit（facade が latched scale で論理化）
+    // raw physical units (the facade turns them into logical ones with the latched scale)
     dx *= (float)scale;
     dy *= (float)scale;
 
@@ -1673,13 +1673,13 @@ static size_t utf8SafePrefixLen(const char* s, size_t len, size_t cap) {
     queue_push(q, &ev);
 }
 
-// mouseDown / mouseUp / mouseDragged: 左ボタン
+// mouseDown / mouseUp / mouseDragged: the left button
 - (void)mouseDown:(NSEvent *)event {
-    lastMouseDownEvent = event; // TASK-104: beginDrag 用に直近の左 down を保持（ARC strong）
+    lastMouseDownEvent = event; // keep the most recent left down for beginDrag (ARC strong)
     [self enqueueMouseEvent:PLATFORM_EVENT_MOUSE_DOWN withButton:button_from_event(event) from:event];
 }
 - (void)mouseUp:(NSEvent *)event {
-    lastMouseDownEvent = nil; // TASK-104: up で stale 破棄（drag 開始済みなら既に消費済み）
+    lastMouseDownEvent = nil; // discard the stale event on up (once a drag has started it is already consumed)
     [self enqueueMouseEvent:PLATFORM_EVENT_MOUSE_UP withButton:button_from_event(event) from:event];
 }
 - (void)mouseDragged:(NSEvent *)event {
@@ -1687,7 +1687,7 @@ static size_t utf8SafePrefixLen(const char* s, size_t len, size_t cap) {
 }
 
 // rightMouseDown / rightMouseUp / rightMouseDragged
-// Control+左クリックもここに流れるが、buttonNumber=0 のままなので button=LEFT として扱う
+// Control plus a left click comes here too, but buttonNumber stays 0, so it counts as button=LEFT
 - (void)rightMouseDown:(NSEvent *)event {
     [self enqueueMouseEvent:PLATFORM_EVENT_MOUSE_DOWN withButton:button_from_event(event) from:event];
 }
@@ -1698,7 +1698,7 @@ static size_t utf8SafePrefixLen(const char* s, size_t len, size_t cap) {
     [self enqueueMouseEvent:PLATFORM_EVENT_MOUSE_MOVE withButton:PLATFORM_MOUSE_BUTTON_NONE from:event];
 }
 
-// otherMouseDown / otherMouseUp / otherMouseDragged: middle (buttonNumber=2) のみ受ける、X1/X2 は無視
+// otherMouseDown / otherMouseUp / otherMouseDragged: only middle (buttonNumber=2) is taken; X1/X2 are ignored
 - (void)otherMouseDown:(NSEvent *)event {
     if (event.buttonNumber != 2) return;
     [self enqueueMouseEvent:PLATFORM_EVENT_MOUSE_DOWN withButton:PLATFORM_MOUSE_BUTTON_MIDDLE from:event];
@@ -1712,7 +1712,7 @@ static size_t utf8SafePrefixLen(const char* s, size_t len, size_t cap) {
     [self enqueueMouseEvent:PLATFORM_EVENT_MOUSE_MOVE withButton:PLATFORM_MOUSE_BUTTON_NONE from:event];
 }
 
-// hover (ボタン未押下時) の移動。NSWindow.acceptsMouseMovedEvents = YES + NSTrackingArea が必要
+// A hover move (with no button held). It needs NSWindow.acceptsMouseMovedEvents = YES plus an NSTrackingArea
 - (void)mouseMoved:(NSEvent *)event {
     [self enqueueMouseEvent:PLATFORM_EVENT_MOUSE_MOVE withButton:PLATFORM_MOUSE_BUTTON_NONE from:event];
 }
@@ -1720,15 +1720,15 @@ static size_t utf8SafePrefixLen(const char* s, size_t len, size_t cap) {
 @end
 
 // ========================================
-// キーコード変換
+// Key code conversion
 // ========================================
 
-// macOSのキーコードをPlatformKeyCodeに変換
-// 参考: /Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/SDKs/MacOSX.sdk/System/Library/Frameworks/Carbon.framework/Versions/A/Frameworks/HIToolbox.framework/Versions/A/Headers/Events.h
+// Convert a macOS key code into a PlatformKeyCode
+// Reference: /Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/SDKs/MacOSX.sdk/System/Library/Frameworks/Carbon.framework/Versions/A/Frameworks/HIToolbox.framework/Versions/A/Headers/Events.h
 static PlatformKeyCode mapKeyCodeToPlatform(unsigned short keyCode) {
-    // macOSのキーコード（ANSI配列）から標準キーコードへの変換
+    // From a macOS key code (the ANSI layout) to the standard key code
     switch (keyCode) {
-        // 文字キー（ANSI配列）
+        // character keys (the ANSI layout)
         case 0x00: return PLATFORM_KEY_A;
         case 0x01: return PLATFORM_KEY_S;
         case 0x02: return PLATFORM_KEY_D;
@@ -1786,20 +1786,20 @@ static PlatformKeyCode mapKeyCodeToPlatform(unsigned short keyCode) {
         // Escape
         case 0x35: return PLATFORM_KEY_ESCAPE;  // kVK_Escape
 
-        // モディファイアキー（左）
+        // modifier keys (left)
         case 0x38: return PLATFORM_KEY_LEFT_SHIFT;      // kVK_Shift
         case 0x3A: return PLATFORM_KEY_LEFT_ALT;        // kVK_Option
         case 0x3B: return PLATFORM_KEY_LEFT_CONTROL;    // kVK_Control
         case 0x37: return PLATFORM_KEY_LEFT_SUPER;      // kVK_Command
         case 0x39: return PLATFORM_KEY_CAPS_LOCK;       // kVK_CapsLock
 
-        // モディファイアキー（右）
+        // modifier keys (right)
         case 0x3C: return PLATFORM_KEY_RIGHT_SHIFT;     // kVK_RightShift
         case 0x3D: return PLATFORM_KEY_RIGHT_ALT;       // kVK_RightOption
         case 0x3E: return PLATFORM_KEY_RIGHT_CONTROL;   // kVK_RightControl
         case 0x36: return PLATFORM_KEY_RIGHT_SUPER;     // kVK_RightCommand
 
-        // ファンクションキー
+        // function keys
         case 0x7A: return PLATFORM_KEY_F1;              // kVK_F1
         case 0x78: return PLATFORM_KEY_F2;              // kVK_F2
         case 0x63: return PLATFORM_KEY_F3;              // kVK_F3
@@ -1821,7 +1821,7 @@ static PlatformKeyCode mapKeyCodeToPlatform(unsigned short keyCode) {
         case 0x50: return PLATFORM_KEY_F19;             // kVK_F19
         case 0x5A: return PLATFORM_KEY_F20;             // kVK_F20
 
-        // 編集キー
+        // editing keys
         case 0x72: return PLATFORM_KEY_INSERT;          // kVK_Help
         case 0x73: return PLATFORM_KEY_HOME;            // kVK_Home
         case 0x74: return PLATFORM_KEY_PAGE_UP;         // kVK_PageUp
@@ -1829,13 +1829,13 @@ static PlatformKeyCode mapKeyCodeToPlatform(unsigned short keyCode) {
         case 0x77: return PLATFORM_KEY_END;             // kVK_End
         case 0x79: return PLATFORM_KEY_PAGE_DOWN;       // kVK_PageDown
 
-        // 矢印キー
+        // arrow keys
         case 0x7B: return PLATFORM_KEY_LEFT;            // kVK_LeftArrow
         case 0x7C: return PLATFORM_KEY_RIGHT;           // kVK_RightArrow
         case 0x7D: return PLATFORM_KEY_DOWN;            // kVK_DownArrow
         case 0x7E: return PLATFORM_KEY_UP;              // kVK_UpArrow
 
-        // テンキー
+        // the numeric keypad
         case 0x52: return PLATFORM_KEY_KP_0;            // kVK_ANSI_Keypad0
         case 0x53: return PLATFORM_KEY_KP_1;            // kVK_ANSI_Keypad1
         case 0x54: return PLATFORM_KEY_KP_2;            // kVK_ANSI_Keypad2
@@ -1858,7 +1858,7 @@ static PlatformKeyCode mapKeyCodeToPlatform(unsigned short keyCode) {
     }
 }
 
-// プラットフォーム初期化
+// Platform initialisation
 bool platform_init(void) {
     const char* trace = getenv("VP_KEY_TRACE");
     g_key_trace_enabled = trace && strcmp(trace, "1") == 0;
@@ -1867,9 +1867,9 @@ bool platform_init(void) {
     return true;
 }
 
-// TASK-104: borderless ウィンドウは既定では key/main になれない。NSWindow を subclass して
-// canBecomeKeyWindow/canBecomeMainWindow を YES にし、入力・IME first responder・
-// performWindowDragWithEvent: が効くようにする。透過/borderless 時のみ使う。
+// A borderless window cannot become key or main by default. NSWindow is subclassed to answer YES
+// to canBecomeKeyWindow/canBecomeMainWindow, so that input, the IME first responder and
+// performWindowDragWithEvent: work. It is used only for a transparent or borderless window.
 @interface MascotWindow : NSWindow
 @end
 @implementation MascotWindow
@@ -1877,17 +1877,17 @@ bool platform_init(void) {
 - (BOOL)canBecomeMainWindow { return YES; }
 @end
 
-// ウィンドウ作成（既存 API。opts なし = 従来どおり不透明・タイトル付き）
+// Create a window (the existing API; no opts = opaque with a title, as before)
 PlatformWindow* platform_create_window(int width, int height, const char* title,
                                       FrameCallback callback, void* userdata) {
     return platform_create_window_ex(width, height, title, callback, userdata, NULL);
 }
 
-// TASK-104 / TASK-117 / TASK-156.1: options 付きウィンドウ作成。opts==NULL は従来動作。
+// Create a window with options. opts==NULL keeps the previous behaviour.
 PlatformWindow* platform_create_window_ex(int width, int height, const char* title,
                                           FrameCallback callback, void* userdata,
                                           const PlatformWindowOptions* opts) {
-    // unknown flags / reserved!=0 は NULL（silent 無視しない。facade が error.Unsupported へ）
+    // Unknown flags or reserved!=0 give NULL (never ignored silently; the facade turns it into error.Unsupported)
     BOOL transparent = NO, borderless = NO, has_position = NO, physical = NO;
     int pos_x = 0, pos_y = 0;
     if (opts) {
@@ -1907,54 +1907,54 @@ PlatformWindow* platform_create_window_ex(int width, int height, const char* tit
     PlatformWindow* platformWindow = (PlatformWindow*)malloc(sizeof(PlatformWindow));
     if (!platformWindow) return NULL;
 
-    // イベントキューを初期化
+    // Initialise the event queue
     memset(&platformWindow->event_queue, 0, sizeof(EventQueue));
     platformWindow->quit_delegate = nil;
     platformWindow->quit_requested = false;
 
     @autoreleasepool {
-        // NSApplicationを取得
+        // Get the NSApplication
         NSApplication* app = [NSApplication sharedApplication];
         [app setActivationPolicy:NSApplicationActivationPolicyRegular];
 
-        // ウィンドウを作成
+        // Create the window
         NSRect frame = NSMakeRect(0, 0, width, height);
         NSWindowStyleMask styleMask;
         if (borderless) {
-            styleMask = NSWindowStyleMaskBorderless; // TASK-104: 枠なし（マスコット等）
+            styleMask = NSWindowStyleMaskBorderless; // frameless (for a mascot and the like)
         } else {
             styleMask = NSWindowStyleMaskTitled |
                         NSWindowStyleMaskClosable |
                         NSWindowStyleMaskMiniaturizable |
-                        NSWindowStyleMaskResizable; // TASK-23: 自由リサイズ
+                        NSWindowStyleMaskResizable; // freely resizable
         }
 
-        // borderless は key window になれる subclass を使う（transparent 単独は通常 NSWindow で可）
+        // borderless uses the subclass that can become the key window (transparent on its own works with a plain NSWindow)
         Class windowClass = borderless ? [MascotWindow class] : [NSWindow class];
         platformWindow->window = [[windowClass alloc] initWithContentRect:frame
                                                                styleMask:styleMask
                                                                  backing:NSBackingStoreBuffered
                                                                    defer:NO];
-        // TASK-139: window tabbing を無効化（保存 defaults / システム設定に依存させず描画領域を full height に保つ）
+        // Disable window tabbing (so the drawing area stays full height regardless of saved defaults or a system setting)
         [platformWindow->window setTabbingMode:NSWindowTabbingModeDisallowed];
 
         [platformWindow->window setTitle:[NSString stringWithUTF8String:title]];
 
-        // hover の mouseMoved: を受け取るために必須 (TASK-21.1)
+        // Required in order to receive a hover mouseMoved:
         [platformWindow->window setAcceptsMouseMovedEvents:YES];
 
-        // TASK-104: 透過ウィンドウ設定（背後が透ける）
+        // Configure the transparent window (the desktop shows through)
         if (transparent) {
             [platformWindow->window setOpaque:NO];
             [platformWindow->window setBackgroundColor:[NSColor clearColor]];
         }
-        // borderless は透過有無に関わらず矩形影を消し、ドラッグ移動可能にする（設計契約）
+        // Borderless drops the rectangular shadow and becomes draggable whether or not it is transparent (the design contract)
         if (borderless) {
             [platformWindow->window setHasShadow:NO];
             [platformWindow->window setMovable:YES];
         }
 
-        // カスタムビューを作成して設定
+        // Create and install the custom view
         platformWindow->view = [[FramebufferView alloc] initWithFrame:frame
                                                                width:width
                                                               height:height
@@ -1967,36 +1967,36 @@ PlatformWindow* platform_create_window_ex(int width, int height, const char* tit
         platformWindow->quit_delegate = quitDelegate;
         [platformWindow->window setDelegate:quitDelegate];
         if (transparent) {
-            [platformWindow->view setTransparentMode:YES]; // CGImage を premultiplied alpha 化
+            [platformWindow->view setTransparentMode:YES]; // Make the CGImage premultiplied alpha
         }
         [platformWindow->window setContentView:platformWindow->view];
-        // setContentView 後に updateTrackingAreas を呼ぶ (view の bounds が確定したタイミングで TrackingArea を構築)
+        // Call updateTrackingAreas after setContentView (the view's bounds are settled by then, so the tracking area is built correctly)
         [platformWindow->view updateTrackingAreas];
 
-        // ウィンドウを表示（TASK-117: 明示位置があれば setFrameOrigin、なければ center）
+        // Show the window (with an explicit position, setFrameOrigin; otherwise center)
         if (has_position) {
             [platformWindow->window setFrameOrigin:NSMakePoint(pos_x, pos_y)];
         } else {
             [platformWindow->window center];
         }
         [platformWindow->window makeKeyAndOrderFront:nil];
-        // IME: view を first responder にして inputContext / interpretKeyEvents が効くようにする（TASK-79.6.1）
+        // IME: make the view the first responder so that inputContext and interpretKeyEvents work
         [platformWindow->window makeFirstResponder:platformWindow->view];
         [app activateIgnoringOtherApps:YES];
 
-        // CADisplayLinkを開始
+        // Start the CADisplayLink
         [platformWindow->view startDisplayLink];
     }
 
 #if defined(VP_ENABLE_GAMEPAD)
-    // ゲームパッド: このwindowをアクティブにし、既接続コントローラを取り込む (TASK-80.2)
+    // Gamepads: make this window the active one and take in the controllers already connected
     gamepadAttachWindow(platformWindow);
 #endif
 
     return platformWindow;
 }
 
-// TASK-117: 現在のウィンドウ geometry。位置=frame.origin、サイズ=content サイズ。
+// The current window geometry. The position is frame.origin, the size is the content size.
 void platform_get_window_geometry(PlatformWindow* platformWindow, PlatformWindowGeometry* out) {
     if (!out) return;
     out->x = 0;
@@ -2017,7 +2017,7 @@ void platform_get_window_geometry(PlatformWindow* platformWindow, PlatformWindow
     }
 }
 
-// 表示中のウィンドウタイトルを更新する（イベント時のみ）。
+// Update the title of the visible window (event time only).
 void platform_set_title(PlatformWindow* platformWindow, const char* title) {
     if (!platformWindow || !title) return;
     @autoreleasepool {
@@ -2025,9 +2025,9 @@ void platform_set_title(PlatformWindow* platformWindow, const char* title) {
     }
 }
 
-// TASK-100.1: 既存ウィンドウをネイティブフルスクリーン化する（緑ボタンと同じ toggleFullScreen:）。
-// titled+resizable window は既定でフルスクリーン可だが、念のため collectionBehavior に
-// FullScreenPrimary を立ててから toggle する。既にフルスクリーンなら no-op（二重 toggle 防止）。
+// Make an existing window natively fullscreen (the same toggleFullScreen: as the green button).
+// A titled, resizable window can go fullscreen by default, but FullScreenPrimary is set on
+// collectionBehavior first, to be safe. Already fullscreen is a no-op (no double toggle).
 void platform_enter_fullscreen(PlatformWindow* window) {
     if (!window) return;
     @autoreleasepool {
@@ -2043,15 +2043,15 @@ void platform_enter_fullscreen(PlatformWindow* window) {
 }
 
 // ========================================
-// 透過 / borderless ウィンドウ + ドラッグ移動 の C ABI 実装 (TASK-104)
+// The C ABI implementation of transparent / borderless windows plus drag-to-move
 // ========================================
 
-// 直近の左 mouse-down を使って OS の対話的ウィンドウ移動を開始する。
+// Start the OS's interactive window move using the most recent left mouse-down.
 void platform_begin_window_drag(PlatformWindow* window) {
     if (!window || !window->view || !window->window) return;
     @autoreleasepool {
-        NSEvent* ev = [window->view takeLastMouseDownEvent]; // one-shot 消費（呼び出し時にクリア）
-        if (!ev) return; // 保持 event が無ければ no-op
+        NSEvent* ev = [window->view takeLastMouseDownEvent]; // consumed one-shot (cleared as it is taken)
+        if (!ev) return; // a no-op when no event is retained
         [window->window performWindowDragWithEvent:ev];
     }
 }
@@ -2059,7 +2059,7 @@ void platform_begin_window_drag(PlatformWindow* window) {
 void platform_set_always_on_top(PlatformWindow* window, bool on) {
     if (!window || !window->window) return;
     @autoreleasepool {
-        // status level = Dock より前・大半のウィンドウより前。off は通常レベルへ戻す。
+        // The status level sits above the Dock and above most windows. Turning it off goes back to the normal level.
         [window->window setLevel:(on ? NSStatusWindowLevel : NSNormalWindowLevel)];
     }
 }
@@ -2072,13 +2072,13 @@ void platform_set_click_through(PlatformWindow* window, bool on) {
 void platform_set_dock_visible(bool visible) {
     @autoreleasepool {
         NSApplication* app = [NSApplication sharedApplication];
-        // accessory = Dock アイコン/メニューバー無しの常駐アプリ。regular = 通常アプリ。
+        // accessory = a background app with no Dock icon and no menu bar. regular = an ordinary app.
         [app setActivationPolicy:(visible ? NSApplicationActivationPolicyRegular
                                           : NSApplicationActivationPolicyAccessory)];
     }
 }
 
-// 終了メニュー用のターゲット。action でフラグを立て、popUp のモーダル復帰後に読む。
+// The target of the quit menu. The action raises a flag, read once popUp returns from its modal loop.
 @interface QuitMenuTarget : NSObject
 @property (nonatomic) BOOL quitChosen;
 - (void)onQuit:(id)sender;
@@ -2098,7 +2098,7 @@ void platform_show_quit_menu(PlatformWindow* window) {
                                                keyEquivalent:@""];
         [item setTarget:target];
         [menu addItem:item];
-        // 現在のマウス位置（view ローカル）にポップアップ。モーダルで、選択されるまで戻らない。
+        // Pop up at the current mouse position (in view coordinates). It is modal and does not return until something is chosen.
         NSPoint screenPt = [NSEvent mouseLocation];
         NSPoint winPt = [window->window convertPointFromScreen:screenPt];
         NSPoint viewPt = [window->view convertPoint:winPt fromView:nil];
@@ -2112,7 +2112,7 @@ void platform_show_quit_menu(PlatformWindow* window) {
     }
 }
 
-// メインループ
+// The main loop
 void platform_run(PlatformWindow* platformWindow) {
     if (!platformWindow) return;
 
@@ -2122,73 +2122,73 @@ void platform_run(PlatformWindow* platformWindow) {
     }
 }
 
-// ウィンドウ破棄
+// Destroying a window
 void platform_destroy_window(PlatformWindow* platformWindow) {
     if (!platformWindow) return;
 
 #if defined(VP_ENABLE_MENU)
-    // menu: 解放前に配送先を外し、遅延 MenuTarget action の UAF を防ぐ (TASK-122 r2)
+    // menu: detach the delivery target before releasing, so a late MenuTarget action cannot use freed memory
     platform_menu_window_will_destroy(platformWindow);
 #endif
 #if defined(VP_ENABLE_GAMEPAD)
-    // ゲームパッド: このwindowがアクティブなら参照を外す (TASK-80.2)
+    // gamepads: drop the reference when this window is the active one
     gamepadDetachWindow(platformWindow);
 #endif
 
     @autoreleasepool {
-        // 1. view の back-reference を無効化 (以降の mouseDown: 等は早期 return)
+        // 1. invalidate the view's back-reference (a later mouseDown: and friends return early)
         [platformWindow->view clearPlatformWindow];
 
-        // 2. CADisplayLink を停止 (callback から view への参照を断つ)
+        // 2. stop the CADisplayLink (cutting the callback's reference to the view)
         [platformWindow->view stopDisplayLink];
 
-        // 3. delegate を外してから自己終了する（windowShouldClose が誤って quit を積まないため）。
+        // 3. detach the delegate before closing ourselves (so windowShouldClose does not wrongly push a quit).
         [platformWindow->window setDelegate:nil];
         platformWindow->quit_delegate = nil;
-        // 4. window を閉じる → NSWindow が contentView (view) を release
+        // 4. close the window → NSWindow releases the contentView (the view)
         [platformWindow->window close];
     }
 
-    // 5. PlatformWindow 自体を解放
+    // 5. free the PlatformWindow itself
     free(platformWindow);
 }
 
-// consumer が close request をキャンセルして window を継続する。
+// The consumer cancels the close request and keeps the window alive.
 void platform_cancel_quit(PlatformWindow* platformWindow) {
     if (!platformWindow) return;
     platformWindow->quit_requested = false;
 }
 
-// プラットフォームシャットダウン
+// Platform shutdown
 void platform_shutdown(void) {
-    // macOSでは特にクリーンアップ不要
+    // macOS needs no particular cleanup
 }
 
 // ========================================
-// 手動描画用API実装
+// The implementation of the manual drawing API
 // ========================================
 
-// イベントをポーリング（ノンブロッキング）
+// Poll events (non-blocking)
 bool platform_poll_events(PlatformWindow* platformWindow) {
     if (!platformWindow) return false;
 
     @autoreleasepool {
         NSApplication* app = [NSApplication sharedApplication];
 
-        // イベントをポーリング（ブロックしない）
+        // Poll events (without blocking)
         NSEvent* event;
         while ((event = [app nextEventMatchingMask:NSEventMaskAny
                                          untilDate:[NSDate distantPast]
                                             inMode:NSDefaultRunLoopMode
                                            dequeue:YES])) {
-            // キーボードイベントをイベントキューに追加
+            // Add a keyboard event to the event queue
             if (event.type == NSEventTypeKeyDown || event.type == NSEventTypeKeyUp) {
 #if defined(VP_ENABLE_MENU)
-                // TASK-97.3 AC#2（keyEquivalent 二重発火防止）:
-                // 本ループは key イベントを [NSApp sendEvent:] せず直接 C event queue に積む。
-                // そのため AppKit 標準の sendEvent → mainMenu performKeyEquivalent 経路は通らない。
-                // 共有 menu TU へ明示的に performKeyEquivalent を委譲し、消費時は key_down を積まない。
-                // メニュー action は同期で PLATFORM_EVENT_MENU_COMMAND を queue に積む。
+                // Preventing a keyEquivalent from firing twice:
+                // this loop does not [NSApp sendEvent:] a key event but pushes it straight onto the C event queue,
+                // so AppKit's standard sendEvent → mainMenu performKeyEquivalent path is never taken.
+                // performKeyEquivalent is therefore delegated to the shared menu TU explicitly, and once it is consumed no key_down is pushed.
+                // A menu action pushes PLATFORM_EVENT_MENU_COMMAND onto the queue synchronously.
                 if (event.type == NSEventTypeKeyDown) {
                     if (platform_menu_consume_key_equivalent((__bridge void*)event)) {
                         continue;
@@ -2206,17 +2206,17 @@ bool platform_poll_events(PlatformWindow* platformWindow) {
                 EventQueueToken token = queue_push(&platformWindow->event_queue, &platform_event);
                 key_trace("key_%s push=%d slot=%d gen=%u key=%d mods=0x%X", event.type == NSEventTypeKeyDown ? "down" : "up", token.valid, token.index, token.generation, platform_event.payload.keyboard.key, platform_event.payload.keyboard.modifiers);
 
-                // keyDown: 物理 key_down を積んだ後 IME/inputContext 経路へ（TASK-79.6.1）。
-                // insertText: が char_input の唯一の生成元。旧 event.characters 直読みは廃止
-                // （二重入力・IME 迂回防止）。sendEvent は呼ばない（ビープは doCommandBySelector で吸収）。
+                // keyDown: push the physical key_down and then go on to the IME / inputContext path.
+                // insertText: is the only source of char_input; the event.characters are never read directly
+                // (which would double the input and bypass the IME). sendEvent is not called (the beep is absorbed by doCommandBySelector).
                 if (event.type == NSEventTypeKeyDown && platformWindow->view) {
                     FramebufferView* view = platformWindow->view;
                     const BOOL hadMarked = [view hasMarkedText];
                     BOOL handled = NO;
                     const BOOL hasInputContext = [view inputContext] != nil;
-                    // TASK-142: app が text input を制御しているなら active のときだけ IME へ渡す。
-                    // 未制御（imeControlled==NO）は従来どおり常時渡す（後方互換）。渡さない場合は
-                    // insertText/setMarkedText が発火せず、物理 key_down が tombstone されず生き残る。
+                    // When the application controls text input, hand the event to the IME only while it is active.
+                    // Uncontrolled (imeControlled==NO) always hands it over, as before. When it is not handed over,
+                    // insertText/setMarkedText never fire, so the physical key_down is not tombstoned and survives.
                     const BOOL routeToIme = [view imeRouteEnabled];
                     if (hasInputContext && routeToIme) {
                         handled = [[view inputContext] handleEvent:event];
@@ -2227,7 +2227,7 @@ bool platform_poll_events(PlatformWindow* platformWindow) {
                     key_trace("handleEvent bool=%d marked=%d->%d route=%d tombstone=%d", handled, hadMarked, hasMarked, routeToIme, tombstone);
                 }
 
-                // キーイベントは処理済みなので、システムに渡さない（ビープ音を防ぐ）
+                // The key event has been handled, so it is not passed on to the system (which prevents the beep)
                 continue;
             }
 
@@ -2235,9 +2235,9 @@ bool platform_poll_events(PlatformWindow* platformWindow) {
             [app updateWindows];
         }
 
-        // ウィンドウが閉じられているか確認
+        // Check whether the window has been closed
         if (![platformWindow->window isVisible]) {
-            // QUITイベントをキューに追加
+            // Add a QUIT event to the queue
             PlatformEvent quit_event;
             quit_event.type = PLATFORM_EVENT_QUIT;
             queue_push(&platformWindow->event_queue, &quit_event);
@@ -2248,13 +2248,13 @@ bool platform_poll_events(PlatformWindow* platformWindow) {
     }
 }
 
-// 高精度モノトニック時刻を取得（調整なし）
+// Read a high-resolution monotonic time (unadjusted)
 double platform_get_time(void) {
     uint64_t ns = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
     return (double)ns / 1e9;
 }
 
-// フレームバッファへのアクセスを開始（既存 wrapper。lock_ex の width/height 投影）
+// Begin accessing the framebuffer (the existing wrapper; the width/height projection of lock_ex)
 uint32_t* platform_lock_framebuffer(PlatformWindow* platformWindow, int* out_width, int* out_height) {
     PlatformFramebufferMetrics metrics;
     uint32_t* px = platform_lock_framebuffer_ex(platformWindow, &metrics);
@@ -2268,7 +2268,7 @@ bool platform_get_framebuffer_metrics(PlatformWindow* platformWindow, PlatformFr
     if (!platformWindow || !out) return false;
     FramebufferView* view = platformWindow->view;
     if (!view) return false;
-    // current query: pending/current negotiated scale を即座に反映（lock 前の入力正規化用）
+    // The current query: it reflects the pending or current negotiated scale at once (for normalising input before a lock)
     [view fillMetrics:out forQuery:YES];
     return true;
 }
@@ -2278,35 +2278,35 @@ uint32_t* platform_lock_framebuffer_ex(PlatformWindow* platformWindow, PlatformF
     FramebufferView* view = platformWindow->view;
     if (!view) return NULL;
 
-    // pending scale/size を latch（成功時のみ buffer/scale/epoch を原子 commit）
+    // Latch the pending scale and size (only on success are the buffer, scale and epoch committed atomically)
     [view applyLatchedMetricsIfNeeded];
-    // latched snapshot（4 fields が同一 frame に属する）
+    // the latched snapshot (all four fields belong to the same frame)
     if (out) [view fillMetrics:out forQuery:NO];
 
-    // currentBufferを返す（ユーザーが書き込むバッファ）
+    // Return currentBuffer (the buffer the user writes into)
     return [view getCurrentBuffer];
 }
 
-// フレームバッファへのアクセスを終了
+// Finish accessing the framebuffer
 void platform_unlock_framebuffer(PlatformWindow* platformWindow) {
-    // このAPIでは特に何もする必要なし
-    // バッファのスワップはplatform_present()で行う
+    // Nothing in particular is needed in this API
+    // The buffers are swapped in platform_present()
     (void)platformWindow;
 }
 
-// 画面を更新
+// Update the screen
 void platform_present(PlatformWindow* platformWindow) {
     if (!platformWindow) return;
 
     @autoreleasepool {
         FramebufferView* view = platformWindow->view;
 
-        // アクセサメソッドを使用して手動描画
+        // Draw manually, through the accessors
         [view presentManual];
     }
 }
 
-// カーソル形状を設定する (TASK-75.1)。未知値は PLATFORM_CURSOR_DEFAULT にフォールバックする。
+// Set the cursor shape. An unknown value falls back to PLATFORM_CURSOR_DEFAULT.
 void platform_set_cursor(PlatformWindow* platformWindow, int shape) {
     if (!platformWindow) return;
 
@@ -2322,7 +2322,7 @@ void platform_set_cursor(PlatformWindow* platformWindow, int shape) {
     }
 }
 
-// ライブリサイズ再描画コールバック登録 (TASK-23.1)。cb==NULL で解除。
+// Register the live-resize redraw callback. cb==NULL unregisters.
 void platform_set_redraw_callback(PlatformWindow* platformWindow, PlatformRedrawCallback cb, void* userdata) {
     if (!platformWindow) return;
     @autoreleasepool {
@@ -2330,7 +2330,7 @@ void platform_set_redraw_callback(PlatformWindow* platformWindow, PlatformRedraw
     }
 }
 
-// IME composition preedit snapshot（TASK-79.6.1）
+// The IME composition preedit snapshot
 uint32_t platform_get_composition_snapshot(PlatformWindow* window, char* buf, uint32_t cap, PlatformCompositionMeta* meta) {
     if (meta) {
         meta->revision = 0;
@@ -2346,9 +2346,9 @@ void platform_set_composition_rect(PlatformWindow* window, int32_t x, int32_t y,
     [window->view setCompositionRectPixelsX:x y:y w:w h:h];
 }
 
-// TASK-142: テキスト入力フォーカスの有無を platform へ伝える。一度でも呼ぶと以後 controlled 化し、
-// active のときだけ keyDown を IME(inputContext) へ渡す（未呼び出しアプリは従来どおり常時渡す）。
-// active==false への遷移では保留中の composition を破棄する（MacVim の abandonMarkedText 相当）。
+// Tell the platform whether a text editing widget has focus. One call makes it controlled from then
+// on, and keyDown reaches the IME (inputContext) only while active (an application that never calls it always hands it over, as before).
+// A transition to active==false discards any pending composition (the equivalent of MacVim's abandonMarkedText).
 void platform_set_text_input_active(PlatformWindow* window, bool active) {
     if (!window || !window->view) return;
     [window->view setTextInputActive:(active ? YES : NO)];
@@ -2363,7 +2363,7 @@ void platform_set_text_input_document_access(
     [window->view setTextInputDocumentAccess:callbacks userdata:userdata];
 }
 
-// イベントキューカウンタの snapshot 取得 (TASK-21.1)
+// Take a snapshot of the event queue counters
 void platform_get_event_stats(PlatformWindow* window, PlatformEventStats* out) {
     if (!window || !out) return;
     EventQueue* q = &window->event_queue;
@@ -2372,54 +2372,54 @@ void platform_get_event_stats(PlatformWindow* window, PlatformEventStats* out) {
     out->event_drop_count = q->event_drop_count;
 }
 
-// イベント取得API
+// The event API
 bool platform_get_event(PlatformWindow* window, PlatformEvent* event) {
     if (!window || !event) return false;
 
     EventQueue* queue = &window->event_queue;
 
-    // キューが空の場合
+    // when the queue is empty
     if (queue->head == queue->tail) {
         return false;
     }
 
-    // キューから次のイベントを取得
+    // Take the next event from the queue
     *event = queue->events[queue->tail];
     queue->tail = (queue->tail + 1) % EVENT_QUEUE_SIZE;
 
     return true;
 }
 
-// native メニュー本体は platform_macos_menu.m（TASK-122 共有 TU）。
-// 本ファイルは EventQueue bridge（platform_menu_enqueue_command）と
-// poll ループの keyEquivalent 消費呼び出しのみを持つ。
+// The native menu itself lives in platform_macos_menu.m (the shared TU).
+// This file holds only the EventQueue bridge (platform_menu_enqueue_command) and the
+// keyEquivalent consumption call in the poll loop.
 
 // ========================================
-// ゲームパッド入力 (TASK-80.2。ADR-009)
+// Gamepad input (ADR-009)
 // ========================================
 //
-// opt-in（TASK-80.2 opt-in 化）: `platform_get_gamepad_state` は platform.h で常時宣言されるため
-// シンボル自体は non-opt-in exe でも定義する必要がある。GameController 型を一切参照しない
-// always-false fallback を #else 側に用意し、リンクエラーの可能性を Zig 側の dead-code-elimination
-// 頼みにしない（防御的設計）。
+// Opt-in: `platform_get_gamepad_state` is declared unconditionally in platform.h, so the symbol has
+// to be defined even in an executable without the opt-in. An always-false fallback that references
+// no GameController type is provided in the #else branch, rather than relying on dead code
+// elimination on the Zig side to avoid a link error (defensive by design).
 #if defined(VP_ENABLE_GAMEPAD)
 //
-// GCExtendedGamepad.buttonA/B/X/Y は Apple が「物理位置ベース」で既に正規化済み
-// （Nintendo 系コントローラの A/B・X/Y 入替も GameController framework 側で吸収される。
-// Apple公式ドキュメント: "refer to conceptual roles based on physical position, similar to
-// Xbox layout"）ため、本実装は 1:1 マッピングするだけで良い。stick の Y 軸は GameController の
-// raw 値（上入力 = +1）をそのまま渡す（screen 座標へのフリップは consumer 責務。ADR-009 の
-// raw値契約を継承）。
+// GCExtendedGamepad.buttonA/B/X/Y are already normalised by Apple by physical position (the A/B and
+// X/Y swap of a Nintendo-style controller is absorbed by the GameController framework itself; Apple's
+// documentation says they "refer to conceptual roles based on physical position, similar to Xbox
+// layout"), so this implementation only has to map them one to one. A stick's Y axis passes on
+// GameController's raw value (up = +1); flipping it into screen coordinates is the consumer's job
+// (inheriting the raw value contract of ADR-009).
 //
-// ホットパス宣言: フレーム毎に呼ばれる想定だが 4台×少数フィールドの固定長 copy
-// （alloc/lock 無し）で全画素ループでも RT でもないため性能規約の適用対象外（ADR-009 参照）。
+// Hot path declaration: called once per frame, but it is a fixed-length copy of four pads with a few
+// fields each (no allocation, no lock), which is neither an all-pixel loop nor real time, so the performance rules do not apply (see ADR-009).
 bool platform_get_gamepad_state(PlatformWindow* window, int index, PlatformGamepadState* out_state) {
     (void)window;
     if (!out_state || index < 0 || index >= PLATFORM_MAX_GAMEPADS) return false;
     GCController* controller = g_gamepad_slots[index];
     if (!controller) return false;
     GCExtendedGamepad* pad = controller.extendedGamepad;
-    if (!pad) return false; // 接続後に非対応プロファイルへ変化した場合の防御（通常発生しない）
+    if (!pad) return false; // A guard for a profile that changes to an unsupported one after connecting (it does not normally happen)
 
     uint32_t mask = 0;
     if (pad.buttonA.isPressed) mask |= PLATFORM_GAMEPAD_BUTTON_A;
@@ -2429,7 +2429,7 @@ bool platform_get_gamepad_state(PlatformWindow* window, int index, PlatformGamep
     if (pad.leftShoulder.isPressed) mask |= PLATFORM_GAMEPAD_BUTTON_LEFT_SHOULDER;
     if (pad.rightShoulder.isPressed) mask |= PLATFORM_GAMEPAD_BUTTON_RIGHT_SHOULDER;
     if (pad.buttonMenu.isPressed) mask |= PLATFORM_GAMEPAD_BUTTON_START;
-    if (pad.buttonOptions.isPressed) mask |= PLATFORM_GAMEPAD_BUTTON_BACK; // nullable。nilメッセージングでfalse
+    if (pad.buttonOptions.isPressed) mask |= PLATFORM_GAMEPAD_BUTTON_BACK; // nullable; messaging nil gives false
     if (pad.leftThumbstickButton.isPressed) mask |= PLATFORM_GAMEPAD_BUTTON_LEFT_STICK; // nullable
     if (pad.rightThumbstickButton.isPressed) mask |= PLATFORM_GAMEPAD_BUTTON_RIGHT_STICK; // nullable
     if (pad.dpad.up.isPressed) mask |= PLATFORM_GAMEPAD_BUTTON_DPAD_UP;
@@ -2452,17 +2452,17 @@ bool platform_get_gamepad_state(PlatformWindow* window, int index, PlatformGamep
     (void)window;
     (void)index;
     (void)out_state;
-    return false; // opt-in 無効（TASK-80.2 opt-in 化。GameController型を一切参照しない）
+    return false; // the opt-in is off (no GameController type is referenced at all)
 }
 #endif // VP_ENABLE_GAMEPAD
 
 // ========================================
-// ファイル選択ダイアログ (TASK-24)
+// File selection dialogs
 // ========================================
-// 拡張子フィルタは allowedContentTypes (UTType) を使う（macOS 11+ 専用。allowedFileTypes は
-// macOS 12 で deprecated なため移行。UniformTypeIdentifiers framework をリンクする）。
-// 未知拡張子で UTType が nil の場合はフィルタ未設定（全許可）にフォールバックする。
-// fileSystemRepresentation は autorelease プール生存中のみ有効なので、その場で strdup する。
+// The extension filter uses allowedContentTypes (UTType), which is macOS 11 and later only
+// (allowedFileTypes was deprecated in macOS 12). It links the UniformTypeIdentifiers framework.
+// When UTType is nil for an unknown extension, this falls back to no filter (everything allowed).
+// fileSystemRepresentation is valid only while the autorelease pool lives, so it is strdup'd on the spot.
 
 char* platform_save_file_dialog(const PlatformSaveDialogOptions* opts) {
     @autoreleasepool {
@@ -2513,7 +2513,7 @@ void platform_free_path(char* path) {
 }
 
 // ========================================
-// OS テキストクリップボード (TASK-120)
+// The OS text clipboard
 // ========================================
 
 static uint32_t clipboardUtf8TruncateLen(const char* bytes, uint32_t len, uint32_t cap) {

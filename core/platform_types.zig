@@ -1,46 +1,46 @@
-//! Platform 層の共有型定義（backend 非依存の純 Zig 型）
+//! The shared types of the platform layer (pure Zig types, independent of any backend)
 //!
-//! macOS / Linux 等の各 backend が参照する「正準の型契約」。C ABI (`platform.h`)
-//! には依存しない。各 backend は自身の native 値（C 構造体や Xlib イベント等）から
-//! これらの型を構築する。`src/platform.zig`（facade）はこのファイルの型を単一ソースとして
-//! 公開し、`Window`/`Framebuffer` と関数群だけを各 backend から re-export する。
+//! The canonical type contract that each backend (macOS, Linux and the rest) refers to. It does not
+//! depend on the C ABI (`platform.h`); each backend builds these types out of its own native values
+//! (a C struct, an Xlib event, and so on). `core/platform.zig` (the facade) publishes these as the single
+//! source, and re-exports only `Window`/`Framebuffer` and the functions from each backend.
 
 const std = @import("std");
 
 pub const Error = error{
     InitFailed,
     WindowCreationFailed,
-    /// backend が要求されたウィンドウ機能（透過 / borderless 等）に未対応（TASK-104）。
+    /// The backend does not support a requested window feature (transparency, borderless and the like).
     Unsupported,
 };
 
-/// ウィンドウ初期位置（OS 画面座標。TASK-117）。
+/// The initial window position (in OS screen coordinates).
 pub const WindowPosition = struct {
     x: i32,
     y: i32,
 };
 
-/// ウィンドウ content/client サイズ（TASK-117）。
+/// The window's content/client size.
 pub const WindowSize = struct {
     width: u32,
     height: u32,
 };
 
-/// 現在のウィンドウ geometry（TASK-117）。
-/// `position == null` は位置取得・適用非対応または取得不能（Wayland/wasm/headless 等）。
+/// The current window geometry.
+/// `position == null` means reading or applying a position is unsupported or failed (Wayland, wasm, headless).
 pub const WindowGeometry = struct {
     position: ?WindowPosition,
     size: WindowSize,
 };
 
-/// framebuffer 解像度モード（TASK-156.1 / ADR-011 R1）。既定 `.logical` = 現状維持。
-/// `.physical` は opt-in（論理座標のまま物理 px の fb を確保）。
+/// The framebuffer resolution mode (ADR-011 R1). The default `.logical` keeps today's behaviour;
+/// `.physical` is opt-in (a framebuffer in physical pixels while the coordinates stay logical).
 pub const FramebufferMode = enum {
     logical,
     physical,
 };
 
-/// `lockFramebuffer` が返す 1 フレーム分の scale/size snapshot（TASK-156.1 / ADR-011 R2）。
+/// The scale and size snapshot of one frame, returned by `lockFramebuffer` (ADR-011 R2).
 pub const FramebufferSnapshot = struct {
     logical_size: WindowSize,
     framebuffer_size: WindowSize,
@@ -48,9 +48,9 @@ pub const FramebufferSnapshot = struct {
     scale_epoch: u64,
 };
 
-/// ウィンドウ生成オプション（TASK-104 / TASK-117 / TASK-156.1）。既定 `.{}` は現行と同一挙動（不透明・タイトル付き・logical fb）。
-/// 透過は per-pixel alpha（premultiplied alpha 前提）。borderless は枠・タイトルバーなし。
-/// `size` 指定時は `Window.createWithOptions` の w/h を上書きする。`position` は対応 backend のみ適用。
+/// Window creation options. The default `.{}` behaves exactly as before (opaque, with a title, a logical framebuffer).
+/// Transparency is per-pixel alpha (premultiplied alpha is assumed). borderless has no frame and no title bar.
+/// When `size` is given it overrides the w/h of `Window.createWithOptions`. `position` applies only on a backend that supports it.
 pub const WindowOptions = struct {
     transparent: bool = false,
     borderless: bool = false,
@@ -63,11 +63,11 @@ pub const WindowOptions = struct {
 // KeyCode (non-exhaustive enum)
 // ============================================================================
 //
-// 物理キーボードの仮想キーコード。non-exhaustive (`_,`) にしているのは:
-//   - 未列挙の値が来ても `@enumFromInt` が panic しない
-//   - 別バックエンド (Linux/X11 等) が独自キーを足したいときの拡張余地
+// The virtual key codes of a physical keyboard. It is non-exhaustive (`_,`) so that:
+//   - `@enumFromInt` does not panic on a value that is not listed
+//   - another backend (Linux/X11, say) has room to add keys of its own
 //
-// 値は `platform.h` の PlatformKeyCode と同値（macOS backend が C 値をそのまま流用するため）。
+// The values equal PlatformKeyCode in `platform.h` (the macOS backend passes the C values straight through).
 
 pub const KeyCode = enum(c_int) {
     UNKNOWN = -1,
@@ -183,7 +183,7 @@ pub const KeyCode = enum(c_int) {
 };
 
 // ============================================================================
-// ModifierFlags (packed struct, LSB-first で C の bit-mask と一致)
+// ModifierFlags (a packed struct, LSB-first, matching the C bit-mask)
 // ============================================================================
 
 pub const ModifierFlags = packed struct(u32) {
@@ -203,7 +203,7 @@ pub const ModifierFlags = packed struct(u32) {
 };
 
 comptime {
-    // C の SHIFT=0x01, CTRL=0x02, ALT=0x04, CMD=0x08 と packed struct のビット並びが一致することを保証
+    // Guarantees that the bit order of the packed struct matches C's SHIFT=0x01, CTRL=0x02, ALT=0x04, CMD=0x08
     std.debug.assert(@as(u32, @bitCast(ModifierFlags{ .shift = true })) == 0x01);
     std.debug.assert(@as(u32, @bitCast(ModifierFlags{ .ctrl = true })) == 0x02);
     std.debug.assert(@as(u32, @bitCast(ModifierFlags{ .alt = true })) == 0x04);
@@ -211,7 +211,7 @@ comptime {
 }
 
 // ============================================================================
-// MouseButton (物理ボタン基準、C 側 PlatformMouseButton と同じ int 幅)
+// MouseButton (physical buttons, the same int width as C's PlatformMouseButton)
 // ============================================================================
 
 pub const MouseButton = enum(c_int) {
@@ -223,7 +223,7 @@ pub const MouseButton = enum(c_int) {
 };
 
 // ============================================================================
-// MouseButtons (packed struct, LSB-first で C の bit-mask と一致)
+// MouseButtons (a packed struct, LSB-first, matching the C bit-mask)
 // ============================================================================
 
 pub const MouseButtons = packed struct(u8) {
@@ -242,7 +242,7 @@ pub const MouseButtons = packed struct(u8) {
 };
 
 comptime {
-    // C 側 LEFT=0x01, RIGHT=0x02, MIDDLE=0x04 と packed struct のビット並びが一致することを保証
+    // Guarantees that the bit order of the packed struct matches C's LEFT=0x01, RIGHT=0x02, MIDDLE=0x04
     std.debug.assert(@as(u8, @bitCast(MouseButtons{ .left = true })) == 0x01);
     std.debug.assert(@as(u8, @bitCast(MouseButtons{ .right = true })) == 0x02);
     std.debug.assert(@as(u8, @bitCast(MouseButtons{ .middle = true })) == 0x04);
@@ -258,18 +258,18 @@ pub const KeyEvent = struct {
     modifiers: ModifierFlags,
 };
 
-/// テキスト入力イベント（TASK-22）。key_down（物理キー）と独立した「確定文字」の通知。
-/// codepoint は UTF-32（Unicode スカラー値）。IME 確定文字もこの経路で流れる
-/// （TASK-79.6.1: macOS insertText → char_input）。変換中 preedit は `composition_changed`
-/// + `getCompositionSnapshot`（TASK-79.6）。制御文字（0x20 未満・DELETE 0x7f）は
-/// backend 側で除外して印字可能文字のみ流す。
+/// A text input event: a committed character, notified independently of key_down (a physical key).
+/// codepoint is UTF-32 (a Unicode scalar value). A character committed by an IME also arrives here
+/// (on macOS, insertText → char_input). The preedit text being converted comes through
+/// `composition_changed` plus `getCompositionSnapshot`. Control characters (below 0x20, and DELETE
+/// 0x7f) are filtered out by the backend, so only printable characters flow through.
 pub const CharEvent = struct {
     codepoint: u32,
     modifiers: ModifierFlags,
 };
 
-/// IME composition（変換中 preedit）の状態遷移 phase（TASK-79.6.1）。
-/// 本文は event に載せず per-window snapshot API で読む（codex 決定: 寿命契約を曖昧にしない）。
+/// The state transition phase of an IME composition (the preedit being converted).
+/// The text itself is not carried on the event but read through a per-window snapshot API (which keeps the lifetime contract unambiguous).
 pub const CompositionPhase = enum(u8) {
     start = 0,
     update = 1,
@@ -277,23 +277,23 @@ pub const CompositionPhase = enum(u8) {
     cancel = 3,
 };
 
-/// composition_changed イベント本体。revision は snapshot との突合用カウンタ。
-/// cursor は preedit 内 UTF-8 バイトオフセット（caret）。
+/// The composition_changed event itself. revision is the counter used to match it against a snapshot.
+/// cursor is the UTF-8 byte offset within the preedit (the caret).
 pub const CompositionEvent = struct {
     revision: u32,
     phase: CompositionPhase,
     cursor: u32,
 };
 
-/// `Window.getCompositionSnapshot` の戻り値（caller の buf へ UTF-8 を書き込んだ slice）。
+/// The return value of `Window.getCompositionSnapshot` (a slice of the UTF-8 written into the caller's buf).
 pub const CompositionSnapshot = struct {
     text: []const u8,
     revision: u32,
     cursor: u32,
 };
 
-/// IME document access の UTF-16 code unit range（TASK-79.6.3）。
-/// `location == TEXT_INPUT_RANGE_NOT_FOUND` は NSNotFound 相当。
+/// A UTF-16 code unit range for IME document access.
+/// `location == TEXT_INPUT_RANGE_NOT_FOUND` is the equivalent of NSNotFound.
 pub const TEXT_INPUT_RANGE_NOT_FOUND: u64 = std.math.maxInt(u64);
 
 pub const TextInputRange = struct {
@@ -305,31 +305,31 @@ pub const TextInputRange = struct {
     }
 };
 
-/// `getSubstring` が返す借用 UTF-8 と実際に切り出した UTF-16 range。
+/// The borrowed UTF-8 that `getSubstring` returns, plus the UTF-16 range actually taken.
 pub const TextInputSubstring = struct {
     utf8: []const u8,
     actual_range: TextInputRange,
 };
 
-/// IME document access の Zig callback 束（TASK-79.6.3）。
-/// C trampoline から同期呼び出し。getSubstring の utf8 は callback 復帰まで有効。
+/// The bundle of Zig callbacks for IME document access.
+/// Called synchronously from a C trampoline. getSubstring's utf8 is valid until the callback returns.
 pub const TextInputDocumentCallbacks = struct {
     getSelectedRange: *const fn (*anyopaque) ?TextInputRange,
     getSubstring: *const fn (*anyopaque, TextInputRange) ?TextInputSubstring,
     replaceText: *const fn (*anyopaque, TextInputRange, []const u8) bool,
 };
 
-/// マウスイベント。座標は window 座標 (window contentRect 左上原点・logical 単位)。
-/// framebuffer / canvas への変換は caller の責任。
+/// A mouse event. Coordinates are window coordinates (origin at the top-left of the window contentRect, in logical units).
+/// Converting them to framebuffer or canvas coordinates is the caller's job.
 pub const MouseEvent = struct {
     x: i32,
     y: i32,
-    button: MouseButton, // mouse_move では .none、mouse_down/up でのみ left/right/middle
-    buttons: MouseButtons, // 現在押下中のボタン集合 (post-state)
+    button: MouseButton, // .none on mouse_move; left/right/middle only on mouse_down/up
+    buttons: MouseButtons, // the set of buttons currently held (post-state)
     modifiers: ModifierFlags,
 };
 
-/// スクロールイベント。dx, dy の単位は window 座標と同じ。
+/// A scroll event. dx and dy are in the same units as window coordinates.
 pub const ScrollEvent = struct {
     x: i32,
     y: i32,
@@ -344,28 +344,28 @@ pub const Event = union(enum) {
     quit,
     key_down: KeyEvent,
     key_up: KeyEvent,
-    char_input: CharEvent, // 確定テキスト文字（TASK-22。key_down と独立）
+    char_input: CharEvent, // a committed text character (independent of key_down)
     mouse_move: MouseEvent,
     mouse_down: MouseEvent,
     mouse_up: MouseEvent,
     mouse_scroll: ScrollEvent,
-    gamepad_connected: GamepadInfo, // ゲームパッド接続（TASK-80.1。ADR-009）
-    gamepad_disconnected: GamepadDisconnect, // ゲームパッド切断
-    /// IME composition 状態変化通知（TASK-79.6.1）。本文は snapshot API で読む。
-    /// **末尾追加** = exhaustive switch 破壊範囲を TASK-22 と同型で一括対応。
+    gamepad_connected: GamepadInfo, // a gamepad was connected (ADR-009)
+    gamepad_disconnected: GamepadDisconnect, // a gamepad was disconnected
+    /// Notification that the IME composition state changed. The text is read through the snapshot API.
+    /// **Appended at the end**, so the breakage of exhaustive switches is confined the same way as for char_input.
     composition_changed: CompositionEvent,
-    /// ネイティブ/GUI メニューから app の command table へ配送する ID。
-    /// **必ず末尾に追加**し、backend の C ABI 変換は 97.3/97.4 で行う。
+    /// The id delivered to the application's command table from a native or GUI menu.
+    /// **Always append at the end**; the backend's C ABI conversion happens on the backend side.
     menu_command: u32,
-    /// OS ファイル drag & drop（TASK-113.4）。**末尾追加**。path は inline owned bytes。
-    /// 上限は `FILE_DROP_PATH_BYTES`（1024。macOS PATH_MAX）。超過・NUL・不正 UTF-8 は生成しない。
+    /// An OS file drag and drop. **Appended at the end**. The path is inline owned bytes.
+    /// The limit is `FILE_DROP_PATH_BYTES` (1024, macOS PATH_MAX). Over the limit, a NUL, or invalid UTF-8 is never constructed.
     file_drop: FileDropEvent,
 };
 
-/// file drop path の inline 上限（macOS PATH_MAX=1024。超過 path は reject）。
-/// Event union に 4KB を入れると全イベントの値コピーが浪費になるため 1024 に抑える。
+/// The inline limit on a dropped file path (macOS PATH_MAX=1024; a longer path is rejected).
+/// Putting 4KB into the Event union would waste a value copy on every event, so it is held to 1024.
 pub const FILE_DROP_PATH_BYTES: usize = 1024;
-/// MVP は単一ファイルのみ。将来の複数パス拡張用に配列長を残す。
+/// Only a single file for now. The array length is kept for a future extension to several paths.
 pub const FILE_DROP_MAX_PATHS: usize = 1;
 
 pub const FileDropPath = struct {
@@ -382,8 +382,8 @@ pub const FileDropEvent = struct {
     count: u8 = 0,
 };
 
-/// 単一 path から `FileDropEvent` を作る（harness / macOS facade 共通）。
-/// 空・NUL 含有・不正 UTF-8・`FILE_DROP_PATH_BYTES` 超過は `null`（イベント非生成）。
+/// Build a `FileDropEvent` from a single path (shared by the harness and the macOS facade).
+/// Empty, containing a NUL, invalid UTF-8, or longer than `FILE_DROP_PATH_BYTES` gives `null` (no event is produced).
 pub fn makeFileDropEventFromPath(path: []const u8) ?FileDropEvent {
     if (path.len == 0) return null;
     if (path.len > FILE_DROP_PATH_BYTES) return null;
@@ -397,13 +397,13 @@ pub fn makeFileDropEventFromPath(path: []const u8) ?FileDropEvent {
 }
 
 // ============================================================================
-// MIDI (TASK-115.1。ADR-010)
+// MIDI (ADR-010)
 // ============================================================================
 //
-// MIDI は Window イベントとは異なる受信頻度・所有モデルを持つため、Event union には
-// 追加せず、core/midi.zig のポーリング facade で公開する。note/controller/value は
-// MIDI 標準の 7-bit 値域 (0..127) を u8 で保持する。backend 境界では値域を検証してから
-// この型を構築する。
+// MIDI has a different arrival rate and ownership model from window events, so it is not added to
+// the Event union but published through the polling facade in core/midi.zig. note, controller and
+// value hold the MIDI standard's 7-bit range (0..127) in a u8. The value range is validated at the
+// backend boundary, before this type is built.
 
 pub const MidiDeviceId = u32;
 
@@ -425,7 +425,7 @@ pub const MidiEvent = union(enum) {
     cc: MidiCcEvent,
 };
 
-/// イベントキューの観測カウンタ (累積値の snapshot)
+/// Counters observed on the event queue (a snapshot of cumulative values)
 pub const EventStats = struct {
     mouse_move_merge_count: u64,
     mouse_scroll_merge_count: u64,
@@ -433,26 +433,26 @@ pub const EventStats = struct {
 };
 
 // ============================================================================
-// ゲームパッド (TASK-80.1。ADR-009)
+// gamepads (ADR-009)
 // ============================================================================
 //
-// 設計の正は docs/adr/009_gamepad-input.md。ポーリング主軸（Window.getGamepadState）+
-// 接続イベント（Event.gamepad_connected/disconnected）。標準レイアウトへ正規化済みの値のみを
-// 公開し（native raw レポートは backend 内部に閉じる）、トリガーは axis のみ（ボタンとしては
-// 公開しない）。deadzone は未適用の raw 値（stick -1..1 / trigger 0..1）を返し、適用は
-// `src/gamepad.zig` の `applyDeadzone()` へ委ねる。
+// The authority on the design is docs/adr/009_gamepad-input.md: polling is the main axis
+// (Window.getGamepadState), with connection events (Event.gamepad_connected/disconnected). Only
+// values already normalised to the standard layout are exposed (a native raw report stays inside the
+// backend), and triggers are axes only, never buttons. The raw values are returned with no deadzone
+// applied (a stick is -1..1, a trigger 0..1); applying one is left to `applyDeadzone()` in `src/gamepad.zig`.
 //
-// 呼び出し頻度: `GamepadState` はフレーム毎にポーリングされる想定だが、4台×少数フィールドの
-// 固定長 copy（alloc/lock 無し）で全画素ループでも RT でもないため性能規約
-// （SIMD 3点セット・cache_line 分離等）の適用対象外（ADR-009「ホットパス宣言」節）。
+// Call frequency: `GamepadState` is expected to be polled once per frame, but it is a fixed-length
+// copy of four pads with a few fields each (no allocation, no lock), which is neither an all-pixel
+// loop nor real time, so the performance rules do not apply (see the hot path declaration in ADR-009).
 
-/// 同時サポートするゲームパッド数（`Window.getGamepadState`/harness の `gamepad_states` 配列長の
-/// 単一ソース）。
+/// How many gamepads are supported at once (the single source for the length of the `gamepad_states`
+/// array in `Window.getGamepadState` and in the harness).
 pub const MAX_GAMEPADS: u8 = 4;
 
-/// 標準レイアウトのボタン（15 種。exhaustive enum。ADR-009 決定）。
-/// 固定レイアウトのため拡張は「末尾に値を追加」で足りる。non-exhaustive にすると
-/// isSet/set/getButtonName/harness parser 全箇所に未知値分岐が要るため見送った。
+/// The buttons of the standard layout (15 of them; an exhaustive enum, per ADR-009).
+/// The layout is fixed, so appending a value at the end is enough to extend it. Making it
+/// non-exhaustive would demand an unknown-value branch in isSet, set, getButtonName and the harness parser alike.
 pub const GamepadButton = enum(u8) {
     a,
     b,
@@ -462,17 +462,17 @@ pub const GamepadButton = enum(u8) {
     right_shoulder,
     back,
     start,
-    left_stick, // スティック押し込み（クリック）
+    left_stick, // pressing the stick in (a click)
     right_stick,
     dpad_up,
     dpad_down,
     dpad_left,
     dpad_right,
-    guide, // Xbox ボタン相当（ホームボタン）
+    guide, // the Xbox button (the home button)
 };
 
 // ============================================================================
-// GamepadButtons (packed struct, LSB-first で C の PlatformGamepadButtonFlags と一致)
+// GamepadButtons (a packed struct, LSB-first, matching C's PlatformGamepadButtonFlags)
 // ============================================================================
 
 pub const GamepadButtons = packed struct(u32) {
@@ -543,7 +543,7 @@ pub const GamepadButtons = packed struct(u32) {
 };
 
 comptime {
-    // C 側 PlatformGamepadButtonFlags の bit 位置（a=bit0 … guide=bit14）と一致することを保証
+    // Guarantees the bit positions match C's PlatformGamepadButtonFlags (a=bit0 … guide=bit14)
     std.debug.assert(@as(u32, @bitCast(GamepadButtons{ .a = true })) == 0x0001);
     std.debug.assert(@as(u32, @bitCast(GamepadButtons{ .b = true })) == 0x0002);
     std.debug.assert(@as(u32, @bitCast(GamepadButtons{ .x = true })) == 0x0004);
@@ -561,26 +561,26 @@ comptime {
     std.debug.assert(@as(u32, @bitCast(GamepadButtons{ .guide = true })) == 0x4000);
 }
 
-/// アナログスティック（raw値。-1.0..1.0。deadzone 未適用。ADR-009）。
+/// An analogue stick (raw values, -1.0..1.0, with no deadzone applied; ADR-009).
 pub const Stick = struct {
     x: f32 = 0,
     y: f32 = 0,
 };
 
-/// ゲームパッドの正規化済みポーリング状態（`Window.getGamepadState` の戻り値）。
+/// The normalised, pollable state of a gamepad (what `Window.getGamepadState` returns).
 pub const GamepadState = struct {
     buttons: GamepadButtons = .{},
     left_stick: Stick = .{},
     right_stick: Stick = .{},
-    left_trigger: f32 = 0, // raw値。0.0..1.0
-    right_trigger: f32 = 0, // raw値。0.0..1.0
+    left_trigger: f32 = 0, // raw values, 0.0..1.0
+    right_trigger: f32 = 0, // raw values, 0.0..1.0
 };
 
-/// `GamepadInfo.name` の最大バイト数（UTF-8 バイト列。NUL 不要 = name_len で管理）。
+/// The maximum byte length of `GamepadInfo.name` (a UTF-8 byte sequence; no NUL is needed, since name_len holds the length).
 pub const GAMEPAD_NAME_MAX: usize = 32;
 
-/// ゲームパッド接続イベントのペイロード。`name` は `name_len` バイトのみ有効
-/// （固定長 buffer + 使用長。allocator 不要で Event union に値として載せられる）。
+/// The payload of a gamepad connection event. Only `name_len` bytes of `name` are valid
+/// (a fixed-length buffer plus the length used, so it needs no allocator and rides in the Event union by value).
 pub const GamepadInfo = struct {
     index: u8,
     name_len: u8 = 0,
@@ -591,22 +591,22 @@ pub const GamepadInfo = struct {
     }
 };
 
-/// ゲームパッド切断イベントのペイロード。
+/// The payload of a gamepad disconnection event.
 pub const GamepadDisconnect = struct {
     index: u8,
 };
 
 // ============================================================================
-// ファイル選択ダイアログ (TASK-24 / Linux: TASK-28.4)
+// file selection dialogs
 // ============================================================================
 
-/// ファイルダイアログのエラー（全 OS 共通の戻り値型に使う）。
-/// - DialogUnavailable: ダイアログ機構が使えない（Linux: zenity 不在）。
-///   macOS/Windows は通常返さない（型互換のため宣言に含める）。
-/// - DialogFailed: 予期せぬ失敗（異常終了 / signal / 環境不備等）。
-/// - DialogPending: 非同期ダイアログが進行中（wasm file picker。次 frame で再試行。TASK-73.3）。
-///   native backend は返さない（型互換のため宣言に含める）。
-/// ユーザーキャンセルは error ではなく null で表す。OOM は Allocator.Error。
+/// The errors of a file dialog (used in the return type shared by every OS).
+/// - DialogUnavailable: the dialog mechanism is unusable (on Linux, zenity is absent).
+///   macOS and Windows do not normally return it (it is declared for type compatibility).
+/// - DialogFailed: an unexpected failure (an abnormal exit, a signal, a broken environment).
+/// - DialogPending: an asynchronous dialog is in progress (the wasm file picker; retry on the next frame).
+///   A native backend never returns it (it is declared for type compatibility).
+/// A user cancelling is not an error but a null. Running out of memory is an Allocator.Error.
 pub const DialogError = error{ DialogUnavailable, DialogFailed, DialogPending };
 
 pub const SaveDialogOptions = struct {
@@ -619,15 +619,15 @@ pub const OpenDialogOptions = struct {
 };
 
 // ============================================================================
-// CursorShape (システムカーソル。TASK-75.1)
+// CursorShape (the system cursor)
 // ============================================================================
 //
-// M1 スコープは 3 値のみ（TASK-75 の設計でツール識別はソフトオーバーレイに委ね、OS ハードカーソルは
-// precision point 用に crosshair/default/hidden の 3 種だけを使うと確定済み）。値は `platform.h` の
-// PlatformCursorShape と同値（macOS backend が C 値をそのまま流用するため）。
+// There are only three values: identifying the current tool is left to a soft overlay, so the hard OS
+// cursor serves the precision point alone and needs no more than crosshair, default and hidden. The
+// values equal PlatformCursorShape in `platform.h` (the macOS backend passes the C values straight through).
 //
-// 呼び出し頻度: ツール切替・キー入力等の**イベント時のみ**。フレーム毎の全画素ループでも RT（毎サンプル）
-// 経路でもないため、性能規約（SIMD 3点セット・cache_line 分離等）の適用対象外。
+// Call frequency: **at event time only** (a tool change, a key press). It is neither an all-pixel
+// per-frame loop nor a real-time (per sample) path, so the performance rules do not apply.
 pub const CursorShape = enum(c_int) {
     default = 0,
     crosshair = 1,
@@ -645,7 +645,7 @@ test "ModifierFlags round trip via @bitCast" {
     try std.testing.expect(back.cmd);
 }
 
-test "GamepadButtons: isSet/set は全15ボタンで独立に効き、他ビットを汚さない" {
+test "GamepadButtons: isSet/set act independently on all 15 buttons and dirty no other bit" {
     var b = GamepadButtons{};
     inline for (@typeInfo(GamepadButton).@"enum".fields) |f| {
         const btn: GamepadButton = @enumFromInt(f.value);
@@ -659,7 +659,7 @@ test "GamepadButtons: isSet/set は全15ボタンで独立に効き、他ビッ�
     try std.testing.expect(!b.isSet(.guide));
     b.set(.a, false);
     try std.testing.expect(!b.isSet(.a));
-    try std.testing.expect(b.isSet(.start)); // 他ビットは無変更
+    try std.testing.expect(b.isSet(.start)); // the other bits are unchanged
 }
 
 test "GamepadButtons round trip via @bitCast (toC/fromC)" {
@@ -674,7 +674,7 @@ test "GamepadButtons round trip via @bitCast (toC/fromC)" {
     try std.testing.expect(!back.isSet(.b));
 }
 
-test "GamepadInfo.name: name_len が指す範囲だけを返す" {
+test "GamepadInfo.name: only the range name_len points at is returned" {
     var info = GamepadInfo{ .index = 0 };
     const src = "Pad";
     @memcpy(info.name_buf[0..src.len], src);
@@ -682,7 +682,7 @@ test "GamepadInfo.name: name_len が指す範囲だけを返す" {
     try std.testing.expectEqualStrings("Pad", info.name());
 }
 
-test "Event: menu_command は数値 ID をそのまま配送できる" {
+test "Event: menu_command delivers the numeric id unchanged" {
     const ev: Event = .{ .menu_command = 0x1234 };
     switch (ev) {
         .menu_command => |id| try std.testing.expectEqual(@as(u32, 0x1234), id),
@@ -690,54 +690,54 @@ test "Event: menu_command は数値 ID をそのまま配送できる" {
     }
 }
 
-test "FileDrop: ASCII path の copy と len" {
+test "FileDrop: the copy and len of an ASCII path" {
     const drop = makeFileDropEventFromPath("/tmp/a.png").?;
     try std.testing.expectEqual(@as(u8, 1), drop.count);
     try std.testing.expectEqualStrings("/tmp/a.png", drop.paths[0].slice());
 }
 
-test "FileDrop: スペースを含む path を保持する" {
+test "FileDrop: a path containing a space is kept" {
     const drop = makeFileDropEventFromPath("/tmp/My Image.png").?;
     try std.testing.expectEqualStrings("/tmp/My Image.png", drop.paths[0].slice());
 }
 
-test "FileDrop: UTF-8 path を保持する" {
+test "FileDrop: a UTF-8 path is kept" {
     const drop = makeFileDropEventFromPath("/tmp/画像.png").?;
     try std.testing.expectEqualStrings("/tmp/画像.png", drop.paths[0].slice());
 }
 
-test "FileDrop: 空 path を拒否する" {
+test "FileDrop: an empty path is rejected" {
     try std.testing.expect(makeFileDropEventFromPath("") == null);
 }
 
-test "FileDrop: NUL を含む path を拒否する" {
+test "FileDrop: a path containing a NUL is rejected" {
     try std.testing.expect(makeFileDropEventFromPath("a\x00b.png") == null);
 }
 
-test "FileDrop: 上限長 path を受理する" {
+test "FileDrop: a path of exactly the maximum length is accepted" {
     var buf: [FILE_DROP_PATH_BYTES]u8 = undefined;
     @memset(&buf, 'a');
     const drop = makeFileDropEventFromPath(&buf).?;
     try std.testing.expectEqual(@as(u32, FILE_DROP_PATH_BYTES), drop.paths[0].len);
 }
 
-test "FileDrop: 上限超過 path を拒否する" {
+test "FileDrop: a path over the maximum length is rejected" {
     var buf: [FILE_DROP_PATH_BYTES + 1]u8 = undefined;
     @memset(&buf, 'a');
     try std.testing.expect(makeFileDropEventFromPath(&buf) == null);
 }
 
-test "Event: file_drop は末尾 variant" {
+test "Event: file_drop is the last variant" {
     const tags = std.meta.tags(std.meta.Tag(Event));
     try std.testing.expectEqual(tags[tags.len - 1], .file_drop);
 }
 
-test "FileDrop: count == 1 の固定契約" {
+test "FileDrop: the fixed contract of count == 1" {
     const drop = makeFileDropEventFromPath("/tmp/x.png").?;
     try std.testing.expectEqual(@as(u8, 1), drop.count);
 }
 
-test "MidiEvent: 3 variant は device id と payload を保持する" {
+test "MidiEvent: all three variants keep the device id and the payload" {
     const note_on: MidiEvent = .{ .note_on = .{ .device_id = 7, .note = 60, .velocity = 100 } };
     const note_off: MidiEvent = .{ .note_off = .{ .device_id = 7, .note = 60, .velocity = 12 } };
     const cc: MidiEvent = .{ .cc = .{ .device_id = 7, .controller = 74, .value = 96 } };
@@ -750,7 +750,7 @@ test "MidiEvent: 3 variant は device id と payload を保持する" {
     try std.testing.expectEqual(@as(u8, 96), cc.cc.value);
 }
 
-test "MidiEvent: MIDI 7-bit 境界値 0 と 127 を保持する" {
+test "MidiEvent: the MIDI 7-bit boundary values 0 and 127 are kept" {
     const low: MidiEvent = .{ .cc = .{ .device_id = 0, .controller = 0, .value = 0 } };
     const high: MidiEvent = .{ .note_on = .{ .device_id = std.math.maxInt(MidiDeviceId), .note = 127, .velocity = 127 } };
 
@@ -761,7 +761,7 @@ test "MidiEvent: MIDI 7-bit 境界値 0 と 127 を保持する" {
     try std.testing.expectEqual(@as(u8, 127), high.note_on.velocity);
 }
 
-test "WindowOptions: 既定値は後方互換（透明/枠なし/位置サイズなし/logical fb）" {
+test "WindowOptions: the defaults are backwards compatible (no transparency, no borderless, no position or size, a logical fb)" {
     const opts: WindowOptions = .{};
     try std.testing.expect(!opts.transparent);
     try std.testing.expect(!opts.borderless);
@@ -770,13 +770,13 @@ test "WindowOptions: 既定値は後方互換（透明/枠なし/位置サイズ
     try std.testing.expectEqual(FramebufferMode.logical, opts.fb_mode);
 }
 
-test "FramebufferMode: 既定は logical、physical は opt-in" {
+test "FramebufferMode: logical is the default and physical is opt-in" {
     try std.testing.expectEqual(FramebufferMode.logical, (WindowOptions{}).fb_mode);
     const phys: WindowOptions = .{ .fb_mode = .physical };
     try std.testing.expectEqual(FramebufferMode.physical, phys.fb_mode);
 }
 
-test "FramebufferSnapshot: logical では logical==framebuffer、physical scale=2 は 2 倍寸法" {
+test "FramebufferSnapshot: logical==framebuffer under logical, and physical scale=2 doubles the size" {
     const logical: FramebufferSnapshot = .{
         .logical_size = .{ .width = 800, .height = 600 },
         .framebuffer_size = .{ .width = 800, .height = 600 },
@@ -797,7 +797,7 @@ test "FramebufferSnapshot: logical では logical==framebuffer、physical scale=
     try std.testing.expectEqual(@as(f32, 2.0), physical.content_scale);
 }
 
-test "WindowOptions: position/size の optional 値を保持する" {
+test "WindowOptions: the optional position and size values are kept" {
     const opts: WindowOptions = .{
         .position = .{ .x = 40, .y = -10 },
         .size = .{ .width = 720, .height = 480 },
@@ -808,7 +808,7 @@ test "WindowOptions: position/size の optional 値を保持する" {
     try std.testing.expectEqual(@as(u32, 480), opts.size.?.height);
 }
 
-test "WindowGeometry: position null 契約（未対応/取得不能）" {
+test "WindowGeometry: the position null contract (unsupported, or unreadable)" {
     const geo: WindowGeometry = .{
         .position = null,
         .size = .{ .width = 780, .height = 600 },
@@ -818,7 +818,7 @@ test "WindowGeometry: position null 契約（未対応/取得不能）" {
     try std.testing.expectEqual(@as(u32, 600), geo.size.height);
 }
 
-test "TASK-79.6.3: TextInputRange NOT_FOUND sentinel は UINT64_MAX" {
+test "TextInputRange NOT_FOUND sentinel is UINT64_MAX" {
     try std.testing.expectEqual(std.math.maxInt(u64), TEXT_INPUT_RANGE_NOT_FOUND);
     const nf: TextInputRange = .{ .location = TEXT_INPUT_RANGE_NOT_FOUND, .length = 0 };
     try std.testing.expect(nf.isNotFound());

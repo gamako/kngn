@@ -1,54 +1,54 @@
 //! Platform abstraction layer (facade)
 //!
-//! 複数バックエンド対応の Zig interface 層。`builtin.os.tag` で backend を選ぶ。
-//!   - macOS → `platform_macos.zig`（C ABI `platform.h` 経由。objc/swift/metal は .o リンクの差のみで Zig 側は共通）
-//!   - Linux → `platform_linux.zig`（X11/Wayland。純 Zig で `@cImport(Xlib)` 等を直接呼ぶ。x11/wayland は build_options.platform_backend で選ぶ）
-//!   - Windows → `platform_windows.zig`（dispatcher。純 Zig で Win32 API を extern fn で直接呼ぶ。gdi/d3d11 は build_options.platform_backend で選ぶ。TASK-31/35）
+//! The Zig interface layer over several backends. `builtin.os.tag` selects the backend.
+//!   - macOS → `platform_macos.zig` (through the C ABI `platform.h`; objc/swift/metal differ only in which .o is linked, and the Zig side is shared)
+//!   - Linux → `platform_linux.zig` (X11/Wayland; pure Zig calling `@cImport(Xlib)` and friends directly; x11/wayland is picked by build_options.platform_backend)
+//!   - Windows → `platform_windows.zig` (a dispatcher; pure Zig calling the Win32 API through extern fn; gdi/d3d11 is picked by build_options.platform_backend)
 //!
-//! 公開型（KeyCode / Event 等）は `platform_types.zig` を単一ソースとして re-export し、
-//! `Window`/`Framebuffer` と関数群だけを各 backend から re-export する。
-//! （Zig 0.16 で `pub usingnamespace` が削除されたため、明示的に列挙する。）
+//! The public types (KeyCode, Event and friends) are re-exported with `platform_types.zig` as the
+//! single source, and only `Window`/`Framebuffer` and the functions come from each backend.
+//! (Zig 0.16 removed `pub usingnamespace`, so they are listed explicitly.)
 //!
-//! ## ヘッドレス検証 harness（TASK-32.1）
+//! ## The headless verification harness
 //!
-//! `Window` を薄い wrapper 化し、唯一の入力/出力チョークポイント4箇所を `harness.zig` に interpose する:
-//!   - `pollEvents` = フレーム進行の同期点（replay の step gate）
-//!   - `nextEvent`  = 注入イベント（+ native は quit のみ通す）
-//!   - `present`    = `fb` probe 捕捉（owned copy）
-//!   - `getTime`    = 仮想クロック
-//! env `VP_HARNESS_SCRIPT` 未設定なら全フックは即パススルー（既存挙動と完全一致）。
+//! `Window` is a thin wrapper, and the four input/output choke points are interposed by `harness.zig`:
+//!   - `pollEvents` = the synchronisation point of frame progress (replay's step gate)
+//!   - `nextEvent`  = injected events (and from native, only quit passes through)
+//!   - `present`    = the `fb` probe capture (an owned copy)
+//!   - `getTime`    = the virtual clock
+//! With env `VP_HARNESS_SCRIPT` unset every hook passes straight through (behaviour is identical).
 //!
-//! ## 完全 display-less（TASK-165: platform/null backend）
+//! ## Fully display-less (the platform/null backend)
 //!
-//! `VP_HEADLESS=1` のとき facade が runtime で `platform_null` を選び、native backend の
-//! `init`/display 接続を一切しない。一次 framebuffer は null `Window` が所有し、harness は
-//! 観測 copy（`onLock`/`onPresent`）だけを行う。SCRIPT/LIVE は任意（単独の display-less 起動可）。
-//! `Framebuffer` は facade 独自の struct（`pixels/width/height` + `unlock()`）で、内部に
-//! native / null の tagged union を持つ。caller が使うのは `fb.pixels/.width/.height/.unlock()`
-//! のみなのでソース互換（apps/synth 等の既存コード無改造）。wasm は compile-time 分岐のまま
-//! DOM canvas backend を維持し、null runtime union の対象外とする。
+//! With `VP_HEADLESS=1` the facade picks `platform_null` at runtime and never calls the native
+//! backend's `init` or connects to a display. The primary framebuffer is owned by the null `Window`,
+//! and the harness only takes observation copies (`onLock`/`onPresent`). SCRIPT/LIVE are optional (a display-less run on its own works).
+//! `Framebuffer` is the facade's own struct (`pixels/width/height` plus `unlock()`), holding a
+//! tagged union of native and null inside. A caller only uses `fb.pixels/.width/.height/.unlock()`,
+//! so it stays source compatible (existing code such as apps/synth is untouched). wasm keeps its
+//! DOM canvas backend on a compile-time branch and stays outside the null runtime union.
 //!
-//! ## canonical pixel format（全 OS 共通・TASK-28.6）
+//! ## The canonical pixel format (shared by every OS)
 //!
-//! framebuffer のピクセルは **canonical BGRA**: u32 `0xAARRGGBB`（リトルエンディアンの
-//! メモリ上は `[B, G, R, A]`）。pack = `(a<<24)|(r<<16)|(g<<8)|b`。web 16進 `0xRRGGBB` が
-//! 低 24bit にそのまま一致する。Windows(GDI/DXGI)・X11 標準 visual・macOS(CGImage/Metal) が
-//! 共通して BGRA を native に扱えるため、中間変換層も実行時分岐も持たず全 OS で直書きできる。
+//! A framebuffer pixel is **canonical BGRA**: u32 `0xAARRGGBB` (in little-endian memory,
+//! `[B, G, R, A]`). Packing is `(a<<24)|(r<<16)|(g<<8)|b`, so a web hex `0xRRGGBB` lands exactly in
+//! the low 24 bits. Windows (GDI/DXGI), the standard X11 visual and macOS (CGImage/Metal) all handle
+//! BGRA natively, so every OS writes it directly, with no conversion layer and no runtime branch.
 
 const std = @import("std");
 const builtin = @import("builtin");
 const types = @import("platform_types");
 const command_types = @import("command_types");
-// harness は共有 module（src/audio.zig facade も同一インスタンスを import し module-level state を共有する）。
-// このため source-relative `@import("harness.zig")` ではなく名前付き module import を使う (TASK-32.2)。
+// harness is a shared module (the src/audio.zig facade imports the same instance and shares its module-level state).
+// That is why this is a named module import rather than a source-relative `@import("harness.zig")`.
 const harness = @import("harness");
-// copilot（通常 UX と共存する assist transport。TASK-62.5.2）。harness module 内の namespace
-// 再エクスポート経由で参照する（意味的依存は copilot→harness の一方向）。
+// copilot (the assist transport that coexists with the normal UX). It is referenced through the
+// namespace re-exported inside the harness module (the semantic dependency is one-way, copilot→harness).
 const copilot = harness.copilot;
 const netsync = harness.netsync;
-// ゲームパッド実 backend（GameController framework）の opt-in フラグ（TASK-80.2 opt-in 化。audio の
-// `link_audio` と対称）。build.zig の `createPlatformModule`/`buildStandalone` が常にこの named import を
-// 付与するため（外部公開 module も含む）、全 caller で安全に参照できる。
+// The opt-in flag for the real gamepad backend (the GameController framework), symmetrical with
+// audio's `link_audio`. build.zig's `createPlatformModule`/`buildStandalone` always supply this named
+// import (the externally published module included), so every caller can reference it safely.
 const build_options = @import("build_options");
 
 const native_backend = if (builtin.cpu.arch.isWasm())
@@ -60,11 +60,11 @@ else switch (builtin.os.tag) {
     else => @compileError("video-proto: unsupported OS for platform backend: " ++ @tagName(builtin.os.tag)),
 };
 
-/// null runtime は native OS のみ（wasm は DOM canvas の compile-time branch を維持。TASK-165）。
+/// The null runtime covers native operating systems only (wasm keeps its compile-time DOM canvas branch).
 const null_runtime_supported = !builtin.cpu.arch.isWasm();
 const null_backend = if (null_runtime_supported) @import("platform_null.zig") else struct {};
 
-/// `VP_HEADLESS=1` で確定した runtime 選択（`platform.init` 先頭で設定。wasm は常に false）。
+/// The runtime choice settled by `VP_HEADLESS=1` (set at the top of `platform.init`; always false on wasm).
 var runtime_null: bool = false;
 
 fn envHeadlessOne() bool {
@@ -79,23 +79,23 @@ fn nativePumpPoll(ctx: *anyopaque) bool {
 }
 
 // ============================================================================
-// ライブリサイズ redraw コールバック（TASK-23.1）
+// The live-resize redraw callback
 // ============================================================================
 //
-// OS のモーダル/ネストした event-tracking ループ（枠ドラッグ中）から app へ
-// 「今 1 フレーム描いてほしい」とだけ通知する opt-in 機構。
+// An opt-in mechanism by which the OS's modal, nested event-tracking loop (while the frame is being
+// dragged) tells the application "draw one frame now", and nothing more.
 //
-// 契約:
-// - callback は**イベントポンプ（pollEvents 内の sendEvent / DispatchMessageW）実行中**に呼ばれる。
-// - callback 内で `pollEvents` を呼んではならない（ネイティブポンプへの再入）。
-// - `nextEvent` はキューを読むだけ（ポンプしない）なので呼んでよい。
-// - モーダルダイアログ（file dialog）を callback から開いてはならない。
-// - lockFramebuffer 保持中に pollEvents を呼ぶ設計のアプリは登録不可。
-// - 単一プロセス・単一ウィンドウ前提の module-level 状態（harness / registerProbe と同じ設計）。
-// - harness 有効時（VP_HARNESS_*）は登録自体をしない（frame_index / 仮想クロック / replay の
-//   bit 決定論を壊さないため。registerProbe の「harness 無効時 no-op」と対称）。
+// The contract:
+// - The callback runs **while the event pump runs** (inside pollEvents: sendEvent / DispatchMessageW).
+// - The callback must not call `pollEvents` (that re-enters the native pump).
+// - `nextEvent` only reads the queue (it does not pump), so it may be called.
+// - A modal dialog (a file dialog) must not be opened from the callback.
+// - An application designed to call pollEvents while holding lockFramebuffer cannot register one.
+// - Module-level state, assuming a single process and a single window (the same design as harness / registerProbe).
+// - While the harness is enabled (VP_HARNESS_*) nothing is registered at all, so that frame_index, the
+//   virtual clock and replay's bit determinism stay intact (symmetrical with registerProbe being a no-op while the harness is disabled).
 
-/// OS モーダルループ中に backend が 1 フレームの描画を app へ要求するコールバック型。
+/// The callback type through which a backend asks the application for one frame during an OS modal loop.
 pub const RedrawFn = *const fn (ctx: *anyopaque) void;
 
 var redraw_guard: struct {
@@ -113,7 +113,7 @@ fn redrawWrapper(ctx: *anyopaque) void {
     cb(redraw_guard.ctx);
 }
 
-// 型は platform_types を単一ソースに re-export（backend 間で乖離させない）
+// The types are re-exported with platform_types as the single source (they must not drift between backends)
 pub const Error = types.Error;
 pub const KeyCode = types.KeyCode;
 pub const ModifierFlags = types.ModifierFlags;
@@ -146,12 +146,12 @@ pub const DialogError = types.DialogError;
 pub const SaveDialogOptions = types.SaveDialogOptions;
 pub const OpenDialogOptions = types.OpenDialogOptions;
 pub const CursorShape = types.CursorShape;
-pub const WindowOptions = types.WindowOptions; // TASK-104 / TASK-117 / TASK-156.1
-pub const WindowPosition = types.WindowPosition; // TASK-117
-pub const WindowSize = types.WindowSize; // TASK-117
-pub const WindowGeometry = types.WindowGeometry; // TASK-117
-pub const FramebufferMode = types.FramebufferMode; // TASK-156.1
-pub const FramebufferSnapshot = types.FramebufferSnapshot; // TASK-156.1
+pub const WindowOptions = types.WindowOptions; // transparency, borderless, position, size, framebuffer mode
+pub const WindowPosition = types.WindowPosition; // a position in OS screen coordinates
+pub const WindowSize = types.WindowSize; // a width and a height
+pub const WindowGeometry = types.WindowGeometry; // a position plus a size
+pub const FramebufferMode = types.FramebufferMode; // .logical or .physical
+pub const FramebufferSnapshot = types.FramebufferSnapshot; // the per-frame size and scale snapshot
 pub const MAX_GAMEPADS = types.MAX_GAMEPADS;
 pub const GamepadButton = types.GamepadButton;
 pub const GamepadButtons = types.GamepadButtons;
@@ -160,11 +160,11 @@ pub const GamepadState = types.GamepadState;
 pub const GamepadInfo = types.GamepadInfo;
 pub const GamepadDisconnect = types.GamepadDisconnect;
 
-/// Locked framebuffer view（facade 独自型。TASK-32.4 P4 / TASK-165 / TASK-156.1）。
-/// caller が使うのは `pixels/width/height/unlock()` に加え、同一フレームの不変 snapshot
-/// （`logical_size` / `framebuffer_size` / `content_scale` / `scale_epoch`）。
-/// `width`/`height` は `framebuffer_size` の後方互換 alias。
-/// 内部は「native（compile-time backend）」か「null（VP_HEADLESS）」かの tagged union。
+/// A locked framebuffer view (a type of the facade's own).
+/// A caller uses `pixels/width/height/unlock()` plus the immutable snapshot of that same frame
+/// (`logical_size` / `framebuffer_size` / `content_scale` / `scale_epoch`).
+/// `width`/`height` are backwards-compatible aliases of `framebuffer_size`.
+/// Inside is a tagged union of native (the compile-time backend) and null (`VP_HEADLESS`).
 pub const Framebuffer = struct {
     pixels: []u32,
     width: u32, // == framebuffer_size.width
@@ -212,9 +212,9 @@ fn snapshotFromBackendFb(fb: anytype) FramebufferSnapshot {
     };
 }
 
-/// native mouse/scroll の raw physical 座標を latched scale で論理 pt へ in-place 正規化する（TASK-156.1）。
-/// harness 注入 Event は通さない。scale<=0 は 1.0 に補正。
-/// 単体テスト（platform_clipboard_test 等）からも呼べるよう pub。
+/// Normalise a native mouse/scroll event's raw physical coordinates in place into logical points, using the latched scale.
+/// Harness-injected events do not pass through here. A scale <= 0 is corrected to 1.0.
+/// pub so that unit tests (platform_clipboard_test and friends) can call it too.
 pub fn normalizeEventWithScale(scale_in: f32, event: Event) Event {
     const scale: f32 = if (scale_in > 0) scale_in else 1.0;
     if (scale == 1.0) return event;
@@ -235,13 +235,13 @@ pub fn normalizeEventWithScale(scale_in: f32, event: Event) Event {
     return ev;
 }
 
-/// Window facade。harness 有効時のみ 4 フックを差し込む。harness 無効時は backend への即パススルー。
-/// **null runtime（TASK-165）**は `inner` が `null_backend.Window` を持ち、一次 framebuffer を所有する。
-/// TASK-156.1: `lockFramebuffer`/`nextEvent` は latched snapshot 保持のため `*Window` 受け取り。
-/// ループ契約: `pollEvents` → `lockFramebuffer` → `nextEvent`（native 入力は latch scale で正規化）。
+/// The Window facade. The four hooks are inserted only while the harness is enabled; with it disabled every call passes straight through to the backend.
+/// Under the **null runtime**, `inner` holds a `null_backend.Window`, which owns the primary framebuffer.
+/// `lockFramebuffer`/`nextEvent` take a `*Window` because they hold the latched snapshot.
+/// The loop contract: `pollEvents` → `lockFramebuffer` → `nextEvent` (native input is normalised with the latched scale).
 pub const Window = struct {
     inner: Inner,
-    /// 直近 `lockFramebuffer` で latch した frame snapshot（入力正規化の唯一の scale 源）。
+    /// The frame snapshot latched by the most recent `lockFramebuffer` (the only source of scale for input normalisation).
     latched_snapshot: FramebufferSnapshot = .{
         .logical_size = .{ .width = 0, .height = 0 },
         .framebuffer_size = .{ .width = 0, .height = 0 },
@@ -262,7 +262,7 @@ pub const Window = struct {
         return self.inner == .null_win;
     }
 
-    /// 現在の negotiated logical size（frame 中の描画・入力には `Framebuffer.logical_size` を使う）。
+    /// The currently negotiated logical size (within a frame, use `Framebuffer.logical_size` for drawing and input).
     pub fn logicalSize(self: *const Window) WindowSize {
         if (comptime null_runtime_supported) {
             if (self.inner == .null_win) {
@@ -275,7 +275,7 @@ pub const Window = struct {
         return geo.size;
     }
 
-    /// 現在の negotiated framebuffer size（frame 中は `Framebuffer.framebuffer_size` を使う）。
+    /// The currently negotiated framebuffer size (within a frame, use `Framebuffer.framebuffer_size`).
     pub fn framebufferSize(self: *const Window) WindowSize {
         if (comptime null_runtime_supported) {
             if (self.inner == .null_win) {
@@ -287,7 +287,7 @@ pub const Window = struct {
         return self.logicalSize();
     }
 
-    /// 現在の negotiated content scale（frame 中は `Framebuffer.content_scale` を使う）。
+    /// The currently negotiated content scale (within a frame, use `Framebuffer.content_scale`).
     pub fn contentScale(self: *const Window) f32 {
         if (comptime null_runtime_supported) {
             if (self.inner == .null_win) {
@@ -321,11 +321,11 @@ pub const Window = struct {
         return .{ .inner = .{ .native = try native_backend.Window.create(width, height, title) } };
     }
 
-    /// 本物のフルスクリーンウィンドウを作成する（agent-face 向け。TASK-100。video-proto に
-    /// OS レベルのフルスクリーン切替 API が無かったため追加）。`native_backend.Window` が
-    /// `createFullscreen` を実装していれば（Linux x11/wayland）それを使い、無ければ
-    /// 固定サイズの通常ウィンドウへフォールバックする（macOS/Windows backend は無改造）。
-    /// ホットパス宣言: 初期化時のみ（ウィンドウ生成 1 回）。
+    /// Create a real fullscreen window: this is the OS-level fullscreen entry point of the API.
+    /// When `native_backend.Window` implements `createFullscreen` (Linux x11/wayland) that path is
+    /// used; otherwise this falls back to an ordinary window of a fixed size (the macOS and Windows
+    /// backends need no change of their own for it).
+    /// Hot path declaration: initialisation only (a single window creation).
     pub fn createFullscreen(title: [:0]const u8) Error!Window {
         if (comptime null_runtime_supported) {
             if (runtime_null) {
@@ -338,13 +338,13 @@ pub const Window = struct {
         return .{ .inner = .{ .native = try native_backend.Window.create(1920, 1080, title) } };
     }
 
-    /// 透過 / borderless / 初期位置・サイズ オプション付きでウィンドウを作成する（TASK-104 / TASK-117）。
-    /// `.{}` は従来 create と同一挙動（後方互換）。`opts.size` 指定時だけ w/h を上書きする。
-    /// backend が `createWithOptions` を実装していればそれを使い、無ければ透過/borderless 要求時に
-    /// `error.Unsupported`、無指定なら通常 create へフォールバックする。
-    /// null runtime（`VP_HEADLESS=1`）は options を受理し CPU framebuffer だけで動く
-    /// （表示は無いが fb の alpha を digest 検証できる。位置は常に null）。
-    /// ホットパス宣言: 初期化時のみ（ウィンドウ生成 1 回）。
+    /// Create a window with options: transparency, borderless, an initial position and a size.
+    /// `.{}` behaves exactly like plain create. w/h are overridden only when `opts.size` is given.
+    /// When the backend implements `createWithOptions` that is used; otherwise a request for
+    /// transparency or borderless gives `error.Unsupported`, and with neither it falls back to create.
+    /// The null runtime (`VP_HEADLESS=1`) accepts the options and runs on the CPU framebuffer alone
+    /// (nothing is displayed, but the framebuffer alpha can still be checked through a digest; the position is always null).
+    /// Hot path declaration: initialisation only (a single window creation).
     pub fn createWithOptions(width: u32, height: u32, title: [:0]const u8, opts: WindowOptions) Error!Window {
         const w = if (opts.size) |s| s.width else width;
         const h = if (opts.size) |s| s.height else height;
@@ -360,9 +360,9 @@ pub const Window = struct {
         return .{ .inner = .{ .native = try native_backend.Window.create(w, h, title) } };
     }
 
-    /// 現在のウィンドウ geometry を返す（TASK-117）。エラーを返さず安全な既定値を返す。
-    /// null は作成時サイズ + position=null。backend 未実装は size=0 + position=null。
-    /// ホットパス宣言: ウィンドウ生成時 / 終了時 shutdown / harness digest 観測時のみ。
+    /// Return the current window geometry. It never fails, and falls back to safe defaults.
+    /// null gives the creation size with position=null. A backend without support gives size=0 and position=null.
+    /// Hot path declaration: window creation, shutdown, and harness digest observation only.
     pub fn getGeometry(self: Window) WindowGeometry {
         if (comptime null_runtime_supported) {
             if (self.inner == .null_win) {
@@ -376,8 +376,8 @@ pub const Window = struct {
     }
 
     pub fn destroy(self: Window) void {
-        // callback clear は public setRedrawCallback に null を通さず、facade/backend の
-        // private clear 経路で行う（TASK-23.1 実装メモ）。destroy 後の遅延 setFrameSize 防御。
+        // Clearing the callback goes through the facade/backend private clear path rather than passing null
+        // to the public setRedrawCallback. It guards against a late setFrameSize after destroy.
         redraw_guard = .{};
         if (comptime null_runtime_supported) {
             if (self.inner == .null_win) {
@@ -385,9 +385,9 @@ pub const Window = struct {
                 return;
             }
         }
-        // document access 登録解除（dangling userdata。backend が実装していれば）。
+        // Unregister document access (a dangling userdata otherwise), when the backend implements it.
         if (comptime @hasDecl(native_backend.Window, "setTextInputDocumentAccess")) {
-            // userdata は解除時に読まれないが、型上 *anyopaque が必要なのでダミーを渡す。
+            // userdata is not read on unregister, but the type demands an *anyopaque, so a dummy is passed.
             var dummy: u8 = 0;
             self.inner.native.setTextInputDocumentAccess(@ptrCast(&dummy), null);
         }
@@ -395,20 +395,20 @@ pub const Window = struct {
         self.inner.native.destroy();
     }
 
-    /// OS の close/quit 要求を consumer がキャンセルし、window を継続する。
-    /// ホットパス宣言: quit/close イベント時のみ。null runtime は no-op。
+    /// Let the consumer cancel the OS's close/quit request and keep the window alive.
+    /// Hot path declaration: quit/close events only. A no-op under the null runtime.
     pub fn cancelQuit(self: Window) void {
         if (self.isNull()) return;
         if (@hasDecl(native_backend.Window, "cancelQuit")) self.inner.native.cancelQuit();
     }
 
     pub fn pollEvents(self: Window) bool {
-        // netsync.pump は harness gate 早期 return より前（全経路・毎フレーム。TASK-62.3.2）。
-        // queue 空なら即 return。env 未設定時も started ガードでパススルー。
+        // netsync.pump runs before the harness gate's early return (on every path, every frame).
+        // It returns immediately on an empty queue, and the started guard passes through when the env is unset.
         netsync.pump();
         if (comptime null_runtime_supported) {
             if (self.inner == .null_win) {
-                // null に native compositor pump は渡さない。harness 無効時は常に continue。
+                // No native compositor pump is handed to null. With the harness disabled this always continues.
                 if (!harness.isEnabled()) return true;
                 return harness.pollGate(true);
             }
@@ -416,12 +416,12 @@ pub const Window = struct {
         var native_win = self.inner.native;
         const native = native_win.pollEvents();
         if (!harness.isEnabled()) {
-            // 通常 UX の毎フレーム末尾で copilot transport を進める（disabled 時は即 return の no-op。
-            // harness 有効時は排他により copilot は必ず disabled なので、このパスに置くだけで足りる）。
+            // Advance the copilot transport at the end of every frame of the normal UX (a no-op that returns
+            // immediately while disabled; exclusivity disables copilot whenever the harness is on, so this placement suffices).
             copilot.pump();
             return native;
         }
-        // manual/replay: blocking gate + NativePump。free-run: 非 blocking drain（pump なし）。
+        // manual/replay: a blocking gate plus NativePump. free-run: a non-blocking drain (no pump).
         if (harness.isManualClock()) {
             const pump = harness.NativePump{
                 .ptr = @ptrCast(&native_win),
@@ -433,17 +433,17 @@ pub const Window = struct {
     }
 
     pub fn nextEvent(self: *Window) ?Event {
-        // ホットパス宣言: イベント時のみ。native mouse/scroll は latched scale で scalar 除算するだけ。
-        // harness 注入は既に論理値なので normalization を通さない。
-        if (self.isNull()) return harness.nextInjectedEvent(); // native pump が無いので注入イベントのみ
+        // Hot path declaration: event time only. A native mouse/scroll is a scalar division by the latched scale, nothing more.
+        // A harness injection is already in logical units, so it does not go through normalisation.
+        if (self.isNull()) return harness.nextInjectedEvent(); // only injected events, since there is no native pump
         if (!harness.isEnabled()) {
             const ev = self.inner.native.nextEvent() orelse return null;
             return self.normalizeNativeEvent(ev);
         }
-        // 注入イベントを優先。尽きたら native を drain する。
-        // manual/replay: 注入駆動なので native は quit のみ通す（実クリック等は無視）。
-        // free-run: 実 display をユーザーが操作するので native 入力を app へ通す（TASK-164 の核心
-        //   ＝人が実 window を操作しつつ agent が LISTEN で横から inject/action する共同操作）。
+        // Injected events come first; once they run out, native is drained.
+        // manual/replay: injection drives everything, so only quit passes from native (a real click is ignored).
+        // free-run: the user works the real display, so native input reaches the application. That is what
+        //   makes collaboration possible: a person drives the real window while an agent injects and acts over LISTEN.
         if (harness.nextInjectedEvent()) |ev| return ev;
         const pass_native = !harness.isManualClock();
         while (self.inner.native.nextEvent()) |ev| {
@@ -462,9 +462,9 @@ pub const Window = struct {
     }
 
     pub fn lockFramebuffer(self: *Window) ?Framebuffer {
-        // ホットパス宣言: native/null とも backend buffer の view 返却 + snapshot latch + harness 有効時の onLock 記録のみ。
-        // フレーム毎の新規確保・per-pixel 処理・変換コピーは行わない（観測 copy は present 時の onPresent）。
-        // pending scale/size の再確保は backend の lock 境界（初期化/scale・resize 時のみ）。
+        // Hot path declaration: for native and null alike this only returns a view of the backend buffer, latches the snapshot, and records onLock while the harness is enabled.
+        // No per-frame allocation, no per-pixel work and no converting copy (the observation copy happens in onPresent, at present time).
+        // Reallocating for a pending scale or size happens at the backend's lock boundary (initialisation, or a scale or resize change).
         if (comptime null_runtime_supported) {
             if (self.inner == .null_win) {
                 const fb = self.inner.null_win.lockFramebuffer() orelse return null;
@@ -505,8 +505,8 @@ pub const Window = struct {
     }
 
     pub fn present(self: Window) void {
-        // ホットパス宣言: harness 有効時は onStats→onPresent（観測 owned copy）の後に backend present。
-        // null present は no-op。フレーム毎の新規確保・per-pixel 処理は行わない。
+        // Hot path declaration: while the harness is enabled, onStats→onPresent (an owned observation copy) runs before the backend present.
+        // A null present is a no-op. There is no per-frame allocation and no per-pixel work.
         if (harness.isEnabled()) {
             harness.onStats(self.getEventStats());
             harness.onPresent();
@@ -520,91 +520,91 @@ pub const Window = struct {
         self.inner.native.present();
     }
 
-    /// カーソル形状を設定する（システムカーソル。TASK-75.1）。
-    /// ホットパス宣言: ツール切替等の**イベント時のみ**呼ぶ想定（フレーム毎/RT ではない。
-    /// 性能規約の対象外）。null runtime（表示先が無い＝VP_HEADLESS）は no-op（AC#3）。
-    /// probe が観測する値ではない（副作用が表示にしか出ない）ため harness 側のフック追加は不要。
+    /// Set the cursor shape (the system cursor).
+    /// Hot path declaration: called **at event time only** (a tool change and the like), never per frame
+    /// or in real time, so the performance rules do not apply. The null runtime (nothing to display, i.e. VP_HEADLESS) is a no-op.
+    /// It is not a value a probe observes (its effect shows only on screen), so the harness needs no hook for it.
     pub fn setCursor(self: Window, shape: CursorShape) void {
         if (self.isNull()) return;
         self.inner.native.setCursor(shape);
     }
 
-    /// 表示中の OS ウィンドウタイトルを更新する。状態遷移時のみ呼ぶ。
-    /// null と未対応 backend は no-op とし、framebuffer を変更しない。
+    /// Update the title of the visible OS window. Called only on a state transition.
+    /// null and a backend without support are no-ops, and the framebuffer is left alone.
     pub fn setTitle(self: Window, title: [:0]const u8) void {
         if (self.isNull()) return;
         if (@hasDecl(native_backend.Window, "setTitle")) self.inner.native.setTitle(title);
     }
 
-    /// 直近のポインタ押下から OS の対話的ウィンドウ移動を開始する（TASK-104）。
-    /// アプリは掴む領域で mouse_down を受けたら呼ぶ。backend 未対応・null は no-op。
-    /// ホットパス宣言: mouse_down 起点のイベント時のみ。
+    /// Start the OS's interactive window move from the most recent pointer press.
+    /// An application calls it on a mouse_down inside the region the user can grab. A backend without support, and null, are no-ops.
+    /// Hot path declaration: only on a mouse_down event.
     pub fn beginDrag(self: Window) void {
         if (self.isNull()) return;
         if (@hasDecl(native_backend.Window, "beginDrag")) self.inner.native.beginDrag();
     }
 
-    /// 常に最前面（always-on-top）を設定する（TASK-104）。backend 未対応・null は no-op。イベント時のみ。
+    /// Set always-on-top. A backend without support, and null, are no-ops. Event time only.
     pub fn setAlwaysOnTop(self: Window, on: bool) void {
         if (self.isNull()) return;
         if (@hasDecl(native_backend.Window, "setAlwaysOnTop")) self.inner.native.setAlwaysOnTop(on);
     }
 
-    /// クリック透過（per-pixel。透明画素上のクリックを背後へ抜けさせる）を設定する（TASK-104）。
-    /// backend 未対応・null は no-op。イベント時のみ。
+    /// Set per-pixel click-through, letting a click over a transparent pixel fall through to what is behind.
+    /// A backend without support, and null, are no-ops. Event time only.
     pub fn setClickThrough(self: Window, on: bool) void {
         if (self.isNull()) return;
         if (@hasDecl(native_backend.Window, "setClickThrough")) self.inner.native.setClickThrough(on);
     }
 
-    /// 終了メニューをポップアップする（TASK-104。選択時に window の event queue に quit を積む）。
-    /// backend 未対応・null は no-op。イベント時のみ。
+    /// Pop up a quit menu (choosing it pushes quit onto the window's event queue).
+    /// A backend without support, and null, are no-ops. Event time only.
     pub fn showQuitMenu(self: Window) void {
         if (self.isNull()) return;
         if (@hasDecl(native_backend.Window, "showQuitMenu")) self.inner.native.showQuitMenu();
     }
 
-    /// OS のモーダルループ（ライブリサイズ等）中に backend が 1 フレームの描画を app へ要求する
-    /// opt-in 登録（TASK-23.1）。未登録時は backend が何も呼ばず従来挙動。
-    /// harness 有効時（VP_HARNESS_*）および null runtime 時は登録自体をしない（no-op）。
-    /// 再入ガードは facade の `redrawWrapper` に集約（コールバック中の再コールバックを遮断）。
+    /// Opt in to the backend asking the application for one frame during an OS modal loop (a live
+    /// resize, say). With nothing registered the backend calls nothing and behaviour is unchanged.
+    /// While the harness is enabled (VP_HARNESS_*) and under the null runtime nothing is registered at all (a no-op).
+    /// The re-entrancy guard lives in the facade's `redrawWrapper` (it blocks a callback during a callback).
     pub fn setRedrawCallback(self: Window, ctx: *anyopaque, cb: RedrawFn) void {
         if (self.isNull() or harness.isEnabled()) return;
         redraw_guard = .{ .ctx = ctx, .cb = cb, .in_callback = false };
         self.inner.native.setRedrawCallback(@ptrCast(&redraw_guard), redrawWrapper);
     }
 
-    /// 指定 index のゲームパッド状態を取得する（ポーリング主軸。ADR-009 / TASK-80.1・80.2）。
-    /// harness 有効時（null runtime 含む）は facade の 5 つ目のチョークポイントとして
-    /// `harness.getGamepadState` へ委譲し、`inject gamepad_connect/button/axis` の注入 state を返す
-    /// （実 backend の有無・opt-in 状態に関わらず synthetic state を返す。TASK-80.1 の決定を継承）。
-    /// 非 harness 時は macOS かつ `build_options.enable_gamepad`（TASK-80.2 opt-in 化。audio の
-    /// `link_audio` と対称で、exe ごとに build.zig が opt-in する）のときだけ実 backend
-    /// （GameController framework）へ分岐する。他 backend（Linux/Windows）や opt-in 無効の macOS exe は
-    /// `null` を返すスタブのまま（`builtin.os.tag == .macos` と `build_options.enable_gamepad` は
-    /// いずれも comptime-known 条件のため unselected 分岐は解析されない。本 facade の `sleep()`/`win_sleep`
-    /// と同じ idiom で、Linux/Windows の `Window` に `getGamepadState` を実装させる必要が無く、opt-in
-    /// 無効の macOS exe も GameController のシンボルを一切参照しない）。
+    /// Read the state of the gamepad at the given index (polling is the main axis; ADR-009).
+    /// While the harness is enabled (the null runtime included) this is the facade's fifth choke point:
+    /// it delegates to `harness.getGamepadState` and returns the state injected by `inject gamepad_connect/button/axis`
+    /// (a synthetic state, whether or not a real backend exists and whatever the opt-in state is).
+    /// Without the harness, the real backend (the GameController framework) is reached only on macOS and
+    /// only with `build_options.enable_gamepad`, which build.zig opts into per executable, symmetrically
+    /// with audio's `link_audio`. Other backends (Linux, Windows) and a macOS executable without the
+    /// opt-in stay a stub returning `null` (`builtin.os.tag == .macos` and `build_options.enable_gamepad`
+    /// are both comptime-known, so the unselected branch is never analysed. It is the same idiom as this
+    /// facade's `sleep()`/`win_sleep`: the Linux and Windows `Window` need no `getGamepadState`, and a
+    /// macOS executable without the opt-in references no GameController symbol at all).
     ///
-    /// ホットパス宣言: フレーム毎に呼ばれる想定だが 4台×少数フィールドの固定長 copy
-    /// （alloc/lock 無し）で全画素ループでも RT でもない。性能規約（SIMD 3点セット等）の
-    /// 適用対象外（docs/adr/009 参照）。
+    /// Hot path declaration: called once per frame, but it is a fixed-length copy of four pads with a few
+    /// fields each (no allocation, no lock), which is neither an all-pixel loop nor real time. The
+    /// performance rules (the three rules for an all-pixel loop and so on) do not apply (see docs/adr/009).
     pub fn getGamepadState(self: Window, index: u8) ?GamepadState {
         if (harness.isEnabled() or harness.isHeadlessActive()) return harness.getGamepadState(index);
-        if (builtin.os.tag != .macos) return null; // Linux/Windows backend は当面未実装（TASK-80.2 は macOS のみ）
-        if (!build_options.enable_gamepad) return null; // opt-in 無効（TASK-80.2 opt-in 化）
+        if (builtin.os.tag != .macos) return null; // the Linux and Windows backends do not implement it (macOS only)
+        if (!build_options.enable_gamepad) return null; // the opt-in is off
         return self.inner.native.getGamepadState(index);
     }
 
     // ========================================================================
-    // native menu (TASK-97.1)
+    // native menus
     // ========================================================================
 
-    /// この backend が native menu API を提供するかを返す。
+    /// Whether this backend provides the native menu API.
     ///
-    /// backend は module-level の任意 decl で実装する。未実装 backend と null は
-    /// 常に false。Command の slice は register/update 呼び出し中だけ有効でよく、
-    /// backend が必要な分を copy する。
+    /// A backend implements it as an optional module-level decl. A backend without one, and null,
+    /// always answer false. The Command slice need only stay valid for the duration of the
+    /// register/update call; the backend copies whatever it needs.
     pub fn nativeMenuAvailable(self: Window) bool {
         if (self.isNull()) return false;
         if (comptime @hasDecl(native_backend, "nativeMenuAvailable")) {
@@ -613,9 +613,9 @@ pub const Window = struct {
         return false;
     }
 
-    /// native menu を登録する。未実装 backend / null では no-op。
-    /// macOS のように app 単位のメニューバーを持つ backend では、window は契約上
-    /// 無視して最後の登録が全体を差し替える。Windows 等は window 単位で扱う。
+    /// Register a native menu. A backend without support, and null, are no-ops.
+    /// On a backend whose menu bar belongs to the application, as on macOS, window is ignored by
+    /// contract and the last registration replaces the whole bar. Windows and the like work per window.
     pub fn registerMenu(self: Window, commands: []const Command) void {
         if (self.isNull()) return;
         if (comptime @hasDecl(native_backend, "registerMenu")) {
@@ -623,7 +623,7 @@ pub const Window = struct {
         }
     }
 
-    /// 登録済み native menu の enabled/checked 等を更新する。未実装 backend / null は no-op。
+    /// Update enabled/checked and the like on a registered native menu. A backend without support, and null, are no-ops.
     pub fn updateMenu(self: Window, commands: []const Command) void {
         if (self.isNull()) return;
         if (comptime @hasDecl(native_backend, "updateMenu")) {
@@ -631,7 +631,7 @@ pub const Window = struct {
         }
     }
 
-    /// 登録済み native menu を破棄する。未実装 backend / null は no-op。
+    /// Destroy the registered native menu. A backend without support, and null, are no-ops.
     pub fn destroyMenu(self: Window) void {
         if (self.isNull()) return;
         if (comptime @hasDecl(native_backend, "destroyMenu")) {
@@ -639,17 +639,17 @@ pub const Window = struct {
         }
     }
 
-    /// 呼び出し側の命名差を避けるための query alias。意味と契約は nativeMenuAvailable と同じ。
+    /// A query alias, so callers need not care which name they know. Its meaning and contract match nativeMenuAvailable.
     pub const supportsNativeMenus = nativeMenuAvailable;
 
-    /// IME composition preedit 本文を buf へ書く（TASK-79.6.1）。
-    /// null / 非対応 backend は常に空（text 0 長・revision/cursor 0）。
+    /// Write the IME composition preedit text into buf.
+    /// null and a backend without support always give empty results (zero-length text, revision/cursor 0).
     ///
-    /// **latest-wins 契約（親 TASK-79.6 codex 収束）**: snapshot は常に「現在の」未確定状態。
-    /// 同一 poll 内の複数 `composition_changed` は最新 snapshot に潰れる。event の `revision` は
-    /// 取りこぼし検知用で、過去 revision の snapshot は取得できない。
+    /// **The latest-wins contract**: a snapshot is always the *current* uncommitted state.
+    /// Several `composition_changed` events within one poll collapse into the latest snapshot. An event's
+    /// `revision` exists to detect a missed update; a snapshot of an older revision cannot be obtained.
     ///
-    /// ホットパス宣言: イベント時のみ（描画前の preedit 読み。フレーム毎全画素でも RT でもない）。
+    /// Hot path declaration: event time only (reading the preedit before drawing); neither an all-pixel per-frame loop nor real time.
     pub fn getCompositionSnapshot(self: Window, buf: []u8) CompositionSnapshot {
         if (harness.isEnabled()) return harness.getCompositionSnapshot(buf);
         if (comptime null_runtime_supported) {
@@ -658,8 +658,8 @@ pub const Window = struct {
         return self.inner.native.getCompositionSnapshot(buf);
     }
 
-    /// IME 候補窓の caret 基準 rect を framebuffer pixel・content 左上原点で供給する。
-    /// null / 未対応 backend は no-op。レイアウト変化時などイベント時のみ呼ぶ。
+    /// Supply the caret rect the IME candidate window is anchored to, in framebuffer pixels with the origin at the content's top-left.
+    /// null and a backend without support are no-ops. Called at event time only, such as when the layout changes.
     pub fn setCompositionRect(self: Window, x: i32, y: i32, w: i32, h: i32) void {
         if (self.isNull()) return;
         if (comptime @hasDecl(native_backend.Window, "setCompositionRect")) {
@@ -667,15 +667,15 @@ pub const Window = struct {
         }
     }
 
-    /// TASK-142: テキスト編集ウィジェットのフォーカス有無を platform へ伝える汎用プリミティブ
-    /// （SDL の StartTextInput/StopTextInput 相当。`setCompositionRect` と対になる）。
-    /// active=false の間は IME/composition を経路から外すので、IME 有効中でも修飾なし英字キーが
-    /// ショートカットとして届く。**冪等**なので consumer は毎フレーム focus 状態に追従して呼んでよい
-    /// （実効経路が変わらなければ副作用なし。変わるときのみ composition 破棄等が走る）。null は no-op。
-    /// 将来の Linux/Windows 実装も「毎フレーム安全な冪等 setter（内部で変化検出）」であること。
-    /// backend 実装は `@hasDecl` gate で opt-in: 現在は macOS（objc/swift/metal）のみ実装。
-    /// Linux(XIM/ibus/text-input-v3)・Windows(IMM/WM_IME) は IME composition 実装時にこのメソッドを
-    /// backend Window に足せば、facade も consumer も無改修で有効化される（未実装 backend は no-op）。
+    /// A general primitive that tells the platform whether a text editing widget has focus
+    /// (the equivalent of SDL's StartTextInput/StopTextInput; it pairs with `setCompositionRect`).
+    /// While active=false the IME and composition are kept out of the path, so even with an IME enabled
+    /// an unmodified letter key arrives as a shortcut. It is **idempotent**, so a consumer may call it
+    /// every frame to track focus (no effect while the effective path is unchanged; a composition is discarded only when it changes). null is a no-op.
+    /// A future Linux or Windows implementation must likewise be an idempotent setter that is safe every frame (detecting the change internally).
+    /// A backend opts in through the `@hasDecl` gate; today only macOS (objc/swift/metal) implements it.
+    /// Once Linux (XIM/ibus/text-input-v3) or Windows (IMM/WM_IME) implements IME composition, adding
+    /// this method to the backend Window enables it with no change to the facade or the consumer (a backend without it is a no-op).
     pub fn setTextInputActive(self: Window, active: bool) void {
         if (self.isNull()) return;
         if (comptime @hasDecl(native_backend.Window, "setTextInputActive")) {
@@ -683,8 +683,8 @@ pub const Window = struct {
         }
     }
 
-    /// TASK-79.6.3: IME document access（確定テキストの再変換）。`callbacks == null` で登録解除。
-    /// null / 非対応 backend は no-op。window destroy 時に facade 側も解除する。
+    /// IME document access (reconverting committed text). `callbacks == null` unregisters.
+    /// null and a backend without support are no-ops. The facade unregisters as well when the window is destroyed.
     pub fn setTextInputDocumentAccess(
         self: Window,
         userdata: *anyopaque,
@@ -698,11 +698,11 @@ pub const Window = struct {
 };
 
 pub fn init() Error!void {
-    // frame pacing の学習状態（TASK-176）。プロセス再初期化で異常値を持ち越さない。
+    // The frame pacing learning state. Re-initialising the process must not carry a bad value over.
     pacer.reset();
-    // VP_HEADLESS を harness.parseConfig より前に確定（TASK-165）。値が "1" のときだけ null runtime。
-    // copilot は TASK-62.5.2 §3b の順序: harness.parseConfig → copilot.parseConfig → backend init →
-    // harness.startTransport → copilot.startTransport（排他は env 存在ベースで parseConfig 時点に確定）。
+    // VP_HEADLESS is settled before harness.parseConfig. Only the value "1" selects the null runtime.
+    // The copilot order is: harness.parseConfig → copilot.parseConfig → backend init →
+    // harness.startTransport → copilot.startTransport (exclusivity is settled at parseConfig time, from which env vars are present).
     runtime_null = envHeadlessOne();
     harness.setHeadlessActive(runtime_null);
     harness.parseConfig();
@@ -716,11 +716,11 @@ pub fn init() Error!void {
     }
     harness.startTransport();
     copilot.startTransport();
-    // netsync session → copilot operate 拒否（callback は initFromEnv の enableRouter より前に登録）。
+    // A netsync session makes copilot reject operate calls (registered before initFromEnv's enableRouter).
     netsync.setSessionStateCallback(copilot.setNetsyncSessionActive);
-    // netsync は null runtime 分岐でも起動（env 未設定なら initFromEnv 即 return。TASK-62.3.2）。
+    // netsync starts on the null runtime branch too (with the env unset, initFromEnv returns immediately).
     netsync.initFromEnv();
-    // 観測 probe（TASK-62.3.4）。有効時のみ。netsync→harness 逆依存を避けるため platform から登録。
+    // The observation probe, only while enabled. It is registered from platform to avoid a netsync→harness reverse dependency.
     if (netsync.isEnabled()) {
         harness.registerProbe(.{
             .name = "netsync",
@@ -734,14 +734,14 @@ pub fn init() Error!void {
 }
 
 pub fn shutdown() void {
-    // frame pacing の OS リソース（Windows の waitable timer handle）を閉じる（TASK-176）。
+    // Close the OS resource behind frame pacing (Windows's waitable timer handle).
     if (comptime builtin.os.tag == .windows) windows_wait.deinit();
-    // app_runtime の defer は登録順と逆に実行されるため App.deinit が先に走る。
-    // 借用先の App 解放後に netsync/copilot が executor を deref しないよう、先に借用を drop する。
+    // app_runtime's defers run in reverse order of registration, so App.deinit runs first.
+    // The borrow is dropped first, so netsync and copilot never dereference the executor after the borrowed App is freed.
     netsync.forgetSharedExecutor();
     copilot.forgetSharedExecutor();
-    netsync.shutdown(); // main thread で setRouter(null)。disabled 時は no-op
-    copilot.stopTransport(); // 接続中 stream → listener の順に close（disabled 時は no-op）
+    netsync.shutdown(); // setRouter(null) on the main thread; a no-op while disabled
+    copilot.stopTransport(); // close the connected stream, then the listener (a no-op while disabled)
     if (runtime_null) {
         if (comptime null_runtime_supported) null_backend.shutdown();
         return;
@@ -750,8 +750,8 @@ pub fn shutdown() void {
 }
 
 pub fn getTime() f64 {
-    // manual clock（replay / LISTEN+MANUAL_CLOCK）のみ仮想クロック。free-run は backend 実時刻
-    // （clock ownership と control channel の分離。TASK-164）。
+    // Only a manual clock (replay, or LISTEN+MANUAL_CLOCK) is virtual; free-run reads the backend's real
+    // time (clock ownership is kept separate from the control channel).
     if (harness.isManualClock()) return harness.now();
     if (runtime_null) {
         if (comptime null_runtime_supported) return null_backend.getTime();
@@ -760,48 +760,48 @@ pub fn getTime() f64 {
     return native_backend.getTime();
 }
 
-/// Dock アイコン / メニューバーの表示を切替える（TASK-104。アプリ全体・window 非依存）。
-/// visible=false で常駐アプリらしくする（macOS=accessory policy）。backend 未対応・null は no-op。
-/// ホットパス宣言: 初期化/イベント時のみ。
+/// Show or hide the Dock icon and the menu bar (application-wide, not per window).
+/// visible=false makes it behave like a background app (on macOS, the accessory policy). A backend without support, and null, are no-ops.
+/// Hot path declaration: initialisation and event time only.
 pub fn setDockVisible(visible: bool) void {
     if (runtime_null) return;
     if (@hasDecl(native_backend, "setDockVisible")) native_backend.setDockVisible(visible);
 }
 
-/// ファイル保存ダイアログ。null runtime 時は backend が未初期化（native panel / zenity を呼べない）ため
-/// 即 `error.DialogFailed` を返す（TASK-165）。
+/// The save file dialog. Under the null runtime the backend is uninitialised (there is no native
+/// panel and no zenity to call), so it returns `error.DialogFailed` immediately.
 pub fn saveFileDialog(gpa: std.mem.Allocator, io: std.Io, opts: SaveDialogOptions) (DialogError || std.mem.Allocator.Error)!?[]u8 {
     if (runtime_null) return error.DialogFailed;
     return native_backend.saveFileDialog(gpa, io, opts);
 }
 
-/// ファイルを開くダイアログ。null runtime 時は即 `error.DialogFailed`（`saveFileDialog` と同じ理由）。
-/// wasm では非同期: 未 pick 時 `error.DialogPending`（次 frame で再試行。TASK-73.3）。
+/// The open file dialog. Under the null runtime it returns `error.DialogFailed` immediately, for the same reason as `saveFileDialog`.
+/// On wasm it is asynchronous: until something is picked it gives `error.DialogPending` (retry on the next frame).
 pub fn openFileDialog(gpa: std.mem.Allocator, io: std.Io, opts: OpenDialogOptions) (DialogError || std.mem.Allocator.Error)!?[]u8 {
     if (runtime_null) return error.DialogFailed;
     return native_backend.openFileDialog(gpa, io, opts);
 }
 
 // ============================================================================
-// System clipboard（TASK-73.3 wasm 色 clipboard。native は no-op / 未実装）
-// TASK-120 の setClipboardText/getClipboardText（OS テキスト）とは別経路。混在させない。
+// The system clipboard (the wasm colour clipboard; native is a no-op / unimplemented)
+// A path distinct from setClipboardText/getClipboardText (OS text). Do not mix the two.
 // ============================================================================
 
-/// システム clipboard へ text を書く。backend 未実装時は no-op。
+/// Write text to the system clipboard. A no-op when the backend does not implement it.
 pub fn clipboardWrite(text: []const u8) void {
     if (comptime @hasDecl(native_backend, "clipboardWrite")) {
         native_backend.clipboardWrite(text);
     }
 }
 
-/// システム clipboard の text を非同期要求。backend 未実装時は no-op。
+/// Ask for the system clipboard text asynchronously. A no-op when the backend does not implement it.
 pub fn clipboardRequestPaste() void {
     if (comptime @hasDecl(native_backend, "clipboardRequestPaste")) {
         native_backend.clipboardRequestPaste();
     }
 }
 
-/// 届いていれば text を返し消費する。未着・未実装は null。
+/// Return and consume the text once it has arrived. Not yet arrived, or unimplemented, gives null.
 pub fn clipboardTakePaste() ?[]const u8 {
     if (comptime @hasDecl(native_backend, "clipboardTakePaste")) {
         return native_backend.clipboardTakePaste();
@@ -810,12 +810,12 @@ pub fn clipboardTakePaste() ?[]const u8 {
 }
 
 // ============================================================================
-// OS テキストクリップボード（TASK-120）
+// The OS text clipboard
 // ============================================================================
 //
-// ホットパス宣言: イベント時のみ（Cmd+C/X/V）。フレーム毎・RT では呼ばない。
-// null runtime / unit test では固定長 in-memory fallback。通常 native runtime は backend
-//（macOS objc=NSPasteboard）へ委譲する。
+// Hot path declaration: event time only (Cmd+C/X/V). Never called per frame or in real time.
+// The null runtime and unit tests use a fixed-length in-memory fallback; the ordinary native runtime
+// delegates to the backend (on macOS objc, NSPasteboard).
 
 const MEMORY_CLIPBOARD_CAP: usize = 4096;
 
@@ -833,14 +833,14 @@ fn utf8TruncateLen(text: []const u8, max: usize) usize {
     return n;
 }
 
-/// テスト間で in-memory clipboard を初期化する（`builtin.is_test` 時のみ有効）。
+/// Reset the in-memory clipboard between tests (effective only under `builtin.is_test`).
 pub fn resetClipboardForTest() void {
     if (!builtin.is_test) return;
     memory_clipboard_len = 0;
     memory_clipboard_set = false;
 }
 
-/// UTF-8 text を OS clipboard へ書く。未対応 backend は no-op。
+/// Write UTF-8 text to the OS clipboard. A backend without support is a no-op.
 pub fn setClipboardText(text: []const u8) void {
     if (useMemoryClipboard()) {
         const n = utf8TruncateLen(text, MEMORY_CLIPBOARD_CAP);
@@ -854,8 +854,8 @@ pub fn setClipboardText(text: []const u8) void {
     }
 }
 
-/// OS clipboard の UTF-8 text を caller 所有 buffer へコピーする。
-/// null = 未対応 / 未設定 / 失敗。空文字列は `buf[0..0]`。容量超過は UTF-8 境界で切り詰め。
+/// Copy the OS clipboard's UTF-8 text into a caller-owned buffer.
+/// null = unsupported, unset, or a failure. An empty string is `buf[0..0]`. Anything over capacity is truncated at a UTF-8 boundary.
 pub fn getClipboardText(buf: []u8) ?[]const u8 {
     if (useMemoryClipboard()) {
         if (!memory_clipboard_set) return null;
@@ -870,107 +870,107 @@ pub fn getClipboardText(buf: []u8) ?[]const u8 {
 }
 
 // ============================================================================
-// custom probe（ヘッドレス検証 harness・TASK-32.3）
+// custom probes (the headless verification harness)
 //
-// app が `platform.registerProbe(.{ .name, .ctx, .snapshot, .digest })` で probe を opt-in 登録する。
-// platform module は共有 harness module を既に import 済みなので re-export だけで露出でき、build.zig 変更は不要。
-// harness 無効時（env 未設定）は registerProbe が no-op。framework は probe の中身を解釈しない。
+// An application opts a probe in with `platform.registerProbe(.{ .name, .ctx, .snapshot, .digest })`.
+// The platform module already imports the shared harness module, so a re-export exposes it and build.zig needs no change.
+// With the harness disabled (the env unset) registerProbe is a no-op. The framework never interprets a probe's contents.
 // ============================================================================
 pub const Probe = harness.Probe;
 pub const registerProbe = harness.registerProbe;
 
 // ============================================================================
-// custom action（TASK-62.1 → TASK-62.3.1 で action_registry へ分離）
+// custom actions (they live in action_registry)
 //
-// app が `platform.registerAction(.{ .name, .ctx, .run })` で高レベル操作を opt-in 登録する。
-// probe（read）に対称な操作（write）口。参照先は `action_registry`（harness 経由の同一インスタンス）。
-// harness/action_registry 無効時（env 未設定）は registerAction が no-op。
-// framework は action の中身を解釈しない（probe と同じ不変条件）。
+// An application opts a high-level operation in with `platform.registerAction(.{ .name, .ctx, .run })`.
+// It is the write side, symmetrical with a probe's read side, and points at `action_registry` (the same instance, reached through harness).
+// With harness and action_registry disabled (the env unset) registerAction is a no-op.
+// The framework never interprets an action's contents (the same invariant as a probe).
 // ============================================================================
 pub const Action = harness.action_registry.Action;
 pub const NetworkPolicy = harness.action_registry.NetworkPolicy;
 pub const registerAction = harness.action_registry.registerAction;
-/// action 失敗時の structured error（code + suggested_next_action）。opt-in。TASK-62.5.9。
+/// The structured error for a failed action (code + suggested_next_action). Opt-in.
 pub const setActionErrorDetail = harness.action_registry.setActionErrorDetail;
 
 pub const StateSync = netsync.StateSync;
-/// netsync join 時の document/patch 同期アダプタ登録（無効時も保存のみ・常に呼んでよい）。
+/// Register the document/patch synchronisation adapter used when netsync joins (while disabled it only stores it, so it is always safe to call).
 pub const registerStateSync = netsync.registerStateSync;
 
-/// netsync session が有効か（host/client 接続中）。キーボード undo/redo の経路切替用（TASK-62.3.5）。
+/// Whether a netsync session is live (a host or client is connected). Used to switch the keyboard undo/redo path.
 pub const netsyncActive = netsync.isEnabled;
 
-/// このプロセスが netsync host か（TASK-106.1 pattern_state 配信判定）。
+/// Whether this process is the netsync host (it decides who distributes the pattern_state).
 pub const netsyncIsHost = netsync.isHost;
 
-/// client の outbound proposal 待ち件数（TASK-162 chunk drain。host/無効時は 0）。
+/// How many outbound proposals a client has pending (0 on a host and while disabled).
 pub const netsyncPendingProposalCount = netsync.pendingProposalCount;
-/// client proposal 待ち行列容量（TASK-162: release 時一括 PROPOSE の上限判定）。
+/// The capacity of the client's pending proposal queue (the limit on a batched PROPOSE at release time).
 pub const netsyncPendingCap = netsync.PENDING_CAP;
 
-/// 接続中 peer 数（host=active client 数 / client=catalog の active 数）。generic 透過 facade。
+/// The number of connected peers (on a host, the active clients; on a client, the active catalog entries). A transparent generic facade.
 pub const netsyncPeerCount = netsync.peerCount;
 
-/// peer origin 解決（TASK-83 Phase 2）。apps は netsync 実装型を直接 import しない。
+/// Resolving a peer origin. Applications never import the netsync implementation types directly.
 pub const NetsyncPeerOriginView = netsync.PeerOriginView;
 pub const netsyncResolvePeerOrigin = netsync.resolvePeerOrigin;
 pub const netsyncPeerMetadataRevision = netsync.peerMetadataRevision;
 pub const netsyncLocalPeerId = netsync.localPeerId;
 
-/// host-generated internal action を COMMIT broadcast する（name+args 透過・framework 非解釈）。
-/// host 以外 / netsync 無効時は `error.NotHost`。RT thread からは呼ばない（main thread イベント境界のみ）。
+/// Broadcast a host-generated internal action as a COMMIT (name and args pass through; the framework does not interpret them).
+/// A non-host, or netsync disabled, gives `error.NotHost`. Never call it from the real-time thread (main thread event boundaries only).
 pub fn commitHostAction(name: []const u8, args: []const u8, buf: []u8) anyerror![]const u8 {
     if (!netsync.isEnabled() or !netsync.isHost()) return error.NotHost;
     return netsync.commitAndBroadcast(name, args, buf);
 }
 
-/// TASK-163: netsync COMMIT 適用後の汎用 post-apply hook（opaque ctx + raw 情報のみ）。
-/// 未登録 / netsync 無効時は no-op。App 解放前に `setNetsyncPostApplyHook(null, null)` で解除する。
+/// A general post-apply hook, run once a netsync COMMIT has been applied (an opaque ctx plus raw information only).
+/// Unregistered, or netsync disabled, is a no-op. Unregister with `setNetsyncPostApplyHook(null, null)` before freeing the App.
 pub const NetsyncPostApplyContext = netsync.PostApplyContext;
 pub const NetsyncPostApplyHook = netsync.PostApplyHook;
 pub fn setNetsyncPostApplyHook(ctx: ?*anyopaque, hook: ?NetsyncPostApplyHook) void {
     netsync.setPostApplyHook(ctx, hook);
 }
 
-/// action を netsync router 経由で実行（router 未設定時は dispatch 等価）。
+/// Run an action through the netsync router (equivalent to dispatch when no router is set).
 pub const routeAction = harness.action_registry.routeLocalAction;
 
 // ============================================================================
-// command model（TASK-62.5.1/62.5.3）
+// the command model
 //
-// app が CommandLog + Executor を所有して「誰が（ActorId）・何を実行したか」を記録する型群。
-// command.zig は std のみ（platform/harness 非依存）だが、型の単一 instance 共有のため
-// harness module 経由で再エクスポートする。apps は `kit.platform.command` で届く
-// （command は std のみなので層規約上の追加依存は生じない）。
+// The types with which an application owns a CommandLog and an Executor and records who (an ActorId) ran what.
+// command.zig depends on std alone (not on platform or harness), but it is re-exported through the
+// harness module so that a single instance of the types is shared. Applications reach it as
+// `kit.platform.command` (since command is std-only, this adds no dependency under the layer rules).
 // ============================================================================
 pub const command = harness.command;
-/// app の `dispatchCommand(id)` を Executor/router へ接続する adapter 契約。
+/// The adapter contract connecting an application's `dispatchCommand(id)` to the Executor and the router.
 pub const command_adapter = harness.command;
 
-/// Co-pilot / netsync の共有 executor を設定する（各 setSharedExecutor への委譲。TASK-62.5.3）。
-/// 設定時、copilot transport の `action` は app 側 wrapper（executor 経由の記録を一元化）へ
-/// 直 dispatch し、`begin_tx`/`end_tx`/`cancel_tx` はこの executor に対して操作する。
-/// **harness 無効・copilot 無効時も呼んでよい**（module 変数の代入のみの no-op 規約）。
-/// Executor は caller 所有の借用であり、platform.shutdown が teardown 時に借用を drop するため
-/// app 側の明示的な登録解除は不要。ただし platform.shutdown より後まで Executor を生かし続けてはならない。
+/// Set the executor shared by copilot and netsync (delegating to each setSharedExecutor).
+/// Once it is set, the copilot transport's `action` dispatches straight to the application-side
+/// wrapper (which centralises recording through the executor), and `begin_tx`/`end_tx`/`cancel_tx` act on this executor.
+/// **It is safe to call with the harness and copilot disabled** (by contract a no-op that only assigns a module variable).
+/// The Executor is a borrow owned by the caller, and platform.shutdown drops the borrow during
+/// teardown, so the application need not unregister. It must not keep the Executor alive past platform.shutdown.
 pub fn setCommandExecutor(exec: ?*command.Executor) void {
     copilot.setSharedExecutor(exec);
-    netsync.setSharedExecutor(exec); // remote COMMIT 適用（no_record）。未設定時 netsync は dispatch fallback
+    netsync.setSharedExecutor(exec); // applying a remote COMMIT (no_record); with none set, netsync falls back to dispatch
 }
 
 // ============================================================================
-// sleep（OS 非依存のフレームウェイト）
+// sleep (an OS-independent frame wait)
 //
-// zig 0.16 は std.time.sleep を廃し sleep が std.Io 経由になったため、main/examples が共通で使える
-// 単純な遅延を facade に置く。backend を増やさず comptime OS 分岐で済む（POSIX=nanosleep, Windows=Sleep）。
-// unselected 分岐は comptime-known 条件のため解析されない（winapi extern が POSIX を壊さない）。
+// zig 0.16 dropped std.time.sleep and routes sleep through std.Io, so the facade keeps the simple
+// delay that main and the examples share. A comptime OS branch is enough, with no extra backend (POSIX nanosleep, Windows Sleep).
+// The unselected branch is comptime-known and never analysed (the winapi extern does not break POSIX).
 // ============================================================================
 const win_sleep = if (builtin.os.tag == .windows) struct {
     extern "kernel32" fn Sleep(dwMilliseconds: u32) callconv(.winapi) void;
 } else struct {};
 
-/// 指定ナノ秒だけ最低限スリープする（精度は OS 依存）。
-/// wasm では no-op（rAF がペーシング。nanosleep 参照を comptime で除外。TASK-73.1）。
+/// Sleep for at least the given nanoseconds (the resolution depends on the OS).
+/// A no-op on wasm (rAF does the pacing; the nanosleep reference is excluded at comptime).
 const sleep_impl = if (builtin.cpu.arch.isWasm()) struct {
     fn call(_: u64) void {}
 } else struct {
@@ -991,9 +991,9 @@ pub fn sleep(nanoseconds: u64) void {
     sleep_impl.call(nanoseconds);
 }
 
-// ── 高精度 sleep（TASK-176。framePaceUntil 専用） ─────────────────────────────
-// 各 OS の最も精度の高い待ちを使う。いずれも要求超過分は EWMA 補正が吸収するので、
-// プリミティブの差は「学習後のジッタ幅」に出る。失敗時は既存 `sleep()` へ落ちる。
+// ── A high-resolution sleep (for framePaceUntil alone) ──────────────────────
+// Each OS's most precise wait is used. Since the EWMA correction absorbs whatever each one overshoots,
+// the difference between the primitives shows up as the jitter left after learning. On failure this falls back to `sleep()`.
 
 const darwin_wait = if (builtin.os.tag == .macos) struct {
     const TimebaseInfo = extern struct { numer: u32, denom: u32 };
@@ -1003,7 +1003,7 @@ const darwin_wait = if (builtin.os.tag == .macos) struct {
 
     var timebase: TimebaseInfo = .{ .numer = 0, .denom = 0 };
 
-    /// ns → mach tick。timebase は初回のみ取得しキャッシュする。
+    /// ns → mach ticks. The timebase is read once, on the first call, and cached.
     fn ticks(nanoseconds: u64) ?u64 {
         if (timebase.numer == 0 or timebase.denom == 0) {
             if (mach_timebase_info(&timebase) != 0) return null;
@@ -1019,9 +1019,9 @@ const darwin_wait = if (builtin.os.tag == .macos) struct {
 } else struct {};
 
 const linux_wait = if (builtin.os.tag == .linux) struct {
-    /// `clock_nanosleep(CLOCK_MONOTONIC, ABSTIME)`。getTime() は MONOTONIC_RAW なので
-    /// **待ち時点で CLOCK_MONOTONIC を読み**、そこへ相対 request を足した絶対時刻を渡す
-    /// （clock domain を混ぜない）。EINTR は残り時間で再試行する。
+    /// `clock_nanosleep(CLOCK_MONOTONIC, ABSTIME)`. Since getTime() reads MONOTONIC_RAW, CLOCK_MONOTONIC
+    /// is **read at the moment of the wait** and the relative request is added to it to form the absolute
+    /// deadline passed in (the clock domains are never mixed). EINTR is retried.
     fn call(nanoseconds: u64) void {
         var target: std.c.timespec = undefined;
         if (std.c.clock_gettime(.MONOTONIC, &target) != 0) return sleep(nanoseconds);
@@ -1033,16 +1033,16 @@ const linux_wait = if (builtin.os.tag == .linux) struct {
             target.sec += 1;
             target.nsec -= 1_000_000_000;
         }
-        // `clock_nanosleep` は POSIX 契約どおり **errno を設定せずエラー番号を戻り値で返す**。
-        // EINTR は同じ絶対 target で再試行（絶対指定なので残り時間の再計算は不要）。
+        // Per the POSIX contract, `clock_nanosleep` **returns the error number rather than setting errno**.
+        // EINTR retries with the same absolute target (being absolute, the remaining time needs no recomputing).
         var attempts: u8 = 0;
         while (attempts < 8) : (attempts += 1) {
             const rc = std.c.clock_nanosleep(.MONOTONIC, .{ .ABSTIME = true }, &target, null);
             if (rc == 0) return;
             if (rc != @intFromEnum(std.c.E.INTR)) return sleep(nanoseconds);
         }
-        // EINTR が続いて上限に達した場合: **残り時間を計り直して相対 sleep で埋める**
-        // （ここで return すると deadline 前に早期復帰して pacing が外れる）。
+        // When EINTR keeps happening and the attempt limit is reached: **measure the remaining time again**
+        // **and fill it with a relative sleep** (returning here would come back before the deadline and break pacing).
         var now: std.c.timespec = undefined;
         if (std.c.clock_gettime(.MONOTONIC, &now) != 0) return;
         const remain_sec = target.sec - now.sec;
@@ -1075,7 +1075,7 @@ const windows_wait = if (builtin.os.tag == .windows) struct {
     extern "kernel32" fn WaitForSingleObject(hHandle: HANDLE, dwMilliseconds: u32) callconv(.winapi) u32;
     extern "kernel32" fn CloseHandle(hObject: HANDLE) callconv(.winapi) i32;
 
-    /// 高精度 timer → 通常 timer → `Sleep(ms)` の 3 段 fallback。handle は初回生成しキャッシュする。
+    /// A three-step fallback: a high-resolution timer, a normal timer, then `Sleep(ms)`. The handle is created once and cached.
     var timer: ?HANDLE = null;
     var timer_tried = false;
 
@@ -1090,7 +1090,7 @@ const windows_wait = if (builtin.os.tag == .windows) struct {
 
     fn call(nanoseconds: u64) void {
         const h = handle() orelse return sleep(nanoseconds);
-        // 負値 = 相対（100ns 単位）。0 になる短さなら待たない。
+        // A negative value means relative (in 100ns units). Anything short enough to round to 0 does not wait.
         const hundred_ns: i64 = @intCast(@min(nanoseconds / 100, @as(u64, @intCast(std.math.maxInt(i64)))));
         if (hundred_ns == 0) return;
         const due: i64 = -hundred_ns;
@@ -1107,7 +1107,7 @@ const windows_wait = if (builtin.os.tag == .windows) struct {
     }
 } else struct {};
 
-/// OS ごとの高精度 sleep（`framePaceUntil` 専用。wasm は no-op）。
+/// The per-OS high-resolution sleep (for `framePaceUntil` alone; a no-op on wasm).
 fn sleepPrecise(nanoseconds: u64) void {
     if (comptime builtin.cpu.arch.isWasm()) return;
     switch (comptime builtin.os.tag) {
@@ -1118,59 +1118,59 @@ fn sleepPrecise(nanoseconds: u64) void {
     }
 }
 
-/// フレーム毎の main loop ウェイト（TASK-32.4 P4 / TASK-164）。
-/// manual clock（replay / LISTEN+MANUAL_CLOCK）のときだけ **no-op**（仮想クロック + pollGate が
-/// フレーム進行を決めるため実時間 sleep は待ち損）。free-run と harness 無効時は `sleep()` と同じ。
+/// The per-frame main loop wait.
+/// Under a manual clock (replay, or LISTEN+MANUAL_CLOCK) it is a **no-op**, because the virtual clock
+/// plus pollGate decide frame progress and a real-time sleep would be wasted. In free-run, and with the harness disabled, it equals `sleep()`.
 ///
-/// **注意（TASK-176）**: これは「フレーム作業時間を引かない固定 sleep」なので、周期の目標値を渡しても
-/// 実 fps は `1/(work + nanoseconds + OS の timer slack)` になる（実測: apps/patch で 60fps 目標に対し
-/// 41.8fps）。新規コードでは `framePaceUntil` を使う。examples の固定呼び出しは TASK-177 で移行予定。
+/// **Note**: this is a fixed sleep that does not subtract the frame's work time, so passing the target
+/// period still gives a real frame rate of `1/(work + nanoseconds + the OS timer slack)` (measured:
+/// 41.8fps against a 60fps target in apps/patch). New code uses `framePaceUntil` instead.
 pub fn frameDelay(nanoseconds: u64) void {
     if (harness.isManualClock()) return;
     sleep(nanoseconds);
 }
 
 // ============================================================================
-// frame pacing（deadline + overshoot 補正。TASK-176）
+// frame pacing (a deadline plus overshoot correction)
 //
-// フレーム毎に 1 回呼ぶ「目標時刻まで待つ」pacing。固定 sleep（frameDelay）と違い作業時間を差し引く。
-// OS の相対/絶対 sleep はいずれも要求時間を超過する（macOS は timer slack が要求の約 20%: 16.67ms 要求で
-// 平均 3.4ms 超過＝49.8fps）。**絶対時刻 sleep でも解消しない**ため、実測 overshoot を EWMA で学習して
-// 要求から差し引く（実測: 平均誤差 -0.10ms = 60.4fps。busy-wait なし）。
+// Pacing that waits until a target time, called once per frame. Unlike a fixed sleep (frameDelay) it subtracts the work time.
+// Both relative and absolute OS sleeps overshoot the requested time (on macOS the timer slack is about
+// 20% of the request: 16.67ms requested overshoots by 3.4ms on average, i.e. 49.8fps). **An absolute-time
+// sleep does not fix it**, so the measured overshoot is learned with an EWMA and subtracted from the request (measured: a mean error of -0.10ms, i.e. 60.4fps, with no busy-wait).
 //
-// ホットパス宣言: フレーム毎（1 フレーム 1 回）。全画素ループ・RT（毎サンプル）経路ではない。
+// Hot path declaration: per frame (once per frame). Neither an all-pixel loop nor a real-time (per sample) path.
 // ============================================================================
 
-/// pacing の純ロジック（判断・EWMA 学習・定数）は `core/frame_pacing.zig`（OS 非依存・単体テスト対象）。
+/// The pure pacing logic (the decision, the EWMA learning and the constants) lives in `core/frame_pacing.zig` (OS independent, and unit tested).
 const frame_pacing = @import("frame_pacing.zig");
 
-/// main thread 専有の pacing 学習状態。RT スレッドからは触らない。
+/// The pacing learning state, owned by the main thread alone. The real-time thread never touches it.
 var pacer: frame_pacing.Pacer = .{};
 
-/// 時計と高精度 sleep を注入した pacing 実行器（comptime 注入なので間接呼び出しにならない）。
+/// The pacing driver with the clock and the high-resolution sleep injected (injected at comptime, so no indirect call).
 const PaceDriver = frame_pacing.Driver(getTime, sleepPrecise);
 
-/// 目標時刻（`getTime()` と同じ単調時計・秒）に向けてフレームを **best-effort で pacing** する。
-/// フレーム毎に 1 回だけ呼ぶ（`frameDelay` の置き換え）。
+/// Pace the frame **best-effort** towards a target time (in seconds, on the same monotonic clock as `getTime()`).
+/// Call it exactly once per frame (in place of `frameDelay`).
 ///
-/// 厳密な deadline 保証ではない: 平均周期は目標に一致するが、個々のフレームは最大
-/// `frame_pacing.MARGIN_NS`(200µs) 早く return しうるし、OS の timer slack 由来のジッタ（macOS 実測 p95 約 2ms）
-/// は残る。deadline が過去 / 非有限なら即 return。
+/// This is not a hard deadline guarantee: the mean period matches the target, but an individual frame
+/// may return up to `frame_pacing.MARGIN_NS` (200µs) early, and the jitter from the OS timer slack
+/// (measured on macOS at a p95 of about 2ms) remains. A deadline in the past, or a non-finite one, returns immediately.
 ///
-/// manual clock（replay / LISTEN+MANUAL_CLOCK）では **完全 no-op**（OS 時計も読まず学習状態も触らない）。
+/// Under a manual clock (replay, or LISTEN+MANUAL_CLOCK) it is a **complete no-op** (it reads no OS clock and touches no learning state).
 ///
-/// 1 級 backend（Metal / D3D11-DXGI / Wayland）との関係: backend が vsync 等で待った時間はフレーム起点からの
-/// 経過に含まれるため remaining から差し引かれ、追加待ちは残余のみになる（present が非ブロックなら
-/// caller 側の待ちが残る＝二重待ちしないことの保証ではない）。
+/// How it relates to a first-class backend (Metal / D3D11-DXGI / Wayland): time the backend spent
+/// waiting on vsync counts towards the elapsed time since the frame started, so it is subtracted from
+/// the remaining time and only the remainder is waited out (with a non-blocking present the wait stays on the caller's side; this is no guarantee against waiting twice).
 pub fn framePaceUntil(deadline_seconds: f64) void {
     PaceDriver.pace(&pacer, deadline_seconds, harness.isManualClock());
 }
 
 // ============================================================================
-// TASK-156.1 unit tests（入力正規化・snapshot 契約。display 不要）
+// unit tests for input normalisation and the snapshot contract (no display needed)
 // ============================================================================
 
-test "TASK-156.1: normalizeEventWithScale floor divide（scale=2 raw→logical）" {
+test "normalizeEventWithScale floors the divide (scale=2 raw to logical)" {
     const raw_move: Event = .{ .mouse_move = .{
         .x = 20,
         .y = 10,
@@ -1209,7 +1209,7 @@ test "TASK-156.1: normalizeEventWithScale floor divide（scale=2 raw→logical�
     try std.testing.expectEqual(@as(f32, -3.0), scroll_l.mouse_scroll.dy);
 }
 
-test "TASK-156.1: normalizeEventWithScale scale=1 と scale<=0 は恒等/補正" {
+test "normalizeEventWithScale is the identity at scale=1 and corrects scale<=0" {
     const ev: Event = .{ .mouse_move = .{
         .x = 11,
         .y = 22,
@@ -1223,7 +1223,7 @@ test "TASK-156.1: normalizeEventWithScale scale=1 と scale<=0 は恒等/補正"
     try std.testing.expectEqual(@as(i32, 11), fixed.mouse_move.x);
 }
 
-test "TASK-156.1: FramebufferSnapshot の logical/physical 寸法契約" {
+test "FramebufferSnapshot logical and physical size contract" {
     const logical: FramebufferSnapshot = .{
         .logical_size = .{ .width = 800, .height = 600 },
         .framebuffer_size = .{ .width = 800, .height = 600 },

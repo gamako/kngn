@@ -1,25 +1,25 @@
 import Cocoa
 import QuartzCore
 
-// CALayer最適化版の backend 実装（Swift。TASK-140 で共有コードを platform_macos_shared.swift へ分離）
-// 型定義 (PlatformEvent, PlatformEventType, PlatformKeyCode, PLATFORM_* 定数,
-//        FrameCallback typealias など) は bridging header (-import-objc-header
-//        platform/platform.h) 経由で C ヘッダから自動取得する。
+// The CALayer-optimised backend, in Swift (the shared code lives in platform_macos_shared.swift)
+// The type definitions (PlatformEvent, PlatformEventType, PlatformKeyCode, the PLATFORM_* constants,
+//        the FrameCallback typealias and so on) come from the C header automatically, through the
+//        bridging header (-import-objc-header platform/platform.h).
 //
-// 本ファイルは PlatformBackendView に適合する FramebufferView（CALayer + no-copy CGDataProvider +
-// double buffer + CADisplayLink）と makePlatformBackendView() ファクトリのみを持つ。C ABI・
-// イベントキュー・IME 状態・ウィンドウ生成骨格は platform_macos_shared.swift 側。
+// This file holds only the FramebufferView that conforms to PlatformBackendView (CALayer plus a
+// no-copy CGDataProvider plus a double buffer plus CADisplayLink) and the makePlatformBackendView()
+// factory. The C ABI, the event queue, the IME state and the window creation skeleton are in platform_macos_shared.swift.
 let IMPLEMENTATION_TYPE = "CALayer Optimized (Swift)"
 
-// カスタムNSView - CALayerベースの高速描画 + NSTextInputClient（TASK-79.6.1 IME）
+// A custom NSView: fast CALayer-based drawing plus NSTextInputClient (the IME)
 class FramebufferView: NSView, NSTextInputClient, PlatformBackendView {
-    var width: Int   // framebuffer pixel width（.logical では logical と同値）
+    var width: Int   // the framebuffer pixel width (equal to the logical one under .logical)
     var height: Int  // framebuffer pixel height
     private var logicalWidth: Int
     private var logicalHeight: Int
     private let physicalMode: Bool
-    private var contentScale: CGFloat        // latched（lock で commit 済み）
-    private var pendingContentScale: CGFloat // 検出済み current negotiated scale
+    private var contentScale: CGFloat        // latched (committed by lock)
+    private var pendingContentScale: CGFloat // the detected current negotiated scale
     private var scaleEpoch: UInt64 = 0
     private var hasPendingResize = false
     private var pendingLogicalWidth: Int
@@ -28,50 +28,50 @@ class FramebufferView: NSView, NSTextInputClient, PlatformBackendView {
     private var callback: FrameCallback?
     private var userdata: UnsafeMutableRawPointer?
 
-    // ダブルバッファリング（ポインタスワップ方式）
+    // Double buffering (by swapping pointers)
     private var buffer0: UnsafeMutablePointer<UInt32>
     private var buffer1: UnsafeMutablePointer<UInt32>
-    private var currentBuffer: UnsafeMutablePointer<UInt32>  // コールバックが書き込むバッファ
-    private var displayBuffer: UnsafeMutablePointer<UInt32>  // 画面に表示中のバッファ
+    private var currentBuffer: UnsafeMutablePointer<UInt32>  // the buffer the callback writes into
+    private var displayBuffer: UnsafeMutablePointer<UInt32>  // the buffer currently on screen
 
-    // レイヤー
+    // the layer
     private var contentLayer: CALayer
 
-    // CGオブジェクト（初期化時に作成して再利用）
+    // the CG objects (created at initialisation and reused)
     private var colorSpace: CGColorSpace
-    // no-copy provider（buffer0/1 を直接参照。TASK-55）。resize/deinit で buffer より先に
-    // 解放する必要があるため optional で寿命を明示管理する。
+    // The no-copy providers (referring straight into buffer0/1). They have to be released before the
+    // buffers are, so their lifetime is managed explicitly through an optional.
     private var provider0: CGDataProvider?
     private var provider1: CGDataProvider?
 
-    // パフォーマンス測定
+    // performance measurement
     private var lastFrameTime: CFAbsoluteTime
     private var frameCount: Int
     private var totalFrameTime: Double
 
-    // マウスイベント用 (TASK-21.1)。back-ref 設定時に imeState へも伝播する。
+    // For mouse events. Setting the back-reference propagates it to imeState as well.
     weak var platformWindow: PlatformWindowHandle? {
         didSet { imeState.platformWindow = platformWindow }
     }
     private var trackingArea: NSTrackingArea?
 
-    // IME 状態は共有 PlatformIMEState に集約（TASK-140）。NSTextInputClient / カスタム IME メソッドを転送する。
+    // The IME state is gathered into the shared PlatformIMEState; NSTextInputClient and the custom IME methods forward to it.
     let imeState = PlatformIMEState()
 
-    // カーソル制御用 (TASK-75.1)
-    private var currentCursorShape: PlatformCursorShape = PLATFORM_CURSOR_DEFAULT  // 直近に要求された形状
-    private var cursorHiddenByThisView: Bool = false  // このviewが [NSCursor hide] を所有中か（グローバル参照カウントAPIの多重呼び出し防止）
-    private var mouseInsideView: Bool = false         // マウスが現在 view 内にあるか（view外では set/hide を保留する）
+    // for cursor control
+    private var currentCursorShape: PlatformCursorShape = PLATFORM_CURSOR_DEFAULT  // the most recently requested shape
+    private var cursorHiddenByThisView: Bool = false  // whether this view owns the [NSCursor hide] (the API is a global reference count, so it must not be called twice)
+    private var mouseInsideView: Bool = false         // whether the mouse is inside the view right now (set and hide are held back while it is outside)
 
-    // ライブリサイズ再描画 (TASK-23.1)。CADisplayLink 用 FrameCallback とは別 field。
+    // Live-resize redraw. A separate field from the FrameCallback used by CADisplayLink.
     private var redrawCallback: PlatformRedrawCallback?
     private var redrawUserdata: UnsafeMutableRawPointer?
 
-    // 透過ウィンドウ / クリック透過 / 対話的ドラッグ (TASK-104)
-    private var transparentMode: Bool = false  // true で CGImage を premultiplied alpha 化し fb の alpha を honor
-    private var clickThrough: Bool = false     // true で透明画素上のクリックを背後へ抜けさせる（per-pixel）
-    private var clickThroughState: Bool = false // 直近設定した ignoresMouseEvents 値（変化時のみ再設定）
-    private var lastMouseDownEvent: NSEvent?    // 直近の左ボタン mouse-down（beginDrag 用。one-shot 消費）
+    // Transparent windows, click-through and interactive dragging
+    private var transparentMode: Bool = false  // true makes the CGImage premultiplied alpha and honours the framebuffer alpha
+    private var clickThrough: Bool = false     // true lets a click over a transparent pixel fall through to what is behind (per pixel)
+    private var clickThroughState: Bool = false // the ignoresMouseEvents value set most recently (only reapplied when it changes)
+    private var lastMouseDownEvent: NSEvent?    // the most recent left-button mouse-down (for beginDrag; consumed one-shot)
 
     init(frame: NSRect, width w: Int, height h: Int, callback: FrameCallback?, userdata: UnsafeMutableRawPointer?, physical: Bool) {
         self.physicalMode = physical
@@ -79,7 +79,7 @@ class FramebufferView: NSView, NSTextInputClient, PlatformBackendView {
         self.logicalHeight = max(1, h)
         self.pendingLogicalWidth = self.logicalWidth
         self.pendingLogicalHeight = self.logicalHeight
-        // 初期 scale: window 未接続なので mainScreen。未取得・非対応は 1.0。
+        // The initial scale: no window is attached yet, so mainScreen is used. Unavailable or unsupported gives 1.0.
         var scale: CGFloat = 1.0
         if let screen = NSScreen.main {
             let s = screen.backingScaleFactor
@@ -98,7 +98,7 @@ class FramebufferView: NSView, NSTextInputClient, PlatformBackendView {
         self.callback = callback
         self.userdata = userdata
 
-        // ダブルバッファを確保（calloc = ゼロ初期化 + OOM は nil。objc 版と同型）
+        // Allocate the double buffer (calloc zero-fills, and gives nil on OOM; the same shape as the objc version)
         let bufferSize = fw * fh
         guard let raw0 = calloc(bufferSize, MemoryLayout<UInt32>.size),
               let raw1 = calloc(bufferSize, MemoryLayout<UInt32>.size) else {
@@ -110,15 +110,15 @@ class FramebufferView: NSView, NSTextInputClient, PlatformBackendView {
         self.currentBuffer = self.buffer0
         self.displayBuffer = self.buffer1
 
-        // CGオブジェクトを初期化
-        // TASK-156.6 の教訓（objc .physical で実測・修正済み）: DeviceRGB は広色域ディスプレイで
-        // 毎フレーム ColorSync 変換を誘発し fps を大きく落とす（.physical で顕著）。
-        // 実際の画面の色空間に合わせて変換を回避する（objc の platform_macos.m と同型）。
+        // Create the CG objects
+        // DeviceRGB provokes a ColorSync conversion every frame on a wide-gamut display and costs a great
+        // deal of frame rate (most visibly under .physical, where it was measured).
+        // Matching the screen's actual colour space avoids that conversion (as in objc's platform_macos.m).
         let screenCS = NSScreen.main?.colorSpace
         self.colorSpace = screenCS?.cgColorSpace ?? CGColorSpaceCreateDeviceRGB()
 
-        // no-copy provider（objc 版 CGDataProviderCreateWithData と同型。TASK-55）。
-        // バッファは view が所有するため releaseData は no-op。
+        // The no-copy providers (the same shape as objc's CGDataProviderCreateWithData).
+        // The buffers belong to the view, so releaseData is a no-op.
         guard let p0 = Self.makeNoCopyProvider(buffer: self.buffer0, count: bufferSize),
               let p1 = Self.makeNoCopyProvider(buffer: self.buffer1, count: bufferSize) else {
             free(raw0)
@@ -128,27 +128,27 @@ class FramebufferView: NSView, NSTextInputClient, PlatformBackendView {
         self.provider0 = p0
         self.provider1 = p1
 
-        // レイヤー
+        // the layer
         self.contentLayer = CALayer()
 
-        // パフォーマンス測定の初期化
+        // Initialise the performance measurement
         self.lastFrameTime = CFAbsoluteTimeGetCurrent()
         self.frameCount = 0
         self.totalFrameTime = 0.0
 
         super.init(frame: frame)
 
-        // IME 状態に host view / fb サイズを渡す（firstRect の換算に使う。TASK-140）
+        // Hand the host view and the framebuffer size to the IME state (firstRect converts with them)
         imeState.hostView = self
         imeState.updateFramebufferSize(width: fw, height: fh)
 
-        // レイヤーバックドビューに設定
+        // Make it a layer-backed view
         self.wantsLayer = true
 
-        // コンテンツレイヤーを作成（frame は常に logical points）
+        // Create the content layer (its frame is always in logical points)
         self.contentLayer.frame = CGRect(x: 0, y: 0, width: CGFloat(self.logicalWidth), height: CGFloat(self.logicalHeight))
         self.contentLayer.isOpaque = true
-        self.contentLayer.isGeometryFlipped = true  // Y軸反転を一度だけ設定
+        self.contentLayer.isGeometryFlipped = true  // Flip the Y axis, once
         self.contentLayer.magnificationFilter = .nearest
         self.contentLayer.minificationFilter = .nearest
         if physical {
@@ -156,7 +156,7 @@ class FramebufferView: NSView, NSTextInputClient, PlatformBackendView {
         }
         self.layer?.addSublayer(self.contentLayer)
 
-        // TASK-135: OS ファイル drag & drop（file URL のみ。objc backend 先行の横展開）
+        // OS file drag and drop (file URLs only, following the objc backend)
         self.registerForDraggedTypes([.fileURL])
 
         NSLog("[\(IMPLEMENTATION_TYPE)] Framebuffer initialized: logical=\(self.logicalWidth)x\(self.logicalHeight) fb=\(fw)x\(fh) scale=\(String(format: "%.2f", Double(scale))) physical=\(physical ? 1 : 0)")
@@ -166,14 +166,14 @@ class FramebufferView: NSView, NSTextInputClient, PlatformBackendView {
         fatalError("init(coder:) has not been implemented")
     }
 
-    // MARK: - PlatformBackendView (TASK-140)
+    // MARK: - PlatformBackendView
 
     var nativeView: NSView { return self }
     var implementationType: String { return IMPLEMENTATION_TYPE }
     var initialFramebuffer: UnsafeMutablePointer<UInt32>? { return currentBuffer }
 
-    // present: 既存 presentManual と同じ swap + layer 更新を行い、次の書込バッファを返す。
-    // size 引数は互換のため受けるが内部サイズを使う（引数は無視）。
+    // present: the same swap and layer update as presentManual, returning the next buffer to write into.
+    // The size argument is taken for compatibility but ignored; the internal size is used.
     func present(framebuffer: UnsafeMutablePointer<UInt32>, width: Int, height: Int) -> UnsafeMutablePointer<UInt32>? {
         presentManual()
         return currentBuffer
@@ -187,7 +187,7 @@ class FramebufferView: NSView, NSTextInputClient, PlatformBackendView {
         startDisplayLink()
     }
 
-    // MARK: - NSTextInputClient 転送（共有 PlatformIMEState へ委譲。TASK-140）
+    // MARK: - NSTextInputClient forwarding (delegated to the shared PlatformIMEState)
 
     func copyCompositionSnapshot(buf: UnsafeMutablePointer<CChar>?, cap: UInt32, meta: UnsafeMutablePointer<PlatformCompositionMeta>?) -> UInt32 {
         return imeState.copyCompositionSnapshot(buf: buf, cap: cap, meta: meta)
@@ -228,9 +228,9 @@ class FramebufferView: NSView, NSTextInputClient, PlatformBackendView {
 
     override var acceptsFirstResponder: Bool { true }
 
-    // MARK: - NSDraggingDestination / file drop (TASK-135。ホットパス: イベント時のみ)
-    // objc backend（platform/macos/platform_macos.m）と同一契約: 単一 file URL・UTF-8・
-    // 空/上限超(PLATFORM_FILE_DROP_PATH_BYTES)/NUL 含有は reject。struct 充填は共有ヘルパー。
+    // MARK: - NSDraggingDestination / file drop (hot path: event time only)
+    // The same contract as the objc backend (platform/macos/platform_macos.m): a single file URL, UTF-8,
+    // with empty, over-limit (PLATFORM_FILE_DROP_PATH_BYTES) or NUL-containing paths rejected. Filling the struct is the shared helper's job.
 
     override func draggingEntered(_ sender: any NSDraggingInfo) -> NSDragOperation {
         let pb = sender.draggingPasteboard
@@ -244,17 +244,17 @@ class FramebufferView: NSView, NSTextInputClient, PlatformBackendView {
     override func performDragOperation(_ sender: any NSDraggingInfo) -> Bool {
         guard let handle = platformWindow else { return false }
         let pb = sender.draggingPasteboard
-        // MVP は単一ファイルのみ。複数同時 drop はイベント全体を reject。
+        // A single file only. A simultaneous multi-file drop rejects the whole event.
         guard let urls = pb.readObjects(forClasses: [NSURL.self], options: [.urlReadingFileURLsOnly: true]) as? [URL],
               urls.count == 1 else { return false }
         return enqueueFileDropIfValid(handle: handle, url: urls[0])
     }
 
-    // MARK: - CADisplayLink / 描画
+    // MARK: - CADisplayLink and drawing
 
     func startDisplayLink() {
         if #available(macOS 13.0, *) {
-            // ビューを含むウィンドウのスクリーンから displayLink を取得
+            // Get the displayLink from the screen of the window holding the view
             if let screen = self.window?.screen {
                 displayLink = screen.displayLink(target: self, selector: #selector(displayLinkFired(_:)))
                 displayLink?.add(to: .main, forMode: .common)
@@ -267,23 +267,23 @@ class FramebufferView: NSView, NSTextInputClient, PlatformBackendView {
         displayLink = nil
     }
 
-    /// buffer を直接参照する no-copy CGDataProvider を作る（コピーなし。TASK-55）。
-    /// 失敗時は nil（force unwrap しない。resizeBuffers の回復可能経路用）。
-    /// buffer の解放前に provider の参照（layer.contents 含む）を必ず切ること。
+    /// Make a no-copy CGDataProvider that refers straight into buffer (nothing is copied).
+    /// nil on failure (no force unwrap; this is the recoverable path of resizeBuffers).
+    /// Every reference to the provider (layer.contents included) must be cut before the buffer is freed.
     private static func makeNoCopyProvider(buffer: UnsafeMutablePointer<UInt32>, count: Int) -> CGDataProvider? {
         return CGDataProvider(
             dataInfo: nil,
             data: UnsafeRawPointer(buffer),
             size: count * MemoryLayout<UInt32>.size,
-            releaseData: { _, _, _ in } // バッファは view 所有（no-op）
+            releaseData: { _, _, _ in } // the buffer belongs to the view (a no-op)
         )
     }
 
-    /// 表示中バッファに対応する no-copy provider から CGImage を作る（ピクセルコピーなし）。
-    /// フレーム毎に呼ばれるが、生成されるのは参照オブジェクトのみ。
+    /// Make a CGImage from the no-copy provider of the buffer being displayed (no pixels are copied).
+    /// It is called every frame, but all it creates is a reference object.
     private func makeDisplayImage() -> CGImage? {
         guard let provider = (displayBuffer == buffer0) ? provider0 : provider1 else { return nil }
-        // TASK-104: 透過モードは premultiplied alpha で fb の alpha を honor。既定は従来どおり alpha skip。
+        // In transparent mode, premultiplied alpha honours the framebuffer alpha; by default alpha is skipped, as before.
         let alphaInfo = transparentMode ? CGImageAlphaInfo.premultipliedFirst.rawValue
                                         : CGImageAlphaInfo.noneSkipFirst.rawValue
         return CGImage(
@@ -293,7 +293,7 @@ class FramebufferView: NSView, NSTextInputClient, PlatformBackendView {
             bitsPerPixel: 32,
             bytesPerRow: width * 4,
             space: colorSpace,
-            bitmapInfo: CGBitmapInfo(rawValue: alphaInfo | CGBitmapInfo.byteOrder32Little.rawValue), // canonical BGRA: メモリ [B,G,R,A] = u32 0xAARRGGBB
+            bitmapInfo: CGBitmapInfo(rawValue: alphaInfo | CGBitmapInfo.byteOrder32Little.rawValue), // canonical BGRA: memory [B,G,R,A] = u32 0xAARRGGBB
             provider: provider,
             decode: nil,
             shouldInterpolate: false,
@@ -305,35 +305,35 @@ class FramebufferView: NSView, NSTextInputClient, PlatformBackendView {
     func displayLinkFired(_ link: CADisplayLink) {
         let frameStartTime = CFAbsoluteTimeGetCurrent()
 
-        // ユーザーのコールバックを呼び出してピクセルデータを生成
+        // Call the user's callback to produce the pixel data
         if let callback = callback {
             let callbackStart = CFAbsoluteTimeGetCurrent()
             callback(currentBuffer, Int32(width), Int32(height), userdata)
             let callbackEnd = CFAbsoluteTimeGetCurrent()
 
-            // バッファをスワップ（ゼロコピー）
+            // Swap the buffers (zero copy)
             let temp = currentBuffer
             currentBuffer = displayBuffer
             displayBuffer = temp
 
-            // 表示バッファの no-copy provider から CGImage を作成（コピーなし。TASK-55）
+            // Make the CGImage from the displayed buffer's no-copy provider (nothing is copied)
             let renderStart = CFAbsoluteTimeGetCurrent()
             if let cgImage = makeDisplayImage() {
                 contentLayer.contents = cgImage
             }
 
-            // TASK-104: callback/display-link 経路でも click-through を更新（無効時は即 return）
+            // Update click-through on the callback and display-link path too (returns immediately while disabled)
             refreshClickThrough()
 
             let renderEnd = CFAbsoluteTimeGetCurrent()
 
-            // パフォーマンス測定
+            // performance measurement
             frameCount += 1
             let frameTime = frameStartTime - lastFrameTime
             totalFrameTime += frameTime
             lastFrameTime = frameStartTime
 
-            // 60フレームごとに統計を出力
+            // Print the statistics every 60 frames
             if frameCount % 60 == 0 {
                 let avgFrameTime = totalFrameTime / 60.0
                 let fps = 1.0 / avgFrameTime
@@ -348,54 +348,54 @@ class FramebufferView: NSView, NSTextInputClient, PlatformBackendView {
     }
 
     func presentManual() {
-        // バッファをスワップ（ゼロコピー）
+        // Swap the buffers (zero copy)
         let temp = currentBuffer
         currentBuffer = displayBuffer
         displayBuffer = temp
 
-        // 表示バッファの no-copy provider から CGImage を作成（コピーなし。TASK-55）
+        // Make the CGImage from the displayed buffer's no-copy provider (nothing is copied)
         if let cgImage = makeDisplayImage() {
             contentLayer.contents = cgImage
         }
 
-        // TASK-104: クリック透過のカーソル位置判定を更新（clickThrough 無効時は即 return）
+        // Update the cursor-position test for click-through (returns immediately while clickThrough is off)
         refreshClickThrough()
     }
 
     override var isOpaque: Bool {
-        return !transparentMode // TASK-104: 透過モードは非不透明
+        return !transparentMode // transparent mode is not opaque
     }
 
-    // TASK-104: クリック透過（per-pixel）。NSView.hitTest で nil を返しても背後の別アプリへは抜けない
-    // （それは window-level の ignoresMouseEvents）。present 毎に現在のカーソル位置の alpha を見て
-    // `window.ignoresMouseEvents` をトグルする（透明画素上なら背後へ抜け、本体上なら window が受ける）。
-    // ホットパス宣言: present 毎だが 1 画素サンプル + プロパティ設定のみ（per-pixel ループなし）。
+    // Per-pixel click-through. Returning nil from NSView.hitTest does not let it through to an application behind
+    // (that is the window-level ignoresMouseEvents). On every present the alpha under the current cursor position
+    // toggles `window.ignoresMouseEvents` (over a transparent pixel it falls through, over the artwork the window gets it).
+    // Hot path declaration: once per present, but only one pixel sample and a property write (no per-pixel loop).
     func refreshClickThrough() {
         if !clickThrough { return }
         guard let win = window else { return }
         let screenPt = NSEvent.mouseLocation
         let winPt = win.convertPoint(fromScreen: screenPt)
-        let local = convert(winPt, from: nil) // window → view（非 flipped = 左下原点）
+        let local = convert(winPt, from: nil) // window → view (not flipped: the origin is bottom-left)
         let b = bounds
-        var passThrough = true // カーソルが window 外/未確定なら抜けさせる
+        var passThrough = true // let it fall through when the cursor is outside the window or unknown
         if b.width > 0 && b.height > 0 &&
            local.x >= 0 && local.x < b.width && local.y >= 0 && local.y < b.height {
             var px = Int(local.x / b.width * CGFloat(width))
-            var py = Int((1.0 - local.y / b.height) * CGFloat(height)) // top-left 原点へ
-            if px >= width { px = width - 1 } // 右端/下端の丸め込み clamp（下端1px落ち防止）
+            var py = Int((1.0 - local.y / b.height) * CGFloat(height)) // to a top-left origin
+            if px >= width { px = width - 1 } // clamp what rounding at the right and bottom edges would push out (it would drop the last row)
             if py >= height { py = height - 1 }
             if px < 0 { px = 0 }
             if py < 0 { py = 0 }
             let alpha = UInt8((displayBuffer[py * width + px] >> 24) & 0xFF)
             passThrough = (alpha == 0)
         }
-        if passThrough != clickThroughState { // 値が変わったときだけ WindowServer 状態を書く
+        if passThrough != clickThroughState { // only write the WindowServer state when the value has changed
             win.ignoresMouseEvents = passThrough
             clickThroughState = passThrough
         }
     }
 
-    // TASK-104: 透過/クリック透過モードの設定・beginDrag 用 event の消費（one-shot）。
+    // Configure transparency and click-through, and consume the event kept for beginDrag (one-shot).
     func setTransparentMode(_ on: Bool) {
         transparentMode = on
         contentLayer.isOpaque = !on
@@ -404,18 +404,18 @@ class FramebufferView: NSView, NSTextInputClient, PlatformBackendView {
     func setClickThrough(_ on: Bool) {
         clickThrough = on
         if !on {
-            window?.ignoresMouseEvents = false // 無効化時は受け取りへ戻す
+            window?.ignoresMouseEvents = false // go back to receiving events when it is turned off
             clickThroughState = false
         }
     }
     func takeLastMouseDownEvent() -> NSEvent? {
         let ev = lastMouseDownEvent
-        lastMouseDownEvent = nil // 呼び出し時に消費（mouse-up 未達に備え再利用しない）
+        lastMouseDownEvent = nil // consumed as it is taken (never reused, in case the mouse-up never arrives)
         return ev
     }
 
     // ========================================
-    // マウスイベント関連 (TASK-21.1)
+    // Mouse events
     // ========================================
 
     override func acceptsFirstMouse(for event: NSEvent?) -> Bool {
@@ -428,10 +428,10 @@ class FramebufferView: NSView, NSTextInputClient, PlatformBackendView {
             self.removeTrackingArea(ta)
             trackingArea = nil
         }
-        // .cursorUpdate: マウス再入時に cursorUpdate(with:) を呼んでもらい、OS がウィンドウ切替等で
-        // カーソルをリセットしても復帰できるようにする (TASK-75.1)。
-        // .mouseEnteredAndExited: view 内外を追跡し、hidden の所有権解除（exited）と形状の適用（entered）を
-        // 行う（codex レビュー: hide/unhide は view 内にいる時のみ行う）。
+        // .cursorUpdate: have cursorUpdate(with:) called when the mouse re-enters, so the cursor recovers
+        // even after the OS resets it on a window switch.
+        // .mouseEnteredAndExited: track entering and leaving the view, releasing ownership of hidden (exited)
+        // and applying the shape (entered). Hiding and unhiding happen only while inside the view.
         let opts: NSTrackingArea.Options = [.mouseMoved, .cursorUpdate, .mouseEnteredAndExited, .activeInKeyWindow, .inVisibleRect]
         let ta = NSTrackingArea(rect: .zero, options: opts, owner: self, userInfo: nil)
         self.addTrackingArea(ta)
@@ -439,24 +439,24 @@ class FramebufferView: NSView, NSTextInputClient, PlatformBackendView {
     }
 
     // ========================================
-    // カーソル制御 (TASK-75.1)
+    // Cursor control
     // ========================================
     //
-    // 方針: NSCursor.hide/unhide はプロセス全体の参照カウント API のため、view が「今 hide を
-    // 所有しているか」を cursorHiddenByThisView で厳密に管理する（hide は false→true 遷移時のみ、
-    // unhide は true→false 遷移時のみ呼ぶ）。加えて set/hide の実適用は mouseInsideView が true の
-    // 間だけ行い、view 外にいる間に来た setCursor はまだ反映せず形状のみ保存する。
+    // The policy: NSCursor.hide/unhide is a process-wide reference-counted API, so cursorHiddenByThisView
+    // tracks strictly whether this view currently owns the hide (hide only on a false→true transition,
+    // unhide only on true→false). On top of that, set and hide are really applied only while
+    // mouseInsideView is true; a setCursor arriving while the mouse is outside merely stores the shape.
 
-    // currentCursorShape に対応する NSCursor を返す（PLATFORM_CURSOR_HIDDEN はここでは扱わない）。
-    // 未対応形状は arrow にフォールバックする。
+    // Return the NSCursor matching currentCursorShape (PLATFORM_CURSOR_HIDDEN is not handled here).
+    // An unsupported shape falls back to the arrow.
     private func nsCursor(for shape: PlatformCursorShape) -> NSCursor {
         switch shape {
         case PLATFORM_CURSOR_CROSSHAIR: return .crosshair
-        default: return .arrow // PLATFORM_CURSOR_DEFAULT および未対応形状のフォールバック
+        default: return .arrow // PLATFORM_CURSOR_DEFAULT, and the fallback for an unsupported shape
         }
     }
 
-    // mouseInsideView 前提で currentCursorShape を実際に適用する（hide 所有権の遷移も含む）。
+    // Really apply currentCursorShape, assuming mouseInsideView (including the transfer of hide ownership).
     private func applyCursorShapeIfInside() {
         guard mouseInsideView else { return }
         if currentCursorShape == PLATFORM_CURSOR_HIDDEN {
@@ -473,20 +473,20 @@ class FramebufferView: NSView, NSTextInputClient, PlatformBackendView {
         }
     }
 
-    // platform_set_cursor から呼ばれる。形状を保存し、view 内にいれば即時反映する。
+    // Called from platform_set_cursor. Stores the shape and applies it at once while inside the view.
     func setCursorShape(_ shape: PlatformCursorShape) {
         currentCursorShape = shape
         applyCursorShapeIfInside()
     }
 
-    // マウスが view に再入した (TASK-75.1)。現在の形状を反映する。
+    // The mouse re-entered the view. Apply the current shape.
     override func mouseEntered(with event: NSEvent) {
         mouseInsideView = true
         applyCursorShapeIfInside()
     }
 
-    // マウスが view から出た (TASK-75.1)。hide を所有中なら必ず解放する
-    // （view 外で OS カーソルが消えたままになるのを防ぐ。codex レビュー指摘）。
+    // The mouse left the view. Whenever this view owns the hide, it must release it
+    // (otherwise the OS cursor stays gone while outside the view).
     override func mouseExited(with event: NSEvent) {
         mouseInsideView = false
         if cursorHiddenByThisView {
@@ -495,10 +495,10 @@ class FramebufferView: NSView, NSTextInputClient, PlatformBackendView {
         }
     }
 
-    // AppKit がトラッキングエリア再入時に呼ぶ。他アプリ切替等で OS がカーソルをリセットしても復帰する。
+    // Called by AppKit when the tracking area is re-entered. The cursor recovers even after the OS reset it on an application switch.
     override func cursorUpdate(with event: NSEvent) {
-        // cursorUpdate は tracking rect 内でのみ呼ばれる（.cursorUpdate）ので view 内扱いにする。
-        // mouseEntered 未発火・順序差・window 切替後の cursor reset 復帰でも形状を反映するため（codex レビュー指摘）。
+        // cursorUpdate is only called inside the tracking rect (.cursorUpdate), so this counts as being inside the view.
+        // That applies the shape even when mouseEntered did not fire, when the order differs, or when recovering from a cursor reset after a window switch.
         mouseInsideView = true
         applyCursorShapeIfInside()
     }
@@ -528,7 +528,7 @@ class FramebufferView: NSView, NSTextInputClient, PlatformBackendView {
             dx *= SCROLL_LINE_TO_POINTS
             dy *= SCROLL_LINE_TO_POINTS
         }
-        // raw physical unit（facade が latched scale で論理化）
+        // raw physical units (the facade turns them into logical ones with the latched scale)
         dx *= Float(scale)
         dy *= Float(scale)
         var ev = PlatformEvent()
@@ -545,11 +545,11 @@ class FramebufferView: NSView, NSTextInputClient, PlatformBackendView {
     }
 
     override func mouseDown(with event: NSEvent) {
-        lastMouseDownEvent = event // TASK-104: beginDrag 用に直近の左 down を保持
+        lastMouseDownEvent = event // keep the most recent left down for beginDrag
         enqueueMouseEvent(type: PLATFORM_EVENT_MOUSE_DOWN, button: buttonFromEvent(event), from: event)
     }
     override func mouseUp(with event: NSEvent) {
-        lastMouseDownEvent = nil // TASK-104: up で stale 破棄
+        lastMouseDownEvent = nil // discard the stale event on up
         enqueueMouseEvent(type: PLATFORM_EVENT_MOUSE_UP, button: buttonFromEvent(event), from: event)
     }
     override func mouseDragged(with event: NSEvent) {
@@ -580,21 +580,21 @@ class FramebufferView: NSView, NSTextInputClient, PlatformBackendView {
         enqueueMouseEvent(type: PLATFORM_EVENT_MOUSE_MOVE, button: PLATFORM_MOUSE_BUTTON_NONE, from: event)
     }
 
-    // TASK-23 / TASK-156.5: 新サイズへ two-phase でバッファを再確保する。
-    // 単位は framebuffer pixels（.physical では物理寸法。.logical では logical=fb）。
-    // TASK-55 で provider が buffer を **no-copy 参照**するため、旧 buffer の解放前に
-    // 「layer.contents の参照を切る → 旧 provider を解放する」順序が必須（objc 版と同順序）。
-    // lock 中には呼ばれない（イベントポンプ中 / applyLatched から発火）。
-    // 戻り値: サイズが実際に変わって再確保した場合 true。変化なし / OOM / provider 失敗は
-    // false（旧サイズ維持・redraw callback 非発火。allocate trap は使わない）。
+    // Reallocate the buffers for a new size, in two phases.
+    // The unit is framebuffer pixels (physical under .physical; logical == fb under .logical).
+    // Because a provider refers to a buffer **without copying**, the order before freeing the old buffer
+    // must be: cut the layer.contents reference, then release the old provider (as in the objc version).
+    // It is never called while locked (it fires during the event pump, or from applyLatched).
+    // Returns: true when the size really changed and the buffers were reallocated. No change, OOM or a
+    // failed provider gives false (the old size is kept, the redraw callback does not fire, and no allocate trap is used).
     @discardableResult
     func resizeBuffersTo(width w0: Int, height h0: Int) -> Bool {
         let w = max(1, w0)
         let h = max(1, h0)
-        if w == width && h == height { return false } // 変化なし
+        if w == width && h == height { return false } // unchanged
         let newSize = w * h
 
-        // phase 1: 新バッファ + 新 no-copy provider を確保（成功するまで旧リソースには触れない）
+        // phase 1: allocate the new buffers and new no-copy providers (the old resources are untouched until this succeeds)
         guard let raw0 = calloc(newSize, MemoryLayout<UInt32>.size) else { return false }
         guard let raw1 = calloc(newSize, MemoryLayout<UInt32>.size) else {
             free(raw0)
@@ -611,14 +611,14 @@ class FramebufferView: NSView, NSTextInputClient, PlatformBackendView {
         guard let np1 = Self.makeNoCopyProvider(buffer: nb1, count: newSize) else {
             free(raw0)
             free(raw1)
-            return false // np0 はローカル ARC で解放
+            return false // np0 is released by local ARC
         }
 
-        // phase 2: 旧 buffer への参照を先に全て切る（contents → provider の順。TASK-55）
+        // phase 2: cut every reference to the old buffer first (contents, then provider)
         contentLayer.contents = nil
         provider0 = nil
         provider1 = nil
-        // phase 3: 旧バッファを破棄して差し替え（calloc 所有なので free）
+        // phase 3: destroy the old buffers and swap them in (calloc owns them, so free)
         free(UnsafeMutableRawPointer(buffer0))
         free(UnsafeMutableRawPointer(buffer1))
         buffer0 = nb0
@@ -630,7 +630,7 @@ class FramebufferView: NSView, NSTextInputClient, PlatformBackendView {
         width = w
         height = h
         if !physicalMode {
-            // .logical: framebuffer == logical。layer frame も同寸法（従来どおり）。
+            // .logical: framebuffer == logical, and the layer frame has the same size (as before).
             logicalWidth = w
             logicalHeight = h
             contentLayer.frame = CGRect(x: 0, y: 0, width: CGFloat(w), height: CGFloat(h))
@@ -638,7 +638,7 @@ class FramebufferView: NSView, NSTextInputClient, PlatformBackendView {
         return true
     }
 
-    // TASK-156.5: pending logical size / scale を lock 境界で latch（objc と同型）。
+    // Latch the pending logical size and scale at the lock boundary (the same shape as objc).
     func refreshPendingContentScale() {
         guard let win = window else { return }
         var live = win.backingScaleFactor
@@ -647,14 +647,14 @@ class FramebufferView: NSView, NSTextInputClient, PlatformBackendView {
     }
 
     func applyLatchedMetricsIfNeeded() {
-        // lock 時に live backingScaleFactor を再確認（通知取りこぼし対策）
+        // Re-read the live backingScaleFactor at lock time (in case a notification was missed)
         refreshPendingContentScale()
 
         let newScale = effectiveContentScale(pendingContentScale)
         let scaleChanging = abs(newScale - contentScale) > 1e-6
 
         if !physicalMode {
-            // .logical: buffer 寸法は触らず。scale が変わったときだけ epoch と latched scale を原子 commit。
+            // .logical: the buffer size is left alone. Only when the scale changes are the epoch and the latched scale committed atomically.
             if scaleChanging {
                 contentScale = newScale
                 scaleEpoch &+= 1
@@ -677,13 +677,13 @@ class FramebufferView: NSView, NSTextInputClient, PlatformBackendView {
 
         if sizeChanging {
             if !resizeBuffersTo(width: fw, height: fh) {
-                // OOM: 旧 buffer / 旧 latched scale / 旧 epoch を維持（pending は残して次 lock で再試行）
+                // out of memory: keep the old buffer, the old latched scale and the old epoch (the pending value stays for the next lock to retry)
                 return
             }
             platformWindow?.currentFramebuffer = currentBuffer
             imeState.updateFramebufferSize(width: width, height: height)
         }
-        // 成功時のみ logical・latched scale・epoch をまとめて commit
+        // only on success are the logical size, the latched scale and the epoch committed together
         logicalWidth = lw
         logicalHeight = lh
         if scaleChanging { scaleEpoch &+= 1 }
@@ -716,7 +716,7 @@ class FramebufferView: NSView, NSTextInputClient, PlatformBackendView {
             s = win.backingScaleFactor
             if s <= 0 { s = 1.0 }
         }
-        // pending のみ更新。epoch / latched scale / buffer は次の lock 成功時に原子 commit。
+        // Only the pending value is updated. The epoch, the latched scale and the buffer are committed atomically on the next successful lock.
         if abs(s - pendingContentScale) > 1e-6 {
             pendingContentScale = s
             if physicalMode, let cb = redrawCallback {
@@ -725,9 +725,9 @@ class FramebufferView: NSView, NSTextInputClient, PlatformBackendView {
         }
     }
 
-    // NSView がリサイズ時に呼ぶ。新しい logical サイズに合わせて fb を再確保する。
-    // .physical は pending のみ記録し次 lock で commit（objc と同型）。
-    // .logical は即 resize。成功時だけ redraw callback を発火する（TASK-23.1）。
+    // Called by NSView on a resize. Reallocates the framebuffer for the new logical size.
+    // .physical only records the pending value and commits it on the next lock (the same shape as objc).
+    // .logical resizes at once, and the redraw callback fires only on success.
     override func setFrameSize(_ newSize: NSSize) {
         super.setFrameSize(newSize)
         if physicalMode {
@@ -739,7 +739,7 @@ class FramebufferView: NSView, NSTextInputClient, PlatformBackendView {
                 pendingLogicalWidth = nw
                 pendingLogicalHeight = nh
                 hasPendingResize = true
-                // buffer は次 lock で apply。redraw で app に lock を促す。
+                // the buffer is applied on the next lock; the redraw prompts the application to lock
                 if let cb = redrawCallback {
                     cb(redrawUserdata)
                 }
@@ -747,7 +747,7 @@ class FramebufferView: NSView, NSTextInputClient, PlatformBackendView {
             return
         }
         if resizeBuffersTo(width: Int(newSize.width), height: Int(newSize.height)) {
-            // TASK-140: 再確保後の新書込バッファを handle へ反映する（次 lock/present が正しい buffer を指す）。
+            // Point the handle at the new write buffer after reallocation (so the next lock and present use the right one).
             platformWindow?.currentFramebuffer = currentBuffer
             imeState.updateFramebufferSize(width: width, height: height)
             if let cb = redrawCallback {
@@ -756,7 +756,7 @@ class FramebufferView: NSView, NSTextInputClient, PlatformBackendView {
         }
     }
 
-    // ライブリサイズ再描画コールバック登録 (TASK-23.1)。cb==nil で解除。
+    // Register the live-resize redraw callback. cb==nil unregisters.
     func setRedrawCallback(_ cb: PlatformRedrawCallback?, userdata: UnsafeMutableRawPointer?) {
         redrawCallback = cb
         redrawUserdata = userdata
@@ -765,15 +765,15 @@ class FramebufferView: NSView, NSTextInputClient, PlatformBackendView {
     deinit {
         stopDisplayLink()
 
-        // カーソルを hide したまま破棄されると OS カーソルが消えたままになる (TASK-75.1 codex レビュー指摘)。
+        // Being destroyed while the cursor is hidden would leave the OS cursor gone for good.
         if cursorHiddenByThisView {
             NSCursor.unhide()
             cursorHiddenByThisView = false
         }
 
-        // no-copy provider が buffer を参照するため、解放順序は
-        // contents → provider → buffer（stored property の自動解放が buffer 解放後に
-        // 走って use-after-free する事故を防ぐ。TASK-55）
+        // Since a no-copy provider refers to the buffer, the release order is
+        // contents → provider → buffer (which prevents a stored property being released automatically
+        // after the buffer has gone, and using freed memory)
         contentLayer.contents = nil
         provider0 = nil
         provider1 = nil
@@ -783,10 +783,10 @@ class FramebufferView: NSView, NSTextInputClient, PlatformBackendView {
 }
 
 // ========================================
-// backend ファクトリ (TASK-140)
+// The backend factory
 // ========================================
-// 共有 createWindowImpl から呼ばれ、CALayer backend の view を生成する。透過モード等の view 側
-// 設定はここで行う（window レベルの透過は共有側）。
+// Called from the shared createWindowImpl, it creates the view of the CALayer backend. View-level
+// settings such as transparent mode are made here (window-level transparency is on the shared side).
 func makePlatformBackendView(
     frame: NSRect,
     width: Int,
@@ -805,7 +805,7 @@ func makePlatformBackendView(
         physical: physical
     )
     if transparent {
-        view.setTransparentMode(true) // CGImage を premultiplied alpha 化
+        view.setTransparentMode(true) // Make the CGImage premultiplied alpha
     }
     return view
 }

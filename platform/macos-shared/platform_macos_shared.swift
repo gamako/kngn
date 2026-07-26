@@ -4,29 +4,29 @@ import UniformTypeIdentifiers
 import GameController
 #endif
 
-// macOS Swift backend 共有コード (TASK-140)
-// swift(CALayer) / metal 両 backend で共通の C ABI・イベントキュー・IME・ゲームパッド・
-// メニュー bridge・ウィンドウ生成骨格を集約する。backend 固有の描画実装は
-// platform/macos-swift/platform_macos_swift.swift（CALayer）と
-// platform/macos-metal/platform_macos_metal.swift（Metal）が PlatformBackendView に適合し、
-// makePlatformBackendView() ファクトリで生成する。
+// The shared code of the macOS Swift backends
+// It gathers the C ABI, the event queue, the IME, gamepads, the menu bridge and the window creation
+// skeleton that the swift (CALayer) and metal backends have in common. The backend-specific drawing
+// lives in platform/macos-swift/platform_macos_swift.swift (CALayer) and
+// platform/macos-metal/platform_macos_metal.swift (Metal), each conforming to PlatformBackendView
+// and created through the makePlatformBackendView() factory.
 //
-// 型定義 (PlatformEvent, PlatformEventType, PlatformKeyCode, PLATFORM_* 定数,
-//        FrameCallback typealias など) は bridging header (-import-objc-header
-//        platform/platform.h) 経由で C ヘッダから自動取得する。
+// The type definitions (PlatformEvent, PlatformEventType, PlatformKeyCode, the PLATFORM_* constants,
+//        the FrameCallback typealias and so on) come from the C header automatically, through the
+//        bridging header (-import-objc-header platform/platform.h).
 //
-// TASK-113.4 / TASK-135: OS ファイル drag & drop（file URL のみ）を objc backend と同一契約で実装。
-// 各 backend の view が NSDraggingDestination を実装し、単一 file URL を PLATFORM_EVENT_FILE_DROP として
-// event_queue へ inline copy で投入する（複数/非ファイル/空/上限超/NUL は reject）。struct 充填・
-// 長さ/NUL 検証は共有ヘルパー enqueueFileDropIfValid（さらに platform.h の platform_fill_file_drop_event）。
+// OS file drag and drop (file URLs only) is implemented on the same contract as the objc backend.
+// Each backend's view implements NSDraggingDestination and puts a single file URL onto the event_queue
+// as a PLATFORM_EVENT_FILE_DROP by inline copy (several, non-file, empty, over-limit or NUL-containing paths are rejected).
+// Filling the struct and validating the length and NULs are the shared helper enqueueFileDropIfValid (and beneath it platform.h's platform_fill_file_drop_event).
 
 // ========================================
-// イベント処理用定義 (Swift 側ローカル)
+// Definitions for event handling (local to the Swift side)
 // ========================================
 
 let EVENT_QUEUE_SIZE = 256
 let keyTraceEnabled = ProcessInfo.processInfo.environment["VP_KEY_TRACE"] == "1"
-// TASK-159 診断: IME / document access の実測トレース（既定 OFF。VP_IME_TRACE=1 で有効）。
+// Diagnostics: a trace of IME and document access as it happens (off by default; VP_IME_TRACE=1 enables it).
 let imeTraceEnabled = ProcessInfo.processInfo.environment["VP_IME_TRACE"] == "1"
 
 func keyTrace(_ message: String) {
@@ -58,21 +58,21 @@ struct EventQueueToken {
     let generation: UInt32
 }
 
-// イベントキュー構造体（固定サイズ配列を使用）
+// The event queue struct (backed by a fixed-size array)
 class EventQueue {
     private var events: UnsafeMutablePointer<PlatformEvent>
     private var slotGeneration: [UInt32]
-    var head: Int = 0  // 次に書き込む位置
-    var tail: Int = 0  // 次に読む位置
-    // 観測カウンタ (累積値、example で差分監視に使う)
+    var head: Int = 0  // where the next write goes
+    var tail: Int = 0  // where the next read comes from
+    // observation counters (cumulative; the examples watch the difference)
     var mouseMoveMergeCount: UInt64 = 0
     var mouseScrollMergeCount: UInt64 = 0
     var eventDropCount: UInt64 = 0
 
     init() {
-        // 固定サイズのメモリバッファを確保
+        // Allocate the fixed-size memory buffer
         events = UnsafeMutablePointer<PlatformEvent>.allocate(capacity: EVENT_QUEUE_SIZE)
-        // すべてのイベントを 0 初期化 (type = PLATFORM_EVENT_NONE)
+        // Zero every event (type = PLATFORM_EVENT_NONE)
         events.initialize(repeating: PlatformEvent(), count: EVENT_QUEUE_SIZE)
         slotGeneration = [UInt32](repeating: 0, count: EVENT_QUEUE_SIZE)
     }
@@ -86,14 +86,14 @@ class EventQueue {
         }
     }
 
-    // キュー末尾の最新イベント (空なら nil)。読み書き両用にポインタ経由でアクセス。
+    // The newest event at the tail of the queue (nil when empty). Accessed through a pointer, for reading and writing alike.
     func peekTail() -> UnsafeMutablePointer<PlatformEvent>? {
         if head == tail { return nil }
         let prev = (head - 1 + EVENT_QUEUE_SIZE) % EVENT_QUEUE_SIZE
         return events.advanced(by: prev)
     }
 
-    // mouse_move の末尾合体 (buttons_mask + modifiers 同一時のみ)。合体時 true。
+    // Merge a mouse_move into the tail (only when buttons_mask and modifiers match). True once merged.
     func tryMergeMouseMove(_ ev: PlatformEvent) -> Bool {
         guard let tail = peekTail() else { return false }
         if tail.pointee.type != PLATFORM_EVENT_MOUSE_MOVE { return false }
@@ -105,7 +105,7 @@ class EventQueue {
         return true
     }
 
-    // mouse_scroll の末尾合体 (is_precise + buttons_mask + modifiers 同一時のみ)。
+    // Merge a mouse_scroll into the tail (only when is_precise, buttons_mask and modifiers match).
     func tryMergeMouseScroll(_ ev: PlatformEvent) -> Bool {
         guard let tail = peekTail() else { return false }
         if tail.pointee.type != PLATFORM_EVENT_MOUSE_SCROLL { return false }
@@ -120,9 +120,9 @@ class EventQueue {
         return true
     }
 
-    // キューに push (満杯なら drop カウンタを増やして捨てる)
-    // token は gamepad connect の後追い無効化にのみ使う。他の呼び出し元は戻り値不要のため
-    // @discardableResult（swiftc の unused-result 警告を抑止。objc 側の queue_push と同じ扱い）。
+    // Push onto the queue (when full, bump the drop counter and discard)
+    // The token is used only to invalidate a gamepad connect after the fact. No other caller needs the
+    // return value, hence @discardableResult (which silences swiftc's unused-result warning, as with queue_push on the objc side).
     @discardableResult
     func push(_ ev: PlatformEvent) -> EventQueueToken? {
         let next_head = (head + 1) % EVENT_QUEUE_SIZE
@@ -152,20 +152,20 @@ class EventQueue {
 }
 
 // ========================================
-// マウス入力ヘルパー (TASK-21.1)
+// Mouse input helpers
 // ========================================
 
-// non-precise scroll の line→points 変換係数 (経験則)
+// The line→points factor for a non-precise scroll (a rule of thumb)
 let SCROLL_LINE_TO_POINTS: Float = 16.0
 
-// TASK-156.5 Stage 1: 共通スケールヘルパー（objc / ADR-011 と同型）。
-// 入力正規化用の実スケール（query 用。fb_mode に非依存）。
+// The shared scale helpers (the same shape as objc and ADR-011).
+// The real scale used for input normalisation (for a query; independent of fb_mode).
 func effectiveContentScale(_ rawScale: CGFloat) -> CGFloat {
     return (rawScale > 0 && rawScale.isFinite) ? rawScale : 1.0
 }
 
-/// objc の `(int)lround((double)px * (double)scale)` と数値一致。
-/// 有限値 [1, UInt32.max] にクランプする。
+/// Numerically identical to objc's `(int)lround((double)px * (double)scale)`.
+/// Clamps to a finite value in [1, UInt32.max].
 func roundToPhysicalPx(_ logicalPx: Int, scale: CGFloat) -> Int {
     let s = Double(effectiveContentScale(scale))
     let v = (Double(logicalPx) * s).rounded()
@@ -174,31 +174,31 @@ func roundToPhysicalPx(_ logicalPx: Int, scale: CGFloat) -> Int {
     return Int(v)
 }
 
-/// framebuffer 物理サイズ。.logical は常に logical そのもの。
+/// The physical framebuffer size. Under .logical it is always the logical size itself.
 func effectiveFramebufferSize(physicalMode: Bool, logicalWidth: Int, logicalHeight: Int, scale: CGFloat) -> (Int, Int) {
     if !physicalMode { return (max(1, logicalWidth), max(1, logicalHeight)) }
     return (roundToPhysicalPx(logicalWidth, scale: scale), roundToPhysicalPx(logicalHeight, scale: scale))
 }
 
-// NSEvent.locationInWindow を view 内の左上原点・raw physical pixel へ変換 (floor 整数化)。
-// scale は current native backing scale（content_scale）。.logical でも実 scale を乗算する
-// （objc `event_location_to_platform_raw_coords` と同契約。facade が正規化する）。
+// Convert NSEvent.locationInWindow into raw physical pixels with the origin at the view's top-left (floored to an integer).
+// scale is the current native backing scale (content_scale). The real scale is applied even under
+// .logical (the same contract as objc's `event_location_to_platform_raw_coords`; the facade normalises it).
 func eventLocationToPlatformCoords(_ event: NSEvent, _ view: NSView, scale: CGFloat) -> (Int32, Int32) {
     let windowPt = event.locationInWindow
     let viewPt = view.convert(windowPt, from: nil)
     let viewHeight = view.bounds.size.height
     let s = effectiveContentScale(scale)
     let x = Int32(floor(viewPt.x * s))
-    let y = Int32(floor((viewHeight - viewPt.y) * s))  // Y フリップ
+    let y = Int32(floor((viewHeight - viewPt.y) * s))  // flip Y
     return (x, y)
 }
 
-// 現在押下中のボタン bitmask (& 0x07 で X1/X2 を除外)。
+// The bitmask of the buttons currently held (& 0x07 excludes X1/X2).
 func pressedButtonsMask() -> UInt8 {
     return UInt8(NSEvent.pressedMouseButtons & 0x07)
 }
 
-// NSEvent.buttonNumber から PlatformMouseButton へ (物理ボタン基準)。
+// From NSEvent.buttonNumber to PlatformMouseButton (by physical button).
 func buttonFromEvent(_ event: NSEvent) -> PlatformMouseButton {
     switch event.buttonNumber {
         case 0: return PLATFORM_MOUSE_BUTTON_LEFT
@@ -208,11 +208,11 @@ func buttonFromEvent(_ event: NSEvent) -> PlatformMouseButton {
     }
 }
 
-// macOSのキーコードをPlatformKeyCodeに変換
-// 参考: /Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/SDKs/MacOSX.sdk/System/Library/Frameworks/Carbon.framework/Versions/A/Frameworks/HIToolbox.framework/Versions/A/Headers/Events.h
+// Convert a macOS key code into a PlatformKeyCode
+// Reference: /Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/SDKs/MacOSX.sdk/System/Library/Frameworks/Carbon.framework/Versions/A/Frameworks/HIToolbox.framework/Versions/A/Headers/Events.h
 func mapKeyCodeToPlatform(_ keyCode: UInt16) -> PlatformKeyCode {
     switch keyCode {
-        // 文字キー（ANSI配列）
+        // character keys (the ANSI layout)
         case 0x00: return PLATFORM_KEY_A
         case 0x01: return PLATFORM_KEY_S
         case 0x02: return PLATFORM_KEY_D
@@ -270,20 +270,20 @@ func mapKeyCodeToPlatform(_ keyCode: UInt16) -> PlatformKeyCode {
         // Escape
         case 0x35: return PLATFORM_KEY_ESCAPE  // kVK_Escape
 
-        // モディファイアキー（左）
+        // modifier keys (left)
         case 0x38: return PLATFORM_KEY_LEFT_SHIFT      // kVK_Shift
         case 0x3A: return PLATFORM_KEY_LEFT_ALT        // kVK_Option
         case 0x3B: return PLATFORM_KEY_LEFT_CONTROL    // kVK_Control
         case 0x37: return PLATFORM_KEY_LEFT_SUPER      // kVK_Command
         case 0x39: return PLATFORM_KEY_CAPS_LOCK       // kVK_CapsLock
 
-        // モディファイアキー（右）
+        // modifier keys (right)
         case 0x3C: return PLATFORM_KEY_RIGHT_SHIFT     // kVK_RightShift
         case 0x3D: return PLATFORM_KEY_RIGHT_ALT       // kVK_RightOption
         case 0x3E: return PLATFORM_KEY_RIGHT_CONTROL   // kVK_RightControl
         case 0x36: return PLATFORM_KEY_RIGHT_SUPER     // kVK_RightCommand
 
-        // ファンクションキー
+        // function keys
         case 0x7A: return PLATFORM_KEY_F1              // kVK_F1
         case 0x78: return PLATFORM_KEY_F2              // kVK_F2
         case 0x63: return PLATFORM_KEY_F3              // kVK_F3
@@ -305,7 +305,7 @@ func mapKeyCodeToPlatform(_ keyCode: UInt16) -> PlatformKeyCode {
         case 0x50: return PLATFORM_KEY_F19             // kVK_F19
         case 0x5A: return PLATFORM_KEY_F20             // kVK_F20
 
-        // 編集キー
+        // editing keys
         case 0x72: return PLATFORM_KEY_INSERT          // kVK_Help
         case 0x73: return PLATFORM_KEY_HOME            // kVK_Home
         case 0x74: return PLATFORM_KEY_PAGE_UP         // kVK_PageUp
@@ -313,13 +313,13 @@ func mapKeyCodeToPlatform(_ keyCode: UInt16) -> PlatformKeyCode {
         case 0x77: return PLATFORM_KEY_END             // kVK_End
         case 0x79: return PLATFORM_KEY_PAGE_DOWN       // kVK_PageDown
 
-        // 矢印キー
+        // arrow keys
         case 0x7B: return PLATFORM_KEY_LEFT            // kVK_LeftArrow
         case 0x7C: return PLATFORM_KEY_RIGHT           // kVK_RightArrow
         case 0x7D: return PLATFORM_KEY_DOWN            // kVK_DownArrow
         case 0x7E: return PLATFORM_KEY_UP              // kVK_UpArrow
 
-        // テンキー
+        // the numeric keypad
         case 0x52: return PLATFORM_KEY_KP_0            // kVK_ANSI_Keypad0
         case 0x53: return PLATFORM_KEY_KP_1            // kVK_ANSI_Keypad1
         case 0x54: return PLATFORM_KEY_KP_2            // kVK_ANSI_Keypad2
@@ -342,7 +342,7 @@ func mapKeyCodeToPlatform(_ keyCode: UInt16) -> PlatformKeyCode {
     }
 }
 
-// モディファイアキーを抽出
+// Extract the modifier keys
 func extractModifiers(_ nsModifiers: NSEvent.ModifierFlags) -> UInt32 {
     var mods: UInt32 = 0
     if nsModifiers.contains(.shift)   { mods |= UInt32(PLATFORM_MOD_SHIFT.rawValue) }
@@ -353,19 +353,19 @@ func extractModifiers(_ nsModifiers: NSEvent.ModifierFlags) -> UInt32 {
 }
 
 // ========================================
-// backend view 抽象 (TASK-140)
+// The backend view abstraction
 // ========================================
 //
-// swift(CALayer) / metal 両 backend の view が適合する共有プロトコル。共有 C ABI は
-// backendView 経由でのみ view を操作し、backend 固有の描画実装（CALayer / Metal ring）を
-// 隠蔽する。thin に保ち、描画本体・IME 状態は各 backend / PlatformIMEState 側に置く。
+// The shared protocol that the views of both the swift (CALayer) and metal backends conform to. The
+// shared C ABI drives the view only through backendView, which hides the backend-specific drawing
+// (CALayer or the Metal ring). It stays thin: drawing itself and the IME state live in each backend and in PlatformIMEState.
 protocol PlatformBackendView: AnyObject {
     var nativeView: NSView { get }
     var width: Int { get }
     var height: Int { get }
     var initialFramebuffer: UnsafeMutablePointer<UInt32>? { get }
-    // 現在の書込バッファを present（swap / submit）し、次に書込むバッファを返す。
-    // size 引数は互換のため受けるが実装は内部サイズを使う。
+    // Present the current write buffer (a swap or a submit) and return the next buffer to write into.
+    // The size argument is taken for compatibility, but the implementation uses its internal size.
     func present(
         framebuffer: UnsafeMutablePointer<UInt32>,
         width: Int,
@@ -380,29 +380,29 @@ protocol PlatformBackendView: AnyObject {
     func prepareForDestroy()
     func setTransparentMode(_ enabled: Bool)
     func startPresentation()
-    // IME surface（共有 C ABI / poll_events から使う）
+    // The IME surface (used by the shared C ABI and by poll_events)
     func copyCompositionSnapshot(buf: UnsafeMutablePointer<CChar>?, cap: UInt32, meta: UnsafeMutablePointer<PlatformCompositionMeta>?) -> UInt32
     func setCompositionRectPixels(x: Int32, y: Int32, w: Int32, h: Int32)
     func setTextInputActive(_ active: Bool)
     func setTextInputDocumentAccess(callbacks: UnsafePointer<PlatformTextInputDocumentCallbacks>?, userdata: UnsafeMutableRawPointer?)
     func hasMarkedText() -> Bool
     func imeRouteEnabled() -> Bool
-    // TASK-156.5 Stage 1: scale latch / metrics（objc fillMetrics / applyLatched / nativeEventScale と同型）
-    // forQuery=true: current negotiated（pending scale）。lock 前の contentScale()/入力正規化用。
-    // forQuery=false: latched snapshot（buffer/scale/epoch が同一 frame に属する）。lock_ex 用。
+    // The scale latch and metrics (the same shape as objc's fillMetrics / applyLatched / nativeEventScale)
+    // forQuery=true: the current negotiated value (the pending scale), for contentScale() and input normalisation before a lock.
+    // forQuery=false: the latched snapshot (buffer, scale and epoch all belong to the same frame), for lock_ex.
     func fillMetrics(_ out: UnsafeMutablePointer<PlatformFramebufferMetrics>, forQuery: Bool)
     func applyLatchedMetricsIfNeeded()
     func nativeEventScale() -> CGFloat
 }
 
-// PlatformWindowの不透明型として NSObject を継承（参照カウントのため）
+// The opaque PlatformWindow type inherits NSObject (for reference counting)
 final class PlatformWindowHandle: NSObject {
     let window: NSWindow
     let backendView: any PlatformBackendView
     var currentFramebuffer: UnsafeMutablePointer<UInt32>?
-    let width: Int   // create 時サイズ。lock/present は backendView.width/height（live・resize-safe）を使う。
+    let width: Int   // The size at creation. lock and present use backendView.width/height (live and resize-safe).
     let height: Int
-    let event_queue: EventQueue  // 名前 event_queue は維持（gamepad/既存コードが参照）
+    let event_queue: EventQueue  // The name event_queue is kept (gamepad and existing code refer to it)
     var quitRequested: Bool = false
     var quitDelegate: QuitWindowDelegate?
 
@@ -421,7 +421,7 @@ final class PlatformWindowHandle: NSObject {
     }
 }
 
-// close ボタンを終了要求へ変換し、consumer が判断するまで window を閉じない。
+// Turn the close button into a quit request; the window is not closed until the consumer decides.
 final class QuitWindowDelegate: NSObject, NSWindowDelegate {
     weak var handle: PlatformWindowHandle?
 
@@ -438,24 +438,24 @@ final class QuitWindowDelegate: NSObject, NSWindowDelegate {
 }
 
 // ========================================
-// ゲームパッド入力 (TASK-80.2。ADR-009)
+// Gamepad input (ADR-009)
 // ========================================
 //
-// opt-in（TASK-80.2 opt-in 化）: GameController framework は audio と同じ opt-in link 方式で、
-// ゲームパッドを使う exe（examples/22_gamepad）だけが build.zig から `-DVP_ENABLE_GAMEPAD` を渡す
-// （build_helpers/platform.zig の compilePlatformLayer 参照）。非 opt-in exe はこのブロック全体が
-// コンパイル対象外になり GameController のシンボルを一切参照しない（`otool -L` にも出ない）。
+// Opt-in: the GameController framework uses the same opt-in linking as audio, and only an executable
+// that uses a gamepad (examples/22_gamepad) gets `-DVP_ENABLE_GAMEPAD` from build.zig
+// (see compilePlatformLayer in build_helpers/platform.zig). In an executable without the opt-in this
+// whole block is not compiled and no GameController symbol is referenced at all (nor shown by `otool -L`).
 #if VP_ENABLE_GAMEPAD
 //
-// GCController ↔ index (0..<PLATFORM_MAX_GAMEPADS) のマッピングを module-level state として保持する。
-// 単一 window 前提（既存コードと同じ）なので、connect/disconnect イベントは「現在アクティブな
-// window」(最後に create された window) の event_queue へ push する。
+// The mapping from GCController to an index (0..<PLATFORM_MAX_GAMEPADS) is held as module-level state.
+// A single window is assumed (as in the rest of the code), so a connect/disconnect event is pushed
+// onto the event_queue of the "currently active window" (the window created last).
 
-/// 接続中コントローラの index→GCController マッピング。nil = 空きスロット。
+/// The index→GCController mapping of the connected controllers. nil = a free slot.
 var gamepadSlots: [GCController?] = Array(repeating: nil, count: Int(PLATFORM_MAX_GAMEPADS))
-/// connect/disconnect イベントを push する先の window。
+/// The window that connect and disconnect events are pushed to.
 weak var gamepadEventWindow: PlatformWindowHandle?
-/// GCControllerDidConnect/DidDisconnect の Notification 監視を設置済みか（1プロセス1回）。
+/// Whether the GCControllerDidConnect/DidDisconnect observers are installed (once per process).
 var gamepadObserversInstalled = false
 
 func gamepadFindSlot(for controller: GCController) -> Int? {
@@ -466,7 +466,7 @@ func gamepadFindFreeSlot() -> Int? {
     return gamepadSlots.firstIndex { $0 == nil }
 }
 
-/// PlatformEvent.payload.gamepad.name（固定33バイト、NUL終端）へ UTF-8 文字列を切り詰めコピーする。
+/// Copy a UTF-8 string, truncated, into PlatformEvent.payload.gamepad.name (a fixed 33 bytes, NUL-terminated).
 func setGamepadEventName(_ ev: inout PlatformEvent, _ name: String) {
     withUnsafeMutableBytes(of: &ev.payload.gamepad.name) { raw in
         for i in 0..<raw.count { raw[i] = 0 }
@@ -475,12 +475,12 @@ func setGamepadEventName(_ ev: inout PlatformEvent, _ name: String) {
     }
 }
 
-/// GCController 接続を取り込む。extendedGamepad 非対応（micro gamepad 等）・追跡済み・上限超は無視する。
+/// Take in a GCController connection. Anything without extendedGamepad (a micro gamepad, say), already tracked, or over the limit is ignored.
 func gamepadHandleConnect(_ controller: GCController) {
-    guard controller.extendedGamepad != nil else { return } // 標準レイアウト非対応は対象外
-    guard gamepadFindSlot(for: controller) == nil else { return } // 追跡済み（defensive）
-    guard let handle = gamepadEventWindow else { return } // window 未生成中は無視
-    guard let idx = gamepadFindFreeSlot() else { return } // PLATFORM_MAX_GAMEPADS 台超は無視
+    guard controller.extendedGamepad != nil else { return } // not the standard layout, so out of scope
+    guard gamepadFindSlot(for: controller) == nil else { return } // already tracked (defensive)
+    guard let handle = gamepadEventWindow else { return } // no window has been created yet
+    guard let idx = gamepadFindFreeSlot() else { return } // more than PLATFORM_MAX_GAMEPADS pads
     gamepadSlots[idx] = controller
 
     var ev = PlatformEvent()
@@ -490,7 +490,7 @@ func gamepadHandleConnect(_ controller: GCController) {
     handle.event_queue.push(ev)
 }
 
-/// GCController 切断を取り込む。未追跡なら無視する。
+/// Take in a GCController disconnection. An untracked one is ignored.
 func gamepadHandleDisconnect(_ controller: GCController) {
     guard let idx = gamepadFindSlot(for: controller) else { return }
     gamepadSlots[idx] = nil
@@ -502,11 +502,11 @@ func gamepadHandleDisconnect(_ controller: GCController) {
     handle.event_queue.push(ev)
 }
 
-/// GCControllerDidConnect/DidDisconnect の Notification 監視を 1 プロセス 1 回だけ設置する。
-/// `queue: .main` を明示指定し main thread 配信を強制する（`queue: nil` だと「通知を post した
-/// スレッドで同期実行」になり main thread 保証が無いため。codex レビュー指摘）。これにより
-/// event_queue / gamepadSlots への書き込みが pollEvents 等の main thread 経路と同じスレッドに揃い、
-/// lock 無しでも race しない。
+/// Install the GCControllerDidConnect/DidDisconnect observers exactly once per process.
+/// `queue: .main` is given explicitly to force delivery on the main thread (with `queue: nil` the
+/// observer runs synchronously on whichever thread posted the notification, which guarantees
+/// nothing). That keeps writes to event_queue and gamepadSlots on the same thread as pollEvents and
+/// the rest of the main thread path, so there is no race even without a lock.
 func gamepadInstallObserversIfNeeded() {
     if gamepadObserversInstalled { return }
     gamepadObserversInstalled = true
@@ -520,10 +520,10 @@ func gamepadInstallObserversIfNeeded() {
     }
 }
 
-/// window の create/destroy に合わせて「アクティブ window」を切替える。既に他 window から引き継いだ
-/// slot（前 window の生存中に接続済みだった controller）は新 window へ connected event を再送し、
-/// 未追跡のコントローラは通常の connect 処理で取り込む（codex レビュー指摘: window 再生成時に
-/// 既接続 controller の connected event が新 window に届かない問題への対応）。
+/// Switch the "active window" as windows are created and destroyed. A slot inherited from another
+/// window (a controller that connected while the previous window was alive) has its connected event
+/// resent to the new window, and an untracked controller is taken in by the ordinary connect path
+/// (without this, a controller that was already connected gets no connected event on the new window).
 func gamepadAttachWindow(_ handle: PlatformWindowHandle) {
     gamepadEventWindow = handle
     gamepadInstallObserversIfNeeded()
@@ -536,7 +536,7 @@ func gamepadAttachWindow(_ handle: PlatformWindowHandle) {
         handle.event_queue.push(ev)
     }
     for controller in GCController.controllers() {
-        gamepadHandleConnect(controller) // 未追跡のみ実際に処理する（gamepadFindSlot でスキップ）
+        gamepadHandleConnect(controller) // only an untracked one is really processed (gamepadFindSlot skips the rest)
     }
 }
 
@@ -548,11 +548,11 @@ func gamepadDetachWindow(_ handle: PlatformWindowHandle) {
 #endif // VP_ENABLE_GAMEPAD
 
 // ========================================
-// native メニュー bridge (TASK-122)
+// The native menu bridge
 // ========================================
 //
-// 共有 platform_macos_menu.m が NSMenu 本体を持ち、本 backend は EventQueue への
-// MENU_COMMAND 積込みと keyEquivalent 消費判定の呼び出しだけを担う。
+// The shared platform_macos_menu.m holds the NSMenu itself; this backend only pushes a
+// MENU_COMMAND onto the EventQueue and asks whether a keyEquivalent was consumed.
 #if VP_ENABLE_MENU
 
 @_silgen_name("platform_menu_consume_key_equivalent")
@@ -574,18 +574,18 @@ func platform_menu_enqueue_command(_ window: UnsafeMutableRawPointer?, _ command
 #endif // VP_ENABLE_MENU
 
 // ========================================
-// IME 状態 (TASK-79.6.1 / 79.6.3 / 142) — 共有 (TASK-140)
+// The IME state, shared by both backends
 // ========================================
 //
-// NSTextInputClient のロジックと composition/document-access 状態を PlatformIMEState に集約する。
-// 各 backend の view は `let imeState = PlatformIMEState()` を持ち、NSTextInputClient メソッド +
-// カスタム IME メソッドを imeState へ転送する。firstRect は hostView.bounds + fb サイズ
-// （updateFramebufferSize で更新）から算出する。
+// The NSTextInputClient logic and the composition and document-access state are gathered into PlatformIMEState.
+// Each backend's view holds `let imeState = PlatformIMEState()` and forwards the NSTextInputClient
+// methods and the custom IME methods to it. firstRect is computed from hostView.bounds and the
+// framebuffer size (updated through updateFramebufferSize).
 
-// composition preedit 固定バッファ容量（UTF-8。TASK-79.6.1）
+// The capacity of the fixed composition preedit buffer (in UTF-8 bytes)
 let compositionUtf8Cap = 1024
 
-/// s[0..<len] のうち cap 以内に収まる最長 UTF-8 codepoint 境界プレフィックス長（codex 修正 A）。
+/// The longest prefix of s[0..<len] that fits within cap and ends on a UTF-8 code point boundary.
 func utf8SafePrefixLen(_ s: [UInt8], len: Int, cap: Int) -> Int {
     var i = 0
     let n = min(len, s.count)
@@ -605,18 +605,18 @@ func utf8SafePrefixLen(_ s: [UInt8], len: Int, cap: Int) -> Int {
 }
 
 final class PlatformIMEState {
-    // event_queue への push 先 / bounds・inputContext・convert・window 参照元
+    // where events are pushed, and the source of bounds, inputContext, convert and the window reference
     weak var platformWindow: PlatformWindowHandle?
     weak var hostView: NSView?
 
-    // firstRect の pixel→bounds 換算に使う現在の fb サイズ（resize で更新）
+    // the current framebuffer size, used to convert firstRect from pixels into bounds (updated on a resize)
     private var fbWidth: Int = 0
     private var fbHeight: Int = 0
 
-    // IME composition 状態 (TASK-79.6.1)
+    // The IME composition state
     private var markedTextStorage = NSMutableString()
     private var imeSelectedRange = NSRange(location: 0, length: 0)
-    // テキスト入力フォーカス制御 (TASK-142)。imeControlled=false の間は従来どおり常時 IME 経路。
+    // Text input focus control. While imeControlled=false everything goes through the IME, as before.
     private var imeControlled = false
     private var imeActive = false
     private var compositionUtf8 = [UInt8](repeating: 0, count: compositionUtf8Cap)
@@ -626,28 +626,28 @@ final class PlatformIMEState {
     private var compositionRectPixels = NSRect.zero
     private var compositionRectSet = false
 
-    // IME document access (TASK-79.6.3)
+    // IME document access
     private var docAccessCallbacks = PlatformTextInputDocumentCallbacks()
     private var docAccessUserdata: UnsafeMutableRawPointer?
     private var docAccessEnabled = false
     private var hasPendingReplacement = false
     private var pendingReplacement = NSRange(location: NSNotFound, length: 0)
 
-    // fb サイズを更新する（init 直後と resize 時に backend が呼ぶ）。firstRect の換算に使う。
+    // Update the framebuffer size (the backend calls it right after init and on a resize). It is used by the firstRect conversion.
     func updateFramebufferSize(width: Int, height: Int) {
         fbWidth = width
         fbHeight = height
     }
 
     func copyCompositionSnapshot(buf: UnsafeMutablePointer<CChar>?, cap: UInt32, meta: UnsafeMutablePointer<PlatformCompositionMeta>?) -> UInt32 {
-        // latest-wins: 常に現在 preedit。event.revision は取りこぼし検知用（過去 revision は取れない）。
+        // latest-wins: always the current preedit. event.revision only detects a missed update (an older revision cannot be read).
         if let meta = meta {
             meta.pointee.revision = compositionRevision
             meta.pointee.cursor = compositionCursor
             meta.pointee.len = 0
         }
         guard let buf = buf, cap > 0, compositionLen > 0 else { return 0 }
-        // UTF-8 codepoint 境界で切断（codex 修正 A）
+        // cut on a UTF-8 code point boundary
         let n = UInt32(utf8SafePrefixLen(compositionUtf8, len: Int(compositionLen), cap: Int(cap)))
         compositionUtf8.withUnsafeBytes { raw in
             if let base = raw.baseAddress {
@@ -668,7 +668,7 @@ final class PlatformIMEState {
             compositionCursor = 0
             return
         }
-        // 固定バッファへ UTF-8 境界で truncate（codex 修正 A）
+        // truncate into the fixed buffer on a UTF-8 boundary
         var tmp = [UInt8](repeating: 0, count: data.count)
         data.copyBytes(to: &tmp, count: data.count)
         let len = utf8SafePrefixLen(tmp, len: data.count, cap: compositionUtf8Cap)
@@ -698,11 +698,11 @@ final class PlatformIMEState {
         keyTrace("composition phase=\(phase) revision=\(compositionRevision) cursor=\(compositionCursor)")
     }
 
-    /// Cmd/Ctrl 押下中は char_input を出さない（キーバインド経由 insertText の誤印字防止。codex 修正 B）。
+    /// No char_input is emitted while Cmd or Ctrl is held (which would print a character for an insertText coming from a key binding).
     private func pushCharInputs(from str: String) {
         guard let handle = platformWindow else { return }
         let charMods = extractModifiers(NSEvent.modifierFlags)
-        // printable フィルタと同列の invariant: cmd/ctrl 付きは印字しない
+        // the same invariant as the printable filter: nothing with cmd or ctrl is printed
         if (charMods & (UInt32(PLATFORM_MOD_CMD.rawValue) | UInt32(PLATFORM_MOD_CTRL.rawValue))) != 0 {
             return
         }
@@ -743,7 +743,7 @@ final class PlatformIMEState {
             imeTrace("insertText text=\"\(imePreview(str))\" explicit=\(imeRangeDesc(replacementRange)) path=\(resolved.path) final=\(imeRangeDesc(resolved.range)) pending_before_clear=\(hasPendingReplacement ? imeRangeDesc(pendingReplacement) : "none")")
             clearPendingReplacement(reason: "insertText")
             guard resolved.range.location != NSNotFound else { return }
-            // 不正 UTF-8 は拒否（String(decoding:) による置換は行わない）
+            // Invalid UTF-8 is rejected (no substitution through String(decoding:))
             guard let data = str.data(using: .utf8) else { return }
             var rr = PlatformTextInputRange()
             rr.location = UInt64(resolved.range.location)
@@ -771,17 +771,17 @@ final class PlatformIMEState {
             str = ""
         }
         let pendingBefore = hasPendingReplacement ? imeRangeDesc(pendingReplacement) : "none"
-        // TASK-159: 有効な replacementRange は同一 reconversion/composition で一度だけ latch する。
-        // 後続の NSNotFound / caret 零長では上書きしない。
+        // A valid replacementRange is latched exactly once per reconversion or composition.
+        // A later NSNotFound or zero-length caret does not overwrite it.
         //
-        // pending 破棄条件（空 setMarkedText は cancel ではない — 日本語 IM 再変換は
-        // setMarkedText(" ", range) → setMarkedText("") → setMarkedText(候補) → insertText
-        // の列で来る。空 mark で pending を消すと insertText が caret 純挿入になり二重化する）:
-        //   - insertText で消費した直後
-        //   - unmarkText（ESC 等）
-        //   - setTextInputActive(false) / document access 解除 / window destroy 経路
-        // 安全弁: 新規の有効 replacementRange は hasPending==false のときだけ latch
-        // （消費・破棄後の次セッション開始）。空 mark や NSNotFound 更新では破棄しない。
+        // When the pending range is discarded (an empty setMarkedText is not a cancel: Japanese input reconversion
+        // arrives as setMarkedText(" ", range) → setMarkedText("") → setMarkedText(candidate) → insertText, and
+        // dropping the pending range on the empty mark would turn insertText into a plain caret insertion, duplicating the text):
+        //   - right after insertText consumed it
+        //   - unmarkText (ESC and the like)
+        //   - setTextInputActive(false), unregistering document access, or destroying the window
+        // The safety valve: a new valid replacementRange is latched only while hasPending==false
+        // (the start of the next session, after the previous one was consumed or discarded). An empty mark or an NSNotFound update discards nothing.
         if replacementRange.location != NSNotFound && !hasPendingReplacement {
             hasPendingReplacement = true
             pendingReplacement = replacementRange
@@ -798,8 +798,8 @@ final class PlatformIMEState {
         if markedTextStorage.length == 0 {
             compositionLen = 0
             compositionCursor = 0
-            // TASK-159: 空 mark は preedit 表示のクリアのみ。pending は保持する。
-            // CANCEL phase も出さない（真の cancel は unmarkText）。
+            // An empty mark only clears the preedit display; the pending range is kept.
+            // No CANCEL phase is emitted either (a real cancel is unmarkText).
             imeTrace("setMarkedText empty-mark keep pending=\(hasPendingReplacement ? imeRangeDesc(pendingReplacement) : "none") wasEmpty=\(wasEmpty)")
             return
         }
@@ -827,20 +827,20 @@ final class PlatformIMEState {
         return markedTextStorage.length > 0
     }
 
-    // TASK-142: keyDown を IME(inputContext) へ渡すべきか。未制御=従来どおり常時 true。
+    // Whether keyDown should go to the IME (inputContext). Uncontrolled means always true, as before.
     func imeRouteEnabled() -> Bool {
         return imeControlled ? imeActive : true
     }
 
-    // TASK-142: テキスト編集フォーカスの有無を app から受ける。実効経路が YES→NO へ変わるとき
-    // （未制御=常時 YES からの初回 inactive も含む）保留 composition を破棄する。
+    // Receive the presence of text editing focus from the application. When the effective path goes
+    // YES→NO (the first inactive from uncontrolled, i.e. always-YES, included) a pending composition is discarded.
     func setTextInputActive(_ active: Bool) {
-        let wasRouting = imeRouteEnabled()      // 変更前の実効経路（未制御なら true）
+        let wasRouting = imeRouteEnabled()      // the effective path before the change (true while uncontrolled)
         imeControlled = true
-        imeActive = active                      // 変更後の実効経路 = active
+        imeActive = active                      // the effective path after the change = active
         if wasRouting && !active {
-            unmarkText()                        // markedText クリア + CANCEL phase + pending 破棄
-            hostView?.inputContext?.discardMarkedText()   // IME の変換セッションも破棄（候補窓を閉じる）
+            unmarkText()                        // clear markedText, emit the CANCEL phase and discard the pending range
+            hostView?.inputContext?.discardMarkedText()   // discard the IME's conversion session too (closing the candidate window)
             clearPendingReplacement(reason: "setTextInputActive_false")
         }
     }
@@ -876,10 +876,10 @@ final class PlatformIMEState {
         return resolveReplacementRangeDetailed(replacementRange).range
     }
 
-    /// insertText 用: 解決 range と経路名（explicit_len/pending/explicit_zero/selected/none）。
+    /// For insertText: the resolved range plus the name of the path taken (explicit_len/pending/explicit_zero/selected/none).
     private func resolveReplacementRangeDetailed(_ replacementRange: NSRange) -> (range: NSRange, path: String) {
-        // 優先順: 明示（length>0）→ pending → 明示（length==0 / caret）→ selected。
-        // TASK-159: insertText が caret 零長を明示しても、再変換 latch 済み pending を優先する。
+        // Priority: explicit (length>0) → pending → explicit (length==0, a caret) → selected.
+        // Even when insertText states a zero-length caret, a pending range latched for reconversion wins.
         if replacementRange.location != NSNotFound && replacementRange.length > 0 {
             return (replacementRange, "explicit_len")
         }
@@ -958,7 +958,7 @@ final class PlatformIMEState {
                 return nil
             }
             let data = Data(bytes: utf8Ptr, count: Int(len))
-            // 不正 UTF-8 は nil（置換しない）
+            // invalid UTF-8 gives nil (nothing is substituted)
             guard let s = String(data: data, encoding: .utf8) else {
                 imeTrace("attributedSubstring proposed=\(imeRangeDesc(range)) -> nil (bad utf8)")
                 return nil
@@ -995,8 +995,8 @@ final class PlatformIMEState {
         let height = fbHeight
         var r: NSRect
         if compositionRectSet && compositionRectPixels.width > 0 && compositionRectPixels.height > 0 {
-            // fb は Retina backing ではなく layer が bounds 全面へ拡縮表示するため、換算は
-            // bounds 比（mouse 変換の逆写像と同型）。
+            // The framebuffer is not a Retina backing: the layer scales it across the whole of bounds, so the
+            // conversion is the bounds ratio (the inverse of the mouse conversion).
             let sx = width > 0 ? bounds.width / CGFloat(width) : 1.0
             let sy = height > 0 ? bounds.height / CGFloat(height) : 1.0
             var x = compositionRectPixels.origin.x * sx
@@ -1020,8 +1020,8 @@ final class PlatformIMEState {
     }
 
     func doCommand(by selector: Selector) {
-        // 未処理 command を吸収してビープ抑止。物理キーは key_down 経路で既に届く。
-        // super は呼ばない（未処理 command のビープを抑止する NSTextInputClient 契約）。
+        // Absorb an unhandled command to suppress the beep. A physical key already arrives through the key_down path.
+        // super is not called (the NSTextInputClient contract that suppresses the beep of an unhandled command).
         keyTrace("doCommandBySelector=\(NSStringFromSelector(selector))")
     }
 
@@ -1036,12 +1036,12 @@ final class PlatformIMEState {
 }
 
 // ========================================
-// ファイル drop 共有ヘルパー (TASK-135 / TASK-140)
+// The shared file drop helper
 // ========================================
-// objc backend（platform/macos/platform_macos.m）と同一契約: 単一 file URL・UTF-8・
-// 空/上限超(PLATFORM_FILE_DROP_PATH_BYTES)/NUL 含有は reject。struct 充填・長さ/NUL 検証は
-// platform.h の共有ヘルパー platform_fill_file_drop_event（objc/swift/metal 単一ソース）。
-// inline copy 完了後は URL 寿命に非依存。
+// The same contract as the objc backend (platform/macos/platform_macos.m): a single file URL, UTF-8,
+// with empty, over-limit (PLATFORM_FILE_DROP_PATH_BYTES) or NUL-containing paths rejected. Filling the
+// struct and validating the length and NULs are platform.h's shared helper platform_fill_file_drop_event (one source for objc/swift/metal).
+// Once the inline copy is done, nothing depends on the URL's lifetime.
 func enqueueFileDropIfValid(handle: PlatformWindowHandle, url: URL) -> Bool {
     guard url.isFileURL else { return false }
     guard let data = url.path.data(using: .utf8), data.count <= Int(UInt32.max) else { return false }
@@ -1051,31 +1051,31 @@ func enqueueFileDropIfValid(handle: PlatformWindowHandle, url: URL) -> Bool {
         return platform_fill_file_drop_event(&ev, base, UInt32(data.count))
     }
     guard ok else { return false }
-    // inline copy 完了。NSURL/String の寿命に依存しない。
+    // The inline copy is done; nothing depends on the lifetime of the NSURL or the String.
     handle.event_queue.push(ev)
     return true
 }
 
-// TASK-104: borderless ウィンドウは既定では key/main になれない。subclass で canBecomeKey/Main を
-// true にし、入力・IME first responder・performWindowDragWithEvent: を効かせる。
+// A borderless window cannot become key or main by default. A subclass answers true to
+// canBecomeKey/Main, so that input, the IME first responder and performWindowDragWithEvent: work.
 class MascotWindow: NSWindow {
     override var canBecomeKey: Bool { return true }
     override var canBecomeMain: Bool { return true }
 }
 
-// 終了メニュー用ターゲット（action でフラグを立て、popUp のモーダル復帰後に読む）。
+// The target of the quit menu (the action raises a flag, read once popUp returns from its modal loop).
 class QuitMenuTarget: NSObject {
     var quitChosen = false
     @objc func onQuit(_ sender: Any?) { quitChosen = true }
 }
 
 // ========================================
-// C 互換の関数でエクスポート (@_cdecl)
+// Exported as C-compatible functions (@_cdecl)
 // ========================================
 
 @_cdecl("platform_init")
 func platform_init() -> Bool {
-    // macOSでは特に初期化不要
+    // macOS needs no particular initialisation
     return true
 }
 
@@ -1084,7 +1084,7 @@ func platform_create_window(width: Int32, height: Int32, title: UnsafePointer<CC
     return createWindowImpl(width: width, height: height, title: title, callback: callback, userdata: userdata, transparent: false, borderless: false, position: nil, physical: false)
 }
 
-// TASK-104 / TASK-117 / TASK-156.5: options 付きウィンドウ作成。opts==NULL は従来動作。unknown flags / reserved!=0 は NULL。
+// Create a window with options. opts==NULL keeps the previous behaviour, and unknown flags or reserved!=0 give NULL.
 @_cdecl("platform_create_window_ex")
 func platform_create_window_ex(width: Int32, height: Int32, title: UnsafePointer<CChar>, callback: FrameCallback?, userdata: UnsafeMutableRawPointer?, opts: UnsafePointer<PlatformWindowOptions>?) -> UnsafeMutableRawPointer? {
     var transparent = false
@@ -1105,8 +1105,8 @@ func platform_create_window_ex(width: Int32, height: Int32, title: UnsafePointer
     return createWindowImpl(width: width, height: height, title: title, callback: callback, userdata: userdata, transparent: transparent, borderless: borderless, position: position, physical: physical)
 }
 
-// ウィンドウ生成の共有骨格。backend 固有の view 生成は makePlatformBackendView() ファクトリへ委譲する
-// （各 backend ファイルが定義）。window レベルの style / 透過 / 位置決めは共通。
+// The shared skeleton of window creation. Creating the backend-specific view is delegated to the
+// makePlatformBackendView() factory (defined in each backend file). The window-level style, transparency and placement are shared.
 private func createWindowImpl(width: Int32, height: Int32, title: UnsafePointer<CChar>, callback: FrameCallback?, userdata: UnsafeMutableRawPointer?, transparent: Bool, borderless: Bool, position: (x: Int32, y: Int32)?, physical: Bool) -> UnsafeMutableRawPointer? {
     let app = NSApplication.shared
     app.setActivationPolicy(.regular)
@@ -1116,34 +1116,34 @@ private func createWindowImpl(width: Int32, height: Int32, title: UnsafePointer<
     let frame = NSRect(x: 0, y: 0, width: windowWidth, height: windowHeight)
 
     let styleMask: NSWindow.StyleMask = borderless
-        ? [.borderless]                                    // TASK-104: 枠なし
-        : [.titled, .closable, .miniaturizable, .resizable] // TASK-23: 自由リサイズ
+        ? [.borderless]                                    // frameless
+        : [.titled, .closable, .miniaturizable, .resizable] // freely resizable
 
-    // borderless は key window になれる subclass を使う（transparent 単独は通常 NSWindow で可）
+    // borderless uses the subclass that can become the key window (transparent on its own works with a plain NSWindow)
     let window: NSWindow = borderless
         ? MascotWindow(contentRect: frame, styleMask: styleMask, backing: .buffered, defer: false)
         : NSWindow(contentRect: frame, styleMask: styleMask, backing: .buffered, defer: false)
-    // TASK-139: window tabbing を無効化（保存 defaults / システム設定に依存させず描画領域を full height に保つ）
+    // Disable window tabbing (so the drawing area stays full height regardless of saved defaults or a system setting)
     window.tabbingMode = .disallowed
 
-    // タイトルを設定
+    // Set the title
     window.title = String(cString: title)
 
-    // hover の mouseMoved を受け取るために必須 (TASK-21.1)
+    // Required in order to receive a hover mouseMoved
     window.acceptsMouseMovedEvents = true
 
-    // TASK-104: 透過ウィンドウ設定（背後が透ける）
+    // Configure the transparent window (the desktop shows through)
     if transparent {
         window.isOpaque = false
         window.backgroundColor = NSColor.clear
     }
-    // borderless は透過有無に関わらず矩形影を消し、ドラッグ移動可能にする（設計契約）
+    // Borderless drops the rectangular shadow and becomes draggable whether or not it is transparent (the design contract)
     if borderless {
         window.hasShadow = false
         window.isMovable = true
     }
 
-    // backend 固有 view を生成（CALayer / Metal）。透過・physical 等の view 側設定はファクトリ内で行う。
+    // Create the backend-specific view (CALayer or Metal). View-level settings such as transparency and physical mode are made inside the factory.
     guard let backendView = makePlatformBackendView(
         frame: frame,
         width: Int(width),
@@ -1157,29 +1157,29 @@ private func createWindowImpl(width: Int32, height: Int32, title: UnsafePointer<
     }
     window.contentView = backendView.nativeView
 
-    // PlatformWindowハンドルを作成
+    // Create the PlatformWindow handle
     let platformWindow = PlatformWindowHandle(window: window, backendView: backendView)
-    // view → handle の back-reference を設定 (TASK-21.1)
+    // Set the view → handle back-reference
     backendView.platformWindow = platformWindow
-    // setContentView 後に NSTrackingArea を構築
+    // Build the NSTrackingArea after setContentView
     backendView.nativeView.updateTrackingAreas()
 
-    // ウィンドウを表示（TASK-117: 明示位置があれば setFrameOrigin、なければ center）
+    // Show the window (with an explicit position, setFrameOrigin; otherwise center)
     if let position = position {
         window.setFrameOrigin(NSPoint(x: CGFloat(position.x), y: CGFloat(position.y)))
     } else {
         window.center()
     }
     window.makeKeyAndOrderFront(nil)
-    // IME: view を first responder にして inputContext / interpretKeyEvents が効くようにする（TASK-79.6.1）
+    // IME: make the view the first responder so that inputContext and interpretKeyEvents work
     window.makeFirstResponder(backendView.nativeView)
     app.activate(ignoringOtherApps: true)
 
-    // 描画駆動を開始（swift: CADisplayLink 開始 / metal: no-op。isPaused はファクトリで設定済み）
+    // Start driving the drawing (swift: start the CADisplayLink; metal: a no-op, since isPaused is set in the factory)
     backendView.startPresentation()
 
     #if VP_ENABLE_GAMEPAD
-    // ゲームパッド: このwindowをアクティブにし、既接続コントローラを取り込む (TASK-80.2)
+    // Gamepads: make this window the active one and take in the controllers already connected
     gamepadAttachWindow(platformWindow)
     #endif
 
@@ -1188,7 +1188,7 @@ private func createWindowImpl(width: Int32, height: Int32, title: UnsafePointer<
     return handle
 }
 
-// TASK-117: 現在のウィンドウ geometry。位置=frame.origin、サイズ=content サイズ。
+// The current window geometry. The position is frame.origin, the size is the content size.
 @_cdecl("platform_get_window_geometry")
 func platform_get_window_geometry(window: UnsafeMutableRawPointer?, out: UnsafeMutablePointer<PlatformWindowGeometry>?) {
     guard let out = out else { return }
@@ -1208,7 +1208,7 @@ func platform_get_window_geometry(window: UnsafeMutableRawPointer?, out: UnsafeM
     out.pointee.flags = UInt32(PLATFORM_GEOMETRY_POSITION_VALID)
 }
 
-// 表示中のウィンドウタイトルを更新する（イベント時のみ）。
+// Update the title of the visible window (event time only).
 @_cdecl("platform_set_title")
 func platform_set_title(platformWindow: UnsafeMutableRawPointer?, title: UnsafePointer<CChar>?) -> Void {
     guard let platformWindow = platformWindow, let title = title else { return }
@@ -1216,12 +1216,12 @@ func platform_set_title(platformWindow: UnsafeMutableRawPointer?, title: UnsafeP
     handle.window.title = String(cString: title)
 }
 
-// TASK-104: 透過 / borderless ウィンドウ + ドラッグ移動 の C ABI 実装
+// The C ABI implementation of transparent / borderless windows plus drag-to-move
 @_cdecl("platform_begin_window_drag")
 func platform_begin_window_drag(platformWindow: UnsafeMutableRawPointer?) -> Void {
     guard let platformWindow = platformWindow else { return }
     let handle = Unmanaged<PlatformWindowHandle>.fromOpaque(platformWindow).takeUnretainedValue()
-    guard let ev = handle.backendView.takeLastMouseDownEvent() else { return } // one-shot 消費
+    guard let ev = handle.backendView.takeLastMouseDownEvent() else { return } // consumed one-shot
     handle.window.performDrag(with: ev)
 }
 
@@ -1253,7 +1253,7 @@ func platform_show_quit_menu(platformWindow: UnsafeMutableRawPointer?) -> Void {
     let item = NSMenuItem(title: "終了", action: #selector(QuitMenuTarget.onQuit(_:)), keyEquivalent: "")
     item.target = target
     menu.addItem(item)
-    // 現在のマウス位置（view ローカル）にポップアップ（モーダル。選択されるまで戻らない）。
+    // Pop up at the current mouse position (in view coordinates). It is modal and does not return until something is chosen.
     let view = handle.backendView.nativeView
     let screenPt = NSEvent.mouseLocation
     let winPt = handle.window.convertPoint(fromScreen: screenPt)
@@ -1266,8 +1266,8 @@ func platform_show_quit_menu(platformWindow: UnsafeMutableRawPointer?) -> Void {
     }
 }
 
-// TASK-100.1: 既存ウィンドウをネイティブフルスクリーン化する（緑ボタンと同じ toggleFullScreen(nil)）。
-// 既にフルスクリーンなら no-op（二重 toggle 防止）。
+// Make an existing window natively fullscreen (the same toggleFullScreen(nil) as the green button).
+// Already fullscreen is a no-op (no double toggle).
 @_cdecl("platform_enter_fullscreen")
 func platform_enter_fullscreen(platformWindow: UnsafeMutableRawPointer?) -> Void {
     guard let platformWindow = platformWindow else { return }
@@ -1285,7 +1285,7 @@ func platform_enter_fullscreen(platformWindow: UnsafeMutableRawPointer?) -> Void
 func platform_run(platformWindow: UnsafeMutableRawPointer?) -> Void {
     guard let platformWindow = platformWindow else { return }
 
-    // ハンドルからPlatformWindowHandleを復元（ウィンドウを保持）
+    // Recover the PlatformWindowHandle from the handle (retaining the window)
     let _ = Unmanaged<PlatformWindowHandle>.fromOpaque(platformWindow).takeUnretainedValue()
 
     let app = NSApplication.shared
@@ -1297,30 +1297,30 @@ func platform_destroy_window(platformWindow: UnsafeMutableRawPointer?) -> Void {
     guard let platformWindow = platformWindow else { return }
 
     #if VP_ENABLE_MENU
-    // menu: 解放前に配送先を外し、遅延 MenuTarget action の UAF を防ぐ (TASK-122 r2)
+    // menu: detach the delivery target before releasing, so a late MenuTarget action cannot use freed memory
     platform_menu_window_will_destroy(platformWindow)
     #endif
 
-    // ハンドルからPlatformWindowHandleを復元してリリース
+    // Recover the PlatformWindowHandle from the handle and release it
     let handle = Unmanaged<PlatformWindowHandle>.fromOpaque(platformWindow).takeRetainedValue()
     #if VP_ENABLE_GAMEPAD
-    // ゲームパッド: このwindowがアクティブなら参照を外す (TASK-80.2)
+    // gamepads: drop the reference when this window is the active one
     gamepadDetachWindow(handle)
     #endif
-    // 描画駆動を停止し callback から view への参照を断つ（swift: CADisplayLink / metal: MTKView delegate）
+    // Stop driving the drawing and cut the callback's reference to the view (swift: CADisplayLink; metal: the MTKView delegate)
     handle.backendView.prepareForDestroy()
-    // delegate を外してから自己終了する（windowShouldClose の誤 quit を防止）
+    // Detach the delegate before closing ourselves (so windowShouldClose does not wrongly push a quit)
     handle.window.delegate = nil
     handle.quitDelegate?.handle = nil
     handle.quitDelegate = nil
-    // window を閉じる
+    // Close the window
     handle.window.close()
     handle.window.orderOut(nil)
-    // weak var platformWindow は自動で nil 化される
-    // handleはここで自動的にdeallocされる
+    // weak var platformWindow is nilled automatically
+    // the handle is deallocated automatically here
 }
 
-// consumer が close request をキャンセルして window を継続する。
+// The consumer cancels the close request and keeps the window alive.
 @_cdecl("platform_cancel_quit")
 func platform_cancel_quit(platformWindow: UnsafeMutableRawPointer?) -> Void {
     guard let platformWindow = platformWindow else { return }
@@ -1330,11 +1330,11 @@ func platform_cancel_quit(platformWindow: UnsafeMutableRawPointer?) -> Void {
 
 @_cdecl("platform_shutdown")
 func platform_shutdown() -> Void {
-    // macOSでは特にクリーンアップ不要
+    // macOS needs no particular cleanup
 }
 
 // ========================================
-// 手動描画用API実装
+// The implementation of the manual drawing API
 // ========================================
 
 @_cdecl("platform_poll_events")
@@ -1344,14 +1344,14 @@ func platform_poll_events(platformWindow: UnsafeMutableRawPointer?) -> Bool {
     let handle = Unmanaged<PlatformWindowHandle>.fromOpaque(platformWindow).takeUnretainedValue()
     let app = NSApplication.shared
 
-    // イベントをポーリング（ブロックしない）
+    // Poll events (without blocking)
     while let event = app.nextEvent(matching: .any, until: Date.distantPast, inMode: .default, dequeue: true) {
-        // キーボードイベントをイベントキューに追加
+        // Add a keyboard event to the event queue
         if event.type == .keyDown || event.type == .keyUp {
             #if VP_ENABLE_MENU
-            // TASK-97.3 AC#2 / TASK-122: keyEquivalent 二重発火防止。
-            // 共有 menu TU へ performKeyEquivalent を委譲し、消費時は key_down を積まず
-            // inputContext にも渡さない（objc と同意味論）。
+            // Preventing a keyEquivalent from firing twice.
+            // performKeyEquivalent is delegated to the shared menu TU, and once it is consumed no key_down is
+            // pushed and nothing goes to the inputContext either (the same semantics as objc).
             if event.type == .keyDown {
                 if platform_menu_consume_key_equivalent(Unmanaged.passUnretained(event).toOpaque()) {
                     continue
@@ -1366,14 +1366,14 @@ func platform_poll_events(platformWindow: UnsafeMutableRawPointer?) -> Bool {
             let token = handle.event_queue.push(platform_event)
             keyTrace("key_\(event.type == .keyDown ? "down" : "up") push=\(token != nil) key=\(platform_event.payload.keyboard.key) mods=0x\(String(platform_event.payload.keyboard.modifiers, radix: 16))")
 
-            // keyDown: 物理 key_down を積んだ後 IME/inputContext 経路へ（TASK-79.6.1）。
-            // insertText が char_input の唯一の生成元。旧 event.characters 直読みは廃止。
+            // keyDown: push the physical key_down and then go on to the IME / inputContext path.
+            // insertText is the only source of char_input; the event.characters are never read directly.
             if event.type == .keyDown {
                 let backendView = handle.backendView
                 let nsView = backendView.nativeView
                 let hadMarked = backendView.hasMarkedText()
                 let hasInputContext = nsView.inputContext != nil
-                // TASK-142: text input を制御しているなら active のときだけ IME へ渡す（未制御=常時）。
+                // When text input is controlled, hand the event to the IME only while it is active (uncontrolled always hands it over).
                 let routeToIme = backendView.imeRouteEnabled()
                 var handled = false
                 if routeToIme, let inputContext = nsView.inputContext {
@@ -1385,7 +1385,7 @@ func platform_poll_events(platformWindow: UnsafeMutableRawPointer?) -> Bool {
                 keyTrace("handleEvent bool=\(handled) marked=\(hadMarked)->\(hasMarked) route=\(routeToIme) tombstone=\(tombstone)")
             }
 
-            // キーイベントは処理済みなので、システムに渡さない（ビープ音を防ぐ）
+            // The key event has been handled, so it is not passed on to the system (which prevents the beep)
             continue
         }
 
@@ -1393,9 +1393,9 @@ func platform_poll_events(platformWindow: UnsafeMutableRawPointer?) -> Bool {
         app.updateWindows()
     }
 
-    // ウィンドウが閉じられているか確認
+    // Check whether the window has been closed
     if !handle.window.isVisible {
-        // QUITイベントをキューに追加
+        // Add a QUIT event to the queue
         var quit_event = PlatformEvent()
         quit_event.type = PLATFORM_EVENT_QUIT
         handle.event_queue.push(quit_event)
@@ -1405,7 +1405,7 @@ func platform_poll_events(platformWindow: UnsafeMutableRawPointer?) -> Bool {
     return true
 }
 
-// IME composition preedit snapshot（TASK-79.6.1）
+// The IME composition preedit snapshot
 @_cdecl("platform_get_composition_snapshot")
 func platform_get_composition_snapshot(
     platformWindow: UnsafeMutableRawPointer?,
@@ -1430,7 +1430,7 @@ func platform_set_composition_rect(platformWindow: UnsafeMutableRawPointer?, x: 
     handle.backendView.setCompositionRectPixels(x: x, y: y, w: w, h: h)
 }
 
-// TASK-142: テキスト入力フォーカスの有無を platform へ伝える（objc と同意味論）。
+// Tell the platform whether a text editing widget has focus (the same semantics as objc).
 @_cdecl("platform_set_text_input_active")
 func platform_set_text_input_active(platformWindow: UnsafeMutableRawPointer?, active: Bool) {
     guard let platformWindow = platformWindow else { return }
@@ -1438,7 +1438,7 @@ func platform_set_text_input_active(platformWindow: UnsafeMutableRawPointer?, ac
     handle.backendView.setTextInputActive(active)
 }
 
-// TASK-79.6.3: IME document access
+// IME document access
 @_cdecl("platform_set_text_input_document_access")
 func platform_set_text_input_document_access(
     platformWindow: UnsafeMutableRawPointer?,
@@ -1450,7 +1450,7 @@ func platform_set_text_input_document_access(
     handle.backendView.setTextInputDocumentAccess(callbacks: callbacks, userdata: userdata)
 }
 
-// イベントキューカウンタの snapshot 取得 (TASK-21.1)
+// Take a snapshot of the event queue counters
 @_cdecl("platform_get_event_stats")
 func platform_get_event_stats(platformWindow: UnsafeMutableRawPointer?, out: UnsafeMutablePointer<PlatformEventStats>?) -> Void {
     guard let platformWindow = platformWindow, let out = out else { return }
@@ -1461,7 +1461,7 @@ func platform_get_event_stats(platformWindow: UnsafeMutableRawPointer?, out: Uns
     out.pointee.event_drop_count = q.eventDropCount
 }
 
-// 高精度モノトニック時刻を取得（調整なし）
+// Read a high-resolution monotonic time (unadjusted)
 @_cdecl("platform_get_time")
 func platform_get_time() -> Double {
     let ns = clock_gettime_nsec_np(CLOCK_UPTIME_RAW)
@@ -1488,7 +1488,7 @@ func platform_lock_framebuffer(platformWindow: UnsafeMutableRawPointer?, out_wid
     return px
 }
 
-// TASK-156.5 Stage 1: query 用 metrics（pending scale を都度再取得）。
+// The metrics for a query (the pending scale is re-read each time).
 @_cdecl("platform_get_framebuffer_metrics")
 func platform_get_framebuffer_metrics(platformWindow: UnsafeMutableRawPointer?, out: UnsafeMutablePointer<PlatformFramebufferMetrics>?) -> Bool {
     guard let platformWindow = platformWindow, let out = out else { return false }
@@ -1501,13 +1501,13 @@ func platform_get_framebuffer_metrics(platformWindow: UnsafeMutableRawPointer?, 
 func platform_lock_framebuffer_ex(platformWindow: UnsafeMutableRawPointer?, out: UnsafeMutablePointer<PlatformFramebufferMetrics>?) -> UnsafeMutablePointer<UInt32>? {
     guard let platformWindow = platformWindow else { return nil }
     let handle = Unmanaged<PlatformWindowHandle>.fromOpaque(platformWindow).takeUnretainedValue()
-    // pending scale/size を latch（成功時のみ buffer/scale/epoch を原子 commit）
+    // Latch the pending scale and size (only on success are the buffer, scale and epoch committed atomically)
     handle.backendView.applyLatchedMetricsIfNeeded()
-    // latched snapshot（4 fields が同一 frame に属する）
+    // the latched snapshot (all four fields belong to the same frame)
     if let out = out {
         handle.backendView.fillMetrics(out, forQuery: false)
     }
-    // currentBuffer を返す（objc getCurrentBuffer と同型。latch 後の書込バッファ）
+    // Return currentBuffer (the same shape as objc's getCurrentBuffer: the write buffer after the latch)
     if let live = handle.backendView.initialFramebuffer {
         handle.currentFramebuffer = live
     }
@@ -1516,8 +1516,8 @@ func platform_lock_framebuffer_ex(platformWindow: UnsafeMutableRawPointer?, out:
 
 @_cdecl("platform_unlock_framebuffer")
 func platform_unlock_framebuffer(platformWindow: UnsafeMutableRawPointer?) -> Void {
-    // このAPIでは特に何もする必要なし
-    // バッファのスワップはplatform_present()で行う
+    // Nothing in particular is needed in this API
+    // The buffers are swapped in platform_present()
 }
 
 @_cdecl("platform_present")
@@ -1528,13 +1528,13 @@ func platform_present(platformWindow: UnsafeMutableRawPointer?) -> Void {
     guard let fb = handle.currentFramebuffer else { return }
     let view = handle.backendView
 
-    // present して次の書込バッファを受け取り保存する（swift: swap / metal: submit + slot 前進）
+    // Present, then receive and store the next write buffer (swift: a swap; metal: a submit plus a slot advance)
     if let next = view.present(framebuffer: fb, width: view.width, height: view.height) {
         handle.currentFramebuffer = next
     }
 }
 
-// カーソル形状を設定する (TASK-75.1)。未知値は PLATFORM_CURSOR_DEFAULT にフォールバックする。
+// Set the cursor shape. An unknown value falls back to PLATFORM_CURSOR_DEFAULT.
 @_cdecl("platform_set_cursor")
 func platform_set_cursor(platformWindow: UnsafeMutableRawPointer?, shape: Int32) -> Void {
     guard let platformWindow = platformWindow else { return }
@@ -1549,7 +1549,7 @@ func platform_set_cursor(platformWindow: UnsafeMutableRawPointer?, shape: Int32)
     handle.backendView.setCursorShape(s)
 }
 
-// ライブリサイズ再描画コールバック登録 (TASK-23.1)。cb==nil で解除。
+// Register the live-resize redraw callback. cb==nil unregisters.
 @_cdecl("platform_set_redraw_callback")
 func platform_set_redraw_callback(platformWindow: UnsafeMutableRawPointer?, cb: PlatformRedrawCallback?, userdata: UnsafeMutableRawPointer?) {
     guard let platformWindow = platformWindow else { return }
@@ -1557,7 +1557,7 @@ func platform_set_redraw_callback(platformWindow: UnsafeMutableRawPointer?, cb: 
     handle.backendView.setRedrawCallback(cb, userdata: userdata)
 }
 
-// イベント取得API
+// The event API
 @_cdecl("platform_get_event")
 func platform_get_event(window: UnsafeMutableRawPointer?, event: UnsafeMutableRawPointer?) -> Bool {
     guard let window = window, let event = event else { return false }
@@ -1565,12 +1565,12 @@ func platform_get_event(window: UnsafeMutableRawPointer?, event: UnsafeMutableRa
     let handle = Unmanaged<PlatformWindowHandle>.fromOpaque(window).takeUnretainedValue()
     let queue = handle.event_queue
 
-    // キューが空の場合
+    // when the queue is empty
     if queue.head == queue.tail {
         return false
     }
 
-    // キューから次のイベントを取得（メモリコピー）
+    // Take the next event from the queue (a memory copy)
     let eventPtr = event.bindMemory(to: PlatformEvent.self, capacity: 1)
     eventPtr.pointee = queue[queue.tail]
 
@@ -1580,28 +1580,28 @@ func platform_get_event(window: UnsafeMutableRawPointer?, event: UnsafeMutableRa
 }
 
 // ========================================
-// ゲームパッド入力 (TASK-80.2。ADR-009)
+// Gamepad input (ADR-009)
 // ========================================
 //
-// opt-in（TASK-80.2 opt-in 化）: `platform_get_gamepad_state` は platform.h（bridging header）で
-// 常時宣言されるため、シンボル自体は non-opt-in exe でも定義する必要がある。GameController 型を
-// 一切参照しない always-false fallback を #else 側に用意し、リンクエラーの可能性を Zig 側の
-// dead-code-elimination 頼みにしない（防御的設計）。
+// Opt-in: `platform_get_gamepad_state` is declared unconditionally in platform.h (the bridging
+// header), so the symbol has to be defined even in an executable without the opt-in. An always-false
+// fallback that references no GameController type is provided in the #else branch, rather than relying
+// on dead code elimination on the Zig side to avoid a link error (defensive by design).
 #if VP_ENABLE_GAMEPAD
 //
-// GCExtendedGamepad.buttonA/B/X/Y は Apple が「物理位置ベース」で既に正規化済み
-// （Nintendo 系コントローラの A/B・X/Y 入替も GameController framework 側で吸収される）ため、
-// 本実装は 1:1 マッピングするだけで良い。stick の Y 軸は GameController の raw 値
-// （上入力 = +1）をそのまま渡す（screen 座標へのフリップは consumer 責務。ADR-009 の raw値契約を継承）。
+// GCExtendedGamepad.buttonA/B/X/Y are already normalised by Apple by physical position (the A/B and
+// X/Y swap of a Nintendo-style controller is absorbed by the GameController framework itself), so this
+// implementation only has to map them one to one. A stick's Y axis passes on GameController's raw
+// value (up = +1); flipping it into screen coordinates is the consumer's job (inheriting the raw value contract of ADR-009).
 //
-// ホットパス宣言: フレーム毎に呼ばれる想定だが 4台×少数フィールドの固定長 copy
-// （alloc/lock 無し）で全画素ループでも RT でもないため性能規約の適用対象外（ADR-009 参照）。
+// Hot path declaration: called once per frame, but it is a fixed-length copy of four pads with a few
+// fields each (no allocation, no lock), which is neither an all-pixel loop nor real time, so the performance rules do not apply (see ADR-009).
 @_cdecl("platform_get_gamepad_state")
 func platform_get_gamepad_state(window: UnsafeMutableRawPointer?, index: Int32, out_state: UnsafeMutablePointer<PlatformGamepadState>?) -> Bool {
     guard let out_state = out_state else { return false }
     guard index >= 0 && Int(index) < gamepadSlots.count else { return false }
     guard let controller = gamepadSlots[Int(index)] else { return false }
-    guard let pad = controller.extendedGamepad else { return false } // 接続後に非対応プロファイルへ変化した場合の防御
+    guard let pad = controller.extendedGamepad else { return false } // A guard for a profile that changes to an unsupported one after connecting
 
     var mask: UInt32 = 0
     if pad.buttonA.isPressed { mask |= UInt32(PLATFORM_GAMEPAD_BUTTON_A.rawValue) }
@@ -1632,16 +1632,16 @@ func platform_get_gamepad_state(window: UnsafeMutableRawPointer?, index: Int32, 
 #else
 @_cdecl("platform_get_gamepad_state")
 func platform_get_gamepad_state(window: UnsafeMutableRawPointer?, index: Int32, out_state: UnsafeMutablePointer<PlatformGamepadState>?) -> Bool {
-    return false // opt-in 無効（TASK-80.2 opt-in 化。GameController型を一切参照しない）
+    return false // the opt-in is off (no GameController type is referenced at all)
 }
 #endif // VP_ENABLE_GAMEPAD
 
 // ========================================
-// ファイル選択ダイアログ (TASK-24)
+// File selection dialogs
 // ========================================
-// 拡張子フィルタは allowedContentTypes (UTType) を使う（macOS 11+ 専用。allowedFileTypes は
-// macOS 12 で deprecated なため移行）。未知拡張子で UTType が nil の場合はフィルタ未設定（全許可）にフォールバック。
-// withUnsafeFileSystemRepresentation の ptr は Optional。non-null を確認してから strdup する。
+// The extension filter uses allowedContentTypes (UTType), which is macOS 11 and later only
+// (allowedFileTypes was deprecated in macOS 12). When UTType is nil for an unknown extension, it falls back to no filter (everything allowed).
+// The ptr of withUnsafeFileSystemRepresentation is Optional. It is strdup'd only once it is known to be non-null.
 
 @_cdecl("platform_save_file_dialog")
 func platform_save_file_dialog(opts: UnsafePointer<PlatformSaveDialogOptions>?) -> UnsafeMutablePointer<CChar>? {
@@ -1685,12 +1685,12 @@ func platform_free_path(path: UnsafeMutablePointer<CChar>?) -> Void {
 }
 
 // ========================================
-// OS テキストクリップボード (TASK-120 / TASK-161)
+// The OS text clipboard
 // ========================================
-// objc (platform_macos.m) と bit 同一意味論:
-// UTF-8 境界切り詰め / clearContents→setString / 空文字 / null ガード。
+// Bit-identical semantics to objc (platform_macos.m):
+// truncating on a UTF-8 boundary, clearContents→setString, the empty string, and the null guards.
 
-/// cap 超過時に UTF-8 コードポイント境界まで後退する（objc clipboardUtf8TruncateLen と同一）。
+/// Step back to a UTF-8 code point boundary when cap is exceeded (identical to objc's clipboardUtf8TruncateLen).
 private func clipboardUtf8TruncateLen(_ bytes: UnsafePointer<UInt8>, _ len: UInt32, _ cap: UInt32) -> UInt32 {
     var n = min(len, cap)
     while n > 0 && n < len && (bytes[Int(n)] & 0xC0) == 0x80 {
@@ -1699,8 +1699,8 @@ private func clipboardUtf8TruncateLen(_ bytes: UnsafePointer<UInt8>, _ len: UInt
     return n
 }
 
-/// OS clipboard へ UTF-8 テキストを書く。len はバイト長（NUL 終端不要）。
-/// utf8==nil && len>0 は即 return。不正 UTF-8 は clear 後に return（set しない）。
+/// Write UTF-8 text to the OS clipboard. len is a byte length (no NUL termination is needed).
+/// utf8==nil && len>0 returns immediately. Invalid UTF-8 clears and then returns (nothing is set).
 @_cdecl("platform_set_clipboard_text")
 func platform_set_clipboard_text(_ utf8: UnsafePointer<CChar>?, _ len: UInt32) {
     if utf8 == nil && len > 0 { return }
@@ -1710,7 +1710,7 @@ func platform_set_clipboard_text(_ utf8: UnsafePointer<CChar>?, _ len: UInt32) {
     if len == 0 {
         str = ""
     } else if let utf8 = utf8 {
-        // String(decoding:as:) は置換文字になるので使わない（不正 UTF-8 は nil→return）
+        // String(decoding:as:) is not used, since it substitutes a replacement character (invalid UTF-8 gives nil and returns)
         str = String(bytes: UnsafeRawBufferPointer(start: UnsafeRawPointer(utf8), count: Int(len)), encoding: .utf8)
     } else {
         return
@@ -1719,8 +1719,8 @@ func platform_set_clipboard_text(_ utf8: UnsafePointer<CChar>?, _ len: UInt32) {
     pb.setString(str, forType: .string)
 }
 
-/// OS clipboard から UTF-8 テキストを caller buffer へ読む。
-/// 成功時 true（空文字列含む）。文字列無し・失敗は false。cap 超過は UTF-8 境界で切り詰め。
+/// Read UTF-8 text from the OS clipboard into the caller's buffer.
+/// true on success (an empty string included). No string present, or a failure, gives false. Anything past cap is truncated on a UTF-8 boundary.
 @_cdecl("platform_get_clipboard_text")
 func platform_get_clipboard_text(
     _ out: UnsafeMutablePointer<CChar>?,
@@ -1734,12 +1734,12 @@ func platform_get_clipboard_text(
     return data.withUnsafeBytes { rawBuffer -> Bool in
         guard let base = rawBuffer.baseAddress else {
             outLen?.pointee = 0
-            return true // 空データ = 空文字成功
+            return true // empty data = an empty string, successfully
         }
         let bytes = base.assumingMemoryBound(to: UInt8.self)
         let len = UInt32(data.count)
         let n = clipboardUtf8TruncateLen(bytes, len, cap)
-        // CChar↔UInt8 符号差は UnsafeMutableRawPointer 経由で回避
+        // The sign difference between CChar and UInt8 is avoided by going through UnsafeMutableRawPointer
         UnsafeMutableRawPointer(out).copyMemory(from: bytes, byteCount: Int(n))
         outLen?.pointee = n
         return true
