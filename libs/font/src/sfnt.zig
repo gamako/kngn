@@ -15,7 +15,7 @@ pub const Metrics = font.Metrics;
 pub const Error = error{
     /// Structurally or semantically invalid font.
     InvalidFont,
-    /// Unsupported sfnt variant (e.g. ttcf collections).
+    /// Unsupported sfnt variant (a .ttc collection is supported: its first font).
     UnsupportedFormat,
 };
 

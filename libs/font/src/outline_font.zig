@@ -3,7 +3,7 @@
 //
 //   FontFace  … immutable parsed font (borrows `data`; `data` must outlive FontFace).
 //   OutlineFont … mutable drawable instance binding a FontFace to a pixel size.
-//                 Glyphs are rasterized lazily on demand and cached by (GID) key.
+//                 Glyphs rasterize lazily and cache by (GID, physical_px_q) key.
 //
 // Usage contract: OutlineFont is **not thread-safe** (thread-confined). drawTo lazily fills
 // the cache (= interior mutability), so asFont() must be called only from a **mutable** instance,
