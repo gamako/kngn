@@ -1,16 +1,16 @@
-//! FFT（基数2 反復 Cooley-Tukey）+ Hann 窓 + 振幅スペクトル。
-//! スペクトログラム可視化用。**メインスレッドで実行**（RT スレッドからは呼ばない）。
+//! FFT (radix-2 iterative Cooley-Tukey) + Hann window + magnitude spectrum.
+//! For spectrogram visualization. **Runs on the main thread** (do not call from a real-time thread).
 
 const std = @import("std");
 
-/// in-place 順方向 FFT。`re`/`im` は同長で 2 の冪。
+/// In-place forward FFT. `re`/`im` must be the same length and a power of two.
 pub fn fft(re: []f32, im: []f32) void {
     const n = re.len;
     std.debug.assert(n == im.len);
     std.debug.assert(std.math.isPowerOfTwo(n));
     if (n <= 1) return;
 
-    // ビットリバース置換
+    // Bit-reversal permutation
     var j: usize = 0;
     var i: usize = 1;
     while (i < n) : (i += 1) {
@@ -23,7 +23,7 @@ pub fn fft(re: []f32, im: []f32) void {
         }
     }
 
-    // バタフライ
+    // Butterfly
     var len: usize = 2;
     while (len <= n) : (len <<= 1) {
         const ang = -2.0 * std.math.pi / @as(f32, @floatFromInt(len));
@@ -54,7 +54,7 @@ pub fn fft(re: []f32, im: []f32) void {
     }
 }
 
-/// Hann 窓を in-place で掛ける。
+/// Apply a Hann window in place.
 pub fn applyHann(buf: []f32) void {
     const n = buf.len;
     if (n <= 1) return;
@@ -66,9 +66,9 @@ pub fn applyHann(buf: []f32) void {
     }
 }
 
-/// 実数信号 `samples`(長さ N=2^k) に Hann 窓を掛けて FFT し、
-/// 振幅スペクトル `mags[0..N/2]` を埋める。`mags.len >= samples.len/2` が必要。
-/// `scratch_re`/`scratch_im` は長さ N の作業領域（呼び出し側が確保 = ここでは alloc しない）。
+/// Apply a Hann window to the real signal `samples` (length N=2^k), run an FFT, and
+/// fill the magnitude spectrum `mags[0..N/2]`. Requires `mags.len >= samples.len/2`.
+/// `scratch_re`/`scratch_im` are length-N workspaces (caller allocates = no alloc here).
 pub fn magnitudeSpectrum(
     samples: []const f32,
     scratch_re: []f32,
@@ -105,7 +105,7 @@ test "fft: impulse -> flat spectrum (all ones)" {
 
 test "fft: bin-aligned cosine peaks at its bin" {
     const n = 64;
-    const k0 = 8; // 周波数ビン
+    const k0 = 8; // Frequency bin
     var re: [n]f32 = undefined;
     var im = [_]f32{0} ** n;
     var idx: usize = 0;
@@ -114,7 +114,7 @@ test "fft: bin-aligned cosine peaks at its bin" {
         re[idx] = @cos(2.0 * std.math.pi * @as(f32, k0) * t / @as(f32, n));
     }
     fft(&re, &im);
-    // 振幅は k0 と n-k0 にピーク（各 n/2）、他はほぼ 0
+    // Peaks at k0 and n-k0 (each about n/2); elsewhere near 0
     var mags: [n]f32 = undefined;
     for (0..n) |m| mags[m] = @sqrt(re[m] * re[m] + im[m] * im[m]);
     try testing.expect(mags[k0] > @as(f32, n) * 0.4);
@@ -143,7 +143,7 @@ test "magnitudeSpectrum: sine energy concentrates near its bin" {
     var sim: [n]f32 = undefined;
     var mags: [n / 2]f32 = undefined;
     magnitudeSpectrum(&samples, &sre, &sim, &mags);
-    // 最大ビンが k0 近傍（窓で多少漏れる）
+    // Peak bin is near k0 (some leakage from the window)
     var max_bin: usize = 0;
     var max_val: f32 = 0;
     for (mags, 0..) |m, bi| {

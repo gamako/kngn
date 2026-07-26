@@ -1,16 +1,16 @@
-//! ビットクラッシャ: bit 深度量子化 + サンプルレート低減(S&H ダウンサンプル)。lofi の主役。
-//! RT 安全(算術 + 分岐のみ・確保/ロックなし)。
+//! Bitcrusher: bit-depth quantization + sample-rate reduction (S&H downsample). The main lofi effect.
+//! Real-time safe (arithmetic and branches only; no malloc / locking).
 
 const std = @import("std");
 
 pub const Bitcrush = struct {
-    bit_depth: u8 = 8, // 1..16 に clamp
-    hold_samples: u32 = 4, // S&H 保持サンプル数(>=1)。大きいほど SR 低下
+    bit_depth: u8 = 8, // Clamped to 1..16
+    hold_samples: u32 = 4, // S&H hold length in samples (>=1). Larger lowers the effective SR
     wet: f32 = 1.0,
     counter: u32 = 0,
     held: f32 = 0,
 
-    /// 1 サンプル処理。
+    /// Process one sample.
     pub fn process(self: *Bitcrush, x: f32) f32 {
         const in = if (std.math.isFinite(x)) x else 0.0;
         const bits: u8 = std.math.clamp(self.bit_depth, 1, 16);
@@ -19,7 +19,7 @@ pub const Bitcrush = struct {
             const shift: u5 = @intCast(bits);
             const levels: f32 = @floatFromInt((@as(u32, 1) << shift) - 1);
             const clamped = std.math.clamp(in, -1.0, 1.0);
-            // [-1,1] -> [0,1] -> levels で量子化 -> [-1,1]
+            // [-1,1] -> [0,1] -> quantize by levels -> [-1,1]
             const q = @round((clamped * 0.5 + 0.5) * levels) / levels;
             self.held = q * 2.0 - 1.0;
         }
@@ -44,14 +44,14 @@ test "Bitcrush: low bit depth stairsteps the signal (few distinct levels)" {
     while (i < 200) : (i += 1) {
         const x = @as(f32, @floatFromInt(i)) / 200.0 * 2.0 - 1.0; // -1..1 ramp
         const y = bc.process(x);
-        // bit_depth=2 -> levels=3 -> 4 段(0,1/3,2/3,1)->[-1,1]
+        // bit_depth=2 -> levels=3 -> 4 steps (0,1/3,2/3,1)->[-1,1]
         const idx: usize = @intFromFloat(@round((std.math.clamp(y, -1.0, 1.0) * 0.5 + 0.5) * 3.0));
         if (idx < seen.len and !seen[idx]) {
             seen[idx] = true;
             distinct += 1;
         }
     }
-    try testing.expect(distinct <= 4); // 連続でなく段階化されている
+    try testing.expect(distinct <= 4); // Stepped, not continuous
     try testing.expect(distinct >= 2);
 }
 
@@ -65,7 +65,7 @@ test "Bitcrush: hold_samples holds value across samples (sample-rate reduction)"
         if (y == prev) held_runs += 1;
         prev = y;
     }
-    try testing.expect(held_runs > 0); // 保持区間がある
+    try testing.expect(held_runs > 0); // Hold intervals are present
 }
 
 test "Bitcrush: NaN/Inf input stays finite; deterministic" {
@@ -78,6 +78,6 @@ test "Bitcrush: NaN/Inf input stays finite; deterministic" {
         const ya = a.process(x);
         const yb = b.process(x);
         try testing.expect(std.math.isFinite(ya));
-        try testing.expectEqual(ya, yb); // 決定的
+        try testing.expectEqual(ya, yb); // Deterministic
     }
 }

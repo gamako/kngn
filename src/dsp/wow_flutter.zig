@@ -1,5 +1,5 @@
-//! ワウ・フラッター: 可変ディレイ＋低速 LFO でテープのピッチ揺れを作る（lofi の質感）。
-//! feedback なし（発散経路を作らない）。RT 安全（DelayLine 固定確保・確保/ロックなし）。
+//! Wow and flutter: variable delay plus a slow LFO for tape-like pitch wander (lofi texture).
+//! No feedback (no divergence path). Real-time safe (DelayLine fixed allocation; no malloc / locking).
 
 const std = @import("std");
 const DelayLine = @import("delay.zig").DelayLine;
@@ -18,7 +18,7 @@ pub const WowFlutter = struct {
     flutter_rate_hz: f32 = 6.0,
     wet: f32 = 0.35,
 
-    /// 1 サンプル処理（sr 必須）。
+    /// Process one sample (sr required).
     pub fn process(self: *WowFlutter, x: f32, sr: f32) f32 {
         const in = if (std.math.isFinite(x)) x else 0.0;
         const wow = self.wow_lfo.next(self.wow_rate_hz, sr);
@@ -57,8 +57,8 @@ test "WowFlutter: delays signal (impulse comes out later)" {
         const y = wf.process(0.0, sr);
         max_after = @max(max_after, @abs(y));
     }
-    try testing.expect(@abs(out_first) < 0.5); // 即座には出ない（遅延）
-    try testing.expect(max_after > 0.5); // 後で出てくる
+    try testing.expect(@abs(out_first) < 0.5); // Does not appear immediately (delayed)
+    try testing.expect(max_after > 0.5); // Appears later
 }
 
 test "WowFlutter: deterministic and finite/bounded over long run" {

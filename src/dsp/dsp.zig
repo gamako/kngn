@@ -1,7 +1,7 @@
-//! src/dsp: L2 DSP プリミティブ（純 Zig・platform 非依存・単体テスト容易）。
+//! src/dsp: L2 DSP primitives (pure Zig, platform-independent, easy to unit-test).
 //!
-//! TASK-27.3: Oscillator / Envelope(ADSR) / Filter(SVF) / Mixer + denormal 対策。
-//! FFT/窓関数はスペクトログラム用に TASK-27.8 で追加（MVP 経路には載せない）。
+//! Oscillator / Envelope(ADSR) / Filter(SVF) / Mixer plus denormal handling.
+//! FFT and window functions were added for spectrogram visualization (not on the MVP path).
 
 const oscillator = @import("oscillator.zig");
 const envelope = @import("envelope.zig");
@@ -26,7 +26,7 @@ pub const DelayLine = delay_mod.DelayLine;
 pub const softClip = distortion_mod.softClip;
 pub const Reverb = reverb_mod.Reverb;
 
-// lofi FX プリミティブ（TASK-40.2.2）
+// lofi FX primitives
 pub const Bitcrush = bitcrush_mod.Bitcrush;
 pub const VinylNoise = vinyl_mod.VinylNoise;
 pub const WowFlutter = wow_flutter_mod.WowFlutter;
@@ -46,7 +46,7 @@ pub const StereoGain = mixer.StereoGain;
 pub const equalPowerPan = mixer.equalPowerPan;
 pub const downmixStereoToMono = mixer.downmixStereoToMono;
 
-// FFT / 窓（スペクトログラム可視化用、メインスレッドで実行）
+// FFT / window (spectrogram visualization; runs on the main thread)
 pub const fft = fft_mod.fft;
 pub const applyHann = fft_mod.applyHann;
 pub const magnitudeSpectrum = fft_mod.magnitudeSpectrum;

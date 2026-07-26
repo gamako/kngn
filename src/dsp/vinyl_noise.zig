@@ -1,5 +1,5 @@
-//! ビニルノイズ: 軽いヒス + ランダムな crackle インパルス（lofi の質感）。
-//! 固定 seed の xorshift で決定的・RT 安全（確保/ロックなし）。入力に加算する。
+//! Vinyl noise: light hiss plus random crackle impulses (lofi texture).
+//! Deterministic and real-time safe via a fixed-seed xorshift (no malloc / locking). Added onto the input.
 
 const std = @import("std");
 const Noise = @import("noise.zig").Noise;
@@ -8,11 +8,11 @@ pub const VinylNoise = struct {
     noise: Noise = .{ .state = 0x56494E59 }, // "VINY"
     hiss_gain: f32 = 0.003,
     crackle_gain: f32 = 0.08,
-    crackle_prob: f32 = 0.00035, // 毎サンプルの crackle 発生確率
-    decay: f32 = 0.92, // crackle インパルスの減衰
+    crackle_prob: f32 = 0.00035, // Per-sample probability of a crackle
+    decay: f32 = 0.92, // Decay of the crackle impulse
     impulse: f32 = 0,
 
-    /// 1 サンプル処理（x に hiss + crackle を加算）。
+    /// Process one sample (add hiss + crackle onto x).
     pub fn process(self: *VinylNoise, x: f32) f32 {
         const in = if (std.math.isFinite(x)) x else 0.0;
         const hiss = self.noise.next() * std.math.clamp(self.hiss_gain, 0.0, 1.0);
@@ -40,7 +40,7 @@ test "VinylNoise: adds non-zero texture even with silent input" {
         try testing.expect(std.math.isFinite(y));
         energy += @as(f64, y) * @as(f64, y);
     }
-    try testing.expect(energy > 0.0); // 無音入力でも質感が乗る
+    try testing.expect(energy > 0.0); // Texture is present even with silent input
 }
 
 test "VinylNoise: deterministic for fixed seed; bounded over long run" {
@@ -52,9 +52,9 @@ test "VinylNoise: deterministic for fixed seed; bounded over long run" {
         const x = @sin(@as(f32, @floatFromInt(i)) * 0.01) * 0.3;
         const ya = a.process(x);
         const yb = b.process(x);
-        try testing.expectEqual(ya, yb); // 決定的
+        try testing.expectEqual(ya, yb); // Deterministic
         try testing.expect(std.math.isFinite(ya));
         peak = @max(peak, @abs(ya));
     }
-    try testing.expect(peak < 1.5); // 入力 0.3 + hiss/crackle で過大にならない
+    try testing.expect(peak < 1.5); // Input 0.3 + hiss/crackle does not become excessive
 }

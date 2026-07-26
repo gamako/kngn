@@ -1,5 +1,5 @@
-//! 低周波オシレータ (LFO)。vibrato/tremolo/filter mod 等のモジュレーション源。
-//! 出力は -1..1（bipolar）。位相累積で rate(Hz) に追従。
+//! Low-frequency oscillator (LFO). Modulation source for vibrato/tremolo/filter mod and similar.
+//! Output is -1..1 (bipolar). Phase accumulation tracks rate(Hz).
 
 const std = @import("std");
 
@@ -9,8 +9,8 @@ pub const Lfo = struct {
     phase: f32 = 0.0, // 0..1
     waveform: LfoWaveform = .sine,
 
-    /// 現在位相の波形値（-1..1）を返す（位相は進めない）。
-    /// sine は超越関数（@sin）なので control-rate（tick 時のみ）評価に向く（TASK-57）。
+    /// Return the waveform value at the current phase (-1..1) without advancing phase.
+    /// sine uses a transcendental (@sin), so evaluate it at control-rate only (on tick).
     pub fn value(self: *const Lfo) f32 {
         return switch (self.waveform) {
             .sine => @sin(self.phase * std.math.tau),
@@ -19,13 +19,13 @@ pub const Lfo = struct {
         };
     }
 
-    /// 位相のみ 1 サンプル分前進（波形評価なし・超越関数なし。毎サンプル呼んでも軽量）。
+    /// Advance phase by one sample only (no waveform eval, no transcendental; cheap enough per sample).
     pub fn advance(self: *Lfo, rate_hz: f32, sample_rate: f32) void {
         self.phase += rate_hz / sample_rate;
-        self.phase -= @floor(self.phase); // 任意 rate でも 0..1 に収める（負値・高 rate でも安全）
+        self.phase -= @floor(self.phase); // Keep phase in 0..1 for any rate (safe for negative and high rates)
     }
 
-    /// 1 サンプル進めて -1..1 を返す（= value() → advance()。従来挙動）。
+    /// Advance one sample and return -1..1 (= value() then advance(); the historical behaviour).
     pub fn next(self: *Lfo, rate_hz: f32, sample_rate: f32) f32 {
         const out = self.value();
         self.advance(rate_hz, sample_rate);
@@ -65,7 +65,7 @@ test "Lfo: slow rate advances slowly (1Hz @ 1000sr → phase ~0.001/sample)" {
     try testing.expectApproxEqAbs(@as(f32, 0.001), lfo.phase, 1e-5);
 }
 
-test "Lfo: value()→advance() 分解は next() と等価（位相・値とも）" {
+test "Lfo: value()→advance() decomposition matches next() (phase and value)" {
     var a = Lfo{ .waveform = .sine };
     var b = Lfo{ .waveform = .sine };
     var i: u32 = 0;
@@ -78,8 +78,8 @@ test "Lfo: value()→advance() 分解は next() と等価（位相・値とも�
     }
 }
 
-test "Lfo: 毎サンプル advance + tick 時 value = per-sample next の間引きサンプリングと一致" {
-    // 16 サンプル毎の tick で value() を読むと、per-sample next() 列の 16 の倍数番目と一致する
+test "Lfo: per-sample advance + value-at-tick matches decimated per-sample next" {
+    // Reading value() on a tick every 16 samples matches the multiples-of-16 entries of a per-sample next() series
     var full = Lfo{ .waveform = .sine };
     var thinned = Lfo{ .waveform = .sine };
     var expected: [8]f32 = undefined;

@@ -1,27 +1,27 @@
-//! 白色ノイズ源。xorshift32 PRNG で -1..1 の擬似乱数を 1 サンプルずつ生成する。
-//! RT 安全(分岐 + 算術のみ、確保/ロック/IO なし)。シンセのノイズオシレータ用。
+//! White noise source. Generates one sample of -1..1 pseudo-random noise at a time via an xorshift32 PRNG.
+//! Real-time safe (branches and arithmetic only; no malloc / locking / IO). For a synth noise oscillator.
 //!
-//! 注: `<<` は通常の左シフト(溢れビットを破棄)で safety-checked overflow を起こさない
-//! (それは `@shlExact` のみ)。よって xorshift の `x << 13` / `x << 5` は wrapping で安全。
+//! Note: `<<` is a plain left shift (discards overflow bits) and does not trip a safety-checked overflow
+//! (only `@shlExact` does). So the xorshift `x << 13` / `x << 5` are wrapping-safe.
 
 const std = @import("std");
 
 pub const Noise = struct {
-    state: u32 = 0x12345678, // 非ゼロ seed(xorshift は state=0 で停止する)
+    state: u32 = 0x12345678, // Non-zero seed (xorshift stalls when state=0)
 
-    /// seed を設定(0 を渡しても停止しないよう最下位ビットを立てて非ゼロ保証)。
+    /// Set the seed (OR in the low bit so a 0 argument still guarantees non-zero and does not stall).
     pub fn seed(self: *Noise, s: u32) void {
         self.state = s | 1;
     }
 
-    /// xorshift32 で 1 サンプル進め、[-1, 1) の白色ノイズを返す。
+    /// Advance one sample with xorshift32 and return white noise in [-1, 1).
     pub fn next(self: *Noise) f32 {
         var x = self.state;
         x ^= x << 13;
         x ^= x >> 17;
         x ^= x << 5;
         self.state = x;
-        // u32(0..2^32-1) を [-1, 1) にマップ
+        // Map u32(0..2^32-1) onto [-1, 1)
         return @as(f32, @floatFromInt(x)) * (2.0 / 4294967296.0) - 1.0;
     }
 };
@@ -46,8 +46,8 @@ test "Noise: output stays within [-1, 1) and varies (not constant)" {
         min = @min(min, v);
         max = @max(max, v);
     }
-    try testing.expect(changed); // 一定でない
-    // 広い範囲を使う(±0.5 を超える両端に到達)
+    try testing.expect(changed); // Not constant
+    // Uses a wide range (reaches beyond ±0.5 at both ends)
     try testing.expect(min < -0.5 and max > 0.5);
 }
 
@@ -64,8 +64,8 @@ test "Noise: roughly zero-mean with positive variance over many samples" {
     }
     const mean = sum / @as(f64, @floatFromInt(count));
     const variance = sumsq / @as(f64, @floatFromInt(count)) - mean * mean;
-    try testing.expect(@abs(mean) < 0.05); // 平均 ~0
-    try testing.expect(variance > 0.1); // 一様 [-1,1) の分散は理論上 ~0.33
+    try testing.expect(@abs(mean) < 0.05); // Mean ~0
+    try testing.expect(variance > 0.1); // Variance of uniform [-1,1) is theoretically ~0.33
 }
 
 test "Noise: deterministic for a given seed (reproducible)" {
@@ -77,9 +77,9 @@ test "Noise: deterministic for a given seed (reproducible)" {
     while (i < 256) : (i += 1) {
         try testing.expectEqual(a.next(), b.next());
     }
-    // seed(0) でも停止しない(非ゼロ保証)
+    // Does not stall even with seed(0) (non-zero guarantee)
     var z = Noise{};
     z.seed(0);
-    try testing.expect(z.next() != z.next() or true); // trap せず動くこと(値は問わない)
+    try testing.expect(z.next() != z.next() or true); // Runs without a trap (value is unchecked)
     try testing.expect(z.state != 0);
 }
