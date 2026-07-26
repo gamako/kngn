@@ -227,7 +227,7 @@ fn writePortFile(port: u16) void {
     };
 }
 
-/// Reads an environment variable (libc getenv, as harness does; the platform module always links libc).
+/// Reads an environment variable (libc getenv, as harness does; the platform module is always `link_libc`).
 fn getEnv(name: [*:0]const u8) ?[]const u8 {
     const v = std.c.getenv(name) orelse return null;
     return std.mem.span(v);

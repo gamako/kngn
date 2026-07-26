@@ -6335,7 +6335,7 @@ test "netsync: PRESENCE codec round-trip / signed coords / subtype / reject" {
 }
 
 test "netsync: an unknown kind 0x0A is discarded and carries on (compatibility with older peers)" {
-    // The same branch as readerMain's: when isKnownKind is false it discards the payload and continues.
+    // The same branch as readerMain's: when isKnownKind is false it calls discardPayload and continues.
     // Here, at the codec layer, what is pinned is that "the frame after an unknown kind can still be read".
     try testing.expect(!isKnownKind(0x0A));
     var raw: [5 + 4 + 5 + 3]u8 = undefined;

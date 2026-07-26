@@ -8,7 +8,7 @@
 //! ## Hot path declaration
 //! Recording a command, managing a transaction and searching for an undo or a redo all run **at event time only** (when a
 //! user or an agent operates, or asks for undo or redo). None of it sits on a per-frame (all-pixel) or real-time (per-sample) path,
-//! so the performance rules' SIMD trio, cache line separation and before-and-after benchmarks do not apply.
+//! so the performance rules' SIMD trio, `cache_line` separation and before-and-after benchmarks do not apply.
 //! Execution is main-thread only (the same rule as harness actions and the UI), and this module holds no lock and no atomic.
 //!
 //! ## Dependencies

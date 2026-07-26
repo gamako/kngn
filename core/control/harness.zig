@@ -509,7 +509,7 @@ pub fn isHeadlessActive() bool {
 /// The condition for enabling it follows the same rule as the existing audio output: harness's environment read
 /// (`parseConfig()`) runs only through `platform.init()`, so in a capture-only application that never calls
 /// `platform.init()` this function always returns `false` (the same known limitation as an audio-only application
-/// being unable to interpret `VP_HEADLESS`).
+/// such as `examples/15_audio_tone` being unable to interpret `VP_HEADLESS`).
 pub fn isCaptureSyntheticActive() bool {
     return capture_synthetic_requested and isEnabled();
 }
@@ -3016,7 +3016,7 @@ fn warnLine(msg: []const u8) void {
 }
 
 /// Reads an environment variable. 0.16's std has no libc-independent getenv, so libc getenv is used
-/// (the platform module always links libc).
+/// (the platform module is always built with `link_libc`).
 fn getEnv(name: [*:0]const u8) ?[]const u8 {
     const v = std.c.getenv(name) orelse return null;
     return std.mem.span(v);
