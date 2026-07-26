@@ -35,7 +35,7 @@ const TaggedModule = struct {
     /// Import name (the consumer's `@import("<name>")`).
     name: []const u8,
     /// Allow apps to import a flux lib directly (ADR-007 maturity gate: not in kit, but apps may
-    /// direct-import it as "internal / may break": modular / paint / spectrogram / scope).
+    /// direct-import it as "internal / may break": modular / paint / spectrogram / scope / serde).
     /// Kit-listed libs and core stay false.
     app_direct_ok: bool = false,
     /// Type-only module (platform_types). The only core form libs may reference (see ADR-007).
@@ -74,8 +74,8 @@ fn linkCoreException(consumer: TaggedModule, dep: TaggedModule, comptime reason:
 
 /// app → lib direct-import exceptions. The full set is the linkAppException call sites:
 ///   - apps/editor/apps/pixie → pixelops (downscale blit SIMD)
-///   - example_26 → paint; apps/patch/lofi.zig → synth / dsp
-/// Same module instance as kit, so type identity holds.
+///   - example_26 → paint; apps/patch/lofi.zig → synth / dsp (keeps a pure-test root platform-free)
+/// A kit-listed dep is the same module instance kit exposes, so type identity holds.
 fn linkAppException(consumer: TaggedModule, dep: TaggedModule, comptime reason: []const u8) void {
     comptime std.debug.assert(reason.len > 0);
     std.debug.assert(consumer.layer == .app and dep.layer == .lib);
@@ -331,7 +331,7 @@ pub fn build(b: *std.Build) void {
     platform.assertBackendForOs(platform_option, target_os);
 
     // SDK / toolchain paths are needed only for macOS backends (Linux has no xcrun, so they are not resolved).
-    // When unspecified, auto-detect via xcrun.
+    // When unspecified, auto-detect via xcode-select (toolchain) and xcrun (SDK).
     const swift_toolchain_path = b.option(
         []const u8,
         "swift-toolchain-path",
