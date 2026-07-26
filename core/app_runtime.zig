@@ -1,19 +1,19 @@
-//! Frame-driven application runtime（TASK-73）
+//! Frame-driven application runtime
 //!
-//! ①フレーム駆動の push/pull 差を 1 箇所で吸収する。App は init/frame/deinit を提供し、
-//! native では既存 pull ループをここに閉じ込め、wasm では rAF 経由の `vp_frame` export になる。
-//! ②イベント配送 / ③FB / ④audio は経路不変。
+//! (1) It absorbs the push/pull difference of frame driving in one place. An App provides init, frame and deinit;
+//! on native the existing pull loop is confined here, and on wasm it becomes the `vp_frame` export driven by rAF.
+//! (2) Event delivery, (3) the framebuffer and (4) audio all keep their existing paths.
 //!
-//! App が提供する面:
+//! The surface an App provides:
 //! - `pub const window = .{ .w: u32, .h: u32, .title: [:0]const u8 }`
 //! - `pub fn init(gpa: Allocator, io: std.Io) !*App`
-//! - `pub fn frame(self: *App, win: *platform.Window, now: f64) bool`（running）
+//! - `pub fn frame(self: *App, win: *platform.Window, now: f64) bool` (running)
 //! - `pub fn deinit(self: *App) void`
 //!
-//! opt-in（TASK-117）:
-//! - `pub fn windowBootstrap(gpa, io) !platform.WindowOptions` — platform.init 後・Window.create 前
-//! - `pub fn onWindowShutdown(self: *App, win: *platform.Window) void` — destroy 前・deinit 前
-//! - `pub const frame_period_s: f64` — native ループの目標周期（既定 1/60。`0` で pacing 無効。TASK-180）
+//! opt-in:
+//! - `pub fn windowBootstrap(gpa, io) !platform.WindowOptions` — after platform.init, before Window.create
+//! - `pub fn onWindowShutdown(self: *App, win: *platform.Window) void` — before destroy and before deinit
+//! - `pub const frame_period_s: f64` — the native loop's target period (1/60 by default; `0` disables pacing)
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -23,9 +23,9 @@ pub fn Runtime(comptime App: type) type {
     return struct {
         const Self = @This();
 
-        /// 目標フレーム周期（秒）。既定 60fps。App が `pub const frame_period_s: f64` を持てば上書きし、
-        /// `0`（以下）なら pacing 無効＝自走（deadline が現在時刻以前になり `framePaceUntil` が即 return する）。
-        /// native ループのみに効く（wasm は rAF 律速なので pacing しない）。
+        /// The target frame period in seconds, 60fps by default. An App holding `pub const frame_period_s: f64` overrides it, and
+        /// `0` (or less) disables pacing so the loop runs freely (the deadline lands at or before now, and `framePaceUntil` returns at once).
+        /// It applies to the native loop only (wasm is paced by rAF, so it does not pace).
         const frame_period_s: f64 = if (@hasDecl(App, "frame_period_s")) App.frame_period_s else 1.0 / 60.0;
 
         fn createAppWindow(gpa: std.mem.Allocator, io: std.Io) !platform.Window {
@@ -36,14 +36,14 @@ pub fn Runtime(comptime App: type) type {
             return platform.Window.create(App.window.w, App.window.h, App.window.title);
         }
 
-        /// native: `std.process.Init` を受けて pull ループを所有する。
-        /// 既存 pixie と同型: `while (running and pollEvents()) { running = frame(...) }`。
-        /// **frame pacing は runtime が所有する**（TASK-180）: 各周回で `framePaceUntil(t0 + frame_period_s)` を
-        /// `defer` で 1 回呼ぶ（`app.frame` が error / running=false を返した経路でも 1 回だけ待つ）。
-        /// 周期は `frame_period_s`（既定 60fps。`App.frame_period_s` で上書き・`0` で pacing 無効）。
-        /// deadline の基準は `app.frame` へ渡す `now` と**同一の `t0`**（二重待ちにならない）。
-        /// harness の manual clock（replay）では `framePaceUntil` が no-op なので replay 速度は落ちない。
-        /// shutdown 順序は `onWindowShutdown → App.deinit → Window.destroy`（TASK-117）。
+        /// native: takes a `std.process.Init` and owns the pull loop.
+        /// The same shape as the existing editor: `while (running and pollEvents()) { running = frame(...) }`.
+        /// **The runtime owns the frame pacing**: each time round the loop it calls `framePaceUntil(t0 + frame_period_s)` once,
+        /// through `defer` (so it waits exactly once even on the path where `app.frame` returns an error or running=false).
+        /// The period is `frame_period_s` (60fps by default, overridden by `App.frame_period_s`, and `0` disables pacing).
+        /// The deadline is based on **the same `t0`** that is passed to `app.frame` as `now`, so there is no double wait.
+        /// Under the harness's manual clock (a replay) `framePaceUntil` is a no-op, so replay speed does not drop.
+        /// The shutdown order is `onWindowShutdown → App.deinit → Window.destroy`.
         pub fn runNative(process_init: std.process.Init) !void {
             const gpa = process_init.gpa;
             const io = process_init.io;
@@ -58,13 +58,13 @@ pub fn Runtime(comptime App: type) type {
             defer app.deinit();
             defer if (@hasDecl(App, "onWindowShutdown")) app.onWindowShutdown(&win);
 
-            // window 生成後の opt-in 配線点（ライブリサイズ redraw callback 等。TASK-23.1 統合）。
-            // native のみ: wasm はモーダルループが無く rAF が回り続けるため不要。
+            // The opt-in wiring point once the window exists (a live-resize redraw callback, say).
+            // native only: wasm has no modal loop and rAF keeps running, so it is unnecessary.
             if (@hasDecl(App, "onWindowReady")) app.onWindowReady(&win);
 
             var running = true;
             while (running and win.pollEvents()) {
-                // フレーム起点。`app.frame` の `now` と pacing の deadline で同じ値を使う。
+                // The frame's starting point. The same value is used for `app.frame`'s `now` and for the pacing deadline.
                 const t0 = platform.getTime();
                 defer platform.framePaceUntil(t0 + frame_period_s);
                 running = try app.frame(&win, t0);
@@ -72,14 +72,14 @@ pub fn Runtime(comptime App: type) type {
         }
 
         // ------------------------------------------------------------------
-        // wasm: グローバル保持 + export
+        // wasm: hold it globally, plus the export
         // ------------------------------------------------------------------
 
         var g_app: ?*App = null;
         var g_win: ?platform.Window = null;
         var g_running: bool = false;
 
-        /// wasm root が参照することで export を解析対象に載せる。
+        /// Referencing it from the wasm root brings the export into the analysis.
         pub fn enableWasmExports() void {
             if (!builtin.cpu.arch.isWasm()) return;
             _ = &vp_init;
@@ -89,8 +89,8 @@ pub fn Runtime(comptime App: type) type {
         export fn vp_init() void {
             if (!builtin.cpu.arch.isWasm()) return;
             const gpa = std.heap.wasm_allocator;
-            // H1: wasi 改訂 — Io.Threaded single-threaded global 由来の実 std.Io
-            // （debug_io 既定 singleton と整合。thread spawn しない同期 I/O）。
+            // A real std.Io coming from Io.Threaded's single-threaded global
+            // (consistent with the debug_io default singleton; it spawns no thread and does synchronous I/O).
             const io = std.Io.Threaded.global_single_threaded.io();
 
             platform.init() catch {
@@ -119,7 +119,7 @@ pub fn Runtime(comptime App: type) type {
                     extern "env" fn vp_log(ptr: [*]const u8, len: u32) void;
                 };
                 env.vp_log(msg, msg.len);
-                // native 経路の defer window.destroy / platform.shutdown と対称
+                // symmetrical with the native path's defer window.destroy and platform.shutdown
                 win.destroy();
                 g_win = null;
                 platform.shutdown();

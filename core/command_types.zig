@@ -1,14 +1,14 @@
-//! メニューとアプリ操作を結ぶ、platform 非依存の Command 定義。
+//! The platform-independent Command definition that ties menus to application operations.
 //!
-//! このファイルは `platform_types` と同じく type-only の共有 module である。
-//! backend や facade の実装を import せず、メニューを表示する側と app 側が同じ
-//! 型を参照できる境界に置く。文字列 slice の所有権は Command の利用側にあり、
-//! `registerMenu` の呼び出し中だけ有効でよい。
+//! Like `platform_types`, this file is a type-only shared module.
+//! It imports neither a backend nor the facade implementation, and sits at the boundary where the side
+//! showing a menu and the application side can refer to the same types. A string slice is owned by the
+//! user of Command, and need only stay valid for the duration of the `registerMenu` call.
 
 const std = @import("std");
 const platform_types = @import("platform_types");
 
-/// app が割り当てる stable な command ID。
+/// The stable command ID an application assigns.
 pub const CommandId = u32;
 
 pub const INVALID_COMMAND_ID: CommandId = 0;
@@ -16,10 +16,10 @@ pub const FIRST_APP_COMMAND_ID: CommandId = 1;
 pub const LAST_APP_COMMAND_ID: CommandId = 0xFFFF;
 pub const FIRST_FRAMEWORK_COMMAND_ID: CommandId = 0x1_0000;
 
-/// メニュー項目の実行種別。NetworkPolicy ではない。
+/// What kind of execution a menu item is. This is not a NetworkPolicy.
 ///
-/// netsync 中の relay/reject/undo_own 判定は app の action registry/router が担い、
-/// この値は app の command table が通常操作と undo/redo 操作を区別するためだけに使う。
+/// Deciding relay, reject or undo_own during netsync is the job of the application's action registry and router;
+/// this value exists only so that the application's command table can tell an ordinary operation from an undo or a redo.
 pub const ExecutionPolicy = enum(u8) {
     normal,
     undo,
@@ -27,14 +27,14 @@ pub const ExecutionPolicy = enum(u8) {
 };
 pub const CommandExecutionPolicy = ExecutionPolicy;
 
-/// 物理キーと修飾キー。表示用の Cmd+Z / Ctrl+Z は backend が OS 規約から導出する。
+/// A physical key plus its modifiers. The backend derives the displayed Cmd+Z or Ctrl+Z from the OS convention.
 pub const Shortcut = struct {
     key: platform_types.KeyCode,
     modifiers: platform_types.ModifierFlags = .{},
 };
 pub const CommandShortcut = Shortcut;
 
-/// トップメニュー一段分の所属と表示順。submenu は MVP では持たない。
+/// Which top-level menu it belongs to, and the display order. A submenu is not held in the MVP.
 pub const MenuPath = struct {
     title: []const u8,
     order: u16 = 0,
@@ -45,10 +45,10 @@ pub const CommandKind = enum(u8) {
     separator,
 };
 
-/// ネイティブメニューに登録する command 定義。
+/// The command definition registered with a native menu.
 ///
-/// `label`/`menu.title`/`shortcut` の slice は登録呼び出し中だけ有効でよい。
-/// backend が必要な分を copy することが facade の契約である。
+/// The `label`, `menu.title` and `shortcut` slices need only stay valid for the duration of the registration call.
+/// It is the facade's contract that the backend copies whatever it needs.
 pub const Command = struct {
     id: CommandId,
     label: []const u8 = "",
@@ -59,7 +59,7 @@ pub const Command = struct {
     checked: bool = false,
     execution_policy: ExecutionPolicy = .normal,
 
-    /// separator は ID を持たず、通常項目だけが app command ID の範囲を使う。
+    /// A separator holds no ID, and only ordinary items use the range of application command IDs.
     pub fn validate(self: Command) error{ InvalidCommandId, InvalidSeparator }!void {
         if (self.kind == .separator) {
             if (self.id != INVALID_COMMAND_ID) return error.InvalidSeparator;

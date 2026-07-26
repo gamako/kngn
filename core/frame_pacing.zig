@@ -1,58 +1,58 @@
-//! フレーム pacing の純ロジック（TASK-176）。OS / display / platform 非依存で単体テストできる。
+//! The pure frame pacing logic. It is independent of the OS, the display and platform, so it is unit testable.
 //!
-//! **ホットパス宣言: フレーム毎（1 フレームに 1 回）**。全画素ループ・RT（毎サンプル）経路ではない。
-//! 追加コストは f64 演算数回と時計読み 2-3 回で、フレーム予算（ms 級）に対し無視できる。
+//! **Hot path declaration: per frame (once per frame)**. It is neither an all-pixel loop nor a real-time (per-sample) path.
+//! The added cost is a few f64 operations plus two or three clock reads, negligible against a frame budget measured in ms.
 //!
-//! ## なぜ「固定 sleep」ではなく deadline + 補正なのか（実測。2026-07-25 / Apple Silicon / ReleaseFast）
+//! ## Why a deadline plus a correction rather than a fixed sleep (measured on Apple Silicon, ReleaseFast)
 //!
-//! 目標周期 16.667ms・300 反復での平均 overshoot と実効 fps:
+//! The mean overshoot and effective fps over 300 iterations at a target period of 16.667ms:
 //!
-//! | 手法 | 平均 overshoot | 実効 fps |
+//! | Method | Mean overshoot | Effective fps |
 //! |---|---|---|
-//! | `nanosleep`（相対） | 3.40ms | 49.8 |
-//! | `mach_wait_until`（絶対時刻） | 3.45ms | 49.7 |
-//! | 絶対時刻 + 最後 1.5ms busy-wait | 1.69ms | 54.5 |
-//! | **overshoot EWMA 補正（busy-wait なし）** | **-0.10ms** | **60.4** |
+//! | `nanosleep` (relative) | 3.40ms | 49.8 |
+//! | `mach_wait_until` (absolute time) | 3.45ms | 49.7 |
+//! | absolute time plus a final 1.5ms busy-wait | 1.69ms | 54.5 |
+//! | **overshoot EWMA correction (no busy-wait)** | **-0.10ms** | **60.4** |
 //!
-//! macOS の overshoot は要求時間の約 20%（timer slack）に比例し、**絶対時刻 sleep では解消しない**。
-//! そこで「実測 overshoot を EWMA で学習し、要求から差し引く」方式を採る（busy-wait は使わない。
-//! 常時 spin は平均誤差を +0.6ms 側にずらし fps を落とす）。
+//! macOS's overshoot is proportional to roughly 20% of the requested time (timer slack), and **an absolute-time sleep does not remove it**.
+//! So the approach is to learn the measured overshoot with an EWMA and subtract it from the request (busy-wait is not used:
+//! spinning all the while shifts the mean error towards +0.6ms and lowers fps).
 //!
-//! caller（`core/platform.zig`）は `Driver(clock, sleeper)` に時計と sleep を comptime で注入する。
-//! テストは偽の時計/sleep を注入して、sleep 要求値・呼び出し回数・学習状態を直接 assert する。
+//! The caller (`core/platform.zig`) injects the clock and the sleep into `Driver(clock, sleeper)` at comptime.
+//! The tests inject a fake clock and sleep, and assert directly on the requested sleep, the call count and the learned state.
 
 const std = @import("std");
 
-/// 早めに起きるための固定マージン（学習誤差の吸収分）。
+/// The fixed margin for waking early (it absorbs the error in what has been learned).
 pub const MARGIN_NS: u64 = 200_000; // 200µs
-/// overshoot 推定の上限。1 度の巨大 oversleep で推定が壊れ pacing が永久停止するのを防ぐ。
+/// The upper bound on the overshoot estimate. It stops one huge oversleep from wrecking the estimate and stalling pacing forever.
 pub const MAX_EST_NS: u64 = 4_000_000; // 4ms
-/// これを超える残り時間は「時計飛び / スリープ復帰」と判断して学習をリセットする。
+/// A remaining time above this is taken to be a clock jump or a wake from sleep, and resets what has been learned.
 pub const MAX_REMAINING_S: f64 = 1.0;
-/// EWMA の重み（1/8）。
+/// The EWMA weight (1/8).
 const EWMA_SHIFT: u6 = 3;
 
-/// pacing 判断の結果。実行（sleep）は Driver が行う。
+/// The result of a pacing decision. Carrying it out (the sleep) is the Driver's job.
 pub const Decision = union(enum) {
-    /// 待たない（deadline 到達済み / 非有限入力）
+    /// Do not wait (the deadline has passed, or the input was not finite)
     no_wait,
-    /// 学習状態を初期化して待たない（時計飛び・スリープ復帰を検出）
+    /// Reset what has been learned and do not wait (a clock jump or a wake from sleep was detected)
     reset,
-    /// この ns だけ sleep を要求する（0 は「sleep しないが学習は減衰させる」）
+    /// Request a sleep of exactly this many ns (0 means "do not sleep, but still decay what has been learned")
     sleep: u64,
 };
 
-/// 要求 sleep 時間 = remaining - (推定 overshoot + margin)。下限 0。
+/// The requested sleep = remaining - (the estimated overshoot + the margin), with a floor of 0.
 pub fn requestNs(remaining_ns: u64, est_ns: u64, margin_ns: u64) u64 {
     const deduct = est_ns +| margin_ns;
     if (remaining_ns <= deduct) return 0;
     return remaining_ns - deduct;
 }
 
-/// overshoot 推定の EWMA 更新。
-/// - overshoot は `actual - request`（逆向きではない）。負値（早起き）は 0 として扱う。
-/// - `request == 0`（sleep しなかったフレーム）は観測が無いので **推定を半減**して必ず回復させる。
-/// - 上限 `MAX_EST_NS` でクランプする（異常値で pacing が永久停止しないための安全策）。
+/// The EWMA update of the overshoot estimate.
+/// - The overshoot is `actual - request` (not the other way round). A negative value (waking early) counts as 0.
+/// - `request == 0` (a frame that did not sleep) has nothing to observe, so **the estimate is halved** to guarantee recovery.
+/// - It is clamped at `MAX_EST_NS` (the safeguard that stops an outlier stalling pacing forever).
 pub fn updateEwma(prev_ns: u64, request_ns: u64, actual_ns: u64) u64 {
     if (request_ns == 0) return prev_ns / 2;
     const observed: u64 = if (actual_ns > request_ns) actual_ns - request_ns else 0;
@@ -64,19 +64,19 @@ pub fn updateEwma(prev_ns: u64, request_ns: u64, actual_ns: u64) u64 {
     return @min(next, MAX_EST_NS);
 }
 
-/// pacing の判断（入力ガードもここに集約する。実装が迂回できない単一窓口）。
-/// deadline/now は単調時計の秒。**f64 のまま検査してから ns 化**する
-/// （先に整数化すると Inf / 巨大値で trap する）。
+/// The pacing decision (the input guards live here too, as the single window an implementation cannot bypass).
+/// deadline and now are seconds on a monotonic clock. **They are checked while still f64 and only then converted to ns**
+/// (converting to an integer first would trap on Inf or on a huge value).
 pub fn decide(deadline_s: f64, now_s: f64, est_ns: u64) Decision {
     if (!std.math.isFinite(deadline_s) or !std.math.isFinite(now_s)) return .no_wait;
     const remaining_s = deadline_s - now_s;
-    if (!(remaining_s > 0)) return .no_wait; // NaN 混入でも false になる
+    if (!(remaining_s > 0)) return .no_wait; // false even when a NaN gets in
     if (remaining_s > MAX_REMAINING_S) return .reset;
     const remaining_ns: u64 = @intFromFloat(remaining_s * 1_000_000_000.0);
     return .{ .sleep = requestNs(remaining_ns, est_ns, MARGIN_NS) };
 }
 
-/// 学習状態（main thread 専有。RT スレッドからは触らない）。
+/// What has been learned (owned by the main thread; never touched from a real-time thread).
 pub const Pacer = struct {
     est_overshoot_ns: u64 = 0,
 
@@ -85,12 +85,12 @@ pub const Pacer = struct {
     }
 };
 
-/// 時計（秒を返す）と sleep（ns 要求）を comptime 注入した pacing 実行器。
-/// 間接呼び出しを作らないため comptime パラメータにしている。
+/// The pacing executor, with the clock (returning seconds) and the sleep (taking a request in ns) injected at comptime.
+/// They are comptime parameters so that no indirect call is created.
 pub fn Driver(comptime clock: fn () f64, comptime sleeper: fn (u64) void) type {
     return struct {
-        /// `deadline_s` に向けて best-effort で待つ。`manual_clock=true`（harness の replay 等）では
-        /// **完全 no-op**（時計も読まず学習状態も触らない）。
+        /// Waits best-effort towards `deadline_s`. With `manual_clock=true` (a harness replay, say) it is
+        /// **a complete no-op** (it neither reads the clock nor touches what has been learned).
         pub fn pace(pacer: *Pacer, deadline_s: f64, manual_clock: bool) void {
             if (manual_clock) return;
             const before = clock();
@@ -99,11 +99,11 @@ pub fn Driver(comptime clock: fn () f64, comptime sleeper: fn (u64) void) type {
                 .reset => pacer.reset(),
                 .sleep => |request_ns| {
                     if (request_ns == 0) {
-                        // sleep しないフレームでも推定を減衰させる（回復経路）。
+                        // Decay the estimate even on a frame that does not sleep (the recovery path).
                         pacer.est_overshoot_ns = updateEwma(pacer.est_overshoot_ns, 0, 0);
                         return;
                     }
-                    // 実 sleep 時間は **sleep 直前・直後**の差で測る（判断や学習更新のコストを混ぜない）。
+                    // The real sleep time is measured as the difference **immediately before and after** the sleep, so the cost of deciding and of updating what is learned is not mixed in.
                     const t0 = clock();
                     sleeper(request_ns);
                     const t1 = clock();
@@ -119,62 +119,62 @@ pub fn Driver(comptime clock: fn () f64, comptime sleeper: fn (u64) void) type {
 }
 
 // ============================================================================
-// tests（display / OS 非依存。偽の時計と sleep を注入して挙動を固定する）
+// tests (independent of display and OS; a fake clock and sleep are injected to pin the behaviour down)
 // ============================================================================
 
-test "requestNs は remaining から est+margin を引く（下限 0・overflow しない）" {
+test "requestNs subtracts est+margin from remaining (floored at 0, and never overflowing)" {
     try std.testing.expectEqual(@as(u64, 13_466_666), requestNs(16_666_666, 3_000_000, 200_000));
     try std.testing.expectEqual(@as(u64, 0), requestNs(3_200_000, 3_000_000, 200_000));
     try std.testing.expectEqual(@as(u64, 0), requestNs(1_000_000, 3_000_000, 200_000));
     try std.testing.expectEqual(@as(u64, 0), requestNs(0, 0, 200_000));
-    // 飽和加算で overflow しない
+    // a saturating add, so it cannot overflow
     try std.testing.expectEqual(@as(u64, 0), requestNs(std.math.maxInt(u64) - 1, std.math.maxInt(u64), 200_000));
 }
 
-test "updateEwma は overshoot=actual-request を学習し早起きは 0 扱い" {
-    // 計算方向: actual > request の差分が overshoot（request - actual ではない）
+test "updateEwma learns overshoot=actual-request and counts waking early as 0" {
+    // The direction: the overshoot is the amount by which actual exceeds request (not request minus actual)
     try std.testing.expectEqual(@as(u64, 375_000), updateEwma(0, 10_000_000, 13_000_000));
-    // 早起き（actual < request）は observed=0 → prev から 1/8 下がる
+    // waking early (actual < request) gives observed=0, so it falls an eighth of the way down from prev
     try std.testing.expectEqual(@as(u64, 875_000), updateEwma(1_000_000, 10_000_000, 9_000_000));
-    // 一定 overshoot を与え続けると当該値へ漸近する
+    // feeding a constant overshoot converges on that value
     var est: u64 = 0;
     for (0..200) |_| est = updateEwma(est, 10_000_000, 13_000_000);
     try std.testing.expect(est > 2_900_000 and est <= 3_000_000);
 }
 
-test "updateEwma は上限クランプし request==0 で必ず回復する（永久停止しない）" {
-    // 1 秒 oversleep 相当の異常値でも上限 4ms を超えない
+test "updateEwma clamps at the upper bound and always recovers when request==0 (so it never stalls forever)" {
+    // even an outlier worth a 1 second oversleep does not exceed the 4ms bound
     try std.testing.expect(updateEwma(0, 10_000_000, 1_010_000_000) <= MAX_EST_NS);
-    // 上限に張り付いた状態から sleep しないフレームが続けば半減で回復する
+    // once it is pinned at the bound, a run of frames that do not sleep halves it back down
     var est: u64 = MAX_EST_NS;
     var frames: u32 = 0;
     while (est > MARGIN_NS and frames < 32) : (frames += 1) est = updateEwma(est, 0, 0);
-    try std.testing.expect(frames <= 6); // 4ms → 200µs は半減 5 回
-    // 回復後は 16.67ms の残りに対して再び十分な sleep 要求が出る
+    try std.testing.expect(frames <= 6); // 4ms to 200µs is five halvings
+    // after recovering, the remainder of 16.67ms again produces a sizeable sleep request
     try std.testing.expect(requestNs(16_666_666, est, MARGIN_NS) > 15_000_000);
 }
 
-test "decide の入力ガード（非有限・過去 deadline・時計飛び）" {
+test "decide's input guards (not finite, a deadline in the past, a clock jump)" {
     const nan = std.math.nan(f64);
     const inf = std.math.inf(f64);
     try std.testing.expectEqual(Decision.no_wait, decide(nan, 100.0, 0));
     try std.testing.expectEqual(Decision.no_wait, decide(100.0, nan, 0));
-    try std.testing.expectEqual(Decision.no_wait, decide(inf, 100.0, 0)); // 非有限は remaining>1s より優先
+    try std.testing.expectEqual(Decision.no_wait, decide(inf, 100.0, 0)); // not finite takes priority over remaining>1s
     try std.testing.expectEqual(Decision.no_wait, decide(-inf, 100.0, 0));
-    try std.testing.expectEqual(Decision.no_wait, decide(100.0, 100.0, 0)); // 同時刻
-    try std.testing.expectEqual(Decision.no_wait, decide(99.9, 100.0, 0)); // 過去
-    try std.testing.expectEqual(Decision.reset, decide(101.5, 100.0, 0)); // 1 秒超 = 時計飛び
-    switch (decide(100.016_666_666, 100.0, 0)) { // 通常
+    try std.testing.expectEqual(Decision.no_wait, decide(100.0, 100.0, 0)); // the same instant
+    try std.testing.expectEqual(Decision.no_wait, decide(99.9, 100.0, 0)); // in the past
+    try std.testing.expectEqual(Decision.reset, decide(101.5, 100.0, 0)); // over 1 second = a clock jump
+    switch (decide(100.016_666_666, 100.0, 0)) { // the ordinary case
         .sleep => |ns| try std.testing.expect(ns > 16_000_000 and ns < 16_666_666),
         else => return error.TestUnexpectedResult,
     }
-    switch (decide(100.001, 100.0, 4_000_000)) { // 推定が残りを食い切る
+    switch (decide(100.001, 100.0, 4_000_000)) { // the estimate eats up the whole remainder
         .sleep => |ns| try std.testing.expectEqual(@as(u64, 0), ns),
         else => return error.TestUnexpectedResult,
     }
 }
 
-/// テスト用の偽時計・偽 sleep。`sleeper` は「要求 ns に overshoot_ns を足した時間だけ経過した」ことにする。
+/// A fake clock and fake sleep for the tests. `sleeper` pretends that the requested ns plus overshoot_ns elapsed.
 const Fake = struct {
     var now_s: f64 = 100.0;
     var overshoot_ns: u64 = 0;
@@ -198,72 +198,72 @@ const Fake = struct {
 };
 const FakeDriver = Driver(Fake.clock, Fake.sleeper);
 
-test "Driver: manual clock では sleep も学習更新も起きない" {
+test "Driver: under a manual clock neither the sleep nor the learning update happens" {
     Fake.reset(0);
     var pacer: Pacer = .{ .est_overshoot_ns = 1_234_567 };
-    FakeDriver.pace(&pacer, Fake.now_s + 10.0, true); // 遠い未来でも no-op
+    FakeDriver.pace(&pacer, Fake.now_s + 10.0, true); // a no-op even for a deadline far in the future
     try std.testing.expectEqual(@as(u32, 0), Fake.sleep_calls);
-    try std.testing.expectEqual(@as(f64, 100.0), Fake.now_s); // 時計も読まない（進めない）
+    try std.testing.expectEqual(@as(f64, 100.0), Fake.now_s); // it does not even read the clock (which therefore does not advance)
     try std.testing.expectEqual(@as(u64, 1_234_567), pacer.est_overshoot_ns);
 }
 
-test "Driver: deadline 過去・時計飛びでは sleep しない（reset は学習を初期化）" {
+test "Driver: it does not sleep for a deadline in the past or a clock jump (and reset clears what has been learned)" {
     Fake.reset(0);
     var pacer: Pacer = .{ .est_overshoot_ns = 3_000_000 };
-    FakeDriver.pace(&pacer, Fake.now_s - 0.01, false); // 過去
+    FakeDriver.pace(&pacer, Fake.now_s - 0.01, false); // in the past
     try std.testing.expectEqual(@as(u32, 0), Fake.sleep_calls);
-    try std.testing.expectEqual(@as(u64, 3_000_000), pacer.est_overshoot_ns); // no_wait は学習を触らない
+    try std.testing.expectEqual(@as(u64, 3_000_000), pacer.est_overshoot_ns); // no_wait does not touch what has been learned
 
-    FakeDriver.pace(&pacer, Fake.now_s + 5.0, false); // 1 秒超 = 時計飛び
+    FakeDriver.pace(&pacer, Fake.now_s + 5.0, false); // over 1 second = a clock jump
     try std.testing.expectEqual(@as(u32, 0), Fake.sleep_calls);
     try std.testing.expectEqual(@as(u64, 0), pacer.est_overshoot_ns); // reset
 }
 
-test "Driver: 20% timer slack の環境で平均周期が目標へ収束する（実測の再現）" {
-    // 実機と同じ性質（要求時間の 20% 超過）を偽 sleep で再現し、60fps 目標に収束することを固定する。
+test "Driver: with 20% timer slack the mean period converges on the target (reproducing the measurement)" {
+    // Reproduce the real machine's property (exceeding the request by 20%) with the fake sleep, and pin that it converges on the 60fps target.
     const period_s: f64 = 1.0 / 60.0;
     Fake.reset(0);
     var pacer: Pacer = .{};
-    // slack は「要求の 20%」なので固定値では表せない → sleeper 呼び出しごとに更新する
+    // The slack is 20% of the request, so a fixed value cannot express it; it is updated on each sleeper call instead
     var last_period_err_ns: i64 = 0;
     var i: u32 = 0;
     while (i < 300) : (i += 1) {
         const t0 = Fake.now_s;
-        // 次フレームの overshoot を「前回要求の 20%」として設定（要求に比例する slack）
+        // Set the next frame's overshoot to 20% of the previous request (slack proportional to the request)
         Fake.overshoot_ns = @intFromFloat(@as(f64, @floatFromInt(@max(Fake.last_request_ns, 1))) * 0.20);
         FakeDriver.pace(&pacer, t0 + period_s, false);
         last_period_err_ns = @as(i64, @intFromFloat((Fake.now_s - t0) * 1e9)) - @as(i64, @intFromFloat(period_s * 1e9));
     }
-    // 収束後の 1 フレーム誤差が ±0.5ms 以内（= 実効 59-61fps 相当）
+    // after convergence the per-frame error is within ±0.5ms (an effective 59-61fps)
     try std.testing.expect(last_period_err_ns > -500_000 and last_period_err_ns < 500_000);
-    // 学習値が slack 相当（要求 ≒ 13ms の 20% ≒ 2.6ms）に収まっている
+    // what has been learned sits around the slack (20% of a request of about 13ms, so about 2.6ms)
     try std.testing.expect(pacer.est_overshoot_ns > 1_500_000 and pacer.est_overshoot_ns <= MAX_EST_NS);
-    // busy-wait をしない設計なので sleep 呼び出しは 1 フレーム 1 回以下
+    // the design never busy-waits, so there is at most one sleep call per frame
     try std.testing.expect(Fake.sleep_calls <= 300);
 }
 
-test "Driver: request==0 のフレームでも学習が減衰する（Driver 経路）" {
+test "Driver: what has been learned decays even on a frame where request==0 (through the Driver path)" {
     Fake.reset(0);
-    // est が残りを食い切る状況（残り 1ms・est 4ms）を作ると decide は sleep 0 を返す。
+    // Making the estimate eat the whole remainder (1ms left against a 4ms estimate) makes decide return a sleep of 0.
     var pacer: Pacer = .{ .est_overshoot_ns = MAX_EST_NS };
     FakeDriver.pace(&pacer, Fake.now_s + 0.001, false);
-    try std.testing.expectEqual(@as(u32, 0), Fake.sleep_calls); // OS sleep は呼ばない
-    try std.testing.expectEqual(MAX_EST_NS / 2, pacer.est_overshoot_ns); // が、学習は半減する
-    // 繰り返せば必ず下がり続ける（永久停止しない）
+    try std.testing.expectEqual(@as(u32, 0), Fake.sleep_calls); // the OS sleep is not called
+    try std.testing.expectEqual(MAX_EST_NS / 2, pacer.est_overshoot_ns); // but what has been learned is halved
+    // repeating it keeps bringing it down, so it never stalls forever
     const before = pacer.est_overshoot_ns;
     FakeDriver.pace(&pacer, Fake.now_s + 0.001, false);
     try std.testing.expect(pacer.est_overshoot_ns < before);
     try std.testing.expectEqual(@as(u32, 0), Fake.sleep_calls);
 }
 
-test "Driver: 巨大 oversleep 後も数フレームで pacing が復活する" {
+test "Driver: pacing comes back within a few frames even after a huge oversleep" {
     const period_s: f64 = 1.0 / 60.0;
-    Fake.reset(1_000_000_000); // 1 秒 oversleep する病的な sleep
+    Fake.reset(1_000_000_000); // a pathological sleep that oversleeps by 1 second
     var pacer: Pacer = .{};
     FakeDriver.pace(&pacer, Fake.now_s + period_s, false);
     try std.testing.expect(pacer.est_overshoot_ns <= MAX_EST_NS);
 
-    // 以降は正常な sleep に戻す。est が残りを食い切る間は sleep 0（=学習減衰）で、やがて sleep が復活する。
+    // From here on the sleep behaves normally. While the estimate eats the remainder it sleeps 0 (decaying what is learned), and eventually the sleep comes back.
     Fake.overshoot_ns = 0;
     var recovered = false;
     var frames: u32 = 0;
