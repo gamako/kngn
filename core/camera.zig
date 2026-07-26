@@ -1,31 +1,31 @@
-//! カメラ入力 L1 facade（TASK-49.1 の設計を OS 別 backend へ委譲）。
+//! The camera input L1 facade (delegating to a per-OS backend).
 //!
-//! `core/audio.zig`（オーディオ出力）と対称の新規 L1 primitive。caller は `@import("camera")` で
-//! このファイルの API のみを使う。設計の正は `docs/plans/capture-foundation-plan.md`。
+//! A new L1 primitive, symmetric with `core/audio.zig` (the audio output). A caller uses the API of this
+//! file alone, through `@import("camera")`. The authority on the design is `docs/capture.md`.
 //!
-//! TASK-49.2/49.3: macOS は AVFoundation（`camera_macos.zig`）、Linux は raw V4L2
-//! （`camera_v4l2.zig`）を経由する。Windows/その他は全 OS 共通 stub（`camera_stub.zig`。
-//! 全動詞が `error.Unsupported`）を経由する（`builtin.os.tag` 分岐）。
+//! macOS goes through AVFoundation (`camera_macos.zig`) and Linux through raw V4L2
+//! (`camera_v4l2.zig`). Windows and anything else go through the stub shared by every OS
+//! (`camera_stub.zig`, where every verb gives `error.Unsupported`), chosen by a `builtin.os.tag` branch.
 //!
-//! ## harness synthetic source の継ぎ目（TASK-49.5 のプレースホルダ。設計文書 5章）
+//! ## The seam for the harness synthetic source
 //!
-//! 各 capture 関数は先頭で `harness.isCaptureSyntheticActive()` を判定する。49.1 の時点では
-//! synthetic backend が存在しないため、`true` 分岐は `error.Unsupported` を返すのみ（常に
-//! `false` を返す固定実装のため実際には到達しない）。TASK-49.5 はこの1行を実際の synthetic
-//! backend 呼び出しに書き換える（facade の構造自体は変更不要）。
+//! Each capture function tests `harness.isCaptureSyntheticActive()` at its head. While no
+//! synthetic backend exists, the `true` branch merely returns `error.Unsupported` (and is in fact
+//! unreachable, the implementation being fixed to return `false`). Implementing the synthetic source rewrites
+//! that one line into the real backend call, leaving the facade's structure untouched.
 //!
-//! ホットパス宣言: このファイル自体は「イベント時のみ / 初期化時のみ」（facade 骨格・stub 委譲）。
-//! フレーム毎(全画素)ループは書かない。`pollLatestFrame()` は capture スレッドが書いた
-//! `TripleBuffer`（`capture_types.zig`）から `acquire()` するだけで、per-frame alloc/lock は無い
-//! （実際のフレーム生成・BGRA 正規化ループは TASK-49.2〜.4 の backend 側の責務）。
+//! Hot path declaration: this file itself runs at event time or initialisation time only (a facade skeleton delegating to the stub).
+//! It contains no per-frame (all-pixel) loop. `pollLatestFrame()` only does an `acquire()` from the
+//! `TripleBuffer` (`capture_types.zig`) the capture thread wrote, with no per-frame alloc or lock
+//! (generating the frames and the BGRA normalisation loop are the backend's responsibility).
 
 const std = @import("std");
 const builtin = @import("builtin");
 const harness = @import("harness");
 const types = @import("capture_types");
 
-// TASK-49.2/49.3: macOS は AVFoundation、Linux は raw V4L2、その他は stub
-// （`core/audio.zig` の `const backend = switch (builtin.os.tag) { ... }` と同型）。
+// macOS uses AVFoundation, Linux raw V4L2, and everything else the stub
+// (the same shape as `const backend = switch (builtin.os.tag) { ... }` in `core/audio.zig`).
 const backend = switch (builtin.os.tag) {
     .macos => @import("camera_macos.zig"),
     .linux => @import("camera_v4l2.zig"),
@@ -48,24 +48,24 @@ pub const Config = backend.Config;
 pub const EffectiveConfig = backend.EffectiveConfig;
 pub const VideoDevice = backend.VideoDevice;
 
-/// 接続中のカメラデバイスを列挙する。呼び出し側 `allocator` で確保した `DeviceInfo` の配列を返す
-/// （`id`/`name` も同 allocator。解放は `freeDeviceList()`。契約は設計文書 4.4）。
+/// Enumerates the connected camera devices. It returns an array of `DeviceInfo` allocated with the caller's `allocator`
+/// (`id` and `name` too; free it with `freeDeviceList()`. The contract is in `docs/capture.md`).
 pub fn enumerate(allocator: std.mem.Allocator) CaptureError![]DeviceInfo {
-    if (harness.isCaptureSyntheticActive()) return error.Unsupported; // TASK-49.5 でここに synthetic backend 呼び出しを追加
+    if (harness.isCaptureSyntheticActive()) return error.Unsupported; // the synthetic backend call goes here
     return backend.enumerate(allocator);
 }
 
-/// カメラ権限を要求し、確定した状態を返す（ブロッキング。macOS TCC 等 OS 側 async は backend 内で
-/// 同期に包む契約。詳細は設計文書 6章）。
+/// Requests camera permission and returns the settled state (blocking; it is the contract that a backend wraps an
+/// OS-side asynchronous call, such as macOS TCC, synchronously. The detail is in `docs/capture.md`).
 pub fn requestPermission() CaptureError!PermissionState {
-    if (harness.isCaptureSyntheticActive()) return error.Unsupported; // TASK-49.5 でここに synthetic backend 呼び出しを追加
+    if (harness.isCaptureSyntheticActive()) return error.Unsupported; // the synthetic backend call goes here
     return backend.requestPermission();
 }
 
-/// カメラを開く。`cfg` の解像度/フレームレートはヒント。実効値は `device.config()` で取得する
-/// （`configure()` という独立動詞は置かない。設計文書 4.2）。
+/// Opens the camera. `cfg`'s resolution and frame rate are hints, and the effective values come from `device.config()`
+/// (there is no separate `configure()` verb; see `docs/capture.md`).
 pub fn open(allocator: std.mem.Allocator, cfg: Config) CaptureError!VideoDevice {
-    if (harness.isCaptureSyntheticActive()) return error.Unsupported; // TASK-49.5 でここに synthetic backend 呼び出しを追加
+    if (harness.isCaptureSyntheticActive()) return error.Unsupported; // the synthetic backend call goes here
     return backend.open(allocator, cfg);
 }
 
@@ -74,19 +74,19 @@ pub fn open(allocator: std.mem.Allocator, cfg: Config) CaptureError!VideoDevice 
 // ============================================================================
 const testing = std.testing;
 
-test "camera facade: harness 無効時は stub へ委譲し全動詞が error.Unsupported を返す（パススルー不変。非 macOS のみ）" {
-    // 実 backend（AVFoundation/V4L2）は permission/open が実デバイスに触れるため自動テスト対象外。
-    // backend の compile+link は backend 専用 test（camera_macos_test / camera_v4l2_test）が担保し、
-    // 純関数/config も同 test で検証する。
-    // `comptime` 必須: ランタイム呼び出しにすると Zig が後続 body を dead-code 消去できず、macOS/Linux
-    // でも実 backend の enumerate/open/requestPermission がこの facade test 経由でコンパイルされてしまう
-    // （facade test は stub 委譲を確認するのが目的で、実 backend 内部を巻き込むべきではない）。
+test "the camera facade: while harness is disabled it delegates to the stub and every verb gives error.Unsupported (passing straight through; not on macOS)" {
+    // A real backend (AVFoundation or V4L2) touches a real device in permission and open, so it is out of scope for an automated test.
+    // The backend's compile and link is covered by the backend's own tests (camera_macos_test and camera_v4l2_test),
+    // which check the pure functions and the config too.
+    // `comptime` is required: making it a runtime call stops Zig dead-code-eliminating the rest of the body, so the real
+    // backend's enumerate, open and requestPermission would be compiled through this facade test even on macOS and Linux
+    // (this facade test means to check the delegation to the stub, and should not drag in a real backend's internals).
     if (comptime hasRealCaptureBackend()) return error.SkipZigTest;
     try testing.expectError(error.Unsupported, enumerate(testing.allocator));
     try testing.expectError(error.Unsupported, requestPermission());
     try testing.expectError(error.Unsupported, open(testing.allocator, .{}));
 }
 
-test "camera facade: isCaptureSyntheticActive() は現状常に false（synthetic 分岐は到達しない）" {
+test "the camera facade: isCaptureSyntheticActive() is always false for now, so the synthetic branch is unreachable" {
     try testing.expect(!harness.isCaptureSyntheticActive());
 }

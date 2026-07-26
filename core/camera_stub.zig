@@ -1,19 +1,19 @@
-//! カメラ backend の全 OS 共通明示 stub（TASK-49.1）。
+//! The explicit camera backend stub shared by every OS.
 //!
-//! 目的: control plane の動詞・型を確定させつつ、実 OS 実装（AVFoundation / V4L2 / Media
-//! Foundation。TASK-49.2〜.4）が入るまで `zig build` を常時通す。**すべての動詞は
-//! `error.Unsupported` を返す**（黙って何もしない劣化ではなく明示エラー。設計文書
-//! `docs/plans/capture-foundation-plan.md` の「control plane 共通規約」参照）。
+//! Its purpose: to settle the control plane's verbs and types while keeping `zig build` green until the real
+//! OS implementations (AVFoundation, V4L2, Media Foundation) arrive. **Every verb returns
+//! `error.Unsupported`** — an explicit error rather than silently degrading to doing nothing. See
+//! the shared control plane conventions in `docs/capture.md`.
 //!
-//! TASK-49.2〜.4 は `core/camera.zig` の `const backend = @import("camera_stub.zig");` を
-//! `builtin.os.tag` 分岐（`core/audio.zig` の出力 backend と同型）へ置き換える。
+//! A real backend replaces `const backend = @import("camera_stub.zig");` in `core/camera.zig` with a
+//! `builtin.os.tag` branch (the same shape as the output backend of `core/audio.zig`).
 //!
-//! ホットパス宣言: 初期化時のみ（全関数が即 `error.Unsupported`/固定値を返すだけ。ループ無し）。
+//! Hot path declaration: initialisation time only (every function merely returns `error.Unsupported` or a fixed value; there is no loop).
 
 const std = @import("std");
 const types = @import("capture_types");
 
-/// 要求設定（あくまでヒント。stub は常に失敗するため実際には使われない）。
+/// The requested settings (hints only; the stub always fails, so they are never actually used).
 pub const Config = struct {
     device_id: ?[]const u8 = null,
     width: u32 = 640,
@@ -21,7 +21,7 @@ pub const Config = struct {
     frame_rate: u32 = 30,
 };
 
-/// `open()` が返す実効値（stub には到達しないため型のみ確定させる）。
+/// The effective values `open()` returns (unreachable in the stub, so only the type is settled).
 pub const EffectiveConfig = struct {
     width: u32,
     height: u32,
@@ -29,13 +29,13 @@ pub const EffectiveConfig = struct {
     format: types.PixelFormat,
 };
 
-/// stub は実体を持たない（`open` が常に失敗するため構築されない）。
+/// The stub holds no instance (it is never constructed, `open` always failing).
 pub const VideoDevice = struct {
     _unused: u0 = 0,
 
     pub fn config(self: VideoDevice) EffectiveConfig {
         _ = self;
-        unreachable; // open が常に失敗するため到達しない
+        unreachable; // unreachable, open always failing
     }
 
     pub fn start(self: VideoDevice) types.CaptureError!void {
@@ -57,19 +57,19 @@ pub const VideoDevice = struct {
     }
 };
 
-/// カメラを列挙する。未実装 backend のため `error.Unsupported`（「デバイス0台」ではなく
-/// 「列挙機能自体が未対応」と明示する）。
+/// Enumerates cameras. This backend is not implemented, so `error.Unsupported` (stating that enumeration
+/// itself is unsupported, rather than that there are zero devices).
 pub fn enumerate(allocator: std.mem.Allocator) types.CaptureError![]types.DeviceInfo {
     _ = allocator;
     return error.Unsupported;
 }
 
-/// カメラ権限を要求する。未実装 backend のため `error.Unsupported`。
+/// Requests camera permission. This backend is not implemented, so `error.Unsupported`.
 pub fn requestPermission() types.CaptureError!types.PermissionState {
     return error.Unsupported;
 }
 
-/// カメラを開く。未実装 backend のため常に `error.Unsupported`。
+/// Opens a camera. This backend is not implemented, so always `error.Unsupported`.
 pub fn open(allocator: std.mem.Allocator, cfg: Config) types.CaptureError!VideoDevice {
     _ = allocator;
     _ = cfg;
@@ -81,7 +81,7 @@ pub fn open(allocator: std.mem.Allocator, cfg: Config) types.CaptureError!VideoD
 // ============================================================================
 const testing = std.testing;
 
-test "camera_stub: enumerate/requestPermission/open は全て error.Unsupported" {
+test "camera_stub: enumerate, requestPermission and open all give error.Unsupported" {
     try testing.expectError(error.Unsupported, enumerate(testing.allocator));
     try testing.expectError(error.Unsupported, requestPermission());
     try testing.expectError(error.Unsupported, open(testing.allocator, .{}));

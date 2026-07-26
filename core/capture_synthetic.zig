@@ -1,34 +1,34 @@
-//! harness 内蔵の synthetic capture source（偽 mic/camera。TASK-49.5）。
+//! The synthetic capture source built into the harness (a fake microphone and camera).
 //!
-//! `core/control/harness.zig` の組み込み `capture` probe / `capture video|audio ...` コマンドから
-//! 呼ばれる。**camera.zig/audio.zig の実 facade 配線は本タスクのスコープ外**（TASK-49.2〜.4 の
-//! OS backend 実装が同じファイルを並行して触るコンフリクトを避けるため。設計文書
-//! `docs/plans/capture-foundation-plan.md` 5章が指す facade 側の書き換えは後続タスクに委ねる。
-//! `camera.open()`/`audio.openCapture()` は本ファイル実装後も `error.Unsupported` を返し続ける）。
-//! 依存は `capture_types`（共有 data plane 型）のみ。camera/audio 実 backend とは独立。
+//! It is called from the built-in `capture` probe and the `capture video|audio ...` commands of
+//! `core/control/harness.zig`. **Wiring it into the real camera.zig and audio.zig facades is out of scope here**
+//! (which avoids conflicting with the OS backend implementations touching the same files in parallel. The facade-side
+//! rewrite is left to a later piece of work, and
+//! `camera.open()` and `audio.openCapture()` keep returning `error.Unsupported` even with this file in place).
+//! It depends on `capture_types` (the shared data plane types) alone, and is independent of the real camera and audio backends.
 //!
-//! - **video**: `SyntheticVideoDevice.renderFrame(tick)` が harness の仮想クロック
-//!   （呼び出し側が渡す `tick`、実体は harness の `frame_index`）から決定論的な BGRA パターンを
-//!   生成する**純関数**（スレッド無し。同じ `tick` なら bit 一致）。
-//! - **audio**: 実 mic backend と同様に**専用スレッドが実時間で `CaptureCallback` を pull 駆動**
-//!   する（`core/audio_null.zig` の `NullBackend` と同型パターン）。波形生成は位相アキュムレータ +
-//!   `@sin`（`src/dsp/oscillator.zig` の `Oscillator.sine` と同じ per-sample `@sin` パターン。
-//!   ADR-007 のレイヤー制約で `dsp`(lib) を `core` から import できないため、アルゴリズムのみ複製する）。
+//! - **video**: `SyntheticVideoDevice.renderFrame(tick)` is a **pure function** generating a deterministic BGRA
+//!   pattern from the harness's virtual clock (the `tick` the caller passes, really the harness's `frame_index`),
+//!   with no thread involved, so the same `tick` gives a bit-identical result.
+//! - **audio**: as with a real mic backend, **a dedicated thread pull-drives `CaptureCallback` in real time**
+//!   (the same pattern as `NullBackend` in `core/audio_null.zig`). The waveform comes from a phase accumulator plus
+//!   `@sin` (the same per-sample `@sin` pattern as `Oscillator.sine` in `src/dsp/oscillator.zig`;
+//!   ADR-007's layering forbids importing `dsp` (a lib) from `core`, so only the algorithm is duplicated).
 //!
-//! ## ホットパス宣言
-//! - `SyntheticVideoDevice.renderFrame`: **イベント時のみ**（`digest capture`/`snapshot capture` の
-//!   都度呼ばれる。最大でも harness の `step` 頻度 ≒ 仮想60fps）。全画素を書くループだが、対象は
-//!   harness 検証ツール専用の合成画像（既定 64x64 程度の小解像度）であり実アプリの本番描画ホット
-//!   パスではないため、`libs/pixelops` の SIMD/div255/clip-hoist 3点セットは適用しない（判断根拠:
-//!   AI/スクリプトが明示コマンドを叩いた時だけ発火し、実アプリの毎フレーム全画素パスと同じ頻度・
-//!   面積では走らない。将来 camera.zig 配線後に高頻度化する場合は再判断が必要）。
-//! - `SyntheticAudioDevice` の生成スレッド（`renderThread`）: **RT（毎サンプル）**。malloc/lock/IO/
-//!   panic 禁止（`audio_null.zig` と同一契約）。毎サンプル `@sin` を呼ぶ点は性能規約「毎サンプルの
-//!   超越関数（pow/tan/exp）は禁止」と字面上緊張するが、`src/dsp/oscillator.zig` の
-//!   `Oscillator.sine`（実際の synth RT パスで本番採用済み）と同一パターンであり、このコードベース
-//!   では `@sin`（コンパイラ組込み。tan/exp のような係数計算ではなく波形生成そのもの）は許容されて
-//!   いる実績があるためそれを踏襲する。probe 用状態（`frames_generated`/`last_peak`）は atomic の
-//!   みで共有し、plain global への書き込みはしない（data race を作らない）。
+//! ## Hot path declaration
+//! - `SyntheticVideoDevice.renderFrame`: **at event time only** (called each time `digest capture` or
+//!   `snapshot capture` runs, so at most at the harness's `step` rate, about a virtual 60fps). It is a loop writing
+//!   every pixel, but the target is a synthetic image for the harness verification tool alone (a small resolution,
+//!   64x64 by default) rather than a real application's production drawing hot path, so `libs/pixelops`'s three rules (SIMD, div255, clip hoisting) are not applied. The grounds: it fires only when an AI or a script issues an
+//!   explicit command, and never runs at the frequency or over the area of a real application's per-frame all-pixel
+//!   path. Should wiring camera.zig later make it high-frequency, it needs judging afresh.
+//! - `SyntheticAudioDevice`'s generating thread (`renderThread`): **real time (per sample)**. No malloc, locking, IO or
+//!   panic (the same contract as `audio_null.zig`). Calling `@sin` per sample is in literal tension with the performance
+//!   rule that transcendental functions per sample (pow, tan, exp) are forbidden, but it is the same pattern as
+//!   `Oscillator.sine` in `src/dsp/oscillator.zig`, which is already in production on the real synth's real-time path.
+//!   In this codebase `@sin` (a compiler builtin, and waveform generation itself rather than coefficient computation
+//!   as with tan or exp) has an established precedent of being allowed, which this follows. The probe state
+//!   (`frames_generated` and `last_peak`) is shared through atomics alone, and nothing is written to a plain global (so no data race is created).
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -38,8 +38,8 @@ const capture_types = @import("capture_types");
 // video: synthetic camera
 // ============================================================================
 
-/// 解像度の上限（harness 検証ツール用の暴走確保防止。page_allocator の確保も PNG snapshot も
-/// この範囲なら実用上問題ない大きさに収まる）。
+/// The upper bound on the resolution (preventing a runaway allocation in a harness verification tool. Within this
+/// range both the page_allocator allocation and the PNG snapshot stay a practical size).
 pub const MAX_VIDEO_DIM: u32 = 4096;
 
 pub const VideoConfig = struct {
@@ -56,14 +56,14 @@ pub const VideoEffectiveConfig = struct {
 };
 
 pub const SyntheticVideoDevice = struct {
-    pixels: []u32, // owned, width*height（open() で固定確保。フレーム毎の realloc 無し）
+    pixels: []u32, // owned, width*height (allocated up front in open(); never realloc'd per frame)
     width: u32,
     height: u32,
     frame_rate: u32,
     allocator: std.mem.Allocator,
 
-    /// `tick` から決定論的な BGRA パターンを全画素へ書き込み、view を返す（純関数的: 同じ tick
-    /// なら bit 一致）。8px ブロックのチェッカーが `tick` で1ブロックずつ回転する。
+    /// Writes a deterministic BGRA pattern over every pixel from `tick` and returns a view (pure in effect: the same tick
+    /// gives a bit-identical result). A checker of 8px blocks rotates by one block per `tick`.
     pub fn renderFrame(self: *SyntheticVideoDevice, tick: u64) capture_types.VideoFrame {
         const w = self.width;
         const h = self.height;
@@ -89,7 +89,7 @@ pub const SyntheticVideoDevice = struct {
             .height = h,
             .stride = w,
             .format = .bgra8,
-            .timestamp_ns = 0, // 仮想クロック駆動のため実時刻を持たない（tick=frame_index が代用）
+            .timestamp_ns = 0, // Being driven by the virtual clock it holds no real time (tick=frame_index stands in for it)
             .frame_index = tick,
         };
     }
@@ -104,7 +104,7 @@ pub const SyntheticVideoDevice = struct {
     }
 };
 
-/// カメラを列挙する（synthetic: 常に1台の "Synthetic Camera" を返す）。
+/// Enumerates cameras (synthetic: always one "Synthetic Camera").
 pub fn enumerateVideo(allocator: std.mem.Allocator) capture_types.CaptureError![]capture_types.DeviceInfo {
     const id = allocator.dupe(u8, "synthetic-camera-0") catch return error.OpenFailed;
     errdefer allocator.free(id);
@@ -115,13 +115,13 @@ pub fn enumerateVideo(allocator: std.mem.Allocator) capture_types.CaptureError![
     return devices;
 }
 
-/// カメラ権限を要求する（synthetic: 常に granted）。
+/// Requests camera permission (synthetic: always granted).
 pub fn requestVideoPermission() capture_types.CaptureError!capture_types.PermissionState {
     return .granted;
 }
 
-/// synthetic カメラを開く。`width`/`height`/`frame_rate` が 0、または解像度が `MAX_VIDEO_DIM` を
-/// 超える場合は `error.ConfigFailed`（暴走確保・巨大 PNG snapshot を防ぐ fail-fast）。
+/// Opens the synthetic camera. When `width`, `height` or `frame_rate` is 0, or the resolution exceeds
+/// `MAX_VIDEO_DIM`, it gives `error.ConfigFailed` (a fail-fast preventing a runaway allocation and an enormous PNG snapshot).
 pub fn openVideo(allocator: std.mem.Allocator, cfg: VideoConfig) capture_types.CaptureError!SyntheticVideoDevice {
     if (cfg.width == 0 or cfg.height == 0 or cfg.frame_rate == 0) return error.ConfigFailed;
     if (cfg.width > MAX_VIDEO_DIM or cfg.height > MAX_VIDEO_DIM) return error.ConfigFailed;
@@ -134,17 +134,17 @@ pub fn openVideo(allocator: std.mem.Allocator, cfg: VideoConfig) capture_types.C
 // audio: synthetic microphone
 // ============================================================================
 
-/// `capture_types.AudioInFrame` の再公開（`core/camera.zig`/`core/audio.zig` が capture_types の
-/// 型を再公開しているのと対称。harness.zig が callback を定義する際に `capture_types` を別途
-/// import しなくても `capture_synthetic.AudioInFrame` だけで完結できるようにする）。
+/// A re-publication of `capture_types.AudioInFrame` (symmetrical with `core/camera.zig` and `core/audio.zig`
+/// re-publishing capture_types' types). It lets harness.zig define a callback using
+/// `capture_synthetic.AudioInFrame` alone, without importing `capture_types` separately.
 pub const AudioInFrame = capture_types.AudioInFrame;
 
-/// mic capture callback に渡される `AudioInFrame` を受け取る関数ポインタ型。**RT スレッドで
-/// 呼ばれる**: malloc/lock/IO/panic をしてはならない。`capture_types` にはデータ型
-/// （`AudioInFrame` 等）のみで callback/Config 型は無いため、ここで独自定義する（実 mic backend
-/// `core/audio_capture_stub.zig` の `CaptureCallback` とはパラメータ型が同一named module
-/// （`capture_types.AudioInFrame`）を参照するため構造的に同一シグネチャになるが、独立した型宣言
-/// であり camera.zig/audio.zig への配線は無い。将来の facade 統合では型調整が必要になりうる）。
+/// The function pointer type receiving the `AudioInFrame` handed to a mic capture callback. **It is called on a
+/// real-time thread**: it must not malloc, lock, do IO or panic. `capture_types` holds only the data types
+/// (`AudioInFrame` and the like) and no callback or Config type, so this is declared here (it ends up structurally
+/// identical in signature to `CaptureCallback` in the real mic backend `core/audio_capture_stub.zig`, both parameter
+/// types referring to the same named module (`capture_types.AudioInFrame`), but it is an independent declaration with
+/// no wiring into camera.zig or audio.zig. A future facade integration may need the types reconciled).
 pub const CaptureCallback = *const fn (frame: AudioInFrame, userdata: ?*anyopaque) void;
 
 pub const AudioConfig = struct {
@@ -162,8 +162,8 @@ pub const AudioEffectiveConfig = struct {
     max_frames_per_slice: u32,
 };
 
-/// 再生スレッド / callback に安定アドレスで渡すための状態。`open()` で heap 確保し `close()` で
-/// 破棄する（`core/audio_null.zig` の `State` と同じ形）。
+/// The state passed to the playback thread and the callback at a stable address. Heap-allocated by `open()` and
+/// destroyed by `close()` (the same shape as `State` in `core/audio_null.zig`).
 const AudioState = struct {
     callback: CaptureCallback,
     userdata: ?*anyopaque,
@@ -171,12 +171,12 @@ const AudioState = struct {
     frequency_hz: f32,
     running: std.atomic.Value(bool),
     thread: ?std.Thread,
-    scratch: []f32, // block_frames*channels の interleaved バッファ（open 時のみ確保）
+    scratch: []f32, // the interleaved buffer of block_frames*channels (allocated only at open)
     allocator: std.mem.Allocator,
-    // probe 用累計状態。RT スレッドが書き main スレッドが読む best-effort torn read（既存 `audio`
-    // probe の `.unordered` store と同じ思想）。plain global には絶対に書かない。
+    // The cumulative state for the probe. The real-time thread writes it and the main thread reads it, a best-effort torn
+    // read (the same thinking as the existing `audio` probe's `.unordered` store). Nothing is ever written to a plain global.
     frames_generated: std.atomic.Value(u64),
-    last_peak_bits: std.atomic.Value(u32), // f32 の bit 表現（peak は非負なので符号は問題にならない）
+    last_peak_bits: std.atomic.Value(u32), // the bit representation of an f32 (peak being non-negative, the sign is not an issue)
 };
 
 pub const SyntheticAudioDevice = struct {
@@ -186,8 +186,8 @@ pub const SyntheticAudioDevice = struct {
         return self.state.effective;
     }
 
-    /// 生成スレッドを起動する。実デバイスの prepare に相当する処理は無いので spawn 失敗のみ
-    /// `error.StartFailed`（`audio_null.zig` と同じ契約。二重 start は無視）。
+    /// Starts the generating thread. There is nothing corresponding to a real device's prepare, so only a failed spawn gives
+    /// `error.StartFailed` (the same contract as `audio_null.zig`; a double start is ignored).
     pub fn start(self: SyntheticAudioDevice) capture_types.CaptureError!void {
         const state = self.state;
         if (state.thread != null) return;
@@ -198,7 +198,7 @@ pub const SyntheticAudioDevice = struct {
         };
     }
 
-    /// 生成スレッドを止める（`running=false` → join。二重 stop は無視）。
+    /// Stops the generating thread (`running=false`, then join. A double stop is ignored).
     pub fn stop(self: SyntheticAudioDevice) void {
         const state = self.state;
         if (state.thread) |thread| {
@@ -208,28 +208,28 @@ pub const SyntheticAudioDevice = struct {
         }
     }
 
-    /// stop → scratch 解放 → State 破棄。
+    /// stop, then free the scratch, then destroy the State.
     pub fn close(self: SyntheticAudioDevice) void {
         self.stop();
         self.state.allocator.free(self.state.scratch);
         self.state.allocator.destroy(self.state);
     }
 
-    /// probe 用: 累計生成フレーム数（best-effort torn read。RT スレッドと同期しない）。
+    /// For the probe: the cumulative count of generated frames (a best-effort torn read, not synchronised with the real-time thread).
     pub fn framesGenerated(self: SyntheticAudioDevice) u64 {
         return self.state.frames_generated.load(.monotonic);
     }
 
-    /// probe 用: 直近ブロックの peak 振幅（best-effort torn read）。
+    /// For the probe: the peak amplitude of the most recent block (a best-effort torn read).
     pub fn lastPeak(self: SyntheticAudioDevice) f32 {
         return @bitCast(self.state.last_peak_bits.load(.monotonic));
     }
 };
 
-/// RT 契約区間: サンプル生成 + callback 呼び出し + sleep のみ。alloc/lock/IO/panic 禁止。
-/// 位相アキュムレータ + `@sin`（`src/dsp/oscillator.zig` の `Oscillator.sine` と同一パターン）で
-/// サイン波を生成する。ブロック内で複数回参照する `ch`/`period`/`sample_rate`/`phase_inc` は
-/// スレッド起動時に1回 latch 済み。
+/// The real-time contract region: generating samples, calling the callback, and the sleep, and nothing else. No alloc, locking, IO or panic.
+/// It generates a sine from a phase accumulator plus `@sin` (the same pattern as `Oscillator.sine` in
+/// `src/dsp/oscillator.zig`). `ch`, `period`, `sample_rate` and `phase_inc`, referenced several times within a block,
+/// are latched once when the thread starts.
 fn renderThread(state: *AudioState) void {
     const ch: usize = state.effective.channels;
     const period: usize = state.effective.max_frames_per_slice;
@@ -242,7 +242,7 @@ fn renderThread(state: *AudioState) void {
         var i: usize = 0;
         var peak: f32 = 0;
         while (i < period) : (i += 1) {
-            const sample = @sin(phase * std.math.tau) * 0.3; // 控えめな振幅
+            const sample = @sin(phase * std.math.tau) * 0.3; // a modest amplitude
             phase += phase_inc;
             if (phase >= 1.0) phase -= 1.0;
             const a = @abs(sample);
@@ -262,12 +262,12 @@ fn renderThread(state: *AudioState) void {
         _ = state.frames_generated.fetchAdd(period, .monotonic);
         state.last_peak_bits.store(@bitCast(peak), .monotonic);
 
-        // 実デバイス同型の実時間ペーシング（1 period 分の再生時間だけ待つ）。
+        // Real-time pacing of the same shape as a real device (waiting for exactly one period's playback time).
         sleepNs(period_ns);
     }
 }
 
-/// マイクを列挙する（synthetic: 常に1台の "Synthetic Microphone" を返す）。
+/// Enumerates microphones (synthetic: always one "Synthetic Microphone").
 pub fn enumerateAudio(allocator: std.mem.Allocator) capture_types.CaptureError![]capture_types.DeviceInfo {
     const id = allocator.dupe(u8, "synthetic-mic-0") catch return error.OpenFailed;
     errdefer allocator.free(id);
@@ -278,13 +278,13 @@ pub fn enumerateAudio(allocator: std.mem.Allocator) capture_types.CaptureError![
     return devices;
 }
 
-/// マイク権限を要求する（synthetic: 常に granted）。
+/// Requests microphone permission (synthetic: always granted).
 pub fn requestAudioPermission() capture_types.CaptureError!capture_types.PermissionState {
     return .granted;
 }
 
-/// synthetic マイクを開く。`sample_rate`/`channels`/`block_frames` のいずれかが 0 の場合は
-/// `error.ConfigFailed`。
+/// Opens the synthetic microphone. When any of `sample_rate`, `channels` or `block_frames` is 0 it gives
+/// `error.ConfigFailed`.
 pub fn openAudio(allocator: std.mem.Allocator, cfg: AudioConfig) capture_types.CaptureError!SyntheticAudioDevice {
     if (cfg.sample_rate == 0 or cfg.channels == 0 or cfg.block_frames == 0) return error.ConfigFailed;
     const effective = AudioEffectiveConfig{
@@ -311,9 +311,9 @@ pub fn openAudio(allocator: std.mem.Allocator, cfg: AudioConfig) capture_types.C
 }
 
 // ============================================================================
-// OS 非依存 sleep（`core/audio_null.zig` と同じ複製実装。audio 層は platform に依存しない
-// レイヤー設計のため import せず同じパターンをここにも複製する。POSIX=nanosleep(要 link_libc) /
-// Windows=Sleep(kernel32 直呼び。libc 不要)）。
+// An OS-independent sleep (the same duplicated implementation as `core/audio_null.zig`'s. The audio layer does not
+// depend on platform by design, so rather than importing it the same pattern is duplicated here too: POSIX uses
+// nanosleep (needing link_libc), and Windows calls Sleep from kernel32 directly (needing no libc)).
 // ============================================================================
 
 const win_sleep = if (builtin.os.tag == .windows) struct {
@@ -332,20 +332,20 @@ fn sleepNs(nanoseconds: u64) void {
     }
 }
 
-/// period（frames）と sample_rate から period の再生時間をナノ秒で求める（純ロジック・テスト可能）。
+/// Works out a period's playback time in nanoseconds from the period (in frames) and the sample_rate (pure logic, testable).
 fn periodNanos(period: usize, sample_rate: u32) u64 {
     if (sample_rate == 0) return 0;
     return @as(u64, period) * std.time.ns_per_s / sample_rate;
 }
 
 // ============================================================================
-// tests（display/実デバイス不要・OS 非依存）
+// tests (no display or real device needed, and OS independent)
 // ============================================================================
 const testing = std.testing;
 
 // --- video ---
 
-test "enumerateVideo/freeDeviceList: allocator 契約どおり確保・解放できる（リーク検出）" {
+test "enumerateVideo and freeDeviceList: allocation and freeing follow the allocator contract (with leak detection)" {
     const allocator = testing.allocator;
     const devices = try enumerateVideo(allocator);
     try testing.expectEqual(@as(usize, 1), devices.len);
@@ -355,21 +355,21 @@ test "enumerateVideo/freeDeviceList: allocator 契約どおり確保・解放で
     capture_types.freeDeviceList(allocator, devices);
 }
 
-test "requestVideoPermission: 常に granted" {
+test "requestVideoPermission: always granted" {
     try testing.expectEqual(capture_types.PermissionState.granted, try requestVideoPermission());
 }
 
-test "openVideo: width/height/frame_rate=0 は ConfigFailed" {
+test "openVideo: a width, height or frame_rate of 0 gives ConfigFailed" {
     try testing.expectError(error.ConfigFailed, openVideo(testing.allocator, .{ .width = 0, .height = 8, .frame_rate = 30 }));
     try testing.expectError(error.ConfigFailed, openVideo(testing.allocator, .{ .width = 8, .height = 0, .frame_rate = 30 }));
     try testing.expectError(error.ConfigFailed, openVideo(testing.allocator, .{ .width = 8, .height = 8, .frame_rate = 0 }));
 }
 
-test "openVideo: 解像度上限超過は ConfigFailed" {
+test "openVideo: exceeding the resolution bound gives ConfigFailed" {
     try testing.expectError(error.ConfigFailed, openVideo(testing.allocator, .{ .width = MAX_VIDEO_DIM + 1, .height = 8, .frame_rate = 30 }));
 }
 
-test "openVideo/config/close: 実効値が要求どおり返る" {
+test "openVideo, config and close: the effective values come back as requested" {
     var dev = try openVideo(testing.allocator, .{ .width = 16, .height = 8, .frame_rate = 24 });
     defer dev.close();
     const cfg = dev.config();
@@ -379,7 +379,7 @@ test "openVideo/config/close: 実効値が要求どおり返る" {
     try testing.expectEqual(capture_types.PixelFormat.bgra8, cfg.format);
 }
 
-test "renderFrame: 同一 tick は bit 一致（決定論）" {
+test "renderFrame: the same tick is bit-identical (deterministic)" {
     var dev = try openVideo(testing.allocator, .{ .width = 16, .height = 16, .frame_rate = 30 });
     defer dev.close();
     const f1 = dev.renderFrame(7);
@@ -390,7 +390,7 @@ test "renderFrame: 同一 tick は bit 一致（決定論）" {
     try testing.expectEqual(@as(u64, 7), f2.frame_index);
 }
 
-test "renderFrame: 異なる tick は内容が変わる（縮退しない）" {
+test "renderFrame: a different tick changes the content (it does not degenerate)" {
     var dev = try openVideo(testing.allocator, .{ .width = 16, .height = 16, .frame_rate = 30 });
     defer dev.close();
     const f1 = dev.renderFrame(0);
@@ -400,7 +400,7 @@ test "renderFrame: 異なる tick は内容が変わる（縮退しない）" {
     try testing.expect(!std.mem.eql(u32, &copy1, f2.pixels[0 .. 16 * 16]));
 }
 
-test "renderFrame: tick=0 の (0,0) ブロックは既知の赤" {
+test "renderFrame: the (0,0) block at tick=0 is a known red" {
     var dev = try openVideo(testing.allocator, .{ .width = 8, .height = 8, .frame_rate = 30 });
     defer dev.close();
     const f = dev.renderFrame(0);
@@ -409,7 +409,7 @@ test "renderFrame: tick=0 の (0,0) ブロックは既知の赤" {
 
 // --- audio ---
 
-test "enumerateAudio/freeDeviceList: allocator 契約どおり確保・解放できる（リーク検出）" {
+test "enumerateAudio and freeDeviceList: allocation and freeing follow the allocator contract (with leak detection)" {
     const allocator = testing.allocator;
     const devices = try enumerateAudio(allocator);
     try testing.expectEqual(@as(usize, 1), devices.len);
@@ -418,11 +418,11 @@ test "enumerateAudio/freeDeviceList: allocator 契約どおり確保・解放で
     capture_types.freeDeviceList(allocator, devices);
 }
 
-test "requestAudioPermission: 常に granted" {
+test "requestAudioPermission: always granted" {
     try testing.expectEqual(capture_types.PermissionState.granted, try requestAudioPermission());
 }
 
-test "openAudio: sample_rate/channels/block_frames=0 は ConfigFailed" {
+test "openAudio: a sample_rate, channels or block_frames of 0 gives ConfigFailed" {
     try testing.expectError(error.ConfigFailed, openAudio(testing.allocator, .{ .sample_rate = 0, .capture_callback = noopAudioCallback }));
     try testing.expectError(error.ConfigFailed, openAudio(testing.allocator, .{ .channels = 0, .capture_callback = noopAudioCallback }));
     try testing.expectError(error.ConfigFailed, openAudio(testing.allocator, .{ .block_frames = 0, .capture_callback = noopAudioCallback }));
@@ -444,12 +444,12 @@ fn countingAudioCallback(frame: capture_types.AudioInFrame, userdata: ?*anyopaqu
     _ = ctx.count.fetchAdd(1, .monotonic);
 }
 
-test "openAudio/start/stop/close: callback が実時間で複数回呼ばれ、probe 状態(frames/peak)が更新される" {
+test "openAudio, start, stop and close: the callback is called several times in real time and the probe state (frames and peak) is updated" {
     var ctx = AudioCallCtx{};
     var dev = try openAudio(testing.allocator, .{
         .sample_rate = 48000,
         .channels = 1,
-        .block_frames = 128, // 短い period で速く複数回まわす（≈2.7ms/回）
+        .block_frames = 128, // go round several times quickly with a short period (about 2.7ms each)
         .frequency_hz = 440.0,
         .capture_callback = countingAudioCallback,
         .userdata = &ctx,
@@ -461,20 +461,20 @@ test "openAudio/start/stop/close: callback が実時間で複数回呼ばれ、p
     try testing.expectEqual(@as(u64, 0), dev.framesGenerated());
 
     try dev.start();
-    sleepNs(30 * std.time.ns_per_ms); // 30ms あれば数回まわる
+    sleepNs(30 * std.time.ns_per_ms); // 30ms is enough for several times round
     dev.stop();
 
     try testing.expect(ctx.count.load(.monotonic) >= 2);
     try testing.expectEqual(@as(u32, 128), ctx.last_frames.load(.monotonic));
     try testing.expect(dev.framesGenerated() >= 256);
-    try testing.expect(dev.lastPeak() > 0); // 非無音（440Hz サイン波の peak > 0）
-    try testing.expect(dev.lastPeak() <= 0.31); // 振幅 0.3 を大きく超えない
+    try testing.expect(dev.lastPeak() > 0); // not silent (a 440Hz sine's peak > 0)
+    try testing.expect(dev.lastPeak() <= 0.31); // it does not go far above an amplitude of 0.3
 
-    // 二重 stop / start(既 close 前) は安全（no-op 相当）
+    // a double stop, or a start before close, is safe (effectively a no-op)
     dev.stop();
 }
 
-test "openAudio: RT 契約 - pull ループ稼働中は追加アロケーションが無い（FailingAllocator）" {
+test "openAudio: the real-time contract — no allocation happens while the pull loop runs (FailingAllocator)" {
     var failing = std.testing.FailingAllocator.init(testing.allocator, .{});
     const alloc = failing.allocator();
 
@@ -489,17 +489,17 @@ test "openAudio: RT 契約 - pull ループ稼働中は追加アロケーショ�
     defer dev.close();
 
     const allocs_after_open = failing.allocations;
-    failing.fail_index = allocs_after_open; // 以降 1 回でも alloc されたら OOM になるよう固定
+    failing.fail_index = allocs_after_open; // From here on, pin it so that a single allocation would give OOM
 
     try dev.start();
     sleepNs(30 * std.time.ns_per_ms);
     dev.stop();
 
-    try testing.expectEqual(allocs_after_open, failing.allocations); // pull ループ中に alloc 無し
-    try testing.expect(ctx.count.load(.monotonic) >= 1); // callback は実際に呼ばれている
+    try testing.expectEqual(allocs_after_open, failing.allocations); // no allocation during the pull loop
+    try testing.expect(ctx.count.load(.monotonic) >= 1); // the callback really is called
 }
 
-test "periodNanos: sample_rate=0 は 0、そうでなければ period/sample_rate 秒" {
+test "periodNanos: sample_rate=0 gives 0, and otherwise period/sample_rate seconds" {
     try testing.expectEqual(@as(u64, 0), periodNanos(512, 0));
     try testing.expectEqual(@as(u64, std.time.ns_per_s), periodNanos(48000, 48000));
 }

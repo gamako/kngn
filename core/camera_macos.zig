@@ -1,54 +1,54 @@
-//! macOS camera backend (L1 カメラ入力プリミティブ)。AVFoundation を Objective-C ランタイム C ABI
-//! （`objc_msgSend` 系。`core/objc_runtime.zig`）経由で叩く。`@cImport`/Swift は使わない
-//! （AudioToolbox の C ABI 直呼びと同じ方針。AVFoundation 自体には C API が無いため libobjc の
-//! C ABI をブリッジとして利用する。aarch64-darwin のみ対応。詳細根拠は `core/objc_runtime.zig`
-//! 冒頭コメント参照）。
+//! macOS camera backend (an L1 camera input primitive). It drives AVFoundation through the Objective-C runtime's
+//! C ABI (the `objc_msgSend` family, in `core/objc_runtime.zig`). Neither `@cImport` nor Swift is used
+//! (the same approach as calling AudioToolbox's C ABI directly. AVFoundation itself has no C API, so libobjc's
+//! C ABI is used as the bridge. Only aarch64-darwin is supported; the detailed reasoning is in the comment at the
+//! head of `core/objc_runtime.zig`).
 //!
-//! **フレーム配送**: `AVCaptureVideoDataOutput` の sample buffer delegate（動的に生成する ObjC
-//! サブクラス `VPCameraCaptureDelegate`）が capture 用 dispatch queue（GCD の専用スレッド）で
-//! 呼ばれ、`CVPixelBuffer`（`kCVPixelFormatType_32BGRA` を明示要求）をそのまま canonical BGRA
-//! として `capture_types.TripleBuffer` へ publish する。正規化は「ストライド吸収の行コピー」のみ
-//! （`copyBgraRows`。per-pixel 演算は無い）。BGRA を明示要求しているため、ネイティブ形式
-//! （YUV 等）からの変換は OS 側が内部で行う。
+//! **Frame delivery**: `AVCaptureVideoDataOutput`'s sample buffer delegate (the dynamically created ObjC
+//! subclass `VPCameraCaptureDelegate`) is called on a dispatch queue for capture (a dedicated GCD thread),
+//! and publishes the `CVPixelBuffer` (with `kCVPixelFormatType_32BGRA` requested explicitly) straight into
+//! `capture_types.TripleBuffer` as canonical BGRA. Normalising it is only a row copy absorbing the stride
+//! (`copyBgraRows`, with no per-pixel arithmetic). Because BGRA is requested explicitly, converting from a
+//! native format such as YUV happens inside the OS.
 //!
-//! **MVP の既知の簡略化**（設計文書 `docs/plans/capture-foundation-plan.md` の未確定事項）:
-//! - 同時に開けるカメラは 1 台のみ（`g_active_state` がプロセス内シングルトン。複数 `open()` の
-//!   同時使用はサポートしない。設計文書 2.2「複数デバイス同時 open」はスコープ外と整合）。
-//! - `device.config()` の `frame_rate` は要求値をそのまま返す（実ネゴシエーション結果の反映は
-//!   フォローアップ。`format` は常に `.bgra8` で正確）。
-//! - `device_id` 指定でのデバイス選択は未実装（既定カメラ固定。将来 `enumerate()` の id を
-//!   `open()` の `device_id` に渡す経路を追加する）。
+//! **The MVP's known simplifications**:
+//! - Only one camera can be open at a time (`g_active_state` is a process-wide singleton, and using several
+//!   `open()`s at once is unsupported, consistent with opening several devices being out of scope).
+//! - `device.config()`'s `frame_rate` returns the requested value as it is (reflecting the real negotiated result
+//!   is follow-up work; `format` is always `.bgra8` and accurate).
+//! - Selecting a device by `device_id` is not implemented (the default camera is fixed. A path passing
+//!   `enumerate()`'s id to `open()`'s `device_id` comes later).
 //!
-//! ホットパス宣言:
-//! - **delegate callback（`sampleBufferCallback`）は capture スレッド（GCD 専用スレッド。実時間・
-//!   カメラ fps 相当=既定30fps 程度）で毎フレーム呼ばれる**。区間内で malloc/lock/IO/panic 禁止
-//!   （既存 audio backend の RT 契約と同じ強度）。行われるのは `CVPixelBufferLockBaseAddress`
-//!   （API 契約上必須のロックで一般的な mutex ではない）+ `copyBgraRows`（行コピー）+
-//!   `TripleBuffer.publish()`（alloc/lock 無し）のみ。バッファは `open()` 時に固定確保済み。
-//! - **`copyBgraRows`**: フレーム毎（全画素相当）。ストライド吸収の `@memcpy` のみで per-pixel
-//!   演算（ブレンド/除算）が無いため、性能規約の「全画素ループの3点セット」(SIMD/div255/
-//!   clip-hoist) は対象外と判断する。既存規約が推奨する「不透明な全面塗りは @memset/一括書き込み
-//!   の高速パスを用意する」という方針にむしろ合致する単純コピー。将来 BGRA 以外のネイティブ形式
-//!   変換（YUV→RGB 等）を追加する場合は per-pixel 演算になるため改めて判断が必要。
-//! - `enumerate`/`requestPermission`/`open`/`start`/`stop`/`close`: **初期化時 / イベント時のみ**
-//!   （フレーム毎・毎サンプルではない）。
+//! Hot path declaration:
+//! - **The delegate callback (`sampleBufferCallback`) is called every frame on the capture thread (a dedicated
+//!   GCD thread, in real time at roughly the camera's fps, 30fps by default)**. Within that region malloc, locking, IO and panic are forbidden
+//!   (the same strength as the existing audio backends' real-time contract). All it does is `CVPixelBufferLockBaseAddress`
+//!   (a lock the API contract requires, not a general mutex) plus `copyBgraRows` (a row copy) plus
+//!   `TripleBuffer.publish()` (with no alloc or lock). The buffers are allocated up front at `open()`.
+//! - **`copyBgraRows`**: per frame, over what amounts to every pixel. It is only an `@memcpy` absorbing the stride, with no
+//!   per-pixel arithmetic (blending or division), so the performance rules' three rules for an all-pixel loop (SIMD, div255,
+//!   clip hoisting) are judged not to apply. It is a plain copy, which if anything matches the existing rule recommending
+//!   an `@memset` or bulk-write fast path for an opaque full-area fill. Adding a conversion from a native format
+//!   other than BGRA (YUV to RGB, say) would make it per-pixel arithmetic and needs judging afresh.
+//! - `enumerate`, `requestPermission`, `open`, `start`, `stop` and `close`: **initialisation time or event time only**
+//!   (neither per frame nor per sample).
 
 const std = @import("std");
 const types = @import("capture_types");
 const objc = @import("objc_runtime");
 
 // ============================================================================
-// AVFoundation / CoreMedia / CoreVideo C ABI（最小サブセット）
+// the AVFoundation, CoreMedia and CoreVideo C ABI (a minimal subset)
 // ============================================================================
 
-/// AVFoundation.framework が公開する `NSString * const AVMediaTypeVideo` 定数。
+/// The `NSString * const AVMediaTypeVideo` constant AVFoundation.framework publishes.
 extern "c" const AVMediaTypeVideo: objc.Id;
 
-/// CoreMedia.framework: `CMSampleBufferRef` から `CVImageBufferRef`（実体は `CVPixelBufferRef`）を
-/// 取り出す（C API。ObjC 不要）。
+/// CoreMedia.framework: takes the `CVImageBufferRef` (really a `CVPixelBufferRef`) out of a
+/// `CMSampleBufferRef` (a C API, needing no ObjC).
 extern "c" fn CMSampleBufferGetImageBuffer(sbuf: objc.Id) objc.Id;
 
-/// CoreVideo.framework: `CVPixelBuffer` 系 C API。
+/// CoreVideo.framework: the `CVPixelBuffer` C APIs.
 extern "c" fn CVPixelBufferLockBaseAddress(pixel_buffer: objc.Id, lock_flags: u64) i32; // CVReturn
 extern "c" fn CVPixelBufferUnlockBaseAddress(pixel_buffer: objc.Id, lock_flags: u64) i32;
 extern "c" fn CVPixelBufferGetBaseAddress(pixel_buffer: objc.Id) ?*anyopaque;
@@ -56,31 +56,31 @@ extern "c" fn CVPixelBufferGetBytesPerRow(pixel_buffer: objc.Id) usize;
 extern "c" fn CVPixelBufferGetWidth(pixel_buffer: objc.Id) usize;
 extern "c" fn CVPixelBufferGetHeight(pixel_buffer: objc.Id) usize;
 
-/// CoreVideo.framework が公開する `NSString * const kCVPixelBufferPixelFormatTypeKey` 定数。
+/// The `NSString * const kCVPixelBufferPixelFormatTypeKey` constant CoreVideo.framework publishes.
 extern "c" const kCVPixelBufferPixelFormatTypeKey: objc.Id;
-/// 出力ピクセルバッファのサイズを要求する CoreVideo キー。videoSettings に指定すると AVFoundation が
-/// **フル画角をこのサイズへスケール**して配信する。未指定だと session preset の native 解像度
-/// （640x480 等）で配信され、`onFrame` の `copyBgraRows` が左上 `min(src, 要求)` だけコピー＝画角の
-/// 一部だけをクロップ表示してしまう（TASK-49.6 実機検証で判明。要求 320x240 に対し native をクロップ）。
+/// The CoreVideo key requesting the output pixel buffer's size. Setting it in videoSettings makes AVFoundation
+/// **scale the full field of view to that size** before delivery. Left unset, delivery uses the session preset's native
+/// resolution (640x480 and the like) and `onFrame`'s `copyBgraRows` copies only the top-left `min(src, requested)`,
+/// so only part of the field of view is shown, cropped.
 extern "c" const kCVPixelBufferWidthKey: objc.Id;
 extern "c" const kCVPixelBufferHeightKey: objc.Id;
 
 const kCVPixelBufferLock_ReadOnly: u64 = 0x0000_0001;
-/// 'BGRA' の FourCharCode（数値定数。NSString ではない）。
+/// The FourCharCode of 'BGRA' (a numeric constant, not an NSString).
 const kCVPixelFormatType_32BGRA: u32 = 0x4247_5241;
 
-/// libdispatch（GCD。libSystem 内蔵。frameworkリンク不要）。
+/// libdispatch (GCD, built into libSystem, needing no framework link).
 extern "c" fn dispatch_queue_create(label: ?[*:0]const u8, attr: ?*anyopaque) ?*anyopaque;
 extern "c" fn dispatch_release(object: ?*anyopaque) void;
 extern "c" fn dispatch_sync_f(queue: ?*anyopaque, context: ?*anyopaque, work: *const fn (?*anyopaque) callconv(.c) void) void;
 
 // ============================================================================
-// 正規化: ストライド吸収の行コピー（フレーム毎。ホットパス宣言はファイル冒頭）
+// Normalising: a row copy absorbing the stride (per frame; the hot path declaration is at the head of the file)
 // ============================================================================
 
-/// `src`（`src_bytes_per_row` でパディングされた BGRA8 ネイティブバッファ）から `dst`
-/// （`dst_stride` pixel 単位で確保済みの固定バッファ）へ、`width`x`height` 分を行単位でコピーする。
-/// per-pixel 演算は無い単純な `@memcpy`（性能規約の適用外。理由はファイル冒頭のホットパス宣言）。
+/// Copies `width`x`height` worth, row by row, from `src` (a native BGRA8 buffer padded to
+/// `src_bytes_per_row`) into `dst` (a fixed buffer allocated in units of `dst_stride` pixels).
+/// A plain `@memcpy` with no per-pixel arithmetic (outside the performance rules; the reasoning is in the hot path declaration at the head of the file).
 pub fn copyBgraRows(
     dst: []u32,
     dst_stride: u32,
@@ -100,7 +100,7 @@ pub fn copyBgraRows(
 }
 
 // ============================================================================
-// 権限
+// permission
 // ============================================================================
 
 fn mapAuthStatus(status: i64) types.PermissionState {
@@ -113,9 +113,9 @@ fn mapAuthStatus(status: i64) types.PermissionState {
     };
 }
 
-/// カメラ権限を要求し、確定した状態を返す（ブロッキング）。**未決定(.not_determined)からのみ
-/// 実際に TCC ダイアログを試みる**（既に granted/denied/restricted な場合は再ダイアログを出さず
-/// 即座にその状態を返す。自動テストからは呼ばないこと。手動検証レンジ。backlog task-49.2 参照）。
+/// Requests camera permission and returns the settled state (blocking). **Only from not_determined does it
+/// actually attempt the TCC dialogue** (when it is already granted, denied or restricted it raises no second dialogue and
+/// returns that state at once). Do not call it from an automated test; it is for manual verification.
 pub fn requestPermission() types.CaptureError!types.PermissionState {
     const initial = mapAuthStatus(objc.avAuthorizationStatus(AVMediaTypeVideo));
     if (initial != .not_determined) return initial;
@@ -124,11 +124,11 @@ pub fn requestPermission() types.CaptureError!types.PermissionState {
 }
 
 // ============================================================================
-// 列挙
+// enumeration
 // ============================================================================
 
-/// 接続中のカメラを列挙する。`AVCaptureDevice.devicesWithMediaType:`（列挙自体は TCC 権限を
-/// 要求しない。実機での動作確認は手動検証レンジ）。
+/// Enumerates the connected cameras with `AVCaptureDevice.devicesWithMediaType:` (enumeration itself requires no
+/// TCC permission. Confirming it against real hardware is for manual verification).
 pub fn enumerate(allocator: std.mem.Allocator) types.CaptureError![]types.DeviceInfo {
     const cls = objc.getClass("AVCaptureDevice");
     const devices_ns = objc.msgSend(objc.Id, cls, objc.sel("devicesWithMediaType:"), .{AVMediaTypeVideo});
@@ -161,7 +161,7 @@ pub fn enumerate(allocator: std.mem.Allocator) types.CaptureError![]types.Device
 }
 
 // ============================================================================
-// 動的 delegate クラス（sample buffer 受信）
+// the dynamic delegate class (receiving sample buffers)
 // ============================================================================
 
 var delegate_class: objc.Class = null;
@@ -170,9 +170,9 @@ fn noopDrain(ctx: ?*anyopaque) callconv(.c) void {
     _ = ctx;
 }
 
-/// capture スレッド（GCD queue）で呼ばれる。**RT 契約区間**: malloc/lock/IO/panic 禁止
-/// （ファイル冒頭のホットパス宣言）。`g_active_state` は atomic 経由でのみ読む
-/// （`close()` が別スレッド=main から null 化するため）。
+/// Called on the capture thread (a GCD queue). **A real-time contract region**: no malloc, locking, IO or panic
+/// (see the hot path declaration at the head of the file). `g_active_state` is read only through an atomic,
+/// because `close()` nulls it from another thread, namely main.
 fn sampleBufferCallback(self_: objc.Id, _cmd: objc.SEL, output: objc.Id, sample_buffer: objc.Id, connection: objc.Id) callconv(.c) void {
     _ = self_;
     _ = _cmd;
@@ -202,15 +202,15 @@ fn sampleBufferCallback(self_: objc.Id, _cmd: objc.SEL, output: objc.Id, sample_
         .height = state.height,
         .stride = state.width,
         .format = .bgra8,
-        .timestamp_ns = 0, // MVP: CMSampleBuffer の PTS 変換は未実装（フォローアップ）
+        .timestamp_ns = 0, // MVP: converting CMSampleBuffer's PTS is not implemented
         .frame_index = frame_index,
     });
 }
 
-/// `VPCameraCaptureDelegate`（NSObject サブクラス。`captureOutput:didOutputSampleBuffer:
-/// fromConnection:` のみ実装）を初回のみ動的生成する。プロセス内で1回だけ登録される
-/// （`objc_allocateClassPair` は同名クラスが既にあれば null を返すため、その場合は
-/// `objc_getClass` で既存クラスを拾う防御を入れる）。
+/// Dynamically creates `VPCameraCaptureDelegate` (an NSObject subclass implementing only
+/// `captureOutput:didOutputSampleBuffer:fromConnection:`) on the first call alone. It is registered exactly once per
+/// process (`objc_allocateClassPair` returns null when a class of the same name already exists, and in that case
+/// a guard picks up the existing class with `objc_getClass`).
 fn ensureDelegateClass() objc.Class {
     if (delegate_class) |c| return c;
     const superclass = objc.getClass("NSObject");
@@ -220,8 +220,8 @@ fn ensureDelegateClass() objc.Class {
     };
     const sel_name = objc.sel("captureOutput:didOutputSampleBuffer:fromConnection:");
     _ = objc.class_addMethod(cls, sel_name, @ptrCast(&sampleBufferCallback), "v@:@@@");
-    // 実行時の意味論には影響しない（setSampleBufferDelegate:queue: 自体は raw runtime 経由なら
-    // プロトコル適合を検査しない）が、`conformsToProtocol:`/introspection の正しさのため宣言する。
+    // It does not affect the runtime semantics (setSampleBufferDelegate:queue: itself does not check protocol
+    // conformance when it goes through the raw runtime), but it is declared for the sake of `conformsToProtocol:` and introspection.
     if (objc.objc_getProtocol("AVCaptureVideoDataOutputSampleBufferDelegate")) |proto| {
         _ = objc.class_addProtocol(cls, proto);
     }
@@ -231,20 +231,20 @@ fn ensureDelegateClass() objc.Class {
 }
 
 // ============================================================================
-// 公開型
+// the public types
 // ============================================================================
 
 pub const MAX_VIDEO_DIM: u32 = 4096;
 
-/// 要求設定（あくまでヒント）。実効値は `open()` 後に `device.config()` で取得する。
+/// The requested settings (hints only). The effective values are read with `device.config()` after `open()`.
 pub const Config = struct {
-    device_id: ?[]const u8 = null, // MVP 未使用（既定カメラ固定。将来デバイス選択に対応）
+    device_id: ?[]const u8 = null, // unused in the MVP (the default camera is fixed; selecting a device comes later)
     width: u32 = 640,
     height: u32 = 480,
     frame_rate: u32 = 30,
 };
 
-/// `open()` が返す実効値。
+/// The effective values `open()` returns.
 pub const EffectiveConfig = struct {
     width: u32,
     height: u32,
@@ -265,11 +265,11 @@ const State = struct {
     allocator: std.mem.Allocator,
     triple: types.TripleBuffer(types.VideoFrame),
     frame_counter: std.atomic.Value(u64),
-    slot_pixels: [3][]u32, // TripleBuffer の3スロットそれぞれに対応する物理ピクセルバッファ
+    slot_pixels: [3][]u32, // the physical pixel buffer corresponding to each of the TripleBuffer's three slots
 };
 
-/// プロセス内シングルトン（MVP の簡略化。ファイル冒頭コメント参照）。capture スレッドと main
-/// スレッドの双方から触るため atomic。
+/// A process-wide singleton (an MVP simplification; see the comment at the head of the file). It is atomic
+/// because both the capture thread and the main thread touch it.
 var g_active_state: std.atomic.Value(?*State) = .init(null);
 
 pub const VideoDevice = struct {
@@ -296,15 +296,15 @@ pub const VideoDevice = struct {
         self.state.running = false;
     }
 
-    /// stop → **delegate を output から detach**（`setSampleBufferDelegate:queue:` に
-    /// nil,nil。以後 output は新規 callback を一切 enqueue しない）→ `g_active_state` を null 化
-    /// → capture queue を drain（detach 前に**既に**enqueue 済みだった callback の完了を待つ。
-    /// 同一 serial queue 上の `dispatch_sync_f` no-op で保証）→ ObjC オブジェクト解放 →
-    /// 物理バッファ解放 → State 破棄。
+    /// stop, then **detach the delegate from the output** (`setSampleBufferDelegate:queue:` with
+    /// nil and nil, after which the output enqueues no new callback at all), then null `g_active_state`,
+    /// then drain the capture queue (waiting for callbacks that had **already** been enqueued before the detach to
+    /// finish, guaranteed by a no-op `dispatch_sync_f` on the same serial queue), then release the ObjC objects,
+    /// then free the physical buffers, then destroy the State.
     ///
-    /// detach を drain より先に行うのが重要（codex レビュー指摘）: `g_active_state` の null 化と
-    /// drain だけでは「drain 後に AVFoundation が新しい callback を enqueue する」余地が残り、
-    /// 解放済み delegate への use-after-free になり得る。delegate を先に外せばそのリスクが無い。
+    /// Detaching before draining matters: nulling `g_active_state` and draining alone would still leave room for
+    /// AVFoundation to enqueue a new callback after the drain, which could be a use-after-free on the released
+    /// delegate. Detaching the delegate first removes that risk.
     pub fn close(self: VideoDevice) void {
         const state = self.state;
         if (state.running) {
@@ -325,28 +325,28 @@ pub const VideoDevice = struct {
         state.allocator.destroy(state);
     }
 
-    /// 直近フレームを非ブロッキングで取得する。1度も publish されていなければ `null`
-    /// （`open`直後/capture開始前。設計文書3.2）。
+    /// Gets the most recent frame without blocking. `null` when nothing has been published yet
+    /// (right after `open`, or before capture starts).
     pub fn pollLatestFrame(self: VideoDevice) ?types.VideoFrame {
         if (self.state.frame_counter.load(.monotonic) == 0) return null;
         return self.state.triple.acquire().*;
     }
 };
 
-/// カメラを開く。`cfg.width`/`height`/`frame_rate` がいずれか 0、または `MAX_VIDEO_DIM` を超える
-/// 場合は AVFoundation を一切呼ばず `error.ConfigFailed`（自動テスト対象。暴走確保防止）。
-/// それ以外の経路（実際に `AVCaptureSession` を組み立てる）は実デバイス・TCC 権限に依存するため
-/// 自動テストからは呼ばない（手動検証レンジ。backlog task-49.2 参照）。
+/// Opens the camera. When `cfg.width`, `height` or `frame_rate` is 0, or exceeds `MAX_VIDEO_DIM`,
+/// it calls no AVFoundation at all and gives `error.ConfigFailed` (this path is automatically tested, and it prevents a runaway allocation).
+/// The other path, which really does assemble an `AVCaptureSession`, depends on a real device and on TCC permission,
+/// so it is not called from an automated test; it is for manual verification.
 ///
-/// **同時に開けるカメラは 1 台のみ**（`g_active_state` プロセス内シングルトン。codex レビュー
-/// 指摘: 2 度目の `open()` を素通しすると、先に開いていた device の callback/`close()` が
-/// 後発の `State` を巻き込んで壊す）。既に active な場合は AVFoundation を呼ばず即
-/// `error.OpenFailed`（fail-fast チェック）。関数末尾でも `cmpxchgStrong` で再確認し、
-/// 2並行 `open()` の race を防ぐ（負けた側はここまでに確保した全リソースを errdefer で解放する）。
+/// **Only one camera can be open at a time** (`g_active_state` is a process-wide singleton: letting a second
+/// `open()` through would let the callback or `close()` of the device already open wreck the later
+/// `State`). When one is already active it calls no AVFoundation and gives
+/// `error.OpenFailed` at once (a fail-fast check). It is checked again at the end of the function with `cmpxchgStrong`
+/// to prevent a race between two concurrent `open()`s (the loser frees everything acquired so far through errdefer).
 pub fn open(allocator: std.mem.Allocator, cfg: Config) types.CaptureError!VideoDevice {
     if (cfg.width == 0 or cfg.height == 0 or cfg.frame_rate == 0) return error.ConfigFailed;
     if (cfg.width > MAX_VIDEO_DIM or cfg.height > MAX_VIDEO_DIM) return error.ConfigFailed;
-    if (g_active_state.load(.acquire) != null) return error.OpenFailed; // fail-fast（既に1台 open 中）
+    if (g_active_state.load(.acquire) != null) return error.OpenFailed; // fail-fast (one camera is already open)
 
     const device = objc.msgSend(objc.Id, objc.getClass("AVCaptureDevice"), objc.sel("defaultDeviceWithMediaType:"), .{AVMediaTypeVideo});
     if (device == null) return error.NoDevice;
@@ -365,12 +365,12 @@ pub fn open(allocator: std.mem.Allocator, cfg: Config) types.CaptureError!VideoD
     if (output == null) return error.OpenFailed;
     errdefer objc.msgSend(void, output, objc.sel("release"), .{});
 
-    // videoSettings = { kCVPixelBufferPixelFormatTypeKey: kCVPixelFormatType_32BGRA(数値) }
+    // videoSettings = { kCVPixelBufferPixelFormatTypeKey: kCVPixelFormatType_32BGRA (numeric) }
     const dict = objc.msgSend(objc.Id, objc.msgSend(objc.Id, objc.getClass("NSMutableDictionary"), objc.sel("alloc"), .{}), objc.sel("init"), .{});
     if (dict == null) return error.OpenFailed;
     const num = objc.msgSend(objc.Id, objc.getClass("NSNumber"), objc.sel("numberWithUnsignedInt:"), .{@as(u32, kCVPixelFormatType_32BGRA)});
     objc.msgSend(void, dict, objc.sel("setObject:forKey:"), .{ num, kCVPixelBufferPixelFormatTypeKey });
-    // 要求サイズを指定してフル画角をスケール配信させる（未指定だと native 解像度でクロップ。TASK-49.6）。
+    // Give the requested size so the full field of view is scaled before delivery (left unset it is cropped at the native resolution).
     const wnum = objc.msgSend(objc.Id, objc.getClass("NSNumber"), objc.sel("numberWithUnsignedInt:"), .{cfg.width});
     objc.msgSend(void, dict, objc.sel("setObject:forKey:"), .{ wnum, kCVPixelBufferWidthKey });
     const hnum = objc.msgSend(objc.Id, objc.getClass("NSNumber"), objc.sel("numberWithUnsignedInt:"), .{cfg.height});
@@ -400,7 +400,7 @@ pub fn open(allocator: std.mem.Allocator, cfg: Config) types.CaptureError!VideoD
     }
     while (allocated < 3) : (allocated += 1) {
         slot_pixels[allocated] = allocator.alloc(u32, n) catch return error.OpenFailed;
-        @memset(slot_pixels[allocated], 0xFF00_0000); // 未 publish 時は不透明黒（fb 初期値と対称）
+        @memset(slot_pixels[allocated], 0xFF00_0000); // opaque black before anything is published (symmetrical with the framebuffer's initial value)
     }
 
     const state = allocator.create(State) catch return error.OpenFailed;
@@ -414,9 +414,9 @@ pub fn open(allocator: std.mem.Allocator, cfg: Config) types.CaptureError!VideoD
         .timestamp_ns = 0,
         .frame_index = 0,
     });
-    // init() は3スロット全てに同じ initial 値を複製するため、各スロットが対応する物理バッファを
-    // 指すよう明示的に固定し直す（設計文書3.2「3枚の物理ピクセルバッファに固定」を open() 直後
-    // から満たす）。
+    // init() copies the same initial value into all three slots, so each slot is explicitly re-pinned to
+    // point at its own physical buffer (satisfying "fixed to three physical pixel buffers" from `open()`
+    // onwards).
     triple.bufs[0].pixels = slot_pixels[0];
     triple.bufs[1].pixels = slot_pixels[1];
     triple.bufs[2].pixels = slot_pixels[2];
@@ -437,8 +437,8 @@ pub fn open(allocator: std.mem.Allocator, cfg: Config) types.CaptureError!VideoD
         .slot_pixels = slot_pixels,
     };
 
-    // cmpxchg で再確認（2並行 open() の race に備える。fail-fast チェック後にもう1本の open() が
-    // 先に成立していたら、ここまでに確保した全リソースを errdefer で解放して失敗させる）。
+    // Check again with cmpxchg (guarding against a race between two concurrent open()s. If another open() got
+    // in first after the fail-fast check, everything acquired so far is freed through errdefer and this one fails).
     if (g_active_state.cmpxchgStrong(null, state, .acq_rel, .acquire) != null) {
         return error.OpenFailed;
     }
@@ -446,11 +446,11 @@ pub fn open(allocator: std.mem.Allocator, cfg: Config) types.CaptureError!VideoD
 }
 
 // ============================================================================
-// tests（display/実デバイス不要・OS 非依存の範囲のみ自動実行。手動テストは末尾）
+// tests (only the range needing no display or real device runs automatically; the manual tests are at the end)
 // ============================================================================
 const testing = std.testing;
 
-test "copyBgraRows: パディング付き source から stride 吸収で正しく抽出できる" {
+test "copyBgraRows: it extracts correctly from a padded source, absorbing the stride" {
     const width: u32 = 3;
     const height: u32 = 2;
     const bytes_per_row: usize = 16; // width*4=12 + 4 byte padding
@@ -460,7 +460,7 @@ test "copyBgraRows: パディング付き source から stride 吸収で正し�
     @memcpy(src[0..16], &row0);
     @memcpy(src[16..32], &row1);
 
-    var dst: [6]u32 = undefined; // stride == width == 3（パディング無し）
+    var dst: [6]u32 = undefined; // stride == width == 3 (no padding)
     copyBgraRows(&dst, 3, &src, bytes_per_row, width, height);
 
     var expected: [24]u8 = undefined;
@@ -469,10 +469,10 @@ test "copyBgraRows: パディング付き source から stride 吸収で正し�
     try testing.expectEqualSlices(u8, &expected, std.mem.sliceAsBytes(dst[0..]));
 }
 
-test "copyBgraRows: dst_stride > width でも正しい列に書く（dst 側のパディングも吸収）" {
+test "copyBgraRows: even with dst_stride > width it writes the correct columns (absorbing the padding on the dst side too)" {
     const width: u32 = 2;
     const height: u32 = 2;
-    const bytes_per_row: usize = 8; // width*4=8, パディング無し source
+    const bytes_per_row: usize = 8; // width*4=8, a source with no padding
     const row0 = [_]u8{ 1, 2, 3, 4, 5, 6, 7, 8 };
     const row1 = [_]u8{ 9, 10, 11, 12, 13, 14, 15, 16 };
     var src: [16]u8 = undefined;
@@ -483,34 +483,34 @@ test "copyBgraRows: dst_stride > width でも正しい列に書く（dst 側の�
     copyBgraRows(&dst, 4, &src, bytes_per_row, width, height);
 
     const dst_bytes = std.mem.sliceAsBytes(dst[0..]);
-    try testing.expectEqualSlices(u8, &row0, dst_bytes[0..8]); // row0 の実データ
-    try testing.expectEqual(@as(u32, 0xDEADBEEF), dst[2]); // row0 のパディング列は未変更
+    try testing.expectEqualSlices(u8, &row0, dst_bytes[0..8]); // row0's real data
+    try testing.expectEqual(@as(u32, 0xDEADBEEF), dst[2]); // row0's padding columns are unchanged
     try testing.expectEqual(@as(u32, 0xDEADBEEF), dst[3]);
-    try testing.expectEqualSlices(u8, &row1, dst_bytes[16..24]); // row1 (dst_stride=4 の位置から)
+    try testing.expectEqualSlices(u8, &row1, dst_bytes[16..24]); // row1 (from the dst_stride=4 position)
 }
 
-test "mapAuthStatus: AVAuthorizationStatus の4値を正しく写像する" {
+test "mapAuthStatus: it maps AVAuthorizationStatus's four values correctly" {
     try testing.expectEqual(types.PermissionState.not_determined, mapAuthStatus(0));
     try testing.expectEqual(types.PermissionState.restricted, mapAuthStatus(1));
     try testing.expectEqual(types.PermissionState.denied, mapAuthStatus(2));
     try testing.expectEqual(types.PermissionState.granted, mapAuthStatus(3));
-    try testing.expectEqual(types.PermissionState.denied, mapAuthStatus(99)); // 未知値は安全側(denied)
+    try testing.expectEqual(types.PermissionState.denied, mapAuthStatus(99)); // an unknown value errs on the safe side (denied)
 }
 
-test "open: width/height/frame_rate=0 は AVFoundation を呼ばず ConfigFailed" {
+test "open: a width, height or frame_rate of 0 gives ConfigFailed without calling AVFoundation" {
     try testing.expectError(error.ConfigFailed, open(testing.allocator, .{ .width = 0, .height = 8, .frame_rate = 30 }));
     try testing.expectError(error.ConfigFailed, open(testing.allocator, .{ .width = 8, .height = 0, .frame_rate = 30 }));
     try testing.expectError(error.ConfigFailed, open(testing.allocator, .{ .width = 8, .height = 8, .frame_rate = 0 }));
 }
 
-test "open: 解像度上限超過は AVFoundation を呼ばず ConfigFailed" {
+test "open: exceeding the resolution bound gives ConfigFailed without calling AVFoundation" {
     try testing.expectError(error.ConfigFailed, open(testing.allocator, .{ .width = MAX_VIDEO_DIM + 1, .height = 8, .frame_rate = 30 }));
     try testing.expectError(error.ConfigFailed, open(testing.allocator, .{ .width = 8, .height = MAX_VIDEO_DIM + 1, .frame_rate = 30 }));
 }
 
 // ============================================================================
-// 手動検証専用テスト（既定は SkipZigTest。実機で `VP_MANUAL_CAPTURE_TEST=1` を指定した時のみ
-// 実カメラを開く。TCC ダイアログ・実デバイスに触れるため自動テストには含めない）
+// Tests for manual verification only (SkipZigTest by default; a real camera is opened only when
+// `VP_MANUAL_CAPTURE_TEST=1` is set on real hardware. They touch the TCC dialogue and a real device, so they are not in the automated tests)
 // ============================================================================
 
 fn sleepMs(ms: u64) void {
@@ -521,7 +521,7 @@ fn sleepMs(ms: u64) void {
     _ = std.c.nanosleep(&req, null);
 }
 
-test "[MANUAL] 実カメラを開いて数フレーム受信できるか確認する（VP_MANUAL_CAPTURE_TEST=1 でのみ実行）" {
+test "[MANUAL] open a real camera and confirm a few frames arrive (runs only with VP_MANUAL_CAPTURE_TEST=1)" {
     if (std.c.getenv("VP_MANUAL_CAPTURE_TEST") == null) return error.SkipZigTest;
     const allocator = testing.allocator;
 

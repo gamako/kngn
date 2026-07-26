@@ -1,21 +1,21 @@
 //! Linux native camera capture backend (L1, raw V4L2 ioctl).
 //!
-//! libv4l2 は使わず、Linux kernel UAPI の ioctl と libc の open/close/mmap/munmap だけで
-//! YUYV capture を行う。V4L2 の MMAP バッファ4本は driver-owned の入力キューであり、
-//! 正規化後の BGRA を保持する `TripleBuffer` の3本の物理ピクセルバッファとは別物である。
+//! It does not use libv4l2, and does YUYV capture with nothing but the Linux kernel UAPI's ioctls and libc's
+//! open, close, mmap and munmap. V4L2's four MMAP buffers are a driver-owned input queue, and are
+//! distinct from the three physical pixel buffers of the `TripleBuffer` holding the normalised BGRA.
 //!
-//! ホットパス宣言:
-//! - **capture スレッド（`VIDIOC_DQBUF` の blocking pull、カメラ fps 相当）**: malloc/lock/IO/panic
-//!   禁止。open 時に固定確保した MMAP/TripleBuffer を使い、変換・publish・QBUF のみを行う。
-//! - **`yuyvToBgraRow`**: フレーム毎の全画素を処理する per-pixel 色変換で、macOS の
-//!   `copyBgraRows`（単純な行 `@memcpy`）とは異なり、整数乗算・加算・クランプを行う。
-//!   MVP は固定小数点スカラー実装とし、SIMD 化は本タスクのベンチ結果次第とする。
-//! - enumerate/open/start/stop/close は初期化・イベント時のみ。
+//! Hot path declaration:
+//! - **The capture thread (a blocking `VIDIOC_DQBUF` pull, at roughly the camera's fps)**: no malloc, locking, IO or panic.
+//!   It uses the MMAP and TripleBuffer allocated up front at open, and only converts, publishes and QBUFs.
+//! - **`yuyvToBgraRow`**: a per-pixel colour conversion processing every pixel of every frame. Unlike macOS's
+//!   `copyBgraRows` (a plain row `@memcpy`) it does integer multiplication, addition and clamping.
+//!   The MVP is a fixed-point scalar implementation, and whether to make it SIMD depends on the benchmark results.
+//! - enumerate, open, start, stop and close run at initialisation or event time only.
 
 const std = @import("std");
 const types = @import("capture_types");
 
-// libc ABI. ioctl は可変長C関数を固定ポインタ引数として宣言する既存方針に合わせる。
+// The libc ABI. ioctl is declared with fixed pointer arguments, following the existing approach to variadic C functions.
 extern "c" fn ioctl(fd: c_int, request: c_ulong, arg: ?*anyopaque) c_int;
 extern "c" fn __errno_location() *c_int;
 extern "c" fn mmap(addr: ?*anyopaque, length: usize, prot: c_int, flags: c_int, fd: c_int, offset: c_long) ?*anyopaque;
@@ -125,9 +125,9 @@ const v4l2_buffer = extern struct {
     timestamp: timeval,
     timecode: v4l2_timecode,
     sequence: u32,
-    memory: u32, // UAPI は sequence と m の間に __u32 memory を持つ。省くと m 前の align パディングが
-    // 偶然 4byte を埋めて sizeof/m/length offset は一致するが、memory を設定できず QUERYBUF/QBUF/
-    // DQBUF が EINVAL になる（実機で判明。offsetof(memory)==60 の assert で再発防止）。
+    memory: u32, // The UAPI has a __u32 memory between sequence and m. Leaving it out happens to make the alignment padding
+    // before m fill 4 bytes, so sizeof and the offsets of m and length still match, but memory cannot be set and QUERYBUF, QBUF
+    // and DQBUF return EINVAL (an assert on offsetof(memory)==60 prevents a recurrence).
     m: extern union {
         offset: u32,
         userptr: u64,
@@ -157,7 +157,7 @@ comptime {
 pub const MAX_VIDEO_DIM: u32 = 4096;
 
 pub const Config = struct {
-    device_id: ?[]const u8 = null, // MVP は /dev/video0 固定
+    device_id: ?[]const u8 = null, // the MVP is fixed to /dev/video0
     width: u32 = 640,
     height: u32 = 480,
     frame_rate: u32 = 30,
@@ -212,7 +212,7 @@ pub const VideoDevice = struct {
         };
     }
 
-    /// `running=false` を先に公開してから STREAMOFF で blocking DQBUF を解除し、join する。
+    /// It publishes `running=false` first, releases the blocking DQBUF with STREAMOFF, and then joins.
     pub fn stop(self: VideoDevice) void {
         const state = self.state;
         if (state.thread) |thread| {
@@ -325,7 +325,7 @@ fn captureThread(state: *State) void {
     while (state.running.load(.acquire)) {
         var buffer = std.mem.zeroes(v4l2_buffer);
         buffer.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
-        buffer.memory = V4L2_MEMORY_MMAP; // DQBUF は type/memory 必須（未設定=memory 0 だと厳格 driver が EINVAL）
+        buffer.memory = V4L2_MEMORY_MMAP; // DQBUF requires type and memory (leaving memory at 0 makes a strict driver return EINVAL)
         if (ioctl(state.fd, VIDIOC_DQBUF, @ptrCast(&buffer)) < 0) break;
         if (!state.running.load(.acquire)) break;
         if (buffer.index >= state.buffer_count) break;
@@ -389,7 +389,7 @@ pub fn open(allocator: std.mem.Allocator, cfg: Config) types.CaptureError!VideoD
     while (i < buffer_count) : (i += 1) {
         var buffer = std.mem.zeroes(v4l2_buffer);
         buffer.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
-        buffer.memory = V4L2_MEMORY_MMAP; // QUERYBUF は type/memory/index 必須（memory 未設定だと EINVAL）
+        buffer.memory = V4L2_MEMORY_MMAP; // QUERYBUF requires type, memory and index (EINVAL when memory is unset)
         buffer.index = i;
         if (ioctl(fd, VIDIOC_QUERYBUF, @ptrCast(&buffer)) < 0) return error.OpenFailed;
         const mapped = mmap(null, buffer.length, PROT_READ | PROT_WRITE, MAP_SHARED, fd, @intCast(buffer.m.offset));
@@ -401,7 +401,7 @@ pub fn open(allocator: std.mem.Allocator, cfg: Config) types.CaptureError!VideoD
     while (i < buffer_count) : (i += 1) {
         var buffer = std.mem.zeroes(v4l2_buffer);
         buffer.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
-        buffer.memory = V4L2_MEMORY_MMAP; // QBUF も type/memory/index 必須
+        buffer.memory = V4L2_MEMORY_MMAP; // QBUF requires type, memory and index too
         buffer.index = i;
         if (ioctl(fd, VIDIOC_QBUF, @ptrCast(&buffer)) < 0) return error.OpenFailed;
     }
@@ -454,21 +454,21 @@ test "yuyvToBgraRow: gray and red known bytes become canonical BGRA values" {
     try testing.expectEqual(@as(u32, 0xFFFF_0000), dst[1]);
 }
 
-test "open: width/height/frame_rate=0 は V4L2 を呼ばず ConfigFailed" {
+test "open: a width, height or frame_rate of 0 gives ConfigFailed without calling V4L2" {
     try testing.expectError(error.ConfigFailed, open(testing.allocator, .{ .width = 0, .height = 8, .frame_rate = 30 }));
     try testing.expectError(error.ConfigFailed, open(testing.allocator, .{ .width = 8, .height = 0, .frame_rate = 30 }));
     try testing.expectError(error.ConfigFailed, open(testing.allocator, .{ .width = 8, .height = 8, .frame_rate = 0 }));
 }
 
-test "open: 解像度上限超過は V4L2 を呼ばず ConfigFailed" {
+test "open: exceeding the resolution bound gives ConfigFailed without calling V4L2" {
     try testing.expectError(error.ConfigFailed, open(testing.allocator, .{ .width = MAX_VIDEO_DIM + 1, .height = 8, .frame_rate = 30 }));
     try testing.expectError(error.ConfigFailed, open(testing.allocator, .{ .width = 8, .height = MAX_VIDEO_DIM + 1, .frame_rate = 30 }));
 }
 
-test "enumerate/requestPermission: 実 V4L2 を呼んでもクラッシュ/ハングせず妥当な結果を返す" {
-    // デバイス有無は環境依存（0台の CI/リモート機も、実カメラ持ちの機もある）なので台数は assert
-    // しない。open は非ブロッキング・QUERYCAP は即時なのでハングしない（Linux に TCC 相当は無い）。
-    // enumerate が返す id/name の allocator 契約（freeDeviceList で対称解放）も同時に検証する。
+test "enumerate and requestPermission: calling the real V4L2 neither crashes nor hangs, and returns a sensible result" {
+    // Whether a device exists depends on the environment (there are CI and remote machines with none, and machines with a
+    // real camera), so the count is not asserted. open is non-blocking and QUERYCAP returns immediately, so it cannot hang (Linux has no equivalent of TCC).
+    // The allocator contract for the id and name enumerate returns (freed symmetrically by freeDeviceList) is checked at the same time.
     const devices = try enumerate(testing.allocator);
     defer types.freeDeviceList(testing.allocator, devices);
     const perm = try requestPermission();
@@ -480,14 +480,14 @@ test "enumerate/requestPermission: 実 V4L2 を呼んでもクラッシュ/ハ�
     }
 }
 
-// 手動検証専用（既定 SkipZigTest。実カメラを掴むため VP_CAPTURE_FULL_SMOKE=1 の時のみ実行）。
-// open→start→pollLatestFrame→stop→close の全サイクルと、特に stop() の STREAMOFF が blocking
-// DQBUF を確実に unblock して join できるかを実機で確認する（audio_macos.zig の VP_MANUAL_CAPTURE_TEST
-// と同じ手動テスト規約）。YUYV 非対応/デバイス不在は best-effort で許容（NoDevice/ConfigFailed は skip）。
-test "full cycle (manual): open→start→pollLatestFrame→stop→close が実カメラでハングせず回る" {
+// For manual verification only (SkipZigTest by default; it runs only with VP_CAPTURE_FULL_SMOKE=1, since it takes a real camera).
+// It checks on real hardware the whole cycle of open, start, pollLatestFrame, stop and close, and above all whether stop()'s
+// STREAMOFF reliably unblocks the blocking DQBUF so that the join completes (the same manual test convention as
+// audio_macos.zig's VP_MANUAL_CAPTURE_TEST). A lack of YUYV support or of a device is tolerated best-effort (NoDevice and ConfigFailed skip).
+test "full cycle (manual): open, start, pollLatestFrame, stop and close go round on a real camera without hanging" {
     if (std.c.getenv("VP_CAPTURE_FULL_SMOKE") == null) return error.SkipZigTest;
     var dev = open(testing.allocator, .{ .width = 640, .height = 480, .frame_rate = 30 }) catch |err| {
-        std.debug.print("[v4l2 full] open failed: {s}（best-effort: YUYV 非対応/デバイス不在で許容）\n", .{@errorName(err)});
+        std.debug.print("[v4l2 full] open failed: {s} (best-effort: a lack of YUYV support or of a device is tolerated)\n", .{@errorName(err)});
         return;
     };
     defer dev.close();
@@ -496,7 +496,7 @@ test "full cycle (manual): open→start→pollLatestFrame→stop→close が実�
     try dev.start();
     var got: ?types.VideoFrame = null;
     var tries: usize = 0;
-    while (tries < 100) : (tries += 1) { // 最大 ~2s（20ms×100）実時間で 1 フレームを待つ
+    while (tries < 100) : (tries += 1) { // wait up to about 2s (20ms × 100) in real time for one frame
         if (dev.pollLatestFrame()) |f| {
             got = f;
             break;
@@ -507,8 +507,8 @@ test "full cycle (manual): open→start→pollLatestFrame→stop→close が実�
     if (got) |f| {
         std.debug.print("[v4l2 full] frame received: {d}x{d} stride={d} idx={d}\n", .{ f.width, f.height, f.stride, f.frame_index });
     } else {
-        std.debug.print("[v4l2 full] no frame within timeout（best-effort: stop→close のハング有無を確認）\n", .{});
+        std.debug.print("[v4l2 full] no frame within timeout (best-effort: checking whether stop and close hang)\n", .{});
     }
-    dev.stop(); // ← STREAMOFF で blocking DQBUF を unblock → join。ハングしないことがこのテストの主眼。
-    std.debug.print("[v4l2 full] stop/close ok（STREAMOFF が DQBUF を unblock した）\n", .{});
+    dev.stop(); // STREAMOFF unblocks the blocking DQBUF so the join completes. Not hanging is this test's whole point.
+    std.debug.print("[v4l2 full] stop/close ok (STREAMOFF unblocked DQBUF)\n", .{});
 }
