@@ -1,19 +1,19 @@
-//! Pixie MVP: libs/gui UI + Pen/Eraser/DB16 パレット/Undo/PNG 保存
+//! Pixie MVP: libs/gui UI + Pen/Eraser/DB16 palette / Undo / PNG save
 //!
-//! - レイアウト: menu bar / PanelHost(left=History, center=canvas, right=Color/Palette/
-//!   Tool Options/Layers, bottom=Timeline) / status bar（TASK-148.1）
-//! - canvas 入力: press 起点 capture（canvas_input.zig の状態機械）。stroke 中は GUI 上に
-//!   逸れても継続（座標は clamp なし変換 + ピクセル側 clip）
-//! - Tool / Undo: core の Tool(Pen/Eraser) / StrokeRecorder / UndoStack（TASK-21.7 で core 化）
-//! - ファイル I/O: Cmd+S=保存(記憶パス) / Cmd+Shift+S=名前を付けて保存 / Cmd+O=開く（TASK-24）。
-//!   ファイルダイアログは framebuffer lock 中に呼べない（再入の危険）ため、handleKey/ボタンは
-//!   pending_file_op をセットするだけにし、フレーム末の安全点 runPendingFileOp() で実行する。
-//! - キー: B=Pen / E=Eraser / C=全消去 / Cmd+Z=Undo / Cmd+Shift+Z=Redo
-//!         ESC・Cmd+Q=終了（ウィンドウクローズ含め running=false の単一経路）
+//! - Layout: menu bar / PanelHost(left=History, center=canvas, right=Color/Palette/
+//!   Tool Options/Layers, bottom=Timeline) / status bar
+//! - Canvas input: press-start capture (canvas_input.zig state machine). During a stroke,
+//!   continue even if the pointer leaves over the GUI (unclamped transform + pixel-side clip)
+//! - Tool / Undo: core Tool(Pen/Eraser) / StrokeRecorder / UndoStack
+//! - File I/O: Cmd+S=save (remembered path) / Cmd+Shift+S=save as / Cmd+O=open.
+//!   File dialogs must not run under the framebuffer lock (re-entrancy risk), so handleKey/buttons
+//!   only set pending_file_op; runPendingFileOp() executes them at the end-of-frame safe point.
+//! - Keys: B=Pen / E=Eraser / C=clear all / Cmd+Z=Undo / Cmd+Shift+Z=Redo
+//!         ESC / Cmd+Q=quit (including window close: single path sets running=false)
 
 const std = @import("std");
 const builtin = @import("builtin");
-const kit = @import("kit"); // 公開 umbrella（ADR-007 R4/R5: apps は kit-only 消費者）
+const kit = @import("kit"); // Public umbrella (ADR-007 R4/R5: apps are kit-only consumers)
 const platform = kit.platform;
 const gui = kit.gui;
 const recipe = kit.recipe;
@@ -45,27 +45,27 @@ const text_content_input = @import("text_content_input.zig");
 const history_summary = @import("history_summary.zig");
 const history_thumbnail = @import("history_thumbnail.zig");
 
-// レイヤー名の最大長は libs/paint（保存側）と pixie（編集バッファ側）で独立定義しているため
-// （循環 import 回避。詳細は layer_rename_input.zig 冒頭）、乖離しないことを comptime で保証する。
+// Layer-name max length is defined independently in libs/paint (save side) and pixie (edit buffer)
+// (avoids a cyclic import; see the top of layer_rename_input.zig). Comptime-assert they match.
 comptime {
     if (core.layer_name_max != layer_rename_input.max_len) {
         @compileError("layer_name_max mismatch between paint.Canvas and layer_rename_input");
     }
 }
-// テキストレイヤー内容の最大長も同様に独立定義しているため乖離しないことを保証する（TASK-79.5）。
+// Text-layer content max length is likewise independently defined; comptime-assert they match.
 comptime {
     if (core.text_content_max != text_content_input.max_len) {
         @compileError("text_content_max mismatch between paint.Canvas and text_content_input");
     }
 }
-// brush size 上限も actions.zig（std のみ）と paint 側で独立定義しているため乖離を防ぐ（TASK-62.5.3）。
+// Brush-size max is likewise independently defined in actions.zig (std-only) and paint; guard drift.
 comptime {
     if (actions.MAX_BRUSH_SIZE != core.Brush.MAX_SIZE) {
         @compileError("MAX_BRUSH_SIZE mismatch between actions.zig and paint.Brush");
     }
 }
-// TASK-162: RELAY_STROKE_CHUNK_POINTS の worst-case args が実 MAX_CMD_ARGS に収まること
-// （actions.zig は std のみのため 4096 リテラルで自己検査。ここが drift guard）。
+// Drift guard: RELAY_STROKE_CHUNK_POINTS worst-case args must fit the real MAX_CMD_ARGS
+// (actions.zig is std-only so it self-checks against a 4096 literal; this is the platform-side guard).
 comptime {
     const commit_framing = 12 + "stroke ".len;
     const worst_head =
@@ -82,28 +82,28 @@ comptime {
 
 const WINDOW_W: u32 = 780;
 const WINDOW_H: u32 = 600;
-/// 起動時既定キャンバスサイズ（実行時サイズは `doc.width` / `doc.height`）。
+/// Default canvas size at startup (runtime size is `doc.width` / `doc.height`).
 const DEFAULT_CANVAS_W: u32 = 256;
 const DEFAULT_CANVAS_H: u32 = 256;
-// ビューポート（TASK-153.2）: rational Zoom（1/4..1/2 + 整数 1..32）。既定 2x。
+// Viewport: rational Zoom (1/4..1/2 plus integer 1..32). Default 2x.
 
-/// パンドラッグの開始入力種別（開始時に latch。Cmd が move に載らない backend でも完走させる）
+/// Input kind that started a pan drag (latched at start so backends that omit Cmd on move still finish)
 const PanKind = enum { space_left, middle, cmd_left };
-// 透明背景チェッカー（screen 固定セル。canonical BGRA 0xAARRGGBB）
-// チェッカー定数の単一ソースは blit.zig（TASK-54 で移動）
+// Transparent-background checker (screen-fixed cells; canonical BGRA 0xAARRGGBB)
+// Single source for checker constants is blit.zig
 const CHECKER_LIGHT = blit.CHECKER_LIGHT;
 const CHECKER_DARK = blit.CHECKER_DARK;
-// PanelHost スロット寸法の既定（TASK-148.1。旧 TASK-42 の right/bottom pane 定数を継承）。
+// Default PanelHost slot extents (inherits the former right/bottom pane constants).
 const RIGHT_PANE_DEFAULT: i32 = 200;
 const RIGHT_PANE_MIN: i32 = 120;
 const LEFT_PANE_DEFAULT: i32 = 200;
 const LEFT_PANE_MIN: i32 = 120;
 const BOTTOM_PANE_DEFAULT: i32 = 120;
 const BOTTOM_PANE_MIN: i32 = 80;
-const CANVAS_MIN: i32 = 120; // pane リサイズ時に canvas へ残す最小辺
-const SPLITTER_T: i32 = 6; // 境界帯の太さ
+const CANVAS_MIN: i32 = 120; // Minimum canvas edge kept when resizing panes
+const SPLITTER_T: i32 = 6; // Splitter band thickness
 
-/// PanelHost の安定 panel name（Preferences / Collapsible / View メニューで共用）。
+/// Stable PanelHost panel names (shared by Preferences / Collapsible / View menu).
 const PanelNames = struct {
     pub const history = "History";
     pub const color = "Color";
@@ -113,20 +113,20 @@ const PanelNames = struct {
     pub const timeline = "Timeline";
 };
 
-/// `digest panels` 用の 1 パネル分 rect（y/h）。
+/// One panel's rect (y/h) for `digest panels`.
 const PanelProbeRect = struct { y: i32, h: i32 };
 const SAVE_MSG_DURATION: f64 = 3.0;
-// 範囲選択のマーチングアンツ（TASK-44）。phase 速度（units/sec）と周期（=2*DASH。selection_overlay の DASH=4）。
+// Selection marching ants. Phase speed (units/sec) and period (=2*DASH; selection_overlay DASH=4).
 const MARCH_SPEED: f64 = 12.0;
 const MARCH_PERIOD: f64 = 8.0;
 
-/// ファイル操作要求。framebuffer lock 中（フレーム処理中）に発生した要求を保持し、
-/// unlock 後の安全点で 1 回だけ実行する（ダイアログのモーダルループ再入を避ける）。
+/// File-op request. Holds a request that arrived under the framebuffer lock (during frame work)
+/// and runs it once at the post-unlock safe point (avoids re-entering a dialog modal loop).
 const FileOp = enum { save, save_as, open, save_palette, load_palette, save_project, open_project, export_seq, export_sheet, confirm_save_as };
 
-// ── File/Edit/View Command 定義（TASK-97.2）────────────────────────────────
-// ID は stable。separator は INVALID_COMMAND_ID。GUI fallback / keyboard / menu_command が
-// 同じ App.dispatchCommand へ到達する。
+// ── File/Edit/View Command definitions ────────────────────────────────
+// IDs are stable. Separators use INVALID_COMMAND_ID. GUI fallback / keyboard / menu_command
+// all reach the same App.dispatchCommand.
 const CmdId = struct {
     pub const open: platform.CommandId = 1;
     pub const save: platform.CommandId = 2;
@@ -150,8 +150,8 @@ const CmdId = struct {
     pub const toggle_layers: platform.CommandId = 20;
 };
 
-/// TASK-144.2: New Size / Resize Canvas モーダル。TextBuffer は App 寿命で所有し、
-/// `size_dialog != null` のときだけ表示（storage へのポインタ）。
+/// New Size / Resize Canvas modal. TextBuffers are owned for the App lifetime and
+/// shown only while `size_dialog != null` (pointer into storage).
 const SizeDialogMode = enum { new_size, resize };
 const SizeDialogState = struct {
     mode: SizeDialogMode,
@@ -180,8 +180,8 @@ const SIZE_DIALOG_W_ID: gui.Id = SIZE_DIALOG_ID_BASE + 1;
 const SIZE_DIALOG_H_ID: gui.Id = SIZE_DIALOG_ID_BASE + 2;
 const SIZE_DIALOG_OK_ID: gui.Id = SIZE_DIALOG_ID_BASE + 3;
 const SIZE_DIALOG_CANCEL_ID: gui.Id = SIZE_DIALOG_ID_BASE + 4;
-/// status bar の zoom%/cursor 可変スロット（TASK-154）。layout 予約用の明示 ID。
-/// 実テキストは updateViewport 後に drawStatusBarLive が描く。
+/// Status-bar zoom%/cursor variable slots. Explicit IDs reserved for layout.
+/// Live text is drawn by drawStatusBarLive after updateViewport.
 const STATUS_BAR_ID_BASE: gui.Id = 0xA451_0000;
 const STATUS_CURSOR_ID: gui.Id = STATUS_BAR_ID_BASE + 1;
 const STATUS_ZOOM_ID: gui.Id = STATUS_BAR_ID_BASE + 2;
@@ -190,9 +190,9 @@ const STATUS_BAR_BG = gui.Color.rgba(0x28, 0x28, 0x30, 0xFF);
 const MENU_CMD_CAP = 40;
 const RECENT_CMD_BASE: platform.CommandId = 100;
 
-/// native menu dirty-gate 用（TASK-97.3）。
-/// label / top_menu は全文 hash+len（prefix 切り捨てだと recent path の suffix 差を取りこぼす）。
-/// shortcut は Optional の有無 + key/modifiers を保持する。
+/// Snapshot for the native-menu dirty gate.
+/// label / top_menu use full-string hash+len (prefix truncation would miss recent-path suffix diffs).
+/// shortcut keeps Optional presence plus key/modifiers.
 const NativeMenuSnap = struct {
     id: platform.CommandId,
     enabled: bool,
@@ -214,36 +214,36 @@ fn hashMenuStr(s: []const u8) u32 {
 const LAYER_PANEL_ID_BASE: gui.Id = 0xA430_0000;
 const LAYER_ROW_ID_BASE: gui.Id = 0xA430_1000;
 const LAYER_PANEL_ID_STRIDE: gui.Id = 8;
-/// レイヤー行の右クリックコンテキストメニュー（TASK-79.2）。popup primitive（TASK-79.1）の id。
+/// Layer-row right-click context menu id (popup primitive).
 const LAYER_CTX_MENU_ID: gui.Id = 0xA430_2000;
-/// テキストレイヤー編集パネル（TASK-79.5）の明示 ID 群。
+/// Explicit IDs for the text-layer edit panel.
 const TEXT_PANEL_ID_BASE: gui.Id = 0xA430_3000;
 const TEXT_EDIT_BOX_ID: gui.Id = TEXT_PANEL_ID_BASE + 6;
-/// レイヤー行 box 自身の明示 ID に使う `layerWidgetId` part（0..3 は既存: 0=選択ボタン/1=可視
-/// トグル/2=opacity slider/3=サムネ）。右クリックのヒットテストは行全体の矩形を使う。
+/// `layerWidgetId` part for the layer-row box itself (0..3 already used: 0=select button / 1=visibility
+/// toggle / 2=opacity slider / 3=thumb). Right-click hit-testing uses the full row rect.
 const LAYER_ROW_PART_ROW: gui.Id = 4;
 const LAYER_ROW_PART_IME: gui.Id = 5;
-/// 履歴パネル（TASK-83 Phase 1）の明示 ID 群。
+/// Explicit IDs for the history panel.
 const HISTORY_PANEL_ID_BASE: gui.Id = 0xA431_0000;
-/// ツール／対称アイコン明示 ID（TASK-148.2）。オフセット 0..13 を固定割当。
+/// Explicit IDs for tool / symmetry icons. Offsets 0..13 are a fixed assignment.
 const TOOL_ICON_ID_BASE: gui.Id = 0xA148_2000;
-// レイヤーパネルのサムネイル（raw layer をチェッカー下地へ最近傍縮小・等倍 blit）
+// Layer-panel thumbnail (nearest-neighbor downscale of the raw layer onto a checker, then 1:1 blit)
 const LAYER_THUMB_W: i32 = 24;
 const LAYER_THUMB_H: i32 = 24;
-const LAYER_THUMB_CELL: usize = 4; // サムネ内チェッカーのセル px
-/// タイムライン UI（TASK-45.2）
+const LAYER_THUMB_CELL: usize = 4; // Checker cell size in px inside the thumbnail
+/// Timeline UI
 const TIMELINE_SCROLL_ID: gui.Id = 0xC0FFEE07;
-/// Layers 専用スクロール（TASK-148.3）。旧 RIGHT_SCROLL_ID の後継。
+/// Layers-only scroll (successor to the former RIGHT_SCROLL_ID).
 const LAYERS_SCROLL_ID: gui.Id = 0xC0FFEE08;
-/// Layers ScrollArea の最小高 = レイヤー 1 行分（thumb 律速。固定 80/180 は使わない）。
+/// Layers ScrollArea min height = one layer row (thumb-paced; no fixed 80/180).
 const LAYERS_VIEWPORT_ROW_MIN: i32 = LAYER_THUMB_H;
-/// chrome（Collapsible 見出し + toolbar）の初回フォールバック。以降は panelRect − scroll rect で実測。
+/// First-frame fallback for chrome (Collapsible heading + toolbar). Later measured as panelRect − scroll rect.
 const LAYERS_CHROME_FALLBACK: i32 = 50;
-/// Text Layer UI を Layers scroll 内に含むときの概算高（実測が無い初回用）。
+/// Approximate height when Text Layer UI is inside the Layers scroll (first frame before measurement).
 const LAYERS_TEXT_UI_FALLBACK: i32 = 130;
-/// PanelHost right slot の縦 padding 合計（slot build の padding top+bottom = 4+4）。
+/// Total vertical padding of the PanelHost right slot (slot build padding top+bottom = 4+4).
 const PANEL_SLOT_PAD_V: i32 = 8;
-/// PanelHost slot 内 panel 間 gap。
+/// Gap between panels inside a PanelHost slot.
 const PANEL_SLOT_GAP: i32 = 4;
 const TIMELINE_PANEL_ID_BASE: gui.Id = 0xA440_0000;
 const TIMELINE_HEADER_ID_BASE: gui.Id = 0xA441_0000;
@@ -255,14 +255,14 @@ const TIMELINE_LABEL_W: i32 = 72;
 const TIMELINE_LINK_BORDER = gui.Color.rgba(0x40, 0xA0, 0xE0, 0xFF);
 const TIMELINE_PLAYHEAD_BORDER = gui.Color.rgba(0xE0, 0xC0, 0x40, 0xFF);
 
-const COLOR_WINDOW_BG: u32 = 0xFF_24_20_20; // canonical BGRA: r=24,g=20,b=20（従来の見た目を維持）
+const COLOR_WINDOW_BG: u32 = 0xFF_24_20_20; // canonical BGRA: r=24,g=20,b=20 (keeps the existing look)
 
-/// canvas pixel（canonical BGRA 0xAARRGGBB）→ gui.Color（同一ビットレイアウト）。スウォッチ/プレビュー描画用。
+/// canvas pixel (canonical BGRA 0xAARRGGBB) → gui.Color (same bit layout). For swatch/preview drawing.
 fn guiColor(c: u32) gui.Color {
     return @bitCast(c);
 }
 
-/// 現在の描画ツール種別（UI 表示・選択ハイライト用。dispatch は core.Tool が担う）
+/// Current drawing-tool kind (UI display / selection highlight; dispatch is owned by core.Tool)
 const ToolKind = enum {
     pen,
     eraser,
@@ -290,8 +290,8 @@ const ToolKind = enum {
         };
     }
 
-    /// ソフトオーバーレイのツールバッジ（cursor_overlay.drawGlyph）用の2文字ラベル + 背景色
-    /// （TASK-75.4）。label は全て string literal（DrawList.text の寿命契約を満たす）。
+    /// Soft-overlay tool badge (cursor_overlay.drawGlyph): 2-char label + background color.
+    /// Labels are all string literals (satisfies DrawList.text lifetime).
     fn glyph(self: ToolKind) struct { label: []const u8, color: gui.Color } {
         return switch (self) {
             .pen => .{ .label = "Pn", .color = gui.Color.rgba(0x2A, 0x5F, 0xB0, 0xFF) },
@@ -312,10 +312,10 @@ const ToolKind = enum {
     }
 };
 
-/// ブラシ footprint 輪郭リングの配色（selection_overlay の marching ants と同じ「偶奇で交互」流儀。
-/// 任意の canvas 背景色に対するコントラストを確保する）。
-const RING_COLOR_A = gui.Color.rgba(0xFF, 0xFF, 0xFF, 0xFF); // 白
-const RING_COLOR_B = gui.Color.rgba(0xC9, 0x7A, 0x20, 0xFF); // ブラシバッジと同系オレンジ
+/// Brush footprint outline-ring colors (same even/odd alternating style as selection_overlay marching ants,
+/// to keep contrast against any canvas background).
+const RING_COLOR_A = gui.Color.rgba(0xFF, 0xFF, 0xFF, 0xFF); // White
+const RING_COLOR_B = gui.Color.rgba(0xC9, 0x7A, 0x20, 0xFF); // Same orange family as the brush badge
 
 const InlineCompositionDraw = struct {
     committed: []const u8,
@@ -332,14 +332,14 @@ fn drawInlineComposition(ctx_ptr: *anyopaque, dl: *gui.DrawList, rect: gui.Rect)
     const d: *const InlineCompositionDraw = @ptrCast(@alignCast(ctx_ptr));
     const committed_w: i32 = @intCast(d.font.measure(d.committed));
     const preedit_w: i32 = @intCast(d.font.measure(d.preedit));
-    // custom leaf 高さは ink 基準。text/underline/caret を同じ y 基準で揃える（TASK-167）。
+    // Custom leaf height is ink-based. Align text/underline/caret to the same y (ink, not line_height).
     const metrics = d.font.metrics();
     const ink_h = gui.inkHeight(metrics);
     const text_y = gui.centeredTextY(rect.y, @as(i32, @intCast(rect.h)), ink_h);
     dl.textEx(.{ .x = rect.x, .y = text_y }, d.committed, d.color, d.font) catch @panic("composition text: OOM");
     dl.textEx(.{ .x = rect.x + committed_w, .y = text_y }, d.preedit, d.preedit_color, d.font) catch @panic("composition preedit: OOM");
     const start_x = rect.x + committed_w;
-    // 下線は baseline 直下（ascent+2）。ink 箱下端でクランプ（line_height ではなく ink）。
+    // Underline sits just under the baseline (ascent+2). Clamped to the ink-box bottom (ink, not line_height).
     const underline_y = @min(text_y + metrics.ascent + 2, text_y + ink_h - 1);
     dl.line(.{
         .x = start_x,
@@ -356,7 +356,7 @@ fn drawInlineComposition(ctx_ptr: *anyopaque, dl: *gui.DrawList, rect: gui.Rect)
     }, d.preedit_color, 1) catch @panic("composition caret: OOM");
 }
 
-/// platform.MouseButton → InputEvent の button index（0=left/1=right/2=middle）。
+/// platform.MouseButton → InputEvent button index (0=left/1=right/2=middle).
 fn buttonToU8(b: platform.MouseButton) u8 {
     return switch (b) {
         .left => 0,
@@ -366,9 +366,9 @@ fn buttonToU8(b: platform.MouseButton) u8 {
     };
 }
 
-/// platform.Event → gui.InputEvent。GUI に関係しない quit は null。
-/// key の負値（platform KeyCode.UNKNOWN = -1）は捨てる（libs/gui は u32 code 前提）。
-/// `pass_char_input`: size_dialog 表示中のみ true（通常は char_input を GUI へ流さない）。
+/// platform.Event → gui.InputEvent. quit (GUI-irrelevant) becomes null.
+/// Drop negative key codes (platform KeyCode.UNKNOWN = -1); libs/gui assumes u32 codes.
+/// `pass_char_input`: true only while size_dialog is open (normally char_input is not forwarded to GUI).
 fn toGuiEvent(ev: platform.Event) ?gui.InputEvent {
     return toGuiEventEx(ev, false);
 }
@@ -380,10 +380,10 @@ fn toGuiEventEx(ev: platform.Event, pass_char_input: bool) ?gui.InputEvent {
             .{ .char_input = .{ .codepoint = ch.codepoint, .modifiers = ch.modifiers.toC() } }
         else
             null,
-        .gamepad_connected, .gamepad_disconnected => null, // TASK-80.1: pixie 未消費（cross-cutting Event 追加。他機能は無改造）
-        .composition_changed => null, // TASK-79.6.1: composition 未消費（inline preedit は 79.6.2）
-        .menu_command => null, // TASK-97.2: App.dispatchCommand で消費（gui へは渡さない）
-        .file_drop => null, // TASK-113.4: GUI へ転送しない
+        .gamepad_connected, .gamepad_disconnected => null, // pixie does not consume this (cross-cutting Event; other features untouched)
+        .composition_changed => null, // composition not consumed here (inline preedit is separate)
+        .menu_command => null, // Consumed by App.dispatchCommand (not forwarded to gui)
+        .file_drop => null, // Do not forward to GUI
         .mouse_move => |m| .{ .mouse_move = .{ .x = m.x, .y = m.y, .modifiers = m.modifiers.toC() } },
         .mouse_down => |m| .{ .mouse_down = .{ .x = m.x, .y = m.y, .button = buttonToU8(m.button), .modifiers = m.modifiers.toC() } },
         .mouse_up => |m| .{ .mouse_up = .{ .x = m.x, .y = m.y, .button = buttonToU8(m.button), .modifiers = m.modifiers.toC() } },
@@ -401,8 +401,8 @@ fn toGuiEventEx(ev: platform.Event, pass_char_input: bool) ?gui.InputEvent {
     };
 }
 
-/// アプリ状態（イベント処理と UI 構築の両方から触る）
-/// TASK-162: relay wire 用の 1 chunk（点列コピー所有。canonical 化は release 時）。
+/// App state (touched from both event handling and UI build)
+/// One relay-wire chunk (owns a copied point list; canonicalized on release).
 const RelayStrokeChunk = struct {
     pts: [actions.RELAY_STROKE_CHUNK_POINTS]actions.Point = undefined,
     len: usize = 0,
@@ -410,12 +410,12 @@ const RelayStrokeChunk = struct {
 };
 
 const App = struct {
-    /// app_runtime が参照する初期ウィンドウ仕様（TASK-73.1）
+    /// Initial window spec consulted by app_runtime
     pub const window = .{ .w = WINDOW_W, .h = WINDOW_H, .title = "Pixie" };
 
-    /// 起動前に window_state を load して WindowOptions を返す（TASK-117）。
-    /// platform.init 後・Window.create 前。失敗時はデフォルト 780x600。
-    /// TASK-156.4: fb_mode=.physical（HiDPI crisp UI + canvas nearest）。
+    /// Load window_state before startup and return WindowOptions.
+    /// After platform.init, before Window.create. On failure: default 780x600.
+    /// fb_mode=.physical (HiDPI crisp UI + nearest-neighbor canvas).
     pub fn windowBootstrap(gpa: std.mem.Allocator, io: std.Io) !platform.WindowOptions {
         const fallback_opts: platform.WindowOptions = .{
             .position = null,
@@ -453,17 +453,17 @@ const App = struct {
     pub fn frame(self: *App, win: *platform.Window, now: f64) !bool {
         return appFrame(self, win, now);
     }
-    /// app_runtime が Window.create + App.init 直後に呼ぶ opt-in hook（TASK-23.1 統合）。
-    /// ライブリサイズ redraw callback を登録する（harness/headless 時は facade 側で no-op）。
+    /// Opt-in hook app_runtime calls right after Window.create + App.init.
+    /// Registers the live-resize redraw callback (facade no-op under harness/headless).
     pub fn onWindowReady(self: *App, win: *platform.Window) void {
         self.redraw_win = win.*;
         self.os_window = win;
         win.setRedrawCallback(self, redrawCb);
-        // TASK-142: 起動直後は「テキスト編集フォーカス無し」を宣言（初回 pollEvents 前の keyDown が
-        // 従来の route-always で IME に吸われる隙間を塞ぐ）。以後は毎フレーム編集状態に追従する。
+        // At startup declare "no text-edit focus" (closes the gap where keyDown before the first pollEvents
+        // was swallowed by IME via the old route-always). Afterwards track edit state every frame.
         win.setTextInputActive(false);
         self.refreshTitle();
-        // TASK-122: native メニュー（macOS native backend + enable_menu）。headless は false → GUI fallback のまま。
+        // Native menu (macOS native backend + enable_menu). headless stays false → GUI fallback.
         self.rebuildMenuCommands();
         if (win.nativeMenuAvailable()) {
             self.native_menu_active = true;
@@ -473,10 +473,10 @@ const App = struct {
         }
     }
 
-    /// Window.destroy 前・App.deinit 前に呼ぶ（TASK-117）。geometry を window_state へ保存。
-    /// PanelHost の可視/寸法も Preferences へ永続化（TASK-148.1）。
-    /// size=0（facade の安全既定 / 取得失敗）は既存 state を温存するため window_state 保存スキップ。
-    /// Preferences は geometry 成否に関わらず persist+save を試みる。失敗は log のみ。
+    /// Called before Window.destroy and App.deinit. Persists geometry into window_state.
+    /// Also persists PanelHost visibility/extents into Preferences.
+    /// size=0 (facade safe default / fetch failure) skips window_state save so existing state is kept.
+    /// Preferences always attempts persist+save regardless of geometry success; failures are log-only.
     pub fn onWindowShutdown(self: *App, win: *platform.Window) void {
         self.persistPanels() catch |err| {
             std.log.err("pixie: preferences save failed: {s}", .{@errorName(err)});
@@ -509,91 +509,91 @@ const App = struct {
 
     io: std.Io,
     gpa: std.mem.Allocator,
-    /// GUI コンテキスト（跨フレーム永続。wasm runtime 用に App へ寄せた。TASK-73.1）
+    /// GUI context (cross-frame persistent; owned by App for the wasm runtime).
     ctx: gui.Context,
-    /// ドキュメント（frames × layers。MVP は 1 frame）。Canvas は heap 所有・ポインタ安定（TASK-63）。
+    /// Document (frames × layers; MVP is 1 frame). Canvas is heap-owned with a stable pointer.
     doc: core.Document,
-    /// アクティブフレームの Canvas（doc.activeCanvas()）。既存参照の churn 最小化のため *Canvas を保持。
+    /// Active-frame Canvas (doc.activeCanvas()). Keep *Canvas to minimize churn of existing references.
     canvas: *core.Canvas = undefined,
-    /// GUI / canvas 共有の system OutlineFont（TASK-138。所有は App。未検出時は default_font）。
+    /// System OutlineFont shared by GUI / canvas (owned by App; falls back to default_font if missing).
     gui_font: kit.GuiFont = .{},
     recorder: core.StrokeRecorder,
-    /// ベジェ編集中のブラシプレビュー用一時 canvas/recorder（本 layer のコピーへ非破壊描画）
+    /// Temporary canvas/recorder for brush preview while editing a bezier (non-destructive draw on a copy of this layer)
     preview_canvas: core.Canvas,
     preview_rec: core.StrokeRecorder,
-    // undo は独立フィールドを廃止し `doc.undo` を経由する（TASK-45.1。plan 8.3節）。
+    // Undo no longer has a standalone field; go through `doc.undo`.
     pen: core.Pen,
     eraser: core.Eraser = .{},
     brush: core.Brush,
-    /// 塗りつぶし（バケツ）ツール（TASK-76）。Pen/Eraser/Brush と同じく canvas_input 経由の
-    /// down/move/up 契約に乗る（bezier/select のような独立経路は不要）。
+    /// Fill (bucket) tool. Shares the canvas_input down/move/up contract with Pen/Eraser/Brush
+    /// (no independent path like bezier/select).
     fill: core.Fill,
     input: canvas_input.CanvasInput = .{},
-    /// ベジェ(ペン)ツール（独立経路。TASK-21.13）。状態機械 + マウス入力アダプタ。
+    /// Bezier (pen) tool (independent path). State machine + mouse-input adapter.
     bezier_editor: core.PathEditor = .{},
     bez_in: bezier_input.BezierInput = .{},
-    /// 範囲選択ツール（独立経路。TASK-44）。マーキー作成 / 選択範囲移動の状態機械。
+    /// Selection tool (independent path). State machine for marquee create / selection move.
     sel_in: selection_input.SelectionInput = .{},
-    /// シェイプツール（独立経路。TASK-90）。Line/Rect/Ellipse の press→drag→release。
+    /// Shape tool (independent path). Line/Rect/Ellipse press→drag→release.
     shape_in: shape_input.ShapeInput = .{},
-    /// ピクセルパーフェクト線（Pen size=1 のみ有効。StrokeRecorder へ反映。TASK-90）。
+    /// Pixel-perfect lines (Pen size=1 only; reflected into StrokeRecorder).
     pixel_perfect: bool = false,
-    /// 対称描画（StrokeRecorder へ反映。Pen/Eraser/Brush/Shape 全部に効く。TASK-90）。
+    /// Symmetry drawing (reflected into StrokeRecorder; applies to Pen/Eraser/Brush/Shape).
     symmetry: core.Symmetry = .off,
-    /// スポイトツール（独立経路。TASK-68）。press-capture の最小状態機械（塗り操作が無いため
-    /// Tool vtable / StrokeRecorder / Undo は不要）。専用ツール選択・Alt+クリック一時スポイトの両方で使う。
+    /// Eyedropper tool (independent path). Minimal press-capture state machine (no paint ops, so
+    /// Tool vtable / StrokeRecorder / Undo are unused). Used for both dedicated tool mode and Alt+click temporary pick.
     eye_in: eyedropper_input.EyedropperInput = .{},
-    /// clipboard（copy/cut で確保し paste で参照。gpa 所有・deinit で free）。
+    /// Clipboard (allocated on copy/cut, referenced on paste; gpa-owned, freed in deinit).
     clipboard: ?core.PixelBlock = null,
-    /// 視覚差分の基準スナップショット（TASK-87。遅延 alloc・gpa 所有・deinit で free）。
-    /// compositeStraight の借用スライスは保持せず、必ずコピーする。
+    /// Baseline snapshot for visual diff (lazy alloc; gpa-owned; freed in deinit).
+    /// Never retain a borrowed compositeStraight slice; always copy.
     diff_base: ?[]u32 = null,
-    /// paste/move のブロック配置方法（既定 over=透明を保持＝下の絵を残す）。右ペインのトグルで切替（TASK-44）。
+    /// Block placement for paste/move (default over=keep transparency=leave art below). Toggled in the right pane.
     blend_mode: core.selection.Blend = .over,
     active_kind: ToolKind = .pen,
-    /// ── ビューポート（TASK-153.1/153.2）。view_zoom は rational Zoom、cam_cx/cy は表示領域中心が指す連続キャンバス座標 ──
+    /// ── Viewport. view_zoom is rational Zoom; cam_cx/cy are continuous canvas coords under the view center ──
     view_zoom: Zoom = Zoom.default(),
-    /// キャンバス左上端基準の連続キャンバス座標（表示領域中心がこの点を指す）。初期は文書中心。
+    /// Continuous canvas coords from the canvas top-left (view center points here). Starts at document center.
     cam_cx: f32 = @as(f32, @floatFromInt(DEFAULT_CANVAS_W)) / 2.0,
     cam_cy: f32 = @as(f32, @floatFromInt(DEFAULT_CANVAS_H)) / 2.0,
-    /// 直近フレームの canvas area rect（Fit ズーム計算用。canvasBlitRect が毎フレーム更新）
+    /// Previous frame's canvas area rect (for Fit zoom; canvasBlitRect updates every frame)
     last_area: ?core.Rect = null,
-    /// Space 押下継続（key_down/up で更新）。Space+左ドラッグでパン
+    /// Space held (updated on key_down/up). Space+left-drag pans
     space_down: bool = false,
-    /// パンドラッグ進行中。開始時に anchor を latch（描画 capture とは排他）
+    /// Pan drag in progress. Anchor latched at start (exclusive with paint capture)
     pan_active: bool = false,
-    /// パン開始時の入力種別（Cmd が move に載らない backend でもドラッグを完走させる）
+    /// Input kind that started the pan (so backends that omit Cmd on move still finish the drag)
     pan_kind: PanKind = .space_left,
     pan_anchor_mouse: core.Vec2 = .{ .x = 0, .y = 0 },
     pan_anchor_cam_x: f32 = 0,
     pan_anchor_cam_y: f32 = 0,
-    /// KP_ADD/KP_SUBTRACT の保留ズーム段数。updateViewport がカーソル位置で zoomAround 適用する。
+    /// Pending KP_ADD/KP_SUBTRACT zoom steps. updateViewport applies zoomAround at the cursor.
     pending_zoom_delta: i32 = 0,
-    /// ── ミニマップ（TASK-153.3）。編集イベント時のみサムネ再生成。ドラッグでカメラ移動 ──
+    /// ── Minimap. Thumbnail regenerates on edit events only; drag moves the camera ──
     minimap: minimap_mod.MiniMapCache = .{},
     minimap_drag_active: bool = false,
-    /// ソフトオーバーレイ（ツールグリフ + ブラシ footprint 輪郭リング。TASK-75.4）──
-    /// hover 中の生スクリーン座標（ツールバッジの錨点）。in_canvas かつ非 busy の時だけ Some
-    /// （updateCursorAndHover が毎フレーム設定）。
+    /// Soft overlay (tool glyph + brush footprint outline ring) ──
+    /// Raw screen coords while hovering (tool-badge anchor). Some only when in_canvas and not busy
+    /// (set every frame by updateCursorAndHover).
     hover_screen: ?core.Vec2 = null,
-    /// hover 中の canvas 画素座標（footprint リングの錨点）。`core.screenToCanvas` 経由（実 canvas
-    /// 画素範囲外なら null）なので、レターボックス／canvas 外では自然にリングだけ非表示になる。
+    /// Canvas pixel coords while hovering (footprint-ring anchor). Via `core.screenToCanvas` (null outside
+    /// real canvas pixels), so the ring alone stays hidden over letterbox / outside the canvas.
     hover_cell: ?core.Vec2 = null,
-    /// 直近に OS へ要求した cursor shape（変化検出用 + `cursor` probe 公開用）。
+    /// Last cursor shape requested from the OS (change detection + `cursor` probe).
     cursor_shape: platform.CursorShape = .default,
-    /// Brush footprint 輪郭リングの縁セルキャッシュ（(size,hardness) 変化時のみ再計算）。
+    /// Edge-cell cache for the brush footprint outline ring (recomputed only when (size,hardness) change).
     brush_edges: brush_edge_cache.EdgeCache = .{},
-    /// ephemeral プレゼンス状態（TASK-103。Document/CommandLog 非保持）。
+    /// Ephemeral presence state (not held in Document/CommandLog).
     presence: actions.PresenceStore = .{},
-    /// ── PanelHost（TASK-148.1）。left/right/bottom + center。Preferences で永続化 ──
+    /// ── PanelHost. left/right/bottom + center. Persisted via Preferences ──
     panels: [6]gui.Panel = undefined,
     panel_host: gui.PanelHost = undefined,
     preferences: appshell.preferences.Preferences = undefined,
-    /// Layers 専用スクロール（TASK-148.3）
+    /// Layers-only scroll
     layers_scroll: gui.Vec2f = .{},
-    /// Layers ScrollArea の固定 viewport 高（内容量ベース。初回は 1 行分）。
+    /// Fixed Layers ScrollArea viewport height (content-based; starts at one row).
     layers_viewport_h: i32 = LAYERS_VIEWPORT_ROW_MIN,
-    /// `digest panels` 用: 前フレーム確定後に cachePanelsProbe が書く。
+    /// For `digest panels`: written by cachePanelsProbe after the previous frame settles.
     panels_probe_fb_h: i32 = 0,
     panels_probe_bottom: i32 = 0,
     panels_probe_ok: bool = false,
@@ -602,49 +602,49 @@ const App = struct {
     panels_probe_palette: ?PanelProbeRect = null,
     panels_probe_tool: ?PanelProbeRect = null,
     panels_probe_layers: ?PanelProbeRect = null,
-    /// Tool Options 動的タイトル用バッファ（Panel.title が指す。stable name は別）
+    /// Buffer for the dynamic Tool Options title (pointed to by Panel.title; stable name is separate)
     tool_options_title_buf: [64]u8 = undefined,
     tool_options_title_len: usize = 0,
-    /// タイムライン UI 状態（TASK-45.2）
+    /// Timeline UI state
     timeline_scroll: gui.Vec2f = .{},
     timeline_playing: bool = false,
     timeline_fps: f32 = 10.0,
     timeline_last_advance: f64 = 0,
     timeline_target_layer: usize = 0,
     timeline_target_frame: u32 = 0,
-    /// オニオンスキン（TASK-45.3）。表示専用。
+    /// Onion skin. Display-only.
     onion_enabled: bool = false,
     onion_count: u32 = 1,
     onion_buf: []u32 = &.{},
     onion_scratch: []u32 = &.{},
-    /// Brush パラメータの UI 状態（Slider の *i32/*f32 と Brush の u32/u8 の型差を吸収）。
+    /// Brush-parameter UI state (bridges Slider *i32/*f32 vs Brush u32/u8).
     brush_size_i32: i32 = 8,
     brush_opacity_i32: i32 = 255,
     brush_hardness_f32: f32 = 1.0,
-    /// Fill の色許容差 tolerance の UI 状態（Slider の *i32 と u8 の型差吸収。brush_size_i32 と同パターン）。
+    /// Fill color-tolerance UI state (bridges Slider *i32 vs u8; same pattern as brush_size_i32).
     fill_tolerance_i32: i32 = 0,
-    /// 編集可能パレット（colors.len>=1）。描画色 = palette.current()。
+    /// Editable palette (colors.len>=1). Drawing color = palette.current().
     palette: palette_mod.Palette,
-    /// 編集中 HSV 状態。選択切替/load 後のみ RGB→HSV で再同期（s==0 でも hue を失わない）。
+    /// In-edit HSV state. Re-sync RGB→HSV only after selection change/load (keeps hue when s==0).
     edit_h: f32 = 0,
     edit_s: f32 = 0,
     edit_v: f32 = 0,
-    /// HSV を同期済みの selected。null/不一致なら再同期。
+    /// selected already synced to HSV. Resync when null/mismatch.
     edit_synced_for: ?usize = null,
-    /// UI Repl 用: スウォッチ選択時点の色（applyEditColor で swatch が変わっても from を保持。TASK-89）。
+    /// For UI Repl: color at swatch-select time (keeps `from` even if applyEditColor changes the swatch).
     repl_source: ?u32 = null,
     running: bool = true,
-    /// フレーム本体の再入ガード（TASK-23.1。redraw callback と main loop の二重実行防止）。
+    /// Re-entrancy guard for the frame body (stops double-run of redraw callback vs main loop).
     in_frame: bool = false,
-    /// redraw callback 用に onWindowReady で保持する Window 値コピー（TASK-23.1。FrameCtx 相当）。
+    /// Window value copy kept in onWindowReady for the redraw callback (FrameCtx role).
     redraw_win: ?platform.Window = null,
-    /// appshell title 更新用の借用 Window。runtime が window を所有する。
+    /// Borrowed Window for appshell title updates. The runtime owns the window.
     os_window: ?*platform.Window = null,
-    /// 現在の PNG 保存先（gpa 所有）。Cmd+S はここへ直接上書き、保存/読込ダイアログ成功時に更新。
+    /// Current PNG save path (gpa-owned). Cmd+S overwrites here; updated on successful save/open dialogs.
     current_path: ?[]u8 = null,
-    /// 現在の .pix プロジェクト保存先（gpa 所有。PNG の current_path とは別管理。TASK-63）。
+    /// Current .pix project save path (gpa-owned; managed separately from PNG current_path).
     current_project_path: ?[]u8 = null,
-    /// .pix の lifecycle は DocumentHost が正本。legacy field は既存 UI/action との同期用。
+    /// DocumentHost is authoritative for .pix lifecycle. Legacy fields sync existing UI/action.
     host: appshell.document_host.DocumentHost = undefined,
     data_dir: std.Io.Dir = undefined,
     autosave_dir: std.Io.Dir = undefined,
@@ -653,87 +653,87 @@ const App = struct {
     recovery: ?appshell.autosave.Candidate = null,
     pending_png_path: ?[]u8 = null,
     png_import_pending: bool = false,
-    /// `new W H` 確認フロー用（hostNewDocument が消費。TASK-144.1）。
+    /// For the `new W H` confirmation flow (consumed by hostNewDocument).
     pending_new_size: ?struct { w: u32, h: u32 } = null,
-    /// TASK-144.2: サイズダイアログ本体（TextBuffer は appInit/appDeinit で管理）。
+    /// Size-dialog body (TextBuffers managed in appInit/appDeinit).
     size_dialog_storage: SizeDialogState = undefined,
-    /// null=閉じ。open 中は `&size_dialog_storage`（毎フレーム再生成しない）。
+    /// null=closed. While open, `&size_dialog_storage` (not rebuilt every frame).
     size_dialog: ?*SizeDialogState = null,
     title_cache: [std.fs.max_path_bytes + 64]u8 = undefined,
     title_cache_len: usize = 0,
-    /// パレットの .gpl 保存先（gpa 所有。PNG の current_path とは別管理）。
+    /// Palette .gpl save path (gpa-owned; managed separately from PNG current_path).
     palette_path: ?[]u8 = null,
-    /// 安全点で実行する保留中のファイル操作（フレーム処理中にセット、unlock 後に消費）。
+    /// Pending file op to run at the safe point (set during frame work; consumed after unlock).
     pending_file_op: ?FileOp = null,
-    /// digest menu の last_op キー用ラッチ（TASK-97.2）: 直近に dispatch された FileOp。
-    /// 次の dispatch まで保持（情報提供のみ。真の未消費状態は pending キー = dialog_op/pending_file_op）。
-    /// headless では runPendingFileOp が同フレームで消費するため、「メニュー選択が FileOp を
-    /// 積んだ」ことは last_op で観測する。
+    /// Latch for digest menu `last_op`: most recently dispatched FileOp.
+    /// Kept until the next dispatch (informational only. True pending state is dialog_op/pending_file_op).
+    /// Under headless, runPendingFileOp consumes in the same frame, so "menu selection queued a FileOp"
+    /// is observed via last_op.
     menu_pending_probe: ?FileOp = null,
-    /// GUI fallback メニューバーの開閉（TASK-97.2）。
+    /// Open/closed state of the GUI-fallback menu bar.
     menu_bar_state: gui.MenuBarState = .{},
-    /// 毎フレーム再構築する Command 表（enabled/checked 反映。native updateMenu と同役割）。
+    /// Command table rebuilt every frame (enabled/checked; same role as native updateMenu).
     menu_commands: [MENU_CMD_CAP]platform.Command = undefined,
     menu_command_count: usize = 0,
-    /// native メニューが有効か（onWindowReady で確定。headless/swift/metal は false）。
+    /// Whether native menu is enabled (set in onWindowReady; false for headless/swift/metal).
     native_menu_active: bool = false,
-    /// native updateMenu dirty-gate 用スナップショット（enabled/checked/id/label）。
+    /// Snapshot for the native updateMenu dirty gate (enabled/checked/id/label).
     native_menu_snap: [MENU_CMD_CAP]NativeMenuSnap = undefined,
     native_menu_snap_count: usize = 0,
     native_menu_registered: bool = false,
-    /// wasm file picker 進行中の FileOp（TASK-73.3 修正1）。
-    /// DialogPending のあいだはこの op だけを再試行し、待機中に pending_file_op へ積まれた別要求は破棄する
-    /// （例: Cmd+O 待ち中の Cmd+Shift+S が picked path を誤って save_as に食わせない）。
+    /// FileOp while a wasm file picker is in flight.
+    /// While DialogPending, only this op is retried; other requests queued on pending_file_op are discarded
+    /// (e.g. Cmd+Shift+S while waiting on Cmd+O must not feed the picked path into save_as).
     dialog_op: ?FileOp = null,
     save_msg_buf: [128]u8 = undefined,
     save_msg_len: usize = 0,
     save_msg_until: f64 = 0,
-    /// レイヤー名インライン編集の状態機械（TASK-79.3）。`rename_in.active` が true の間、
-    /// メインループのイベントポンプは char_input/ENTER/ESCAPE/BACKSPACE のみをここへ回し、
-    /// 他のキー・gui への pushEvent は止める（タイプ中に B/E 等のツール切替が誤発火しないため）。
+    /// Inline layer-name edit state machine. While `rename_in.active` is true,
+    /// the main-loop event pump routes only char_input/ENTER/ESCAPE/BACKSPACE here and
+    /// blocks other keys and gui pushEvent (so B/E tool shortcuts do not fire while typing).
     rename_in: layer_rename_input.LayerRenameInput = .{},
-    /// テキストレイヤー内容インライン編集の状態機械（TASK-79.5）。`rename_in` と対称
-    /// （どちらか一方のみ active。`beginTextEdit`/`beginRenameLayer` が互いを明示的に cancel する）。
+    /// Inline text-layer content edit state machine. Symmetric with `rename_in`
+    /// (only one may be active; `beginTextEdit`/`beginRenameLayer` explicitly cancel each other).
     text_in: text_content_input.TextContentInput = .{},
-    /// IME preedit snapshot（latest-wins）。composition_changed を受けたフレームで更新する。
+    /// IME preedit snapshot (latest-wins). Updated on the frame that receives composition_changed.
     preedit_buf: [1024]u8 = undefined,
     preedit_len: usize = 0,
     preedit_cursor: usize = 0,
     composition_dirty: bool = false,
     composition_rect: ?CompositionCaretRect = null,
 
-    /// ── command model（TASK-62.5.3）。「誰が（local_user/local_agent）・何を実行したか」の単一 log ──
-    /// 常時有効・固定容量（alloc なし）。transport の有無に依存しない（harness replay でも copilot
-    /// でも通常起動でも同じ経路）。記録はイベント時のみ（ホットパス外）。
+    /// ── command model. Single log of who (local_user/local_agent) did what ──
+    /// Always on, fixed capacity (no alloc). Independent of transport (same path for harness replay, copilot,
+    /// and normal launch). Recording is event-time only (off the hot path).
     cmd_log: platform.command.CommandLog = .{},
-    /// dispatcher/log は main() で配線する（ctx に &app が要るため field default にできない）。
+    /// dispatcher/log are wired in main() (need &app in ctx, so not field-defaultable).
     cmd_exec: platform.command.Executor = undefined,
-    /// recipe_replay 実行中フラグ（入れ子 `recipe_replay` 拒否用。TASK-62.5.8）。
+    /// recipe_replay in-progress flag (rejects nested `recipe_replay`).
     recipe_replaying: bool = false,
-    /// UI stroke（canvas_input 経由）の点列蓄積（§5c。press〜release のイベント時 append・固定上限は
-    /// actions.MAX_STROKE_POINTS を共有）。連続同一点は追加しない（同一点 move は描画上 no-op）。
+    /// UI-stroke point buffer via canvas_input (event-time append from press through release; fixed cap
+    /// shared with actions.MAX_STROKE_POINTS). Consecutive identical points are not appended (same-point move is a draw no-op).
     ui_stroke_pts: [actions.MAX_STROKE_POINTS]actions.Point = undefined,
     ui_stroke_len: usize = 0,
-    /// 上限超過 → この stroke は記録しない（257 点以上を記録すると 62.5.4 の redo 再 dispatch が
-    /// TooManyPoints で失敗するため。Op は legacy UndoStack に残り既存 undo UI では戻せる）。
+    /// On overflow this stroke is not recorded (recording past MAX_STROKE_POINTS would make redo re-dispatch
+    /// fail with TooManyPoints; the Op remains on the legacy UndoStack so existing undo UI can still reverse it).
     ui_stroke_overflow: bool = false,
-    /// 未記録 undoable 編集の検出用（TASK-62.5.4 §2b）: 記録が起きた点（noteUndo/
-    /// recordUiStroke/legacy redo）で `doc.undo.next_handle` に追従させ、フレーム末尾に
-    /// `next_handle > last_seen_handle` なら「CommandLog に載らない undoable push があった」と
-    /// 判定して `bumpEpoch(.local_user)` する（O(1) の整数比較 1 回/フレーム）。
+    /// Detects unrecorded undoable edits: at record sites (noteUndo/
+    /// recordUiStroke/legacy redo) follow `doc.undo.next_handle`, and at frame end if
+    /// `next_handle > last_seen_handle` treat it as "an undoable push missed CommandLog"
+    /// and `bumpEpoch(.local_user)` (one O(1) integer compare per frame).
     last_seen_handle: u64 = 1,
-    /// 履歴パネル表示用キャッシュ（TASK-83。CommandLog 変異を跨いで保持しない契約のため
-    /// dirty 時に全置換再構築。alloc なし・MAX_CMD_LOG 固定配列）。
+    /// Cache for the history-panel display (must not outlive CommandLog mutation, so
+    /// fully rebuilt on dirty. No alloc; fixed MAX_CMD_LOG array).
     history_entries: [platform.command.MAX_CMD_LOG]history_summary.HistoryEntry = undefined,
     history_count: u32 = 0,
     history_dirty: bool = true,
     history_seen_seq: u64 = 1,
-    /// netsync peer catalog/slot metadata revision（変化時に履歴キャッシュ全置換。TASK-83 Phase 2）。
+    /// netsync peer catalog/slot metadata revision (full history-cache rebuild on change).
     history_seen_peer_revision: u64 = 0,
-    /// 履歴行サムネイル固定リング（TASK-83.2。イベント時のみ生成・フレーム毎は blit のみ）。
+    /// Fixed ring of history-row thumbnails (generated on events only; per-frame work is blit only).
     history_thumbs: [platform.command.MAX_CMD_LOG][history_thumbnail.THUMB_PIXELS]u32 = undefined,
     history_thumb_meta: [platform.command.MAX_CMD_LOG]history_thumbnail.HistoryThumbMeta = @splat(.{}),
-    /// capture 開始時に latch した実効パラメータ（canonical args の材料。§5c'）。
+    /// Effective parameters latched at capture start (material for canonical args).
     ui_stroke_layer_id: u64 = 1,
     ui_stroke_tool: ToolKind = .pen,
     ui_stroke_color: u32 = 0,
@@ -741,62 +741,62 @@ const App = struct {
     ui_stroke_opacity: u8 = 255,
     ui_stroke_hardness: u8 = 255,
 
-    /// TASK-162: netsync relay 専用の wire 点列チャンク（solo は ui_stroke_* のみ。preview は別経路）。
-    /// release 時に全 chunk を同期 PROPOSE するため、跨フレームの send queue は持たない。
+    /// netsync-relay-only wire point chunks (solo uses ui_stroke_* only; preview is a separate path).
+    /// All chunks are sync-PROPOSEd on release, so there is no cross-frame send queue.
     relay_stroke: bool = false,
     relay_active_pts: [actions.RELAY_STROKE_CHUNK_POINTS]actions.Point = undefined,
     relay_active_len: usize = 0,
     relay_active_continuation: bool = false,
-    /// finalization 済み chunk（drag 中 flush + release 最終分）。要素はコピー所有。
+    /// Finalized chunks (mid-drag flush + final release piece). Elements are copy-owned.
     relay_chunks: std.ArrayListUnmanaged(RelayStrokeChunk) = .empty,
 
-    /// 選択中レイヤーが text kind か（テキストレイヤーへの直接 raster 編集を防ぐガード。
-    /// TASK-79.5）。text layer の pixels は「TextParams からの再ラスタライズ結果」という
-    /// 不変条件（libs/paint/src/canvas.zig の `TextParams` doc comment 参照）を守るため、
-    /// Pen/Eraser/Brush/Fill/Bezier/選択操作（cut/paste/move）の書き込み経路はこれで弾く
-    /// （Rasterize 確定後=kind が raster 化した後は通常どおり描画できる）。
+    /// Whether the selected layer is text kind (guards against direct raster edits on text layers.
+    /// Text-layer pixels are the rasterization of TextParams — that invariant
+    /// (see the `TextParams` doc comment in libs/paint/src/canvas.zig) is enforced by rejecting
+    /// Pen/Eraser/Brush/Fill/Bezier/selection (cut/paste/move) write paths here
+    /// (after Rasterize commits and kind becomes raster, normal drawing is allowed again).
     fn selectedLayerIsText(self: *const App) bool {
         return self.canvas.selected_layer < self.canvas.layers.items.len and
             self.canvas.layers.items[self.canvas.selected_layer].kind == .text;
     }
 
-    /// `gui_font.systemBytes()`（TASK-138 / 旧 TASK-82）を `doc.active_view` へ反映する。新しい Document
-    /// インスタンス（`core.Document.init`/`document_io.loadDocument` が返す）は
-    /// `active_view.system_font` が既定 `null` で始まるため、Document を新規作成/差し替えた直後は
-    /// 必ず呼ぶ必要がある（`main()` 起動時 + `doOpenProject`）。`preview_canvas` は
-    /// `addTextLayer`/`setLayerTextParams` を一切呼ばないため対象外。イベント時/初期化時のみ
-    /// （フレーム毎には呼ばない）。**TASK-45.1**: セルグリッド化により「アクティブフレームの
-    /// 編集可能ビュー」は `doc.active_view` の1個のみになった（`resyncActiveView` は
-    /// `system_font` を一切触らないため、ここで一度設定すれば保持され続ける。plan 4.2節）。
+    /// Apply `gui_font.systemBytes()` onto `doc.active_view`. A fresh Document
+    /// (`core.Document.init` / `document_io.loadDocument`) starts with
+    /// `active_view.system_font` as the default `null`, so this must be called right after creating/replacing
+    /// a Document (`main()` startup + `doOpenProject`). `preview_canvas` is out of scope because it never
+    /// calls `addTextLayer`/`setLayerTextParams`. Event-time / init-time only
+    /// (not every frame). After cel-grid migration the editable view of the active frame
+    /// is the single `doc.active_view` (`resyncActiveView` never
+    /// touches `system_font`, so one assignment here keeps it for the Document lifetime).
     fn applySystemFont(self: *App) void {
         self.doc.active_view.system_font = self.gui_font.systemBytes();
     }
 
-    /// 現在 UI 選択中の Tool（fat-pointer。capture 開始時に canvas_input が latch する）
+    /// Currently UI-selected Tool (fat pointer; latched by canvas_input when capture starts)
     fn activeTool(self: *App) core.Tool {
         return switch (self.active_kind) {
             .pen => self.pen.tool(),
             .eraser => self.eraser.tool(),
             .brush => self.brush.tool(),
-            .bezier => self.pen.tool(), // bezier は独立経路で canvas_input を経由しない（到達しないフォールバック）
-            .select => self.pen.tool(), // select も独立経路（到達しないフォールバック）
+            .bezier => self.pen.tool(), // bezier is an independent path and does not go through canvas_input (unreachable fallback)
+            .select => self.pen.tool(), // select is also an independent path (unreachable fallback)
             .fill => self.fill.tool(),
-            .eyedropper => self.pen.tool(), // eyedropper も独立経路（到達しないフォールバック。actionStroke で明示的に弾く）
-            .line, .rect, .ellipse => self.pen.tool(), // shape も独立経路（到達しないフォールバック）
+            .eyedropper => self.pen.tool(), // eyedropper is also an independent path (unreachable fallback; actionStroke rejects it explicitly)
+            .line, .rect, .ellipse => self.pen.tool(), // shape is also an independent path (unreachable fallback)
         };
     }
 
-    /// StrokeRecorder に UI の pixel_perfect / symmetry を反映する（stroke/shape 開始前に呼ぶ）。
-    /// pixel_perfect は Pen のみ（size=1 固定の現状 Pen）。
+    /// Reflect UI pixel_perfect / symmetry into StrokeRecorder (call before stroke/shape start).
+    /// pixel_perfect is Pen-only (current Pen is fixed at size=1).
     fn syncRecorderModes(self: *App) void {
         self.recorder.pixel_perfect = self.pixel_perfect and self.active_kind == .pen;
         self.recorder.symmetry = self.symmetry;
     }
 
-    /// ツール切替を一元化（active_kind への代入は全てここ経由）。
-    /// capture / 選択ドラッグ / シェイプドラッグ / スポイト picking 中は切替しない（進行中操作を宙ぶらりんにしない）。
-    /// .bezier から出る時は未確定パスを cancel。.select から出る時は進行中ドラッグを破棄（selection は保持）。
-    /// シェイプから出る時は進行中ドラッグを cancel。
+    /// Single chokepoint for tool switches (all writes to active_kind go through here).
+    /// No switch during capture / selection-drag / shape-drag / eyedropper picking (do not strand an in-flight op).
+    /// Leaving .bezier cancels the unfinished path. Leaving .select discards an in-flight drag (selection kept).
+    /// Leaving a shape cancels an in-flight drag.
     fn setActiveKind(self: *App, next: ToolKind) void {
         if (self.input.capturing or self.sel_in.state != .idle or self.shape_in.state != .idle or self.eye_in.picking) return;
         if (self.active_kind == .bezier and next != .bezier) {
@@ -805,8 +805,8 @@ const App = struct {
         if (self.active_kind.isShape() and !next.isShape()) {
             self.shape_in.cancel();
         }
-        if (next != .select) self.sel_in.discardFloat(self.gpa); // 選択ツールを離れる → フロート破棄（canvas は最終形のまま）
-        // shape ツール種別を shape_in へ同期
+        if (next != .select) self.sel_in.discardFloat(self.gpa); // Leaving the select tool → discard the float (canvas stays at its final form)
+        // Sync the shape-tool kind into shape_in
         if (next.isShape()) {
             self.shape_in.kind = switch (next) {
                 .line => .line,
@@ -818,15 +818,15 @@ const App = struct {
         self.active_kind = next;
     }
 
-    /// ズームを設定し、カメラを文書中心へリセット（0/F 用）。
+    /// Set zoom and reset the camera to document center (for 0/F).
     fn setZoomCentered(self: *App, z: Zoom) void {
         self.view_zoom = z;
         self.cam_cx = @as(f32, @floatFromInt(self.doc.width)) / 2.0;
         self.cam_cy = @as(f32, @floatFromInt(self.doc.height)) / 2.0;
     }
 
-    /// 画面注視点 (fx,fy) を不動点に zoom を変更する（scroll / +/- 用）。
-    /// カーソルが表示領域外なら表示中心を注視点とする。clamp は canvasBlitRect が行う。
+    /// Change zoom with screen focus (fx,fy) as the fixed point (scroll / +/-).
+    /// If the cursor is outside the view, use the view center as the focus. canvasBlitRect performs clamp.
     fn zoomAround(self: *App, z: Zoom, fx: i32, fy: i32) void {
         const new_zoom = z;
         const old_zoom = self.view_zoom;
@@ -848,7 +848,7 @@ const App = struct {
         self.view_zoom = new_zoom;
     }
 
-    /// canvas が表示領域に収まる最大倍率へ（Fit。1 未満は 1/2..1/4）。カメラは中央リセット。
+    /// Largest zoom that fits the canvas in the view (Fit; sub-1 uses 1/2..1/4). Camera resets to center.
     fn fitZoom(self: *App) void {
         const area = self.last_area orelse return;
         self.setZoomCentered(Zoom.fit(area.w, area.h, self.doc.width, self.doc.height));
@@ -860,7 +860,7 @@ const App = struct {
         self.save_msg_until = platform.getTime() + SAVE_MSG_DURATION;
     }
 
-    /// appshell の title を OS 側へ反映する。title は状態遷移時だけ更新し、毎フレームは触らない。
+    /// Push the appshell title to the OS. Title updates only on state transitions, never every frame.
     fn refreshTitle(self: *App) void {
         var doc_title_buf: [std.fs.max_path_bytes + 32]u8 = undefined;
         const doc_title = self.host.title(&doc_title_buf);
@@ -878,7 +878,7 @@ const App = struct {
         self.current_project_path = owned;
     }
 
-    /// DocumentHost の path と autosave ID、既存 pixie field を同期するイベント境界。
+    /// Event boundary that syncs DocumentHost path and autosave ID with the legacy pixie fields.
     fn syncProjectState(self: *App) void {
         self.setProjectPath(self.host.currentPath()) catch @panic("syncProjectState: OOM");
         self.autosave.setPath(self.host.currentPath()) catch @panic("syncProjectState: OOM");
@@ -886,7 +886,7 @@ const App = struct {
         self.refreshTitle();
     }
 
-    /// document 内容を変更した編集イベントの共通入口。選択/tool/zoom では呼ばない。
+    /// Common entry for edit events that change document contents. Not called for selection/tool/zoom.
     fn markProjectDirty(self: *App) void {
         self.host.markDirty();
         self.autosave.markDirty(platform.getTime());
@@ -908,8 +908,8 @@ const App = struct {
         return self.input.capturing or self.bezier_editor.isEditing() or self.sel_in.state != .idle or self.shape_in.state != .idle;
     }
 
-    /// Document サイズ変更後に recorder / preview / onion / diff_base を新サイズへ再構築する。
-    /// loadProjectPath / netsyncImport / doResize / doNew が共有する（dangling pointer 防止）。
+    /// After a Document size change, rebuild recorder / preview / onion / diff_base for the new size.
+    /// Shared by loadProjectPath / netsyncImport / doResize / doNew (prevents dangling pointers).
     fn rebuildRuntimeForDocSize(self: *App) !void {
         const w = self.doc.width;
         const h = self.doc.height;
@@ -950,7 +950,7 @@ const App = struct {
         self.minimap.invalidate();
     }
 
-    /// 内容保持リサイズ（TASK-144.1）。GUI/action の唯一の入口。
+    /// Content-preserving resize. Sole entry for GUI/action.
     fn doResize(self: *App, new_w: u32, new_h: u32) !void {
         if (self.editingBlocked()) return error.EditingBlocked;
         if (platform.netsyncActive()) return error.RejectedWhileSynced;
@@ -970,8 +970,8 @@ const App = struct {
         self.markProjectDirty();
     }
 
-    /// 指定サイズの blank Document へ置換（TASK-144.1）。GUI/action の唯一の入口。
-    /// project path / PNG / autosave のクリアは hostNewDocument 側の規則に任せる。
+    /// Replace with a blank Document of the given size. Sole entry for GUI/action.
+    /// Clearing project path / PNG / autosave follows hostNewDocument rules.
     fn doNew(self: *App, new_w: u32, new_h: u32) !void {
         if (self.editingBlocked()) return error.EditingBlocked;
         if (platform.netsyncActive()) return error.RejectedWhileSynced;
@@ -999,9 +999,9 @@ const App = struct {
         try buf.bytes.appendSlice(buf.alloc, text);
     }
 
-    /// TASK-144.2: New Size / Resize Canvas ダイアログを開く（command は open のみ）。
+    /// Open the New Size / Resize Canvas dialog (command only opens; it does not apply).
     fn openSizeDialog(self: *App, mode: SizeDialogMode) void {
-        // reentrant open 二重防御（dispatchCommand 先頭ガードと対称）。
+        // Double-guard against reentrant open (symmetric with the guard at the top of dispatchCommand).
         if (self.size_dialog != null) return;
         if (self.recovery != null or self.host.confirmation() != .none) return;
         if (platform.netsyncActive()) return;
@@ -1020,7 +1020,7 @@ const App = struct {
         self.size_dialog = null;
     }
 
-    /// OK: parse → validate → doResize/doNew（確認経路）。失敗時は dialog を維持。
+    /// OK: parse → validate → doResize/doNew (confirmation path). On failure keep the dialog open.
     fn confirmSizeDialog(self: *App) void {
         const dlg = self.size_dialog orelse return;
         dlg.clearError();
@@ -1064,23 +1064,23 @@ const App = struct {
                     self.pending_new_size = null;
                     return;
                 }
-                // confirmation / applied のいずれも dialog を閉じる（overlay と同時に開かない）
+                // Both confirmation and applied close the dialog (do not open alongside the overlay)
                 self.closeSizeDialog();
             },
         }
     }
 
-    /// netsync 中に editingBlocked なら、ローカル編集（capture / bezier / select ドラッグ）を
-    /// 中断して適用を許可する（host 権威の remote COMMIT を fail-soft 切断させない。TASK-94 Phase C P1）。
-    /// solo は従来どおり EditingBlocked。
+    /// During netsync, if editingBlocked, interrupt local edits (capture / bezier / select drag)
+    /// and allow the apply (so a host-authoritative remote COMMIT does not fail-soft disconnect).
+    /// Solo still returns EditingBlocked as before.
     fn checkEditingAllowed(self: *App) error{EditingBlocked}!void {
         if (!self.editingBlocked()) return;
         if (!platform.netsyncActive()) return error.EditingBlocked;
         self.interruptLocalEditForNetsync();
     }
 
-    /// ローカルの進行中編集を破棄する（canvas 画素を汚す capture/fill のみ巻き戻し。
-    /// bezier / select ドラッグは確定前に canvas を汚さないので cancel のみ）。
+    /// Discard in-flight local edits (only capture/fill that dirty canvas pixels are rolled back;
+    /// bezier / select drag do not dirty the canvas before commit, so cancel only).
     fn interruptLocalEditForNetsync(self: *App) void {
         if (self.input.capturing) {
             self.recorder.abandon(self.canvas, self.gpa);
@@ -1094,42 +1094,42 @@ const App = struct {
             self.input.cancel();
         }
         if (self.bezier_editor.isEditing()) {
-            // ESC と同じ内部処理（未確定 path 破棄）。ドラッグ中フラグも落とす。
+            // Same internal path as ESC (discard unfinished path). Also clear the in-drag flag.
             self.bezier_editor.update(self.gpa, .cancel);
             self.bez_in.in_drag = false;
         }
         if (self.sel_in.state != .idle) {
-            // ESC ドラッグ中断と同じ（実レイヤーは drag 中不変 → 画素巻き戻し不要）。
+            // Same as ESC drag interrupt (real layer is unchanged during drag → no pixel rollback).
             self.sel_in.cancel(self.gpa);
         }
         if (self.shape_in.state != .idle) {
-            self.shape_in.cancel(); // プレビューのみ・canvas 非汚染
+            self.shape_in.cancel(); // Preview only; does not dirty the canvas
         }
         self.setSaveMsg("netsync: 進行中の編集は相手の操作適用のため中断されました", .{});
     }
 
-    /// ソフトオーバーレイ（ツールグリフ + footprint リング）を隠すべきか（TASK-75.4）。
-    /// 実際に描画/入力操作が進行中（stroke capture・選択ドラッグ・ベジェのハンドルドラッグ・パン）の間は
-    /// 隠す（bezier hover プレビューの「ドラッグ中は隠す」流儀と同じ）。これにより
-    /// `brush_edges.refresh()`（Brush.footprint() 経由で buildDab を再実行する）が Brush ストローク中に
-    /// 呼ばれることも無くなり、「footprint は down 時に latch・stroke 中不変」という既存契約を壊さない。
+    /// Whether the soft overlay (tool glyph + footprint ring) should be hidden.
+    /// Hide while a real draw/input op is in progress (stroke capture, selection drag, bezier handle drag, pan)
+    /// (same "hide while dragging" style as the bezier hover preview). This also prevents
+    /// `brush_edges.refresh()` (which re-runs buildDab via Brush.footprint()) from being called mid-Brush stroke,
+    /// preserving the existing contract that the footprint is latched on down and immutable during the stroke.
     fn isPointerBusy(self: *const App) bool {
         return self.input.capturing or self.sel_in.state != .idle or self.shape_in.state != .idle or self.bez_in.in_drag or self.pan_active or self.minimap_drag_active or self.eye_in.picking;
     }
 
-    /// 安全点（framebuffer unlock 後・入力更新後）で保留中のファイル操作を 1 回だけ実行する。
-    /// `error.DialogPending`（wasm file picker 待ち）のときは `dialog_op` に当該 op を保持して次 frame 再試行。
-    /// dialog 待ち中に `pending_file_op` へ積まれた別要求は破棄する（picker 結果の誤配送防止。TASK-73.3 修正1）。
-    /// それ以外（成功・キャンセル null・他 error 表示済み）では `dialog_op` をクリアして消費する。
+    /// Run the pending file op once at the safe point (after framebuffer unlock and input update).
+    /// On `error.DialogPending` (wasm file picker wait), keep that op in `dialog_op` and retry next frame.
+    /// While a dialog is pending, discard other requests queued on `pending_file_op` (prevents mis-delivering the picker result).
+    /// Otherwise (success, cancel null, or other error already shown) clear `dialog_op` and consume it.
     fn runPendingFileOp(self: *App) void {
-        // システム clipboard paste（色 #RRGGBB）の非同期届けを安全点で取り込む。
+        // Take up an async system-clipboard paste (color #RRGGBB) at the safe point.
         if (platform.clipboardTakePaste()) |text| {
             self.applySystemClipboardColor(text);
         }
 
-        // dialog 進行中は dialog_op を優先。無ければ pending を 1 回だけ起動。
+        // While a dialog is in flight, prefer dialog_op. Otherwise start pending at most once.
         const op = self.dialog_op orelse (self.pending_file_op orelse return);
-        // dialog 待ち中に積まれた別要求は破棄（通知なし。意図: picker 結果を別 op に食わせない）。
+        // Discard other requests queued during dialog wait (no notice; intent: do not feed the picker result to another op).
         self.pending_file_op = null;
         const pending = switch (op) {
             .save => self.doSave(),
@@ -1150,10 +1150,10 @@ const App = struct {
         self.dialog_op = null;
     }
 
-    /// ファイル op の結果。`.dialog_pending` は wasm open の picker 待ち。
+    /// Result of a file op. `.dialog_pending` means waiting on the wasm open picker.
     const FileOpResult = enum { done, dialog_pending };
 
-    /// システム clipboard の text を色として解釈（`#RRGGBB` / `RRGGBB`。他は無視）。
+    /// Interpret system-clipboard text as a color (`#RRGGBB` / `RRGGBB`; anything else is ignored).
     fn applySystemClipboardColor(self: *App, text: []const u8) void {
         var s = std.mem.trim(u8, text, " \t\r\n");
         if (s.len > 0 and s[0] == '#') s = s[1..];
@@ -1162,7 +1162,7 @@ const App = struct {
         self.doSetColorHex(0xFF000000 | rgb);
     }
 
-    /// 現在の描画色を `#RRGGBB` でシステム clipboard へ（wasm Clipboard API。native は no-op）。
+    /// Put the current drawing color on the system clipboard as `#RRGGBB` (wasm Clipboard API; native is a no-op).
     fn copySystemColor(self: *App) void {
         const c = self.pen.color;
         const r: u8 = @truncate(c >> 16);
@@ -1173,20 +1173,20 @@ const App = struct {
         platform.clipboardWrite(hex);
     }
 
-    /// 選択スウォッチの色を編集中 HSV から決定し、palette と描画色（pen）へ反映する。
-    /// edit_synced_for と palette.selected が一致するフレームでだけ呼ぶ（選択切替フレームの上書き事故回避）。
+    /// Resolve the selected swatch color from the in-edit HSV and apply it to the palette and drawing color (pen).
+    /// Call only on frames where edit_synced_for matches palette.selected (avoids overwrite on the selection-change frame).
     fn applyEditColor(self: *App) void {
         const c: u32 = @bitCast(gui.Color.fromHsv(self.edit_h, self.edit_s, self.edit_v));
         self.palette.setSelectedColor(c);
         self.pen.color = c;
-        self.brush.color = c; // Brush の描画色もパレット編集色に追従
-        self.fill.color = c; // Fill の塗り色もパレット編集色に追従
+        self.brush.color = c; // Brush drawing color also follows the palette edit color
+        self.fill.color = c; // Fill paint color also follows the palette edit color
     }
 
-    /// 指定色を直接パレット選択色へ設定する（action `set_color` 用）。HSV ウィジェットを経由しない
-    /// 直接代入のため `edit_synced_for = null` で次フレームの `syncEditHsv` に再同期を強制する
-    /// （無いと HSV スライダーに触れた瞬間に古い HSV から色が巻き戻る）。`applyEditColor` 同様
-    /// guard 無し（色選択は既存 UI でも editingBlocked に関わらず常に効く）。
+    /// Set the palette selection color directly (for action `set_color`). Bypasses the HSV widgets;
+    /// the direct assign forces `edit_synced_for = null` so the next frame's `syncEditHsv` re-syncs
+    /// (otherwise touching an HSV slider would roll the color back from stale HSV). Like `applyEditColor`,
+    /// no editingBlocked guard (color picks always apply in the existing UI regardless of editingBlocked).
     fn doSetColorHex(self: *App, color: u32) void {
         self.palette.setSelectedColor(color);
         self.pen.color = color;
@@ -1195,18 +1195,18 @@ const App = struct {
         self.edit_synced_for = null;
     }
 
-    /// App.palette.colors → doc.palette へ同期（.pix encode / netsync export 前。TASK-89）。
+    /// Sync App.palette.colors → doc.palette (before .pix encode / netsync export).
     fn syncPaletteToDoc(self: *App) void {
         self.doc.palette.clearRetainingCapacity();
         self.doc.palette.ensureTotalCapacity(self.gpa, self.palette.colors.items.len) catch @panic("syncPaletteToDoc: OOM");
         for (self.palette.colors.items) |c| self.doc.palette.appendAssumeCapacity(c);
     }
 
-    /// doc.palette → App.palette 再構築（空なら DB16。load / netsync import 後。TASK-89）。
+    /// Rebuild App.palette from doc.palette (DB16 if empty; after load / netsync import).
     fn loadPaletteFromDoc(self: *App) void {
         self.palette.colors.clearRetainingCapacity();
         if (self.doc.palette.items.len == 0) {
-            // DB16 初期化（initDb16 と同内容・既存 gpa の colors を再利用）
+            // DB16 init (same contents as initDb16; reuse the existing gpa-backed colors)
             self.palette.colors.ensureTotalCapacity(self.gpa, palette_mod.db16.len) catch @panic("loadPaletteFromDoc: OOM");
             for (palette_mod.db16) |rgb| self.palette.colors.appendAssumeCapacity(palette_mod.rgbToCanvas(rgb));
         } else {
@@ -1222,7 +1222,7 @@ const App = struct {
         self.repl_source = null;
     }
 
-    /// パレット色列を全置換する（palette_set / palette_ramp / palette_from_png 共通。undo 対象外）。
+    /// Replace the whole palette color list (shared by palette_set / palette_ramp / palette_from_png; not undoable).
     fn doReplacePalette(self: *App, colors: []const u32) void {
         std.debug.assert(colors.len >= 1);
         self.palette.colors.clearRetainingCapacity();
@@ -1238,8 +1238,8 @@ const App = struct {
         self.markProjectDirty();
     }
 
-    /// 指定 layer の from→to 色置換（UI Repl / action replace_color。undo 可 = .paint Op）。
-    /// layer_idx は呼び出し側が resolve（action は layer ref、UI は selected）。
+    /// Replace from→to colors on the given layer (UI Repl / action replace_color; undoable = .paint Op).
+    /// Caller resolves layer_idx (action uses a layer ref; UI uses selected).
     fn doReplaceColor(self: *App, layer_idx: usize, from: u32, to: u32) !u32 {
         if (self.editingBlocked()) return error.EditingBlocked;
         if (layer_idx >= self.doc.layers.items.len) return error.OutOfRange;
@@ -1249,45 +1249,45 @@ const App = struct {
         };
     }
 
-    /// undo op の所有者タグ（`UndoStack.owners` の pixie 規約。TASK-62.5.4 review 反映:
-    /// CommandLog リング退避で record が消えても op の所有者を誤認しないための op 側タグ）。
-    /// unknown は「まだ確定していない未記録 push」で、フレーム末尾の `checkUnrecordedEdits` が
-    /// user に確定する（agent 操作は常に action 経由で同イベント内にタグ付けされるため、
-    /// フレーム末尾まで unknown で残る push は user の UI 操作しかない）。
+    /// Owner tag for an undo op (pixie convention for `UndoStack.owners`:
+    /// an op-side tag so ownership is not misread after CommandLog ring eviction drops the record).
+    /// unknown means "an as-yet unrecorded push"; end-of-frame `checkUnrecordedEdits` settles it
+    /// as user (agent ops are always tagged in the same event via an action, so the only pushes that
+    /// stay unknown until frame end are user UI ops).
     const OP_OWNER_UNKNOWN: u8 = 0;
     const OP_OWNER_USER: u8 = 1;
     const OP_OWNER_AGENT: u8 = 2;
 
-    /// `first_seq`（呼び出し前の `cmd_log.next_seq`）**以降**に記録された normal record の
-    /// undo_ref op へ所有者タグを付ける（executeAction / redoOne の後始末。record の actor が
-    /// 確定している時点で op 側へ転記する）。
+    /// Tag owner on the undo_ref ops of normal records recorded at/after `first_seq`
+    /// (the pre-call `cmd_log.next_seq`) — cleanup after executeAction / redoOne; once the record's actor is
+    /// known, copy it onto the op side).
     fn tagOwnersFromRecords(self: *App, first_seq: u64, tag: u8) void {
         var i: u32 = self.cmd_log.filled;
         while (i > 0) {
             i -= 1;
             const rec = self.cmd_log.recordAt(i);
-            if (rec.seq < first_seq) break; // seq は単調（これより古い record にタグ対象はない）
+            if (rec.seq < first_seq) break; // seq is monotonic (no older record is a tag target)
             if (rec.kind != .normal) continue;
             const ref = rec.undo_ref orelse continue;
             self.doc.undo.setOwner(ref, tag);
         }
     }
 
-    /// ドキュメント読込/リセットで CommandLog 上の stale な undo/redo 候補を失効させる
-    /// （TASK-62.5.4 review 反映）。undo 側は handle 単調化 + `hasHandle=false`（canUndo）で
-    /// 自然失効するが、**redo 側（revert record）は epoch を進めないと旧 document の command を
-    /// 新 document に再実行してしまう**ため、両 actor の epoch を明示的に bump する。
+    /// Invalidate stale undo/redo candidates on CommandLog after a document load/reset.
+    /// The undo side expires naturally via handle monotonicity + `hasHandle=false` (canUndo), but
+    /// **the redo side (revert records) must bump epoch** or old-document commands would re-run
+    /// against the new document — bump both actors' epochs explicitly.
     fn invalidateHistoryAfterDocReset(self: *App) void {
         self.cmd_exec.bumpEpoch(.local_user);
         self.cmd_exec.bumpEpoch(.local_agent);
         self.last_seen_handle = self.doc.undo.next_handle;
-        // 旧 document のサムネイルが新 document に残らないよう固定メタを無効化（TASK-83.2）。
+        // Invalidate fixed visual meta so old-document thumbnails do not linger on the new document.
         for (&self.history_thumb_meta) |*m| m.clear();
         self.markHistoryDirty();
     }
 
-    /// 履歴確定フック: seq の CommandRecord から visual メタ／paint サムネイルを固定リングへ保存。
-    /// **イベント時のみ**。allocator 不使用。
+    /// History commit hook: store visual meta / paint thumbnail for seq's CommandRecord into the fixed ring.
+    /// **Event-time only**. No allocator.
     fn captureHistoryVisual(self: *App, seq: u64) void {
         const rec = self.cmd_log.findBySeq(seq) orelse return;
         const slot: usize = @intCast(seq % platform.command.MAX_CMD_LOG);
@@ -1316,12 +1316,12 @@ const App = struct {
             }
         }
 
-        // normal だが非 paint / undo_ref なし → [meta]
+        // normal but non-paint / no undo_ref → [meta]
         meta.kind = @intFromEnum(history_summary.VisualKind.meta);
         self.history_thumb_meta[slot] = meta;
     }
 
-    /// seq_before 以降に append された record をまとめて capture（redo / undo の複数 append 用）。
+    /// Capture every record appended at/after seq_before (for multi-append redo / undo).
     fn captureHistoryVisualsSince(self: *App, seq_before: u64) void {
         var i: u32 = 0;
         while (i < self.cmd_log.filled) : (i += 1) {
@@ -1330,8 +1330,8 @@ const App = struct {
         }
     }
 
-    /// TASK-163: netsync `applyWireCommit` post-apply → 既存 `captureHistoryVisual`。
-    /// solo の recordedStroke/recordedAction 経路とは発火点が違うので二重 capture しない。
+    /// netsync `applyWireCommit` post-apply → existing `captureHistoryVisual`.
+    /// Fire point differs from solo recordedStroke/recordedAction, so do not double-capture.
     fn netsyncPostApplyHook(ctx: *anyopaque, applied: platform.NetsyncPostApplyContext) void {
         const self: *App = @ptrCast(@alignCast(ctx));
         _ = applied.name;
@@ -1359,9 +1359,9 @@ const App = struct {
         };
     }
 
-    /// stroke の実効パラメータを解決する（§5c': 明示 k=v > 現在の App 状態）。tool 未指定かつ
-    /// 現在ツールが pen/eraser/brush 以外は `error.UnsupportedTool`（fill は呼び出し側が
-    /// legacy 経路で扱う。bezier/select/eyedropper は従来どおり拒否）。
+    /// Resolve effective stroke parameters (explicit k=v overrides current App state). If tool is omitted and
+    /// the current tool is not pen/eraser/brush, return `error.UnsupportedTool` (fill is handled by the caller
+    /// on the legacy path; bezier/select/eyedropper stay rejected as before).
     fn resolveEffectiveStroke(self: *App, p: actions.StrokeParams) error{UnsupportedTool}!actions.EffectiveStroke {
         const tool: actions.StrokeTool = p.tool orelse switch (self.active_kind) {
             .pen => .pen,
@@ -1379,7 +1379,7 @@ const App = struct {
         };
     }
 
-    /// stroke の発信元 layer を安定 id へ解決する。省略時は capture/dispatch 元の selected layer。
+    /// Resolve the stroke's source layer to a stable id. When omitted, use the selected layer at capture/dispatch.
     fn resolveStrokeLayerId(self: *App, ref: ?actions.LayerRef) !u64 {
         const idx = if (ref) |r|
             self.resolveStrokeLayerIndex(r) catch |err| {
@@ -1400,8 +1400,8 @@ const App = struct {
         };
     }
 
-    /// `.relay` route の入口で、発信元の tool/color/brush 設定と layer id を焼き込む。
-    /// fill の旧 legacy 経路だけは従来の raw args を維持する。
+    /// At the `.relay` route entry, bake the source tool/color/brush settings and layer id.
+    /// Only fill's old legacy path keeps raw args as before.
     fn canonicalizeStroke(ctx: *anyopaque, args: []const u8, scratch: []u8) anyerror![]const u8 {
         const app: *App = @ptrCast(@alignCast(ctx));
         var pts_buf: [actions.MAX_STROKE_POINTS]actions.Point = undefined;
@@ -1416,7 +1416,7 @@ const App = struct {
         return actions.formatCanonicalStroke(scratch, canonical, parsed.points) catch return error.ArgsTooLong;
     }
 
-    /// UI stroke の点列蓄積を開始する（capture 開始時。実効パラメータもここで latch する。§5c）。
+    /// Begin accumulating UI-stroke points (at capture start; also latch effective parameters here).
     fn uiStrokeBegin(self: *App, p: core.Vec2) void {
         self.ui_stroke_len = 0;
         self.ui_stroke_overflow = false;
@@ -1426,7 +1426,7 @@ const App = struct {
         self.ui_stroke_size = self.brush.size;
         self.ui_stroke_opacity = self.brush.opacity;
         self.ui_stroke_hardness = self.brush.hardness_q;
-        // TASK-162: netsync 中は relay chunking（overflow しない）。solo は従来固定配列。
+        // During netsync use relay chunking (no overflow). Solo keeps the fixed array.
         self.relay_stroke = platform.netsyncActive();
         if (self.relay_stroke) {
             self.relayResetCapture();
@@ -1444,7 +1444,7 @@ const App = struct {
         if (self.ui_stroke_overflow) return;
         if (self.ui_stroke_len > 0) {
             const last = self.ui_stroke_pts[self.ui_stroke_len - 1];
-            if (last.x == p.x and last.y == p.y) return; // 連続同一点は蓄積しない
+            if (last.x == p.x and last.y == p.y) return; // Do not accumulate consecutive identical points
         }
         if (self.ui_stroke_len >= actions.MAX_STROKE_POINTS) {
             self.ui_stroke_overflow = true;
@@ -1480,7 +1480,7 @@ const App = struct {
                 std.debug.print("pixie: relay chunk flush OOM — subsequent points may be dropped\n", .{});
                 return;
             };
-            // flush 後 active は carry 1 点。同一点なら追加しない。
+            // After flush, active carries 1 point. Do not append if it is the same point.
             if (self.relay_active_len > 0) {
                 const last = self.relay_active_pts[self.relay_active_len - 1];
                 if (last.x == pt.x and last.y == pt.y) return;
@@ -1492,7 +1492,7 @@ const App = struct {
 
     fn relayFlushActiveChunk(self: *App) !void {
         if (self.relay_active_len == 0) return;
-        // continuation で carry のみ（新点なし）は送らない。
+        // Do not send a continuation that is carry-only (no new points).
         if (self.relay_active_continuation and self.relay_active_len == 1) {
             return;
         }
@@ -1508,12 +1508,12 @@ const App = struct {
         self.relay_active_continuation = true;
     }
 
-    /// release 時: 最終 active を chunk 化し、全 chunk の canonical args を `out` に構築する。
-    /// 成功時は `relay_chunks` を空にし、caller が rewind 後に `relaySendCanonicalChunks` する。
-    /// 失敗時は false（preview rewind 禁止）。構築途中の `out` は空に戻す。chunks は触らない
-    /// （caller が abandon する）。
+    /// On release: finalize the last active into a chunk and build canonical args for every chunk into `out`.
+    /// On success empty `relay_chunks`; caller rewinds then calls `relaySendCanonicalChunks`.
+    /// On failure return false (do not rewind the preview). Clear a partially built `out`; leave chunks alone
+    /// (caller abandons them).
     fn relayBuildCanonicalChunks(self: *App, out: *std.ArrayListUnmanaged([]u8)) bool {
-        // 最終 active を flush（carry のみ continuation はスキップ）
+        // Flush the final active (skip carry-only continuation)
         if (self.relay_active_len > 0) {
             if (!(self.relay_active_continuation and self.relay_active_len == 1)) {
                 var chunk: RelayStrokeChunk = .{
@@ -1530,7 +1530,7 @@ const App = struct {
         }
         if (self.relay_chunks.items.len == 0) return true;
 
-        // client: pending FIFO に全 chunk を一度に載せられるか（跨 frame drain しないため事前検査）
+        // client: can the pending FIFO take every chunk at once? (pre-check; no cross-frame drain)
         if (!platform.netsyncIsHost()) {
             const pending = platform.netsyncPendingProposalCount();
             const avail = if (pending < platform.netsyncPendingCap)
@@ -1593,13 +1593,13 @@ const App = struct {
         return true;
     }
 
-    /// release 直後: 構築済み canonical args を順序通りすべて routeAction（COMMIT を待たない）。
-    /// client は PROPOSE を連続 enqueue（pending cap は build 前に検査済み）。
+    /// Right after release: routeAction every built canonical args in order (do not wait for COMMIT).
+    /// Client enqueues PROPOSEs back-to-back (pending cap was checked before build).
     fn relaySendCanonicalChunks(self: *App, args_list: []const []u8) void {
         for (args_list, 0..) |args, i| {
             var out_buf: [256]u8 = undefined;
             _ = platform.routeAction("stroke", args, &out_buf) catch |err| {
-                std.debug.print("pixie: netsync UI stroke chunk {d}/{d} routeAction 失敗: {s}\n", .{
+                std.debug.print("pixie: netsync UI stroke chunk {d}/{d} routeAction failed: {s}\n", .{
                     i + 1,
                     args_list.len,
                     @errorName(err),
@@ -1614,9 +1614,9 @@ const App = struct {
         }
     }
 
-    /// UI stroke の確定点で CommandRecord を記録する（§5c。actor=local_user・canonical args。
-    /// one-shot: 蓄積は必ずクリアする）。`pushed` = pushPaintOp で Op が実際に push されたか
-    /// （true なら undo_ref = 直近 push の handle = AC #2 の対応付け）。
+    /// Record a CommandRecord at UI-stroke commit (actor=local_user, canonical args;
+    /// one-shot: always clear the accumulator). `pushed` = whether pushPaintOp actually pushed an Op
+    /// (when true, undo_ref = handle of the latest push — the action⇄UndoCmd pairing).
     fn recordUiStroke(self: *App, pushed: bool) void {
         if (pushed) self.markProjectDirty();
         const len = self.ui_stroke_len;
@@ -1624,14 +1624,14 @@ const App = struct {
         self.uiStrokeDiscard();
         if (len == 0) return;
         if (overflow) {
-            std.debug.print("pixie: UI stroke の記録を skip（{d} 点超過。Op は legacy UndoStack に残る）\n", .{actions.MAX_STROKE_POINTS});
+            std.debug.print("pixie: skipping UI stroke record ({d} points over limit; Op remains on legacy UndoStack)\n", .{actions.MAX_STROKE_POINTS});
             return;
         }
         const tool: actions.StrokeTool = switch (self.ui_stroke_tool) {
             .pen => .pen,
             .eraser => .eraser,
             .brush => .brush,
-            else => return, // fill 等は §5c の記録対象外（pen/eraser/brush のみ）
+            else => return, // fill etc. are outside this recording path (pen/eraser/brush only)
         };
         var canon_buf: [platform.command.MAX_CMD_ARGS]u8 = undefined;
         const canon = actions.formatCanonicalStroke(&canon_buf, .{
@@ -1642,22 +1642,22 @@ const App = struct {
             .opacity = self.ui_stroke_opacity,
             .hardness = self.ui_stroke_hardness,
         }, self.ui_stroke_pts[0..len]) catch {
-            std.debug.print("pixie: UI stroke の記録を skip（canonical args が {d}B 超過。Op は legacy UndoStack に残る）\n", .{platform.command.MAX_CMD_ARGS});
+            std.debug.print("pixie: skipping UI stroke record (canonical args exceed {d}B; Op remains on legacy UndoStack)\n", .{platform.command.MAX_CMD_ARGS});
             return;
         };
         const undo_ref: ?u64 = if (pushed) self.doc.undo.topHandle() else null;
         var msg_buf: [64]u8 = undefined;
         const seq = self.cmd_exec.recordExecuted("stroke", canon, .{ .actor = .local_user }, undo_ref, &msg_buf) catch |err| {
-            std.debug.print("pixie: UI stroke の記録に失敗: {s}\n", .{@errorName(err)});
-            return; // 記録失敗 = 未記録 push としてフレーム末尾の bumpEpoch に委ねる（§2b）
+            std.debug.print("pixie: failed to record UI stroke: {s}\n", .{@errorName(err)});
+            return; // Record failure = unrecorded push; leave epoch bump to end-of-frame
         };
         if (seq) |s| self.captureHistoryVisual(s);
-        if (undo_ref) |ref| self.doc.undo.setOwner(ref, OP_OWNER_USER); // op は user 所有（review 反映）
-        self.last_seen_handle = self.doc.undo.next_handle; // 記録された push（§2b の追従点）
+        if (undo_ref) |ref| self.doc.undo.setOwner(ref, OP_OWNER_USER); // op is user-owned
+        self.last_seen_handle = self.doc.undo.next_handle; // Recorded push (follow point for unrecorded-edit detection)
     }
 
-    /// netsync 中の UI stroke を routeAction("stroke") へ流す対象か（pen/eraser/brush のみ。
-    /// fill 等は action 語彙なし → netsync 中は rewind_discard。TASK-94 Phase C）。
+    /// Whether a netsync UI stroke should go through routeAction("stroke") (pen/eraser/brush only;
+    /// fill etc. have no action vocabulary → rewind_discard during netsync).
     fn uiStrokeRelaysViaAction(self: *const App) bool {
         return switch (self.ui_stroke_tool) {
             .pen, .eraser, .brush => true,
@@ -1665,15 +1665,15 @@ const App = struct {
         };
     }
 
-    /// ローカル preview 塗りを pd.diffs の before（= ストローク開始前値。StrokeRecorder dedup /
-    /// brush orig）で巻き戻し、diffs を解放する（pushPaintOp しない。TASK-94 Phase C-1b）。
+    /// Rewind the local preview paint from pd.diffs' before values (= pre-stroke; StrokeRecorder dedup /
+    /// brush orig) and free the diffs (do not pushPaintOp).
     fn rewindPaintDiff(self: *App, pd: core.PaintDiff) void {
         const pixels = self.canvas.layerPixels(pd.layer_idx);
         for (pd.diffs) |d| pixels[d.idx] = d.before;
         self.gpa.free(pd.diffs);
     }
 
-    /// UI shape 確定の CommandRecord 記録（TASK-90。actor=local_user）。
+    /// Record a CommandRecord for a committed UI shape (actor=local_user).
     fn recordUiShape(self: *App, pushed: bool) void {
         if (pushed) self.markProjectDirty();
         var canon_buf: [platform.command.MAX_CMD_ARGS]u8 = undefined;
@@ -1687,13 +1687,13 @@ const App = struct {
             .p1 = .{ .x = self.shape_in.cur.x, .y = self.shape_in.cur.y },
             .fill = self.shape_in.fill,
         }) catch {
-            std.debug.print("pixie: UI shape の記録を skip（canonical args 超過）\n", .{});
+            std.debug.print("pixie: skipping UI shape record (canonical args too long)\n", .{});
             return;
         };
         const undo_ref: ?u64 = if (pushed) self.doc.undo.topHandle() else null;
         var msg_buf: [64]u8 = undefined;
         const seq = self.cmd_exec.recordExecuted("shape", canon, .{ .actor = .local_user }, undo_ref, &msg_buf) catch |err| {
-            std.debug.print("pixie: UI shape の記録に失敗: {s}\n", .{@errorName(err)});
+            std.debug.print("pixie: failed to record UI shape: {s}\n", .{@errorName(err)});
             return;
         };
         if (seq) |s| self.captureHistoryVisual(s);
@@ -1701,7 +1701,7 @@ const App = struct {
         self.last_seen_handle = self.doc.undo.next_handle;
     }
 
-    /// netsync 中 UI shape 確定: 巻き戻し済み → routeAction("shape")。
+    /// netsync UI shape commit: already rewound → routeAction("shape").
     fn relayUiShape(self: *App) void {
         var canon_buf: [platform.command.MAX_CMD_ARGS]u8 = undefined;
         const canon = actions.formatCanonicalShape(&canon_buf, .{
@@ -1714,20 +1714,20 @@ const App = struct {
             .p1 = .{ .x = self.shape_in.cur.x, .y = self.shape_in.cur.y },
             .fill = self.shape_in.fill,
         }) catch {
-            std.debug.print("pixie: netsync UI shape を skip（canonical args 超過）\n", .{});
+            std.debug.print("pixie: skipping netsync UI shape (canonical args too long)\n", .{});
             return;
         };
         var out_buf: [256]u8 = undefined;
         _ = platform.routeAction("shape", canon, &out_buf) catch |err| {
-            std.debug.print("pixie: netsync UI shape routeAction 失敗: {s}\n", .{@errorName(err)});
+            std.debug.print("pixie: netsync UI shape routeAction failed: {s}\n", .{@errorName(err)});
         };
     }
 
-    /// netsync 中のみ routeAction、solo は呼び出し側が do* を使う（TASK-94 Phase C-2）。
+    /// routeAction only during netsync; solo callers use do* directly.
     fn routeUi(self: *App, name: []const u8, args: []const u8) void {
         var buf: [256]u8 = undefined;
         _ = platform.routeAction(name, args, &buf) catch |err| {
-            std.debug.print("pixie: routeAction {s} 失敗: {s}\n", .{ name, @errorName(err) });
+            std.debug.print("pixie: routeAction {s} failed: {s}\n", .{ name, @errorName(err) });
             self.setSaveMsg("netsync: {s} を送信できませんでした（{s}）", .{ name, @errorName(err) });
         };
     }
@@ -1760,27 +1760,27 @@ const App = struct {
         self.routeUi("move_layer", args);
     }
 
-    /// スポイト（TASK-68）: 指定 canvas 座標の色を描画色へ反映する。座標は呼び出し側
-    /// （`eyedropper_input.EyedropperInput.update`）が既に canvas 範囲内であることを保証している。
-    /// 取得色は「合成色」（`compositeStraight()`。表示されている見た目の色。設計判断は plan 参照）。
-    /// alpha==0（未描画/透明）は無視する（黒などの偽色を拾わせない）。alpha は不透明へ強制してから
-    /// `doSetColorHex` へ渡す（`palette.zig` の不変条件「色は常に不透明」を守るため）。
-    /// Eraser 選択中に拾った場合は Pen へ自動切替する（Eraser 自体には描画色の概念が無いため。
-    /// パレットスウォッチクリックと同じ既存慣習）。`setActiveKind` は経由しない直接代入で切り替える
-    /// （`setActiveKind` は `eye_in.picking` 中は競合ガードで no-op になるため、drag 中に不透明色を
-    /// 拾った時点で切り替えたい本メソッドの意図と噛み合わない。この切替は「進行中の eyedrop 操作
-    /// 自身の帰結」であり他ツールとの競合ではないので安全にバイパスできる。かつ .eraser から離れる
-    /// 遷移は bezier cancel も sel_in フロート破棄も不要＝`setActiveKind` のガード外処理を再現する
-    /// 必要が無い。codex レビュー指摘 2026-07-05）。
+    /// Eyedropper: apply the color at the given canvas coords as the drawing color. The caller
+    /// (`eyedropper_input.EyedropperInput.update`) already guarantees the coords are inside the canvas.
+    /// The sampled color is the composite (`compositeStraight()` — the on-screen look).
+    /// Ignore alpha==0 (undrawn/transparent) so bogus blacks are not picked. Force opaque alpha before
+    /// passing to `doSetColorHex` (keeps the `palette.zig` invariant that colors are always opaque).
+    /// Picking while Eraser is selected auto-switches to Pen (Eraser has no drawing-color concept;
+    /// same convention as clicking a palette swatch). Assign active_kind directly, not via `setActiveKind`
+    /// (`setActiveKind` is a no-op while `eye_in.picking` due to the conflict guard, which fights this
+    /// method's intent to switch as soon as an opaque color is picked mid-drag. The switch is a
+    /// consequence of the in-flight eyedrop itself, not a conflict with another tool, so the bypass is safe.
+    /// Leaving .eraser also needs no bezier cancel / sel_in float discard, so there is nothing of
+    /// `setActiveKind`'s out-of-guard work to reproduce.)
     fn pickColor(self: *App, x: i32, y: i32) void {
         const idx = @as(usize, @intCast(y)) * self.canvas.width + @as(usize, @intCast(x));
         const sampled = self.canvas.compositeStraight()[idx];
-        if (sampled & 0xFF000000 == 0) return; // 透明部は無視
+        if (sampled & 0xFF000000 == 0) return; // Ignore transparent samples
         self.doSetColorHex(0xFF000000 | (sampled & 0x00FFFFFF));
         if (self.active_kind == .eraser) self.active_kind = .pen;
     }
 
-    /// 選択（or load）が変わったフレームに編集中 HSV を現在色から再同期する。
+    /// On the frame selection (or load) changes, re-sync in-edit HSV from the current color.
     fn syncEditHsv(self: *App) void {
         if (self.edit_synced_for == self.palette.selected) return;
         const hsv = guiColor(self.palette.current()).toHsv();
@@ -1790,7 +1790,7 @@ const App = struct {
         self.edit_synced_for = self.palette.selected;
     }
 
-    /// パレットを .gpl で保存（名前を付けて保存。成功でダイアログ戻り値を palette_path へ移譲）。
+    /// Save the palette as .gpl (save-as; on success hand the dialog path to palette_path).
     fn doSavePalette(self: *App) FileOpResult {
         const maybe = platform.saveFileDialog(self.gpa, self.io, .{
             .default_name = "palette.gpl",
@@ -1818,7 +1818,7 @@ const App = struct {
         return .done;
     }
 
-    /// .gpl を読み込んでパレットを差し替える（成功時のみ。失敗時は既存パレットを保持）。
+    /// Load a .gpl and replace the palette (only on success; keep the existing palette on failure).
     fn doLoadPalette(self: *App) FileOpResult {
         const maybe = platform.openFileDialog(self.gpa, self.io, .{ .allowed_ext = "gpl" }) catch |err| {
             if (err == error.DialogPending) return .dialog_pending;
@@ -1836,11 +1836,11 @@ const App = struct {
             self.setSaveMsg("Palette load failed: {s}", .{@errorName(err)});
             return .done;
         };
-        // 成功: 旧 colors を解放して差し替え、selected/HSV を初期化
+        // Success: free old colors, swap in the new list, reset selected/HSV
         self.palette.colors.deinit(self.gpa);
         self.palette.colors = colors;
         self.palette.selected = 0;
-        self.edit_synced_for = null; // 次フレームで HSV 再同期
+        self.edit_synced_for = null; // Re-sync HSV next frame
         self.repl_source = null;
         const cur = self.palette.current();
         self.pen.color = cur;
@@ -1850,26 +1850,26 @@ const App = struct {
         return .done;
     }
 
-    /// 指定パスへ直接保存する（ダイアログ不使用。`doSave` の共通実装 + action `save <path>` 用）。
-    /// current_path は更新しない（headless 呼び出しが UI の「名前を付けて保存」の永続状態へ
-    /// 暗黙に介入しないため）。editingBlocked チェックは無い（既存 doSave/doSaveAs に無いのでそのまま）。
+    /// Save directly to the given path (no dialog; shared by `doSave` + action `save <path>`).
+    /// Does not update current_path (a headless call must not silently mutate the UI "save as" persistent state).
+    /// No editingBlocked check (neither doSave nor doSaveAs has one).
     fn doSaveTo(self: *App, path: []const u8) !void {
         const flat = self.canvas.compositeStraight();
         try core.savePNG(self.io, path, flat, self.canvas.width, self.canvas.height, self.gpa);
         self.setSaveMsg("Saved: {s}", .{std.fs.path.basename(path)});
     }
 
-    /// 記憶している保存先へ直接上書き。未設定なら「名前を付けて保存」へフォールバック。
+    /// Overwrite the remembered save path directly. If unset, fall back to save-as.
     fn doSave(self: *App) FileOpResult {
         const path = self.current_path orelse return self.doSaveAs();
-        // current_path は永続パスなので失敗しても保持（free しない）
+        // current_path is the persistent path; keep it even on failure (do not free)
         self.doSaveTo(path) catch |err| {
             self.setSaveMsg("Save failed: {s}", .{@errorName(err)});
         };
         return .done;
     }
 
-    /// ダイアログで保存先を選んで保存。成功時にダイアログ戻り値を current_path へ移譲する。
+    /// Pick a save path via dialog and save. On success hand the dialog path to current_path.
     fn doSaveAs(self: *App) FileOpResult {
         const maybe = platform.saveFileDialog(self.gpa, self.io, .{
             .default_name = "untitled.png",
@@ -1879,22 +1879,22 @@ const App = struct {
             self.setSaveMsg("Save failed: {s}", .{@errorName(err)});
             return .done;
         };
-        const path = maybe orelse return .done; // キャンセル: サイレント no-op
+        const path = maybe orelse return .done; // Cancel: silent no-op
         const flat = self.canvas.compositeStraight();
         core.savePNG(self.io, path, flat, self.canvas.width, self.canvas.height, self.gpa) catch |err| {
             self.setSaveMsg("Save failed: {s}", .{@errorName(err)});
-            self.gpa.free(path); // 失敗時はダイアログ戻り値を解放・旧 current_path は触らない
+            self.gpa.free(path); // On failure free the dialog path; leave the old current_path untouched
             return .done;
         };
         if (self.current_path) |old| self.gpa.free(old);
-        self.current_path = path; // 移譲（再 dupe しない）
+        self.current_path = path; // Transfer ownership (do not re-dupe)
         self.setSaveMsg("Saved: {s}", .{std.fs.path.basename(path)});
         return .done;
     }
 
-    /// デコード済み PNG を指定 layer へ左上クロップ/パディングで書き込み、preview と cel へ同期する。
-    /// undo push は一切しない（呼び出し側が `.layer_add` 等の Op 単位を決める）。
-    /// canvas / PNG は canonical BGRA 0xAARRGGBB 同一レイアウトなので変換不要。
+    /// Write a decoded PNG into the given layer with top-left crop/pad, then sync preview and cel.
+    /// Never pushes undo (caller decides the Op unit, e.g. `.layer_add`).
+    /// canvas and PNG share canonical BGRA 0xAARRGGBB, so no conversion.
     fn copyDecodedPngToLayer(self: *App, layer_idx: usize, img: *const png.PNGImage) void {
         const layer = self.canvas.layerPixels(layer_idx);
         @memset(layer, 0);
@@ -1905,30 +1905,30 @@ const App = struct {
             @memcpy(layer[y * self.canvas.width ..][0..cols], img.pixels[y * iw ..][0..cols]);
         }
         self.syncPreviewCanvas();
-        // active_view は cel のコピー。saveDocument は cel_pool を直列化するため、
-        // layer 直書き後に cel へ書き戻す（TASK-95。undo Op は呼び出し側の責務）。
+        // active_view is a copy of the cel. saveDocument serializes cel_pool, so
+        // write the layer back into the cel after a direct layer write (undo Op is the caller's job).
         self.doc.commitActiveLayerToCel(self.gpa, layer_idx);
     }
 
-    /// ダイアログで PNG を選んでキャンバスへ読み込む（左上クロップ/パディング）。
-    /// 進行中 stroke 中は破棄。undo/redo はクリアし、current_path を開いたファイルに更新。
-    /// 指定パスから直接読み込む（ダイアログ不使用。`doOpen` の共通実装 + action `open <path>` 用）。
-    /// `doOpen` と同じ narrow guard（`input.capturing or bezier_editor.isEditing()`。`sel_in.state`
-    /// は見ない＝既存 doOpen の挙動をそのまま踏襲）。path は `gpa.dupe` して current_path へ独立
-    /// 所有コピーとして格納する（呼び出し側の path 所有権には関与しない）。
+    /// Pick a PNG via dialog and load it onto the canvas (top-left crop/pad).
+    /// Discard an in-flight stroke. Clear undo/redo and set current_path to the opened file.
+    /// Load directly from the given path (no dialog; shared by `doOpen` + action `open <path>`).
+    /// Same narrow guard as `doOpen` (`input.capturing or bezier_editor.isEditing()`; does not look at
+    /// `sel_in.state` — preserves existing doOpen behaviour). Path is `gpa.dupe`'d into current_path as an
+    /// independently owned copy (does not take ownership of the caller's path).
     fn doOpenPath(self: *App, path: []const u8) !void {
         if (self.input.capturing or self.bezier_editor.isEditing()) return error.EditingBlocked;
         var img = try png.decodePNGFile(self.io, self.gpa, path);
         defer img.deinit(self.gpa);
-        // current_path 用の独立コピーを、ドキュメントを差し替える**前**に確保する（後段はエラーを
-        // return しない: Document 系の OOM は panic 契約（commitActiveLayerToCel 含む）。エラー return
-        // で「読み込み済みだが失敗扱い」という中途半端な状態を作らない、の意）。
+        // Secure the independent current_path copy **before** swapping the document (later stages do not
+        // return errors: Document OOM is a panic contract, including commitActiveLayerToCel. Avoid an error
+        // return that would leave "loaded but reported as failed".).
         const owned = try self.gpa.dupe(u8, path);
 
-        // PNG はフラット形式として読み込み、layer0 だけの新規ドキュメントへ置き換える。
+        // Load PNG as a flat image and replace with a new single-layer0 document.
         self.resetCanvasToSingleLayer();
-        // selected_frame は resetToSingleBlankLayer で 0 に確定済み。
-        // load はドキュメント差し替えなので undo 不要（reset が doc.undo を破棄済み。TASK-45.1）。
+        // selected_frame is already 0 after resetToSingleBlankLayer.
+        // Load replaces the document, so no undo (reset already discarded doc.undo).
         self.copyDecodedPngToLayer(0, &img);
 
         if (self.current_path) |old| self.gpa.free(old);
@@ -1936,26 +1936,26 @@ const App = struct {
         self.setSaveMsg("Loaded: {s}", .{std.fs.path.basename(path)});
     }
 
-    /// 現ドキュメントへ PNG を新レイヤーとして挿入する（TASK-134）。
-    /// decode 先行（失敗時は document 不変）。`doAddLayer` が push する `.layer_add` 1 件を undo 単位にし、
-    /// 画素は cel へ同期してから返す（undo で layer 構造 + 画素を一体除去）。`pushPaintOp` は呼ばない。
-    /// `current_path` は変更しない。ホットパス: イベント時のみ。
+    /// Insert a PNG into the current document as a new layer.
+    /// Decode first (document unchanged on failure). One `.layer_add` from `doAddLayer` is the undo unit;
+    /// pixels are synced to the cel before return (undo removes layer structure + pixels together). No `pushPaintOp`.
+    /// Does not change `current_path`. Hot path: event-time only.
     fn doImportPngAsLayer(self: *App, path: []const u8) !void {
-        // 不変条件: decode 失敗時は document を一切変更しない。
+        // Invariant: on decode failure, do not mutate the document at all.
         var img = try png.decodePNGFile(self.io, self.gpa, path);
         defer img.deinit(self.gpa);
 
         _ = try self.doAddLayer();
-        // doAddLayer → Document.addLayer が新 layer を選択する（Canvas.insertLayer 経由で
-        // canvas.selected_layer も同期済み）。
+        // doAddLayer → Document.addLayer selects the new layer (Canvas.insertLayer also
+        // syncs canvas.selected_layer).
         const layer_idx = self.canvas.selected_layer;
         self.copyDecodedPngToLayer(layer_idx, &img);
         self.setSaveMsg("Inserted: {s}", .{std.fs.path.basename(path)});
     }
 
-    /// OS / harness の file drop を消費する（TASK-113.4 / TASK-134）。
-    /// PNG のみ `doImportPngAsLayer` へ直結（現ドキュメントへ新レイヤー挿入。.pix / その他は拒否）。
-    /// netsync 中は I/O せず reject。ホットパス: イベント時のみ。
+    /// Consume an OS / harness file drop.
+    /// PNG only goes straight to `doImportPngAsLayer` (new layer in the current document; .pix / others rejected).
+    /// During netsync, reject without I/O. Hot path: event-time only.
     fn handleFileDrop(self: *App, drop: platform.FileDropEvent) void {
         if (drop.count != 1) return;
         const path = drop.paths[0].slice();
@@ -1965,8 +1965,8 @@ const App = struct {
             return;
         }
         if (platform.netsyncActive()) {
-            // 既存 PNG open の reject_when_synced と同じメッセージ経路（setSaveMsg）。
-            // remote action へ route しない・I/O しない・canvas 不変。
+            // Same message path as PNG open's reject_when_synced (setSaveMsg).
+            // Do not route to a remote action; no I/O; canvas unchanged.
             self.setSaveMsg("netsync: open を送信できませんでした（RejectedWhileSynced）", .{});
             return;
         }
@@ -1975,7 +1975,7 @@ const App = struct {
         };
     }
 
-    /// ダイアログで PNG を選んでキャンバスへ読み込む（左上クロップ/パディング）。
+    /// Pick a PNG via dialog and load it onto the canvas (top-left crop/pad).
     fn doOpen(self: *App) FileOpResult {
         if (self.input.capturing or self.bezier_editor.isEditing()) return .done;
         const maybe = platform.openFileDialog(self.gpa, self.io, .{ .allowed_ext = "png" }) catch |err| {
@@ -1983,7 +1983,7 @@ const App = struct {
             self.setSaveMsg("Load failed: {s}", .{@errorName(err)});
             return .done;
         };
-        const path = maybe orelse return .done; // キャンセル: サイレント no-op
+        const path = maybe orelse return .done; // Cancel: silent no-op
         _ = self.requestPngImport(path) catch |err| {
             self.setSaveMsg("Load failed: {s}", .{@errorName(err)});
         };
@@ -2012,9 +2012,9 @@ const App = struct {
         return result;
     }
 
-    // ── .pix プロジェクト保存/読込（レイヤー構造保持。TASK-63）─────────────────
+    // ── .pix project save/load (preserves layer structure) ─────────────────
 
-    /// 記憶している .pix 保存先へ直接上書き。未設定なら「名前を付けて保存」へフォールバック。
+    /// Overwrite the remembered .pix save path directly. If unset, fall back to save-as.
     fn doSaveProject(self: *App) FileOpResult {
         const result = self.host.save() catch |err| {
             self.setSaveMsg("Project save failed: {s}", .{@errorName(err)});
@@ -2026,7 +2026,7 @@ const App = struct {
         return .done;
     }
 
-    /// ダイアログで .pix 保存先を選んで保存。成功時にダイアログ戻り値を current_project_path へ移譲。
+    /// Pick a .pix save path via dialog and save. On success hand the dialog path to current_project_path.
     fn doSaveAsProject(self: *App) FileOpResult {
         const maybe = platform.saveFileDialog(self.gpa, self.io, .{
             .default_name = "untitled.pix",
@@ -2036,7 +2036,7 @@ const App = struct {
             self.setSaveMsg("Project save failed: {s}", .{@errorName(err)});
             return .done;
         };
-        const path = maybe orelse return .done; // キャンセル: サイレント no-op
+        const path = maybe orelse return .done; // Cancel: silent no-op
         const result = self.host.saveAs(path) catch |err| {
             self.setSaveMsg("Project save failed: {s}", .{@errorName(err)});
             self.gpa.free(path);
@@ -2069,9 +2069,9 @@ const App = struct {
         return .done;
     }
 
-    /// .pix プロジェクトを読み込んでドキュメントを差し替える（レイヤー構造保持）。
-    /// 進行中 stroke/編集中は破棄。undo/redo はクリア、selection/float 破棄、current_project_path 更新。
-    /// サイズは peekCanvasSize + 共通上限 validator（各辺≤4096・総画素≤16M）で検証する（TASK-144.1）。
+    /// Load a .pix project and replace the document (preserves layer structure).
+    /// Discard in-flight stroke/edit. Clear undo/redo, discard selection/float, update current_project_path.
+    /// Size is checked with peekCanvasSize + the shared limit validator (edge ≤ MAX_CANVAS_EDGE, pixels ≤ MAX_CANVAS_PIXELS).
     fn doOpenProject(self: *App) FileOpResult {
         if (self.editingBlocked()) return .done;
         const maybe = platform.openFileDialog(self.gpa, self.io, .{ .allowed_ext = "pix" }) catch |err| {
@@ -2079,7 +2079,7 @@ const App = struct {
             self.setSaveMsg("Project load failed: {s}", .{@errorName(err)});
             return .done;
         };
-        const path = maybe orelse return .done; // キャンセル: サイレント no-op
+        const path = maybe orelse return .done; // Cancel: silent no-op
         _ = self.requestProjectOpen(path) catch |err| {
             self.setSaveMsg("Project load failed: {s}", .{@errorName(err)});
         };
@@ -2093,9 +2093,9 @@ const App = struct {
         return result;
     }
 
-    // ── 連番 PNG / スプライトシート書き出し（TASK-45.5）──────────────────────
+    // ── Sequence PNG / sprite-sheet export ──────────────────────
 
-    /// saveFileDialog で選んだ path から `.png` 拡張子を除いた stem を返す（連番書き出し用）。
+    /// From a saveFileDialog path, return the stem with `.png` stripped (for sequence export).
     fn pathToPngStem(allocator: std.mem.Allocator, path: []const u8) ![]u8 {
         if (path.len >= 4 and std.ascii.eqlIgnoreCase(path[path.len - 4 ..], ".png")) {
             return allocator.dupe(u8, path[0 .. path.len - 4]);
@@ -2103,7 +2103,7 @@ const App = struct {
         return allocator.dupe(u8, path);
     }
 
-    /// ダイアログで stem を選び連番 PNG（`<stem>_NNNN.png`）を書き出す。
+    /// Pick a stem via dialog and write sequence PNGs (`<stem>_NNNN.png`).
     fn doExportSeq(self: *App) FileOpResult {
         const maybe = platform.saveFileDialog(self.gpa, self.io, .{
             .default_name = "sequence.png",
@@ -2129,7 +2129,7 @@ const App = struct {
         return .done;
     }
 
-    /// ダイアログで path を選びスプライトシート PNG を書き出す（columns/margin は既定）。
+    /// Pick a path via dialog and write a sprite-sheet PNG (default columns/margin).
     fn doExportSheet(self: *App) FileOpResult {
         const maybe = platform.saveFileDialog(self.gpa, self.io, .{
             .default_name = "spritesheet.png",
@@ -2149,30 +2149,30 @@ const App = struct {
         return .done;
     }
 
-    /// 指定 stem へ連番 PNG を直接書き出す（action `export_seq <stem>` 用）。
+    /// Write sequence PNGs directly to the given stem (for action `export_seq <stem>`).
     fn doExportSeqTo(self: *App, stem: []const u8) !void {
         if (self.doc.frames.items.len == 0) return error.NoFrames;
         try core.document_io.exportPngSequence(self.io, stem, &self.doc, self.gpa);
         self.setSaveMsg("Exported sequence: {s}", .{std.fs.path.basename(stem)});
     }
 
-    /// 指定 path へスプライトシートを直接書き出す（action `export_sheet` 用）。
+    /// Write a sprite sheet directly to the given path (for action `export_sheet`).
     fn doExportSheetTo(self: *App, path: []const u8, opts: core.document_io.SpriteSheetOpts) !void {
         try core.document_io.exportSpriteSheet(self.io, path, &self.doc, self.gpa, opts);
         self.setSaveMsg("Exported sheet: {s}", .{std.fs.path.basename(path)});
     }
 
-    /// 編集系コマンドは stroke 中は無視する（仕様の簡略化指示）。`!void` 化（TASK-64）は UI
-    /// （`catch {}` で無視）と action（`try` で伝播）が同じ判定コードを共有するための変更で、
-    /// 挙動そのものは変わらない（action ⇄ UndoCmd 対応表は下部「custom action」セクションの
-    /// doc comment 参照）。undo/redo スタックが空の場合は失敗にせず冪等 no-op として成功する
-    /// （`UndoStack.undoOne`/`redoOne` も空なら何もしない既存実装のため、新規挙動ではない）。
+    /// Edit commands are ignored during a stroke. Returning `!void` lets UI
+    /// (`catch {}`) and action (`try`) share the same decision code;
+    /// behaviour is unchanged (see the action⇄UndoCmd pairing table in the
+    /// "custom action" section doc comment below). Empty undo/redo stacks succeed as an idempotent no-op
+    /// (`UndoStack.undoOne`/`redoOne` already do nothing when empty — not a new behaviour).
     fn doUndo(self: *App) !void {
         if (self.editingBlocked()) return error.EditingBlocked;
         const undo_before = self.doc.undo.undo.items.len;
         const redo_before = self.doc.undo.redo.items.len;
         const seq_before = self.cmd_log.next_seq;
-        // defer: routeAction が途中失敗しても revert フラグ等の変異は起きうる（next_seq 非依存）
+        // defer: routeAction may mutate revert flags etc. even on mid-failure (independent of next_seq)
         defer self.markHistoryDirty();
         if (platform.netsyncActive()) {
             var buf: [128]u8 = undefined;
@@ -2213,9 +2213,9 @@ const App = struct {
         while (i < self.cmd_log.filled) : (i += 1) {
             const rec = self.cmd_log.recordAt(i);
             self.history_entries[i] = history_summary.makeHistoryEntry(hctx, rec);
-            // HistoryEntry.name は CommandRecord 内バッファへの借用（history_summary.zig の
-            // 「CommandLog 変異を跨いで保持禁止」契約）。パネルは summary（inline copy）のみ
-            // 使うので、キャッシュには借用を残さない。
+            // HistoryEntry.name borrows the buffer inside CommandRecord (history_summary.zig contract:
+            // must not outlive CommandLog mutation). The panel only uses summary (inline copy), so
+            // the cache must not retain the borrow.
             self.history_entries[i].name = "";
         }
         self.history_seen_seq = self.cmd_log.next_seq;
@@ -2230,39 +2230,39 @@ const App = struct {
         self.rebuildHistoryEntries();
     }
 
-    /// local_user の undo（ハイブリッド。TASK-62.5.4 §2）: undo stack を上から走査し、最初の
-    /// 「local_user 所有の op」を undo する。
-    /// - CommandLog に record が対応する op:
-    ///   - actor が local_user 以外（agent 等）→ skip（agent の op は `action undo` でのみ戻す）
-    ///   - actor=local_user → framework 経路 `cmd_exec.undoOne(.local_user)`（revert record の
-    ///     append・reverted マーク・tx bundle・epoch は framework が処理）
-    /// - record が対応しない（未記録）op = local_user 所有（agent 操作は常に action 経由で記録
-    ///   される。62.5.3 の構造）→ legacy 経路:
-    ///   - 最上位なら従来の `doc.undoOne()`（redo stack へ移動）
-    ///   - 最上位でない `.paint` op は `revertByHandle(move_to_redo)`（agent op が上にある場合）
-    ///   - 最上位でない未記録**構造 op は undo 不能として skip**（任意位置 revert は paint 限定 =
-    ///     `Document.canRevertByHandle` の構造 Op 制約参照）。走査は次の user 所有 op へ進む
-    /// 2 系統（framework revert / legacy stack）の時系列交錯は**近似**（MVP 割り切り。62.5.3 の
-    /// 段階移行が完了すれば legacy 系統は消える）。pixel 巻き添え artifact の割り切りは
-    /// `Document.revertByHandle` の doc comment 参照。
+    /// local_user undo (hybrid): walk the undo stack from the top and undo the first
+    /// "local_user-owned op".
+    /// - Op with a matching CommandLog record:
+    ///   - actor other than local_user (agent etc.) → skip (agent ops undo only via `action undo`)
+    ///   - actor=local_user → framework path `cmd_exec.undoOne(.local_user)` (revert-record
+    ///     append, reverted mark, tx bundle, epoch are handled by the framework)
+    /// - Op with no matching record (unrecorded) = local_user-owned (agent ops are always recorded
+    ///   via an action) → legacy path:
+    ///   - If topmost: classic `doc.undoOne()` (moves onto the redo stack)
+    ///   - Non-topmost `.paint` op: `revertByHandle(move_to_redo)` (when an agent op sits above)
+    ///   - Non-topmost unrecorded **structure op: skip as non-undoable** (arbitrary-position revert is paint-only —
+    ///     see `Document.canRevertByHandle` structure-Op constraints). Walk continues to the next user-owned op
+    /// Interleaving of the two systems (framework revert / legacy stack) is an **approximation** (MVP;
+    /// the legacy system goes away once the staged migration finishes). Pixel side-effect trade-offs:
+    /// see the `Document.revertByHandle` doc comment.
     fn userUndo(self: *App) void {
         var i: usize = self.doc.undo.handles.items.len;
         while (i > 0) {
             i -= 1;
             const h = self.doc.undo.handles.items[i];
-            // 所有者判定は record 逆引きでなく op 側の owner タグが正（CommandLog リング退避で
-            // record が消えた agent op を「未記録 = user 所有」と誤認して legacy undo しないため。
-            // review 反映）。unknown は user 扱い（§2 の根拠: agent 操作は常にタグ付けされる）。
+            // Ownership is decided by the op-side owner tag, not by reverse-looking up the record (so an agent op
+            // whose record was ring-evicted is not misread as "unrecorded = user-owned" and legacy-undone.
+            // unknown is treated as user (agent ops are always tagged).
             if (self.doc.undo.owners.items[i] == OP_OWNER_AGENT) continue;
             if (self.findRecordByUndoRef(h)) |rec| {
-                if (!rec.actor.eql(.local_user)) continue; // 防御（owner タグと二重の保険）
+                if (!rec.actor.eql(.local_user)) continue; // Defence in depth alongside the owner tag
                 var buf: [256]u8 = undefined;
                 _ = self.cmd_exec.undoOne(.local_user, &buf) catch |err| {
-                    std.debug.print("pixie: undoOne 失敗: {s}\n", .{@errorName(err)});
+                    std.debug.print("pixie: undoOne failed: {s}\n", .{@errorName(err)});
                 };
                 return;
             }
-            // 未記録 = local_user 所有 → legacy 経路
+            // Unrecorded = local_user-owned → legacy path
             if (i == self.doc.undo.undo.items.len - 1) {
                 self.doc.undoOne(self.gpa);
                 return;
@@ -2271,43 +2271,43 @@ const App = struct {
                 _ = self.doc.revertByHandle(self.gpa, h, .move_to_redo);
                 return;
             }
-            // 最上位でない未記録構造 op → skip して次の user 所有 op へ
+            // Non-topmost unrecorded structure op → skip and continue to the next user-owned op
         }
     }
 
-    /// local_user の redo（ハイブリッド。§2）: framework `redoOne(.local_user)` を先に試み、
-    /// **候補なしなら legacy `doc.redoOne()`**（legacy undo で redo stack に載った未記録 op 用）。
-    /// legacy の再 push は「新規編集」ではないため `last_seen_handle` を追従させ epoch bump を
-    /// 防ぐ（§2b）。framework redo の再 dispatch 側は `dispatchPixieAction` の noteUndo 経路で
-    /// 追従済み。エラー（PartialRedo 等）時は legacy へ流さない（部分適用の上に重ねない）。
+    /// local_user redo (hybrid): try framework `redoOne(.local_user)` first;
+    /// **if no candidate, legacy `doc.redoOne()`** (for unrecorded ops that landed on the redo stack via legacy undo).
+    /// A legacy re-push is not a "new edit", so advance `last_seen_handle` to avoid an epoch bump.
+    /// Framework redo's re-dispatch already advances via `dispatchPixieAction`'s noteUndo path.
+    /// On error (PartialRedo etc.) do not fall through to legacy (do not stack on a partial apply).
     fn userRedo(self: *App) void {
         var buf: [256]u8 = undefined;
         const seq_before = self.cmd_log.next_seq;
         const outcome = self.cmd_exec.redoOne(.local_user, &buf) catch |err| {
-            std.debug.print("pixie: redoOne 失敗: {s}\n", .{@errorName(err)});
-            self.tagOwnersFromRecords(seq_before, OP_OWNER_USER); // PartialRedo でも適用済み分はタグ
-            self.captureHistoryVisualsSince(seq_before); // PartialRedo でも append 済み分を捕捉
+            std.debug.print("pixie: redoOne failed: {s}\n", .{@errorName(err)});
+            self.tagOwnersFromRecords(seq_before, OP_OWNER_USER); // Tag the already-applied portion even on PartialRedo
+            self.captureHistoryVisualsSince(seq_before); // Capture already-appended records even on PartialRedo
             return;
         };
         if (!outcome.happened) {
             const handle_before = self.doc.undo.next_handle;
             self.doc.redoOne(self.gpa);
             self.last_seen_handle = self.doc.undo.next_handle;
-            // legacy redo が実際に再 push した場合のみ owner を user に確定する（no-op 時に
-            // 既存 top（agent 所有かもしれない）を誤って上書きしない。last_seen 更新で
-            // checkUnrecordedEdits の unknown→USER 確定は走らないため、ここで直接付ける）
+            // Only when legacy redo actually re-pushed, settle owner as user (on no-op do not
+            // overwrite the existing top, which may be agent-owned. Updating last_seen skips
+            // checkUnrecordedEdits' unknown→USER settle, so tag directly here)
             if (self.doc.undo.next_handle > handle_before) {
                 if (self.doc.undo.topHandle()) |h| self.doc.undo.setOwner(h, OP_OWNER_USER);
             }
-            // legacy redo は CommandRecord を生成しない → 新規履歴サムネイルなし
+            // legacy redo creates no CommandRecord → no new history thumbnail
             return;
         }
-        self.tagOwnersFromRecords(seq_before, OP_OWNER_USER); // 再 dispatch された新 op は user 所有
+        self.tagOwnersFromRecords(seq_before, OP_OWNER_USER); // Newly re-dispatched ops are user-owned
         self.captureHistoryVisualsSince(seq_before);
     }
 
-    /// CommandLog を後方走査して undo_ref==handle の normal record を返す（userUndo の
-    /// op→record 対応判定。イベント時のみ・最大 128 slot の線形走査）。
+    /// Walk CommandLog backwards for a normal record with undo_ref==handle (userUndo's
+    /// op→record pairing. Event-time only; linear scan of at most 128 slots).
     fn findRecordByUndoRef(self: *App, handle: u64) ?*const platform.command.CommandRecord {
         var i: u32 = self.cmd_log.filled;
         while (i > 0) {
@@ -2318,16 +2318,16 @@ const App = struct {
         return null;
     }
 
-    /// フレーム末尾の未記録 undoable 編集検出（§2b）。検出したら local_user の redo 候補を
-    /// epoch で失効させる（layer add 等の未記録 UI 操作で framework redo が古い候補を再実行
-    /// しないため）。
+    /// End-of-frame detection of unrecorded undoable edits. On hit, expire local_user redo candidates
+    /// via epoch (so an unrecorded UI op like layer add cannot make framework redo
+    /// re-run a stale candidate).
     fn checkUnrecordedEdits(self: *App) void {
         if (self.doc.undo.next_handle > self.last_seen_handle) {
             self.markProjectDirty();
             self.cmd_exec.bumpEpoch(.local_user);
             self.last_seen_handle = self.doc.undo.next_handle;
-            // 未記録 push の owner を user に確定（agent 操作は同イベント内にタグ済み = unknown で
-            // フレーム末尾まで残るのは user の UI 操作のみ。bump 発生時のみの O(depth) 走査）
+            // Settle unrecorded-push owner as user (agent ops are tagged in-event; only user UI ops
+            // stay unknown until frame end. O(depth) walk only when a bump fires)
             for (self.doc.undo.owners.items) |*o| {
                 if (o.* == OP_OWNER_UNKNOWN) o.* = OP_OWNER_USER;
             }
@@ -2336,14 +2336,14 @@ const App = struct {
 
     fn doClear(self: *App) !void {
         if (self.editingBlocked()) return error.EditingBlocked;
-        if (self.selectedLayerIsText()) return error.EditingBlocked; // TASK-79.5: text layer 直接編集禁止
+        if (self.selectedLayerIsText()) return error.EditingBlocked; // Forbid direct edits on a text layer
         self.doc.pushClear(self.gpa, self.canvas.selected_layer) catch |err| switch (err) {
-            error.TextLayerSelected => return error.EditingBlocked, // 上のガードで既に弾いているはずの防御的分岐
+            error.TextLayerSelected => return error.EditingBlocked, // Defensive branch: the guard above should already have rejected this
         };
     }
 
-    /// シェイプを 1 回描画して UndoStack へ push（TASK-90）。UI 確定 / action shape が共有。
-    /// pixel_perfect は一時無効。symmetry は recorder 設定に従う。
+    /// Draw one shape and push onto the UndoStack. Shared by UI commit / action shape.
+    /// pixel_perfect is temporarily off. symmetry follows the recorder setting.
     fn doShape(self: *App, kind: actions.ShapeKind, p0: actions.Point, p1: actions.Point, fill: bool) !void {
         if (self.editingBlocked()) return error.EditingBlocked;
         if (self.selectedLayerIsText()) return error.TextLayerSelected;
@@ -2373,18 +2373,18 @@ const App = struct {
         }
     }
 
-    /// 対称描画モードを設定する（TASK-90。UI / action set_symmetry 共通）。
+    /// Set the symmetry drawing mode (shared by UI / action set_symmetry).
     fn doSetSymmetry(self: *App, mode: core.Symmetry) void {
         self.symmetry = mode;
         self.recorder.symmetry = mode;
     }
 
-    /// ピクセルパーフェクトを設定する（TASK-90。UI / action set_pixel_perfect 共通）。
+    /// Set pixel-perfect (shared by UI / action set_pixel_perfect).
     fn doSetPixelPerfect(self: *App, on: bool) void {
         self.pixel_perfect = on;
     }
 
-    /// UI から対称を切替（TASK-94 Phase C: netsync 中は routeAction、solo は do* 直呼び）。
+    /// UI toggle for symmetry (during netsync: routeAction; solo: do* directly).
     fn uiSetSymmetry(self: *App, mode: core.Symmetry) void {
         const args: []const u8 = switch (mode) {
             .off => "off",
@@ -2395,7 +2395,7 @@ const App = struct {
         if (platform.netsyncActive()) self.routeUi("set_symmetry", args) else self.doSetSymmetry(mode);
     }
 
-    /// UI から pixel_perfect を切替（netsync 中は routeAction）。
+    /// UI toggle for pixel_perfect (during netsync: routeAction).
     fn uiSetPixelPerfect(self: *App, on: bool) void {
         if (platform.netsyncActive()) {
             self.routeUi("set_pixel_perfect", if (on) "1" else "0");
@@ -2404,8 +2404,8 @@ const App = struct {
         }
     }
 
-    /// 選択範囲を clipboard へコピー（読み取りのみ・undo 不要）。selection 無しは no-op。
-    /// 読み取りのみ（pixels を変更しない）なので text layer 選択中でも許可する（TASK-79.5）。
+    /// Copy the selection to the clipboard (read-only; no undo). No-op without a selection.
+    /// Read-only (does not change pixels), so allowed even when a text layer is selected.
     fn doCopy(self: *App) void {
         if (self.editingBlocked()) return;
         const sel = self.canvas.selection orelse return;
@@ -2414,36 +2414,36 @@ const App = struct {
         self.clipboard = block;
     }
 
-    /// 選択範囲を clipboard へコピーし、選択内を透明化する（undo 可）。selection 無しは no-op。
+    /// Copy the selection to the clipboard and clear the selection to transparent (undoable). No-op without a selection.
     fn doCut(self: *App) void {
         if (self.editingBlocked()) return;
-        if (self.selectedLayerIsText()) return; // TASK-79.5: text layer 直接編集禁止
+        if (self.selectedLayerIsText()) return; // Forbid direct edits on a text layer
         const sel = self.canvas.selection orelse return;
         const block = core.selection.extract(self.gpa, self.canvas, self.canvas.selected_layer, sel);
         if (self.clipboard) |*old| old.deinit(self.gpa);
         self.clipboard = block;
         if (core.selection.clearRectCmd(self.gpa, self.canvas, self.canvas.selected_layer, sel)) |pd| {
-            self.doc.pushPaintOp(self.gpa, pd.layer_idx, pd.diffs) catch {}; // 上で text layer は既に弾いている
+            self.doc.pushPaintOp(self.gpa, pd.layer_idx, pd.diffs) catch {}; // Text layer already rejected above
         }
     }
 
-    /// clipboard を貼り付ける（undo 可）。貼付先は selection の左上（無ければ 0,0）。
-    /// selection を貼付矩形（canvas 内 clip）へ更新する。clipboard 無しは no-op。
+    /// Paste the clipboard (undoable). Destination is the selection top-left (or 0,0 if none).
+    /// Update selection to the pasted rect (clipped to the canvas). No-op without a clipboard.
     fn doPaste(self: *App) void {
         if (self.editingBlocked()) return;
-        if (self.selectedLayerIsText()) return; // TASK-79.5: text layer 直接編集禁止
+        if (self.selectedLayerIsText()) return; // Forbid direct edits on a text layer
         const block = self.clipboard orelse return;
         const dx: i32 = if (self.canvas.selection) |s| s.x else 0;
         const dy: i32 = if (self.canvas.selection) |s| s.y else 0;
         if (core.selection.pasteCmd(self.gpa, self.canvas, self.canvas.selected_layer, block, dx, dy, self.blend_mode)) |pd| {
-            self.doc.pushPaintOp(self.gpa, pd.layer_idx, pd.diffs) catch {}; // 上で text layer は既に弾いている
+            self.doc.pushPaintOp(self.gpa, pd.layer_idx, pd.diffs) catch {}; // Text layer already rejected above
         }
         const dest = core.Rect{ .x = dx, .y = dy, .w = @intCast(block.w), .h = @intCast(block.h) };
         self.canvas.setSelection(core.selection.clipRect(dest, self.canvas.width, self.canvas.height));
     }
 
-    /// `Document.addLayer` が mutation + Op構築 + push を内部で完結する（plan 5.4節「一般化」）。
-    /// 戻り値は新規レイヤーの LayerId raw（action 応答 `ok id=#N` 用。TASK-94 Phase B review）。
+    /// `Document.addLayer` completes mutation + Op build + push internally.
+    /// Return value is the new layer's LayerId raw (for action response `ok id=#N`).
     fn doAddLayer(self: *App) !u64 {
         if (self.editingBlocked()) return error.EditingBlocked;
         const idx = self.doc.addLayer(self.gpa) catch |err| {
@@ -2454,14 +2454,14 @@ const App = struct {
         return @intFromEnum(self.doc.layerIdAt(idx).?);
     }
 
-    /// 明示 index のレイヤーを削除する（TASK-94 Phase B: selected 暗黙参照を排除）。
+    /// Delete the layer at an explicit index (no implicit selected reference).
     fn doDeleteLayer(self: *App, idx: usize) !void {
         if (self.editingBlocked()) return error.EditingBlocked;
         try self.doc.deleteLayer(self.gpa, idx);
         self.clampTimelineTarget();
     }
 
-    /// 明示 index のレイヤーを delta（±1）だけ移動する（TASK-94 Phase B）。
+    /// Move the layer at an explicit index by delta (±1).
     fn doMoveLayer(self: *App, idx: usize, delta: i32) !void {
         if (self.editingBlocked()) return error.EditingBlocked;
         const to_i: i32 = @as(i32, @intCast(idx)) + delta;
@@ -2469,16 +2469,16 @@ const App = struct {
         try self.doc.reorderLayer(self.gpa, idx, @intCast(to_i));
     }
 
-    /// レイヤー可視性を明示値へ設定する（`doToggleLayerVisible` の共通実装。TASK-64 で action
-    /// `set_layer_visible` からも直接呼べるよう抽出）。`Document.setLayerVisible` が冪等 no-op
-    /// 判定込みで mutation + Op構築 + push を完結する。
+    /// Set layer visibility to an explicit value (shared implementation behind `doToggleLayerVisible`;
+    /// also called directly from action `set_layer_visible`). `Document.setLayerVisible` completes
+    /// mutation + Op build + push, including the idempotent no-op check.
     fn doSetLayerVisible(self: *App, idx: usize, on: bool) !void {
         if (self.editingBlocked()) return error.EditingBlocked;
         try self.doc.setLayerVisible(self.gpa, idx, on);
     }
 
-    /// UI のトグルボタン用（現在値の反転）。範囲外は既存どおり黙って無視（idx 境界は `doSetLayerVisible`
-    /// 呼び出し前に確認する必要がある＝ `!before` 読み出しの OOB を避けるため）。
+    /// For the UI toggle button (invert current value). Out of range is silently ignored as before
+    /// (caller must check idx bounds before `doSetLayerVisible` — avoids OOB when reading `!before`).
     fn doToggleLayerVisible(self: *App, idx: usize) void {
         if (idx >= self.canvas.layers.items.len) return;
         const before = self.canvas.layers.items[idx].visible;
@@ -2490,28 +2490,28 @@ const App = struct {
         try self.doc.setLayerOpacity(self.gpa, idx, value);
     }
 
-    /// レイヤー名を変更する（Rename。TASK-79.3）。`Document.renameLayer` が冪等 no-op 判定込みで
-    /// mutation + Op構築 + push を完結する。呼び出し元はインライン編集の確定
-    /// （`commitRenameLayer`）と harness action（将来採用時）を想定。
+    /// Rename a layer. `Document.renameLayer` completes mutation + Op build + push, including the
+    /// idempotent no-op check. Callers are the inline-edit commit
+    /// (`commitRenameLayer`) and a future harness action.
     fn doRenameLayer(self: *App, idx: usize, new_name: []const u8) !void {
         if (self.editingBlocked()) return error.EditingBlocked;
         try self.doc.renameLayer(self.gpa, idx, new_name);
     }
 
-    /// レイヤー行の右クリックメニュー「Rename...」から呼ぶ。現在名を編集バッファへコピーして
-    /// インライン編集を開始する（確定は `commitRenameLayer`、取消は `cancelRenameLayer`）。
+    /// Called from the layer-row context menu "Rename...". Copy the current name into the edit buffer and
+    /// start inline editing (commit via `commitRenameLayer`, cancel via `cancelRenameLayer`).
     fn beginRenameLayer(self: *App, idx: usize) void {
         if (idx >= self.canvas.layers.items.len) return;
-        self.text_in.cancel(); // rename/text 編集は同時に active にしない（TASK-79.5）
+        self.text_in.cancel(); // rename and text edit must not both be active
         self.rename_in.begin(idx, self.canvas.layers.items[idx].name());
-        // rename 開始時点で Space パン modifier が張り付いていると、rename 中は key_up を
-        // 素通りさせない設計（下記イベントポンプ参照）のため解除しておく（codex レビュー指摘
-        // 2026-07-05: rename 前に Space が押されたまま rename に入ると space_down が残留しうる）。
+        // If Space pan modifier is still held when rename starts, clear it — during rename the event pump
+        // does not pass key_up through (see below), so a pre-rename Space could otherwise leave
+        // space_down stuck.
         self.space_down = false;
     }
 
-    /// 編集を確定する（ENTER）。`doRenameLayer` へ委譲し Undo へ積む。失敗（境界外等）は無視
-    /// （他の pending file op 等と同型の「UI からの呼び出しはベストエフォート」扱い）。
+    /// Commit the edit (ENTER). Delegates to `doRenameLayer` and pushes Undo. Failures (OOB etc.) are ignored
+    /// (same "best-effort from UI" pattern as other pending file ops).
     fn commitRenameLayer(self: *App) void {
         if (!self.rename_in.active) return;
         const idx = self.rename_in.layer_idx;
@@ -2519,15 +2519,15 @@ const App = struct {
         self.doRenameLayer(idx, committed) catch {};
     }
 
-    /// 編集を取り消す（ESCAPE）。バッファは破棄するだけで Undo には積まない。
+    /// Cancel the edit (ESCAPE). Discard the buffer only; do not push Undo.
     fn cancelRenameLayer(self: *App) void {
         self.rename_in.cancel();
     }
 
-    /// renaming 中の key_down を処理する（メインループのイベントポンプから、通常の
-    /// `handleKey` の代わりに呼ばれる）。ENTER/KP_ENTER=確定・ESCAPE=取消・
-    /// BACKSPACE/DELETE=1文字削除。Cmd+C/X/V はテキスト clipboard（pixel clipboard へ流さない）。
-    /// composition 中の C/X/V は抑止。それ以外はすべて無視。
+    /// Handle key_down while renaming (called from the main-loop event pump in place of the usual
+    /// `handleKey`). ENTER/KP_ENTER=commit, ESCAPE=cancel,
+    /// BACKSPACE/DELETE=delete one char. Cmd+C/X/V go to the text clipboard (not the pixel clipboard).
+    /// Suppress C/X/V during composition. Ignore everything else.
     fn handleRenameKey(self: *App, k: platform.KeyEvent) void {
         if (self.handleTextFieldClipboard(k, .rename)) return;
         if (k.key == .ENTER or k.key == .KP_ENTER) {
@@ -2537,15 +2537,15 @@ const App = struct {
         } else if (k.key == .BACKSPACE or k.key == .DELETE) {
             self.rename_in.backspace();
         }
-        // その他のキーは無視（ツール切替ショートカット等を遮断）
+        // Ignore other keys (block tool-switch shortcuts etc.)
     }
 
-    // ── テキストレイヤー（TASK-79.5）─────────────────────────────
+    // ── Text layers ─────────────────────────────
 
-    /// テキストレイヤーを新規追加する（右クリックメニュー「Add Text Layer」）。既定
-    /// テキスト "Text" / font_px=16 / 現在のパレット色 / 位置(8,8) で作成し選択する。
-    /// Undo は既存 `.layer_add`（Layer 値コピーに kind/text_params が自動的に乗るため
-    /// Op 変更は不要。`doAddLayer` と同じ仕組み）。
+    /// Add a new text layer (context menu "Add Text Layer"). Defaults:
+    /// text "Text" / font_px=16 / current palette color / position (8,8); then select it.
+    /// Undo uses the existing `.layer_add` (the Layer value copy already carries kind/text_params, so
+    /// no Op change is needed — same mechanism as `doAddLayer`).
     fn doAddTextLayer(self: *App) !void {
         if (self.editingBlocked()) return error.EditingBlocked;
         var params: core.TextParams = .{ .x = 8, .y = 8, .color = self.palette.current() };
@@ -2556,34 +2556,34 @@ const App = struct {
         };
     }
 
-    /// テキストレイヤーの text_params を更新し再ラスタライズする（内容確定・サイズ/位置
-    /// スライダー・色ボタンの共通適用口。TASK-79.5）。`Document.setLayerTextParams` が
-    /// 冪等 no-op 判定・共有cel再ラスタライズ・Op構築+push を完結する。
+    /// Update a text layer's text_params and re-rasterize (shared apply path for content commit, size/position
+    /// sliders, and the color button). `Document.setLayerTextParams` completes the
+    /// idempotent no-op check, shared-cel re-rasterize, and Op build+push.
     fn doSetTextParams(self: *App, idx: usize, params: core.TextParams) !void {
         if (self.editingBlocked()) return error.EditingBlocked;
         try self.doc.setLayerTextParams(self.gpa, idx, params);
     }
 
-    /// テキストレイヤーを通常 raster レイヤーへ確定する（Rasterize。右クリックメニュー。
-    /// TASK-79.5）。pixels 不変・kind/text_params のみ変化。Undo 1 回で戻せる。
+    /// Commit a text layer to a normal raster layer (Rasterize; context menu).
+    /// pixels unchanged; only kind/text_params change. One Undo step reverses it.
     fn doRasterizeLayer(self: *App, idx: usize) !void {
         if (self.editingBlocked()) return error.EditingBlocked;
         _ = try self.doc.rasterizeLayer(self.gpa, idx);
     }
 
-    /// レイヤー右クリックメニュー「Edit Text...」（kind==text の時のみ有効）から呼ぶ。
-    /// 現在テキストを編集バッファへコピーしてインライン編集を開始する（確定は
-    /// `commitTextEdit`、取消は `cancelTextEdit`）。`rename_in`/`text_in` は対称実装。
+    /// Called from the layer-row context menu "Edit Text..." (enabled only when kind==text).
+    /// Copy the current text into the edit buffer and start inline editing (commit via
+    /// `commitTextEdit`, cancel via `cancelTextEdit`). `rename_in`/`text_in` are symmetric.
     fn beginTextEdit(self: *App, idx: usize) void {
         if (idx >= self.canvas.layers.items.len) return;
         if (self.canvas.layers.items[idx].kind != .text) return;
-        self.rename_in.cancel(); // rename/text 編集は同時に active にしない（beginRenameLayer と対称）
+        self.rename_in.cancel(); // rename and text edit must not both be active (symmetric with beginRenameLayer)
         self.text_in.begin(idx, self.canvas.layers.items[idx].text_params.text());
-        self.space_down = false; // beginRenameLayer と同じ理由（Space 残留防止）
+        self.space_down = false; // Same reason as beginRenameLayer (prevent stuck Space)
     }
 
-    /// 編集を確定する（ENTER）。`doSetTextParams` へ委譲する（色/サイズ/位置は現状値を維持し
-    /// 文字列だけ更新）。失敗（境界外等）は無視（他の pending file op 等と同型）。
+    /// Commit the edit (ENTER). Delegates to `doSetTextParams` (keep current color/size/position;
+    /// update the string only). Failures (OOB etc.) are ignored (same pattern as other pending file ops).
     fn commitTextEdit(self: *App) void {
         if (!self.text_in.active) return;
         const idx = self.text_in.layer_idx;
@@ -2594,12 +2594,12 @@ const App = struct {
         self.doSetTextParams(idx, params) catch {};
     }
 
-    /// 編集を取り消す（ESCAPE）。バッファは破棄するだけで Undo には積まない。
+    /// Cancel the edit (ESCAPE). Discard the buffer only; do not push Undo.
     fn cancelTextEdit(self: *App) void {
         self.text_in.cancel();
     }
 
-    /// テキスト編集中の key_down を処理する（`handleRenameKey` と対称）。
+    /// Handle key_down while text-editing (symmetric with `handleRenameKey`).
     fn handleTextEditKey(self: *App, k: platform.KeyEvent) void {
         if (self.handleTextFieldClipboard(k, .text)) return;
         if (k.key == .ENTER or k.key == .KP_ENTER) {
@@ -2609,18 +2609,18 @@ const App = struct {
         } else if (k.key == .BACKSPACE or k.key == .DELETE) {
             self.text_in.backspace();
         }
-        // その他のキーは無視（ツール切替ショートカット等を遮断）
+        // Ignore other keys (block tool-switch shortcuts etc.)
     }
 
     const TextFieldClipboardTarget = enum { rename, text };
 
-    /// rename / text 編集中の Cmd+C/X/V。消費したら true（pixel clipboard・tool shortcut へ流さない）。
-    /// composition（preedit あり）中は C/X/V を抑止して消費扱い。
+    /// Cmd+C/X/V during rename / text edit. Return true if consumed (do not reach pixel clipboard / tool shortcuts).
+    /// During composition (preedit present), suppress C/X/V but still treat as consumed.
     fn handleTextFieldClipboard(self: *App, k: platform.KeyEvent, target: TextFieldClipboardTarget) bool {
         const accel = k.modifiers.cmd or k.modifiers.ctrl;
         if (!accel or k.is_repeat) return false;
         if (k.key != .C and k.key != .X and k.key != .V) return false;
-        if (self.preedit().len > 0) return true; // composition 中は抑止（消費）
+        if (self.preedit().len > 0) return true; // Suppress during composition (consumed)
         switch (k.key) {
             .C => {
                 const text = switch (target) {
@@ -2637,7 +2637,7 @@ const App = struct {
                 if (text) |t| platform.setClipboardText(t);
             },
             .V => {
-                var buf: [96]u8 = undefined; // text_content max; rename は短いので共用で足りる
+                var buf: [96]u8 = undefined; // text_content max; rename is short enough to share
                 if (platform.getClipboardText(buf[0..])) |t| {
                     switch (target) {
                         .rename => self.rename_in.clipboardPaste(t),
@@ -2655,10 +2655,10 @@ const App = struct {
         try self.doc.selectLayer(idx);
     }
 
-    /// 明示 index のレイヤーを複製し、直上へ挿入する（Duplicate。TASK-79.2。TASK-94 Phase B で
-    /// selected 暗黙参照を排除）。戻り値は新規レイヤーの LayerId raw（action 応答用）。
-    /// `Document.duplicateLayer` が raster(各frame深いコピー)/text(新規cel全frameリンク)の
-    /// 分岐込みで mutation + Op構築 + push を完結する（4.4/4.5節）。
+    /// Duplicate the layer at an explicit index and insert it above (Duplicate;
+    /// no implicit selected reference). Return value is the new layer's LayerId raw (for action responses).
+    /// `Document.duplicateLayer` completes mutation + Op build + push, including the
+    /// raster (deep-copy each frame) / text (link a new cel across all frames) branch.
     fn doDuplicateLayer(self: *App, idx: usize) !u64 {
         if (self.editingBlocked()) return error.EditingBlocked;
         const new_idx = self.doc.duplicateLayer(self.gpa, idx) catch |err| {
@@ -2668,33 +2668,33 @@ const App = struct {
         return @intFromEnum(self.doc.layerIdAt(new_idx).?);
     }
 
-    /// 明示 index のレイヤーを直下のレイヤーへ結合する（Merge Down。TASK-79.2。TASK-94 Phase B で
-    /// selected 暗黙参照を排除）。選択中レイヤー(top)の内容を opacity 込みで下位レイヤー
-    /// (bottom=top-1)へ src-over 焼き込みし、top 自体を削除する。最下層（index 0）は結合先が
-    /// 無いため error.OutOfRange。
+    /// Merge the layer at an explicit index into the layer below (Merge Down;
+    /// no implicit selected reference). Src-over the selected layer (top) with opacity onto the lower layer
+    /// (bottom=top-1) and delete top. The bottom-most layer (index 0) has no merge target, so
+    /// error.OutOfRange.
     ///
-    /// 「下位への合成」と「上位の削除」という 2 つの構造変化は、libs/paint の atomic な
-    /// `.layer_merge_down` Op（undo.zig, TASK-79.2）へ **1 push** で表現する（2 つの UndoCmd に
-    /// 分けると、片方だけ undo された状態で別操作が push された際に古い座標参照が残り不整合を
-    /// 起こし得るため。codex レビュー指摘 2026-07-05）。
+    /// The two structural changes "composite onto below" and "delete above" are expressed as one atomic
+    /// `.layer_merge_down` Op in libs/paint (undo.zig) with **1 push** (splitting into two UndoCmds
+    /// could leave a stale coordinate reference if only one side is undone and another op is pushed
+    /// in between).
     ///
-    /// ホットパス宣言: イベント時のみ（結合ボタン/メニュー項目クリック時に1回）。下位レイヤーの
-    /// 全画素(256x256)を走るが event-time の1回ループであり、フレーム毎ではない
-    /// （`Canvas.composite`/`UndoStack.pushClear` と同じ既存前例に倣うスカラーループで足りる。
-    /// 性能規約の SIMD 3点セット等は対象外）。
+    /// Hot path: event-time only (once per merge button/menu click). Walks every pixel of the lower layer
+    /// (doc.width × doc.height) once at event time — not every frame
+    /// (a scalar loop matching `Canvas.composite`/`UndoStack.pushClear` is enough;
+    /// the performance-rules SIMD checklist does not apply).
     ///
-    /// **TASK-79.5**: top・bottom いずれかが `kind==.text` なら `error.TextLayerSelected` で
-    /// 拒否する（「選択中レイヤーが text か」だけでは top=raster(選択中)・bottom=text の組を
-    /// 見逃す＝bottom の pixels が直接書き換えられ「text layer の pixels は text_params からの
-    /// 再ラスタライズ結果」という不変条件を破る。codex レビュー指摘 2026-07-05）。
-    /// `Document.mergeDown` が frame数1制限（9.1節MVP制限）込みで mutation + Op構築 + push を
-    /// 完結する（below の焼き込み・top の削除を1 push でatomicに。plan 4.5/5.3節）。
+    /// If either top or bottom has `kind==.text`, reject with `error.TextLayerSelected`
+    /// ("is the selected layer text?" alone would miss top=raster(selected) + bottom=text, which would
+    /// rewrite bottom's pixels directly and break the invariant that text-layer pixels are the
+    /// re-rasterization of text_params).
+    /// `Document.mergeDown` completes mutation + Op build + push, including the frame-count==1 limit,
+    /// baking below and deleting top in one atomic push.
     fn doMergeDown(self: *App, idx: usize) !void {
         if (self.editingBlocked()) return error.EditingBlocked;
         try self.doc.mergeDown(self.gpa, idx);
     }
 
-    // ── タイムライン（TASK-45.2）──────────────────────────────────
+    // ── Timeline ──────────────────────────────────
 
     fn clampTimelineTarget(self: *App) void {
         if (self.doc.layers.items.len == 0) {
@@ -2777,12 +2777,12 @@ const App = struct {
         try self.doc.unlinkCel(self.gpa, layer, frame_idx);
     }
 
-    /// フレーム境界の再生 tick（毎フレーム 1 回・f64 比較のみ。全画素・RT 非該当）。
-    /// 実効間隔 = playbackIntervalSec(fps, 現在 frame の duration_ms)。追いつき無し（1 tick で 1 frame）。
+    /// Playback tick at frame boundaries (once per frame; f64 compares only. Not full-pixel / not RT).
+    /// Effective interval = playbackIntervalSec(fps, current frame's duration_ms). No catch-up (1 tick → 1 frame).
     ///
-    /// `timeline_last_advance` は play 開始時（UI / action play）に `getTime()` で seed する。
-    /// 旧実装の `last==0` 再 seed は、仮想クロックが 0 起点のとき毎 tick で上書きされ
-    /// （advance 前は last が 0 のまま残る）step 数をずらすため行わない（TASK-45.4）。
+    /// `timeline_last_advance` is seeded with `getTime()` when play starts (UI / action play).
+    /// Do not re-seed on `last==0` — with a virtual clock that starts at 0 that would overwrite every tick
+    /// (last stays 0 until advance) and skew the step count.
     fn tickTimelinePlayback(self: *App, now: f64) void {
         if (!self.timeline_playing or self.editingBlocked()) return;
         const nframes = self.doc.frames.items.len;
@@ -2795,12 +2795,12 @@ const App = struct {
         self.doSelectFrame(next) catch {};
     }
 
-    /// PNG open 用: doc/active_view を「1layer・1frame・1cel(空)」状態へ縮める
-    /// （`Document.resetToSingleBlankLayer`。undo/redo も内部で破棄される。plan 8.5節）。
+    /// For PNG open: shrink doc/active_view to "1 layer · 1 frame · 1 empty cel"
+    /// (`Document.resetToSingleBlankLayer`; undo/redo are discarded inside as well).
     fn resetCanvasToSingleLayer(self: *App) void {
         self.doc.resetToSingleBlankLayer(self.gpa);
-        self.sel_in.discardFloat(self.gpa); // フロートも破棄
-        self.invalidateHistoryAfterDocReset(); // 旧 document への framework redo を失効（review 反映）
+        self.sel_in.discardFloat(self.gpa); // Discard the float too
+        self.invalidateHistoryAfterDocReset(); // Expire framework redo against the old document
     }
 
     fn syncPreviewCanvas(self: *App) void {
@@ -2817,14 +2817,14 @@ const App = struct {
             dst.opacity = src.opacity;
         }
         self.preview_canvas.selected_layer = self.canvas.selected_layer;
-        // selection も同期（bezier プレビューが描画制約を commit と一致させる。TASK-44）
+        // Sync selection too (so bezier preview drawing constraints match the commit)
         self.preview_canvas.selection = self.canvas.selection;
-        // 上の @memcpy / visible / opacity は Canvas API を通らない直接書きのため、
-        // composite_cache を明示的に無効化する（TASK-53 の dirty フラグ導入に伴う）
+        // The @memcpy / visible / opacity writes above bypass the Canvas API, so
+        // invalidate composite_cache explicitly.
         self.preview_canvas.markDirty();
     }
 
-    /// 描画用の straight-alpha composite を返す（ベジェ/選択プレビュー時は preview_canvas）。
+    /// Return the straight-alpha composite for drawing (preview_canvas while bezier/selection preview is active).
     fn resolveDisplayComposite(self: *App, gpa: std.mem.Allocator) []const u32 {
         if (self.active_kind == .bezier and self.bezier_editor.isEditing()) {
             self.syncPreviewCanvas();
@@ -2840,21 +2840,21 @@ const App = struct {
         return self.canvas.compositeStraight();
     }
 
-    /// File/Edit/View の共通実行入口（TASK-97.2）。
-    /// keyboard / GUI メニュー / menu_command イベントがここに集約する。
-    /// File 系は pending_file_op へ積むだけ（ダイアログは runPendingFileOp 安全点）。
-    /// Undo/Redo は既存 doUndo/doRedo（ハイブリッド userUndo + netsync route）を維持し、
-    /// 結果と undo 記録を変えない。
+    /// Shared File/Edit/View execution entry.
+    /// keyboard / GUI menu / menu_command events all converge here.
+    /// File ops only queue pending_file_op (dialogs run at the runPendingFileOp safe point).
+    /// Undo/Redo keep the existing doUndo/doRedo (hybrid userUndo + netsync route) and
+    /// do not change results or undo recording.
     fn dispatchCommand(self: *App, id: platform.CommandId) void {
-        // TASK-144.2: size_dialog 中は他メニューコマンドを通さない（recovery/confirmation の
-        // 早期 continue と同じ「開いている間は横取り」方針。native keyEquivalent / menuBarPopup
-        // 経由の reentrant open・confirmation 二重表示・layer 操作を防ぐ）。
-        // Esc/Enter は key_down 経路で処理され、ここは通らない。
+        // While size_dialog is open, do not run other menu commands (same "intercept while open" policy as
+        // the early continue for recovery/confirmation. Prevents reentrant open via native keyEquivalent /
+        // menuBarPopup, double confirmation, and layer ops).
+        // Esc/Enter are handled on the key_down path and do not reach here.
         if (self.size_dialog != null) return;
-        // stale event / disabled 項目の最終防御: 共通入口で Command 表の存在 + enabled を
-        // 再検証する。GUI click / shortcut は各自チェック済みだが、native/harness の
-        // menu_command イベントは ID をそのまま運ぶため、状態更新後の stale event でも
-        // disabled 項目を実行しない（エラーでなく無視）。
+        // Final defence against stale events / disabled items: at this shared entry re-check Command-table
+        // presence + enabled. GUI click / shortcut already check locally, but native/harness
+        // menu_command events carry a raw ID, so even a stale post-update event must not
+        // run a disabled item (ignore, do not error).
         const cmd = self.findMenuCommand(id) orelse return;
         if (!cmd.enabled) return;
         if (id >= RECENT_CMD_BASE and id < RECENT_CMD_BASE + 10) {
@@ -2929,8 +2929,8 @@ const App = struct {
         return false;
     }
 
-    /// View メニュー / panel_toggle 共通。可視を反転し Preferences へ即保存する。
-    /// 未知 name は null。成功時は新しい visible を返す。
+    /// Shared by View menu / panel_toggle. Flip visibility and immediately persist Preferences.
+    /// Unknown name → null. On success return the new visible.
     fn togglePanelVisible(self: *App, name: []const u8) ?bool {
         const p = self.findPanel(name) orelse return null;
         const new_vis = !p.visible;
@@ -2950,7 +2950,7 @@ const App = struct {
         try self.preferences.save(self.io, self.data_dir, "preferences.ash");
     }
 
-    /// Tool Options の表示専用タイトルを毎フレーム更新（stable name は変えず Panel.title のみ）。
+    /// Update the display-only Tool Options title every frame (stable name unchanged; only Panel.title).
     fn syncToolOptionsTitle(self: *App) void {
         const written = std.fmt.bufPrint(&self.tool_options_title_buf, "Tool Options - {s}", .{self.active_kind.name()}) catch {
             self.tool_options_title_len = 0;
@@ -2963,7 +2963,7 @@ const App = struct {
         }
     }
 
-    /// Layers scroll 内の自然コンテンツ高（行数×行高 + Text Layer UI）。
+    /// Natural content height inside the Layers scroll (rows×row-height + Text Layer UI).
     fn layersNaturalContentHeight(self: *const App) i32 {
         const n: i32 = @intCast(self.canvas.layers.items.len);
         if (n <= 0) return LAYERS_VIEWPORT_ROW_MIN;
@@ -2977,7 +2977,7 @@ const App = struct {
         return h;
     }
 
-    /// Layers の Collapsible 見出し + toolbar 高。前フレーム panelRect − scroll rect で実測。
+    /// Layers Collapsible heading + toolbar height. Measured previous-frame as panelRect − scroll rect.
     fn measureLayersChrome(self: *const App, ctx: *const gui.Context) i32 {
         if (self.panel_host.panelRect(ctx, PanelNames.layers)) |pr| {
             if (ctx.getNodeRect(LAYERS_SCROLL_ID)) |vp| {
@@ -2988,28 +2988,28 @@ const App = struct {
         return LAYERS_CHROME_FALLBACK;
     }
 
-    /// Layers body 外側幅（panel wrap の前フレーム rect.w − 余白）。
-    /// Collapsible body は width=.fit のため .fixed 注入する（grow-in-fit collapse 回避。TASK-155 / TASK-149.1 踏襲）。
-    /// 高さの panelRect 再注入はしない（内容高に縮む鶏卵。幅のみ読む）。
-    /// 余白は 24px（TASK-168 で PanelHost 右slotが scrollable 化し、外側 ScrollArea の viewport が
-    /// 1 段深くなった分の実クリップ余裕を含む。16px のままだと Layers 自身の内側スクロールバー
-    /// （幅 8px）が実クリップの外側にはみ出し、描画されなくなる実測バグがあった）。
+    /// Outer width of the Layers body (previous-frame panel-wrap rect.w − margin).
+    /// Collapsible body is width=.fit, so inject .fixed (avoids grow-in-fit collapse).
+    /// Do not re-inject height from panelRect (chicken-and-egg shrink to content; width only).
+    /// Margin is 24px (after the PanelHost right slot became scrollable, the outer ScrollArea viewport is
+    /// one level deeper; the extra clip headroom is included. At 16px the Layers inner scrollbar
+    /// (8px wide) sat outside the real clip and was not drawn).
     fn layersBodyAvail(self: *const App, ctx: *const gui.Context) i32 {
         if (self.panel_host.panelRect(ctx, PanelNames.layers)) |r| {
             return @max(1, @as(i32, @intCast(r.w)) - 24);
         }
-        // 初回フレーム等: rect 未確定 → right slot extent ベース
+        // First frame etc.: rect unset → base on right-slot extent
         return @max(1, self.panel_host.slotExtent(.right) - 24);
     }
 
-    /// Layers ScrollArea の固定高。
+    /// Fixed height of the Layers ScrollArea.
     ///
-    /// 方針（TASK-148.3 Critical 修正）: Tool Options 等の他セクション natural 高を優先し、
-    /// Layers viewport は `clamp(内容 natural 高, 1 行分, 残り高)` に抑える。
-    /// レイヤー 1 枚なら 1 行分だけ確保し、余りを Tool Options に回す。
+    /// Policy: prefer the natural height of other sections (Tool Options etc.) and
+    /// clamp the Layers viewport to `clamp(content natural height, one row, remaining height)`.
+    /// With one layer, reserve only one row and give the rest to Tool Options.
     ///
-    /// Degradation: 全セクション open + 窓が狭いと残り高が 1 行未満になり得る。その場合は
-    /// Layers を 1 行まで縮め、不足分は PanelHost 右 slot 外側 ScrollArea で下端へ到達する。
+    /// Degradation: with every section open and a short window, remaining height can fall below one row.
+    /// Then shrink Layers to one row; the shortfall is reached via the PanelHost right-slot outer ScrollArea.
     fn updateLayersViewportHeight(self: *App, ctx: *const gui.Context) void {
         const right = self.panel_host.slotRect(ctx, .right) orelse return;
         var others: i32 = 0;
@@ -3020,7 +3020,7 @@ const App = struct {
                 others += @intCast(r.h);
                 other_count += 1;
             } else {
-                // 初回等: 他 panel rect が無い → 内容量ベースの最小（1 行〜natural）を仮置き
+                // First frame etc.: other panel rects missing → provisional min from content (one row..natural)
                 const natural = self.layersNaturalContentHeight();
                 self.layers_viewport_h = std.math.clamp(natural, LAYERS_VIEWPORT_ROW_MIN, natural);
                 return;
@@ -3033,12 +3033,12 @@ const App = struct {
         const slot_h: i32 = @intCast(right.h);
         const remain = slot_h - PANEL_SLOT_PAD_V - gaps - others - layers_chrome;
         const natural = self.layersNaturalContentHeight();
-        // remain が極端に小さくても 1 行は確保（下端クリップは許容。上記 Degradation）
+        // Even if remain is tiny, keep one row (bottom clip is acceptable; see Degradation above)
         const max_h = @max(LAYERS_VIEWPORT_ROW_MIN, remain);
         self.layers_viewport_h = std.math.clamp(natural, LAYERS_VIEWPORT_ROW_MIN, max_h);
     }
 
-    /// endFrame 後に呼ぶ。`digest panels` 用に右スロット各 panel の y/h と fb_h を記録。
+    /// Call after endFrame. Record y/h of each right-slot panel and fb_h for `digest panels`.
     fn cachePanelsProbe(self: *App) void {
         self.panels_probe_fb_h = @intCast(self.ctx.screen_h);
         self.panels_probe_color = if (self.panel_host.panelRect(&self.ctx, PanelNames.color)) |r|
@@ -3071,14 +3071,14 @@ const App = struct {
             .{ .y = r.y, .h = @intCast(r.h) }
         else
             null;
-        // ok = 右 slot 自体が framebuffer 内に収まっていること（panel 自然高の raw overflow は許容）。
+        // ok = the right slot itself fits inside the framebuffer (raw overflow of panel natural height is allowed).
         self.panels_probe_ok = if (self.panels_probe_slot) |sr|
             sr.y >= 0 and sr.y + sr.h <= self.panels_probe_fb_h
         else
             false;
     }
 
-    /// Command 表から id を検索（separator は対象外）。dispatchCommand の最終防御用。
+    /// Look up an id in the Command table (separators excluded). Final defence for dispatchCommand.
     fn findMenuCommand(self: *const App, id: platform.CommandId) ?platform.Command {
         if (id == 0) return null;
         for (self.menu_commands[0..self.menu_command_count]) |cmd| {
@@ -3088,7 +3088,7 @@ const App = struct {
         return null;
     }
 
-    /// 現在の app 状態から Command 表を再構築（checked = 各 panel 表示状態）。
+    /// Rebuild the Command table from current app state (checked = each panel's visibility).
     fn rebuildMenuCommands(self: *App) void {
         const accel_mod: platform.ModifierFlags = if (builtin.os.tag == .macos)
             .{ .cmd = true }
@@ -3216,8 +3216,8 @@ const App = struct {
         return false;
     }
 
-    /// enabled/checked 変化時のみ updateMenu。構造変化時は registerMenu。
-    /// 毎フレームの ObjC ブリッジ呼び出しを dirty-gate で禁止（TASK-97.3 付記）。
+    /// updateMenu only when enabled/checked change. registerMenu on structural change.
+    /// Forbid per-frame ObjC bridge calls via the dirty gate.
     fn syncNativeMenu(self: *App, win: *platform.Window) void {
         if (!self.native_menu_active) return;
         const cmds = self.menuCommandsSlice();
@@ -3231,9 +3231,9 @@ const App = struct {
         }
     }
 
-    /// GUI fallback 環境のショートカット照合（single-owner = アプリ側。TASK-97.2 plan 4）。
-    /// primary accel は cmd または ctrl（既存 handleKey と同じ）。
-    /// native メニュー有効時は keyEquivalent が所有するため呼ばない（AC#2）。
+    /// Shortcut matching in the GUI-fallback environment (single-owner = app side).
+    /// Primary accel is cmd or ctrl (same as existing handleKey).
+    /// Not called when the native menu is active — keyEquivalent owns shortcuts then.
     fn matchMenuShortcut(self: *const App, k: platform.KeyEvent) ?platform.CommandId {
         const accel = k.modifiers.cmd or k.modifiers.ctrl;
         for (self.menu_commands[0..self.menu_command_count]) |cmd| {
@@ -3297,12 +3297,12 @@ const App = struct {
     }
 
     fn handleKey(self: *App, k: platform.KeyEvent) void {
-        // Space はパン用 modifier（押下継続を追跡。解放は handleKeyUp）。他処理には回さない。
+        // Space is the pan modifier (track held state; release in handleKeyUp). Do not route elsewhere.
         if (k.key == .SPACE) {
             self.space_down = true;
             return;
         }
-        // ベジェ編集中はツール固有キーを横取り（Enter=確定 / Esc=キャンセル / Delete・Backspace=点削除）
+        // While editing a bezier, intercept tool keys (Enter=commit / Esc=cancel / Delete·Backspace=delete point)
         if (self.active_kind == .bezier and self.bezier_editor.isEditing()) {
             if (k.key == .ENTER or k.key == .KP_ENTER) {
                 self.commitBezier();
@@ -3315,22 +3315,22 @@ const App = struct {
                 return;
             }
         }
-        // 保存系などのアクセラレータ修飾: macOS=Cmd / Linux=Ctrl。
-        // Linux(GNOME 等)は Super(=cmd) を WM が予約してアプリに届かないため Ctrl も受ける
-        // （Ctrl+S 等は Linux の保存の慣習にも合致。macOS は従来どおり Cmd で、Ctrl も追加で効く）。
+        // Accelerator modifier for save etc.: macOS=Cmd / Linux=Ctrl.
+        // On Linux (GNOME etc.) Super(=cmd) is reserved by the WM and never reaches the app, so also accept Ctrl
+        // (Ctrl+S also matches Linux save convention. macOS stays Cmd; Ctrl works as an extra).
         const accel = k.modifiers.cmd or k.modifiers.ctrl;
         if (k.key == .ESCAPE) {
-            // メニュー表示中の Esc はメニューを閉じるだけ（アプリ終了に落とさない）。
-            // popup 本体は次の menuBarPopup が open_title==null を見て閉じる。
+            // Esc while a menu is open only closes the menu (does not quit the app).
+            // The popup itself closes when the next menuBarPopup sees open_title==null.
             if (self.menu_bar_state.open_title != null) {
                 self.menu_bar_state.open_title = null;
                 return;
             }
-            // シェイプ/選択ドラッグ中なら破棄 → 選択(またはフロート)があれば解除 → それ以外は終了
+            // If shape/selection drag is active → cancel; else if selection (or float) exists → clear; else quit
             if (self.shape_in.state != .idle) {
                 self.shape_in.cancel();
             } else if (self.sel_in.state != .idle) {
-                self.sel_in.cancel(self.gpa); // drag 中断（フロート破棄・実レイヤーは drag 中不変）
+                self.sel_in.cancel(self.gpa); // Interrupt drag (discard float; real layer unchanged during drag)
             } else if (self.canvas.selection != null or self.sel_in.float != null) {
                 self.canvas.clearSelection();
                 self.sel_in.discardFloat(self.gpa);
@@ -3340,20 +3340,20 @@ const App = struct {
         } else if (k.key == .Q and accel) {
             if (self.os_window) |win| self.requestClose(win);
         } else if (blk: {
-            // native 有効時は keyEquivalent がショートカットを所有（AC#2）。GUI/headless のみ照合。
+            // When native is active, keyEquivalent owns shortcuts. Match only for GUI/headless.
             break :blk if (self.native_menu_active) null else self.matchMenuShortcut(k);
         }) |cmd_id| {
-            // File/Edit ショートカットは Command 表経由（single-owner。GUI メニューと同じ入口）。
+            // File/Edit shortcuts go through the Command table (single-owner; same entry as the GUI menu).
             self.dispatchCommand(cmd_id);
         } else if (k.key == .C and accel) {
-            self.doCopy(); // accel+C は copy（bare C の clear より前に判定）
-            // システム clipboard へ現在色 #RRGGBB（wasm Clipboard API。TASK-73.3）
+            self.doCopy(); // accel+C is copy (decide before bare-C clear)
+            // Also put the current color #RRGGBB on the system clipboard (wasm Clipboard API)
             self.copySystemColor();
         } else if (k.key == .X and accel) {
             self.doCut();
         } else if (k.key == .V and accel) {
             self.doPaste();
-            // システム clipboard から色 paste を非同期要求（結果は runPendingFileOp で適用）
+            // Async request to paste a color from the system clipboard (applied in runPendingFileOp)
             platform.clipboardRequestPaste();
         } else if (k.key == .B) {
             self.setActiveKind(.pen);
@@ -3366,45 +3366,45 @@ const App = struct {
         } else if (k.key == .G) {
             self.setActiveKind(.fill);
         } else if (k.key == .I) {
-            self.setActiveKind(.eyedropper); // Photoshop/GIMP 慣習のキー割当（一時スポイトは Alt+クリック）
+            self.setActiveKind(.eyedropper); // Photoshop/GIMP-style key binding (temporary eyedropper is Alt+click)
         } else if (k.key == .C) {
             self.doClear() catch {};
         } else if (k.key == .@"0") {
-            self.setZoomCentered(Zoom.one()); // 100% (1x) 中央リセット
+            self.setZoomCentered(Zoom.one()); // 100% (1x) center reset
         } else if (k.key == .F) {
             self.fitZoom();
         } else if (k.key == .KP_ADD) {
-            // カーソル位置は updateViewport 時に確定するため保留（zoom-to-cursor）
+            // Cursor position is finalized in updateViewport, so defer (zoom-to-cursor)
             self.pending_zoom_delta += 1;
         } else if (k.key == .KP_SUBTRACT) {
             self.pending_zoom_delta -= 1;
         }
     }
 
-    /// key_up 処理。現状は Space パン modifier の解放のみ。
+    /// key_up handling. Currently only releases the Space pan modifier.
     fn handleKeyUp(self: *App, k: platform.KeyEvent) void {
         if (k.key == .SPACE) self.space_down = false;
     }
 
-    /// ベジェ確定（現在ブラシ footprint + color/opacity で rasterize → `Document.pushPaintOp`）。
+    /// Commit bezier (rasterize with current brush footprint + color/opacity → `Document.pushPaintOp`).
     fn commitBezier(self: *App) void {
         const dab = self.brush.footprint();
         if (self.bezier_editor.rasterizeCommit(self.canvas, &self.recorder, self.gpa, dab, self.brush.color, self.brush.opacity)) |pd| {
-            self.doc.pushPaintOp(self.gpa, pd.layer_idx, pd.diffs) catch {}; // text layer 選択中はこの経路に到達しない
+            self.doc.pushPaintOp(self.gpa, pd.layer_idx, pd.diffs) catch {}; // This path is not reached while a text layer is selected
         }
     }
 };
 
 // ============================================================================
-// ヘッドレス検証 harness の custom probe（TASK-32.3）
+// Headless-harness custom probes
 //
-// `platform.registerProbe` で opt-in 登録する。framework は中身を解釈せず、snapshot の raw bytes を
-// file へ書き / digest の1行を sink へ流すだけ。各 probe の意味づけは下の callback に閉じる。
-// ctx は *App。harness 無効時は登録自体が no-op なので通常実行に影響しない。
+// Opt-in via `platform.registerProbe`. The framework does not interpret the body; it only writes snapshot raw bytes
+// to a file / streams the one-line digest to the sink. Probe meaning stays inside the callbacks below.
+// ctx is *App. When the harness is disabled, registration itself is a no-op so normal runs are unaffected.
 // ============================================================================
 
-/// canvas digest: サイズ / layer 数 / selected / composite crc / layer metadata。
-/// 1024B に入り切らない場合は打ち切り、top-level `trunc=1` を末尾に付与（TASK-94 Phase B P2）。
+/// canvas digest: size / layer count / selected / composite crc / layer metadata.
+/// If it does not fit in 1024B, truncate and append top-level `trunc=1` at the end.
 fn canvasDigest(ctx: *anyopaque, buf: []u8) []const u8 {
     const app: *App = @ptrCast(@alignCast(ctx));
     var len: usize = 0;
@@ -3422,9 +3422,9 @@ fn canvasDigest(ctx: *anyopaque, buf: []u8) []const u8 {
     else
         std.fmt.bufPrint(buf[len..], " sel=none", .{}) catch return buf[0..len];
     len += sel_part.len;
-    // viewport 観測値（TASK-153.1/153.2/153.3）。top-level key=value。layers より前に置き trunc でも harness が拾えるようにする。
-    // `zoom=` は TASK-153.1 互換キー: den==1 なら整数倍率、den>1（縮小）なら sentinel `0`。
-    // rational 詳細は zoom_num / zoom_den / zoom_pct を併記（追加のみ規約）。
+    // Viewport observations. Top-level key=value, placed before layers so harness can still see them when truncated.
+    // `zoom=` compatibility key: integer scale when den==1; sentinel `0` when den>1 (shrink).
+    // Rational detail is also written as zoom_num / zoom_den / zoom_pct (additive only).
     {
         const doc_w = app.doc.width;
         const doc_h = app.doc.height;
@@ -3456,12 +3456,12 @@ fn canvasDigest(ctx: *anyopaque, buf: []u8) []const u8 {
             if (p != 0) nonzero += 1;
         }
         const crc = png.crc32(std.mem.sliceAsBytes(layer.pixels));
-        // id= を nested 先頭へ（TASK-94 Phase B review: agent が #id を発見する手段）。
-        // nested は expect contains 規約。1024B 予算のため id は短い u64 十進のみ追加。
+        // Put id= first in the nested block (so agents can discover #<id>).
+        // Nested follows the expect-contains convention. Only a short decimal u64 id is added (1024B budget).
         const layer_id: u64 = if (app.doc.layerIdAt(idx)) |lid| @intFromEnum(lid) else 0;
-        // kind=text の時だけ text= を nested 内へ追加する（TASK-79.5。既存 name= と同じ
-        // 「nested は contains で見る」規約。text_content_input が ASCII 制御文字を弾くため
-        // 改行等の混入は無い＝1行契約は保たれる）。
+        // Add text= inside nested only when kind=text (same convention as existing name=:
+        // nested is matched with contains. text_content_input rejects ASCII controls so
+        // newlines and similar cannot appear — the one-line contract holds).
         const part = if (layer.kind == .text)
             std.fmt.bufPrint(buf[len..], " l{d}{{id={d},v={},op={d},crc={X:0>8},nz={d},name={s},kind=text,text={s}}}", .{
                 idx, layer_id, layer.visible, layer.opacity, crc, nonzero, layer.name(), layer.text_params.text(),
@@ -3481,13 +3481,13 @@ fn canvasDigest(ctx: *anyopaque, buf: []u8) []const u8 {
     return actions.finishDigestWithTrunc(buf, len, truncated);
 }
 
-/// canvas snapshot: visible layer を合成したフラット透明 PNG。
+/// canvas snapshot: flat transparent PNG of the visible layers composited.
 fn canvasSnapshot(ctx: *anyopaque, allocator: std.mem.Allocator) anyerror![]u8 {
     const app: *App = @ptrCast(@alignCast(ctx));
     return core.encodePNG(app.canvas.compositeStraight(), app.doc.width, app.doc.height, allocator);
 }
 
-/// undo digest/snapshot: undo/redo スタックの深さ（JSON 1行）。undo で depth が減る。
+/// undo digest/snapshot: undo/redo stack depths (one JSON line). undo reduces depth.
 fn undoDigest(ctx: *anyopaque, buf: []u8) []const u8 {
     const app: *App = @ptrCast(@alignCast(ctx));
     return std.fmt.bufPrint(buf, "{{\"depth\":{d},\"redo\":{d}}}", .{
@@ -3495,15 +3495,15 @@ fn undoDigest(ctx: *anyopaque, buf: []u8) []const u8 {
     }) catch buf[0..0];
 }
 
-/// presence digest（TASK-103）: ephemeral overlay 状態。TTL 期限切れは除去してから出力。
+/// presence digest: ephemeral overlay state. Expired TTL entries are removed before output.
 fn presenceDigest(ctx: *anyopaque, buf: []u8) []const u8 {
     const app: *App = @ptrCast(@alignCast(ctx));
     return app.presence.formatDigest(buf, platform.getTime());
 }
 
-/// menu digest（TASK-97.2）: 開閉・項目数・enabled/checked mask・pending_file_op。
+/// menu digest: open/closed, item count, enabled/checked masks, pending_file_op.
 /// `open=<title|none> items=<n> enabled=<hex> checked=<hex> pending=<tag|none>`
-/// enabled/checked は非 separator 項目の出現順ビット（bit0=先頭の item）。
+/// enabled/checked are bits in non-separator appearance order (bit0 = first item).
 fn menuDigest(ctx: *anyopaque, buf: []u8) []const u8 {
     const app: *App = @ptrCast(@alignCast(ctx));
     const open = if (app.menu_bar_state.open_title) |t| t else "none";
@@ -3518,14 +3518,14 @@ fn menuDigest(ctx: *anyopaque, buf: []u8) []const u8 {
         if (cmd.checked) checked_mask |= bit;
         items += 1;
     }
-    // pending = 実際に未消費の FileOp（dialog 進行中を優先。真の状態）。
-    // last_op = 直近に dispatch された FileOp のラッチ（次の dispatch まで保持。headless では
-    // 同フレームで消費されるため「メニュー選択が FileOp を積んだ」ことはこちらで観測する）。
+    // pending = FileOp actually still unconsumed (prefer in-flight dialog; the true state).
+    // last_op = latch of the most recently dispatched FileOp (kept until the next dispatch. Under headless
+    // it is consumed in the same frame, so "menu selection queued a FileOp" is observed here).
     const live_pending = app.dialog_op orelse app.pending_file_op;
     const pending = if (live_pending) |op| @tagName(op) else "none";
     const last_op = if (app.menu_pending_probe) |op| @tagName(op) else "none";
-    // native=0|1: OS native メニュー（NSMenu）が有効か（TASK-97.3 hotfix で追加。
-    // headless は常に 0 / macOS 実 window + enable_menu ビルドで 1。実機検証の機械 assert 用）。
+    // native=0|1: whether the OS native menu (NSMenu) is enabled
+    // (headless always 0; macOS real window + enable_menu build = 1. For mechanical asserts on device).
     return std.fmt.bufPrint(buf, "open={s} items={d} enabled={X:0>8} checked={X:0>8} pending={s} last_op={s} native={d}", .{
         open, items, enabled_mask, checked_mask, pending, last_op, @intFromBool(app.native_menu_active),
     }) catch buf[0..0];
@@ -3538,7 +3538,7 @@ fn appshellDigest(ctx: *anyopaque, buf: []u8) []const u8 {
     const path = app.host.currentPath() orelse "none";
     const recent0 = if (app.recent.items().len > 0) app.recent.items()[0] else "none";
     const recovery = if (app.recovery != null) "pending" else "none";
-    // TASK-117: geometry を additive で載せる（headless=サイズのみ/pos=none。配線 silent false 検出用）。
+    // Geometry is additive (headless = size only / pos=none. Detects silent false wiring).
     const geo = if (app.os_window) |win| win.getGeometry() else platform.WindowGeometry{
         .position = null,
         .size = .{ .width = 0, .height = 0 },
@@ -3577,7 +3577,7 @@ fn undoSnapshot(ctx: *anyopaque, allocator: std.mem.Allocator) anyerror![]u8 {
     });
 }
 
-/// tool digest/snapshot: 現在ツール名 + 描画色 #RRGGBB。
+/// tool digest/snapshot: current tool name + drawing color #RRGGBB.
 fn toolDigest(ctx: *anyopaque, buf: []u8) []const u8 {
     const app: *App = @ptrCast(@alignCast(ctx));
     const c = app.palette.current();
@@ -3589,8 +3589,8 @@ fn toolDigest(ctx: *anyopaque, buf: []u8) []const u8 {
     }) catch buf[0..0];
 }
 
-/// timeline digest（TASK-45.4）: 再生状態を top-level k=v 1 行で公開（snapshot なし・expect 適合）。
-/// 形式: `playing=<0|1> frame=<n> frames=<n> fps=<f:.1> dur=<ms> layers=<n> onion=<0|1>`
+/// timeline digest: playback state as one top-level k=v line (no snapshot; expect-compatible).
+/// Format: `playing=<0|1> frame=<n> frames=<n> fps=<f:.1> dur=<ms> layers=<n> onion=<0|1>`
 fn timelineDigest(ctx: *anyopaque, buf: []u8) []const u8 {
     const app: *App = @ptrCast(@alignCast(ctx));
     const sf = app.doc.selected_frame;
@@ -3609,9 +3609,9 @@ fn timelineDigest(ctx: *anyopaque, buf: []u8) []const u8 {
     }) catch buf[0..0];
 }
 
-/// panels digest（TASK-148.3）: 右スロット各セクションの前フレーム rect と fb_h。
-/// 形式: `fb_h=<n> bottom=<n> ok=<0|1> RightSlot_y=<n> RightSlot_h=<n> Color_y=<n> ...`
-/// `expect panels ok=1` は右 slot 境界が framebuffer 内であること（自然 content の raw overflow は許容）。
+/// panels digest: previous-frame rects of each right-slot section and fb_h.
+/// Format: `fb_h=<n> bottom=<n> ok=<0|1> RightSlot_y=<n> RightSlot_h=<n> Color_y=<n> ...`
+/// `expect panels ok=1` means the right-slot bounds are inside the framebuffer (raw overflow of natural content is allowed).
 fn panelsDigest(ctx: *anyopaque, buf: []u8) []const u8 {
     const app: *App = @ptrCast(@alignCast(ctx));
     var len: usize = 0;
@@ -3642,8 +3642,8 @@ fn toolSnapshot(ctx: *anyopaque, allocator: std.mem.Allocator) anyerror![]u8 {
     return allocator.dupe(u8, toolDigest(ctx, &buf));
 }
 
-/// diff digest（TASK-87）: 基準スナップショットとの変更画素数 / bbox / 最頻 before・after 色。
-/// 初回（未 mark）は現 composite を基準として自動初期化し changed=0 を返す。snapshot なし。
+/// diff digest: changed pixel count / bbox / most-frequent before and after colors vs the baseline snapshot.
+/// On first use (unmarked) auto-init the baseline from the current composite and return changed=0. No snapshot.
 fn diffDigest(ctx: *anyopaque, buf: []u8) []const u8 {
     const app: *App = @ptrCast(@alignCast(ctx));
     if (app.diff_base == null) {
@@ -3663,8 +3663,8 @@ fn diffDigest(ctx: *anyopaque, buf: []u8) []const u8 {
     }) catch buf[0..0];
 }
 
-/// palette digest（TASK-89）: パレット色数 / canvas 一意色数 / 上位 4 色（fb top 書式整合）。
-/// イベント時のみ（compositeStraight + AutoHashMap ヒストグラム）。
+/// palette digest: palette size / unique canvas colors / top 4 (aligned with fb top format).
+/// Event-time only (compositeStraight + AutoHashMap histogram).
 fn paletteDigest(ctx: *anyopaque, buf: []u8) []const u8 {
     const app: *App = @ptrCast(@alignCast(ctx));
     const flat = app.canvas.compositeStraight();
@@ -3672,14 +3672,14 @@ fn paletteDigest(ctx: *anyopaque, buf: []u8) []const u8 {
     var counts = std.AutoHashMap(u32, u32).init(app.gpa);
     defer counts.deinit();
     for (flat) |p| {
-        // 完全透明は used に含めない（表示色統計）
+        // Fully transparent pixels are excluded from used (visible-color stats)
         if (p & 0xFF000000 == 0) continue;
         const c = 0xFF000000 | (p & 0x00FFFFFF);
         const gop = counts.getOrPut(c) catch return buf[0..0];
         if (gop.found_existing) gop.value_ptr.* += 1 else gop.value_ptr.* = 1;
     }
     const used = counts.count();
-    // 上位 4 色（count 降順・同数は color 昇順）
+    // Top 4 colors (count desc; color asc on ties)
     const Top = struct { color: u32 = 0, count: u32 = 0 };
     var top = [_]Top{.{}} ** 4;
     const better = struct {
@@ -3710,7 +3710,7 @@ fn paletteDigest(ctx: *anyopaque, buf: []u8) []const u8 {
     len += (std.fmt.bufPrint(buf[len..], "colors={d} used={d} top=[", .{
         app.palette.colors.items.len, used,
     }) catch return buf[0..0]).len;
-    // 分母は全画素（透明含む）で fb digest と同じ % 規約
+    // Denominator is all pixels including transparent — same % convention as fb digest
     var first = true;
     for (top) |t| {
         if (t.count == 0) continue;
@@ -3725,7 +3725,7 @@ fn paletteDigest(ctx: *anyopaque, buf: []u8) []const u8 {
     return buf[0..len];
 }
 
-/// compositeStraight を diff_base へコピー（未確保なら alloc）。借用スライスは保持しない。
+/// Copy compositeStraight into diff_base (alloc if needed). Never retain a borrowed slice.
 fn copyCompositeToDiffBase(app: *App) !void {
     const n = @as(usize, app.doc.width) * @as(usize, app.doc.height);
     const dst = if (app.diff_base) |b| blk: {
@@ -3746,9 +3746,9 @@ fn copyCompositeToDiffBase(app: *App) !void {
     @memcpy(dst, src);
 }
 
-/// cursor digest/snapshot（TASK-75.4）: 要求中の OS cursor shape + 現在ツール + footprint リング半径。
-/// OS カーソル自体は framebuffer に写らないため、「pixie が要求した値」を assert する用途
-/// （実際に OS カーソルが変わったかは各 backend 手動目視。docs/plans/cursor-support-plan.md 参照）。
+/// cursor digest/snapshot: requested OS cursor shape + current tool + footprint ring radius.
+/// The OS cursor itself does not appear in the framebuffer, so this asserts "the value pixie requested"
+/// (whether the OS cursor actually changed is per-backend manual inspection).
 fn cursorDigest(ctx: *anyopaque, buf: []u8) []const u8 {
     const app: *App = @ptrCast(@alignCast(ctx));
     const shape_name: []const u8 = switch (app.cursor_shape) {
@@ -3756,8 +3756,8 @@ fn cursorDigest(ctx: *anyopaque, buf: []u8) []const u8 {
         .crosshair => "crosshair",
         .hidden => "hidden",
     };
-    // ring_r は Brush 選択時のみ意味を持つ（それ以外は 0）。EdgeCache と同じ clampedSize 経由で
-    // size 解釈をズレさせない（brush_edge_cache.clampedSize 参照）。
+    // ring_r only means something when Brush is selected (otherwise 0). Use the same clampedSize path as EdgeCache
+    // so size interpretation cannot drift (see brush_edge_cache.clampedSize).
     const ring_r: u32 = if (app.active_kind == .brush) brush_edge_cache.clampedSize(&app.brush) / 2 else 0;
     return std.fmt.bufPrint(buf, "shape={s} tool={s} ring_r={d}", .{
         shape_name, app.active_kind.name(), ring_r,
@@ -3768,13 +3768,13 @@ fn cursorSnapshot(ctx: *anyopaque, allocator: std.mem.Allocator) anyerror![]u8 {
     return allocator.dupe(u8, cursorDigest(ctx, &buf));
 }
 
-/// CommandAdapter（TASK-62.5.4 §4a）: framework undo の逆適用口。
-/// canUndo = handle 現存 + .paint + cel 生存 + 位置前提（`Document.canRevertByHandle`）。
-/// applyUndo は**不可失敗契約**（canUndo==true 前提で呼ばれる。万一の handle 消失時も
-/// `revertByHandle` が no-op で戻るだけ = 部分 undo なし）。mode=.discard（記録済み op の redo は
-/// CommandLog の name/args 再 dispatch で行うため Op は破棄）。resyncActiveView は revertByHandle
-/// 内部・clampTimelineTarget 等の App 同期は undo/redo 呼び出し側の責務（既存 doUndo と同じ分担）。
-/// 構造 Op 制約・pixel 巻き添え artifact の割り切りは `Document.canRevertByHandle`/`revertByHandle` 参照。
+/// CommandAdapter: framework-undo reverse-apply entry.
+/// canUndo = handle still present + .paint + cel alive + position preconditions (`Document.canRevertByHandle`).
+/// applyUndo is **infallible** (called only when canUndo==true. Even if the handle vanishes,
+/// `revertByHandle` returns as a no-op — no partial undo). mode=.discard (redo of a recorded op is
+/// CommandLog name/args re-dispatch, so the Op is discarded). resyncActiveView is inside revertByHandle;
+/// App sync such as clampTimelineTarget is the undo/redo caller's job (same split as existing doUndo).
+/// Structure-Op limits and pixel side-effect trade-offs: see `Document.canRevertByHandle`/`revertByHandle`.
 fn adapterCanUndo(ctx: *anyopaque, rec: *const platform.command.CommandRecord) bool {
     const app: *App = @ptrCast(@alignCast(ctx));
     const ref = rec.undo_ref orelse return false;
@@ -3822,7 +3822,7 @@ fn historyCtx(app: *App) history_summary.HistoryContext {
     };
 }
 
-/// history probe（TASK-62.5.5 正式 schema）: digest=最新+集計（expect 用）、snapshot=全件 JSON。
+/// history probe (formal schema): digest = latest + aggregates (for expect); snapshot = full JSON.
 fn historyDigest(ctx: *anyopaque, buf: []u8) []const u8 {
     const app: *App = @ptrCast(@alignCast(ctx));
     return history_summary.formatDigest(historyCtx(app), buf);
@@ -3834,79 +3834,79 @@ fn historySnapshot(ctx: *anyopaque, allocator: std.mem.Allocator) anyerror![]u8 
 }
 
 // ============================================================================
-// ヘッドレス検証 harness の custom action（TASK-64。TASK-62.1 の registerAction を pixie が採用）
+// Headless-harness custom actions (pixie adopts registerAction)
 //
-// `platform.registerAction` で opt-in 登録する。probe（read）と対称の write/operate 口。
-// 全 action は既存の UI/キーボードと同じ `App.do*` メソッドを呼ぶだけ（入口の一本化＝
-// undo単位=action単位。UI/キーボード/action の3経路が同じ判定コード＝ do* 内のガードを通る）。
-// パーサは `actions.zig`（std のみ・App/kit/platform 非依存）に切り出し単体テストする。
+// Opt-in via `platform.registerAction`. The write/operate counterpart of probes (read).
+// Every action only calls the same `App.do*` methods as UI/keyboard (one entry point =
+// undo unit = action unit. UI / keyboard / action all share the same decision code = guards inside do*).
+// Parsers live in `actions.zig` (std only; no App/kit/platform) and are unit-tested there.
 //
-// action ⇄ UndoCmd 対応表（push は「この action 呼び出しで undo.push が起きるか」。
-// 高々1回＝0 or 1。複数回 push する action は無い）:
+// action ⇄ UndoCmd pairing table (push = "does this action call cause undo.push?".
+// At most once = 0 or 1. No action pushes more than once):
 //
-//   action              → App メソッド          push  失敗時の error
+//   action              → App method            push  error on failure
 //   ------------------  ---------------------  ----  --------------------------------
-//   undo                cmd_exec.undoOne(.local_agent)  no*   EditingBlocked（候補なしは冪等成功。TASK-62.5.4
-//   redo                cmd_exec.redoOne(.local_agent)  no*   で per-actor revert 化。UI の Cmd+Z は userUndo/userRedo）
+//   undo                cmd_exec.undoOne(.local_agent)  no*   EditingBlocked (no candidate = idempotent success;
+//   redo                cmd_exec.redoOne(.local_agent)  no*   per-actor revert. UI Cmd+Z uses userUndo/userRedo)
 //   clear               doClear                 yes   EditingBlocked
 //   add_layer           doAddLayer              yes   EditingBlocked / allocator error
-//   delete_layer        doDeleteLayer(idx)      yes   EditingBlocked / LastLayer / UnknownLayerId（TASK-94: args=`#<id>`|idx）
-//   select_layer        doSelectLayer           no    EditingBlocked / OutOfRange / UnknownLayerId（.local_only）
+//   delete_layer        doDeleteLayer(idx)      yes   EditingBlocked / LastLayer / UnknownLayerId (args=`#<id>`|idx)
+//   select_layer        doSelectLayer           no    EditingBlocked / OutOfRange / UnknownLayerId (.local_only)
 //   set_layer_visible   doSetLayerVisible       yes*  EditingBlocked / OutOfRange / UnknownLayerId
 //   set_layer_opacity   doSetLayerOpacity       yes*  EditingBlocked / OutOfRange / UnknownLayerId
-//   move_layer          doMoveLayer(idx,δ)      yes   EditingBlocked / OutOfRange / UnknownLayerId（args=`#<id> ±1`）
-//   duplicate_layer     doDuplicateLayer(idx)   yes   EditingBlocked / allocator error / UnknownLayerId（TASK-79.2）
-//   merge_down          doMergeDown(idx)        yes   EditingBlocked / OutOfRange / LastLayer / UnknownLayerId（TASK-79.2。
-//                                                      atomic `.layer_merge_down` 1 entry。2 push ではない）
-//   ※ layer 構造 op は canRevertByHandle=false → noteUndo せず wire 上 undoable=false（62.3.5 MVP）
-//   ※ add/delete/visible/opacity/move/duplicate/merge_down は .relay、select_layer は .local_only（TASK-94 B）
-//   set_color           doSetColorHex           no    （guard 無し。常に成功）
-//   set_tool            setActiveKind           no    （guard 無し。既存 UI と同じ「無反応」を許容）
-//   stroke              activeTool().onEvent 直接 yes  EditingBlocked / UnsupportedTool / parse系
-//   save                doSaveTo                no    savePNG の元 error
-//   open                doOpenPath              no    EditingBlocked / decode 系
-//   replace_color       doReplaceColor(layer)   yes*  EditingBlocked / TextLayer / OutOfRange / IdRequired / parse系
-//                                                      args=`[#id|idx] from to`（省略時 selected。netsync 中は #id 必須）
-//   palette_ramp        doReplacePalette        no    parse系（パレット変更は undo 対象外。.reject_when_synced）
-//   palette_from_png    doReplacePalette        no    EmptyPalette / decode 系（.reject_when_synced）
-//   palette_set         doReplacePalette        no    parse系（.reject_when_synced）
+//   move_layer          doMoveLayer(idx,δ)      yes   EditingBlocked / OutOfRange / UnknownLayerId (args=`#<id> ±1`)
+//   duplicate_layer     doDuplicateLayer(idx)   yes   EditingBlocked / allocator error / UnknownLayerId
+//   merge_down          doMergeDown(idx)        yes   EditingBlocked / OutOfRange / LastLayer / UnknownLayerId
+//                                                      (atomic `.layer_merge_down` 1 entry; not 2 pushes)
+//   * layer structure ops have canRevertByHandle=false → no noteUndo; wire undoable=false (MVP)
+//   * add/delete/visible/opacity/move/duplicate/merge_down = .relay; select_layer = .local_only
+//   set_color           doSetColorHex           no    (no guard; always succeeds)
+//   set_tool            setActiveKind           no    (no guard; same "no reaction" tolerance as existing UI)
+//   stroke              activeTool().onEvent direct yes  EditingBlocked / UnsupportedTool / parse errors
+//   save                doSaveTo                no    underlying savePNG error
+//   open                doOpenPath              no    EditingBlocked / decode errors
+//   replace_color       doReplaceColor(layer)   yes*  EditingBlocked / TextLayer / OutOfRange / IdRequired / parse errors
+//                                                      args=`[#id|idx] from to` (defaults to selected; #<id> required during netsync)
+//   palette_ramp        doReplacePalette        no    parse errors (palette changes are not undoable; .reject_when_synced)
+//   palette_from_png    doReplacePalette        no    EmptyPalette / decode errors (.reject_when_synced)
+//   palette_set         doReplacePalette        no    parse errors (.reject_when_synced)
 //
-//   * before==after の冪等呼び出しは push 無し（既存 UI のスライダー/チェックボックス挙動と同じ）。
+//   * an idempotent call with before==after pushes nothing (same as existing UI slider/checkbox behaviour).
 //
-//   TASK-79.5（テキストレイヤー: doAddTextLayer/doSetTextParams/doRasterizeLayer）には action を
-//   追加していない。harness の action registry は `MAX_ACTIONS=16`（core/control/harness.zig）
-//   固定で pixie は既に 16 件を使い切っており、harness.zig 改変はスコープ外（AGENT.md 上位
-//   ルール）のため空き slot が無い。これらは UI 操作（右クリックメニュー + `inject char`
-//   による文字入力）で harness 検証する。
+//   Text-layer ops (doAddTextLayer/doSetTextParams/doRasterizeLayer) are not
+//   registered as harness actions. Harness verifies them via UI (context menu
+//   + `inject char` text input). Slot capacity is not the limiter
+//   (MAX_ACTIONS = action_registry.MAX_ACTIONS has headroom);
+//   these stay UI-only by design.
 //
-// 非 push action（select_layer/set_color/set_tool/save/open/undo/redo 自体）が undo 対象外なのは
-// 新たな非一貫ではない: 既存 UI でも同じ操作（ツール切替キー・HSV スライダー・ファイル I/O）は
-// undo.push を呼ばない設計だった（`applyEditColor`/`setActiveKind`/`doSave` 参照）。本タスクの主眼は
-// 「UI が辿る undo 判定と全く同じコードを agent（action）からも辿れるようにする」ことで、UndoCmd
-// 自体の構造拡張（tool/color の履歴化等）はスコープ外（TASK-64 plan 参照）。
+// Non-push actions (select_layer/set_color/set_tool/save/open/undo/redo themselves) being non-undoable is
+// not a new inconsistency: the existing UI for the same ops (tool keys, HSV sliders, file I/O)
+// also never called undo.push (see `applyEditColor`/`setActiveKind`/`doSave`). The invariant is
+// that agents (actions) walk the exact same undo decision code as UI;
+// extending UndoCmd structure (e.g. historizing tool/color) is out of scope here.
 //
-// 将来 TASK-65（他アプリへの action 横展開）/ network（TASK-62.3）への申し送り: action 呼び出し列
-// （name+args）がそのまま「ネットワークで流す操作ストリーム」の単位になる、という設計意図をここに
-// 残す。UndoCmd の pixel diff は各ノードでの決定的 re-apply の実装詳細であり、ネットワーク越しに
-// 流す粒度ではない。
+// Design note for networked ops: the action call stream (name+args) is the unit
+// that would travel on the wire. UndoCmd pixel diffs are a per-node
+// deterministic re-apply detail, not the granularity to send across
+// the network.
 // ============================================================================
 
 fn actionApp(ctx: *anyopaque) *App {
     return @ptrCast(@alignCast(ctx));
 }
 
-/// action `undo`/`redo`（agent。TASK-62.5.4 §4b）: **executeAction を経由せず** framework の
-/// `undoOne`/`redoOne(.local_agent)` を直接呼ぶ登録 callback（undo/redo は begin_tx と同種の
-/// **制御コマンド**。executeAction 経由だと redoOne の内部再 dispatch が `ReentrantDispatch` に
-/// なるため構造的に不可）。既存ガード（editingBlocked）と実行後の App 同期（clampTimelineTarget）
-/// は従来 doUndo/doRedo と同じ。agent 操作は全て記録済みなのでハイブリッド（userUndo）は不要。
+/// action `undo`/`redo` (agent): registered callbacks that call framework
+/// `undoOne`/`redoOne(.local_agent)` **directly**, not via executeAction (undo/redo are
+/// **control commands** like begin_tx. Going through executeAction makes redoOne's internal re-dispatch hit `ReentrantDispatch`,
+/// which is structurally impossible). Existing guards (editingBlocked) and post-run App sync (clampTimelineTarget)
+/// match classic doUndo/doRedo. Agent ops are all recorded, so the hybrid (userUndo) path is unnecessary.
 fn actionUndo(ctx: *anyopaque, args: []const u8, buf: []u8) anyerror![]const u8 {
     try actions.parseNoArgs(args);
     const app = actionApp(ctx);
     try app.checkEditingAllowed();
     const seq_before = app.cmd_log.next_seq;
-    // defer: undoOne が失敗しても record フラグの変異は起きうる（next_seq 非依存のため
-    // dirty で拾う。codex 指摘）
+    // defer: undoOne may mutate record flags even on failure (independent of next_seq, so
+    // pick them up via dirty).
     defer app.markHistoryDirty();
     const outcome = try app.cmd_exec.undoOne(.local_agent, buf);
     app.captureHistoryVisualsSince(seq_before);
@@ -3919,15 +3919,15 @@ fn actionRedo(ctx: *anyopaque, args: []const u8, buf: []u8) anyerror![]const u8 
     const app = actionApp(ctx);
     try app.checkEditingAllowed();
     const seq_before = app.cmd_log.next_seq;
-    // defer: redoOne は途中失敗でも redo_consumed を更新しうる（next_seq 不変のケースが
-    // あるため dirty で拾う。codex 指摘）
+    // defer: redoOne may update redo_consumed even on mid-failure (next_seq can stay
+    // unchanged, so pick them up via dirty).
     defer app.markHistoryDirty();
     const outcome = app.cmd_exec.redoOne(.local_agent, buf) catch |err| {
-        app.tagOwnersFromRecords(seq_before, App.OP_OWNER_AGENT); // PartialRedo でも適用済み分はタグ
+        app.tagOwnersFromRecords(seq_before, App.OP_OWNER_AGENT); // Tag the already-applied portion even on PartialRedo
         app.captureHistoryVisualsSince(seq_before);
         return err;
     };
-    app.tagOwnersFromRecords(seq_before, App.OP_OWNER_AGENT); // 再 dispatch された新 op は agent 所有
+    app.tagOwnersFromRecords(seq_before, App.OP_OWNER_AGENT); // Newly re-dispatched ops are agent-owned
     app.captureHistoryVisualsSince(seq_before);
     app.clampTimelineTarget();
     return outcome.message;
@@ -3950,8 +3950,8 @@ fn actionAddLayer(ctx: *anyopaque, args: []const u8, buf: []u8) anyerror![]const
     return std.fmt.bufPrint(buf, "ok id=#{d}", .{id}) catch return error.ArgsTooLong;
 }
 
-/// LayerRef → 現在の index。stale id は `unknown_layer_id`、範囲外 index は `index_out_of_range`。
-/// `require_id_during_netsync=true`（.relay layer op）かつ netsync 中の bare index は `id_required`。
+/// LayerRef → current index. Stale id → `unknown_layer_id`; out-of-range index → `index_out_of_range`.
+/// With `require_id_during_netsync=true` (.relay layer op), a bare index during netsync → `id_required`.
 fn resolveLayerRef(app: *App, ref: actions.LayerRef, require_id_during_netsync: bool) !usize {
     if (require_id_during_netsync and actions.layerRefRejectDuringNetsync(ref, platform.netsyncActive())) {
         platform.setActionErrorDetail("id_required", "use #<id> from digest canvas during netsync");
@@ -3990,7 +3990,7 @@ fn actionSelectLayer(ctx: *anyopaque, args: []const u8, buf: []u8) anyerror![]co
     const app = actionApp(ctx);
     try app.checkEditingAllowed();
     const ref = try actions.parseLayerRef(args);
-    // select_layer は .local_only（per-peer view）なので netsync 中も bare index を許容。
+    // select_layer is .local_only (per-peer view), so bare index is allowed during netsync too.
     const idx = try resolveLayerRef(app, ref, false);
     try app.doSelectLayer(idx);
     return "ok";
@@ -4045,7 +4045,7 @@ fn actionMergeDown(ctx: *anyopaque, args: []const u8, buf: []u8) anyerror![]cons
     return "ok";
 }
 
-/// `add` で空フレーム追加、`select <idx>` でフレーム選択（harness 向け。registry 節約のため1名）。
+/// `add` appends an empty frame; `select <idx>` selects a frame (for harness; one name to save registry slots).
 fn actionFrame(ctx: *anyopaque, args: []const u8, buf: []u8) anyerror![]const u8 {
     _ = buf;
     const app = actionApp(ctx);
@@ -4098,9 +4098,9 @@ fn actionSetTool(ctx: *anyopaque, args: []const u8, buf: []u8) anyerror![]const 
     return "ok";
 }
 
-/// `action shape <line|rect|ellipse> <p0> <p1> [fill]`（TASK-90）。
-/// `App.doShape` 経由（UI 確定と同じ描画/undo 経路）。agent 操作の undo は `action undo`
-/// （Cmd+Z は local_user 専用のハイブリッド。既存 stroke action と同型）。
+/// `action shape <line|rect|ellipse> <p0> <p1> [fill]`.
+/// Goes through `App.doShape` (same draw/undo path as UI commit). Agent undo uses `action undo`
+/// (Cmd+Z is the local_user-only hybrid — same shape as existing stroke action).
 fn actionShape(ctx: *anyopaque, args: []const u8, buf: []u8) anyerror![]const u8 {
     _ = buf;
     const app = actionApp(ctx);
@@ -4110,7 +4110,7 @@ fn actionShape(ctx: *anyopaque, args: []const u8, buf: []u8) anyerror![]const u8
     return "ok";
 }
 
-/// `action set_symmetry <off|v|h|quad>`（TASK-90）。document 描画に影響 → .relay。
+/// `action set_symmetry <off|v|h|quad>`. Affects document drawing → .relay.
 fn actionSetSymmetry(ctx: *anyopaque, args: []const u8, buf: []u8) anyerror![]const u8 {
     _ = buf;
     const app = actionApp(ctx);
@@ -4125,7 +4125,7 @@ fn actionSetSymmetry(ctx: *anyopaque, args: []const u8, buf: []u8) anyerror![]co
     return "ok";
 }
 
-/// `action set_pixel_perfect <0|1>`（TASK-90）。Pen 描画に影響 → .relay。
+/// `action set_pixel_perfect <0|1>`. Affects Pen drawing → .relay.
 fn actionSetPixelPerfect(ctx: *anyopaque, args: []const u8, buf: []u8) anyerror![]const u8 {
     _ = buf;
     const app = actionApp(ctx);
@@ -4134,13 +4134,13 @@ fn actionSetPixelPerfect(ctx: *anyopaque, args: []const u8, buf: []u8) anyerror!
     return "ok";
 }
 
-/// canvas 座標の点列を down→move×N→up で直接駆動する（既存 canvas_input と同じ Tool 経路）。
-/// TASK-62.5.3 §5c': `[tool=|color=|size=|opacity=|hardness=]` の k=v 前置を受け、明示された
-/// パラメータを**一時的に latch して実行後に元の App 状態へ復元**する（redo が現在のユーザー
-/// 設定を壊さない）。パラメータ無しは従来どおり現在状態を使う（TASK-64 文法と後方互換。
-/// fill は tool= で表現できない legacy 経路として従来どおり現在ツールで実行する）。
-/// bezier/select/eyedropper は従来どおり明示的に弾く（`activeTool()` の到達しないフォールバック
-/// による意図しない Pen 描画の回避）。
+/// Drive a canvas-coordinate point list as down→move×N→up (same Tool path as existing canvas_input).
+/// Accepts a leading `[tool=|color=|size=|opacity=|hardness=]` k=v prefix; latches the explicit
+/// parameters **temporarily and restores App state after** (so redo cannot clobber the current user
+/// settings). With no parameters, use current state as before (backward-compatible with the action grammar;
+/// fill stays a legacy path that cannot be spelled as tool= and runs with the current tool).
+/// bezier/select/eyedropper stay explicitly rejected (avoids unintended Pen draws via
+/// `activeTool()`'s unreachable fallbacks).
 fn actionStroke(ctx: *anyopaque, args: []const u8, buf: []u8) anyerror![]const u8 {
     _ = buf;
     const app = actionApp(ctx);
@@ -4163,7 +4163,7 @@ fn actionStroke(ctx: *anyopaque, args: []const u8, buf: []u8) anyerror![]const u
     app.doc.selected_layer = target_layer;
     app.canvas.selected_layer = target_layer;
 
-    // 実効パラメータの解決と latch。fill（tool= 無し + active_kind==.fill）のみ legacy 経路。
+    // Resolve and latch effective parameters. Only fill (no tool= + active_kind==.fill) takes the legacy path.
     var tool: core.Tool = undefined;
     var stroke_tool: ?actions.StrokeTool = null;
     const saved_pen_color = app.pen.color;
@@ -4195,8 +4195,8 @@ fn actionStroke(ctx: *anyopaque, args: []const u8, buf: []u8) anyerror![]const u
             },
         }
     } else |err| {
-        // tool= 無しで現在ツールが fill → 従来どおり現在状態で実行（TASK-64 後方互換）。
-        // bezier/select/eyedropper は従来どおり UnsupportedTool。
+        // No tool= and current tool is fill → run with current state as before (backward compatible).
+        // bezier/select/eyedropper stay UnsupportedTool as before.
         if (app.active_kind != .fill or parsed.params.tool != null) return err;
         tool = app.activeTool();
     }
@@ -4204,7 +4204,7 @@ fn actionStroke(ctx: *anyopaque, args: []const u8, buf: []u8) anyerror![]const u
     const is_continuation = (parsed.params.segment orelse .first) == .continuation;
     var cmd: ?core.PaintDiff = null;
     if (is_continuation) {
-        // TASK-162: 始点 no-stamp。fill legacy は segment を付けない前提。
+        // Start-point no-stamp. Fill legacy assumes no segment is attached.
         const st = stroke_tool orelse return error.UnsupportedTool;
         switch (st) {
             .pen => app.recorder.beginAt(target_layer, app.pen.color, pts[0].x, pts[0].y),
@@ -4269,8 +4269,8 @@ fn actionOpen(ctx: *anyopaque, args: []const u8, buf: []u8) anyerror![]const u8 
     try app.checkEditingAllowed();
     const path = try actions.parsePath(args);
     _ = app.requestPngImport(path) catch |err| {
-        // structured error（TASK-62.5.9）: 読込失敗（png は FileNotFound 等を ReadFailed に正規化）は
-        // 自己回復ヒントを wire に載せる。
+        // structured error: load failures (png normalizes FileNotFound etc. to ReadFailed) put a
+        // self-recovery hint on the wire.
         if (err == error.ReadFailed or err == error.FileNotFound) {
             platform.setActionErrorDetail("file_not_found", "check path or use save first");
         }
@@ -4279,8 +4279,8 @@ fn actionOpen(ctx: *anyopaque, args: []const u8, buf: []u8) anyerror![]const u8 
     return "ok";
 }
 
-/// CommandLog の kind=normal を seq 順（recordAt の古い→新しい）で Entry 化する（TASK-62.5.8）。
-/// 返る Entry の name/args は log 内バッファへの借用。スライスは caller が free。
+/// Materialize CommandLog kind=normal as Entry in seq order (recordAt oldest→newest).
+/// Returned Entry name/args borrow buffers inside the log. Caller frees the slice.
 fn recipeEntriesFromLog(log: *const platform.command.CommandLog, gpa: std.mem.Allocator) ![]recipe.Entry {
     var views_buf: [platform.command.MAX_CMD_LOG]recipe.RecordView = undefined;
     var n: usize = 0;
@@ -4297,7 +4297,7 @@ fn recipeEntriesFromLog(log: *const platform.command.CommandLog, gpa: std.mem.Al
     return recipe.collectNormalEntries(gpa, views_buf[0..n]);
 }
 
-/// `replace_color [#<id>|<index>] <from> <to>`（layer 省略時 selected。netsync 中は #id 必須。TASK-89）。
+/// `replace_color [#<id>|<index>] <from> <to>` (defaults to selected; #<id> required during netsync).
 fn actionReplaceColor(ctx: *anyopaque, args: []const u8, buf: []u8) anyerror![]const u8 {
     const app = actionApp(ctx);
     try app.checkEditingAllowed();
@@ -4305,7 +4305,7 @@ fn actionReplaceColor(ctx: *anyopaque, args: []const u8, buf: []u8) anyerror![]c
     const layer_idx: usize = if (p.layer) |ref|
         try resolveLayerRef(app, ref, true)
     else blk: {
-        // 省略 = selected。netsync 中は peer ごとに selected が違うため #id 必須。
+        // Omit = selected. During netsync each peer has a different selected, so #<id> is required.
         if (platform.netsyncActive()) {
             platform.setActionErrorDetail("id_required", "use #<id> from digest canvas during netsync");
             return error.IdRequired;
@@ -4352,7 +4352,7 @@ fn actionDiffMark(ctx: *anyopaque, args: []const u8, buf: []u8) anyerror![]const
     return "ok";
 }
 
-/// TASK-103: presence_* は recordedAction 非経由・Document/CommandLog/undo 非変更。
+/// presence_* bypass recordedAction and do not touch Document/CommandLog/undo.
 fn actionPresencePoint(ctx: *anyopaque, args: []const u8, buf: []u8) anyerror![]const u8 {
     const app = actionApp(ctx);
     const parsed = try actions.parsePresencePoint(args);
@@ -4374,7 +4374,7 @@ fn actionPresenceSuggest(ctx: *anyopaque, args: []const u8, buf: []u8) anyerror!
     return std.fmt.bufPrint(buf, "ok peer={d} x={d} y={d}", .{ parsed.peer_id, parsed.x, parsed.y }) catch "ok";
 }
 
-/// `play`: timeline 再生開始（UI Play ボタンと同一処理）。CommandLog 非記録・冪等。
+/// `play`: start timeline playback (same as the UI Play button). Not recorded in CommandLog; idempotent.
 fn actionPlay(ctx: *anyopaque, args: []const u8, buf: []u8) anyerror![]const u8 {
     _ = buf;
     try actions.parseNoArgs(args);
@@ -4384,7 +4384,7 @@ fn actionPlay(ctx: *anyopaque, args: []const u8, buf: []u8) anyerror![]const u8 
     return "ok";
 }
 
-/// `pause`: timeline 再生停止。CommandLog 非記録・冪等。
+/// `pause`: stop timeline playback. Not recorded in CommandLog; idempotent.
 fn actionPause(ctx: *anyopaque, args: []const u8, buf: []u8) anyerror![]const u8 {
     _ = buf;
     try actions.parseNoArgs(args);
@@ -4393,8 +4393,8 @@ fn actionPause(ctx: *anyopaque, args: []const u8, buf: []u8) anyerror![]const u8
     return "ok";
 }
 
-/// `goto_frame <idx>`: 表示 frame を選択（doSelectFrame・undo-free）。編集中は拒否。
-/// CommandLog 非記録（recordedAction 非経由）。範囲外は structured error。
+/// `goto_frame <idx>`: select the display frame (doSelectFrame; undo-free). Rejected while editing.
+/// Not recorded in CommandLog (bypasses recordedAction). Out of range → structured error.
 fn actionGotoFrame(ctx: *anyopaque, args: []const u8, buf: []u8) anyerror![]const u8 {
     _ = buf;
     const app = actionApp(ctx);
@@ -4411,7 +4411,7 @@ fn actionGotoFrame(ctx: *anyopaque, args: []const u8, buf: []u8) anyerror![]cons
     return "ok";
 }
 
-/// `export_seq <stem>`: 連番 PNG 書き出し（CommandLog 非記録・undo 対象外）。
+/// `export_seq <stem>`: write numbered PNGs (not recorded in CommandLog; not undoable).
 fn actionExportSeq(ctx: *anyopaque, args: []const u8, buf: []u8) anyerror![]const u8 {
     const app = actionApp(ctx);
     const stem = try actions.parseExportSeq(args);
@@ -4426,7 +4426,7 @@ fn actionExportSeq(ctx: *anyopaque, args: []const u8, buf: []u8) anyerror![]cons
     return std.fmt.bufPrint(buf, "ok stem={s}", .{stem}) catch "ok";
 }
 
-/// `export_sheet <path> [columns] [margin]`: スプライトシート書き出し（CommandLog 非記録）。
+/// `export_sheet <path> [columns] [margin]`: write a sprite sheet (not recorded in CommandLog).
 fn actionExportSheet(ctx: *anyopaque, args: []const u8, buf: []u8) anyerror![]const u8 {
     const app = actionApp(ctx);
     const parsed = try actions.parseExportSheet(args);
@@ -4446,7 +4446,7 @@ fn actionExportSheet(ctx: *anyopaque, args: []const u8, buf: []u8) anyerror![]co
     return std.fmt.bufPrint(buf, "ok path={s}", .{parsed.path}) catch "ok";
 }
 
-/// `recipe_save <path>`: CommandLog → recipe ファイル（header.app_name="pixie"）。記録しない（メタ操作）。
+/// `recipe_save <path>`: CommandLog → recipe file (header.app_name="pixie"). Not recorded (meta-op).
 fn actionRecipeSave(ctx: *anyopaque, args: []const u8, buf: []u8) anyerror![]const u8 {
     _ = buf;
     const app = actionApp(ctx);
@@ -4457,8 +4457,8 @@ fn actionRecipeSave(ctx: *anyopaque, args: []const u8, buf: []u8) anyerror![]con
     return "ok";
 }
 
-/// `recipe_replay <path>`: load → app_name 検証 → 各 entry を routeLocalAction で逐次適用。
-/// 失敗で中断（structured error に何番目かを含む）。入れ子 recipe_replay は拒否。
+/// `recipe_replay <path>`: load → verify app_name → apply each entry via routeLocalAction in order.
+/// Abort on failure (structured error includes which entry). Nested recipe_replay is rejected.
 fn actionRecipeReplay(ctx: *anyopaque, args: []const u8, buf: []u8) anyerror![]const u8 {
     const app = actionApp(ctx);
     recipe.checkNotReplaying(app.recipe_replaying) catch {
@@ -4484,7 +4484,7 @@ fn actionRecipeReplay(ctx: *anyopaque, args: []const u8, buf: []u8) anyerror![]c
 
     for (loaded.entries, 0..) |entry, idx| {
         _ = platform.routeAction(entry.name, entry.args, buf) catch |err| {
-            // 入れ子 recipe_replay は内側が nested_replay detail をセット済み → 上書きしない
+            // Nested recipe_replay: the inner already set nested_replay detail → do not overwrite
             if (err == error.NestedReplay) return err;
             var code_buf: [32]u8 = undefined;
             const code = std.fmt.bufPrint(&code_buf, "replay_failed_at_{d}", .{idx + 1}) catch "replay_failed";
@@ -4497,19 +4497,19 @@ fn actionRecipeReplay(ctx: *anyopaque, args: []const u8, buf: []u8) anyerror![]c
     return "ok";
 }
 
-// テキストレイヤー（TASK-79.5）向け action（doAddTextLayer/doSetTextParams/doRasterizeLayer）は
-// 未追加のまま（TASK-62.5.3 で MAX_ACTIONS は 32 へ拡張済みで slot は空いたが、追加自体は
-// 本タスクのスコープ外）。harness 検証は既存の `inject mouse_down/up` + `inject char` で行う。
+// Text-layer actions (doAddTextLayer/doSetTextParams/doRasterizeLayer) remain
+// unregistered. Harness verifies them via existing `inject mouse_down/up` + `inject char`.
+// (MAX_ACTIONS has headroom; leaving them UI-only is by design, not a capacity limit.)
 
 // ============================================================================
-// command model 統合（TASK-62.5.3）
+// command-model integration
 //
-// App が CommandLog + Executor を所有し（常時有効・固定容量）、記録は次の 2 箇所に一元化する:
-//   1. registerAction 経由（harness `action` / copilot `action`）→ 下の記録 wrapper が
-//      `executeAction(actor=.local_agent)` で実ハンドラ（PIXIE_ACTIONS 表）を dispatch + 記録
-//   2. UI の canvas stroke 確定点 → `App.recordUiStroke`（`recordExecuted(actor=.local_user)`）
-// undo/redo action は `.no_record`（正規化された undo 表現は 62.5.4 の revert record。normal
-// record としてログを汚さない）。undo_ref は `UndoStack.handles` の handle（AC #2 の対応付け）。
+// App owns CommandLog + Executor (always on, fixed capacity). Recording is centralized in two places:
+//   1. Via registerAction (harness `action` / copilot `action`) → the recording wrapper below
+//      dispatches + records via `executeAction(actor=.local_agent)` against the PIXIE_ACTIONS table
+//   2. At UI canvas-stroke commit → `App.recordUiStroke` (`recordExecuted(actor=.local_user)`)
+// undo/redo actions use `.no_record` (the normalized undo form is the revert record; do not pollute
+// the log as a normal record). undo_ref is the handle from `UndoStack.handles` (action⇄UndoCmd pairing).
 // ============================================================================
 
 const ActionEntry = struct {
@@ -4517,9 +4517,9 @@ const ActionEntry = struct {
     run: *const fn (ctx: *anyopaque, args: []const u8, buf: []u8) anyerror![]const u8,
 };
 
-/// name→実ハンドラ表（`dispatchPixieAction` が引く。登録 wrapper とは分離）。
-/// undo/redo は載せない（executeAction/redo 再 dispatch の対象外 = 制御コマンド。§4b。
-/// registry へは actionUndo/actionRedo を直接登録する）。
+/// name→handler table (looked up by `dispatchPixieAction`; separate from registration wrappers).
+/// undo/redo are not listed (outside executeAction/redo re-dispatch = control commands.
+/// Register actionUndo/actionRedo directly on the registry).
 const PIXIE_ACTIONS = [_]ActionEntry{
     .{ .name = "clear", .run = actionClear },
     .{ .name = "add_layer", .run = actionAddLayer },
@@ -4537,22 +4537,22 @@ const PIXIE_ACTIONS = [_]ActionEntry{
     .{ .name = "stroke", .run = actionStroke },
     .{ .name = "save", .run = actionSave },
     .{ .name = "open", .run = actionOpen },
-    // TASK-89: 末尾追加のみ（並列制約）
+    // Append-only at the end (parallelism constraint)
     .{ .name = "replace_color", .run = actionReplaceColor },
     .{ .name = "palette_ramp", .run = actionPaletteRamp },
     .{ .name = "palette_from_png", .run = actionPaletteFromPng },
     .{ .name = "palette_set", .run = actionPaletteSet },
-    // TASK-90: 末尾追加のみ
+    // Append-only at the end
     .{ .name = "shape", .run = actionShape },
     .{ .name = "set_symmetry", .run = actionSetSymmetry },
     .{ .name = "set_pixel_perfect", .run = actionSetPixelPerfect },
 };
 
-/// `App.cmd_exec` の Dispatcher: name→実ハンドラ dispatch + noteUndo 配線（§5b）。
-/// dispatch 前後の undo push 回数を handle 採番カウンタ（`next_handle` の差分 = 「深さ +
-/// topHandle」比較の正確化。max_history 満杯時に深さが増えない push も正しく数える）で判定し、
-/// **丁度 1 push のときのみ** `noteUndo(topHandle)` する（0 push = non-undoable、2 push 以上 =
-/// 1 command = 1 Op の対応が崩れるため noteUndo しない + warn。現行 action set では発生しない想定）。
+/// `App.cmd_exec` Dispatcher: name→handler dispatch + noteUndo wiring.
+/// Count undo pushes around dispatch via the handle allocation counter (`next_handle` delta = accurate
+/// "depth + topHandle" even when max_history is full and depth does not grow), and
+/// `noteUndo(topHandle)` **only on exactly 1 push** (0 = non-undoable; 2+ =
+/// breaks 1 command = 1 Op, so skip noteUndo + warn. Not expected with the current action set).
 fn dispatchPixieAction(ctx: *anyopaque, name: []const u8, args: []const u8, buf: []u8) anyerror![]const u8 {
     const app: *App = @ptrCast(@alignCast(ctx));
     for (&PIXIE_ACTIONS) |*e| {
@@ -4560,22 +4560,22 @@ fn dispatchPixieAction(ctx: *anyopaque, name: []const u8, args: []const u8, buf:
             const handle_before = app.doc.undo.next_handle;
             const out = try e.run(ctx, args, buf);
             const handle_after = app.doc.undo.next_handle;
-            // 防御: 採番は生存期間単調が不変条件（clearHistoryPreservingHandles / doOpenProject の
-            // 引き継ぎで維持）だが、万一巻き戻っても unsigned underflow で落とさない（0 push 扱い + warn）。
+            // Defence: allocation is monotonic for a lifetime (kept across clearHistoryPreservingHandles / doOpenProject
+            // hand-off), but if it ever rolled back, do not underflow unsigned (treat as 0 push + warn).
             const pushes = if (handle_after >= handle_before) handle_after - handle_before else blk: {
-                std.debug.print("pixie: action '{s}' で undo handle 採番が巻き戻り（{d}→{d}）。noteUndo を skip\n", .{ name, handle_before, handle_after });
+                std.debug.print("pixie: action '{s}' undo handle allocation went backwards ({d}→{d}); skipping noteUndo\n", .{ name, handle_before, handle_after });
                 break :blk 0;
             };
             if (pushes == 1) {
                 app.markProjectDirty();
-                // 62.3.5 revert は `.paint` のみ（canRevertByHandle）。構造 layer op は push しても
-                // adapter 逆適用不能 → noteUndo せず undoable=false（TASK-94 Phase B MVP）。
+                // revert applies to `.paint` only (canRevertByHandle). Structure layer ops may push but
+                // cannot reverse via the adapter → skip noteUndo; undoable=false (MVP).
                 if (app.doc.undo.topHandle()) |h| {
                     if (app.doc.canRevertByHandle(h)) app.cmd_exec.noteUndo(h);
                 }
-                app.last_seen_handle = app.doc.undo.next_handle; // 記録される push（§2b の追従点）
+                app.last_seen_handle = app.doc.undo.next_handle; // Recorded push (follow point for unrecorded-edit detection)
             } else if (pushes >= 2) {
-                std.debug.print("pixie: action '{s}' が {d} 回 undo.push（1 command = 1 Op が崩れるため noteUndo しない。62.5.4 申し送り）\n", .{ name, pushes });
+                std.debug.print("pixie: action '{s}' pushed undo {d} times (breaks 1 command = 1 Op; skip noteUndo)\n", .{ name, pushes });
             }
             return out;
         }
@@ -4583,12 +4583,12 @@ fn dispatchPixieAction(ctx: *anyopaque, name: []const u8, args: []const u8, buf:
     return error.UnknownAction;
 }
 
-/// registerAction 用の記録 wrapper を comptime 生成する（§5a）。executor 経由で実ハンドラを
-/// dispatch し `actor=.local_agent` で記録する。copilot の `begin_tx` で開いた transaction には
-/// `openTransactionFor` で自動参加する。`policy=.no_record` は undo/redo 用（dispatch のみ）。
-/// layer 系は executeAction 前に index→`#<id>` へ正規化する（TASK-94 Phase B。記録・solo
-/// dispatch 経路の args を id 形式に統一。netsync `.relay` は act.run を迂回するため、relay
-/// 呼び出し側は canonical args を渡すこと＝stroke の recordedStroke と同型）。
+/// Comptime-build a recording wrapper for registerAction. Dispatches the real handler via the executor
+/// and records with `actor=.local_agent`. Auto-joins a transaction opened by copilot `begin_tx` via
+/// `openTransactionFor`. `policy=.no_record` is for undo/redo (dispatch only).
+/// Layer actions normalize index→`#<id>` before executeAction (unify recorded / solo
+/// dispatch args to id form. netsync `.relay` bypasses act.run, so relay
+/// callers must pass canonical args — same shape as stroke's recordedStroke).
 fn recordedAction(comptime name: []const u8, comptime policy: platform.command.RecordPolicy) *const fn (*anyopaque, []const u8, []u8) anyerror![]const u8 {
     return &struct {
         fn run(ctx: *anyopaque, args: []const u8, buf: []u8) anyerror![]const u8 {
@@ -4601,17 +4601,17 @@ fn recordedAction(comptime name: []const u8, comptime policy: platform.command.R
                 .transaction = app.cmd_exec.openTransactionFor(.local_agent),
                 .record_policy = policy,
             }, buf);
-            app.tagOwnersFromRecords(seq_before, App.OP_OWNER_AGENT); // 生んだ op は agent 所有（review 反映）
+            app.tagOwnersFromRecords(seq_before, App.OP_OWNER_AGENT); // Ops produced are agent-owned
             if (res.seq) |s| app.captureHistoryVisual(s);
             return res.output;
         }
     }.run;
 }
 
-/// layer 系 action の args を `#<id>` 形式へ正規化する（非 layer / add_layer はそのまま返す）。
-/// solo: 空 args の delete/duplicate/merge_down と bare delta の move_layer は selected の id を付与。
-/// netsync 中の .relay 対象（select_layer 以外）: 暗黙 selected / bare index の補完・変換を禁止し
-/// `id_required`（peer ごとの selected 補完で diverge するため。TASK-94 Phase B P1）。
+/// Normalize layer-action args to `#<id>` form (non-layer / add_layer returned unchanged).
+/// solo: empty args on delete/duplicate/merge_down and bare-delta move_layer get the selected id.
+/// During netsync, .relay targets (everything except select_layer) forbid implicit-selected / bare-index fill-in
+/// and return `id_required` (per-peer selected fill-in would diverge).
 fn canonicalizeLayerArgs(app: *App, comptime name: []const u8, args: []const u8, buf: []u8) ![]const u8 {
     const is_layer = comptime (std.mem.eql(u8, name, "select_layer") or
         std.mem.eql(u8, name, "set_layer_visible") or
@@ -4623,12 +4623,12 @@ fn canonicalizeLayerArgs(app: *App, comptime name: []const u8, args: []const u8,
         std.mem.eql(u8, name, "replace_color"));
     if (!is_layer) return args;
 
-    // select_layer は .local_only なので netsync 中も index→id 補完を許容。relay 系は禁止。
+    // select_layer is .local_only so index→id fill-in is allowed during netsync too. Relay ops forbid it.
     const can_fill = (comptime std.mem.eql(u8, name, "select_layer")) or actions.allowLayerCanonFill(platform.netsyncActive());
     const forbid_fill = !can_fill;
 
     if (comptime std.mem.eql(u8, name, "replace_color")) {
-        // `#id RRGGBB RRGGBB` に正規化（.relay で peer が同一 layer に適用するため）。
+        // Normalize to `#id RRGGBB RRGGBB` (so .relay applies to the same layer on every peer).
         const p = try actions.parseReplaceColor(args);
         const id: u64 = if (p.layer) |ref|
             try layerRefToId(app, ref, forbid_fill)
@@ -4665,7 +4665,7 @@ fn canonicalizeLayerArgs(app: *App, comptime name: []const u8, args: []const u8,
         return actions.formatLayerId(buf, id) catch return error.ArgsTooLong;
     }
     if (comptime std.mem.eql(u8, name, "move_layer")) {
-        // 旧形式 `<±1>` → selected id を前置。新形式 `ref ±1` はそのまま id 化。
+        // Old form `<±1>` → prepend selected id. New form `ref ±1` is id-ified as-is.
         const trimmed = std.mem.trim(u8, args, " \t");
         var it = std.mem.tokenizeAny(u8, trimmed, " \t");
         const first = it.next() orelse return error.Empty;
@@ -4704,7 +4704,7 @@ fn selectedLayerIdRaw(app: *App, forbid_implicit: bool) !u64 {
 fn layerRefToId(app: *App, ref: actions.LayerRef, forbid_index: bool) !u64 {
     switch (ref) {
         .id => |raw| {
-            // 既に id 形式ならそのまま（存在確認は handler 側。stale は適用時 REJECT）。
+            // Already-id form is left as-is (existence is checked in the handler; stale → REJECT on apply).
             return raw;
         },
         .index => |idx| {
@@ -4718,11 +4718,11 @@ fn layerRefToId(app: *App, ref: actions.LayerRef, forbid_index: bool) !u64 {
     }
 }
 
-/// `stroke` 専用の記録 wrapper（§5c'）: 入力 args を parse → 実効パラメータ解決（明示 k=v >
-/// 現在状態）→ **各 key をちょうど一度だけ含む canonical args** を生成 → canonical args で
-/// executeAction（dispatch も canonical を実行するため挙動は入力の意味と同一。CommandLog 上の
-/// 全 stroke record が状態非依存に再実行可能になる）。fill の legacy 経路（tool= で表現不能）
-/// のみ raw args のまま記録する（従来挙動の互換維持。canonical 化は pen/eraser/brush が対象）。
+/// `stroke`-only recording wrapper: parse input args → resolve effective parameters (explicit k=v
+/// overrides current state) → build **canonical args with each key exactly once** → executeAction with
+/// those canonical args (dispatch runs the same meaning as the input; every stroke record on CommandLog
+/// becomes state-independent and re-runnable). Only fill's legacy path (cannot be spelled as tool=)
+/// is recorded with raw args (keep classic behaviour; canonicalization targets pen/eraser/brush).
 fn recordedStroke(ctx: *anyopaque, args: []const u8, buf: []u8) anyerror![]const u8 {
     const app: *App = @ptrCast(@alignCast(ctx));
     var canon_buf: [platform.command.MAX_CMD_ARGS]u8 = undefined;
@@ -4730,7 +4730,7 @@ fn recordedStroke(ctx: *anyopaque, args: []const u8, buf: []u8) anyerror![]const
         var pts_buf: [actions.MAX_STROKE_POINTS]actions.Point = undefined;
         const parsed = actions.parseStroke(args, &pts_buf) catch return err;
         if (app.active_kind != .fill or parsed.params.tool != null) return err;
-        break :blk args; // fill legacy（actionStroke 側も同じ判定で legacy 経路に入る）
+        break :blk args; // fill legacy (actionStroke takes the same branch into the legacy path)
     };
 
     const seq_before = app.cmd_log.next_seq;
@@ -4739,27 +4739,27 @@ fn recordedStroke(ctx: *anyopaque, args: []const u8, buf: []u8) anyerror![]const
         .transaction = app.cmd_exec.openTransactionFor(.local_agent),
         .record_policy = .record,
     }, buf);
-    app.tagOwnersFromRecords(seq_before, App.OP_OWNER_AGENT); // 生んだ op は agent 所有（review 反映）
+    app.tagOwnersFromRecords(seq_before, App.OP_OWNER_AGENT); // Ops produced are agent-owned
     if (res.seq) |s| app.captureHistoryVisual(s);
     return res.output;
 }
 
-// TASK-88.1: capabilities 用 args シグネチャ（file-scope const。registerActions 直前）。
-// `@FieldType(platform.Action, "args")` = `?[]const ArgSpec`。null=未指定 / 空 slice=引数なし明示。
+// Args signatures for capabilities (file-scope const; just before registerActions).
+// `@FieldType(platform.Action, "args")` = `?[]const ArgSpec`. null=unspecified / empty slice=explicitly no args.
 const pixie_args_none: @FieldType(platform.Action, "args") = &.{};
-/// 省略可 layer ref（TASK-94: delete/duplicate/merge。省略時 selected。netsync 中は #id 必須）。
+/// Optional layer ref (delete/duplicate/merge. Defaults to selected; #<id> required during netsync).
 const pixie_args_layer_ref_opt: @FieldType(platform.Action, "args") = &.{
-    .{ .name = "layer", .kind = "string", .pattern = "#<id>|<index>", .optional = true, .desc = "省略時 selected。netsync 中は #id 必須" },
+    .{ .name = "layer", .kind = "string", .pattern = "#<id>|<index>", .optional = true, .desc = "defaults to selected; #<id> required during netsync" },
 };
 const pixie_args_select_layer: @FieldType(platform.Action, "args") = &.{
-    .{ .name = "layer", .kind = "string", .pattern = "#<id>|<index>", .desc = "netsync 中は #id 必須" },
+    .{ .name = "layer", .kind = "string", .pattern = "#<id>|<index>", .desc = "layer #<id> or index (bare index ok during netsync)" },
 };
 const pixie_args_set_layer_visible: @FieldType(platform.Action, "args") = &.{
-    .{ .name = "layer", .kind = "string", .pattern = "#<id>|<index>", .desc = "netsync 中は #id 必須" },
+    .{ .name = "layer", .kind = "string", .pattern = "#<id>|<index>", .desc = "requires #<id> during netsync" },
     .{ .name = "visible", .kind = "bool", .desc = "0|1" },
 };
 const pixie_args_set_layer_opacity: @FieldType(platform.Action, "args") = &.{
-    .{ .name = "layer", .kind = "string", .pattern = "#<id>|<index>", .desc = "netsync 中は #id 必須" },
+    .{ .name = "layer", .kind = "string", .pattern = "#<id>|<index>", .desc = "requires #<id> during netsync" },
     .{ .name = "value", .kind = "int", .min = 0, .max = 255 },
 };
 const pixie_args_move_layer: @FieldType(platform.Action, "args") = &.{
@@ -4767,7 +4767,7 @@ const pixie_args_move_layer: @FieldType(platform.Action, "args") = &.{
 };
 const pixie_args_frame: @FieldType(platform.Action, "args") = &.{
     .{ .name = "sub", .kind = "enum", .values = &.{ "add", "select" } },
-    .{ .name = "idx", .kind = "int", .optional = true, .desc = "select 時の frame index" },
+    .{ .name = "idx", .kind = "int", .optional = true, .desc = "frame index when selecting" },
 };
 const pixie_args_set_onion: @FieldType(platform.Action, "args") = &.{
     .{ .name = "enabled", .kind = "enum", .values = &.{ "on", "off", "1", "0" } },
@@ -4792,9 +4792,9 @@ const pixie_args_set_pixel_perfect: @FieldType(platform.Action, "args") = &.{
     .{ .name = "on", .kind = "bool", .desc = "0|1" },
 };
 const pixie_args_stroke: @FieldType(platform.Action, "args") = &.{
-    .{ .name = "layer", .kind = "string", .pattern = "#<id>|<index>", .optional = true, .desc = "省略時 selected。canonical wire は #id" },
-    .{ .name = "params", .kind = "string", .optional = true, .desc = "tool/color/size/opacity/hardness の k=v" },
-    .{ .name = "xy", .kind = "int", .variadic = true, .desc = "canvas 座標 x y の組（偶数個・最低1組）" },
+    .{ .name = "layer", .kind = "string", .pattern = "#<id>|<index>", .optional = true, .desc = "defaults to selected; canonical wire uses #<id>" },
+    .{ .name = "params", .kind = "string", .optional = true, .desc = "k=v for tool/color/size/opacity/hardness" },
+    .{ .name = "xy", .kind = "int", .variadic = true, .desc = "canvas x y pairs (even count; at least one pair)" },
 };
 const pixie_args_path: @FieldType(platform.Action, "args") = &.{
     .{ .name = "path", .kind = "path" },
@@ -4810,9 +4810,9 @@ const pixie_args_new: @FieldType(platform.Action, "args") = &.{
 const appshell_args_optional_path: @FieldType(platform.Action, "args") = &.{
     .{ .name = "path", .kind = "path", .optional = true },
 };
-// TASK-89 args
+// palette args
 const pixie_args_replace_color: @FieldType(platform.Action, "args") = &.{
-    .{ .name = "layer", .kind = "string", .pattern = "#<id>|<index>", .optional = true, .desc = "省略時 selected。netsync 中は #id 必須" },
+    .{ .name = "layer", .kind = "string", .pattern = "#<id>|<index>", .optional = true, .desc = "defaults to selected; #<id> required during netsync" },
     .{ .name = "from", .kind = "string", .pattern = "#?RRGGBB" },
     .{ .name = "to", .kind = "string", .pattern = "#?RRGGBB" },
 };
@@ -4824,9 +4824,9 @@ const pixie_args_palette_from_png: @FieldType(platform.Action, "args") = &.{
     .{ .name = "path", .kind = "path" },
 };
 const pixie_args_palette_set: @FieldType(platform.Action, "args") = &.{
-    .{ .name = "hex", .kind = "string", .pattern = "#?RRGGBB", .variadic = true, .desc = "1..=64 色" },
+    .{ .name = "hex", .kind = "string", .pattern = "#?RRGGBB", .variadic = true, .desc = "1..=64 colors" },
 };
-// TASK-45.4: timeline view actions
+// timeline view actions
 const pixie_args_goto_frame: @FieldType(platform.Action, "args") = &.{
     .{ .name = "idx", .kind = "int", .desc = "frame index" },
 };
@@ -4838,7 +4838,7 @@ const pixie_args_export_sheet: @FieldType(platform.Action, "args") = &.{
     .{ .name = "columns", .kind = "int", .optional = true, .desc = "0=auto ceil(sqrt(n))" },
     .{ .name = "margin", .kind = "int", .optional = true, .desc = "gap between frames in px" },
 };
-// TASK-103: presence
+// presence
 const pixie_args_presence_point: @FieldType(platform.Action, "args") = &.{
     .{ .name = "x", .kind = "int", .min = 0, .max = 255 },
     .{ .name = "y", .kind = "int", .min = 0, .max = 255 },
@@ -4957,7 +4957,7 @@ fn panelNameFromToggle(name: actions.PanelToggleName) []const u8 {
     };
 }
 
-/// `panel_toggle <name>`: UI 状態のみ変更（local_only・undo 非対象。TASK-148.1）。
+/// `panel_toggle <name>`: UI state only (local_only; not undoable).
 fn actionPanelToggle(ctx: *anyopaque, args: []const u8, buf: []u8) anyerror![]const u8 {
     const name = try actions.parsePanelToggle(args);
     const app = actionApp(ctx);
@@ -5001,15 +5001,15 @@ fn panelPersistWrite(ud: *anyopaque, key: gui.PersistKey, value: gui.PersistValu
     }
 }
 
-/// 全 action を一括登録する（`platform.init()` 後・main loop 前に呼ぶ。harness/copilot とも
-/// 無効時は `registerAction` 自体が no-op なので通常実行に影響しない）。登録するのは記録
-/// wrapper（実ハンドラは `PIXIE_ACTIONS` 表経由で `dispatchPixieAction` が呼ぶ）。
+/// Register every action in one shot (call after `platform.init()`, before the main loop. When harness/copilot are
+/// disabled, `registerAction` itself is a no-op so normal runs are unaffected). What gets registered is the recording
+/// wrapper (`dispatchPixieAction` calls the real handler via the `PIXIE_ACTIONS` table).
 fn registerActions(app: *App) void {
-    platform.registerAction(.{ .name = "undo", .ctx = app, .run = actionUndo, .network_policy = .undo_own, .args = pixie_args_none }); // 制御コマンド（§4b。executor 非経由）
+    platform.registerAction(.{ .name = "undo", .ctx = app, .run = actionUndo, .network_policy = .undo_own, .args = pixie_args_none }); // Control commands (bypass the executor)
     platform.registerAction(.{ .name = "redo", .ctx = app, .run = actionRedo, .network_policy = .redo_own, .args = pixie_args_none });
     platform.registerAction(.{ .name = "clear", .ctx = app, .run = recordedAction("clear", .record), .args = pixie_args_none });
-    // TASK-94 Phase B: layer 構造 op は handle 参照化済みのため .relay 昇格。
-    // select_layer のみ .local_only（selection は per-peer view。relay すると選択を奪い合う）。
+    // Layer structure ops are handle-referenced → promoted to .relay.
+    // select_layer alone is .local_only (selection is a per-peer view; relaying would fight over selection).
     platform.registerAction(.{ .name = "add_layer", .ctx = app, .run = recordedAction("add_layer", .record), .network_policy = .relay, .args = pixie_args_none });
     platform.registerAction(.{ .name = "delete_layer", .ctx = app, .run = recordedAction("delete_layer", .record), .network_policy = .relay, .args = pixie_args_layer_ref_opt });
     platform.registerAction(.{ .name = "select_layer", .ctx = app, .run = recordedAction("select_layer", .record), .network_policy = .local_only, .args = pixie_args_select_layer });
@@ -5034,35 +5034,35 @@ fn registerActions(app: *App) void {
     platform.registerAction(.{ .name = "confirm_cancel", .ctx = app, .run = actionConfirmCancel, .network_policy = .local_only, .args = pixie_args_none });
     platform.registerAction(.{ .name = "recover", .ctx = app, .run = actionRecover, .network_policy = .local_only, .args = pixie_args_none });
     platform.registerAction(.{ .name = "discard_recovery", .ctx = app, .run = actionDiscardRecovery, .network_policy = .local_only, .args = pixie_args_none });
-    // recipe（TASK-62.5.8）: メタ操作のため executor 非経由・CommandLog 非記録。local_only。
+    // recipe: meta-ops → bypass executor, not recorded in CommandLog, local_only.
     platform.registerAction(.{ .name = "recipe_save", .ctx = app, .run = actionRecipeSave, .network_policy = .local_only, .args = pixie_args_path });
     platform.registerAction(.{ .name = "recipe_replay", .ctx = app, .run = actionRecipeReplay, .network_policy = .local_only, .args = pixie_args_path });
-    // diff_mark（TASK-87）: メタ操作のため executor 非経由・CommandLog 非記録。local_only。
+    // diff_mark: meta-op → bypass executor, not recorded in CommandLog, local_only.
     platform.registerAction(.{ .name = "diff_mark", .ctx = app, .run = actionDiffMark, .network_policy = .local_only, .desc = "mark current composite as diff baseline", .args = pixie_args_none });
-    // TASK-45.4: timeline view actions（executor 非経由・CommandLog 非記録・local_only）
+    // timeline view actions (bypass executor, not recorded in CommandLog, local_only)
     platform.registerAction(.{ .name = "play", .ctx = app, .run = actionPlay, .network_policy = .local_only, .desc = "start timeline playback", .args = pixie_args_none });
     platform.registerAction(.{ .name = "pause", .ctx = app, .run = actionPause, .network_policy = .local_only, .desc = "pause timeline playback", .args = pixie_args_none });
     platform.registerAction(.{ .name = "goto_frame", .ctx = app, .run = actionGotoFrame, .network_policy = .local_only, .desc = "select frame by index (view only, no undo)", .args = pixie_args_goto_frame });
-    // TASK-45.5: 書き出し（executor 非経由・CommandLog 非記録・local_only）
+    // export (bypass executor, not recorded in CommandLog, local_only)
     platform.registerAction(.{ .name = "export_seq", .ctx = app, .run = actionExportSeq, .network_policy = .local_only, .desc = "export numbered PNG sequence", .args = pixie_args_export_seq });
     platform.registerAction(.{ .name = "export_sheet", .ctx = app, .run = actionExportSheet, .network_policy = .local_only, .desc = "export sprite sheet PNG", .args = pixie_args_export_sheet });
-    // TASK-89: 末尾追加のみ（並列制約。既存行の変更・並べ替え禁止）
+    // Append-only at the end (parallelism constraint; do not edit or reorder existing rows)
     platform.registerAction(.{ .name = "replace_color", .ctx = app, .run = recordedAction("replace_color", .record), .network_policy = .relay, .desc = "replace color A→B on layer ([#id|idx] from to; undoable)", .args = pixie_args_replace_color });
-    // palette は document 状態（SYNC 対象）なので session 中のローカル変更は diverge → reject_when_synced
+    // palette is document state (SYNC'd), so local changes during a session would diverge → reject_when_synced
     platform.registerAction(.{ .name = "palette_ramp", .ctx = app, .run = recordedAction("palette_ramp", .record), .network_policy = .reject_when_synced, .desc = "OKLCH light-dark ramp from seed (n=2..32)", .args = pixie_args_palette_ramp });
     platform.registerAction(.{ .name = "palette_from_png", .ctx = app, .run = recordedAction("palette_from_png", .record), .network_policy = .reject_when_synced, .desc = "extract palette from PNG by frequency (max 64)", .args = pixie_args_palette_from_png });
     platform.registerAction(.{ .name = "palette_set", .ctx = app, .run = recordedAction("palette_set", .record), .network_policy = .reject_when_synced, .desc = "replace palette with hex list (1..64)", .args = pixie_args_palette_set });
-    // TASK-90: shape は stroke と同じ .relay（document 画素変更・undoable）。
-    // set_symmetry / set_pixel_perfect も描画結果に影響する document 系トグル → .relay
-    // set_tool / set_color は per-peer のため .local_only。stroke は tool/color を payload に焼き込む。
+    // shape is .relay like stroke (document pixel change; undoable).
+    // set_symmetry / set_pixel_perfect also affect draw results → document toggles → .relay
+    // set_tool / set_color are per-peer → .local_only. stroke bakes tool/color into the payload.
     platform.registerAction(.{ .name = "shape", .ctx = app, .run = recordedAction("shape", .record), .network_policy = .relay, .desc = "draw shape line|rect|ellipse p0 p1 [fill]", .args = pixie_args_shape });
     platform.registerAction(.{ .name = "set_symmetry", .ctx = app, .run = recordedAction("set_symmetry", .record), .network_policy = .relay, .desc = "symmetry off|v|h|quad", .args = pixie_args_set_symmetry });
     platform.registerAction(.{ .name = "set_pixel_perfect", .ctx = app, .run = recordedAction("set_pixel_perfect", .record), .network_policy = .relay, .desc = "pixel-perfect pen 0|1", .args = pixie_args_set_pixel_perfect });
-    // TASK-103: ephemeral presence（recordedAction / CommandLog / undo 非経由）
+    // ephemeral presence (bypasses recordedAction / CommandLog / undo)
     platform.registerAction(.{ .name = "presence_point", .ctx = app, .run = actionPresencePoint, .network_policy = .ephemeral, .desc = "agent cursor / work position", .args = pixie_args_presence_point });
     platform.registerAction(.{ .name = "presence_highlight", .ctx = app, .run = actionPresenceHighlight, .network_policy = .ephemeral, .desc = "temporary canvas highlight rect", .args = pixie_args_presence_highlight });
     platform.registerAction(.{ .name = "presence_suggest", .ctx = app, .run = actionPresenceSuggest, .network_policy = .ephemeral, .desc = "assist suggestion marker", .args = pixie_args_presence_suggest });
-    // TASK-148.1: panel 表示トグル（UI 状態のみ・undo 非対象）
+    // panel visibility toggle (UI state only; not undoable)
     platform.registerAction(.{ .name = "panel_toggle", .ctx = app, .run = actionPanelToggle, .network_policy = .local_only, .desc = "toggle panel visibility", .args = pixie_args_panel_toggle });
 }
 
@@ -5106,7 +5106,7 @@ fn registerStateSync(app: *App) void {
     });
 }
 
-/// peer 固定色（point/highlight 用）。suggest は amber 固定。
+/// Fixed peer colors (for point/highlight). suggest uses a fixed amber.
 fn presencePeerColor(peer_id: u32) gui.Color {
     const palette = [_]gui.Color{
         gui.Color.rgba(0x3B, 0x82, 0xF6, 0xFF), // blue
@@ -5128,7 +5128,7 @@ fn canvasToScreen(canvas_rect: core.Rect, zoom: Zoom, cx: i32, cy: i32) gui.Vec2
     return .{ .x = c.x, .y = c.y };
 }
 
-/// TASK-103 presence overlay。フレーム毎・最大 8 peer × 固定小面積。
+/// presence overlay. Every frame; at most 8 peers × a fixed small area.
 fn drawPresenceOverlay(app: *App, canvas_rect_opt: ?core.Rect) void {
     const canvas_rect = canvas_rect_opt orelse return;
     const area = app.last_area orelse return;
@@ -5190,7 +5190,7 @@ fn drawPresenceOverlay(app: *App, canvas_rect_opt: ?core.Rect) void {
     }
 }
 
-/// 表示領域中心（連続座標）。カメラモデルの S=(Sx,Sy)。
+/// View-area center (continuous coords). Camera model S=(Sx,Sy).
 fn areaCenterF(area: core.Rect) struct { sx: f32, sy: f32 } {
     return .{
         .sx = @as(f32, @floatFromInt(area.x)) + @as(f32, @floatFromInt(area.w)) / 2.0,
@@ -5198,7 +5198,7 @@ fn areaCenterF(area: core.Rect) struct { sx: f32, sy: f32 } {
     };
 }
 
-/// カメラ由来の整数表示原点を計算し、area と最低 1px 交差する範囲へ clamp する（非破壊）。
+/// Compute the camera-derived integer display origin and clamp it to intersect area by at least 1px (non-destructive).
 /// origin ∈ [a - canvas*z + 1, a + area_size - 1]
 fn displayOrigin(app: *const App, area: core.Rect) struct { x: i32, y: i32 } {
     const z = app.view_zoom;
@@ -5213,7 +5213,7 @@ fn displayOrigin(app: *const App, area: core.Rect) struct { x: i32, y: i32 } {
     return .{ .x = ox, .y = oy };
 }
 
-/// 整数表示原点から cam_cx/cy を再導出する（clamp 後の状態整合）。
+/// Re-derive cam_cx/cy from the integer display origin (state consistency after clamp).
 fn syncCameraFromOrigin(app: *App, area: core.Rect, ox: i32, oy: i32) void {
     const zf = app.view_zoom.scaleF32();
     const c = areaCenterF(area);
@@ -5221,11 +5221,11 @@ fn syncCameraFromOrigin(app: *App, area: core.Rect, ox: i32, oy: i32) void {
     app.cam_cy = (c.sy - @as(f32, @floatFromInt(oy))) / zf;
 }
 
-/// canvas_area 内にカメラ由来の表示原点で canvas rect を配置する。
-/// 連続原点を整数へ丸めた後に clamp し、cam_cx/cy を表示原点から再導出する。
-/// 毎フレーム app.last_area も更新する（Fit ズーム計算用）。
-/// 返す core.Rect の w/h は canvas ピクセル数（screenToCanvas* の契約）。初回フレームは null
-/// （PanelHost.centerRect が前フレーム cache を参照するため）。
+/// Place the canvas rect inside canvas_area at the camera-derived display origin.
+/// Round the continuous origin to integers, clamp, then re-derive cam_cx/cy from the display origin.
+/// Also update app.last_area every frame (for Fit zoom).
+/// Returned core.Rect w/h are canvas pixel counts (screenToCanvas* contract). First frame is null
+/// (PanelHost.centerRect reads the previous-frame cache).
 fn canvasBlitRect(ctx: *const gui.Context, app: *App) ?core.Rect {
     const area_node = app.panel_host.centerRect(ctx) orelse return null;
     const area: core.Rect = .{ .x = area_node.x, .y = area_node.y, .w = @intCast(area_node.w), .h = @intCast(area_node.h) };
@@ -5236,9 +5236,9 @@ fn canvasBlitRect(ctx: *const gui.Context, app: *App) ?core.Rect {
     return .{ .x = origin.x, .y = origin.y, .w = @intCast(app.doc.width), .h = @intCast(app.doc.height) };
 }
 
-/// canvas digest 用ミニマップ観測フィールド（追加のみ）。
+/// Minimap observation fields for canvas digest (additive only).
 fn minimapDigestFields(app: *App, area: core.Rect) []const u8 {
-    // 静的バッファ（digest は同期・単一呼び出し）。1024 予算の一部。
+    // Static buffer (digest is sync, single-call). Part of the 1024 budget.
     const Buf = struct {
         var bytes: [192]u8 = undefined;
     };
@@ -5264,7 +5264,7 @@ fn minimapDigestFields(app: *App, area: core.Rect) []const u8 {
     }) catch " minimap=on minimap_rect=none visible_rect=none viewport_rect=none";
 }
 
-/// 現フレームのミニマップ配置（表示条件を満たすときのみ）。
+/// Current-frame minimap placement (only when display conditions hold).
 fn currentMinimapRect(app: *const App, area: core.Rect) ?core.Rect {
     const cw = app.doc.width;
     const ch = app.doc.height;
@@ -5274,8 +5274,8 @@ fn currentMinimapRect(app: *const App, area: core.Rect) ?core.Rect {
     return minimap_mod.layoutRect(area, tw, th);
 }
 
-/// ミニマップ click/drag → カメラ移動。updateViewport より前に呼ぶ。
-/// 戻り値 true = 入力を消費（通常 pan/stroke と排他）。
+/// Minimap click/drag → camera move. Call before updateViewport.
+/// Returns true = input consumed (exclusive with normal pan/stroke).
 fn updateMinimapInput(app: *App, ctx: *const gui.Context) bool {
     const in = &ctx.input;
     const area = app.last_area orelse {
@@ -5304,7 +5304,7 @@ fn updateMinimapInput(app: *App, ctx: *const gui.Context) bool {
         return false;
     }
 
-    // drag 中
+    // During drag
     if (in.mouse_buttons.left) {
         const cam = minimap_mod.screenToCameraCenter(in.mouse_pos.x, in.mouse_pos.y, mm, cw, ch);
         app.cam_cx = cam.cx;
@@ -5315,8 +5315,8 @@ fn updateMinimapInput(app: *App, ctx: *const gui.Context) bool {
     return false;
 }
 
-/// paint.Rect（i32）→ ScreenTransform → 物理 paint.Rect（TASK-156.4）。
-/// scale 規則は gfx.ScreenTransform に一元化。ここは f32 整数値の i32 変換のみ。
+/// paint.Rect (i32) → ScreenTransform → physical paint.Rect.
+/// Scale rules live in gfx.ScreenTransform. Here only f32→i32 conversion of integer-valued floats.
 fn logicalPaintRectToPhysical(r: core.Rect, scale: f32) core.Rect {
     const cam = ScreenTransform.logicalRectToPhysical(.{
         .x = @floatFromInt(r.x),
@@ -5332,8 +5332,8 @@ fn logicalPaintRectToPhysical(r: core.Rect, scale: f32) core.Rect {
     };
 }
 
-/// キャッシュ更新 + fb へミニマップ描画。
-/// `area` は論理 canvas area。物理 fb へは ScreenTransform で floor 変換した rect を渡す（TASK-156.4）。
+/// Refresh the cache and draw the minimap into the fb.
+/// `area` is the logical canvas area. Pass a ScreenTransform floor-converted rect to the physical fb.
 fn drawMinimapOverlay(app: *App, fb: []u32, fb_w: u32, fb_h: u32, area: core.Rect, content_scale: f32) void {
     const mm_logical = currentMinimapRect(app, area) orelse return;
     const cw = app.doc.width;
@@ -5348,18 +5348,18 @@ fn drawMinimapOverlay(app: *App, fb: []u32, fb_w: u32, fb_h: u32, area: core.Rec
     minimap_mod.draw(fb, fb_w, fb_h, &app.minimap, mm, vp, area_phys);
 }
 
-/// ビューポートのズーム/パン入力を処理する（endFrame 後・canvas 入力前に呼ぶ）。
-/// 戻り値: パン中なら true（呼び出し側は描画入力を抑止する）。zoom/pan の変更は app へ書き戻し、
-/// 実際の clamp は次フレームの canvasBlitRect が現 area に対して行う。
+/// Handle viewport zoom/pan input (call after endFrame, before canvas input).
+/// Return: true while panning (caller suppresses draw input). zoom/pan writes go back into app;
+/// actual clamp is done next frame by canvasBlitRect against the current area.
 fn updateViewport(app: *App, ctx: *const gui.Context) bool {
     const in = &ctx.input;
     const area = app.last_area;
-    // popup（レイヤー右クリックメニュー等。TASK-79.2）表示中は新規のズーム/パン**開始**を
-    // 抑止する（canvas への入力貫通防止。既存の stroke 開始ゲートと同じ狙い）。既に進行中の
-    // パンはそのまま release まで完走させる（下の `if (app.pan_active)` は popup_open を見ない）。
+    // While a popup is open (layer context menu etc.), suppress **starting** a new zoom/pan
+    // (block input punch-through to the canvas; same intent as the stroke-start gate). An already in-progress
+    // pan runs through to release (the `if (app.pan_active)` below does not look at popup_open).
     const popup_open = ctx.hasOpenPopup();
 
-    // マウスが canvas area 内か（ズーム/パン開始の判定に使う）
+    // Is the mouse inside the canvas area? (used to decide zoom/pan start)
     const in_area = blk: {
         if (area) |a| {
             const p = in.mouse_pos;
@@ -5368,14 +5368,14 @@ fn updateViewport(app: *App, ctx: *const gui.Context) bool {
         break :blk false;
     };
 
-    // ── ホイールズーム（zoom-to-cursor。area 内のみ）──
-    // scroll_delta.y > 0 = 上スクロール = ズームイン（backend により符号が逆なら調整）。
+    // ── Wheel zoom (zoom-to-cursor; only inside area) ──
+    // scroll_delta.y > 0 = scroll up = zoom in (adjust if a backend flips the sign).
     if (in_area and in.scroll_delta.y != 0 and !popup_open) {
         const step: i32 = if (in.scroll_delta.y > 0) 1 else -1;
         app.zoomAround(app.view_zoom.stepped(step), in.mouse_pos.x, in.mouse_pos.y);
     }
 
-    // ── KP_ADD/KP_SUBTRACT の保留ズーム（カーソル軸。area 外なら中央）──
+    // ── Pending KP_ADD/KP_SUBTRACT zoom (cursor axis; view center if outside area) ──
     if (app.pending_zoom_delta != 0 and !popup_open) {
         const delta = app.pending_zoom_delta;
         app.pending_zoom_delta = 0;
@@ -5384,13 +5384,13 @@ fn updateViewport(app: *App, ctx: *const gui.Context) bool {
         app.pending_zoom_delta = 0;
     }
 
-    // ── パン（Space+左 / middle / Cmd+左）。capturing / bezier 編集中は開始しない ──
+    // ── Pan (Space+left / middle / Cmd+left). Do not start while capturing / editing a bezier ──
     if (!app.pan_active) {
         const bezier_editing = app.active_kind == .bezier and app.bezier_editor.isEditing();
         const kind_opt: ?PanKind = blk: {
             if (app.space_down and in.mouse_pressed.left) break :blk .space_left;
             if (in.mouse_pressed.middle) break :blk .middle;
-            // mouse_pressed_modifiers: down 時の modifier を latch 済み（move に cmd が載らなくても開始判定は正確）
+            // mouse_pressed_modifiers: modifiers latched at down (start detection stays accurate even if move omits cmd)
             if (in.mouse_pressed.left and in.mouse_pressed_modifiers.cmd) break :blk .cmd_left;
             break :blk null;
         };
@@ -5401,7 +5401,7 @@ fn updateViewport(app: *App, ctx: *const gui.Context) bool {
                     if (p.x >= a.x and p.y >= a.y and p.x < a.x + a.w and p.y < a.y + a.h) {
                         app.pan_active = true;
                         app.pan_kind = kind;
-                        // press 座標を anchor にする（同一フレームの move 後 mouse_pos を使うと delta=0 になる）
+                        // Use the press coords as the anchor (using mouse_pos after a same-frame move would make delta=0)
                         app.pan_anchor_mouse = .{ .x = in.mouse_pressed_pos.x, .y = in.mouse_pressed_pos.y };
                         app.pan_anchor_cam_x = app.cam_cx;
                         app.pan_anchor_cam_y = app.cam_cy;
@@ -5414,14 +5414,14 @@ fn updateViewport(app: *App, ctx: *const gui.Context) bool {
         const pan_held = switch (app.pan_kind) {
             .space_left => app.space_down and in.mouse_buttons.left,
             .middle => in.mouse_buttons.middle,
-            // Cmd は開始時に latch 済み。move に modifier が載らなくても左ボタン継続で完走する。
+            // Cmd is latched at start. Finish with the left button held even if move omits modifiers.
             .cmd_left => in.mouse_buttons.left,
         };
         if (pan_held) {
             const zf = app.view_zoom.scaleF32();
             const dx = @as(f32, @floatFromInt(in.mouse_pos.x - app.pan_anchor_mouse.x));
             const dy = @as(f32, @floatFromInt(in.mouse_pos.y - app.pan_anchor_mouse.y));
-            // 画面移動量を zoom で割り、カメラを逆方向へ更新
+            // Divide screen delta by zoom and update the camera in the opposite direction
             app.cam_cx = app.pan_anchor_cam_x - dx / zf;
             app.cam_cy = app.pan_anchor_cam_y - dy / zf;
         } else {
@@ -5431,19 +5431,19 @@ fn updateViewport(app: *App, ctx: *const gui.Context) bool {
     return app.pan_active;
 }
 
-/// M1 配線（TASK-75.4）: hover 領域（canvas / パネル・外）から OS cursor shape を決め、前フレームと
-/// 異なる時だけ `window.setCursor` を呼ぶ（canvas → crosshair、パネル/外 → default）。
-/// あわせて free-hover 位置（`hover_screen`/`hover_cell`）を更新する。
+/// M1 wiring: pick an OS cursor shape from the hover region (canvas / panel / outside) and call
+/// `window.setCursor` only when it differs from the previous frame (canvas → crosshair; panel/outside → default).
+/// Also update the free-hover position (`hover_screen`/`hover_cell`).
 ///
-/// 呼び出しタイミングは「canvas 入力ディスパッチの後・描画の前」（main loop 内）にすること。
-/// ディスパッチ前だと、当フレームで新規 stroke が開始しても `isPointerBusy()` がまだ false のままの
-/// 状態で hover が確定してしまい、直後の描画パスで busy 開始直後の footprint リング（Brush の場合）が
-/// 一瞬出てしまう（codex レビュー指摘。2026-07-05）。
+/// Call after canvas-input dispatch and before drawing (inside the main loop).
+/// If called before dispatch, a newly started stroke this frame still has `isPointerBusy()` false when
+/// hover is finalized, so the draw path can flash a footprint ring (Brush) for one frame
+/// at busy start.
 ///
-/// ホットパス宣言: 毎フレーム呼ばれるが O(1)（矩形内外判定 + 座標変換のみ）。全画素ループ非該当。
+/// Hot path: called every frame but O(1) (rect hit-test + coordinate transform only). Not a full-pixel loop.
 fn updateCursorAndHover(app: *App, window: platform.Window, ctx: *const gui.Context, canvas_rect: ?core.Rect) void {
     const mouse = core.Vec2{ .x = ctx.input.mouse_pos.x, .y = ctx.input.mouse_pos.y };
-    // 表示領域全体ではなく、カメラ由来 canvas_rect 上の画素に乗っているか（screenToCanvas 成功）で判定。
+    // Judge by whether the point lands on a camera-derived canvas_rect pixel (screenToCanvas succeeds), not the whole view area.
     const hover_cell = if (canvas_rect) |rect|
         zoom_mod.screenToCanvas(mouse, rect, app.view_zoom)
     else
@@ -5464,41 +5464,41 @@ fn layerWidgetId(idx: usize, part: gui.Id) gui.Id {
     return LAYER_ROW_ID_BASE + @as(gui.Id, idx) * LAYER_PANEL_ID_STRIDE + part;
 }
 
-/// レイヤー名の表示上限（**切り詰め後を含めた総コードポイント数**。TASK-79.3）。右ペイン幅
-/// 200px の行に収める表示専用の制約で、保存される名前自体（`layer_name_max`=32B）は切り詰めない。
+/// Display cap for layer names (**total codepoints including truncation**). A display-only limit that fits the
+/// 200px right-pane row; the stored name itself (`layer_name_max`=32B) is never truncated.
 ///
-/// 実測値: サムネ(24px)+可視トグル(min_w 22)+opacity slider(track_w 40 他)を差し引いた
-/// 右ペイン(200px)の残り予算では、名前欄が**総描画 7 文字**（フォントは固定 8px/コードポイント。
-/// `libs/gui/src/font.zig`）を超えると opacity slider がスクロール viewport 外へ押し出され
-/// 操作不能になることを harness snapshot で確認済み（7 文字="Layer 1" は収まる／8 文字="Layer 10"
-/// 相当は収まらない）。既定名 "Layer N" は 1 桁のうちは 7 文字ちょうどで収まるが、2 桁以降
-/// （"Layer 10".."Layer 99"）は下記の切り詰めで "Layer.." のように短縮表示される
-/// （番号は失われるが選択ハイライト/サムネで見分けは付く。3 桁以降も同様）。
+/// Measured: after subtracting thumb(24px)+visibility toggle(min_w 22)+opacity slider(track_w 40 etc.) from the
+/// 200px right pane, the name field overflows the scroll viewport's opacity slider (and becomes unusable) once
+/// total drawn characters exceed **7** (fixed font 8px/codepoint;
+/// `libs/gui/src/font.zig`) — confirmed via harness snapshot (7 chars="Layer 1" fits; 8 chars≈"Layer 10"
+/// does not). Default "Layer N" fits exactly at 7 chars for one digit; two digits and beyond
+/// ("Layer 10".."Layer 99") are shortened by the truncation below to forms like "Layer.."
+/// (the number is lost, but selection highlight/thumb still distinguish rows; three+ digits likewise).
 const LAYER_NAME_DISPLAY_MAX: usize = 7;
 
-/// 表示用にレイヤー名を「切り詰め後を含めた総コードポイント数」が `max_total_chars` に収まるよう
-/// 切り詰める（収まらない場合のみ末尾 2 文字を ".." に差し替え）。buttonId/box の width は
-/// min_w を「下限」としてしか扱えないため、切り詰めずに渡すと長い名前でレイヤー行が際限なく
-/// 広がり opacity slider 等がスクロール viewport 外へ押し出され操作不能になりうる
-/// （本関数はその防止専用。保存データは一切変更しない）。
-/// **既にちょうど収まる名前（例: "Layer 1"）を無駄に切り詰めない**よう、「切り詰め要否」の判定は
-/// 元の総コードポイント数で行う（「先頭 N 文字を機械的に切って ".." を足す」だけだと、
-/// 元がわずかに budget を超えるだけの名前で `N+2 > 元の長さ` になり、切り詰めが逆に長くなる
-/// 事故を避けるため）。
-/// alloc は `ctx.allocator()`（フレーム arena）想定で、収まる場合は allocation なしで name を
-/// そのまま返す。
+/// Truncate a layer name for display so the **total codepoints including truncation** fit `max_total_chars`
+/// (only when needed, replace the last 2 chars with ".."). buttonId/box width treats min_w as a
+/// lower bound only, so passing an untruncated long name can grow the layer row without limit and
+/// push the opacity slider etc. outside the scroll viewport
+/// (this function exists only to prevent that; it never mutates saved data).
+/// **Do not needlessly truncate a name that already fits** (e.g. "Layer 1"): decide "needs truncation?" from
+/// the original total codepoint count (a blind "take first N chars and append .." can make
+/// `N+2 > original length` for names that only barely exceed the budget, so truncation would make them longer —
+/// avoid that accident).
+/// Allocations use `ctx.allocator()` (frame arena); when it fits, return name with no
+/// allocation.
 ///
-/// 毎フレーム呼ばれるが（immediate-mode GUI 構築の一部）、対象は高々「レイヤー数×十数文字」で
-/// 全画素ループではない（同じ buildLayerPanel が毎フレーム呼ぶ既存の `fillLayerThumb` と同じ
-/// 「小さい per-frame UI 構築コスト」のクラス。性能規約の SIMD 3点セット等は対象外）。
+/// Called every frame (part of immediate-mode GUI build), but the work is at most "layer count × a few dozen chars" —
+/// not a full-pixel loop (same class of small per-frame UI cost as the existing `fillLayerThumb`
+/// that buildLayerPanel already calls every frame. The performance-rules SIMD checklist does not apply).
 fn truncateForDisplay(alloc: std.mem.Allocator, name: []const u8, max_total_chars: usize) []const u8 {
-    const view = std.unicode.Utf8View.init(name) catch return name; // 不正 UTF-8 はそのまま返す（防御）
+    const view = std.unicode.Utf8View.init(name) catch return name; // Return invalid UTF-8 as-is (defensive)
     var total: usize = 0;
     {
         var counter = view.iterator();
         while (counter.nextCodepointSlice()) |_| total += 1;
     }
-    if (total <= max_total_chars) return name; // 収まる → 切り詰め不要
+    if (total <= max_total_chars) return name; // Fits → no truncation
 
     const keep = if (max_total_chars > 2) max_total_chars - 2 else 0;
     var it = view.iterator();
@@ -5512,23 +5512,23 @@ fn truncateForDisplay(alloc: std.mem.Allocator, name: []const u8, max_total_char
     return std.fmt.allocPrint(alloc, "{s}..", .{name[0..end]}) catch name[0..end];
 }
 
-/// raw layer pixels（`cw`×`ch` = doc.width×doc.height, straight BGRA 0xAARRGGBB）を THUMB へ縮小し、
-/// チェッカー下地へ src-over して不透明サムネを作る（透明部はチェッカーが見える）。
-/// 各サムネ画素は元領域の **alpha 重み付き平均（premultiplied 平均）** にして、1px の細線も
-/// 薄く残し内容が分かるようにする（最近傍だと細線が抜け落ちる）。opacity は反映しない（生の内容を表示）。
-/// buf.len == LAYER_THUMB_W * LAYER_THUMB_H 前提。
+/// Downscale raw layer pixels (`cw`×`ch` = doc.width×doc.height, straight BGRA 0xAARRGGBB) into THUMB,
+/// src-over onto a checker so the thumb is opaque (transparent areas show the checker).
+/// Each thumb pixel is an **alpha-weighted average (premultiplied mean)** of its source region so 1px fine lines
+/// stay faintly visible (nearest-neighbor would drop them). opacity is not applied (show raw content).
+/// Assumes buf.len == LAYER_THUMB_W * LAYER_THUMB_H.
 fn fillLayerThumb(buf: []u32, layer_pixels: []const u32, cw: usize, ch: usize) void {
     const tw: usize = @intCast(LAYER_THUMB_W);
     const th: usize = @intCast(LAYER_THUMB_H);
     var ty: usize = 0;
     while (ty < th) : (ty += 1) {
         const sy0 = ty * ch / th;
-        const sy1 = @max(sy0 + 1, (ty + 1) * ch / th); // 必ず 1 行以上
+        const sy1 = @max(sy0 + 1, (ty + 1) * ch / th); // Always at least one row
         var tx: usize = 0;
         while (tx < tw) : (tx += 1) {
             const sx0 = tx * cw / tw;
             const sx1 = @max(sx0 + 1, (tx + 1) * cw / tw);
-            // 元領域 [sx0,sx1)×[sy0,sy1) の premultiplied 平均で straight BGRA を作る
+            // Build straight BGRA as the premultiplied mean of source region [sx0,sx1)×[sy0,sy1)
             var sum_a: u64 = 0;
             var sum_r: u64 = 0;
             var sum_g: u64 = 0;
@@ -5563,7 +5563,7 @@ fn fillLayerThumb(buf: []u32, layer_pixels: []const u32, cw: usize, ch: usize) v
 }
 
 fn buildLayerPanel(ctx: *gui.Context, app: *App) !void {
-    // Collapsible body は fit のため、panel wrap 前フレーム幅を .fixed 注入（TASK-155 / TASK-149.1）。
+    // Collapsible body is fit, so inject the previous-frame panel-wrap width as .fixed.
     const outer_w = app.layersBodyAvail(ctx);
     const body_pad: i32 = 2;
     const content_w = @max(1, outer_w - body_pad * 2);
@@ -5576,9 +5576,9 @@ fn buildLayerPanel(ctx: *gui.Context, app: *App) !void {
     });
     defer ctx.endBox();
 
-    // toolbar は scroll 外（常に操作可能。TASK-148.3）
+    // toolbar stays outside the scroll (always operable).
     ctx.beginBox(.{ .direction = .row, .width = .{ .fixed = content_w }, .gap = 4 });
-    // TASK-94 Phase C: netsync 中は routeAction（#id）、solo は do* 直呼び。
+    // During netsync use routeAction (#id); solo calls do* directly.
     if (ctx.buttonId(LAYER_PANEL_ID_BASE + 1, "+", .{ .min_w = 28 }).clicked) {
         if (platform.netsyncActive()) app.routeUi("add_layer", "") else _ = app.doAddLayer() catch {};
     }
@@ -5597,7 +5597,7 @@ fn buildLayerPanel(ctx: *gui.Context, app: *App) !void {
     ctx.endBox();
 
     app.updateLayersViewportHeight(ctx);
-    // ScrollArea viewport は content 幅に固定し、row が body 実幅へ伸びるよう content_width=.grow を維持。
+    // Fix the ScrollArea viewport to the content width and keep content_width=.grow so rows stretch to the body width.
     ctx.beginScrollArea(LAYERS_SCROLL_ID, &app.layers_scroll, .{
         .width = .{ .fixed = content_w },
         .height = .{ .fixed = app.layers_viewport_h },
@@ -5612,9 +5612,9 @@ fn buildLayerPanel(ctx: *gui.Context, app: *App) !void {
         rev -= 1;
         const idx = rev;
         const layer = app.canvas.layers.items[idx];
-        // 1 行 = [サムネイル][名前][V/H][opacity slider]。行高はサムネイル(24px)律速。
-        // width=.grow で ScrollArea content 実幅いっぱいへ伸ばし、選択背景が行全体に乗る（TASK-155）。
-        // 明示 ID（row_id）を付けて rect_cache に登録する（右クリックのヒットテスト用。TASK-79.2）。
+        // One row = [thumb][name][V/H][opacity slider]. Row height is paced by the thumb (24px).
+        // width=.grow stretches to the ScrollArea content width so the selection background covers the whole row.
+        // Attach an explicit ID (row_id) so it lands in rect_cache (for right-click hit-testing).
         const row_id = layerWidgetId(idx, LAYER_ROW_PART_ROW);
         const selected = idx == app.canvas.selected_layer;
         const row_bg: ?gui.Color = if (selected) ctx.style.button_bg_selected else null;
@@ -5632,13 +5632,13 @@ fn buildLayerPanel(ctx: *gui.Context, app: *App) !void {
             .border = row_border,
         });
 
-        // サムネイル: raw layer をチェッカー下地へ縮小合成。選択中は枠を明色に。
+        // Thumb: downscale-composite the raw layer onto a checker. Selected rows get a bright border.
         const thumb = ctx.allocator().alloc(u32, @as(usize, @intCast(LAYER_THUMB_W)) * @as(usize, @intCast(LAYER_THUMB_H))) catch @panic("layer thumb: OOM");
         fillLayerThumb(thumb, layer.pixels, app.doc.width, app.doc.height);
         const thumb_border = if (selected) ctx.style.border_hover else ctx.style.border;
         ctx.imageBox(layerWidgetId(idx, 3), thumb, LAYER_THUMB_W, LAYER_THUMB_H, .{ .border = thumb_border });
 
-        // レイヤー名表示（TASK-79.3）。renaming 中の対象行だけ確定前バッファ+カーソルを表示する。
+        // Layer-name display. While renaming, only the target row shows the pre-commit buffer + caret.
         if (app.rename_in.active and app.rename_in.layer_idx == idx) {
             const shown = truncateForDisplay(ctx.allocator(), app.rename_in.text(), LAYER_NAME_DISPLAY_MAX);
             ctx.beginBox(.{
@@ -5670,7 +5670,7 @@ fn buildLayerPanel(ctx: *gui.Context, app: *App) !void {
                 app.doSelectLayer(idx) catch {};
             }
         }
-        // V=visible ON（selected accent）/ H=hidden OFF（通常背景）。状態は色+文字の両方で判別（TASK-155）。
+        // V=visible ON (selected accent) / H=hidden OFF (normal bg). State is readable from both color and letter.
         const vis_label: []const u8 = if (layer.visible) "V" else "H";
         if (ctx.buttonId(layerWidgetId(idx, 1), vis_label, .{ .selected = layer.visible, .min_w = 22 }).clicked) {
             if (platform.netsyncActive()) app.routeUiLayerVisible(idx, !layer.visible) else app.doToggleLayerVisible(idx);
@@ -5682,7 +5682,7 @@ fn buildLayerPanel(ctx: *gui.Context, app: *App) !void {
         }
         ctx.endBox(); // row
 
-        // 右クリック: 行 rect + 祖先 clip（ScrollArea viewport）の両方で判定（TASK-148.3）。
+        // Right-click: test against both the row rect and the ancestor clip (ScrollArea viewport).
         if (ctx.input.mouse_pressed.right) {
             if (ctx.getNodeCachedRect(row_id)) |cached| {
                 const p = ctx.input.mouse_pressed_pos;
@@ -5703,7 +5703,7 @@ fn historyActorAbbrev(entry: *const history_summary.HistoryEntry, buf: []u8) []c
     if (std.mem.eql(u8, entry.actor, "local_agent")) return "ai";
     if (std.mem.eql(u8, entry.actor, "system")) return "sys";
     if (entry.actor_peer) |id| {
-        // 解決済み + 非空 label → H:<label> / AI:<label>。未解決・空 label は #<id>。
+        // Resolved + non-empty label → H:<label> / AI:<label>. Unresolved / empty label → #<id>.
         if (entry.origin_kind != .unknown and entry.origin_label_len > 0) {
             const prefix: []const u8 = switch (entry.origin_kind) {
                 .human => "H",
@@ -5717,7 +5717,7 @@ fn historyActorAbbrev(entry: *const history_summary.HistoryEntry, buf: []u8) []c
     return "peer";
 }
 
-/// 自分の wire op か（netsync 有効時のみ。host=peer_id 0 / client=HELLO 割当 id）。
+/// Whether this is our own wire op (only while netsync is active. host=peer_id 0 / client=HELLO-assigned id).
 fn isOwnHistoryEntry(app: *const App, entry: *const history_summary.HistoryEntry) bool {
     _ = app;
     if (!platform.netsyncActive()) return false;
@@ -5725,7 +5725,7 @@ fn isOwnHistoryEntry(app: *const App, entry: *const history_summary.HistoryEntry
     return peer == platform.netsyncLocalPeerId();
 }
 
-/// 表示優先順位: reverted（グレー）> redo_consumed（淡色）> own-op（通常色 + 背景）> 通常。
+/// Display priority: reverted (grey) > redo_consumed (dim) > own-op (normal color + bg) > normal.
 fn historyRowColor(ctx: *gui.Context, entry: *const history_summary.HistoryEntry, is_own: bool) gui.Color {
     _ = is_own;
     if (entry.reverted) return ctx.style.text_subtle;
@@ -5736,7 +5736,7 @@ fn historyRowColor(ctx: *gui.Context, entry: *const history_summary.HistoryEntry
 fn formatHistoryLine(entry: *const history_summary.HistoryEntry, buf: []u8, is_own: bool) []const u8 {
     var actor_buf: [history_summary.MAX_ACTOR_LABEL + 8]u8 = undefined;
     const actor = historyActorAbbrev(entry, &actor_buf);
-    // 行頭に ★（own wire op のみ。reverted/redo_consumed でも記号は付け、色優先は color/bg 側）
+    // Leading ★ (own wire op only. Still shown when reverted/redo_consumed; color/bg carry priority).
     const star: []const u8 = if (is_own) "★ " else "";
     if (entry.tx != null) {
         return std.fmt.bufPrint(buf, "{s}#{d} {s} T {s}", .{ star, entry.seq, actor, entry.summary() }) catch "";
@@ -5748,9 +5748,9 @@ fn historyRowId(idx: u32) gui.Id {
     return HISTORY_PANEL_ID_BASE + @as(gui.Id, idx);
 }
 
-/// 操作履歴パネル（TASK-83 Phase 1 + 83.2 サムネイル）。CommandLog を最新が上の縦リストで表示する。
-/// ホットパス宣言: 毎フレーム構築されるが履歴データの再構築は dirty 時のみ（イベント時相当）。
-/// サムネイルは固定バッファの blit のみ（PixelDiff / bbox 再計算 / composite / allocator 禁止）。
+/// History panel. CommandLog as a newest-on-top vertical list.
+/// Hot path: rebuilt every frame, but history data rebuilds only when dirty (event-time equivalent).
+/// Thumbnails are blit-only from a fixed buffer (no PixelDiff / bbox recompute / composite / allocator).
 fn buildHistoryPanel(ctx: *gui.Context, app: *App) void {
     app.ensureHistoryFresh();
     if (app.history_count == 0) {
@@ -5764,7 +5764,7 @@ fn buildHistoryPanel(ctx: *gui.Context, app: *App) void {
         rev -= 1;
         const entry = &app.history_entries[rev];
         const is_own = isOwnHistoryEntry(app, entry);
-        // own 背景は reverted/redo_consumed より下位（色優先順位に合わせ背景も抑止）
+        // own background ranks below reverted/redo_consumed (suppress bg to match color priority)
         const own_bg: ?gui.Color = if (is_own and !entry.reverted and !entry.redo_consumed)
             ctx.style.button_bg_selected
         else
@@ -5804,14 +5804,14 @@ fn buildHistoryPanel(ctx: *gui.Context, app: *App) void {
     }
 }
 
-/// テキストレイヤー（kind==.text）専用の編集パネル。選択中レイヤーが text の時のみ表示する
-/// （TASK-79.5）。内容編集（`text_in` 経由のインライン編集）/ font size / 位置(x,y) /
-/// 現在色の適用を扱う。値変化時に `App.doSetTextParams` へ委譲する（既存 opacity スライダーと
-/// 同じ「値が変わった時だけ呼ぶ」パターン。ドラッグ中の複数回 push は既存 opacity スライダーと
-/// 同クラスの既知トレードオフで新規の懸念ではない）。
+/// Edit panel for text layers (kind==.text). Shown only when the selected layer is text.
+/// Handles content edit (inline via `text_in`) / font size / position (x,y) /
+/// applying the current color. On value change, delegates to `App.doSetTextParams` (same
+/// "call only when the value changed" pattern as the existing opacity slider. Multiple pushes while dragging
+/// are the same known trade-off class as that slider — not a new concern).
 ///
-/// ホットパス宣言: 毎フレーム構築されるが（immediate-mode GUI の一部）、実際の再ラスタライズ
-/// （`doSetTextParams` 経由）はスライダー値変化・文字列確定等の**イベント時のみ**走る。
+/// Hot path: built every frame (part of immediate-mode GUI), but actual re-rasterize
+/// (via `doSetTextParams`) runs **event-time only** (slider change, string commit, etc.).
 fn buildTextLayerPanel(ctx: *gui.Context, app: *App) !void {
     const idx = app.canvas.selected_layer;
     if (idx >= app.canvas.layers.items.len) return;
@@ -5893,7 +5893,7 @@ fn timelineHeaderId(frame_idx: u32) gui.Id {
     return TIMELINE_HEADER_ID_BASE + frame_idx;
 }
 
-/// 空セル用チェッカーサムネ（cel 無し）。
+/// Checker thumb for empty cells (no cel).
 fn fillEmptyThumb(buf: []u32) void {
     const tw: usize = @intCast(LAYER_THUMB_W);
     const th: usize = @intCast(LAYER_THUMB_H);
@@ -5938,8 +5938,8 @@ fn timelineCellBorderSides(doc: *const core.Document, layer_idx: usize, frame_id
     return .{ .left = !left_same, .right = !right_same, .is_linked = left_same or right_same };
 }
 
-/// 下ペインのタイムライン UI（TASK-45.2）。行=layer × 列=frame のセルグリッド。
-/// ホットパス宣言: 毎フレーム構築（immediate-mode GUI）。サムネは 24×24 縮小のみ。
+/// Bottom-pane timeline UI. Cell grid of rows=layer × columns=frame.
+/// Hot path: built every frame (immediate-mode GUI). Thumbs are 24×24 downscales only.
 fn buildTimelinePanel(ctx: *gui.Context, app: *App) !void {
     app.clampTimelineTarget();
     const tl = TIMELINE_PANEL_ID_BASE;
@@ -6082,17 +6082,17 @@ fn panelBuildHistory(ctx: *gui.Context, user_data: *anyopaque) anyerror!void {
 
 fn panelBuildColor(ctx: *gui.Context, user_data: *anyopaque) anyerror!void {
     const app: *App = @ptrCast(@alignCast(user_data));
-    // HSV。palette grid より前に write-back（選択変更の上書き事故回避）
+    // HSV. Write-back before the palette grid (avoid overwrite on selection-change).
     ctx.beginBox(.{ .direction = .row, .gap = 8, .align_cross = .start });
-    // 780x600 既定で Color + Tool Options（Brush スライダー / Bezier anchors 含む）が
-    // status bar 上に収まるよう SV を圧縮（TASK-148.3 Critical）
+    // Compress SV so Color + Tool Options (including Brush sliders / Bezier anchors) fit above the
+    // status bar at the default 780x600.
     _ = ctx.svSquareId(0xCED10001, app.edit_h, &app.edit_s, &app.edit_v, .{ .size = 80 });
     _ = ctx.hueBarId(0xCED10002, &app.edit_h, .{ .h = 80 });
     ctx.endBox();
     _ = ctx.sliderF32Id(0xCED10003, "H", &app.edit_h, .{ .min = 0, .max = 360, .step = 1, .track_w = 96 });
     _ = ctx.sliderF32Id(0xCED10004, "S", &app.edit_s, .{ .min = 0, .max = 1, .step = 0.01, .track_w = 96 });
     _ = ctx.sliderF32Id(0xCED10005, "V", &app.edit_v, .{ .min = 0, .max = 1, .step = 0.01, .track_w = 96 });
-    app.edit_h = @min(app.edit_h, 360 - 1e-3); // hueBar と同じ [0,360) 契約
+    app.edit_h = @min(app.edit_h, 360 - 1e-3); // Same [0,360) contract as hueBar
     app.applyEditColor();
 }
 
@@ -6154,7 +6154,7 @@ fn toolIconButton(ctx: *gui.Context, id_off: gui.Id, icon: gui.IconBitmap, selec
 
 fn panelBuildToolOptions(ctx: *gui.Context, user_data: *anyopaque) anyerror!void {
     const app: *App = @ptrCast(@alignCast(user_data));
-    // 4 列アイコングリッド（TASK-148.2）
+    // 4-column icon grid
     ctx.beginBox(.{ .direction = .row, .gap = 4 });
     if (toolIconButton(ctx, 0, icons.pen, app.active_kind == .pen, "Pen (B)")) app.setActiveKind(.pen);
     if (toolIconButton(ctx, 1, icons.eraser, app.active_kind == .eraser, "Eraser (E)")) app.setActiveKind(.eraser);
@@ -6220,15 +6220,15 @@ fn panelBuildTimeline(ctx: *gui.Context, user_data: *anyopaque) anyerror!void {
     try buildTimelinePanel(ctx, app);
 }
 
-/// UI ツリー構築（widget の同期 hit-test もここで走る）
+/// Build the UI tree (widget sync hit-tests also run here)
 fn buildUi(ctx: *gui.Context, app: *App, canvas_rect: ?core.Rect) !void {
-    // canvas_rect は旧く status bar cursor 用だったが、TASK-154 で drawStatusBarLive へ移した。
-    // シグネチャは呼び出し互換のため残し、未使用を明示する。
+    // canvas_rect used to feed the status-bar cursor; that moved to drawStatusBarLive.
+    // Keep the parameter for call-site compatibility and mark it unused.
     _ = canvas_rect;
-    // 選択/load 変更フレームに編集 HSV を現在色から再同期（以後は編集中 HSV を保持）
+    // On selection/load-change frames, re-sync edit HSV from the current color (then keep in-edit HSV)
     app.syncEditHsv();
-    // Color panel 非表示時は HSV widget が無く applyEditColor が callback 内で呼ばれない。
-    // Pal Load 等で current が変わっても pen/brush.color が旧色のままになるのを防ぐ。
+    // When the Color panel is hidden there is no HSV widget, so applyEditColor is never called from a callback.
+    // Prevent pen/brush.color from staying stale after Pal Load etc. change current.
     if (!app.isPanelVisible(PanelNames.color)) app.applyEditColor();
 
     ctx.beginBox(.{
@@ -6239,8 +6239,8 @@ fn buildUi(ctx: *gui.Context, app: *App, canvas_rect: ?core.Rect) !void {
         .gap = 4,
     });
 
-    // ── 1 段目: menu bar（Command 定義から File/Edit/View。TASK-97.2）──
-    // native 有効時は OS メニューバーに任せて GUI fallback 行をスキップ（TASK-97.3）。
+    // ── Row 1: menu bar (File/Edit/View from Command defs) ──
+    // When native is active, skip the GUI-fallback row and leave it to the OS menu bar.
     if (!app.native_menu_active) {
         ctx.beginBox(.{
             .direction = .row,
@@ -6256,22 +6256,22 @@ fn buildUi(ctx: *gui.Context, app: *App, canvas_rect: ?core.Rect) !void {
         app.rebuildMenuCommands();
     }
 
-    // Tool Options 見出しを現在ツールに合わせて更新（Panel.title。stable name は不変）
+    // Update the Tool Options heading for the current tool (Panel.title; stable name unchanged)
     app.syncToolOptionsTitle();
 
-    // ── PanelHost: left/center/right/bottom（center は空 box。canvas blit は centerRect）──
+    // ── PanelHost: left/center/right/bottom (center is an empty box; canvas blit uses centerRect) ──
     try app.panel_host.build(ctx);
 
-    // Brush/Fill UI 状態 → ツール（毎フレーム clamp。Tool Options 非表示でも値は保持同期）
+    // Brush/Fill UI state → tools (clamp every frame. Keep values synced even when Tool Options is hidden)
     app.brush.size = @intCast(std.math.clamp(app.brush_size_i32, 1, 64));
     app.brush.opacity = @intCast(std.math.clamp(app.brush_opacity_i32, 0, 255));
     app.brush.hardness_q = @intFromFloat(std.math.clamp(app.brush_hardness_f32, 0, 1) * 255 + 0.5);
     app.fill.tolerance = @intCast(std.math.clamp(app.fill_tolerance_i32, 0, 255));
 
-    // ── status bar（cursor → zoom → layer → frame → saveMsg。TASK-148.3）──
-    // cursor/zoom は updateViewport 前の旧値になるため、buildUi では layout 用プレースホルダ
-    // （固定幅 box + 明示 ID）だけ置き、実テキストは endFrame 後・updateViewport 後の
-    // drawStatusBarLive で描く（TASK-154。drawAppshellOverlay と同型の低レベル直接描画）。
+    // ── status bar (cursor → zoom → layer → frame → saveMsg) ──
+    // cursor/zoom would be stale before updateViewport, so buildUi only places layout placeholders
+    // (fixed-width box + explicit ID); live text is drawn after endFrame and updateViewport by
+    // drawStatusBarLive (same low-level direct draw style as drawAppshellOverlay).
     ctx.beginBox(.{
         .direction = .row,
         .width = .{ .grow = 1 },
@@ -6281,7 +6281,7 @@ fn buildUi(ctx: *gui.Context, app: *App, canvas_rect: ?core.Rect) !void {
     });
     const arena = ctx.allocator();
     const ink_h = gui.fontInkHeight(ctx.font);
-    // 最大表示幅を予約（座標 4 桁・zoom 最大 3200%。実テキストは後から上書き）。
+    // Reserve max display width (4-digit coords; zoom up to 3200%. Live text overwrites later).
     const cursor_slot_w: i32 = @intCast(ctx.font.measure("cursor: (9999, 9999)"));
     const zoom_slot_w: i32 = @intCast(ctx.font.measure("zoom: 3200%"));
     ctx.beginBox(.{
@@ -6307,10 +6307,10 @@ fn buildUi(ctx: *gui.Context, app: *App, canvas_rect: ?core.Rect) !void {
     if (app.saveMsg()) |msg| ctx.label(msg);
     ctx.endBox();
 
-    // ── TASK-144.2: サイズダイアログ（root 末尾 = 通常 UI より後に layout 発行 = 前面）──
-    // absolute 非対応のため canvas 領域相当の grow box で dim+panel を重ねるのではなく、
-    // root 末尾にフル幅の modal 帯を置き、panel を中央寄せする（確認 overlay と同時非表示は
-    // openSizeDialog 側でガード）。
+    // ── Size dialog (end of root = laid out after normal UI = on top) ──
+    // absolute is unsupported, so instead of stacking dim+panel in a canvas-sized grow box,
+    // place a full-width modal band at the end of root and center the panel (simultaneous display with the
+    // confirmation overlay is guarded in openSizeDialog).
     if (app.size_dialog) |dlg| {
         ctx.beginBox(.{
             .direction = .column,
@@ -6462,10 +6462,10 @@ fn loadProjectPath(app: *App, path: []const u8) !void {
     try app.setProjectPath(path);
 }
 
-/// status bar の zoom%/cursor を updateViewport 適用後の値で直接描画する（TASK-154）。
-/// endFrame 後・canvas_rect 再計算後に呼ぶ。getNodeRect は当フレーム endFrame 済みなので最新 layout。
-/// draw_list.text は文字列を所有しないため、payload は frame arena へ dupe する
-/// （次 beginFrame の arena.reset まで有効。labelEx と同じ契約）。
+/// Draw status-bar zoom%/cursor directly with post-updateViewport values.
+/// Call after endFrame and after canvas_rect recompute. getNodeRect sees the latest layout (endFrame done).
+/// draw_list.text does not own the string, so dupe the payload into the frame arena
+/// (valid until the next beginFrame arena.reset; same contract as labelEx).
 fn drawStatusBarLive(ctx: *gui.Context, app: *const App, canvas_rect: ?core.Rect) !void {
     const col = ctx.style.text_subtle;
     const arena = ctx.allocator();
@@ -6585,9 +6585,9 @@ fn appInit(gpa: std.mem.Allocator, io: std.Io) !*App {
     const self = try gpa.create(App);
     errdefer gpa.destroy(self);
 
-    // fallible 資源は literal 前に段階化 + errdefer（変更前 main の ctx 先行 defer を復元し、
-    // さらに doc/recorder/preview/palette/onion も同等以上の保証にする。literal は移動のみ）。
-    // GuiFont は自己参照ポインタのため literal 後に in-place load（TASK-138）。
+    // Stage fallible resources before the literal + errdefer (restore the pre-change main pattern of ctx-first defer,
+    // and give doc/recorder/preview/palette/onion at least the same guarantee. The literal only moves).
+    // GuiFont has a self-referential pointer, so load in-place after the literal.
     var ctx = gui.Context.init(gpa, gui.default_font);
     errdefer ctx.deinit();
 
@@ -6631,7 +6631,7 @@ fn appInit(gpa: std.mem.Allocator, io: std.Io) !*App {
     var size_h_buf = try gui.TextBuffer.init(gpa, "");
     errdefer size_h_buf.deinit();
 
-    // ここから infallible（所有は App へ移動。成功 return 時は上記 errdefer は発火しない）
+    // From here on, infallible (ownership moves into App. On success return the errdefers above do not fire)
     self.* = .{
         .io = io,
         .gpa = gpa,
@@ -6655,7 +6655,7 @@ fn appInit(gpa: std.mem.Allocator, io: std.Io) !*App {
         .panels = .{
             .{ .name = PanelNames.history, .slot = .left, .build = panelBuildHistory, .user_data = undefined },
             .{ .name = PanelNames.color, .slot = .right, .build = panelBuildColor, .user_data = undefined },
-            // 既定は閉じる: Color + Tool Options 全コントロールと Layers 1 行が 780x600 に並立する余地
+            // Default closed: room for Color + Tool Options controls and one Layers row to coexist at 780x600
             .{ .name = PanelNames.palette, .slot = .right, .open = false, .build = panelBuildPalette, .user_data = undefined },
             .{ .name = PanelNames.tool_options, .slot = .right, .build = panelBuildToolOptions, .user_data = undefined },
             .{ .name = PanelNames.layers, .slot = .right, .build = panelBuildLayers, .user_data = undefined },
@@ -6671,7 +6671,7 @@ fn appInit(gpa: std.mem.Allocator, io: std.Io) !*App {
     };
     errdefer self.preferences.deinit();
 
-    // App 最終配置後に GuiFont を in-place load → ctx.font を再ポイント（自己参照寿命）。
+    // After App is finally placed, load GuiFont in-place → re-point ctx.font (self-ref lifetime).
     self.gui_font.load(io, gpa);
     errdefer self.gui_font.deinit();
     self.ctx.font = self.gui_font.asFont();
@@ -6709,7 +6709,7 @@ fn appInit(gpa: std.mem.Allocator, io: std.Io) !*App {
     self.cmd_exec.log = &self.cmd_log;
     self.cmd_exec.adapter = .{ .ctx = self, .canUndo = adapterCanUndo, .applyUndo = adapterApplyUndo, .summarize = adapterSummarize };
     platform.setCommandExecutor(&self.cmd_exec);
-    // TASK-163: remote COMMIT 適用後の history thumbnail capture（opaque hook）。
+    // history thumbnail capture after remote COMMIT apply (opaque hook).
     platform.setNetsyncPostApplyHook(self, App.netsyncPostApplyHook);
 
     platform.registerProbe(.{ .name = "canvas", .ctx = self, .ext = "png", .snapshot = canvasSnapshot, .digest = canvasDigest });
@@ -6718,7 +6718,7 @@ fn appInit(gpa: std.mem.Allocator, io: std.Io) !*App {
     platform.registerProbe(.{ .name = "cursor", .ctx = self, .ext = "txt", .snapshot = cursorSnapshot, .digest = cursorDigest });
     platform.registerProbe(.{ .name = "history", .ctx = self, .ext = "json", .snapshot = historySnapshot, .digest = historyDigest });
     platform.registerProbe(.{ .name = "diff", .ctx = self, .ext = "txt", .digest = diffDigest, .desc = "visual diff vs marked baseline: changed/bbox/from/to" });
-    // TASK-45.4: timeline 再生状態（digest のみ・snapshot=null）
+    // timeline playback state (digest only; snapshot=null)
     platform.registerProbe(.{ .name = "timeline", .ctx = self, .ext = "txt", .digest = timelineDigest, .desc = "timeline playback: playing/frame/frames/fps/dur/layers/onion" });
     platform.registerProbe(.{ .name = "panels", .ctx = self, .ext = "txt", .digest = panelsDigest, .desc = "right-slot panel rects: fb_h/bottom/ok/RightSlot + Color/Palette/Tool/Layers y,h" });
     platform.registerProbe(.{ .name = "palette", .ctx = self, .ext = "txt", .digest = paletteDigest, .desc = "palette size + canvas color histogram top4" });
@@ -6732,7 +6732,7 @@ fn appInit(gpa: std.mem.Allocator, io: std.Io) !*App {
 
 fn appDeinit(self: *App) void {
     const gpa = self.gpa;
-    // TASK-163: App 解放前に hook 解除（Executor teardown 契約と同型）。
+    // Clear the hook before App teardown (same shape as the Executor teardown contract).
     platform.setNetsyncPostApplyHook(null, null);
     self.relay_chunks.deinit(gpa);
     if (self.native_menu_active) {
@@ -6775,31 +6775,31 @@ fn appDeinit(self: *App) void {
     gpa.destroy(self);
 }
 
-/// ライブリサイズ中の redraw callback と通常 frame の双方から呼ぶフレーム本体（TASK-23.1）。
-/// モーダルダイアログ（runPendingFileOp）は含めない（callback からダイアログを開かない契約）。
+/// Frame body shared by the live-resize redraw callback and the normal frame path.
+/// Does not include modal dialogs (runPendingFileOp) — contract: do not open dialogs from the callback.
 fn appFrameInner(self: *App, win: *platform.Window) !void {
-    // in_frame ガード: early return / error return でも必ず戻るよう defer で落とす。
+    // in_frame guard: defer clears it even on early / error return.
     if (self.in_frame) return;
     self.in_frame = true;
     defer self.in_frame = false;
-    // フレーム処理は内側ブロックに閉じ、ブロックを抜けたところで framebuffer を unlock する。
-    // ファイルダイアログ（モーダル）は lock 中に呼ぶと再入で危険なので、ここでは pending を
-    // セットするだけにし、unlock 後の安全点（下の runPendingFileOp）で実行する。
+    // Close frame work in an inner block and unlock the framebuffer when leaving that block.
+    // File dialogs (modal) are unsafe to call while locked (re-entrancy), so only set pending here
+    // and run at the post-unlock safe point (runPendingFileOp below).
     {
         const fb = win.lockFramebuffer() orelse return;
         defer fb.unlock();
 
-        // TASK-156.4: レイアウト/入力は論理サイズ、raw fb は物理。同一 Framebuffer snapshot の scale のみ使用。
+        // Layout/input use logical size; raw fb is physical. Use only the scale from the same Framebuffer snapshot.
         const logical_w = fb.logical_size.width;
         const logical_h = fb.logical_size.height;
         const content_scale = fb.content_scale;
-        // 物理 target 寸法（fb.width/height は framebuffer_size の alias）
+        // Physical target size (fb.width/height alias framebuffer_size)
         const phys_w = fb.width;
         const phys_h = fb.height;
 
         self.ctx.beginFrame(logical_w, logical_h);
 
-        // Command 表をイベント処理前に更新（ショートカット照合・probe 用。checked 反映）。
+        // Refresh the Command table before event handling (shortcut matching / probes; checked state).
         self.rebuildMenuCommands();
         self.syncNativeMenu(win);
 
@@ -6814,13 +6814,13 @@ fn appFrameInner(self: *App, win: *platform.Window) !void {
                 continue;
             }
             switch (ev) {
-                .quit => self.requestClose(win), // ウィンドウクローズも同一経路
-                // レイヤー名インライン編集中（TASK-79.3）・テキストレイヤー内容編集中
-                // （TASK-79.5、`text_in`。rename_in と対称・互いに同時 active にならない）は
-                // key_down を専用ハンドラへ回し、char_input で確定文字を追記する（TASK-22
-                // char_input の初消費）。key_up は常に通す（Space パン modifier 等の held
-                // 状態を編集中に取りこぼさないため。codex レビュー指摘 2026-07-05）。
-                // TASK-144.2: size_dialog 中は shortcut を流さず Esc=cancel / Enter=OK。
+                .quit => self.requestClose(win), // Window close uses the same path
+                // While inline layer-name edit or text-layer content edit
+                // (`text_in`; symmetric with rename_in; never both active) is in progress,
+                // route key_down to the dedicated handlers and append committed chars from char_input
+                // (first consumer of char_input). Always pass key_up through (so Space-pan modifiers etc. are not
+                // dropped from held state during edit).
+                // During size_dialog: do not run shortcuts; Esc=cancel / Enter=OK.
                 .key_down => |k| if (self.rename_in.active)
                     self.handleRenameKey(k)
                 else if (self.text_in.active)
@@ -6838,10 +6838,10 @@ fn appFrameInner(self: *App, win: *platform.Window) !void {
                 .file_drop => |drop| self.handleFileDrop(drop),
                 else => {},
             }
-            // renaming/テキスト編集中は gui へのマウス/キーイベント転送も止める（他行クリック等
-            // での干渉を避ける。rename_in/text_in はここで破棄されないため、他行の右クリックで
-            // 新たな編集が始まれば単に上書きされるだけでクラッシュはしない）。
-            // size_dialog 中は char_input を GUI へ渡し、Enter/Esc は上で消費済みなので再送しない。
+            // While renaming/text-editing, also stop forwarding mouse/key events to gui (avoid interference from
+            // clicking other rows etc. rename_in/text_in are not discarded here, so a right-click on another row that
+            // starts a new edit simply overwrites — no crash).
+            // During size_dialog, pass char_input to GUI; Enter/Esc were already consumed above so do not re-send.
             if (!self.rename_in.active and !self.text_in.active) {
                 const pass_char = self.size_dialog != null;
                 const skip_dialog_confirm_keys = if (self.size_dialog != null) switch (ev) {
@@ -6856,8 +6856,8 @@ fn appFrameInner(self: *App, win: *platform.Window) !void {
 
         self.syncComposition(win);
 
-        // canvas rect は前フレームの layout 結果（初回フレームは null）。
-        // canvasBlitRect はカメラ原点を現 area に clamp して app へ書き戻し、last_area も更新する。
+        // canvas rect is the previous frame's layout result (null on the first frame).
+        // canvasBlitRect clamps the camera origin to the current area, writes it back into app, and updates last_area.
         var canvas_rect = canvasBlitRect(&self.ctx, self);
 
         self.tickTimelinePlayback(platform.getTime());
@@ -6865,30 +6865,30 @@ fn appFrameInner(self: *App, win: *platform.Window) !void {
         try buildUi(&self.ctx, self, canvas_rect);
         self.ctx.endFrame();
         self.cachePanelsProbe();
-        // endFrame が GUI の draw command を確定した後に追加し、確認 UI を最前面へ置く。
+        // After endFrame has finalized GUI draw commands, append so the confirmation UI sits on top.
         try drawAppshellOverlay(&self.ctx, self);
 
-        // GUI fallback ドロップダウン（endFrame 後契約。popup.zig と同型）。
-        // native 有効時はスキップ（OS メニューバーが所有。TASK-97.3）。
+        // GUI-fallback dropdown (post-endFrame contract; same shape as popup.zig).
+        // Skip when native is active (OS menu bar owns it).
         if (!self.native_menu_active) {
             const menu_res = gui.menuBarPopup(&self.ctx, self.menuCommandsSlice(), &self.menu_bar_state);
             if (menu_res.selected) |id| self.dispatchCommand(id);
-            // View トグル後に checked を即反映（同一フレームの probe 用）
+            // Reflect checked immediately after a View toggle (for same-frame probes)
             if (menu_res.selected != null) self.rebuildMenuCommands();
         } else {
-            // View トグル等で checked が変わった場合に dirty-gate 経由で updateMenu
+            // When View toggles etc. change checked, updateMenu via the dirty-gate
             self.rebuildMenuCommands();
             self.syncNativeMenu(win);
         }
 
-        // TASK-142: テキスト編集（本文入力 or レイヤー名 rename）がアクティブな間だけ keyDown を
-        // IME へ渡す。非アクティブ時は IME 有効中でも修飾なしキーがツール/ショートカットとして届く。
+        // Pass keyDown to IME only while text edit (body input or layer-name rename) is active.
+        // When inactive, unmodified keys still reach tools/shortcuts even if IME is enabled.
         win.setTextInputActive(self.text_in.active or self.rename_in.active);
 
-        // IME 候補窓の基準 caret。rect cache は endFrame 後に確定するため、この時点で供給する。
-        // preedit の有無でゲートしない: IME は composition 開始打鍵の handleEvent 中（= app が
-        // 新 rect を供給する前）に窓位置を決めるため、入力 UI がアクティブな間は常に caret を
-        // 指しておく（stale rect による初回表示ずれの実機指摘 2026-07-17）。
+        // IME candidate-window caret anchor. Supply here because the rect cache is finalized after endFrame.
+        // Do not gate on preedit presence: IME may decide the window position during the composition-start
+        // key's handleEvent (before the app supplies a new rect), so keep pointing at a caret for the whole
+        // time the input UI is active (avoids first-show offset from a stale rect).
         if (self.text_in.active or self.rename_in.active) {
             const caret_text = if (self.text_in.active)
                 self.text_in.text()
@@ -6922,31 +6922,31 @@ fn appFrameInner(self: *App, win: *platform.Window) !void {
             };
         }
 
-        // ── ミニマップ入力（updateViewport より前・通常 pan/stroke と排他。TASK-153.3）──
+        // ── Minimap input (before updateViewport; exclusive with normal pan/stroke) ──
         const minimap_busy = if (self.size_dialog != null) false else updateMinimapInput(self, &self.ctx);
-        // ── ビューポート: ホイールズーム（zoom-to-cursor）/ パン（Space+左 / middle / Cmd+左）──
-        // パン中は描画入力を抑止（既存 stroke 完走を妨げないよう pan は capturing 中に開始しない）。
-        // TASK-144.2: size_dialog 中は viewport 操作も止める。
+        // ── Viewport: wheel zoom (zoom-to-cursor) / pan (Space+left / middle / Cmd+left) ──
+        // While panning, suppress draw input (pan does not start while capturing, so existing strokes can finish).
+        // Also stop viewport ops during size_dialog.
         const panning = if (self.size_dialog != null or minimap_busy) false else updateViewport(self, &self.ctx);
-        // zoom/pan が変わり得たので、当フレームの入力・描画が「旧 rect + 新 zoom」で不整合に
-        // ならないよう rect を再計算する（endFrame 後なので area は当フレームの layout 結果。O(1)）。
+        // zoom/pan may have changed, so recompute rect so this frame's input/draw do not mix
+        // "old rect + new zoom" (post-endFrame, so area is this frame's layout. O(1)).
         canvas_rect = canvasBlitRect(&self.ctx, self);
-        // TASK-154: status bar zoom%/cursor を新 zoom/pan で上書き描画（buildUi 時点の旧値を使わない）。
+        // Overwrite status-bar zoom%/cursor with the new zoom/pan (do not use the stale buildUi values).
         try drawStatusBarLive(&self.ctx, self, canvas_rect);
 
-        // ── canvas 入力。capturing 最優先（既存 stroke を完走）。bezier は独立経路 ──
-        // TASK-79.5: 選択中レイヤーが text kind の間は、この分岐全体（bezier/select/
-        // eyedropper/通常 canvas_input のいずれも）を丸ごと止める。「text layer の pixels は
-        // text_params からの再ラスタライズ結果」という不変条件を守るため（eyedropper は
-        // 本来読み取りのみで実害は無いが、分岐追加のミスリスクよりシンプルさを優先し
-        // 丸ごと止める設計判断。text layer 選択中は色スポイトも一時的に使えない）。
-        // TASK-144.2: size_dialog != null でも同様にブロック。
+        // ── canvas input. capturing first (finish existing strokes). bezier is a separate path ──
+        // While the selected layer is text kind, stop this whole branch (bezier/select/
+        // eyedropper/normal canvas_input alike). Preserves the invariant that
+        // "text-layer pixels are the re-rasterize result of text_params" (eyedropper is
+        // read-only and harmless in principle, but blocking the whole branch is the simpler design
+        // choice over adding a special case; color picking is temporarily unavailable while a text layer is selected).
+        // Same block when size_dialog != null.
         if (!panning and !minimap_busy and !self.selectedLayerIsText() and self.size_dialog == null) {
             const in = &self.ctx.input;
-            // 新規 stroke 開始の gate（TASK-42）: press が canvas area(last_area) 内 かつ gui（widget/
-            // splitter）が press を取っていない（!wantsMouse）時だけ新規開始を許可。進行中 stroke は
-            // pressed_left のみ落として update は通し、release を届けて完走させる（capturing 張り付き防止）。
-            // ミニマップ矩形上の press は updateMinimapInput が消費済みだが、念のためここでも除外する。
+            // New-stroke start gate: allow a new start only when press is inside the canvas area(last_area) and gui
+            // (widget/splitter) did not take the press (!wantsMouse). In-progress strokes drop pressed_left only,
+            // still run update, and deliver release so they finish (prevents stuck capturing).
+            // Presses on the minimap rect were already consumed by updateMinimapInput; exclude them here as a safety net too.
             const pressed_left_gated = in.mouse_pressed.left and gate: {
                 const p = in.mouse_pressed_pos;
                 const in_area = if (self.last_area) |a|
@@ -6957,11 +6957,11 @@ fn appFrameInner(self: *App, win: *platform.Window) !void {
                     if (currentMinimapRect(self, a)) |mm| minimap_mod.contains(mm, p.x, p.y) else false
                 else
                     false;
-                // active_id==0 = どの widget/splitter も press を取っていない（hover だけの wantsMouse は
-                // 抑止しない＝canvas 内 press → 同一フレーム UI 上へ move でも stroke は開始できる）。
-                // !hasOpenPopup() = レイヤー右クリックメニュー（TASK-79.2）表示中は新規 stroke を
-                // 開始しない（popup は active_id を 0 のまま保つため、上の条件だけでは防げない。
-                // popup.zig の wantsMouse() が popup_state を OR しているのと同じ理由）。
+                // active_id==0 = no widget/splitter took the press (hover-only wantsMouse does not
+                // suppress = a canvas press that moves onto UI in the same frame can still start a stroke).
+                // !hasOpenPopup() = do not start a new stroke while the layer context menu is open
+                // (popup keeps active_id at 0, so the condition above alone cannot stop it.
+                // Same reason popup.zig's wantsMouse() ORs popup_state).
                 break :gate in_area and !on_minimap and self.ctx.state.active_id == 0 and !self.ctx.hasOpenPopup();
             };
             if (self.active_kind == .bezier and !self.input.capturing) {
@@ -6978,10 +6978,10 @@ fn appFrameInner(self: *App, win: *platform.Window) !void {
                 self.syncRecorderModes();
                 const dab = self.brush.footprint();
                 if (self.bez_in.update(frame, &self.bezier_editor, self.canvas, &self.recorder, self.gpa, dab, self.brush.color, self.brush.opacity)) |pd| {
-                    self.doc.pushPaintOp(self.gpa, pd.layer_idx, pd.diffs) catch {}; // text layer 選択中はこの分岐に到達しない
+                    self.doc.pushPaintOp(self.gpa, pd.layer_idx, pd.diffs) catch {}; // This branch is unreachable while a text layer is selected
                 }
             } else if (self.active_kind.isShape() and !self.input.capturing) {
-                // シェイプ（独立経路。TASK-90）。press→drag→release で shape 確定。
+                // Shape (separate path). press→drag→release commits the shape.
                 const frame: shape_input.ShapeInput.Frame = .{
                     .canvas_rect = canvas_rect,
                     .zoom = self.view_zoom,
@@ -6992,11 +6992,11 @@ fn appFrameInner(self: *App, win: *platform.Window) !void {
                     .released_left = in.mouse_released.left,
                 };
                 self.syncRecorderModes();
-                // shape_in.kind / fill は UI・setActiveKind で同期済み
+                // shape_in.kind / fill are already synced by UI / setActiveKind
                 if (self.shape_in.update(frame, self.canvas, &self.recorder, self.gpa, self.palette.current())) |pd| {
                     switch (actions.uiPaintCommitPath(platform.netsyncActive(), true)) {
                         .relay => {
-                            // netsync: preview を巻き戻し → action shape で再適用
+                            // netsync: rewind preview → re-apply via action shape
                             self.rewindPaintDiff(pd);
                             self.relayUiShape();
                         },
@@ -7021,15 +7021,15 @@ fn appFrameInner(self: *App, win: *platform.Window) !void {
                     .released_left = in.mouse_released.left,
                 };
                 if (self.sel_in.update(frame, self.canvas, self.canvas.selected_layer, self.gpa, self.blend_mode)) |pd| {
-                    self.doc.pushPaintOp(self.gpa, pd.layer_idx, pd.diffs) catch {}; // text layer 選択中はこの分岐に到達しない
+                    self.doc.pushPaintOp(self.gpa, pd.layer_idx, pd.diffs) catch {}; // This branch is unreachable while a text layer is selected
                 }
             } else if (self.eye_in.picking or self.active_kind == .eyedropper or
                 (pressed_left_gated and in.modifiers.alt))
             {
-                // スポイト（独立経路。TASK-68）。専用ツール選択中、または進行中の picking を完走、
-                // または Alt+クリックの一時スポイト（bezier/select は上の分岐で既に弾かれているので
-                // ここに来る active_kind は pen/eraser/brush/fill/eyedropper のいずれか。4ツール
-                // 全てで Alt+クリックを一律有効にする最小の場合分け）。
+                // Eyedropper (separate path). While the dedicated tool is selected, or finish an in-progress pick,
+                // or temporary Alt+click eyedrop (bezier/select already branched above, so
+                // active_kind here is one of pen/eraser/brush/fill/eyedropper. Minimal case split that enables
+                // Alt+click uniformly for all four tools).
                 const frame: eyedropper_input.EyedropperInput.Frame = .{
                     .canvas_rect = canvas_rect,
                     .zoom = self.view_zoom,
@@ -7054,14 +7054,14 @@ fn appFrameInner(self: *App, win: *platform.Window) !void {
                 const was_capturing = self.input.capturing;
                 self.syncRecorderModes();
                 const pd_opt = self.input.update(frame, self.activeTool(), self.canvas, &self.recorder, self.gpa);
-                // ── UI stroke の点列追跡（TASK-62.5.3 §5c。canvas_input の down/move/up と同じ座標変換）──
+                // ── UI stroke point tracking (same coord transform as canvas_input down/move/up) ──
                 if (canvas_rect) |rect| {
                     if (pd_opt != null) {
-                        // release で確定（同一フレーム press+release は begin から。up は released_pos）
+                        // Commit on release (same-frame press+release starts from begin; up uses released_pos)
                         if (!was_capturing) self.uiStrokeBegin(zoom_mod.screenToCanvasRaw(frame.mouse_pressed_pos, rect, frame.zoom));
                         self.uiStrokeAppend(zoom_mod.screenToCanvasRaw(frame.mouse_released_pos, rect, frame.zoom));
                     } else if (!was_capturing and self.input.capturing) {
-                        // capture 開始（down=pressed_pos + 同フレーム move=mouse_pos）
+                        // Start capture (down=pressed_pos + same-frame move=mouse_pos)
                         self.uiStrokeBegin(zoom_mod.screenToCanvasRaw(frame.mouse_pressed_pos, rect, frame.zoom));
                         self.uiStrokeAppend(zoom_mod.screenToCanvasRaw(frame.mouse_pos, rect, frame.zoom));
                     } else if (self.input.capturing) {
@@ -7069,13 +7069,13 @@ fn appFrameInner(self: *App, win: *platform.Window) !void {
                     }
                 }
                 if (pd_opt) |pd| {
-                    // TASK-94 Phase C: netsync 中は preview を巻き戻し → routeAction("stroke")。
-                    // fill 等（action 語彙なし）は rewind 破棄（silent diverge 防止）。
-                    // solo は従来どおり pushPaintOp + recordUiStroke。
+                    // During netsync: rewind preview → routeAction("stroke").
+                    // fill etc. (no action vocabulary) discard the rewind (prevent silent diverge).
+                    // solo keeps pushPaintOp + recordUiStroke as before.
                     switch (actions.uiPaintCommitPath(platform.netsyncActive(), self.uiStrokeRelaysViaAction())) {
                         .relay => {
-                            // TASK-162: 全 chunk canonical 成功後に一度だけ rewind → 全 PROPOSE を同期送出。
-                            // 跨フレーム drain は持たない（連続ストロークで未送 chunk 破棄を構造的に排除）。
+                            // After every chunk is canonically accepted, rewind once then send all PROPOSEs synchronously.
+                            // No cross-frame drain (structurally avoids dropping unsent chunks across consecutive strokes).
                             var canons: std.ArrayListUnmanaged([]u8) = .empty;
                             defer {
                                 for (canons.items) |a| self.gpa.free(a);
@@ -7089,10 +7089,10 @@ fn appFrameInner(self: *App, win: *platform.Window) !void {
                                 self.ui_stroke_overflow = false;
                                 self.relaySendCanonicalChunks(canons.items);
                             } else {
-                                // preflight 失敗（chunk 数 > pending cap=netsyncPendingCap、または
-                                // pending 飽和）: preview を **rewind** して host と分岐させない。
-                                // ストローク自体は失われるが、silent な canvas 分岐（未送信の
-                                // 幽霊ピクセルが自 peer だけに残り undo 不可・恒久不一致）よりは安全。
+                                // preflight failure (chunk count > pending cap=netsyncPendingCap, or
+                                // pending saturated): **rewind** the preview so we do not diverge from the host.
+                                // The stroke itself is lost, but that is safer than a silent canvas diverge (unsent
+                                // ghost pixels remaining only on this peer, not undoable, permanent mismatch).
                                 self.rewindPaintDiff(pd);
                                 self.relayResetCapture();
                                 self.relay_stroke = false;
@@ -7102,36 +7102,36 @@ fn appFrameInner(self: *App, win: *platform.Window) !void {
                         .rewind_discard => {
                             self.rewindPaintDiff(pd);
                             self.uiStrokeDiscard();
-                            std.debug.print("pixie: netsync 中は fill 等は使えません（action 語彙なし・preview を破棄）\n", .{});
+                            std.debug.print("pixie: netsync: fill etc. unavailable (no action vocabulary — discarding preview)\n", .{});
                             self.setSaveMsg("netsync: fill unavailable (no action)", .{});
                         },
                         .solo => {
                             const handle_before = self.doc.undo.next_handle;
-                            self.doc.pushPaintOp(self.gpa, pd.layer_idx, pd.diffs) catch {}; // text layer 選択中はこの分岐に到達しない
-                            // 確定点で CommandRecord を記録（actor=local_user。undo_ref = push された Op の handle）
+                            self.doc.pushPaintOp(self.gpa, pd.layer_idx, pd.diffs) catch {}; // This branch is unreachable while a text layer is selected
+                            // On commit points, record a CommandRecord (actor=local_user. undo_ref = handle of the pushed Op)
                             self.recordUiStroke(self.doc.undo.next_handle != handle_before);
                         },
                     }
                 } else if (!self.input.capturing) {
-                    self.uiStrokeDiscard(); // release したが確定 diff なし → 蓄積破棄
+                    self.uiStrokeDiscard(); // Released but no committed diff → discard the accumulated points
                 }
             }
         }
 
-        // ── ソフトオーバーレイ用 hover 追跡 + OS カーソル形状の M1 配線（TASK-75.4）。
-        // 入力ディスパッチの後に置くことで、当フレームで新規 stroke が始まった場合の busy 判定
-        // （isPointerBusy）を正しく反映する（描画パスで footprint リングが一瞬出ることを防ぐ）。
+        // ── Soft-overlay hover tracking + OS cursor-shape M1 wiring.
+        // Placed after input dispatch so a newly started stroke this frame correctly updates the busy check
+        // (isPointerBusy) and the draw path does not flash a footprint ring.
         updateCursorAndHover(self, win.*, &self.ctx, canvas_rect);
 
-        // ── 描画: bg → チェッカー背景 → canvas blit(α src-over) → GUI（上に重ねる） ──
-        // 物理 fb を clear。canvas は論理 Zoom rect → 物理 nearest（TASK-156.4）。
+        // ── Draw: bg → checker → canvas blit (α src-over) → GUI (on top) ──
+        // Clear the physical fb. canvas is logical Zoom rect → physical nearest.
         @memset(fb.pixels, COLOR_WINDOW_BG);
         if (canvas_rect) |rect| {
             if (self.last_area) |area| {
                 const zoom = self.view_zoom;
                 const cw = self.doc.width;
                 const ch = self.doc.height;
-                // 論理表示矩形（displayExtent = ceil(canvas * num / den)）
+                // Logical display rect (displayExtent = ceil(canvas * num / den))
                 const screen_rect: core.Rect = .{
                     .x = rect.x,
                     .y = rect.y,
@@ -7146,20 +7146,20 @@ fn appFrameInner(self: *App, win: *platform.Window) !void {
                     break :blk self.onion_buf;
                 } else base_composite;
                 blit.blitCanvasZoomPhysical(fb.pixels, phys_w, phys_h, display_composite, cw, ch, rect, zoom, area, content_scale);
-                // ミニマップ（canvas blit 直後・他 overlay より下。TASK-153.3）
+                // Minimap (right after canvas blit; below other overlays)
                 drawMinimapOverlay(self, fb.pixels, phys_w, phys_h, area, content_scale);
             }
         }
-        // TASK-103: presence overlay（canvas blit の直後・bezier/selection より下）
+        // presence overlay (right after canvas blit; below bezier/selection)
         drawPresenceOverlay(self, canvas_rect);
-        // ベジェ編集中のハンドル/アンカー UI を draw_list へ（プレビューの上、gui.render で焼かれる。area で clip）
+        // Bezier edit handles/anchors into draw_list (above preview; burned by gui.render; clip to area)
         if (self.active_kind == .bezier) {
             if (canvas_rect) |rect| if (self.last_area) |area| {
                 const clip_area: gui.Rect = .{ .x = area.x, .y = area.y, .w = @intCast(area.w), .h = @intCast(area.h) };
                 bezier_overlay.draw(&self.ctx, &self.bezier_editor, rect, self.view_zoom, clip_area);
             };
         }
-        // 範囲選択のマーチングアンツ（選択があれば常時表示。select ツール時はドラッグ中の preview を優先）
+        // Selection marching ants (always when a selection exists; select-tool drag prefers the live preview)
         {
             const display_sel: ?core.Rect = if (self.active_kind == .select)
                 (self.sel_in.previewRect(self.canvas) orelse self.canvas.selection)
@@ -7168,22 +7168,22 @@ fn appFrameInner(self: *App, win: *platform.Window) !void {
             if (display_sel != null) {
                 if (canvas_rect) |rect| if (self.last_area) |area| {
                     const clip_area: gui.Rect = .{ .x = area.x, .y = area.y, .w = @intCast(area.w), .h = @intCast(area.h) };
-                    // phase は時間由来。MARCH_PERIOD(=2*DASH) で mod し i32 overflow を防ぐ（パターンは保存）。
+                    // phase is time-derived. mod by MARCH_PERIOD(=2*DASH) to avoid i32 overflow (pattern preserved).
                     const phase: i32 = @intFromFloat(@mod(platform.getTime() * MARCH_SPEED, MARCH_PERIOD));
                     selection_overlay.draw(&self.ctx, display_sel, rect, self.view_zoom, clip_area, phase);
                 };
             }
         }
-        // シェイプドラッグ中の輪郭プレビュー（TASK-90）
+        // Outline preview while dragging a shape
         if (self.active_kind.isShape() and self.shape_in.state == .dragging) {
             if (canvas_rect) |rect| if (self.last_area) |area| {
                 const clip_area: gui.Rect = .{ .x = area.x, .y = area.y, .w = @intCast(area.w), .h = @intCast(area.h) };
                 shape_overlay.draw(&self.ctx, &self.shape_in, rect, self.view_zoom, clip_area);
             };
         }
-        // ツールグリフ + ブラシ footprint 輪郭リング（ソフトオーバーレイ最前面。TASK-75.4）。
-        // hover_screen は「in_canvas かつ非 busy」の時だけ Some（updateCursorAndHover 参照）なので、
-        // stroke/選択ドラッグ/ベジェドラッグ/パン中はここに来ない。
+        // Tool glyph + brush footprint outline ring (soft overlay, topmost).
+        // hover_screen is Some only when "in_canvas and not busy" (see updateCursorAndHover), so
+        // stroke / selection-drag / bezier-drag / pan never reach here.
         if (self.hover_screen) |hs| {
             if (self.last_area) |area| {
                 const clip_area: gui.Rect = .{ .x = area.x, .y = area.y, .w = @intCast(area.w), .h = @intCast(area.h) };
@@ -7197,16 +7197,16 @@ fn appFrameInner(self: *App, win: *platform.Window) !void {
                 }
             }
         }
-        // レイヤー右クリックコンテキストメニュー（TASK-79.2）。popup.zig の「endFrame 後」契約
-        // + 他のオーバーレイ（bezier/selection/cursor）より後に呼ぶことで最前面に描画される。
-        // 呼び出しは毎フレーム無条件でよい（対象 popup が閉じていれば no-op で即返る。
-        // popup.zig の doc comment 参照）。items は selected_layer の現在値から都度算出する
-        // （右クリック時に doSelectLayer 済みなので、以降の全項目は selected_layer に対して動く）。
+        // Layer right-click context menu. popup.zig's post-endFrame contract
+        // + calling after other overlays (bezier/selection/cursor) puts it on top.
+        // Unconditional every-frame calls are fine (returns immediately as a no-op when the target popup is closed;
+        // see popup.zig's doc comment). items are derived each time from the current selected_layer
+        // (doSelectLayer already ran on right-click, so every later item acts on selected_layer).
         {
             const sel_is_text = self.selectedLayerIsText();
             const items = [_]gui.PopupItem{
                 .{ .label = "Add Layer" },
-                .{ .label = "Add Text Layer" }, // TASK-79.5
+                .{ .label = "Add Text Layer" }, // text-layer path
                 .{ .label = "Delete Layer", .enabled = self.canvas.layers.items.len > 1 },
                 .{ .label = "Move Up", .enabled = self.canvas.selected_layer + 1 < self.canvas.layers.items.len },
                 .{ .label = "Move Down", .enabled = self.canvas.selected_layer > 0 },
@@ -7214,9 +7214,9 @@ fn appFrameInner(self: *App, win: *platform.Window) !void {
                 .{ .label = "Duplicate" },
                 .{ .label = "Merge Down", .enabled = self.canvas.selected_layer > 0 and !sel_is_text and
                     self.canvas.layers.items[self.canvas.selected_layer - 1].kind != .text },
-                .{ .label = "Rename..." }, // TASK-79.3
-                .{ .label = "Edit Text...", .enabled = sel_is_text }, // TASK-79.5
-                .{ .label = "Rasterize", .enabled = sel_is_text }, // TASK-79.5
+                .{ .label = "Rename..." }, // layer-name rename path
+                .{ .label = "Edit Text...", .enabled = sel_is_text }, // text-layer path
+                .{ .label = "Rasterize", .enabled = sel_is_text }, // text-layer path
             };
             const ctx_menu_result = self.ctx.popupMenu(LAYER_CTX_MENU_ID, &items);
             if (ctx_menu_result.selected) |sel| {
@@ -7226,7 +7226,7 @@ fn appFrameInner(self: *App, win: *platform.Window) !void {
                     0 => {
                         if (synced) self.routeUi("add_layer", "") else _ = self.doAddLayer() catch {};
                     },
-                    1 => self.doAddTextLayer() catch {}, // action 未登録・relay 対象外
+                    1 => self.doAddTextLayer() catch {}, // action not registered / not a relay target
                     2 => {
                         if (synced) self.routeUiLayerOp("delete_layer", sel_idx) else self.doDeleteLayer(sel_idx) catch {};
                     },
@@ -7255,7 +7255,7 @@ fn appFrameInner(self: *App, win: *platform.Window) !void {
                 }
             }
         }
-        // GUI DrawList は論理座標のまま。scale は render 出口で注入（TASK-156.2/156.4）。
+        // GUI DrawList stays in logical coords. Inject scale at the render exit.
         gui.render(
             .{ .pixels = fb.pixels, .width = phys_w, .height = phys_h },
             &self.ctx.draw_list,
@@ -7263,28 +7263,28 @@ fn appFrameInner(self: *App, win: *platform.Window) !void {
             content_scale,
         );
         win.present();
-    } // ← ここで framebuffer unlock
+    } // ← framebuffer unlock here
 }
 
 fn appFrame(self: *App, win: *platform.Window, now: f64) !bool {
     try appFrameInner(self, win);
 
-    // 安全点: framebuffer unlock 済み・当フレームの入力更新も完了。ここでモーダルを開く。
-    // 終了要求と同フレームで保存/読込が pending でも、終了中はダイアログを開かない。
+    // Safe point: framebuffer unlocked and this frame's input update done. Open modals here.
+    // Even if save/load is pending in the same frame as a quit request, do not open dialogs while quitting.
     if (self.running) self.runPendingFileOp();
 
     if (self.running and self.recovery == null and !platform.netsyncActive()) {
         _ = self.autosave.tick(now, self, snapshotProject) catch |err| self.setSaveMsg("Autosave failed: {s}", .{@errorName(err)});
     }
 
-    // フレーム末尾: 未記録 undoable 編集の検出 → redo 候補の epoch 失効（TASK-62.5.4 §2b）
+    // End of frame: detect unrecorded undoable edits → expire redo-candidate epochs
     self.checkUnrecordedEdits();
 
     return self.running;
 }
 
-/// ライブリサイズ redraw callback（TASK-23.1）。OS モーダルループ中に backend から呼ばれ 1 フレーム描く。
-/// エラーは log して当該フレームを skip（callback は void）。
+/// Live-resize redraw callback. Called from the backend during an OS modal loop to draw one frame.
+/// Errors are logged and that frame is skipped (callback is void).
 fn redrawCb(ctx_ptr: *anyopaque) void {
     const self: *App = @ptrCast(@alignCast(ctx_ptr));
     var win = self.redraw_win orelse return;
