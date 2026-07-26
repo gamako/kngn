@@ -1,12 +1,12 @@
-//! PanelHost — dock-slot panel system (TASK-147).
+//! PanelHost — dock-slot panel system.
 //!
-//! left / right / bottom / center の 4 スロットに分割し、registry の panel を
-//! Collapsible 付きで縦積みする。center は空 box のみで、rect / hit-test をアプリへ返す。
+//! Splits into left / right / bottom / center slots and stacks registry panels
+//! vertically with Collapsible. center is an empty box only; its rect / hit-test go to the app.
 //!
-//! ホットパス宣言:
-//! - layout と registry 走査はフレーム毎だが widget 数オーダー。
-//! - 全画素ループ・RT 経路・per-frame heap allocation / registry 複製は行わない。
-//! - 永続化 hook は初期化時または明示操作時のみ。
+//! Hot-path note:
+//! - layout and registry walks run every frame but are O(widget count).
+//! - No full-framebuffer loops, RT paths, or per-frame heap allocation / registry copies.
+//! - Persistence hooks run only at init or on explicit user action.
 
 const std = @import("std");
 
@@ -41,8 +41,8 @@ pub const Panel = struct {
     open: bool = true,
     build: PanelBuildFn,
     user_data: *anyopaque,
-    /// 表示専用タイトル（null なら name を表示）。ID・永続化キーは常に name 基準なので、
-    /// 「Tool Options — Brush」のような動的タイトルはここを毎フレーム差し替えてよい。
+    /// Display-only title (null = show name). ID and persistence keys always use name, so
+    /// dynamic titles like "Tool Options — Brush" may be swapped here every frame.
     title: ?[]const u8 = null,
 };
 
@@ -51,7 +51,7 @@ pub const SlotOptions = struct {
     extent: i32,
     min_extent: i32,
     max_extent: i32,
-    /// true なら slot 内を縦 ScrollArea で包み、自然高 overflow を scrollbar で扱う。
+    /// If true, wrap the slot in a vertical ScrollArea and handle natural-height overflow with a scrollbar.
     scrollable: bool = false,
 };
 
@@ -123,7 +123,7 @@ const SlotState = struct {
     scroll: Vec2f = .{},
 };
 
-/// IdStack と同じ string hash（root seed → label）。allocator 不要。
+/// Same string hash as IdStack (root seed → label). No allocator.
 fn hashStr(seed: u64, label: []const u8) Id {
     var h = id_mod.fnv1a(seed, &[_]u8{'s'});
     const len: u64 = label.len;
@@ -150,7 +150,7 @@ pub const PanelHost = struct {
     min_center_width: i32,
     min_center_height: i32,
 
-    // 安定 ID（name / slot 由来。registry 並び替えで移らない）
+    // Stable ID (from name / slot; survives registry reordering)
     id_root: Id = idKind("root"),
     id_main: Id = idKind("main"),
     id_content_row: Id = idKind("content_row"),
@@ -185,7 +185,7 @@ pub const PanelHost = struct {
         const right_on = self.slotActive(.right);
         const bottom_on = self.slotActive(.bottom);
 
-        // defer で begin/end 対称を保証（panel callback の error 伝播でも box が開いたまま残らない）
+        // defer keeps begin/end balanced (a panel callback error must not leave a box open)
         ctx.beginBox(.{
             .id = self.id_root,
             .direction = .column,
@@ -314,10 +314,10 @@ pub const PanelHost = struct {
         return ctx.getNodeRect(self.id_center);
     }
 
-    /// hit-test 優先順位: panel → splitter → center → outside。
-    /// （splitter を center より先に見て canvas への誤貫通を防ぐ。リスク節の順序）
+    /// hit-test priority: panel → splitter → center → outside.
+    /// (Check splitter before center so hits do not leak through to the canvas.)
     pub fn hitTest(self: *const PanelHost, ctx: *const Context, point: Vec2) Hit {
-        // panels（visible + slot active）
+        // panels (visible + slot active)
         for (self.panels) |p| {
             if (!p.visible) continue;
             if (!self.slotActiveConst(p.slot)) continue;
@@ -480,7 +480,7 @@ pub const PanelHost = struct {
         return null;
     }
 
-    /// 同一 slot 内の visible panel に対する 0-based index（非表示は数えない）。
+    /// 0-based index among visible panels in the same slot (hidden panels are not counted).
     fn panelIndexInSlot(self: *const PanelHost, name: []const u8, slot: Slot) usize {
         var i: usize = 0;
         for (self.panels) |p| {
@@ -492,8 +492,8 @@ pub const PanelHost = struct {
         return 0;
     }
 
-    /// splitter ドラッグ上限。他 slot の現在 extent と center 最小を差し引いた残り（下限 0）。
-    /// min_extent は保証しない（狭小画面では clampExtents が min 未満へ圧縮し得る）。
+    /// Upper bound for splitter drag. Remainder after subtracting other slots' current extents and center min (floor 0).
+    /// Does not guarantee min_extent (on a narrow screen clampExtents may compress below min).
     fn maxExtentFor(self: *const PanelHost, slot: Slot, ctx: *const Context) i32 {
         const st = self.slotStateConst(slot) orelse return 0;
         switch (slot) {
@@ -519,13 +519,13 @@ pub const PanelHost = struct {
         }
     }
 
-    /// 共有予算クランプ: center の min_center_width / min_center_height を常に優先する。
+    /// Shared-budget clamp: always prefer center's min_center_width / min_center_height.
     ///
-    /// 横軸: budget = content_row.w - min_center_width - (active splitter 合計厚み)。
-    /// left/right をまず [min_extent, max_extent] に寄せ、合計が budget を超える場合は
-    /// **比例配分**で圧縮する（同条件なら同量。下限 0 まで min_extent を下回り得る）。
-    /// 縦軸: bottom も同様に main.h - min_center_height - splitter 厚みを budget とする。
-    /// 前フレーム rect が無い初回は [min_extent, max_extent] のみ適用する。
+    /// Horizontal: budget = content_row.w - min_center_width - (sum of active splitter thicknesses).
+    /// First clamp left/right to [min_extent, max_extent]; if their sum exceeds budget,
+    /// compress by **proportional split** (equal conditions → equal amounts; may go below min_extent down to 0).
+    /// Vertical: bottom uses main.h - min_center_height - splitter thickness as budget the same way.
+    /// On the first frame with no previous-frame rect, only [min_extent, max_extent] applies.
     fn clampExtents(self: *PanelHost, ctx: *const Context) void {
         const left_on = self.slotActiveConst(.left);
         const right_on = self.slotActiveConst(.right);
@@ -549,7 +549,7 @@ pub const PanelHost = struct {
             if (right_on) sum += self.right.extent;
             if (sum > budget) {
                 if (left_on and right_on) {
-                    // 比例配分（丸めは left 側に寄せ、right = budget - left で合計一致）
+                    // Proportional split (rounding favors left; right = budget - left so the sum matches)
                     const new_left = if (sum > 0) @divTrunc(self.left.extent * budget, sum) else 0;
                     self.left.extent = @max(0, new_left);
                     self.right.extent = @max(0, budget - self.left.extent);
@@ -573,7 +573,7 @@ pub const PanelHost = struct {
                 self.bottom.extent = std.math.clamp(self.bottom.extent, self.bottom.min_extent, self.bottom.max_extent);
                 const budget: i32 = @max(0, @as(i32, @intCast(main.h)) - self.min_center_height - self.splitter_thickness);
                 if (self.bottom.extent > budget) {
-                    self.bottom.extent = budget; // min_extent 未満も許容（下限 0）
+                    self.bottom.extent = budget; // Below min_extent is allowed (floor 0)
                 }
             }
         } else if (bottom_on) {
@@ -639,7 +639,7 @@ pub const PanelHost = struct {
         defer ctx.endBox();
 
         if (ctx.beginCollapsible(collapse_id, panel.title orelse panel.name, &panel.open)) {
-            // error 時も endCollapsible を必ず呼び、collapsible_body_depth / layout を壊さない
+            // Always call endCollapsible on error so collapsible_body_depth / layout stay intact
             panel.build(ctx, panel.user_data) catch |err| {
                 ctx.endCollapsible();
                 return err;
@@ -694,7 +694,7 @@ fn frame(host: *PanelHost, ctx: *Context, w: u32, h: u32) !void {
     ctx.endFrame();
 }
 
-test "PanelHost.init: 空名・重複名・center slot を拒否" {
+test "PanelHost.init: rejects empty names, duplicate names, and center slot" {
     var dummy: u8 = 0;
     var panels_empty = [_]Panel{
         .{ .name = "", .slot = .left, .build = noopBuild, .user_data = &dummy },
@@ -713,7 +713,7 @@ test "PanelHost.init: 空名・重複名・center slot を拒否" {
     try std.testing.expectError(error.PanelInCenterSlot, PanelHost.init(panels_center[0..], .{}));
 }
 
-test "PanelHost: left/right/bottom 矩形配置と center" {
+test "PanelHost: left/right/bottom rect placement and center" {
     var ctx = testCtx();
     defer ctx.deinit();
     var dummy: u8 = 0;
@@ -746,7 +746,7 @@ test "PanelHost: left/right/bottom 矩形配置と center" {
     try std.testing.expect(center.y + @as(i32, @intCast(center.h)) <= bottom.y);
 }
 
-test "PanelHost: slot 非表示で splitter/slot が消え center が拡張" {
+test "PanelHost: hiding a slot removes splitter/slot and expands center" {
     var ctx = testCtx();
     defer ctx.deinit();
     var dummy: u8 = 0;
@@ -770,7 +770,7 @@ test "PanelHost: slot 非表示で splitter/slot が消え center が拡張" {
     try std.testing.expect(center_after.w > center_before.w);
 }
 
-test "PanelHost: panel visible=false で callback/rect/hit から除外" {
+test "PanelHost: panel visible=false excludes from callback/rect/hit" {
     var ctx = testCtx();
     defer ctx.deinit();
     var count: u32 = 0;
@@ -790,11 +790,11 @@ test "PanelHost: panel visible=false で callback/rect/hit から除外" {
     try frame(&host, &ctx, 800, 600);
     try std.testing.expectEqual(@as(u32, 0), count);
     try std.testing.expect(host.panelRect(&ctx, "Inspector") == null);
-    // slot に visible panel が無いので slot 自体も消える
+    // No visible panel in the slot, so the slot itself disappears
     try std.testing.expect(host.slotRect(&ctx, .right) == null);
 }
 
-test "PanelHost: 同一 slot の複数 panel が宣言順に縦積み" {
+test "PanelHost: multiple panels in the same slot stack vertically in declaration order" {
     var ctx = testCtx();
     defer ctx.deinit();
     var dummy: u8 = 0;
@@ -812,7 +812,7 @@ test "PanelHost: 同一 slot の複数 panel が宣言順に縦積み" {
     try std.testing.expectEqual(a.x, b.x);
 }
 
-test "PanelHost: Collapsible open/closed で body callback と高さ変化" {
+test "PanelHost: Collapsible open/closed changes body callback and height" {
     var ctx = testCtx();
     defer ctx.deinit();
     var count: u32 = 0;
@@ -834,7 +834,7 @@ test "PanelHost: Collapsible open/closed で body callback と高さ変化" {
     try std.testing.expect(h_closed < h_open);
 }
 
-test "PanelHost: narrow framebuffer で center 最小を残す extent clamp" {
+test "PanelHost: on a narrow framebuffer, extent clamp leaves center min" {
     var ctx = testCtx();
     defer ctx.deinit();
     var dummy: u8 = 0;
@@ -852,16 +852,16 @@ test "PanelHost: narrow framebuffer で center 最小を残す extent clamp" {
         .splitter_thickness = 6,
     });
 
-    // 狭い FB: 400x300
+    // Narrow FB: 400x300
     try frame(&host, &ctx, 400, 300);
     try frame(&host, &ctx, 400, 300);
     const center = host.centerRect(&ctx).?;
-    try std.testing.expect(center.w >= 100); // clamp 後に最低限残る
+    try std.testing.expect(center.w >= 100); // Minimum left after clamp
     try std.testing.expect(center.h >= 100);
     try std.testing.expect(host.left.extent + host.right.extent < 400);
 }
 
-test "PanelHost: zero-size / thick splitter でも panic しない" {
+test "PanelHost: zero-size / thick splitter does not panic" {
     var ctx = testCtx();
     defer ctx.deinit();
     var dummy: u8 = 0;
@@ -879,7 +879,7 @@ test "PanelHost: zero-size / thick splitter でも panic しない" {
     try frame(&host, &ctx, 50, 50);
 }
 
-test "PanelHost: splitter drag で extent が変わり center 最小を維持" {
+test "PanelHost: splitter drag changes extent and keeps center min" {
     var ctx = testCtx();
     defer ctx.deinit();
     var dummy: u8 = 0;
@@ -896,27 +896,27 @@ test "PanelHost: splitter drag で extent が変わり center 最小を維持" {
     const split = ctx.getNodeRect(host.id_split_right).?;
     const c = centerOf(split);
 
-    // 先に splitter 上へ移動（press フレームの大きな delta を避ける）
+    // Move onto the splitter first (avoid a large delta on the press frame)
     ctx.beginFrame(800, 600);
     moveTo(&ctx, c.x, c.y);
     try host.build(&ctx);
     ctx.endFrame();
 
-    // press（移動なし）
+    // press (no move)
     ctx.beginFrame(800, 600);
     ctx.pushEvent(.{ .mouse_down = .{ .x = c.x, .y = c.y, .button = 0, .modifiers = 0 } });
     try host.build(&ctx);
     ctx.endFrame();
     const before = host.right.extent;
 
-    // drag left 40px → invert=true なので right extent += 40
+    // drag left 40px → invert=true so right extent += 40
     ctx.beginFrame(800, 600);
     moveTo(&ctx, c.x - 40, c.y);
     try host.build(&ctx);
     ctx.endFrame();
     try std.testing.expectEqual(before + 40, host.right.extent);
 
-    // 大きく広げても center min を残す
+    // Even a large expand leaves center min intact
     ctx.beginFrame(800, 600);
     moveTo(&ctx, c.x - 2000, c.y);
     try host.build(&ctx);
@@ -954,7 +954,7 @@ test "PanelHost: hit-test panel/center/splitter/outside" {
     try std.testing.expect(host.hitTest(&ctx, .{ .x = -10, .y = -10 }) == .outside);
 }
 
-test "PanelHost: persistence 全フィールド保存・復元" {
+test "PanelHost: persistence saves and restores all fields" {
     var dummy: u8 = 0;
     var panels = [_]Panel{
         .{ .name = "Inspector", .slot = .right, .visible = true, .open = true, .build = noopBuild, .user_data = &dummy },
@@ -985,7 +985,7 @@ test "PanelHost: persistence 全フィールド保存・復元" {
     try std.testing.expect(panels2[1].open);
 }
 
-test "PanelHost: persistence 未知 panel・型不一致・範囲外・未指定を安全に扱う" {
+test "PanelHost: persistence safely handles unknown panel, type mismatch, out of range, and unspecified" {
     var dummy: u8 = 0;
     var panels = [_]Panel{
         .{ .name = "Inspector", .slot = .right, .visible = true, .open = true, .build = noopBuild, .user_data = &dummy },
@@ -995,23 +995,23 @@ test "PanelHost: persistence 未知 panel・型不一致・範囲外・未指定
     });
 
     var store = PersistStore{};
-    // 型不一致
+    // type mismatch
     store.put(.{ .slot = .{ .slot = .right, .field = .extent } }, .{ .boolean = true });
-    // 範囲外
+    // out of range
     store.put(.{ .slot = .{ .slot = .right, .field = .extent } }, .{ .integer = 9999 });
-    // 未知 panel（restore 時に無視）
+    // unknown panel (ignored on restore)
     store.put(.{ .panel = .{ .name = "Ghost", .field = .visible } }, .{ .boolean = false });
-    // 正しい visible
+    // correct visible
     store.put(.{ .slot = .{ .slot = .right, .field = .visible } }, .{ .boolean = false });
 
     host.restore(store.persistence());
     try std.testing.expectEqual(@as(i32, 400), host.right.extent); // clamped
     try std.testing.expect(!host.slotVisible(.right));
-    try std.testing.expect(panels[0].visible); // 未指定のまま
+    try std.testing.expect(panels[0].visible); // left unspecified
     try std.testing.expect(panels[0].open);
 }
 
-test "PanelHost: 安定 ID — registry 並び替えでも open が移らない" {
+test "PanelHost: stable ID — open does not move across registry reorder" {
     var ctx = testCtx();
     defer ctx.deinit();
     var dummy: u8 = 0;
@@ -1027,7 +1027,7 @@ test "PanelHost: 安定 ID — registry 並び替えでも open が移らない"
     try std.testing.expect(ctx.getNodeRect(id_color) != null);
     try std.testing.expect(ctx.getNodeRect(id_layers) != null);
 
-    // 並び替え
+    // reordered
     var panels2 = [_]Panel{
         .{ .name = "Layers", .slot = .right, .open = false, .build = noopBuild, .user_data = &dummy },
         .{ .name = "Color", .slot = .right, .open = true, .build = noopBuild, .user_data = &dummy },
@@ -1041,7 +1041,7 @@ test "PanelHost: 安定 ID — registry 並び替えでも open が移らない"
     try std.testing.expect(!panels2[0].open);
 }
 
-test "PanelHost: panel build error でも begin/end 対称で次フレームへ進める" {
+test "PanelHost: panel build error still keeps begin/end balanced and advances to the next frame" {
     var ctx = testCtx();
     defer ctx.deinit();
     var dummy: u8 = 0;
@@ -1053,16 +1053,16 @@ test "PanelHost: panel build error でも begin/end 対称で次フレームへ�
 
     ctx.beginFrame(800, 600);
     try std.testing.expectError(error.PanelBuildFailed, host.build(&ctx));
-    // box / collapsible が閉じられていれば endFrame の layout_current==root assert を通る
+    // If box / collapsible were closed, endFrame's layout_current==root assert passes
     ctx.endFrame();
 
-    // 次フレーム: beginFrame の !frame_active assert を通る
+    // Next frame: beginFrame's !frame_active assert passes
     panels[0].build = noopBuild;
     try frame(&host, &ctx, 800, 600);
     try std.testing.expect(host.centerRect(&ctx) != null);
 }
 
-test "PanelHost: min_extent 合計超過でも center 最小を優先し slot を圧縮" {
+test "PanelHost: when min_extent sum exceeds budget, prefer center min and compress slots" {
     var ctx = testCtx();
     defer ctx.deinit();
     var dummy: u8 = 0;
@@ -1070,7 +1070,7 @@ test "PanelHost: min_extent 合計超過でも center 最小を優先し slot �
         .{ .name = "L", .slot = .left, .build = noopBuild, .user_data = &dummy },
         .{ .name = "R", .slot = .right, .build = noopBuild, .user_data = &dummy },
     };
-    // min 合計 150+150 + splitter 6+6 + min_center 200 = 512 > 400
+    // min sum 150+150 + splitter 6+6 + min_center 200 = 512 > 400
     var host = try PanelHost.init(panels[0..], .{
         .left = .{ .extent = 200, .min_extent = 150, .max_extent = 800 },
         .right = .{ .extent = 200, .min_extent = 150, .max_extent = 800 },
@@ -1083,13 +1083,13 @@ test "PanelHost: min_extent 合計超過でも center 最小を優先し slot �
 
     const center = host.centerRect(&ctx).?;
     try std.testing.expect(center.w >= 200);
-    // min_extent 未満へ圧縮されていること
+    // Compressed below min_extent
     try std.testing.expect(host.left.extent < 150);
     try std.testing.expect(host.right.extent < 150);
     try std.testing.expect(host.left.extent + host.right.extent + 12 + @as(i32, @intCast(center.w)) <= 400);
 }
 
-test "PanelHost: left/right 同条件なら比例圧縮で同量" {
+test "PanelHost: equal left/right conditions compress by the same proportional amount" {
     var ctx = testCtx();
     defer ctx.deinit();
     var dummy: u8 = 0;
@@ -1128,7 +1128,7 @@ fn bottomMarkerBuild(ctx: *Context, user_data: *anyopaque) anyerror!void {
     ctx.endBox();
 }
 
-test "PanelHost: scrollable slot — content overflow で scrollbar と offset clamp" {
+test "PanelHost: scrollable slot — content overflow yields scrollbar and offset clamp" {
     var ctx = testCtx();
     defer ctx.deinit();
     var tall_h: usize = 120;
@@ -1154,7 +1154,7 @@ test "PanelHost: scrollable slot — content overflow で scrollbar と offset c
     try std.testing.expect(top.y < bottom.y);
 }
 
-test "PanelHost: scrollable slot — wheel で下側 panel が viewport 内へ入る" {
+test "PanelHost: scrollable slot — wheel brings a lower panel into the viewport" {
     var ctx = testCtx();
     defer ctx.deinit();
     var tall_h: usize = 100;
@@ -1185,7 +1185,7 @@ test "PanelHost: scrollable slot — wheel で下側 panel が viewport 内へ�
     try std.testing.expect(after.y + @as(i32, @intCast(after.h)) <= slot.y + @as(i32, @intCast(slot.h)) + 2);
 }
 
-test "PanelHost: non-scrollable slot は scrollable 回帰なし（scrollbar 無し）" {
+test "PanelHost: non-scrollable slot has no scrollable regression (no scrollbar)" {
     var ctx = testCtx();
     defer ctx.deinit();
     var tall_h: usize = 120;
@@ -1205,7 +1205,7 @@ test "PanelHost: non-scrollable slot は scrollable 回帰なし（scrollbar 無
     try std.testing.expectEqual(@as(f32, 0), host.right.scroll.y);
 }
 
-test "PanelHost: scrollable slot — clip 外 panel は hitTest されない" {
+test "PanelHost: scrollable slot — panels outside clip are not hitTested" {
     var ctx = testCtx();
     defer ctx.deinit();
     var tall_h: usize = 140;
@@ -1239,7 +1239,7 @@ test "PanelHost: scrollable slot — clip 外 panel は hitTest されない" {
     try std.testing.expectEqual(@as(usize, 1), hit.panel.index);
 }
 
-test "PanelHost: scrollable slot — panel build error 後も次フレームへ進める" {
+test "PanelHost: scrollable slot — advances to the next frame after a panel build error" {
     var ctx = testCtx();
     defer ctx.deinit();
     var dummy: u8 = 0;
@@ -1264,7 +1264,7 @@ test "PanelHost: scrollable slot — panel build error 後も次フレームへ�
 // ── in-memory persistence for tests ──────────────────────────
 
 const PersistStore = struct {
-    // 固定サイズの簡易 KV（テスト用）
+    // Fixed-size simple KV (for tests)
     entries: [64]Entry = undefined,
     len: usize = 0,
 
@@ -1339,7 +1339,7 @@ const PersistStore = struct {
     }
 };
 
-test "PanelHost: title は表示専用で ID/永続化は name 基準のまま" {
+test "PanelHost: title is display-only; ID/persistence stay name-based" {
     var ctx = testCtx();
     defer ctx.deinit();
     var dummy: u8 = 0;
@@ -1350,16 +1350,16 @@ test "PanelHost: title は表示専用で ID/永続化は name 基準のまま" 
     try frame(&host, &ctx, 800, 600);
     try frame(&host, &ctx, 800, 600);
 
-    // name 基準の rect/操作が title 設定後も機能する（ID は name から生成）
+    // name-based rect/ops still work after title is set (ID is derived from name)
     try std.testing.expect(host.panelRect(&ctx, "Tool Options") != null);
     try std.testing.expect(host.setPanelOpen("Tool Options", false));
-    panels[0].title = "Tool Options — Fill"; // 毎フレーム差し替え可
+    panels[0].title = "Tool Options — Fill"; // May be swapped every frame
     try frame(&host, &ctx, 800, 600);
     try frame(&host, &ctx, 800, 600);
-    // title を変えても open 状態（name 基準 ID）が保持される
+    // Changing title keeps open state (name-based ID)
     try std.testing.expect(!panels[0].open);
 
-    // 永続化キーも name 基準（title は persist に現れない）
+    // Persistence keys are also name-based (title does not appear in persist)
     var store = PersistStore{};
     try host.persist(store.persistence());
     var found_name = false;
