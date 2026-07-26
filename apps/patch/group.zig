@@ -1,14 +1,14 @@
-//! apps/patch: グループ/マクロ台帳（TASK-40.7.1）。
+//! apps/patch: the group/macro ledger.
 //!
-//! platform / gui / modular を import しない純 Zig（canvas.zig と同格）。型は canvas.zig から import する。
-//! 固定確保・アロケーション無し。display/audio 無しで単体テストできる（test-patch）。
+//! Pure Zig with no platform / gui / modular imports (on par with canvas.zig). Types are imported from canvas.zig.
+//! Fixed allocation only, no dynamic allocation. Unit-testable without display/audio (test-patch).
 //!
-//! 設計（案 A）: マクロのメンバーは通常のプリミティブモジュールとして DynGraph 上の handle を持つ。
-//! 「どの handle がどのマクロに属すか / 畳んでいるか / 外向きポートはどれか」は main（UI）側のこの台帳が持ち、
-//! publish には一切載せない（RT のグラフ記述とは完全分離。AC#3）。展開/畳みは純粋に表示の写像。
+//! Design: a macro's members are ordinary primitive modules, each holding a handle on the DynGraph.
+//! Which handle belongs to which macro, whether it is collapsed, and which ports are exposed outward are held by this ledger on the main (UI) side,
+//! and none of it is ever published (fully separate from the RT graph description). Expand/collapse is purely a display-side mapping.
 //!
-//! **合成 handle（>= GROUP_HANDLE_BASE）は canvas 幾何関数の引数/返り値の中だけで使う**。dyn accessor・
-//! app.layout[h] の index・dyn.disconnect の引数へは決して渡さない（main.zig 側の呼び出し規約）。
+//! **A synthetic handle (>= GROUP_HANDLE_BASE) is used only as an argument/return value of canvas geometry functions.** It must never be passed to dyn
+//! accessors, the app.layout[h] index, or dyn.disconnect (a calling convention enforced on the main.zig side).
 
 const std = @import("std");
 const canvas = @import("canvas.zig");
@@ -24,18 +24,18 @@ pub const MAX_GROUPS = 8;
 pub const GroupId = u8;
 pub const MAX_EXPOSED = 8;
 
-/// == libs/modular/src/dyn.zig の MAX_MODULES。group.zig は modular を import しないため
-/// 同じ build_options.max_modules を読む（modular 依存ではない。TASK-146）。
-/// canvas.Handle は u16 なので GROUP_HANDLE_BASE..BASE+MAX_GROUPS は実 handle 空間と衝突しない。
-/// main.zig 側で `comptime { if (group.GROUP_HANDLE_BASE != modular.dyn.MAX_MODULES) @compileError(...) }` により
-/// 数値の食い違いを検出する。
+/// == libs/modular/src/dyn.zig's MAX_MODULES. Since group.zig does not import modular, it
+/// reads the same build_options.max_modules instead (no dependency on modular).
+/// Since canvas.Handle is u16, GROUP_HANDLE_BASE..BASE+MAX_GROUPS never collides with the real handle space.
+/// On the main.zig side, `comptime { if (group.GROUP_HANDLE_BASE != modular.dyn.MAX_MODULES) @compileError(...) }`
+/// detects any numeric mismatch.
 pub const GROUP_HANDLE_BASE: usize = @import("build_options").max_modules;
 
-/// == modular.signal.MAX_OUT。port id = handle * MAX_OUT_PORTS + out_index。
-/// group.zig は modular 非依存のため複製（resolveExposedPort 用）。
+/// == modular.signal.MAX_OUT. port id = handle * MAX_OUT_PORTS + out_index.
+/// Duplicated here for resolveExposedPort since group.zig is modular-independent.
 pub const MAX_OUT_PORTS: u32 = 4;
 
-/// 40.7.1: drum_machine / 40.7.2: bass_machine を追加。台帳・expose 導出・表示写像は kind 非依存で共通。
+/// drum_machine and bass_machine are supported kinds. The ledger, expose derivation, and display mapping are all kind-independent and shared.
 pub const MacroKind = enum {
     drum_machine,
     bass_machine,
@@ -48,7 +48,7 @@ pub const MacroKind = enum {
     }
 };
 
-/// 畳んだ箱 / 展開時の実メンバーポートへの alias 1 個。
+/// One alias, either to a collapsed box or to a real member port when expanded.
 pub const ExposedPort = struct {
     member: Handle = 0,
     port: u8 = 0,
@@ -57,7 +57,7 @@ pub const ExposedPort = struct {
     label_len: u8 = 0,
 };
 
-/// label を書き込む（8B 超は切り詰め）。イベント時のみ。
+/// Writes the label (truncated beyond 8B). Event-time only.
 pub fn setLabel(ep: *ExposedPort, text: []const u8) void {
     const n = @min(text.len, ep.label.len);
     @memcpy(ep.label[0..n], text[0..n]);
@@ -69,31 +69,31 @@ pub const Group = struct {
     active: bool = false,
     kind: MacroKind = .drum_machine,
     collapsed: bool = true,
-    /// 0 は kind ごとの既定値（パレット macro の drum=2 / bass=4）を使う。
-    /// 生成 macro は表示 lane 数を明示する（生成 drum=3 / bass=4）。UI ローカルのみ。
+    /// 0 uses the per-kind default (palette macro drum=2 / bass=4).
+    /// A generated macro states its display lane count explicitly (generated drum=3 / bass=4). UI-local only.
     grid_rows: u8 = 0,
     pos: Vec2f = .{ .x = 0, .y = 0 },
     exposed_in: [MAX_EXPOSED]ExposedPort = [_]ExposedPort{.{}} ** MAX_EXPOSED,
     n_in: u8 = 0,
     exposed_out: [MAX_EXPOSED]ExposedPort = [_]ExposedPort{.{}} ** MAX_EXPOSED,
     n_out: u8 = 0,
-    /// 先頭 template_n_in/out 件は「テンプレ明示」の expose（deriveExposed が接続の有無に関わらず常に保持。
-    /// 所属メンバーが個別削除された分だけ縮む）。残り（n_in-template_n_in 件等）は「境界跨ぎ自動」で
-    /// deriveExposed の呼び出しごとに再計算・再配置される（(member,port) 昇順で安定）。
+    /// The first template_n_in/out entries are the "explicit template" exposes (deriveExposed always keeps them regardless of connection state;
+    /// they shrink only when their owning member is individually removed). The rest (n_in-template_n_in entries, etc.) are "automatic boundary-crossing" exposes,
+    /// recomputed and repositioned on every deriveExposed call (stable, ordered ascending by (member,port)).
     template_n_in: u8 = 0,
     template_n_out: u8 = 0,
 };
 
-/// visual=描画/ヒットテスト用の写像済み端点（collapsed グループのメンバー端点は箱の合成 handle+exposed
-/// index に写像）。actual=常に実接続の CableRef（選択/削除/drag-off はこちらを使い、合成 handle を
-/// dyn.disconnect へ渡さない）。
+/// visual = the mapped endpoint used for drawing/hit-testing (a collapsed group's member endpoint is mapped to the box's synthetic handle + exposed
+/// index). actual = always the real connection's CableRef (used for select/delete/drag-off; a synthetic handle
+/// is never passed to dyn.disconnect).
 pub const DisplayEdge = struct {
     visual: Edge,
     actual: CableRef,
 };
 
-/// 畳み箱の TR/303 grid の行数（箱高さ拡張用。drum=2 レーン、bass=on/accent/slide 3 行 + pitch 段 1 行）。
-/// クリック可能な mask 行数（drum=2 / bass=3）とは別（pitch 段は表示のみ）。canvas.NodeGeom.grid_rows へ渡す。
+/// The number of TR/303 grid rows in a collapsed box, used to extend the box height (drum=2 lanes; bass=on/accent/slide 3 rows plus a 1-row pitch band).
+/// Distinct from the clickable mask row count (drum=2 / bass=3); the pitch band is display-only. Passed to canvas.NodeGeom.grid_rows.
 pub fn gridRowsForBox(kind: MacroKind) u8 {
     return switch (kind) {
         .drum_machine => 2,
@@ -101,7 +101,7 @@ pub fn gridRowsForBox(kind: MacroKind) u8 {
     };
 }
 
-/// gid ⇔ 合成 handle の変換（両側境界。OOB を閉じる）。
+/// Converts between a gid and its synthetic handle (bidirectional; out-of-bounds values are rejected).
 pub fn handleOfGroup(gid: GroupId) Handle {
     return @intCast(GROUP_HANDLE_BASE + @as(usize, gid));
 }
@@ -110,15 +110,15 @@ pub fn groupIdFromHandle(h: Handle) ?GroupId {
     return @intCast(@as(usize, h) - GROUP_HANDLE_BASE);
 }
 
-/// display handle（実 or 合成箱）を実 global 出力 port id（handle*MAX_OUT_PORTS+out）へ解決。
-/// out0 を代表とする。解決不能（出力なし/非 active/合成箱の expose なし）は -1。
+/// Resolves a display handle (real or a synthetic box) to a real global output port id (handle*MAX_OUT_PORTS+out).
+/// out0 is the representative. Returns -1 when unresolvable (no output / inactive / a synthetic box with no expose).
 ///
-/// `dyn_check` は `slotActive(Handle) bool` と `nOut(Handle) u8` を持つ duck-typed 値
-/// （DynGraph 実型を import せず modular 非依存を保つ。TASK-171）。
+/// `dyn_check` is a duck-typed value with `slotActive(Handle) bool` and `nOut(Handle) u8`
+/// (this keeps modular independence by not importing the real DynGraph type).
 ///
-/// TASK-170 契約: 戻り値（実 port id）と display handle は別軸。
-/// ①合成箱 handle 不変でも exposed_out[0] の member/port が変われば戻り値が変わる。
-/// ②別 display handle が同じ実 member/port を指せば戻り値は同じになりうる。
+/// Contract: the return value (a real port id) and the display handle are independent axes.
+/// (1) Even if a synthetic box handle is unchanged, the return value changes if exposed_out[0]'s member/port changes.
+/// (2) Different display handles can yield the same return value if they point at the same real member/port.
 pub fn resolveExposedPort(ledger: *const Ledger, dyn_check: anytype, dh: Handle) i32 {
     if (groupIdFromHandle(dh)) |gid| {
         const g = ledger.groups[gid];
@@ -131,18 +131,18 @@ pub fn resolveExposedPort(ledger: *const Ledger, dyn_check: anytype, dh: Handle)
     return @intCast(@as(u32, dh) * MAX_OUT_PORTS); // out0
 }
 
-/// handle→所属 GroupId。**Ph7 は 1 レベル限定**（Group に parent 無し。将来ネストは Group.parent 追加で
-/// 拡張できる形に留めるが実装しない＝過剰設計回避）。
+/// Maps a handle to its owning GroupId. **Currently limited to one level** (a Group has no parent). Nesting could be added later via a Group.parent field,
+/// but is left unimplemented to avoid over-engineering.
 pub const Ledger = struct {
     groups: [MAX_GROUPS]Group = [_]Group{.{}} ** MAX_GROUPS,
-    /// 実 handle（< GROUP_HANDLE_BASE）→ 所属 GroupId。合成 handle は index しない。
+    /// A real handle (< GROUP_HANDLE_BASE) maps to its owning GroupId. Synthetic handles are not indexed.
     group_of: [GROUP_HANDLE_BASE]?GroupId = [_]?GroupId{null} ** GROUP_HANDLE_BASE,
 
     // ------------------------------------------------------------------
-    // ライフサイクル（イベント時のみ）
+    // Lifecycle (event-time only)
     // ------------------------------------------------------------------
 
-    /// 空き group slot を確保する（無ければ null）。
+    /// Allocates a free group slot (null if none is available).
     pub fn alloc(self: *Ledger) ?GroupId {
         for (&self.groups, 0..) |*g, i| {
             if (!g.active) {
@@ -153,7 +153,7 @@ pub const Ledger = struct {
         return null;
     }
 
-    /// group を解放し、所属メンバーの group_of もクリアする。
+    /// Frees a group and clears group_of for its members.
     pub fn free(self: *Ledger, gid: GroupId) void {
         if (gid >= MAX_GROUPS or !self.groups[gid].active) return;
         for (&self.group_of) |*go| {
@@ -162,14 +162,14 @@ pub const Ledger = struct {
         self.groups[gid] = .{};
     }
 
-    /// 実 handle h を group gid のメンバーとして登録する。h が合成 handle（>= GROUP_HANDLE_BASE）や
-    /// gid が範囲外なら無視する（1 レベル制約: グループがグループのメンバーにはなれない）。
+    /// Registers real handle h as a member of group gid. If h is a synthetic handle (>= GROUP_HANDLE_BASE)
+    /// or gid is out of range, the call is ignored (a one-level constraint: a group cannot be a member of another group).
     pub fn assign(self: *Ledger, h: Handle, gid: GroupId) void {
         if (h >= GROUP_HANDLE_BASE or gid >= MAX_GROUPS) return;
         self.group_of[h] = gid;
     }
 
-    /// h の所属を外す。所属先グループが 0 メンバーになったら自動消滅（free 相当）。
+    /// Removes h's membership. If the owning group drops to 0 members, it is automatically freed.
     pub fn unassign(self: *Ledger, h: Handle) void {
         if (h >= GROUP_HANDLE_BASE) return;
         const gid = self.group_of[h] orelse return;
@@ -191,14 +191,14 @@ pub const Ledger = struct {
     }
 
     // ------------------------------------------------------------------
-    // expose 導出（イベント時のみ。接続変更のたびに main が呼ぶ）
+    // Expose derivation (event-time only; main calls this on every connection change)
     // ------------------------------------------------------------------
 
-    /// gid の expose 表を「テンプレ明示（先頭固定・現存メンバーのみ再検証）」∪「境界跨ぎ自動
-    /// （グループ外ノードと接続済みのメンバーポートを (member,port) 昇順で追加）」で書き換える。
+    /// Rewrites gid's expose table as the union of "explicit template" (fixed prefix, re-validated against current members only) and "automatic
+    /// boundary-crossing" (member ports connected to a node outside the group, added in ascending (member,port) order).
     ///
-    /// 事前条件: flat_edges は実 handle のみ（buildFlatEdges の結果。DisplayEdge.visual や合成 handle を
-    /// 含む edge を渡すのは呼び出し側のバグ）。synthetic handle 混入は debug assert で落とす。
+    /// Precondition: flat_edges contains only real handles (the result of buildFlatEdges). Passing an edge that contains
+    /// DisplayEdge.visual or a synthetic handle is a caller bug; a mixed-in synthetic handle triggers a debug assert.
     pub fn deriveExposed(self: *Ledger, gid: GroupId, flat_edges: []const Edge) void {
         if (gid >= MAX_GROUPS) return;
         const g = &self.groups[gid];
@@ -209,7 +209,7 @@ pub const Ledger = struct {
             std.debug.assert(e.dst_handle < GROUP_HANDLE_BASE);
         }
 
-        // 1) テンプレ明示を現存メンバーのみで再パック（個別削除された member の分は落ちる）。
+        // 1) Repack the explicit template using only current members (entries for individually removed members are dropped).
         var new_in: [MAX_EXPOSED]ExposedPort = [_]ExposedPort{.{}} ** MAX_EXPOSED;
         var n_in: u8 = 0;
         {
@@ -238,7 +238,7 @@ pub const Ledger = struct {
         }
         const kept_template_out = n_out;
 
-        // 2) 境界跨ぎ自動候補を収集（テンプレと重複しない分だけ、(member,port) 重複除去）。
+        // 2) Collect automatic boundary-crossing candidates (only those not duplicating the template, de-duplicated by (member,port)).
         var cand_in: [MAX_EXPOSED]ExposedPort = undefined;
         var cand_in_n: usize = 0;
         var cand_out: [MAX_EXPOSED]ExposedPort = undefined;
@@ -270,7 +270,7 @@ pub const Ledger = struct {
         sortExposed(cand_in[0..cand_in_n]);
         sortExposed(cand_out[0..cand_out_n]);
 
-        // 3) テンプレの後ろに追加（容量超過分は捨てる。MAX_EXPOSED=8 に対し想定メンバー数は十分小さい）。
+        // 3) Append them after the template (entries beyond capacity are discarded; the expected member count is well within MAX_EXPOSED=8).
         for (cand_in[0..cand_in_n]) |ep| {
             if (n_in >= MAX_EXPOSED) break;
             new_in[n_in] = ep;
@@ -291,18 +291,18 @@ pub const Ledger = struct {
     }
 
     // ------------------------------------------------------------------
-    // 表示写像（フレーム毎・純関数。main が呼ぶ）
+    // Display mapping (per-frame, pure function; called by main)
     // ------------------------------------------------------------------
 
-    /// collapsed グループのメンバーを除外し、代わりに箱 NodeGeom を 1 個追加した表示用ノード列を書く。
-    /// expanded グループのメンバーはそのまま通常表示（flat_nodes をそのまま通す）。
-    /// フレーム毎（ノード数十個規模。全画素ではない）。
+    /// Writes a display node list that excludes a collapsed group's members and adds one box NodeGeom in their place.
+    /// An expanded group's members are shown normally, passed through from flat_nodes unchanged.
+    /// Runs every frame, over on the order of tens of nodes (not per-pixel).
     pub fn mapNodesForCollapsed(self: *const Ledger, flat_nodes: []const NodeGeom, out: []NodeGeom) usize {
         var n: usize = 0;
         for (flat_nodes) |ng| {
             if (ng.handle < GROUP_HANDLE_BASE) {
                 if (self.group_of[ng.handle]) |gid| {
-                    if (self.groups[gid].collapsed) continue; // 畳み時はメンバー非表示（箱側で表現）
+                    if (self.groups[gid].collapsed) continue; // Members are hidden while collapsed (represented by the box instead)
                 }
             }
             if (n < out.len) {
@@ -325,12 +325,12 @@ pub const Ledger = struct {
         return n;
     }
 
-    /// flat edge を表示用に写像する。collapsed グループ内メンバーの端点は箱ポート（合成 handle + exposed
-    /// index）へ写像（visual）。actual は常に実接続（CableRef）。両端が同一 collapsed グループ内部の edge は
-    /// 除外（非表示）。フレーム毎（edge 数十本規模）。
+    /// Maps a flat edge for display. An endpoint on a member inside a collapsed group is mapped to the box's port (synthetic handle + exposed
+    /// index) as `visual`; `actual` is always the real connection (CableRef). An edge whose both ends are inside the same collapsed group is
+    /// excluded (hidden). Runs every frame, over on the order of tens of edges.
     pub fn buildDisplayEdges(self: *const Ledger, flat_edges: []const Edge, out: []DisplayEdge) usize {
-        // deriveExposed と同じく flat edge（実 handle のみ）を事前条件とする。synthetic handle を混ぜると
-        // 下の group_of[e.*_handle] が OOB index になるので早期に落とす（誤投入の防御）。
+        // As with deriveExposed, the precondition is a flat edge (real handles only). Mixing in a synthetic handle
+        // would make group_of[e.*_handle] below an out-of-bounds index, so it is rejected early as a guard against misuse.
         for (flat_edges) |e| {
             std.debug.assert(e.src_handle < GROUP_HANDLE_BASE);
             std.debug.assert(e.dst_handle < GROUP_HANDLE_BASE);
@@ -342,7 +342,7 @@ pub const Ledger = struct {
             const src_collapsed = if (src_gid) |gid| self.groups[gid].collapsed else false;
             const dst_collapsed = if (dst_gid) |gid| self.groups[gid].collapsed else false;
             if (src_gid != null and dst_gid != null and src_gid.? == dst_gid.? and src_collapsed) {
-                continue; // 同一 collapsed グループ内部 edge は非表示
+                continue; // An edge entirely inside the same collapsed group is hidden
             }
             var visual = e;
             if (src_collapsed) {
@@ -369,8 +369,8 @@ pub const Ledger = struct {
         return n;
     }
 
-    /// 合成 PortRef を exposed 表で実メンバーの PortRef へ解決する。実 handle（非合成）はそのまま返す
-    /// （呼び出し側は合成かどうかを事前判定せず常に resolvePort を通せる）。範囲外の gid/index は null。
+    /// Resolves a synthetic PortRef to a real member's PortRef via the expose table. A real (non-synthetic) handle is returned unchanged,
+    /// so the caller can always route through resolvePort without pre-checking whether a handle is synthetic. An out-of-range gid/index yields null.
     pub fn resolvePort(self: *const Ledger, pr: PortRef) ?PortRef {
         const gid = groupIdFromHandle(pr.handle) orelse return pr;
         if (gid >= MAX_GROUPS or !self.groups[gid].active) return null;
@@ -394,7 +394,7 @@ fn findExposedIndex(list: []const ExposedPort, member: Handle, port: u8) ?u8 {
     return null;
 }
 
-/// (member,port) 昇順の挿入ソート（件数は MAX_EXPOSED=8 以下）。
+/// An insertion sort ordered ascending by (member,port); the count is at most MAX_EXPOSED=8.
 fn sortExposed(list: []ExposedPort) void {
     var i: usize = 1;
     while (i < list.len) : (i += 1) {
@@ -410,7 +410,7 @@ fn sortExposed(list: []ExposedPort) void {
 }
 
 // ============================================================================
-// tests（display/audio 不要。test-patch）
+// tests (no display/audio needed; test-patch)
 // ============================================================================
 const testing = std.testing;
 
@@ -425,7 +425,7 @@ test "group: groupIdFromHandle boundary (both ends) and handleOfGroup round-trip
     }
 }
 
-/// resolveExposedPort 用ダミー（DynGraph 無し。slotActive 常 true / nOut 常 >0）。
+/// A dummy for resolveExposedPort (no DynGraph; slotActive is always true, nOut is always >0).
 const DynAlwaysOk = struct {
     fn slotActive(_: @This(), _: Handle) bool {
         return true;
@@ -435,8 +435,8 @@ const DynAlwaysOk = struct {
     }
 };
 
-// TASK-171 ケース A: 合成 handle と実 member handle が同じ exposed 実 port を指す → 戻り値一致
-// （display handle が違っても実 port ID が同じなら updateViz は republish しない契約の単体相当）。
+// Case A: a synthetic handle and the real member handle point at the same exposed real port -> the return values match
+// (the unit-level equivalent of the contract that updateViz does not republish when the real port ID is unchanged even if the display handle differs).
 test "group: resolveExposedPort same real port via synthetic and member handle" {
     var l = Ledger{};
     const gid = l.alloc().?;
@@ -453,8 +453,8 @@ test "group: resolveExposedPort same real port via synthetic and member handle" 
     try testing.expectEqual(@as(i32, @intCast(15 * MAX_OUT_PORTS)), via_group);
 }
 
-// TASK-171 ケース B: 同じ合成 handle のまま exposed_out[0] を差し替え → 戻り値が変わる
-// （handle 不変でも実 port ID 変化を検出できる契約）。
+// Case B: keeping the same synthetic handle but replacing exposed_out[0] -> the return value changes
+// (the contract that a real port ID change is detected even when the handle is unchanged).
 test "group: resolveExposedPort changes when exposed_out member/port swaps on same handle" {
     var l = Ledger{};
     const gid = l.alloc().?;
@@ -483,21 +483,21 @@ test "group: alloc/assign/free lifecycle + auto-vanish on last unassign" {
     l.assign(11, gid);
     try testing.expectEqual(@as(?GroupId, gid), l.group_of[10]);
     l.unassign(10);
-    try testing.expect(l.groups[gid].active); // まだ 1 メンバー残る
+    try testing.expect(l.groups[gid].active); // One member still remains
     l.unassign(11);
-    try testing.expect(!l.groups[gid].active); // 0 メンバーで自動消滅
+    try testing.expect(!l.groups[gid].active); // Auto-freed at 0 members
     try testing.expectEqual(@as(?GroupId, null), l.group_of[10]);
 }
 
 test "group: assign ignores synthetic handle (1-level nesting guard)" {
     var l = Ledger{};
     const gid = l.alloc().?;
-    l.assign(handleOfGroup(0), gid); // 合成 handle は無視（グループがグループのメンバーにはなれない）
+    l.assign(handleOfGroup(0), gid); // A synthetic handle is ignored (a group cannot be a member of another group)
     try testing.expectEqual(@as(?GroupId, null), l.group_of[0]);
 }
 
-/// DrumMachine 相当のテスト用固定シナリオ: 外部 clock(0) → cdiv(10) → seqK(11)/seqH(12) →
-/// kick(13)/hat(14) → mix(15) → 外部 output(20)。cdiv.in0 と mix.out0 がテンプレ明示 expose。
+/// A fixed test scenario equivalent to a DrumMachine: external clock(0) -> cdiv(10) -> seqK(11)/seqH(12) ->
+/// kick(13)/hat(14) -> mix(15) -> external output(20). cdiv.in0 and mix.out0 are the explicit-template exposes.
 const Scenario = struct {
     l: Ledger = .{},
     gid: GroupId = 0,
@@ -519,14 +519,14 @@ const Scenario = struct {
 
     fn flatEdges(buf: []Edge) []Edge {
         const es = [_]Edge{
-            .{ .src_handle = 0, .src_out = 0, .dst_handle = 10, .dst_in = 0 }, // 外部 clock -> cdiv.in0（テンプレと重複）
+            .{ .src_handle = 0, .src_out = 0, .dst_handle = 10, .dst_in = 0 }, // external clock -> cdiv.in0 (duplicates the template)
             .{ .src_handle = 10, .src_out = 0, .dst_handle = 11, .dst_in = 0 },
             .{ .src_handle = 10, .src_out = 0, .dst_handle = 12, .dst_in = 0 },
             .{ .src_handle = 11, .src_out = 0, .dst_handle = 13, .dst_in = 0 },
             .{ .src_handle = 12, .src_out = 0, .dst_handle = 14, .dst_in = 0 },
             .{ .src_handle = 13, .src_out = 0, .dst_handle = 15, .dst_in = 0 },
             .{ .src_handle = 14, .src_out = 0, .dst_handle = 15, .dst_in = 1 },
-            .{ .src_handle = 15, .src_out = 0, .dst_handle = 20, .dst_in = 0 }, // mix.out0 -> 外部 output（テンプレと重複）
+            .{ .src_handle = 15, .src_out = 0, .dst_handle = 20, .dst_in = 0 }, // mix.out0 -> external output (duplicates the template)
         };
         @memcpy(buf[0..es.len], &es);
         return buf[0..es.len];
@@ -551,8 +551,8 @@ test "group: deriveExposed adds boundary-crossing auto ports sorted by (member,p
     var es_buf: [16]Edge = undefined;
     const base = Scenario.flatEdges(&buf);
     @memcpy(es_buf[0..base.len], base);
-    // 追加の境界跨ぎ fan-out: kick(13)/hat(14) の audio out がそれぞれ別の外部ノード（< GROUP_HANDLE_BASE の
-    // 実 handle。ここでは 30/31）へも直結（出力は fan-out 可）。
+    // Additional boundary-crossing fan-out: kick(13)'s and hat(14)'s audio out each also connect directly to a separate external node (a real handle
+    // below GROUP_HANDLE_BASE; here 30/31), since an output can fan out.
     es_buf[base.len] = .{ .src_handle = 14, .src_out = 0, .dst_handle = 31, .dst_in = 0 };
     es_buf[base.len + 1] = .{ .src_handle = 13, .src_out = 0, .dst_handle = 30, .dst_in = 0 };
     const edges = es_buf[0 .. base.len + 2];
@@ -560,38 +560,38 @@ test "group: deriveExposed adds boundary-crossing auto ports sorted by (member,p
     s.l.deriveExposed(s.gid, edges);
     const g = s.l.groups[s.gid];
     try testing.expectEqual(@as(u8, 3), g.n_out);
-    try testing.expectEqual(@as(Handle, 15), g.exposed_out[0].member); // テンプレが先頭
-    try testing.expectEqual(@as(Handle, 13), g.exposed_out[1].member); // 自動は member 昇順
+    try testing.expectEqual(@as(Handle, 15), g.exposed_out[0].member); // The template comes first
+    try testing.expectEqual(@as(Handle, 13), g.exposed_out[1].member); // Automatic entries are ordered ascending by member
     try testing.expectEqual(@as(Handle, 14), g.exposed_out[2].member);
-    try testing.expectEqual(@as(u8, 1), g.n_in); // 入力側は変化なし
+    try testing.expectEqual(@as(u8, 1), g.n_in); // The input side is unchanged
 }
 
 test "group: deriveExposed drops template entry whose member left the group" {
     var s = Scenario.init();
-    s.l.unassign(15); // mix を個別削除（メンバー 0 にはならない = グループは残る）
-    // kick/hat->mix の内部 edge を含む Scenario.flatEdges をそのまま使うと、mix が非メンバーになった
-    // ことで kick/hat の audio out が新たに境界跨ぎ扱いになる（宙に浮いたケーブルの自動 expose
-    // フォールバック。これは意図した挙動で別テストの対象）。ここでは「テンプレ entry が消えること」だけを
-    // 単純に確認するため、その 2 本を含まない最小 edge 列を使う。
+    s.l.unassign(15); // mix is individually removed (member count doesn't reach 0, so the group remains)
+    // Using Scenario.flatEdges as-is, which includes the internal kick/hat->mix edges, would mean that once mix is no longer a member,
+    // kick/hat's audio out would newly count as boundary-crossing (an automatic-expose fallback for a cable left dangling;
+    // this is intended behavior and covered by a separate test). Here we only confirm that the template entry disappears,
+    // so a minimal edge list excluding those two edges is used.
     const edges = [_]Edge{
-        .{ .src_handle = 0, .src_out = 0, .dst_handle = 10, .dst_in = 0 }, // 外部 clock -> cdiv.in0
-        .{ .src_handle = 15, .src_out = 0, .dst_handle = 20, .dst_in = 0 }, // mix(非メンバー) -> 外部 output
+        .{ .src_handle = 0, .src_out = 0, .dst_handle = 10, .dst_in = 0 }, // external clock -> cdiv.in0
+        .{ .src_handle = 15, .src_out = 0, .dst_handle = 20, .dst_in = 0 }, // mix (non-member) -> external output
     };
     s.l.deriveExposed(s.gid, &edges);
     const g = s.l.groups[s.gid];
-    try testing.expectEqual(@as(u8, 0), g.n_out); // mix が居ないので audio out expose は消える（両端非メンバーで無視）
-    try testing.expectEqual(@as(u8, 1), g.n_in); // cdiv 側は無事
+    try testing.expectEqual(@as(u8, 0), g.n_out); // Since mix is absent, the audio out expose disappears (both ends are non-members, so it is ignored)
+    try testing.expectEqual(@as(u8, 1), g.n_in); // The cdiv side is unaffected
 }
 
 test "group: deriveExposed re-exposes a dangling internal port as boundary when its downstream member is removed" {
     var s = Scenario.init();
-    s.l.unassign(15); // mix を個別削除
+    s.l.unassign(15); // mix is individually removed
     var buf: [16]Edge = undefined;
-    const edges = Scenario.flatEdges(&buf); // kick->mix / hat->mix を含む元のシナリオそのまま
+    const edges = Scenario.flatEdges(&buf); // The original scenario as-is, including kick->mix / hat->mix
     s.l.deriveExposed(s.gid, edges);
     const g = s.l.groups[s.gid];
-    // mix が非メンバーになったことで kick(13)/hat(14) の audio out が新たに境界跨ぎ＝自動 expose される
-    // （ケーブルが宙に浮かないフォールバック。member 昇順）。
+    // With mix no longer a member, kick(13)'s and hat(14)'s audio out newly count as boundary-crossing and are auto-exposed
+    // (a fallback so the cable is not left dangling; ordered ascending by member).
     try testing.expectEqual(@as(u8, 2), g.n_out);
     try testing.expectEqual(@as(Handle, 13), g.exposed_out[0].member);
     try testing.expectEqual(@as(Handle, 14), g.exposed_out[1].member);
@@ -611,7 +611,7 @@ test "group: mapNodesForCollapsed hides members and adds a box when collapsed, s
     };
     var out_buf: [16]NodeGeom = undefined;
 
-    // collapsed（既定）: 6 メンバーが 1 箱に畳まれる → 0, box, 20 の 3 個。
+    // collapsed (default): 6 members collapse into 1 box -> 3 nodes total: 0, box, 20.
     {
         const n = s.l.mapNodesForCollapsed(&flat, &out_buf);
         try testing.expectEqual(@as(usize, 3), n);
@@ -621,7 +621,7 @@ test "group: mapNodesForCollapsed hides members and adds a box when collapsed, s
         }
         try testing.expect(saw_box);
     }
-    // expanded: メンバーがそのまま出る（箱は無し）→ 元の 8 個そのまま。
+    // expanded: members appear as-is (no box) -> the original 8 nodes unchanged.
     {
         s.l.groups[s.gid].collapsed = false;
         const n = s.l.mapNodesForCollapsed(&flat, &out_buf);
@@ -656,13 +656,13 @@ test "group: buildDisplayEdges maps collapsed boundary to box index, hides inter
     var s = Scenario.init();
     var buf: [16]Edge = undefined;
     const edges = Scenario.flatEdges(&buf);
-    s.l.deriveExposed(s.gid, edges); // テンプレのみ（境界跨ぎ追加なし）
+    s.l.deriveExposed(s.gid, edges); // Template only (no boundary-crossing additions)
 
     var out_buf: [16]DisplayEdge = undefined;
     const n = s.l.buildDisplayEdges(edges, &out_buf);
-    try testing.expectEqual(@as(usize, 2), n); // 6 本の内部 edge は非表示、2 本の境界 edge のみ
+    try testing.expectEqual(@as(usize, 2), n); // The 6 internal edges are hidden; only the 2 boundary edges remain
 
-    // 0 -> cdiv.in0 の boundary edge: visual dst は箱の exposed_in[0]、actual は実 CableRef(10,0)。
+    // The 0 -> cdiv.in0 boundary edge: visual dst is the box's exposed_in[0], actual is the real CableRef(10,0).
     const in_edge = for (out_buf[0..n]) |de| {
         if (de.visual.src_handle == 0) break de;
     } else unreachable;
@@ -671,7 +671,7 @@ test "group: buildDisplayEdges maps collapsed boundary to box index, hides inter
     try testing.expectEqual(@as(Handle, 10), in_edge.actual.dst_handle);
     try testing.expectEqual(@as(u8, 0), in_edge.actual.dst_in);
 
-    // mix.out0 -> 20 の boundary edge: visual src は箱の exposed_out[0]、actual は実 CableRef(20,0)。
+    // The mix.out0 -> 20 boundary edge: visual src is the box's exposed_out[0], actual is the real CableRef(20,0).
     const out_edge = for (out_buf[0..n]) |de| {
         if (de.visual.dst_handle == 20) break de;
     } else unreachable;
@@ -679,7 +679,7 @@ test "group: buildDisplayEdges maps collapsed boundary to box index, hides inter
     try testing.expectEqual(@as(u8, 0), out_edge.visual.src_out);
     try testing.expectEqual(@as(Handle, 20), out_edge.actual.dst_handle);
 
-    // expanded: フィルタも写像も無し（全 edge がそのまま実 handle で通る）。
+    // expanded: no filtering or mapping (every edge passes through with its real handles unchanged).
     s.l.groups[s.gid].collapsed = false;
     const n2 = s.l.buildDisplayEdges(edges, &out_buf);
     try testing.expectEqual(edges.len, n2);
@@ -693,25 +693,25 @@ test "group: buildDisplayEdges maps collapsed boundary to box index, hides inter
 
 test "group: resolvePort passes through real refs and resolves synthetic refs, rejects out-of-range" {
     var s = Scenario.init();
-    // 実 PortRef はそのまま。
+    // Real PortRefs are unchanged.
     const real = PortRef{ .handle = 10, .is_input = true, .index = 0 };
     try testing.expectEqual(real, s.l.resolvePort(real).?);
 
-    // 合成 in0 → cdiv(10).in0。
+    // synthetic in0 -> cdiv(10).in0.
     const synth_in = PortRef{ .handle = handleOfGroup(s.gid), .is_input = true, .index = 0 };
     const resolved_in = s.l.resolvePort(synth_in).?;
     try testing.expectEqual(@as(Handle, 10), resolved_in.handle);
     try testing.expect(resolved_in.is_input);
     try testing.expectEqual(@as(u8, 0), resolved_in.index);
 
-    // 合成 out0 → mix(15).out0。
+    // synthetic out0 -> mix(15).out0.
     const synth_out = PortRef{ .handle = handleOfGroup(s.gid), .is_input = false, .index = 0 };
     const resolved_out = s.l.resolvePort(synth_out).?;
     try testing.expectEqual(@as(Handle, 15), resolved_out.handle);
     try testing.expect(!resolved_out.is_input);
 
-    // 範囲外 index（exposed_in は 1 個しか無い）。
+    // An out-of-range index (exposed_in has only 1 entry).
     try testing.expectEqual(@as(?PortRef, null), s.l.resolvePort(.{ .handle = handleOfGroup(s.gid), .is_input = true, .index = 5 }));
-    // 非 active な gid。
+    // An inactive gid.
     try testing.expectEqual(@as(?PortRef, null), s.l.resolvePort(.{ .handle = handleOfGroup(1), .is_input = true, .index = 0 }));
 }

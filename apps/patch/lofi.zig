@@ -1,45 +1,45 @@
-//! apps/patch の「lofi ミニマルテクノ生成パッチ」(TASK-40.2.1〜105.3)。
+//! The lo-fi minimal techno generative patch for apps/patch.
 //!
-//! libs/modular のグラフエンジン上に 2 系統の生成を併存させる:
-//!   - 前景(grid/303): editable StepSeq が Clock に同期して Kick/Hat/Clap/Bass を駆動。
-//!     ユーザーが GUI でマス目を編集でき、ロックしていない track は §4.7 の境界内で小節ごとに
-//!     離散変異する（DrumMachine / BassMachine。Ph5）。
-//!   - 背景(アンビエント連続生成): Turing→Quantizer が ChordPad の和音 root を scale 内でゆっくり遷移させ、
-//!     LFO が cutoff を連続変調、S&H が level をゆらす。無操作でも連続的に流れ続ける（Ph5 方針 C）。
-//! Mixer 後に lofi FX チェーン(Saturator→Bitcrusher→Delay→Reverb→VinylNoise→WowFlutter)。
-//! 主スレッド介入なし・生成 RNG は base seed + derive で決定的（offline 2 回 render の CRC 一致で担保）。
-//! 音色用 fixed seed（Kick/Hat/Clap）は base seed 非依存（TASK-62.5.7）。
+//! Two generation streams run together on the libs/modular graph engine:
+//!   - Foreground (grid/303): an editable StepSeq, clock-synced, drives Kick/Hat/Clap/Bass.
+//!     The user can edit the grid in the GUI; unlocked tracks mutate discretely each bar
+//!     within the density-band bounds (DrumMachine / BassMachine; Ph5).
+//!   - Background (continuous ambient): Turing→Quantizer slowly moves the ChordPad chord root within the scale;
+//!     an LFO continuously modulates cutoff; S&H breathes the level. It keeps flowing with no input (Ph5).
+//! After the Mixer, the lofi FX chain (Saturator→Bitcrusher→Delay→Reverb→VinylNoise→WowFlutter).
+//! No main-thread intervention; the generation RNG is deterministic from base seed + derive (guaranteed by matching CRC on two offline renders).
+//! Timbre fixed seeds (Kick/Hat/Clap) are independent of the base seed.
 //!
-//! 自己参照（graph が各モジュール struct への ctx ポインタを保持）するため、
-//! ヒープに固定確保して**ムーブさせない**（create/destroy）。RT callback は render のみ呼ぶ。
+//! Self-referential (the graph holds ctx pointers into each module struct), so
+//! heap-allocate and **never move** (create/destroy). The RT callback only calls render.
 //!
-//! pattern 所有モデル: RT 側 StepSeq field が grid/303 pattern の唯一の authoritative。GUI は毎フレーム
-//! snapshot を読んで表示し、編集時のみ Controls.pattern_db(Mailbox) へ publish する。RT は revision
-//! 変化時のみ取り込み、その後また per-bar 変異を続ける（RT 経路に alloc/lock/IO/panic なし）。
+//! Pattern ownership: the RT StepSeq fields are the sole authority for grid/303 patterns. The GUI reads a
+//! snapshot every frame for display and publishes to Controls.pattern_db (Mailbox) only on edit. RT takes it in
+//! only when the revision changes, then continues per-bar mutation (no alloc/lock/IO/panic on the RT path).
 //!
-//! seed 適用（TASK-62.5.7）: main が `requestSeed`（atomic）→ RT は次 bar 境界で PRNG 再構築 +
-//! 生成状態初期化。RT に alloc/lock を足さない。
+//! Seed apply: main publishes via `requestSeed` (atomic) → RT rebuilds the PRNG and resets generation state
+//! at the next bar boundary. Do not add alloc/lock on the RT path.
 
 const std = @import("std");
 const modular = @import("modular");
-const synth = @import("synth"); // AtomicF32 / Mailbox（GUI→RT のロックフリー受け渡し）
-const dsp = @import("dsp"); // FFT（band energy 検証・テスト用）/ Noise（変異 PRNG）
+const synth = @import("synth"); // AtomicF32 / Mailbox (lock-free GUI→RT handoff)
+const dsp = @import("dsp"); // FFT (band-energy checks in tests) / Noise (mutation PRNG)
 const seedmod = @import("seed.zig");
 const project_io = @import("project_io.zig");
 
 // ----------------------------------------------------------------------------
-// 既定値（= 構築時のパッチ値）。Controls の既定もこれに合わせ、無操作時は従来どおりにする。
+// Defaults (= constructed patch values). Controls defaults match these so an untouched run behaves as before.
 // ----------------------------------------------------------------------------
 const DEFAULT_BPM: f32 = 122.0;
 const DEFAULT_SIDECHAIN: f32 = 0.35;
-const DEFAULT_DENSITY_TARGET: f32 = 0.25; // 現行初期 pattern の derived density (16/64)
+const DEFAULT_DENSITY_TARGET: f32 = 0.25; // Derived density of the current initial pattern (16/64)
 pub const MASTER_CUTOFF_MIN: f32 = 80.0;
-pub const MASTER_CUTOFF_MAX: f32 = 18000.0; // ≒オープン（既定でほぼ素通し）
-// 各トラックの基準 gain（slider は 0..約1.5 の倍率で掛ける。既定 1.0 で基準＝従来）。
+pub const MASTER_CUTOFF_MAX: f32 = 18000.0; // ~open (nearly passthrough by default)
+// Per-track base gain (slider multiplies by ~0..1.5; default 1.0 keeps the historical base).
 pub const KICK_BASE_GAIN: f32 = 0.8;
 pub const HAT_BASE_GAIN: f32 = 0.28;
 pub const CLAP_BASE_GAIN: f32 = 0.42;
-// Ph4: 音色マクロの基準値（Controls 既定もこれに合わせ、無操作時は構築値と一致＝決定的）。
+// Ph4: tone-macro baselines (Controls defaults match; untouched = constructed values = deterministic).
 const KICK_CLICK_BASE: f32 = 0.35;
 const HAT_BASE_BRIGHT: f32 = 1.0;
 const HAT_BASE_DECAY: f32 = 0.045;
@@ -49,15 +49,15 @@ const PAD_CUTOFF_MAX: f32 = 6000.0;
 const PAD_CUTOFF_DEFAULT: f32 = 1400.0;
 const PAD_WARMTH_DEFAULT: f32 = 0.6;
 const MASTER_WARMTH_DEFAULT: f32 = 0.5;
-const AMBIENT_MOVE_DEFAULT: f32 = 0.4; // アンビエント層の連続変化量（LFO rate + cutoff 深さ）
+const AMBIENT_MOVE_DEFAULT: f32 = 0.4; // Ambient-layer continuous motion (LFO rate + cutoff depth)
 
-// Ph5: bass の scale（pitch degree → pitch_cv 写像。StepSeq/Quantizer 共有）。
+// Ph5: bass scale (pitch degree → pitch_cv; shared by StepSeq/Quantizer).
 const BASS_SCALE: modular.Scale = .minor_pentatonic;
 const BASS_OCTAVES: u8 = 2;
-/// bass の degree index の総数（GUI の pitch 循環範囲の単一ソース）。
+/// Total bass degree indices (single source for the GUI pitch wrap range).
 pub const BASS_DEG_TOTAL: usize = modular.scaleDegreeCount(BASS_SCALE, BASS_OCTAVES);
 
-// 初期パターン（現行 Euclid 配置から seed。libs/modular が単一ソース）。
+// Initial patterns (seeded from the current Euclid layout; libs/modular is the single source).
 const KICK_ON = modular.grid_presets.KICK_ON;
 const HAT_ON = modular.grid_presets.HAT_ON;
 const CLAP_ON = modular.grid_presets.CLAP_ON;
@@ -66,7 +66,7 @@ const BASS_ACCENT = modular.grid_presets.BASS_ACCENT;
 const BASS_SLIDE = modular.grid_presets.BASS_SLIDE;
 const BASS_DEG = modular.grid_presets.BASS_DEG;
 
-// 変異の密度バンド（§4.7 density clamp）。kick は four-on-floor 付近で安定させる。
+// Mutation density bands (density clamp). Kick stays near four-on-floor.
 const KICK_BAND = [2]u32{ 3, 5 };
 const HAT_BAND = [2]u32{ 2, 8 };
 const CLAP_BAND = [2]u32{ 1, 4 };
@@ -74,11 +74,11 @@ const BASS_BAND = [2]u32{ 2, 8 };
 const STEPS_PER_BAR: u64 = 16;
 
 // ----------------------------------------------------------------------------
-// grid/303 pattern（GUI⇔RT 受け渡し。Mailbox で整合的に publish）。
+// grid/303 pattern (GUI↔RT handoff; published coherently via Mailbox).
 // ----------------------------------------------------------------------------
 pub const DrumTrack = struct {
     on: u16 = 0,
-    lock: bool = false, // このトラックを凍結（evolve 中でも変異しない）
+    lock: bool = false, // Freeze this track (no mutation even while evolve is on)
 };
 
 pub const BassLane = struct {
@@ -89,14 +89,14 @@ pub const BassLane = struct {
     lock: bool = false,
 };
 
-/// GUI が publish する pattern スナップショット（rev で変化検知）。
-/// evolve = 自己進化の全体トグル（off で完全な手動シーケンサ）、lock = トラック単位の凍結。
-/// トラックが per-bar 変異するのは evolve かつ !lock のときだけ。
-/// quantize_bar（TASK-93）: true なら RT はブロック境界で即反映せず、次 bar 境界まで pending。
-/// GUI 編集・既存 action は false（挙動不変）。mini-notation `action pattern` のみ true。
+/// Pattern snapshot the GUI publishes (change detection via rev).
+/// evolve = global self-evolution toggle (off = fully manual sequencer); lock = per-track freeze.
+/// A track mutates per bar only when evolve && !lock.
+/// quantize_bar: when true, RT does not apply at the block boundary; it stays pending until the next bar.
+/// GUI edits and existing actions use false (behaviour unchanged). Only mini-notation `action pattern` sets true.
 pub const PatternCommand = struct {
     rev: u32 = 0,
-    evolve: bool = true, // 全体の自己進化 on/off（既定 ON）
+    evolve: bool = true, // Global self-evolution on/off (default ON)
     kick: DrumTrack = .{},
     hat: DrumTrack = .{},
     clap: DrumTrack = .{},
@@ -114,17 +114,17 @@ pub const PatternCommand = struct {
 };
 
 // ----------------------------------------------------------------------------
-// TASK-91: M8 式 Song/Chain/Phrase 3層（番号参照・全て固定容量）
+// M8-style Song/Chain/Phrase three layers (numbered refs; all fixed capacity)
 // ----------------------------------------------------------------------------
 pub const MAX_DRUM_PHRASES: usize = 64;
 pub const MAX_BASS_PHRASES: usize = 32;
 pub const MAX_CHAINS: usize = 32;
 pub const MAX_CHAIN_LEN: usize = 16;
 pub const MAX_SONG_ROWS: usize = 64;
-/// song_last_phrase の「未適用」番兵（初回 bar は必ず切替扱い）。
+/// "Not yet applied" sentinel for song_last_phrase (the first bar is always treated as a switch).
 pub const PHRASE_NONE: u8 = 0xFF;
 
-/// bass 1 bar 分の Phrase（on/accent/slide + degree 列）。
+/// One bar of bass Phrase (on/accent/slide + degree column).
 pub const BassPhrase = struct {
     on: u16 = 0,
     accent: u16 = 0,
@@ -132,13 +132,13 @@ pub const BassPhrase = struct {
     deg: [16]i8 = [_]i8{0} ** 16,
 };
 
-/// Phrase index 列（最大 16）。len=0 は空 chain（その track は現行パターン維持）。
+/// Phrase-index sequence (max 16). len=0 is an empty chain (that track keeps its current pattern).
 pub const Chain = struct {
     entries: [MAX_CHAIN_LEN]u8 = [_]u8{0} ** MAX_CHAIN_LEN,
     len: u8 = 0,
 };
 
-/// Song 1 行 = トラック毎の chain index。
+/// One Song row = per-track chain indices.
 pub const SongRow = struct {
     kick: u8 = 0,
     hat: u8 = 0,
@@ -146,15 +146,15 @@ pub const SongRow = struct {
     bass: u8 = 0,
 };
 
-/// Song 全体（phrase pool + chain pool + rows）。Mailbox で GUI/action → RT へ publish。
+/// Whole Song (phrase pool + chain pool + rows). Published GUI/action → RT via Mailbox.
 ///
-/// drum phrase pool: plan の `phrases_drum: [64]u16` を **track 別 3 本**に展開した実装。
-/// 番号空間 0..63 は共有（chain の phrase index は全 drum track で同じ語彙 = 番号参照の再利用）。
-/// 同一 index でも track ごとに別 mask を持てるので `phrase_capture <idx>` が 4 track を同 idx に書ける。
-/// 同じ mask を複数 track で再利用したい場合は capture 時に同じ値を 3 本へ書けばよい。
+/// Drum phrase pool: `phrases_drum: [64]u16` expanded into **three per-track arrays**.
+/// Index space 0..63 is shared (chain phrase indices share one vocabulary across drum tracks = reusable numbered refs).
+/// The same index may hold a different mask per track, so `phrase_capture <idx>` can write all 4 tracks at that idx.
+/// To reuse one mask across tracks, write the same value into all three arrays at capture time.
 pub const SongData = struct {
     rev: u32 = 0,
-    /// plan 名 `phrases_drum` の実体（kick/hat/clap 列。layout は project_io で固定）。
+    /// Concrete `phrases_drum` layout (kick/hat/clap columns; layout fixed in project_io).
     phrases_kick: [MAX_DRUM_PHRASES]u16 = [_]u16{0} ** MAX_DRUM_PHRASES,
     phrases_hat: [MAX_DRUM_PHRASES]u16 = [_]u16{0} ** MAX_DRUM_PHRASES,
     phrases_clap: [MAX_DRUM_PHRASES]u16 = [_]u16{0} ** MAX_DRUM_PHRASES,
@@ -169,8 +169,8 @@ pub const SongData = struct {
     }
 };
 
-/// UI が編集した DynGraph parameter の累積 override 表。
-/// Mailbox は latest-wins のため、差分ではなく touched 済みの全件を毎回 publish する。
+/// Cumulative DynGraph parameter override table edited by the UI.
+/// Mailbox is latest-wins, so publish the full touched set every time (not a delta).
 pub const MAX_PARAM_OVERRIDES: usize = 64;
 pub const ParamOverride = struct {
     handle: modular.dyn.Handle = 0,
@@ -184,43 +184,43 @@ pub const ParamBatch = struct {
     entries: [MAX_PARAM_OVERRIDES]ParamOverride = [_]ParamOverride{.{}} ** MAX_PARAM_OVERRIDES,
 };
 
-/// GUI(メインスレッド)→ Audio(RT) のリアルタイム操作。GUI は store/publish のみ、
-/// render() 冒頭の applyControls() が load→clamp/finite して各モジュール field へ適用する。
+/// Real-time controls from GUI (main thread) → Audio (RT). GUI only store/publish;
+/// applyControls() at the start of render() loads→clamps/finites and writes each module field.
 pub const Controls = struct {
     tempo_bpm: synth.AtomicF32,
     master_cutoff: synth.AtomicF32,
-    // TASK-110.5: derived density とは別の、次 bar から収束させる target。
+    // Target that converges from the next bar, separate from derived density.
     density_target: synth.AtomicF32,
-    // 未操作時は pattern の authoritative 所有モデルを優先し、density 操作後だけ収束を有効化する。
+    // Untouched: prefer the pattern's authoritative ownership; enable convergence only after a density edit.
     density_target_enabled: std.atomic.Value(u32),
     swing: synth.AtomicF32,
     sidechain_amount: synth.AtomicF32,
-    // Ph4: 音色マクロ
+    // Ph4: tone macros
     kick_punch: synth.AtomicF32,
     hat_bright: synth.AtomicF32,
     hat_decay: synth.AtomicF32,
     pad_cutoff: synth.AtomicF32,
     pad_warmth: synth.AtomicF32,
     master_warmth: synth.AtomicF32,
-    // Ph5: アンビエント連続生成の操作量（LFO rate + cutoff 深さに写像）
+    // Ph5: ambient continuous-generation amount (maps to LFO rate + cutoff depth)
     ambient_move: synth.AtomicF32,
-    // Ph5: grid/303 pattern（整合的に差し替えるため Mailbox(triple-buffer)。GUI=producer / RT=consumer）
+    // Ph5: grid/303 pattern (Mailbox triple-buffer for coherent swap; GUI=producer / RT=consumer)
     pattern_db: synth.Mailbox(PatternCommand),
-    // TASK-91: SongData（固定長・triple-buffer。pattern_db と同型）
+    // SongData (fixed-length triple-buffer; same shape as pattern_db)
     song_db: synth.Mailbox(SongData),
-    // TASK-110.4: UI→RT の累積 parameter override 表（latest-wins triple buffer）。
+    // UI→RT cumulative parameter override table (latest-wins triple buffer).
     param_db: synth.Mailbox(ParamBatch),
-    // TASK-91: song 再生 on/off（0/1）。開始エッジで RT が position をリセット。
+    // song play on/off (0/1). Rising edge: RT resets position.
     song_playing: std.atomic.Value(u32),
-    // TASK-91: song_goto。gen 変化で row を latch（0xFF_FF_FF_FF = 無効）。
+    // song_goto. Latch the row when gen changes (0xFF_FF_FF_FF = invalid).
     song_goto_row: std.atomic.Value(u32),
     song_goto_gen: std.atomic.Value(u64),
-    // TASK-62.5.7: main→RT の pending seed（次 bar 境界で latch）。gen が変わったら pending を読む。
+    // main→RT pending seed (latched at the next bar boundary). Read pending when gen changes.
     pending_seed: std.atomic.Value(u64),
     pending_seed_gen: std.atomic.Value(u64),
-    // TASK-106.1: evolve 実行権（1=host/offline が mutate+density、0=client は pattern_state 受信のみ）
+    // evolve authority (1=host/offline runs mutate+density; 0=client only receives pattern_state)
     evolve_host_authority: std.atomic.Value(u32),
-    // TASK-106.1: client digest 用。host の pattern_state が載せた mutation_count。
+    // For client digest: mutation_count carried on the host's pattern_state.
     remote_mutation_count: std.atomic.Value(u32),
 
     pub fn init() Controls {
@@ -257,7 +257,7 @@ fn clampFinite(v: f32, lo: f32, hi: f32, fallback: f32) f32 {
     return std.math.clamp(v, lo, hi);
 }
 
-/// TASK-115.3: MIDI CC 0..127 → descriptor 範囲。main thread / テスト用（RT では呼ばない）。
+/// MIDI CC 0..127 → descriptor range. Main thread / tests only (do not call on RT).
 pub const MidiCcCurve = enum { linear, exponential };
 
 pub fn mapMidiCcValue(raw: u8, curve: MidiCcCurve, min: f32, max: f32) f32 {
@@ -270,13 +270,13 @@ pub fn mapMidiCcValue(raw: u8, curve: MidiCcCurve, min: f32, max: f32) f32 {
         },
     };
     if (!std.math.isFinite(mapped)) return min;
-    // 浮動小数誤差で端が僅かに外れるのを防ぐ
+    // Guard against float error pushing the endpoint slightly out of range
     const lo = @min(min, max);
     const hi = @max(min, max);
     return std.math.clamp(mapped, lo, hi);
 }
 
-/// Mixer per-input から旧 trackGain 相当の実効 gain（mute 時 0、それ以外 base×input_gain）。
+/// Effective gain equivalent to the old trackGain from Mixer per-input (0 when muted; else base×input_gain).
 fn effectiveMixerTrackGain(mixer: ?*const modular.Mixer, slot: usize, base: f32) f32 {
     const m = mixer orelse return 0;
     if (m.input_mute[slot]) return 0.0;
@@ -287,7 +287,7 @@ inline fn bitOf(s: u8) u16 {
     return @as(u16, 1) << @as(u4, @intCast(s & 15));
 }
 
-/// harness probe 用の生成状態スナップショット（best-effort・torn 可）。
+/// Generation-state snapshot for harness probes (best-effort; may tear).
 pub const PatchState = struct {
     bpm: f32,
     clock_phase: f32,
@@ -295,9 +295,9 @@ pub const PatchState = struct {
     hat_step: u8,
     clap_step: u8,
     bass_step: u8,
-    density: f32, // 平均 on 率（popcount/16 を 4 lane 平均）
+    density: f32, // Mean on-rate (popcount/16 averaged over 4 lanes)
     density_target: f32,
-    bass_pitch_cv: f32, // bass_seq の現在 pitch（glide 反映）
+    bass_pitch_cv: f32, // Current bass_seq pitch (with glide)
     kick_active: bool,
     hat_active: bool,
     clap_active: bool,
@@ -332,19 +332,19 @@ pub const PatchState = struct {
     bass_slide: u16,
     bass_deg: [16]i8,
     lock: [4]bool, // kick,hat,clap,bass
-    evolve: bool, // 自己進化の全体トグル
+    evolve: bool, // Global self-evolution toggle
     pattern_rev: u32,
     mutation_count: u32,
-    // Ph5: アンビエント連続生成
+    // Ph5: continuous ambient generation
     ambient_move: f32,
     ambient_register: u32,
-    ambient_root_cv: f32, // ChordPad へ与えている pitch_cv
-    ambient_lfo: f32, // 現 LFO 値（-1..1）
-    // TASK-62.5.7: 適用済み base seed（digest 用。pending ではなく RT が latch した値）
+    ambient_root_cv: f32, // pitch_cv fed to ChordPad
+    ambient_lfo: f32, // Current LFO value (-1..1)
+    // Applied base seed (for digest; the value RT latched, not pending)
     base_seed: u64,
-    // TASK-93: bar 境界待ちの quantize pattern があるか（pending_bar_cmd != null。torn 可）
+    // Whether a quantize pattern is waiting on a bar boundary (pending_bar_cmd != null; may tear)
     bar_pending: bool,
-    // TASK-91: Song 再生位置（RT authoritative・torn 可）
+    // Song play position (RT authoritative; may tear)
     song_playing: bool,
     song_row: u8,
     song_bar_in_row: u16,
@@ -357,9 +357,9 @@ pub const LofiPatch = struct {
     allocator: std.mem.Allocator,
     graph: *modular.DynGraph,
 
-    // 生成モジュールは handle で保持する。pool slot の再利用でポインタが dangling するのを防ぐ。
+    // Hold generation modules by handle. Avoids dangling pointers when a pool slot is reused.
     clock_h: modular.dyn.Handle,
-    // 前景: editable step シーケンサ（DrumMachine + BassMachine）
+    // Foreground: editable step sequencers (DrumMachine + BassMachine)
     kick_seq_h: modular.dyn.Handle,
     hat_seq_h: modular.dyn.Handle,
     clap_seq_h: modular.dyn.Handle,
@@ -368,7 +368,7 @@ pub const LofiPatch = struct {
     kick_h: modular.dyn.Handle,
     hat_h: modular.dyn.Handle,
     clap_h: modular.dyn.Handle,
-    // 背景: アンビエント連続生成（pad の和音 root / cutoff / level をゆっくり動かす）
+    // Background: continuous ambient (slowly moves pad chord root / cutoff / level)
     pad_div_h: modular.dyn.Handle,
     pad_eu_h: modular.dyn.Handle,
     pad_h: modular.dyn.Handle,
@@ -376,17 +376,17 @@ pub const LofiPatch = struct {
     ambient_quant_h: modular.dyn.Handle,
     ambient_lfo_h: modular.dyn.Handle,
     ambient_random_h: modular.dyn.Handle,
-    // bass voice（StepSeq に駆動される）
+    // bass voice (driven by StepSeq)
     bass_perc_h: modular.dyn.Handle,
     vco_h: modular.dyn.Handle,
     vcf_h: modular.dyn.Handle,
     vca_h: modular.dyn.Handle,
-    // mix（kick は素通し / 非kick は sidechain でダッキング）
+    // mix (kick passthrough / non-kick ducked by sidechain)
     nonkick_mixer_h: modular.dyn.Handle,
     sidechain_h: modular.dyn.Handle,
     master_mixer_h: modular.dyn.Handle,
     master_vcf_h: modular.dyn.Handle,
-    // lofi FX チェーン
+    // lofi FX chain
     saturator_h: modular.dyn.Handle,
     bitcrusher_h: modular.dyn.Handle,
     delay_fx_h: modular.dyn.Handle,
@@ -397,33 +397,33 @@ pub const LofiPatch = struct {
 
     controls: Controls,
 
-    // 前景の per-bar 変異状態（RT 所有・base seed derive で決定的）
+    // Foreground per-bar mutation state (RT-owned; deterministic from base-seed derive)
     mut_noise: dsp.Noise,
     last_bar: u64,
     mutation_count: u32,
-    applied_rev: u32, // 適用済みの pattern revision
-    anchor: PatternCommand, // 復帰先（= 直近にユーザーが publish した pattern。迷子防止）
-    // evolve/lock の authoritative state は各 StepSeq（TASK-160.2）。
-    // TASK-62.5.7: 適用済み base seed / pending gen（RT 所有。digest は base_seed を読む）
+    applied_rev: u32, // Applied pattern revision
+    anchor: PatternCommand, // Return target (= last pattern the user published; prevents drift)
+    // evolve/lock authoritative state lives on each StepSeq.
+    // Applied base seed / pending gen (RT-owned; digest reads base_seed)
     base_seed: u64,
     applied_seed_gen: u64,
-    // TASK-93: quantize_bar=true の PatternCommand を次 bar 境界まで退避（固定長・alloc なし）
+    // Hold PatternCommand with quantize_bar=true until the next bar (fixed-length; no alloc)
     pending_bar_cmd: ?PatternCommand,
-    // TASK-91: Song（RT 所有。applyControls で rev 変化時 latch / position は bar 境界で進行）
+    // Song (RT-owned; applyControls latches on rev change / position advances at bar boundaries)
     song: SongData,
     song_playing: bool,
     song_row: u8,
     song_bar_in_row: u16,
-    /// 直前 bar の各 track phrase idx（PHRASE_NONE=空 chain / 未適用。切替検出用）
+    /// Per-track phrase idx of the previous bar (PHRASE_NONE = empty chain / not yet applied; for switch detection)
     song_last_phrase: [4]u8,
     applied_song_goto_gen: u64,
-    /// play/goto 直後の初回 bar を bar 境界を待たず強制 apply する（plan: 初回 bar は必ず切替扱い）
+    /// Force-apply the first bar right after play/goto without waiting for a bar boundary (first bar is always a switch)
     song_force_apply: bool,
 
-    // TASK-115.3: MIDI note → ChordPad（既存 NoteQueue 再利用。cache-line 分離は ring.zig 側）。
+    // MIDI note → ChordPad (reuse existing NoteQueue; cache-line separation is on the ring.zig side).
     note_queue: synth.NoteQueue(256, 16) = .{},
     note_panic_seen: u32 = 0,
-    /// monophonic last-note priority 用の固定長 held 表（RT 所有・alloc なし）。
+    /// Fixed-length held table for monophonic last-note priority (RT-owned; no alloc).
     midi_held: [128]bool = [_]bool{false} ** 128,
     midi_age: [128]u32 = [_]u32{0} ** 128,
     midi_age_clock: u32 = 0,
@@ -446,11 +446,11 @@ pub const LofiPatch = struct {
             .kick_h = undefined,
             .hat_h = undefined,
             .clap_h = undefined,
-            // pad: 1 小節パルス(div=16)→2 小節周期(steps=2,pulses=1)で和音 trigger
+            // pad: 1-bar pulse (div=16) → 2-bar period (steps=2,pulses=1) chord trigger
             .pad_div_h = undefined,
             .pad_eu_h = undefined,
             .pad_h = undefined,
-            // アンビエント: turing(lock 高め)→quant(scale 内 root)→pad。LFO は cutoff、random は level。
+            // Ambient: turing (high lock)→quant (root in scale)→pad. LFO drives cutoff; random drives level.
             .ambient_turing_h = undefined,
             .ambient_quant_h = undefined,
             .ambient_lfo_h = undefined,
@@ -474,7 +474,7 @@ pub const LofiPatch = struct {
             .mut_noise = .{ .state = seedmod.deriveU32(base, .mutate) },
             .last_bar = 0,
             .mutation_count = 0,
-            .applied_rev = def.rev, // 既定(rev 0)は構築時に直接セット済み＝適用不要
+            .applied_rev = def.rev, // Default (rev 0) was set directly at construction = no apply needed
             .anchor = def,
             .base_seed = base,
             .applied_seed_gen = 0,
@@ -500,15 +500,15 @@ pub const LofiPatch = struct {
         return self;
     }
 
-    /// main thread: 次 bar 境界で適用する base seed を publish（alloc/lock なし・atomic のみ）。
+    /// main thread: publish the base seed to apply at the next bar boundary (atomic only; no alloc/lock).
     pub fn requestSeed(self: *LofiPatch, base: u64) void {
         self.controls.pending_seed.store(base, .release);
         _ = self.controls.pending_seed_gen.fetchAdd(1, .release);
     }
 
-    /// offline / 初期化用: base seed を即時適用（live の `action seed` は `requestSeed`＝次 bar 境界）。
-    /// pending gen も同期し、直後の bar 境界で二重適用しない。
-    /// offline なので bar 待ち pattern も破棄する（live の maybeEvolve 経路とは別）。
+    /// offline / init: apply base seed immediately (live `action seed` uses `requestSeed` = next bar boundary).
+    /// Also sync pending gen so the next bar boundary does not double-apply.
+    /// Offline, so also drop any bar-waiting pattern (separate from the live maybeEvolve path).
     pub fn resetWithSeed(self: *LofiPatch, base: u64) void {
         self.requestSeed(base);
         self.applied_seed_gen = self.controls.pending_seed_gen.load(.acquire);
@@ -519,18 +519,18 @@ pub const LofiPatch = struct {
         }
     }
 
-    /// main thread: 累積 override 表を publish する。revision は呼び出し側で管理する。
+    /// main thread: publish the cumulative override table. Caller owns the revision.
     pub fn publishParamBatch(self: *LofiPatch, batch: ParamBatch) void {
         self.controls.param_db.publish(batch);
     }
 
-    /// main thread（イベント時のみ）: MIDI note_on → 既存 NoteQueue。velocity は 0..1。
-    /// 満杯間際は NoteQueue が間引く。CommandLog/recipe 経路は通さない。
+    /// main thread (event only): MIDI note_on → existing NoteQueue. velocity is 0..1.
+    /// Near full, NoteQueue drops. Does not go through CommandLog/recipe.
     pub fn sendMidiNoteOn(self: *LofiPatch, note: u8, velocity: f32) void {
         _ = self.note_queue.sendNoteOn(note, velocity);
     }
 
-    /// main thread（イベント時のみ）: MIDI note_off。送れなければ panic で stuck note を防止。
+    /// main thread (event only): MIDI note_off. On failure, panic to prevent stuck notes.
     pub fn sendMidiNoteOff(self: *LofiPatch, note: u8) void {
         if (!self.note_queue.sendNoteOff(note)) {
             self.note_queue.panicAllNotesOff();
@@ -588,34 +588,34 @@ pub const LofiPatch = struct {
         const n_wow = try g.add(.wow_flutter, .{});
         const n_output = try g.add(.output, .{ .gain = 1.0, .pan = 0.0, .soft_clip = true });
 
-        // timing（clock を前景 StepSeq と pad_div へ fan-out）
+        // timing (fan-out clock to foreground StepSeq and pad_div)
         try g.connect(n_clock, 0, n_kick_seq, 0);
         try g.connect(n_clock, 0, n_hat_seq, 0);
         try g.connect(n_clock, 0, n_clap_seq, 0);
         try g.connect(n_clock, 0, n_bass_seq, 0);
         try g.connect(n_clock, 0, n_pad_div, 0);
-        // 前景 drums: StepSeq.gate -> 各ドラム
+        // Foreground drums: StepSeq.gate -> each drum
         try g.connect(n_kick_seq, 0, n_kick, 0);
-        try g.connect(n_kick_seq, 0, n_sidechain, 1); // sidechain トリガ = kick StepSeq の gate（fan-out）
+        try g.connect(n_kick_seq, 0, n_sidechain, 1); // sidechain trigger = kick StepSeq gate (fan-out)
         try g.connect(n_hat_seq, 0, n_hat, 0);
         try g.connect(n_clap_seq, 0, n_clap, 0);
-        // 前景 bass(303): gate→PercEnv / pitch_cv→VCO / accent_cv→VCF.cutoff_cv
+        // Foreground bass (303): gate→PercEnv / pitch_cv→VCO / accent_cv→VCF.cutoff_cv
         try g.connect(n_bass_seq, 0, n_bass_perc, 0);
         try g.connect(n_bass_seq, 1, n_vco, 0);
         try g.connect(n_bass_seq, 2, n_vcf, 1);
         try g.connect(n_vco, 0, n_vcf, 0);
         try g.connect(n_vcf, 0, n_vca, 0);
         try g.connect(n_bass_perc, 0, n_vca, 1);
-        // 背景アンビエント: pad gate + 連続生成 CV
+        // Background ambient: pad gate + continuous CV
         try g.connect(n_pad_div, 0, n_pad_eu, 0);
         try g.connect(n_pad_div, 0, n_amb_turing, 0);
         try g.connect(n_pad_div, 0, n_amb_random, 0);
         try g.connect(n_pad_eu, 0, n_pad, 0); // pad gate
         try g.connect(n_amb_turing, 0, n_amb_quant, 0);
-        try g.connect(n_amb_quant, 0, n_pad, 1); // pad.pitch_cv（root を scale 内で遷移）
-        try g.connect(n_amb_lfo, 0, n_pad, 2); // pad.cutoff_cv（連続変調）
-        try g.connect(n_amb_random, 0, n_pad, 3); // pad.level_cv（呼吸）
-        // mix: 非kick(hat/clap/bass/pad)を Sidechain でダッキングし、kick は素通しで master に合流
+        try g.connect(n_amb_quant, 0, n_pad, 1); // pad.pitch_cv (root moves within the scale)
+        try g.connect(n_amb_lfo, 0, n_pad, 2); // pad.cutoff_cv (continuous modulation)
+        try g.connect(n_amb_random, 0, n_pad, 3); // pad.level_cv (breathing)
+        // mix: duck non-kick (hat/clap/bass/pad) via Sidechain; kick joins master passthrough
         try g.connect(n_hat, 0, n_nonkick, 0);
         try g.connect(n_clap, 0, n_nonkick, 1);
         try g.connect(n_vca, 0, n_nonkick, 2);
@@ -623,7 +623,7 @@ pub const LofiPatch = struct {
         try g.connect(n_nonkick, 0, n_sidechain, 0);
         try g.connect(n_kick, 0, n_master, 0);
         try g.connect(n_sidechain, 0, n_master, 1);
-        // master LPF → lofi FX チェーン
+        // master LPF → lofi FX chain
         try g.connect(n_master, 0, n_master_vcf, 0);
         try g.connect(n_master_vcf, 0, n_sat, 0);
         try g.connect(n_sat, 0, n_bit, 0);
@@ -636,7 +636,7 @@ pub const LofiPatch = struct {
         g.setOutput(n_output);
         try g.publish();
 
-        // 構築順序・接続内容は従来どおり。以後の参照は制御レートで handle から解決する。
+        // Build order and wiring match the historical patch; later lookups resolve handles at control rate.
         self.clock_h = n_clock;
         self.kick_seq_h = n_kick_seq;
         self.hat_seq_h = n_hat_seq;
@@ -668,11 +668,11 @@ pub const LofiPatch = struct {
         self.wow_h = n_wow;
         self.output_h = n_output;
         self.applyMixerLabels();
-        // TASK-160.2: mutation metadata + evolve ON（PatternCommand 既定）+ density を mask から初期化。
+        // Init mutation metadata + evolve ON (PatternCommand default) + density from each mask.
         self.initStepSeqMutationMeta();
     }
 
-    /// StepSeq の mutation_kind / density_band / evolve / density を生成ロールへ初期化。
+    /// Init StepSeq mutation_kind / density_band / evolve / density for the generation role.
     fn initStepSeqMutationMeta(self: *LofiPatch) void {
         const def = PatternCommand.default();
         if (self.ptr(.step_seq, self.kick_seq_h)) |seq| {
@@ -704,7 +704,7 @@ pub const LofiPatch = struct {
         seq.density = modular.StepSeq.densityFromMask(mask, band);
     }
 
-    /// Mixer 入力ラベル（表示専用。NPRM 非保存。wire / GENR remap 後に再設定）。
+    /// Mixer input labels (display only; not NPRM-persisted; re-set after wire / GENR remap).
     fn applyMixerLabels(self: *LofiPatch) void {
         if (self.ptr(.mixer, self.nonkick_mixer_h)) |m| {
             m.input_labels = .{ "hat", "clap", "bass", "pad" };
@@ -714,35 +714,35 @@ pub const LofiPatch = struct {
         }
     }
 
-    /// 制御レート用の handle 解決。retire 済み handle は null として呼び出し側で no-op にする。
+    /// Control-rate handle resolve. A retired handle becomes null; caller no-ops.
     inline fn ptr(self: *LofiPatch, comptime kind: modular.ModuleKind, handle: modular.dyn.Handle) ?*modular.dyn.KindType(kind) {
         if (!self.graph.isActive(handle)) return null;
         return self.graph.ptrOf(kind, handle);
     }
 
-    /// snapshot 用の const handle 解決。ptrOf は既存の mutable API を維持し、ここで const view にする。
+    /// Const handle resolve for snapshots. ptrOf keeps its mutable API; this wraps a const view.
     inline fn ptrConst(self: *const LofiPatch, comptime kind: modular.ModuleKind, handle: modular.dyn.Handle) ?*const modular.dyn.KindType(kind) {
         if (!self.graph.isActive(handle)) return null;
         return @constCast(self.graph).ptrOf(kind, handle);
     }
 
-    /// RT callback から呼ぶ（alloc/lock/IO/panic なし）。interleaved 出力へ書く。
+    /// Called from the RT callback (no alloc/lock/IO/panic). Writes interleaved output.
     pub fn render(self: *LofiPatch, buf: []f32, frames: u32, channels: u32) void {
-        self.drainMidiNotes(); // block 冒頭: NoteQueue drain のみ（新設 per-sample loop なし）
+        self.drainMidiNotes(); // Block start: NoteQueue drain only (no new per-sample loop)
         self.applyControls();
-        // TASK-91: play/goto 直後の初回 bar を processBlock 前に 1 回だけ apply（bar 境界待ちをしない）。
-        // 固定長・alloc なし。force 消費後は通常の maybeEvolve bar 境界経路のみ。
+        // Force-apply the first bar right after play/goto once before processBlock (do not wait for a bar boundary).
+        // Fixed-length; no alloc. After consuming force, only the normal maybeEvolve bar-boundary path runs.
         if (self.song_force_apply and self.song_playing) {
             self.song_force_apply = false;
             _ = self.applySongBar();
         }
         self.graph.processBlock(buf, frames, channels);
-        self.maybeEvolve(); // 小節境界を跨いだら 1 小節 1 回だけ前景を変異
+        self.maybeEvolve(); // On crossing a bar boundary, mutate the foreground once per bar
     }
 
-    /// RT block 冒頭: NoteQueue を drain し ChordPad MIDI state へ反映（alloc/lock/IO/panic なし）。
-    /// 順序は libs/synth Synth.render と同じ: 先に ring を空にしてから panic を消費する。
-    /// panic 後に残 note_on を適用すると stuck になるため、panic は drain 完了後に全解除する。
+    /// RT block start: drain NoteQueue into ChordPad MIDI state (no alloc/lock/IO/panic).
+    /// Order matches libs/synth Synth.render: empty the ring first, then consume panic.
+    /// Applying leftover note_on after panic would stick, so panic clears all only after drain completes.
     fn drainMidiNotes(self: *LofiPatch) void {
         while (self.note_queue.pop()) |ev| {
             switch (ev) {
@@ -781,8 +781,8 @@ pub const LofiPatch = struct {
             self.syncChordPadFromHeld();
             return;
         };
-        if (cur != n) return; // 他ノートの off は current を変えない
-        // last-note priority: 残 held のうち最新 age を選ぶ。無ければ release。
+        if (cur != n) return; // note_off for other notes does not change current
+        // last-note priority: pick the newest age among remaining held; else release.
         var best_note: ?u8 = null;
         var best_age: u32 = 0;
         var i: u8 = 0;
@@ -801,37 +801,37 @@ pub const LofiPatch = struct {
     fn syncChordPadFromHeld(self: *LofiPatch) void {
         const pad = self.ptr(.chord_pad, self.pad_h) orelse return;
         if (self.midi_current_note) |n| {
-            // velocity は直近 note_on のものを ChordPad が保持。root のみ更新。
+            // ChordPad keeps velocity from the latest note_on; update root only.
             pad.applyMidiNote(n, pad.midi_velocity);
         } else {
             pad.clearMidi();
         }
     }
 
-    /// GUI が store/publish した Controls を各モジュール field へ反映（RT 単一スレッド）。
-    /// ホットパス: ブロック先頭・bool 分岐 + 固定長 struct コピーのみ（alloc/lock/超越関数なし）。
+    /// Apply Controls the GUI store/published onto each module field (RT single-threaded).
+    /// Hot path: block start only — bool branches + fixed-length struct copies (no alloc/lock/transcendentals).
     fn applyControls(self: *LofiPatch) void {
         const c = &self.controls;
-        // grid/303 pattern: revision 変化時のみ取り込む（GUI 編集を反映、StepSeq.step は保持）。
-        const cmd = c.pattern_db.acquire(); // Mailbox: 最新 publish を latch（*const、fresh 無しは現値維持）
+        // grid/303 pattern: take in only on revision change (apply GUI edits; keep StepSeq.step).
+        const cmd = c.pattern_db.acquire(); // Mailbox: latch the latest publish (*const; keep current if not fresh)
         if (cmd.rev != self.applied_rev) {
             self.applied_rev = cmd.rev;
             if (cmd.quantize_bar) {
-                // TASK-93: 小節境界まで退避（後着 publish は pending 上書き = latest-wins）。
-                // rev は consumed。StepSeq への反映は maybeEvolve の bar 境界。
+                // Defer until the bar boundary (a later publish overwrites pending = latest-wins).
+                // rev is consumed. StepSeq apply happens at maybeEvolve's bar boundary.
                 self.pending_bar_cmd = cmd.*;
             } else {
-                // 即反映（GUI / 既存 action）。pending 中の bar 予約は破棄（明示の即時編集が勝つ）。
+                // Apply immediately (GUI / existing actions). Drop any bar reservation in pending (explicit immediate edit wins).
                 self.pending_bar_cmd = null;
                 self.applyPatternCommand(cmd.*);
             }
         }
-        // TASK-91: SongData latch（rev 変化時のみ固定長コピー）
+        // SongData latch (fixed-length copy only on rev change)
         const sd = c.song_db.acquire();
         if (sd.rev != self.song.rev) {
             self.song = sd.*;
         }
-        // TASK-91: song_playing 開始エッジで position リセット + 初回 bar 強制 apply
+        // song_playing rising edge: reset position + force-apply first bar
         const want_play = c.song_playing.load(.acquire) != 0;
         if (want_play and !self.song_playing) {
             self.song_row = 0;
@@ -840,7 +840,7 @@ pub const LofiPatch = struct {
             self.song_force_apply = true;
         }
         self.song_playing = want_play;
-        // TASK-91: song_goto（gen 変化で row を即 latch + 強制 apply）
+        // song_goto (on gen change: latch row immediately + force apply)
         const ggen = c.song_goto_gen.load(.acquire);
         if (ggen != self.applied_song_goto_gen) {
             self.applied_song_goto_gen = ggen;
@@ -852,8 +852,8 @@ pub const LofiPatch = struct {
                 if (self.song_playing) self.song_force_apply = true;
             }
         }
-        // scalar controls — tone macros only（TASK-160.3）。
-        // tempo/bpm/swing/sidechain/cutoff は graph descriptor + param_db が正（Controls から上書きしない）。
+        // scalar controls — tone macros only.
+        // tempo/bpm/swing/sidechain/cutoff are owned by graph descriptors + param_db (Controls must not overwrite them).
         if (self.ptr(.kick, self.kick_h)) |kick| {
             kick.click_gain = KICK_CLICK_BASE * clampFinite(c.kick_punch.load(), 0.0, 2.0, 1.0);
         }
@@ -866,13 +866,13 @@ pub const LofiPatch = struct {
             pad.warmth = clampFinite(c.pad_warmth.load(), 0.0, 1.0, PAD_WARMTH_DEFAULT);
         }
         if (self.ptr(.saturator, self.saturator_h)) |saturator| saturator.drive = 1.0 + clampFinite(c.master_warmth.load(), 0.0, 1.0, MASTER_WARMTH_DEFAULT);
-        // ambient_move(0..1) → LFO rate(0.03..0.45Hz) + pad cutoff 変調深さ(0.2..1.0 oct)
+        // ambient_move(0..1) → LFO rate(0.03..0.45Hz) + pad cutoff mod depth(0.2..1.0 oct)
         const mv = clampFinite(c.ambient_move.load(), 0.0, 1.0, AMBIENT_MOVE_DEFAULT);
         if (self.ptr(.lfo, self.ambient_lfo_h)) |ambient_lfo| ambient_lfo.rate_hz = 0.03 + mv * 0.42;
         if (self.ptr(.chord_pad, self.pad_h)) |pad| pad.cutoff_mod_oct = 0.2 + mv * 0.8;
 
-        // Inspector override は generated Controls より後勝ち。毎 block 全 touched entry を
-        // 再適用することで Mailbox の latest-wins による先行編集の drop を防ぐ。
+        // Inspector overrides win over generated Controls. Re-applying every touched entry each block
+        // prevents earlier edits from being dropped by Mailbox latest-wins.
         const overrides = c.param_db.acquire();
         for (overrides.entries) |entry| {
             if (!entry.touched) continue;
@@ -880,9 +880,9 @@ pub const LofiPatch = struct {
         }
     }
 
-    /// PatternCommand を StepSeq mask / evolve / lock / anchor へ反映（RT・alloc/lock なし・固定長コピー）。
-    /// evolve/lock の authoritative は各 StepSeq（TASK-160.2）。set_evolve は全 4 つへ同一値を書く。
-    /// on_mask が変わった lane は density を mask から再同期し、bar 境界の密度収束が編集を即壊さないようにする。
+    /// Apply PatternCommand onto StepSeq mask / evolve / lock / anchor (RT; no alloc/lock; fixed-length copy).
+    /// evolve/lock authority is each StepSeq. set_evolve writes the same value to all four.
+    /// Lanes whose on_mask changed re-sync density from the mask so bar-boundary density convergence does not immediately undo the edit.
     fn applyPatternCommand(self: *LofiPatch, cmd: PatternCommand) void {
         self.anchor = cmd;
         if (self.ptr(.step_seq, self.kick_seq_h)) |seq| {
@@ -918,14 +918,14 @@ pub const LofiPatch = struct {
         }
     }
 
-    /// 小節境界（floor(tick_index/16) の繰り上がり）を跨いだら、
-    /// 1) pending seed があれば PRNG/生成状態を再初期化（TASK-62.5.7）
-    /// 2) Song 進行で phrase 切替（TASK-91。seed の後・pending の前）
-    /// 3) quantize_bar pending pattern を反映（TASK-93。song の後なので明示編集がその bar は勝つ）
-    /// 4) いずれも無ければ 1 小節 1 回だけ前景パターンを変異
-    /// 適用順: seed → song → pending_bar_cmd → mutate
-    /// block 数ではなく musical bar をキーにする（決定性は固定 seed + 固定 render チャンクで担保）。
-    /// ホットパス: bar 境界での index 計算 + 固定長 PatternCommand 組み立て 1 回（alloc/lock なし）。
+    /// When crossing a bar boundary (floor(tick_index/16) increment):
+    /// 1) if a pending seed exists, re-init PRNG/generation state
+    /// 2) Song advance / phrase switch (after seed, before pending)
+    /// 3) apply quantize_bar pending pattern (after song, so explicit edits win that bar)
+    /// 4) otherwise mutate the foreground pattern once per bar
+    /// Apply order: seed → song → pending_bar_cmd → mutate
+    /// Keyed by musical bar, not block count (determinism from fixed seed + fixed render chunking).
+    /// Hot path: bar-boundary index math + one fixed-length PatternCommand build (no alloc/lock).
     fn maybeEvolve(self: *LofiPatch) void {
         const clock = self.ptr(.clock, self.clock_h) orelse return;
         if (!clock.started) return;
@@ -933,7 +933,7 @@ pub const LofiPatch = struct {
         if (bar == self.last_bar) return;
         self.last_bar = bar;
 
-        // 1) pending seed を先に latch（規約 2/4）。applyBaseSeed は pending_bar_cmd を触らない。
+        // 1) Latch pending seed first. applyBaseSeed does not touch pending_bar_cmd.
         var applied_seed = false;
         const gen = self.controls.pending_seed_gen.load(.acquire);
         if (gen != self.applied_seed_gen) {
@@ -942,13 +942,13 @@ pub const LofiPatch = struct {
             applied_seed = true;
         }
 
-        // 2) Song 進行（phrase 切替。独立ステップ = pending を占有しない）
+        // 2) Song advance (phrase switch; independent step = does not occupy pending)
         var applied_song = false;
         if (self.song_playing) {
             applied_song = self.applySongBar();
         }
 
-        // 3) seed/song の後に pending pattern（ユーザー明示編集がその bar は後勝ち）
+        // 3) After seed/song, pending pattern (user's explicit edit wins that bar)
         var applied_pending = false;
         if (self.pending_bar_cmd) |cmd| {
             self.applyPatternCommand(cmd);
@@ -956,18 +956,18 @@ pub const LofiPatch = struct {
             applied_pending = true;
         }
 
-        // seed / song 切替 / pending を適用した bar は evolve 変異も density 収束もしない。
-        // TASK-106.1: mutate / density は host authority のときだけ（client は pattern_state で収束）。
+        // A bar that applied seed / song switch / pending skips both evolve mutate and density convergence.
+        // mutate / density only under host authority (client converges via pattern_state).
         const host_auth = self.controls.evolve_host_authority.load(.acquire) != 0;
         if (host_auth and !(applied_seed or applied_song or applied_pending)) {
             self.mutatePattern();
-            // density は各 StepSeq.density へ bar ごとに 1 bit 収束（Controls.density_target 非依存。TASK-160.2）。
+            // Density converges 1 bit per bar onto each StepSeq.density (independent of Controls.density_target).
             self.applyDensityTargets(bar);
         }
     }
 
-    /// 各 StepSeq の density/band へ独立収束。kick 含む 4 レーン。lock lane は StepSeq 側で skip。
-    /// ホットパス: bar 境界のみ・固定長 16-bit mask 操作（alloc/lock/IO/panic/超越関数なし）。
+    /// Independent convergence onto each StepSeq density/band. All 4 lanes including kick. Locked lanes skip inside StepSeq.
+    /// Hot path: bar boundary only — fixed-length 16-bit mask ops (no alloc/lock/IO/panic/transcendentals).
     fn applyDensityTargets(self: *LofiPatch, bar: u64) void {
         if (self.ptr(.step_seq, self.kick_seq_h)) |seq| seq.applyDensityStep(bar, self.base_seed);
         if (self.ptr(.step_seq, self.hat_seq_h)) |seq| seq.applyDensityStep(bar, self.base_seed);
@@ -975,11 +975,11 @@ pub const LofiPatch = struct {
         if (self.ptr(.step_seq, self.bass_seq_h)) |seq| seq.applyDensityStep(bar, self.base_seed);
     }
 
-    /// 現在の song position の phrase を解決し、変化した track だけ PatternCommand を組み立てて適用。
-    /// 適用後に position を 1 bar 進める。戻り値 = 切替を適用したか（mutate スキップ用）。
-    /// ホットパス: 固定長コピー + index 計算のみ（alloc/lock なし）。
+    /// Resolve phrases at the current song position and build/apply a PatternCommand only for tracks that changed.
+    /// Then advance position by 1 bar. Return value = whether a switch was applied (to skip mutate).
+    /// Hot path: fixed-length copies + index math only (no alloc/lock).
     fn applySongBar(self: *LofiPatch) bool {
-        // song_len=0 で play → 即 stop
+        // song_len=0 + play → stop immediately
         if (self.song.row_count == 0) {
             self.song_playing = false;
             self.controls.song_playing.store(0, .release);
@@ -1000,7 +1000,7 @@ pub const LofiPatch = struct {
         const phrases = self.resolveRowPhrases(row, self.song_bar_in_row);
         const row_len = self.rowLength(row);
 
-        // phrase idx が直前 bar から変化した track がある bar のみ PatternCommand を組み立て
+        // Build a PatternCommand only on bars where some track's phrase idx changed from the previous bar
         var any_change = false;
         var i: usize = 0;
         while (i < 4) : (i += 1) {
@@ -1012,7 +1012,7 @@ pub const LofiPatch = struct {
 
         var applied = false;
         if (any_change) {
-            // 現行 pattern を base に、変化 track だけ pool から上書き（空 chain = 現行維持）
+            // Start from the current pattern; overwrite only changed tracks from the pool (empty chain = keep current)
             const locks = self.readStepSeqLocks();
             var cmd: PatternCommand = .{
                 .rev = self.applied_rev,
@@ -1049,17 +1049,17 @@ pub const LofiPatch = struct {
                     cmd.bass.deg = bp.deg;
                 }
             }
-            // 切替時は anchor も更新（evolve 復帰先が新 phrase になる = 確定方針）
+            // On switch, also update anchor (evolve return target becomes the new phrase = settled policy)
             self.applyPatternCommand(cmd);
             applied = true;
         }
 
-        // last_phrase を常に更新（空 chain → NONE 番兵。phrase0→空→phrase0 の再入場を切替扱いにする）
+        // Always update last_phrase (empty chain → NONE sentinel. Re-entry phrase0→empty→phrase0 counts as a switch)
         self.song_last_phrase = phrases;
 
-        // position を 1 bar 進める
+        // Advance position by 1 bar
         if (row_len == 0) {
-            // 全 chain 空 → この row は 1 bar 扱いで次 row へ
+            // All chains empty → treat this row as 1 bar and move to the next row
             self.advanceSongRow();
         } else {
             self.song_bar_in_row +%= 1;
@@ -1077,7 +1077,7 @@ pub const LofiPatch = struct {
             if (self.song.loop) {
                 self.song_row = 0;
             } else {
-                // 最終 row の最終 bar を再生し終えた → stop（次回 applySongBar で playing=false）
+                // Finished the last bar of the last row → stop (next applySongBar sees playing=false)
                 self.song_row = self.song.row_count; // sentinel >= row_count
             }
         } else {
@@ -1085,7 +1085,7 @@ pub const LofiPatch = struct {
         }
     }
 
-    /// row 内 chain len の最大値（0 = 全空）。
+    /// Max chain len within the row (0 = all empty).
     fn rowLength(self: *const LofiPatch, row: SongRow) u16 {
         var max_len: u16 = 0;
         const idxs = [_]u8{ row.kick, row.hat, row.clap, row.bass };
@@ -1098,7 +1098,7 @@ pub const LofiPatch = struct {
         return max_len;
     }
 
-    /// 各 track の phrase idx を解決。空 chain / OOB → PHRASE_NONE（現行維持）。
+    /// Resolve each track's phrase idx. Empty chain / OOB → PHRASE_NONE (keep current).
     fn resolveRowPhrases(self: *const LofiPatch, row: SongRow, bar_in_row: u16) [4]u8 {
         var out: [4]u8 = .{ PHRASE_NONE, PHRASE_NONE, PHRASE_NONE, PHRASE_NONE };
         const chain_idxs = [_]u8{ row.kick, row.hat, row.clap, row.bass };
@@ -1112,18 +1112,18 @@ pub const LofiPatch = struct {
         return out;
     }
 
-    /// 生成状態を base seed 由来の初期状態へ戻す（RT・alloc/lock なし）。
-    /// パターン・変異・生成 RNG・StepSeq 実行位置・クロック位相・背景生成 runtime を
-    /// fresh create 相当へ揃える。音響残響 transient（reverb/delay 尾・envelope 等）は対象外。
-    /// **pending_bar_cmd はクリアしない**（maybeEvolve が seed 後に pattern を載せるため。
-    /// offline の `resetWithSeed` だけが pending を明示クリアする）。
+    /// Reset generation state to the initial state derived from base seed (RT; no alloc/lock).
+    /// Align pattern / mutation / generation RNG / StepSeq playhead / clock phase / background generation runtime
+    /// to a fresh create. Acoustic ring-out transients (reverb/delay tails, envelopes, etc.) are out of scope.
+    /// **Does not clear pending_bar_cmd** (maybeEvolve applies the pattern after seed.
+    /// Only offline `resetWithSeed` clears pending explicitly).
     fn applyBaseSeed(self: *LofiPatch, base: u64) void {
         self.base_seed = base;
 
-        // --- 生成 RNG ---
+        // --- generation RNG ---
         self.mut_noise.state = seedmod.deriveU32(base, .mutate);
-        // anchor_register param 契約は 0..65535（16 bit）。deriveU32 は全幅 u32 なので mask する。
-        // （未 mask だと VPRJ NPRM validate が OutOfRange になり save→load が壊れる）
+        // anchor_register param contract is 0..65535 (16 bit). deriveU32 is full-width u32, so mask it.
+        // (Unmasked, VPRJ NPRM validate returns OutOfRange and save→load breaks)
         const treg = seedmod.deriveU32(base, .ambient_turing_register) & 0xFFFF;
         if (self.ptr(.random, self.ambient_random_h)) |ambient_random| {
             ambient_random.noise.state = seedmod.deriveU32(base, .ambient_random);
@@ -1141,7 +1141,7 @@ pub const LofiPatch = struct {
         if (self.ptr(.lfo, self.ambient_lfo_h)) |ambient_lfo| ambient_lfo.lfo.phase = 0.0;
         if (self.ptr(.quantizer, self.ambient_quant_h)) |ambient_quant| ambient_quant.last_out = 0.0;
 
-        // --- クロック位相（bar/step の起点を fresh と揃える）---
+        // --- clock phase (align bar/step origin with fresh) ---
         if (self.ptr(.clock, self.clock_h)) |clock| {
             clock.phase_samples = 0;
             clock.tick_index = 0;
@@ -1151,7 +1151,7 @@ pub const LofiPatch = struct {
         }
         self.last_bar = 0;
 
-        // --- 前景 pattern + StepSeq runtime ---
+        // --- foreground pattern + StepSeq runtime ---
         const def = PatternCommand.default();
         if (self.ptr(.step_seq, self.kick_seq_h)) |seq| resetStepSeqRuntime(seq, .{ .on = def.kick.on });
         if (self.ptr(.step_seq, self.hat_seq_h)) |seq| resetStepSeqRuntime(seq, .{ .on = def.hat.on });
@@ -1162,12 +1162,12 @@ pub const LofiPatch = struct {
             .slide = def.bass.slide,
             .deg = def.bass.deg,
         });
-        // evolve/lock/density を default pattern 相当へ（mutation_kind/band は維持）。
+        // evolve/lock/density back to default-pattern equivalents (keep mutation_kind/band).
         self.initStepSeqMutationMeta();
         self.anchor = def;
         self.mutation_count = 0;
 
-        // --- 背景生成のシーケンサ実行位置（pad トリガ経路）---
+        // --- background generation sequencer playhead (pad trigger path) ---
         if (self.ptr(.clock_divider, self.pad_div_h)) |pad_div| {
             pad_div.count = 0;
             pad_div.prev_gate = false;
@@ -1185,7 +1185,7 @@ pub const LofiPatch = struct {
         deg: ?[16]i8 = null,
     };
 
-    /// StepSeq の pattern + runtime を fresh create 相当へ戻す（RT・alloc なし）。
+    /// Reset StepSeq pattern + runtime to fresh-create equivalents (RT; no alloc).
     fn resetStepSeqRuntime(seq: *modular.StepSeq, p: StepSeqReset) void {
         seq.storeOnMask(p.on);
         seq.storeAccentMask(p.accent);
@@ -1208,8 +1208,8 @@ pub const LofiPatch = struct {
         return @min(v, 15);
     }
 
-    /// 復帰: eligible な lane の 1 step を anchor へ戻す（迷子防止。§4.7）。
-    /// on-mask は density バンドを守る（バンドを割る方向の復帰はスキップ）。accent/slide/deg は密度非依存。
+    /// Return: restore one step of an eligible lane to the anchor (anti-drift; density-band policy).
+    /// on-mask respects the density band (skip a restore that would leave the band). accent/slide/deg are density-independent.
     fn recoverOneStep(self: *LofiPatch, lane: usize) void {
         const s = self.randStep();
         const b = bitOf(s);
@@ -1218,7 +1218,7 @@ pub const LofiPatch = struct {
             1 => if (self.ptr(.step_seq, self.hat_seq_h)) |seq| seq.recoverOn(self.anchor.hat.on, b),
             2 => if (self.ptr(.step_seq, self.clap_seq_h)) |seq| seq.recoverOn(self.anchor.clap.on, b),
             else => {
-                // bass も「1 小節 1 パラメータ」を守るため、戻す要素を 1 つだけ選ぶ。
+                // Bass also picks only one element to restore, keeping "one parameter per bar".
                 const which = self.rand01();
                 if (self.ptr(.step_seq, self.bass_seq_h)) |seq| {
                     if (which < 0.5) {
@@ -1235,7 +1235,7 @@ pub const LofiPatch = struct {
         }
     }
 
-    /// 1 小節につき最大 1 パラメータ変異。evolve && !lock の lane だけが対象（per-StepSeq）。
+    /// At most one parameter mutates per bar. Only lanes with evolve && !lock (per StepSeq).
     fn mutatePattern(self: *LofiPatch) void {
         var elig: [4]usize = undefined;
         var n: usize = 0;
@@ -1251,7 +1251,7 @@ pub const LofiPatch = struct {
         if (n == 0) return;
         self.mutation_count +%= 1;
         const pick = elig[@min(n - 1, @as(usize, @intFromFloat(self.rand01() * @as(f32, @floatFromInt(n)))))];
-        // 低確率で anchor へ 1 step 復帰（迷子防止）
+        // Low probability: restore one step to the anchor (anti-drift)
         if (self.rand01() < 0.06) {
             self.recoverOneStep(pick);
             return;
@@ -1264,7 +1264,7 @@ pub const LofiPatch = struct {
         }
     }
 
-    /// set_evolve は全 4 StepSeq へ同一値を書く前提。snapshot / song は kick を代表値にする。
+    /// set_evolve writes the same value to all 4 StepSeqs. snapshot / song use kick as the representative.
     fn readStepSeqEvolve(self: *const LofiPatch) bool {
         if (self.ptrConst(.step_seq, self.kick_seq_h)) |seq| return seq.evolve;
         return true;
@@ -1279,7 +1279,7 @@ pub const LofiPatch = struct {
         };
     }
 
-    /// 4 StepSeq.density の平均（probe 表示用）。
+    /// Mean of the 4 StepSeq.density values (for probe display).
     fn averageStepSeqDensity(self: *const LofiPatch) f32 {
         var sum: f32 = 0;
         var n: f32 = 0;
@@ -1294,8 +1294,8 @@ pub const LofiPatch = struct {
         return sum / n;
     }
 
-    /// 生成 role handle の固定順スナップショット（VPRJ GENR。イベント時のみ）。
-    /// render / processBlock の処理順と RT アクセスは変更しない。
+    /// Fixed-order snapshot of generation role handles (VPRJ GENR; event only).
+    /// Does not change render / processBlock order or RT access.
     pub fn snapshotGenRoles(self: *const LofiPatch) project_io.GenRoleHandles {
         var g: project_io.GenRoleHandles = .{};
         g.set(.clock, self.clock_h);
@@ -1331,7 +1331,7 @@ pub const LofiPatch = struct {
         return g;
     }
 
-    /// GENR remap 後の role handle を適用する（イベント時のみ。invalid は isActive で false）。
+    /// Apply role handles after a GENR remap (event only; invalid → isActive false).
     pub fn applyGenRoles(self: *LofiPatch, g: project_io.GenRoleHandles) void {
         self.clock_h = g.get(.clock);
         self.kick_seq_h = g.get(.kick_seq);
@@ -1366,12 +1366,12 @@ pub const LofiPatch = struct {
         self.applyMixerLabels();
     }
 
-    /// 旧形式（GENR 無し）ロード時: role を無効化し isActive ガードで安全に扱う。
+    /// Old-format load (no GENR): invalidate roles and handle safely via the isActive guard.
     pub fn invalidateGenRoles(self: *LofiPatch) void {
         self.applyGenRoles(.{});
     }
 
-    /// harness probe 用の生成状態スナップショット（alloc/lock/IO なし・torn 可）。
+    /// Generation-state snapshot for harness probes (no alloc/lock/IO; may tear).
     pub fn snapshotState(self: *const LofiPatch) PatchState {
         const clock = self.ptrConst(.clock, self.clock_h);
         const kick_seq = self.ptrConst(.step_seq, self.kick_seq_h);
@@ -1400,8 +1400,8 @@ pub const LofiPatch = struct {
         return .{
             .bpm = if (clock) |p| p.bpm else DEFAULT_BPM,
             .clock_phase = phase,
-            // step は RT process が @atomicStore する（40.7.2）。main スレッドの snapshotState はプレーン read
-            // でなく loadStep()(atomic load) で読む（mixed cross-thread access を避ける。値は monotonic で不変）。
+            // step is @atomicStore'd by the RT process. main-thread snapshotState must not plain-read;
+            // use loadStep() (atomic load) to avoid mixed cross-thread access (value is monotonic).
             .kick_step = if (kick_seq) |p| p.loadStep() else 0,
             .hat_step = if (hat_seq) |p| p.loadStep() else 0,
             .clap_step = if (clap_seq) |p| p.loadStep() else 0,
@@ -1443,7 +1443,7 @@ pub const LofiPatch = struct {
             .lock = self.readStepSeqLocks(),
             .evolve = self.readStepSeqEvolve(),
             .pattern_rev = self.applied_rev,
-            // TASK-106.1: client netsync 中は host から受信した remote mutation_count を digest に出す。
+            // During client netsync, expose the remote mutation_count received from the host in the digest.
             .mutation_count = if (self.controls.evolve_host_authority.load(.acquire) != 0)
                 self.mutation_count
             else
@@ -1469,7 +1469,7 @@ pub const LofiPatch = struct {
 };
 
 // ============================================================================
-// tests（offline・display/audio デバイス不要）
+// tests (offline; no display/audio device needed)
 // ============================================================================
 const testing = std.testing;
 const wav = @import("wav.zig");
@@ -1483,7 +1483,7 @@ fn renderCrc(allocator: std.mem.Allocator, sample_rate: f32, frames: u32) !u32 {
     return std.hash.Crc32.hash(std.mem.sliceAsBytes(buf));
 }
 
-/// chunk 分割で target サンプルを render し CRC を返す（per-bar 変異を跨ぐ長さでの決定性検証用）。
+/// Render target samples in chunks and return CRC (determinism across lengths that span per-bar mutation).
 fn renderCrcChunked(allocator: std.mem.Allocator, sample_rate: f32, chunk: u32, target: u64) !u32 {
     const patch = try LofiPatch.create(allocator, sample_rate);
     defer patch.destroy();
@@ -1520,14 +1520,14 @@ test "LofiPatch: offline render is non-silent and finite" {
 }
 
 test "LofiPatch: deterministic render for same initial state (single block)" {
-    const frames: u32 = 24000; // < 1 bar（変異前）でも、同一初期状態なら bit 一致
+    const frames: u32 = 24000; // Even under 1 bar (pre-mutation), the same initial state is bit-identical
     const crc_a = try renderCrc(testing.allocator, 48000, frames);
     const crc_b = try renderCrc(testing.allocator, 48000, frames);
     try testing.expectEqual(crc_a, crc_b);
 }
 
 test "LofiPatch: deterministic across bars with fixed chunking (per-bar mutation is reproducible)" {
-    // per-bar 変異を複数回跨ぐ長さ。固定 seed + 固定チャンク分割なら 2 回 render で bit 一致。
+    // Length spanning multiple per-bar mutations. Fixed seed + fixed chunking → two renders bit-match.
     const crc_a = try renderCrcChunked(testing.allocator, 48000, 4800, 48000 * 10);
     const crc_b = try renderCrcChunked(testing.allocator, 48000, 4800, 48000 * 10);
     try testing.expectEqual(crc_a, crc_b);
@@ -1539,7 +1539,7 @@ test "LofiPatch: RT render is zero-allocation (FailingAllocator)" {
 
     var failing = std.testing.FailingAllocator.init(testing.allocator, .{ .fail_index = 0 });
     patch.graph.allocator = failing.allocator();
-    defer patch.graph.allocator = testing.allocator; // destroy は構築時 allocator へ戻す
+    defer patch.graph.allocator = testing.allocator; // destroy returns memory to the construction-time allocator
 
     const chunk: u32 = 4096;
     var buf: [chunk * 2]f32 = undefined;
@@ -1555,8 +1555,8 @@ test "LofiPatch: RT render is zero-allocation (FailingAllocator)" {
     try testing.expectEqual(@as(usize, 0), failing.allocated_bytes);
 }
 
-/// offline render → PCM16 WAV バイト列（chunk=4800・2ch。action render と同型）。
-/// `setup` が non-null なら create/resetWithSeed 後に呼ばれ、actionRender 相当の状態複製を行う。
+/// offline render → PCM16 WAV bytes (chunk=4800, 2ch; same shape as action render).
+/// If `setup` is non-null it runs after create/resetWithSeed and copies actionRender-equivalent state.
 fn renderToWavBytes(
     allocator: std.mem.Allocator,
     sample_rate: u32,
@@ -1591,7 +1591,7 @@ fn renderToWavBytes(
 }
 
 test "LofiPatch: offline renderToWav is deterministic (2x bit-identical) and non-silent" {
-    // TASK-86: 同一 seed + 同一チャンク分割で 2 回 render → WAV 全バイト bit 一致 + 非無音。
+    // Same seed + same chunking, two renders → WAV bytes bit-identical + non-silent.
     const sr: u32 = 48000;
     const seconds: u32 = 1;
     const a = try renderToWavBytes(testing.allocator, sr, seconds, 42, null);
@@ -1602,12 +1602,12 @@ test "LofiPatch: offline renderToWav is deterministic (2x bit-identical) and non
     try testing.expectEqual(a.len, b.len);
     try testing.expectEqualStrings("RIFF", a[0..4]);
     try testing.expectEqualStrings("WAVE", a[8..12]);
-    // ヘッダ 44B + PCM16 stereo: 44 + seconds*sr*2*2
+    // 44B header + PCM16 stereo: 44 + seconds*sr*2*2
     try testing.expectEqual(@as(usize, 44 + @as(usize, seconds) * sr * 2 * 2), a.len);
     try testing.expectEqualSlices(u8, a, b);
 
     var nonzero: bool = false;
-    // PCM16 payload が全ゼロでないこと（非無音）。
+    // PCM16 payload must not be all zeros (non-silent).
     var i: usize = 44;
     while (i + 1 < a.len) : (i += 2) {
         if (std.mem.readInt(i16, a[i..][0..2], .little) != 0) {
@@ -1618,9 +1618,9 @@ test "LofiPatch: offline renderToWav is deterministic (2x bit-identical) and non
     try testing.expect(nonzero);
 }
 
-/// actionRender と同じ状態複製: 非デフォルト tone macros + graph ParamBatch + pattern（rev 強制 apply）。
+/// Same state copy as actionRender: non-default tone macros + graph ParamBatch + pattern (force-apply rev).
 fn setupActionLikeEditState(patch: *LofiPatch) void {
-    // publishControls 相当（tone macros）。track gain/mute + tempo/cutoff 等は ParamBatch。
+    // publishControls equivalent (tone macros). track gain/mute + tempo/cutoff etc. via ParamBatch.
     const c = &patch.controls;
     c.kick_punch.store(1.2);
     c.hat_bright.store(1.1);
@@ -1643,7 +1643,7 @@ fn setupActionLikeEditState(patch: *LofiPatch) void {
     batch.entries[8] = .{ .handle = patch.nonkick_mixer_h, .name = "in3_gain", .value = .{ .scalar = 0.5 }, .touched = true };
     patch.publishParamBatch(batch);
 
-    // stateToCommand + cmd.rev = offline.applied_rev +% 1 相当
+    // stateToCommand + cmd.rev = offline.applied_rev +% 1 equivalent
     var cmd = PatternCommand.default();
     cmd.kick = .{ .on = 0x1111, .lock = true };
     cmd.hat = .{ .on = 0xAAAA, .lock = false };
@@ -1661,7 +1661,7 @@ fn setupActionLikeEditState(patch: *LofiPatch) void {
 }
 
 test "LofiPatch: offline renderToWav with action-like state copy is deterministic (2x bit-identical)" {
-    // TASK-86 修正3: actionRender と同じ状態複製経路でも 2 回 render が bit 一致。
+    // Same state-copy path as actionRender still bit-matches across two renders.
     const sr: u32 = 48000;
     const seconds: u32 = 1;
     const a = try renderToWavBytes(testing.allocator, sr, seconds, 99, setupActionLikeEditState);
@@ -1674,7 +1674,7 @@ test "LofiPatch: offline renderToWav with action-like state copy is deterministi
     try testing.expectEqualSlices(u8, a, b);
 }
 
-/// render して finite/有界を検証しつつ peak/rms を返す（テスト用）。
+/// Render and return peak/rms while checking finite/bounded (tests).
 fn renderStats(patch: *LofiPatch, buf: []f32, frames: u32) !struct { peak: f32, rms: f64 } {
     patch.render(buf, frames, 2);
     var peak: f32 = 0;
@@ -1688,7 +1688,7 @@ fn renderStats(patch: *LofiPatch, buf: []f32, frames: u32) !struct { peak: f32, 
     return .{ .peak = peak, .rms = @sqrt(acc / @as(f64, @floatFromInt(frames * 2))) };
 }
 
-/// chunk 分割で long render し finite/有界を検証して最終 snapshot を返す。
+/// Long chunked render; check finite/bounded; return the final snapshot.
 fn renderLong(patch: *LofiPatch, chunk: u32, target: u64) !PatchState {
     const buf = try testing.allocator.alloc(f32, chunk * 2);
     defer testing.allocator.free(buf);
@@ -1721,10 +1721,10 @@ test "Controls: defaults match constructed patch values (no-op baseline)" {
     try testing.expectEqual(@as(f32, PAD_CUTOFF_DEFAULT), testPad(patch).cutoff);
     try testing.expectEqual(@as(f32, PAD_WARMTH_DEFAULT), testPad(patch).warmth);
     try testing.expectEqual(@as(f32, 1.5), testSaturator(patch).drive);
-    // 初期 pattern が seed 値で StepSeq に入っている
+    // Initial pattern is in each StepSeq at the seed values
     try testing.expectEqual(KICK_ON, testSeq(patch, patch.kick_seq_h).on_mask);
     try testing.expectEqual(BASS_ON, testSeq(patch, patch.bass_seq_h).on_mask);
-    // density_target = 4 StepSeq.density の平均（mask から初期化）
+    // density_target = mean of 4 StepSeq.density (initialised from masks)
     const expect_avg =
         modular.StepSeq.densityFromMask(KICK_ON, KICK_BAND) +
         modular.StepSeq.densityFromMask(HAT_ON, HAT_BAND) +
@@ -1733,10 +1733,10 @@ test "Controls: defaults match constructed patch values (no-op baseline)" {
     try testing.expectApproxEqAbs(expect_avg / 4.0, patch.snapshotState().density_target, 1e-5);
 }
 
-test "TASK-110.5: density target converges pattern at bar boundaries" {
+test "density target converges pattern at bar boundaries" {
     const patch = try LofiPatch.create(testing.allocator, 48000);
     defer patch.destroy();
-    // evolve ON（density 収束に必要）。mutate も走るが density=1 で帯上限へ寄せる。
+    // evolve ON (needed for density convergence). mutate also runs; density=1 pushes toward the band ceiling.
     var warm = PatternCommand.default();
     warm.rev = 1;
     warm.evolve = true;
@@ -1756,7 +1756,7 @@ test "TASK-110.5: density target converges pattern at bar boundaries" {
     try testing.expect(after.density > before);
 }
 
-test "TASK-110.5: gain and mute remain independent controls" {
+test "gain and mute remain independent controls" {
     const patch = try LofiPatch.create(testing.allocator, 48000);
     defer patch.destroy();
     var batch = ParamBatch{};
@@ -1799,7 +1799,7 @@ test "param_db: swing/sidechain/cutoff change output (bounded & finite)" {
     try testing.expect(crc_base != crc_mod);
 }
 
-test "TASK-110.4: cumulative param override wins after generated Controls" {
+test "cumulative param override wins after generated Controls" {
     const patch = try LofiPatch.create(testing.allocator, 48000);
     defer patch.destroy();
     var batch = ParamBatch{};
@@ -1819,7 +1819,7 @@ test "TASK-110.4: cumulative param override wins after generated Controls" {
         .choice => return error.TestUnexpectedResult,
     }
 
-    // Mailbox payload は差分ではなく累積表なので、先行した cutoff も残る。
+    // Mailbox payload is the cumulative table, not a delta, so the earlier cutoff remains.
     batch.revision = 2;
     batch.entries[1] = .{
         .handle = patch.master_vcf_h,
@@ -1834,8 +1834,8 @@ test "TASK-110.4: cumulative param override wins after generated Controls" {
     try testing.expectEqual(@as(f32, 2000.0), cutoff.scalar);
     try testing.expectEqual(@as(f32, 0.75), resonance.scalar);
 
-    // cutoff だけ purge。Controls.master_cutoff はもう graph を上書きしない（TASK-160.3）。
-    // モジュール field は直前の setParam 値（2000）のまま、resonance override は残る。
+    // Purge cutoff only. Controls.master_cutoff no longer overwrites the graph.
+    // Module field stays at the previous setParam value (2000); resonance override remains.
     batch.entries[0] = .{};
     batch.revision = 3;
     patch.controls.master_cutoff.store(600.0);
@@ -1877,7 +1877,7 @@ test "Controls: non-finite tone macros fall back; graph scalars ignore dead Cont
     defer testing.allocator.free(buf);
     const patch = try LofiPatch.create(testing.allocator, 48000);
     defer patch.destroy();
-    // 旧 transport Controls は applyControls から外したので、non-finite でも graph 初期値を壊さない。
+    // Old transport Controls were removed from applyControls, so non-finite values do not break graph initials.
     patch.controls.tempo_bpm.store(std.math.nan(f32));
     patch.controls.master_cutoff.store(std.math.inf(f32));
     patch.controls.swing.store(std.math.inf(f32));
@@ -1895,7 +1895,7 @@ test "Controls: non-finite tone macros fall back; graph scalars ignore dead Cont
     try testing.expectEqual(@as(f32, 0.0), testClock(patch).swing);
     try testing.expectEqual(@as(f32, DEFAULT_SIDECHAIN), testSidechain(patch).amount);
     try testing.expectEqual(@as(f32, MASTER_CUTOFF_MAX), testMasterVcf(patch).cutoff);
-    // Controls.density_target は mutation 非依存。snapshot は StepSeq.density 平均。
+    // Controls.density_target is independent of mutation. snapshot is the StepSeq.density mean.
     const expect_avg =
         modular.StepSeq.densityFromMask(KICK_ON, KICK_BAND) +
         modular.StepSeq.densityFromMask(HAT_ON, HAT_BAND) +
@@ -1911,14 +1911,14 @@ test "Controls: non-finite tone macros fall back; graph scalars ignore dead Cont
 }
 
 // ----------------------------------------------------------------------------
-// Ph5 検証: grid 編集 / lock / evolve / アンビエント層
+// Ph5 checks: grid edit / lock / evolve / ambient layer
 // ----------------------------------------------------------------------------
 
 fn publishPattern(patch: *LofiPatch, cmd: PatternCommand) void {
     patch.controls.pattern_db.publish(cmd);
 }
 
-// テストは wire 済み active handle を前提に、実装と同じガード付き解決を通す。
+// Tests assume wired active handles and go through the same guarded resolve as production.
 fn testClock(patch: *LofiPatch) *modular.Clock {
     return patch.ptr(.clock, patch.clock_h).?;
 }
@@ -1961,20 +1961,20 @@ test "Ph5: grid edit (publish) changes output CRC" {
     defer mod.destroy();
     var cmd = PatternCommand.default();
     cmd.rev = 1;
-    cmd.kick.on = 0xFFFF; // 全 step kick（明確に変わる）
+    cmd.kick.on = 0xFFFF; // All-step kick (clearly different)
     publishPattern(mod, cmd);
     _ = try renderStats(mod, buf, frames);
     const crc_mod = std.hash.Crc32.hash(std.mem.sliceAsBytes(buf[0 .. frames * 2]));
 
     try testing.expect(crc_base != crc_mod);
-    try testing.expectEqual(@as(u16, 0xFFFF), testSeq(mod, mod.kick_seq_h).on_mask); // 取り込まれた
+    try testing.expectEqual(@as(u16, 0xFFFF), testSeq(mod, mod.kick_seq_h).on_mask); // Taken in
     try testing.expectEqual(@as(u32, 1), mod.applied_rev);
 }
 
 test "Ph5: locked track does not mutate over many bars" {
     const patch = try LofiPatch.create(testing.allocator, 48000);
     defer patch.destroy();
-    // 全 track を lock（evolve は ON だが lock 優先で不変のはず）
+    // Lock all tracks (evolve ON but lock wins → must stay unchanged)
     var cmd = PatternCommand.default();
     cmd.rev = 1;
     cmd.kick.lock = true;
@@ -1982,7 +1982,7 @@ test "Ph5: locked track does not mutate over many bars" {
     cmd.clap.lock = true;
     cmd.bass.lock = true;
     publishPattern(patch, cmd);
-    _ = try renderLong(patch, 4800, 48000 * 12); // 多数の bar を跨ぐ
+    _ = try renderLong(patch, 4800, 48000 * 12); // Span many bars
     try testing.expectEqual(KICK_ON, testSeq(patch, patch.kick_seq_h).on_mask);
     try testing.expectEqual(HAT_ON, testSeq(patch, patch.hat_seq_h).on_mask);
     try testing.expectEqual(CLAP_ON, testSeq(patch, patch.clap_seq_h).on_mask);
@@ -1991,7 +1991,7 @@ test "Ph5: locked track does not mutate over many bars" {
 }
 
 test "Ph5: evolve OFF freezes pattern; evolve ON evolves it (deterministic)" {
-    // evolve OFF（全体）→ 変異しない（純粋な手動シーケンサ）
+    // evolve OFF (global) → no mutation (pure manual sequencer)
     const frozen = try LofiPatch.create(testing.allocator, 48000);
     defer frozen.destroy();
     var off = PatternCommand.default();
@@ -2003,16 +2003,16 @@ test "Ph5: evolve OFF freezes pattern; evolve ON evolves it (deterministic)" {
     try testing.expectEqual(HAT_ON, testSeq(frozen, frozen.hat_seq_h).on_mask);
     try testing.expectEqual(@as(u32, 0), frozen.mutation_count);
 
-    // evolve ON（既定）→ 変異が起き、固定 seed なので 2 回 render で同じ最終状態
+    // evolve ON (default) → mutation runs; fixed seed → two renders end in the same state
     const a = try LofiPatch.create(testing.allocator, 48000);
     defer a.destroy();
     const sa = try renderLong(a, 4800, 48000 * 12);
     const b = try LofiPatch.create(testing.allocator, 48000);
     defer b.destroy();
     const sb = try renderLong(b, 4800, 48000 * 12);
-    try testing.expect(sa.mutation_count > 0); // 変異した
+    try testing.expect(sa.mutation_count > 0); // Mutated
     try testing.expectEqual(sa.mutation_count, sb.mutation_count);
-    try testing.expectEqual(sa.kick_on, sb.kick_on); // 決定的
+    try testing.expectEqual(sa.kick_on, sb.kick_on); // Deterministic
     try testing.expectEqual(sa.bass_on, sb.bass_on);
     try testing.expectEqual(sa.bass_deg, sb.bass_deg);
 }
@@ -2047,15 +2047,15 @@ test "Ph5: ambient layer evolves and stays in scale range (pad root migrates)" {
     while (rendered < 48000 * 30) : (rendered += 4800) {
         patch.render(buf, 4800, 2);
         const st = patch.snapshotState();
-        // pad root は minor_pentatonic(octaves=1) の範囲: pitch_cv 0..10/12
+        // pad root stays in minor_pentatonic (octaves=1): pitch_cv 0..10/12
         try testing.expect(st.ambient_root_cv >= -1e-4 and st.ambient_root_cv <= 10.0 / 12.0 + 1e-4);
         addDistinctF32(&seen_root, &n_root, st.ambient_root_cv);
     }
-    try testing.expect(n_root >= 2); // アンビエント和音 root が動いている（収束していない）
+    try testing.expect(n_root >= 2); // Ambient chord root is moving (not converged)
 }
 
 test "Ph5: ambient layer contributes energy (pad on vs muted differs)" {
-    // pad は 2 小節周期で発音するので 5s render。
+    // pad triggers on a 2-bar period, so render 5s.
     const frames: u32 = 48000 * 5;
     const buf = try testing.allocator.alloc(f32, frames * 2);
     defer testing.allocator.free(buf);
@@ -2102,7 +2102,7 @@ test "Ph5: tone macros (kick punch / pad gain / master warmth / ambient move) ch
     try testing.expect(crc_base != crc_mod);
 }
 
-test "TASK-160.1: track gain/mute reflected via Mixer" {
+test "track gain/mute reflected via Mixer" {
     const patch = try LofiPatch.create(testing.allocator, 48000);
     defer patch.destroy();
     var batch = ParamBatch{};
@@ -2133,7 +2133,7 @@ test "TASK-160.1: track gain/mute reflected via Mixer" {
     try testing.expectEqual(@as(f32, PAD_BASE_GAIN), testPad(patch).gain);
 }
 
-test "TASK-160.1: muting one track does not affect others" {
+test "muting one track does not affect others" {
     const frames: u32 = 24000;
     const buf = try testing.allocator.alloc(f32, frames * 2);
     defer testing.allocator.free(buf);
@@ -2159,7 +2159,7 @@ test "TASK-160.1: muting one track does not affect others" {
     try testing.expectApproxEqAbs(@as(f32, HAT_BASE_GAIN), st.hat_gain, 1e-6);
 }
 
-test "TASK-160.1: Mixer per-input setParam roundtrip (NPRM path)" {
+test "Mixer per-input setParam roundtrip (NPRM path)" {
     const patch = try LofiPatch.create(testing.allocator, 48000);
     defer patch.destroy();
     try modular.setParam(patch.graph, patch.master_mixer_h, "in0_gain", .{ .scalar = 0.33 });
@@ -2176,7 +2176,7 @@ test "TASK-160.1: Mixer per-input setParam roundtrip (NPRM path)" {
     try testing.expectEqual(@as(f32, 1.25), g3.scalar);
     try testing.expectEqual(@as(usize, 1), m2.choice);
 
-    // labels are runtime metadata（wire で設定、NPRM 非保存）
+    // labels are runtime metadata (set at wire; not NPRM-persisted)
     const master = patch.ptrConst(.mixer, patch.master_mixer_h).?;
     const nonkick = patch.ptrConst(.mixer, patch.nonkick_mixer_h).?;
     try testing.expectEqualStrings("kick", master.input_labels[0]);
@@ -2204,7 +2204,7 @@ fn addDistinctF32(buf: []f32, n: *usize, v: f32) void {
 }
 
 // ----------------------------------------------------------------------------
-// band energy（dsp FFT 流用）: 低域の芯 / harsh 非支配（音色回帰の最低条件）
+// band energy (reuse dsp FFT): low-band body / not harsh-dominated (minimum timbre regression)
 // ----------------------------------------------------------------------------
 fn bandEnergy(mags: []const f32, f_lo: f32, f_hi: f32, sr: f32, n: usize) f64 {
     const bin_hz = sr / @as(f32, @floatFromInt(n));
@@ -2237,7 +2237,7 @@ test "Ph5: default patch has low-band (kick body) energy and is not harsh-domina
 }
 
 // ----------------------------------------------------------------------------
-// TASK-62.5.7: seed 決定性 / bar 境界遅延
+// seed determinism / bar-boundary deferral
 // ----------------------------------------------------------------------------
 
 fn renderCrcChunkedSeeded(allocator: std.mem.Allocator, sample_rate: f32, chunk: u32, target: u64, base: u64) !u32 {
@@ -2276,7 +2276,7 @@ test "seed: DEFAULT_BASE_SEED path matches create()-only render (legacy compat)"
 test "seed: requestSeed applies only at next bar boundary (pre-boundary output unchanged)" {
     const sr: f32 = 48000;
     const chunk: u32 = 4800;
-    // 1 bar ≒ 16 ticks * (48000*60)/(122*4) ≒ 94426 samples。pre = 半小節弱。
+    // 1 bar ≈ 16 ticks * (48000*60)/(122*4) ≈ 94426 samples. pre = just under half a bar.
     const pre_frames: u64 = 48000; // < 1 bar
     const post_frames: u64 = 48000 * 6;
 
@@ -2299,11 +2299,11 @@ test "seed: requestSeed applies only at next bar boundary (pre-boundary output u
     try testing.expectEqual(crc_ctrl.final(), crc_chg.final());
     try testing.expectEqual(seedmod.DEFAULT_BASE_SEED, chg.base_seed);
 
-    // まだ bar 0 の途中で pending を立てる → 境界まで base_seed は変わらない
+    // Raise pending mid bar 0 → base_seed unchanged until the boundary
     chg.requestSeed(42);
     crc_ctrl = std.hash.Crc32.init();
     crc_chg = std.hash.Crc32.init();
-    // 追加で少し render（まだ同一 bar 内に留まる長さ）
+    // Render a little more (still within the same bar)
     const mid_extra: u64 = 24000;
     rendered = 0;
     while (rendered < mid_extra) : (rendered += chunk) {
@@ -2313,9 +2313,9 @@ test "seed: requestSeed applies only at next bar boundary (pre-boundary output u
         crc_chg.update(std.mem.sliceAsBytes(buf));
     }
     try testing.expectEqual(crc_ctrl.final(), crc_chg.final());
-    try testing.expectEqual(seedmod.DEFAULT_BASE_SEED, chg.base_seed); // 未適用
+    try testing.expectEqual(seedmod.DEFAULT_BASE_SEED, chg.base_seed); // Not yet applied
 
-    // bar 境界を跨ぐまで進める → chg だけ seed 適用され出力が分岐
+    // Advance past the bar boundary → only chg gets the seed and outputs diverge
     crc_ctrl = std.hash.Crc32.init();
     crc_chg = std.hash.Crc32.init();
     rendered = 0;
@@ -2341,8 +2341,8 @@ test "seed: resetWithSeed restores initial pattern and clears mutation_count" {
     try testing.expectEqual(KICK_ON, testSeq(patch, patch.kick_seq_h).on_mask);
 }
 
-/// 生成レイヤ（pattern / StepSeq runtime / 変異 / 生成 RNG / クロック位相 / 背景生成 runtime）の
-/// field 単位一致。音響 transient（reverb 尾等）は比較しない。
+/// Field-wise match of the generation layer (pattern / StepSeq runtime / mutation / generation RNG / clock phase / background runtime).
+/// Acoustic transients (reverb tails, etc.) are not compared.
 fn expectGenLayerEqual(a: *const LofiPatch, b: *const LofiPatch) !void {
     try testing.expectEqual(a.base_seed, b.base_seed);
     try testing.expectEqual(a.mutation_count, b.mutation_count);
@@ -2384,7 +2384,7 @@ fn expectGenLayerEqual(a: *const LofiPatch, b: *const LofiPatch) !void {
     try testing.expectEqual(a.ptrConst(.euclid, a.pad_eu_h).?.step, b.ptrConst(.euclid, b.pad_eu_h).?.step);
     try testing.expectEqual(a.ptrConst(.euclid, a.pad_eu_h).?.prev_gate, b.ptrConst(.euclid, b.pad_eu_h).?.prev_gate);
 
-    // 生成 RNG の次値（state 消費前にコピーして比較）
+    // Next generation-RNG value (copy state before consuming to compare)
     var na = a.mut_noise;
     var nb = b.mut_noise;
     try testing.expectEqual(na.next(), nb.next());
@@ -2422,29 +2422,29 @@ test "seed: mid-run applyBaseSeed matches fresh create gen-layer state field-wis
 
     const run = try LofiPatch.create(testing.allocator, 48000);
     defer run.destroy();
-    _ = try renderLong(run, 4800, 48000 * 10); // 数 bar 進めて runtime を汚す
+    _ = try renderLong(run, 4800, 48000 * 10); // Advance a few bars to dirty the runtime
     try testing.expect(testClock(run).started);
     try testing.expect(testSeq(run, run.kick_seq_h).loadStep() != 0 or testClock(run).tick_index > 0);
     try testing.expect(run.mutation_count > 0);
-    run.resetWithSeed(base); // = requestSeed 同期 + applyBaseSeed
+    run.resetWithSeed(base); // = requestSeed sync + applyBaseSeed
 
     try expectGenLayerEqual(fresh, run);
 }
 
 // ----------------------------------------------------------------------------
-// TASK-93: quantize_bar（小節境界適用）
+// quantize_bar (apply at bar boundary)
 // ----------------------------------------------------------------------------
 
-test "TASK-93: quantize_bar=true defers pattern until next bar boundary" {
+test "quantize_bar=true defers pattern until next bar boundary" {
     const sr: f32 = 48000;
     const chunk: u32 = 4800;
-    // 1 bar ≒ 16 ticks * (48000*60)/(122*4) ≒ 94426 samples。
+    // 1 bar ≈ 16 ticks * (48000*60)/(122*4) ≈ 94426 samples.
     const pre_frames: u64 = 48000; // < 1 bar
-    const post_frames: u64 = 48000 * 4; // bar 境界を跨ぐ
+    const post_frames: u64 = 48000 * 4; // Cross a bar boundary
 
     const patch = try LofiPatch.create(testing.allocator, sr);
     defer patch.destroy();
-    // evolve OFF で変異ノイズを排除（pattern 比較を決定的に）
+    // evolve OFF to remove mutation noise (keep pattern compare deterministic)
     var freeze = PatternCommand.default();
     freeze.rev = 1;
     freeze.evolve = false;
@@ -2453,7 +2453,7 @@ test "TASK-93: quantize_bar=true defers pattern until next bar boundary" {
     const buf = try testing.allocator.alloc(f32, chunk * 2);
     defer testing.allocator.free(buf);
 
-    // bar 0 の途中まで進める
+    // Advance partway through bar 0
     var rendered: u64 = 0;
     while (rendered < pre_frames) : (rendered += chunk) {
         patch.render(buf, chunk, 2);
@@ -2461,7 +2461,7 @@ test "TASK-93: quantize_bar=true defers pattern until next bar boundary" {
     const old_kick = testSeq(patch, patch.kick_seq_h).on_mask;
     try testing.expectEqual(KICK_ON, old_kick);
 
-    // quantize_bar=true で新 pattern を publish → 次 bar まで旧のまま
+    // Publish new pattern with quantize_bar=true → keep old until next bar
     var cmd = PatternCommand.default();
     cmd.rev = 2;
     cmd.evolve = false;
@@ -2469,7 +2469,7 @@ test "TASK-93: quantize_bar=true defers pattern until next bar boundary" {
     cmd.kick.on = 0x5555;
     publishPattern(patch, cmd);
 
-    // 同一 bar 内で少し render → まだ旧 pattern
+    // Render a little within the same bar → still the old pattern
     const mid_extra: u64 = 24000;
     rendered = 0;
     while (rendered < mid_extra) : (rendered += chunk) {
@@ -2478,7 +2478,7 @@ test "TASK-93: quantize_bar=true defers pattern until next bar boundary" {
     try testing.expectEqual(old_kick, testSeq(patch, patch.kick_seq_h).on_mask);
     try testing.expect(patch.pending_bar_cmd != null);
 
-    // bar 境界を跨ぐ → 新 pattern 反映
+    // Cross the bar boundary → new pattern applied
     rendered = 0;
     while (rendered < post_frames) : (rendered += chunk) {
         patch.render(buf, chunk, 2);
@@ -2487,7 +2487,7 @@ test "TASK-93: quantize_bar=true defers pattern until next bar boundary" {
     try testing.expect(patch.pending_bar_cmd == null);
 }
 
-test "TASK-93: quantize_bar=false still applies immediately (GUI path unchanged)" {
+test "quantize_bar=false still applies immediately (GUI path unchanged)" {
     const patch = try LofiPatch.create(testing.allocator, 48000);
     defer patch.destroy();
     var cmd = PatternCommand.default();
@@ -2495,15 +2495,15 @@ test "TASK-93: quantize_bar=false still applies immediately (GUI path unchanged)
     cmd.quantize_bar = false;
     cmd.kick.on = 0xFFFF;
     publishPattern(patch, cmd);
-    // render 1 block で applyControls が走る
+    // One render block runs applyControls
     var buf: [256]f32 = undefined;
     patch.render(&buf, 128, 2);
     try testing.expectEqual(@as(u16, 0xFFFF), testSeq(patch, patch.kick_seq_h).on_mask);
     try testing.expect(patch.pending_bar_cmd == null);
 }
 
-test "TASK-93 P1-2: same-bar seed then pattern → both applied at boundary" {
-    // maybeEvolve 順: seed → pattern。同一 bar に両 pending があっても notation pattern が残る。
+test "same-bar seed then pattern → both applied at boundary" {
+    // maybeEvolve order: seed → pattern. Even with both pending on the same bar, the notation pattern remains.
     const sr: f32 = 48000;
     const chunk: u32 = 4800;
     const pre_frames: u64 = 48000;
@@ -2524,7 +2524,7 @@ test "TASK-93 P1-2: same-bar seed then pattern → both applied at boundary" {
         patch.render(buf, chunk, 2);
     }
 
-    // 同一 bar 内: seed 42 + quantize pattern（kick 0x5555）
+    // Same bar: seed 42 + quantize pattern (kick 0x5555)
     patch.requestSeed(42);
     var cmd = PatternCommand.default();
     cmd.rev = 2;
@@ -2533,7 +2533,7 @@ test "TASK-93 P1-2: same-bar seed then pattern → both applied at boundary" {
     cmd.kick.on = 0x5555;
     publishPattern(patch, cmd);
 
-    // 境界前: seed 未適用・pattern 未適用
+    // Before boundary: seed not applied, pattern not applied
     rendered = 0;
     while (rendered < 24000) : (rendered += chunk) {
         patch.render(buf, chunk, 2);
@@ -2542,7 +2542,7 @@ test "TASK-93 P1-2: same-bar seed then pattern → both applied at boundary" {
     try testing.expectEqual(KICK_ON, testSeq(patch, patch.kick_seq_h).on_mask);
     try testing.expect(patch.pending_bar_cmd != null);
 
-    // 境界後: seed=42 かつ kick=0x5555（pattern が seed 後に載る）
+    // After boundary: seed=42 and kick=0x5555 (pattern lands after seed)
     rendered = 0;
     while (rendered < post_frames) : (rendered += chunk) {
         patch.render(buf, chunk, 2);
@@ -2552,9 +2552,9 @@ test "TASK-93 P1-2: same-bar seed then pattern → both applied at boundary" {
     try testing.expect(patch.pending_bar_cmd == null);
 }
 
-test "TASK-151: seed + quantized saved pattern → bar restores edited masks" {
-    // VPRJ load 相当: 同一 bar に requestSeed + quantize_bar pattern。
-    // applyBaseSeed が default anchor に戻した後、pending が保存 mask を後勝ち適用する。
+test "seed + quantized saved pattern → bar restores edited masks" {
+    // VPRJ-load equivalent: requestSeed + quantize_bar pattern on the same bar.
+    // After applyBaseSeed resets to the default anchor, pending applies the saved masks last-wins.
     const sr: f32 = 48000;
     const chunk: u32 = 4800;
     const pre_frames: u64 = 48000;
@@ -2575,7 +2575,7 @@ test "TASK-151: seed + quantized saved pattern → bar restores edited masks" {
         patch.render(buf, chunk, 2);
     }
 
-    // 保存 pattern（E2E / AC と同値）を quantize_bar で staging + seed 42
+    // Stage the saved pattern (same values as E2E / AC) via quantize_bar + seed 42
     patch.requestSeed(42);
     var saved = PatternCommand.default();
     saved.rev = 2;
@@ -2587,7 +2587,7 @@ test "TASK-151: seed + quantized saved pattern → bar restores edited masks" {
     saved.bass.on = 0x4949;
     publishPattern(patch, saved);
 
-    // 境界前: seed 未適用・pattern は pending
+    // Before boundary: seed not applied; pattern is pending
     rendered = 0;
     while (rendered < 24000) : (rendered += chunk) {
         patch.render(buf, chunk, 2);
@@ -2595,7 +2595,7 @@ test "TASK-151: seed + quantized saved pattern → bar restores edited masks" {
     try testing.expectEqual(seedmod.DEFAULT_BASE_SEED, patch.base_seed);
     try testing.expect(patch.pending_bar_cmd != null);
 
-    // 境界後: seed=42 かつ保存 mask が復元（default 1111/4444/1010/4949 ではない）
+    // After boundary: seed=42 and saved masks restored (not the default 1111/4444/1010/4949)
     rendered = 0;
     while (rendered < post_frames) : (rendered += chunk) {
         patch.render(buf, chunk, 2);
@@ -2609,12 +2609,12 @@ test "TASK-151: seed + quantized saved pattern → bar restores edited masks" {
     try testing.expect(!patch.readStepSeqEvolve());
 }
 
-test "TASK-151: evolve=ON load bar keeps saved masks (pending skips mutate)" {
-    // 計画 §7: evolve=ON でも load 直後 1 bar は applied_pending ゲートで mutate せず保存 mask を壊さない。
+test "evolve=ON load bar keeps saved masks (pending skips mutate)" {
+    // Even with evolve=ON, the first bar after load skips mutate via the applied_pending gate and keeps saved masks.
     const sr: f32 = 48000;
     const chunk: u32 = 4800;
     const pre_frames: u64 = 48000;
-    // 1 bar だけ跨ぐ（2 bar 目以降の mutate 再開は対象外）
+    // Cross only 1 bar (mutate resuming from bar 2 onward is out of scope)
     const one_bar_frames: u64 = 48000 + 24000;
 
     const patch = try LofiPatch.create(testing.allocator, sr);
@@ -2655,13 +2655,13 @@ test "TASK-151: evolve=ON load bar keeps saved masks (pending skips mutate)" {
     try testing.expectEqual(@as(u16, 0xc444), testSeq(patch, patch.clap_seq_h).on_mask);
     try testing.expectEqual(@as(u16, 0x4949), testSeq(patch, patch.bass_seq_h).on_mask);
     try testing.expect(patch.pending_bar_cmd == null);
-    // applyBaseSeed が mutation_count を 0 に戻し、当該 bar は applied_pending で mutate スキップ
+    // applyBaseSeed zeroes mutation_count; that bar skips mutate via applied_pending
     try testing.expectEqual(@as(u32, 0), patch.mutation_count);
 }
 
-test "TASK-93 P1-3: two consecutive quantized publishes chain both tracks" {
-    // 連続 quantize publish で後着が先行 track を潰さないこと（main の last_quantized_cmd 相当を
-    // ここでは cmd を累積して publish する統合テストで担保）。
+test "two consecutive quantized publishes chain both tracks" {
+    // Consecutive quantize publishes must not let a later one wipe an earlier track (main's last_quantized_cmd
+    // is covered here by an integration test that accumulates cmd then publishes).
     const sr: f32 = 48000;
     const chunk: u32 = 4800;
     const pre_frames: u64 = 48000;
@@ -2682,18 +2682,18 @@ test "TASK-93 P1-3: two consecutive quantized publishes chain both tracks" {
         patch.render(buf, chunk, 2);
     }
 
-    // 1st: kick のみ置換（hat は default 維持）
+    // 1st: replace kick only (hat stays default)
     var cmd1 = PatternCommand.default();
     cmd1.rev = 2;
     cmd1.evolve = false;
     cmd1.quantize_bar = true;
     cmd1.kick.on = 0x5555;
     publishPattern(patch, cmd1);
-    // applyControls で pending に載せる
+    // Land on pending via applyControls
     patch.render(buf, chunk, 2);
     try testing.expect(patch.snapshotState().bar_pending);
 
-    // 2nd: cmd1 を base に hat を置換（main の last_quantized チェーン相当）
+    // 2nd: replace hat on top of cmd1 (equivalent to main's last_quantized chain)
     var cmd2 = cmd1;
     cmd2.rev = 3;
     cmd2.hat.on = 0xAAAA;
@@ -2701,7 +2701,7 @@ test "TASK-93 P1-3: two consecutive quantized publishes chain both tracks" {
     patch.render(buf, chunk, 2);
     try testing.expect(patch.pending_bar_cmd != null);
 
-    // 境界後: kick と hat の両方が反映
+    // After boundary: both kick and hat applied
     rendered = 0;
     while (rendered < post_frames) : (rendered += chunk) {
         patch.render(buf, chunk, 2);
@@ -2712,13 +2712,13 @@ test "TASK-93 P1-3: two consecutive quantized publishes chain both tracks" {
 }
 
 // ============================================================================
-// TASK-91: Song/Chain/Phrase（bar 境界切替・evolve 共存・loop/stop・pending 後勝ち・決定性）
+// Song/Chain/Phrase (bar-boundary switch; coexist with evolve; loop/stop; pending last-wins; determinism)
 // ============================================================================
 
-/// evolve OFF + 2 phrase chain で song を組み立てる共通ヘルパ。
-/// phrase 0/1 はどちらも**既定 KICK_ON と異なる**（初回 bar 適用を見逃さない）。
+/// Shared helper: build a song with evolve OFF and a 2-phrase chain.
+/// Phrases 0/1 both **differ from default KICK_ON** (so a missed first-bar apply is obvious).
 fn setupSongTwoPhrase(patch: *LofiPatch, loop: bool) void {
-    // evolve を止めて変異ノイズを排除
+    // Stop evolve to remove mutation noise
     var freeze = PatternCommand.default();
     freeze.rev = 1;
     freeze.evolve = false;
@@ -2726,7 +2726,7 @@ fn setupSongTwoPhrase(patch: *LofiPatch, loop: bool) void {
 
     var song = SongData.default();
     song.rev = 1;
-    // phrase 0/1 とも既定と異なる mask
+    // Both phrase 0/1 masks differ from default
     song.phrases_kick[0] = 0x0F0F;
     song.phrases_hat[0] = 0xF0F0;
     song.phrases_clap[0] = 0x00FF;
@@ -2743,27 +2743,27 @@ fn setupSongTwoPhrase(patch: *LofiPatch, loop: bool) void {
     patch.controls.song_db.publish(song);
 }
 
-test "TASK-91: song play force-applies phrase on first bar (not default)" {
-    // P1-1: play 直後の bar 0 で phrase が適用される（既定 KICK_ON と異なる phrase 0）
+test "song play force-applies phrase on first bar (not default)" {
+    // play applies phrase on bar 0 immediately (phrase 0 differs from default KICK_ON)
     const sr: f32 = 48000;
     const chunk: u32 = 4800;
     const patch = try LofiPatch.create(testing.allocator, sr);
     defer patch.destroy();
     setupSongTwoPhrase(patch, true);
-    try testing.expectEqual(KICK_ON, testSeq(patch, patch.kick_seq_h).on_mask); // play 前は既定
+    try testing.expectEqual(KICK_ON, testSeq(patch, patch.kick_seq_h).on_mask); // Before play: default
     patch.controls.song_playing.store(1, .release);
 
     const buf = try testing.allocator.alloc(f32, chunk * 2);
     defer testing.allocator.free(buf);
-    // 1 ブロック render で force apply が走る（bar 境界を待たない）
+    // One-block render runs force apply (does not wait for a bar boundary)
     patch.render(buf, chunk, 2);
     try testing.expectEqual(@as(u16, 0x0F0F), testSeq(patch, patch.kick_seq_h).on_mask);
     try testing.expectEqual(@as(u16, 0xF0F0), testSeq(patch, patch.hat_seq_h).on_mask);
     try testing.expect(patch.song_playing);
-    try testing.expect(!patch.song_force_apply); // 消費済み
+    try testing.expect(!patch.song_force_apply); // Consumed
 }
 
-test "TASK-91: song play switches phrase at bar boundary" {
+test "song play switches phrase at bar boundary" {
     const sr: f32 = 48000;
     const chunk: u32 = 4800;
     const patch = try LofiPatch.create(testing.allocator, sr);
@@ -2790,14 +2790,14 @@ test "TASK-91: song play switches phrase at bar boundary" {
     try testing.expect(patch.snapshotState().song_playing);
 }
 
-test "TASK-91: empty chain then same phrase re-applies (NONE sentinel)" {
-    // P1-2: phrase0 → 空 chain → phrase0 で復帰 bar に再適用（間に evolve 変異を挟む）
+test "empty chain then same phrase re-applies (NONE sentinel)" {
+    // phrase0 → empty chain → phrase0 re-applies on the return bar (with evolve mutation in between)
     const sr: f32 = 48000;
     const chunk: u32 = 4800;
     const patch = try LofiPatch.create(testing.allocator, sr);
     defer patch.destroy();
 
-    // evolve ON + 全 lock 解除で、空 chain bar 中に mutate が kick を変えうる
+    // evolve ON + all locks cleared so mutate can change kick during the empty-chain bar
     var evo = PatternCommand.default();
     evo.rev = 1;
     evo.evolve = true;
@@ -2806,16 +2806,16 @@ test "TASK-91: empty chain then same phrase re-applies (NONE sentinel)" {
 
     var song = SongData.default();
     song.rev = 1;
-    song.phrases_kick[0] = 0x0F0F; // 既定とも変異後とも区別しやすい
+    song.phrases_kick[0] = 0x0F0F; // Easy to tell apart from both default and post-mutation
     song.phrases_hat[0] = HAT_ON;
     song.phrases_clap[0] = CLAP_ON;
     song.phrases_bass[0] = .{ .on = BASS_ON, .accent = BASS_ACCENT, .slide = BASS_SLIDE, .deg = BASS_DEG };
-    // chain 0 = [phrase 0], chain 1 = 空
+    // chain 0 = [phrase 0], chain 1 = empty
     song.chains[0] = .{ .entries = .{0} ++ ([_]u8{0} ** 15), .len = 1 };
-    song.chains[1] = .{ .len = 0 }; // 空
-    // 3 row: phrase0 → 空 → phrase0（各 1 bar）
+    song.chains[1] = .{ .len = 0 }; // empty
+    // 3 rows: phrase0 → empty → phrase0 (1 bar each)
     song.rows[0] = .{ .kick = 0, .hat = 0, .clap = 0, .bass = 0 };
-    song.rows[1] = .{ .kick = 1, .hat = 1, .clap = 1, .bass = 1 }; // 空 chain
+    song.rows[1] = .{ .kick = 1, .hat = 1, .clap = 1, .bass = 1 }; // empty chain
     song.rows[2] = .{ .kick = 0, .hat = 0, .clap = 0, .bass = 0 };
     song.row_count = 3;
     song.loop = false;
@@ -2825,25 +2825,25 @@ test "TASK-91: empty chain then same phrase re-applies (NONE sentinel)" {
     const buf = try testing.allocator.alloc(f32, chunk * 2);
     defer testing.allocator.free(buf);
 
-    // force: phrase 0 適用
+    // force: apply phrase 0
     patch.render(buf, chunk, 2);
     try testing.expectEqual(@as(u16, 0x0F0F), testSeq(patch, patch.kick_seq_h).on_mask);
 
-    // 空 chain row へ進むまで render（変異が kick を 0x0F0F から動かしうる）
+    // Render until the empty-chain row (mutation may move kick away from 0x0F0F)
     var rendered: u64 = 0;
     var saw_empty_row = false;
     var saw_reapply = false;
     while (rendered < 48000 * 30) : (rendered += chunk) {
         patch.render(buf, chunk, 2);
-        // 空 chain 中は last_phrase が NONE
+        // During empty chain, last_phrase is NONE
         if (patch.song_last_phrase[0] == PHRASE_NONE) {
             saw_empty_row = true;
-            // 空 row 中に kick を強制改変して「間の変異」をシミュレート
+            // Force-alter kick during the empty row to simulate intervening mutation
             if (testSeq(patch, patch.kick_seq_h).on_mask == 0x0F0F) {
-                testSeq(patch, patch.kick_seq_h).on_mask = 0x0001; // phrase 0 でも既定でもない
+                testSeq(patch, patch.kick_seq_h).on_mask = 0x0001; // Neither phrase 0 nor default
             }
         }
-        // 復帰 row で phrase 0 が再適用される
+        // Return row re-applies phrase 0
         if (saw_empty_row and testSeq(patch, patch.kick_seq_h).on_mask == 0x0F0F and patch.song_last_phrase[0] == 0) {
             saw_reapply = true;
             break;
@@ -2854,13 +2854,13 @@ test "TASK-91: empty chain then same phrase re-applies (NONE sentinel)" {
     try testing.expect(saw_reapply);
 }
 
-test "TASK-91: switch bar skips mutate; non-switch bar mutates when evolve on" {
+test "switch bar skips mutate; non-switch bar mutates when evolve on" {
     const sr: f32 = 48000;
     const chunk: u32 = 4800;
     const patch = try LofiPatch.create(testing.allocator, sr);
     defer patch.destroy();
 
-    // phrase 0 のみの 1 要素 chain → 毎 bar 同じ phrase（切替なし）+ evolve ON
+    // 1-element chain of phrase 0 only → same phrase every bar (no switch) + evolve ON
     var song = SongData.default();
     song.rev = 1;
     song.phrases_kick[0] = KICK_ON;
@@ -2872,24 +2872,24 @@ test "TASK-91: switch bar skips mutate; non-switch bar mutates when evolve on" {
     song.row_count = 1;
     song.loop = true;
     patch.controls.song_db.publish(song);
-    // evolve ON（default）のまま
+    // Leave evolve ON (default)
     patch.controls.song_playing.store(1, .release);
 
     const buf = try testing.allocator.alloc(f32, chunk * 2);
     defer testing.allocator.free(buf);
-    // 初回 bar は切替（last=NONE→0）で mutate スキップ。2 bar 目以降は phrase 不変 → mutate 可。
+    // First bar is a switch (last=NONE→0) so mutate is skipped. From bar 2, phrase unchanged → mutate allowed.
     var rendered: u64 = 0;
     while (rendered < 48000 * 12) : (rendered += chunk) {
         patch.render(buf, chunk, 2);
     }
-    // 非切替 bar が走っていれば mutation_count > 0
+    // If a non-switch bar ran, mutation_count > 0
     try testing.expect(patch.mutation_count > 0);
 
-    // 対比: 2 phrase 交互 + evolve ON → 切替 bar は毎 bar（phrase が毎 bar 変わる）で mutate 抑制
+    // Contrast: alternating 2 phrases + evolve ON → every bar is a switch (phrase changes every bar) so mutate is suppressed
     const patch2 = try LofiPatch.create(testing.allocator, sr);
     defer patch2.destroy();
     setupSongTwoPhrase(patch2, true);
-    // setup が evolve OFF にするので ON に戻す
+    // setup turned evolve OFF; turn it back ON
     var evo = PatternCommand.default();
     evo.rev = 2;
     evo.evolve = true;
@@ -2899,17 +2899,17 @@ test "TASK-91: switch bar skips mutate; non-switch bar mutates when evolve on" {
     while (rendered < 48000 * 8) : (rendered += chunk) {
         patch2.render(buf, chunk, 2);
     }
-    // 毎 bar 切替なので mutation は起きない（applied_song が毎 bar true）
+    // Every bar switches so mutation never runs (applied_song is true every bar)
     try testing.expectEqual(@as(u32, 0), patch2.mutation_count);
 }
 
-test "TASK-91: song loop vs stop at end" {
+test "song loop vs stop at end" {
     const sr: f32 = 48000;
     const chunk: u32 = 4800;
     const buf = try testing.allocator.alloc(f32, chunk * 2);
     defer testing.allocator.free(buf);
 
-    // loop=false, row_count=1, chain len=2 → 2 bar で stop
+    // loop=false, row_count=1, chain len=2 → stop after 2 bars
     const stop_p = try LofiPatch.create(testing.allocator, sr);
     defer stop_p.destroy();
     setupSongTwoPhrase(stop_p, false);
@@ -2921,7 +2921,7 @@ test "TASK-91: song loop vs stop at end" {
     }
     try testing.expect(!stop_p.song_playing);
 
-    // loop=true → 長く回しても playing のまま
+    // loop=true → stays playing even over a long run
     const loop_p = try LofiPatch.create(testing.allocator, sr);
     defer loop_p.destroy();
     setupSongTwoPhrase(loop_p, true);
@@ -2933,7 +2933,7 @@ test "TASK-91: song loop vs stop at end" {
     try testing.expect(loop_p.song_playing);
 }
 
-test "TASK-91: pending_bar_cmd wins over song on same bar" {
+test "pending_bar_cmd wins over song on same bar" {
     const sr: f32 = 48000;
     const chunk: u32 = 4800;
     const patch = try LofiPatch.create(testing.allocator, sr);
@@ -2944,13 +2944,13 @@ test "TASK-91: pending_bar_cmd wins over song on same bar" {
     const buf = try testing.allocator.alloc(f32, chunk * 2);
     defer testing.allocator.free(buf);
 
-    // 1 bar 進めて song を走らせる
+    // Advance 1 bar to get song moving
     var rendered: u64 = 0;
     while (rendered < 48000 * 2) : (rendered += chunk) {
         patch.render(buf, chunk, 2);
     }
 
-    // quantize pending で kick を 0xFFFF に（song の後に適用される）
+    // quantize pending sets kick to 0xFFFF (applied after song)
     var pending = PatternCommand.default();
     pending.rev = 10;
     pending.evolve = false;
@@ -2966,7 +2966,7 @@ test "TASK-91: pending_bar_cmd wins over song on same bar" {
     };
     publishPattern(patch, pending);
 
-    // 次の bar 境界まで
+    // Until the next bar boundary
     rendered = 0;
     while (rendered < 48000 * 4) : (rendered += chunk) {
         patch.render(buf, chunk, 2);
@@ -2992,13 +2992,13 @@ fn songRenderCrc(seed: u64, chunk: u32, target: u64) !u32 {
     return crc.final();
 }
 
-test "TASK-91: song_playing is deterministic (same seed+song → bit identical)" {
+test "song_playing is deterministic (same seed+song → bit identical)" {
     const a = try songRenderCrc(42, 4800, 48000 * 8);
     const b = try songRenderCrc(42, 4800, 48000 * 8);
     try testing.expectEqual(a, b);
 }
 
-test "TASK-91: song_len=0 play stops immediately at bar boundary" {
+test "song_len=0 play stops immediately at bar boundary" {
     const patch = try LofiPatch.create(testing.allocator, 48000);
     defer patch.destroy();
     var song = SongData.default();
@@ -3009,7 +3009,7 @@ test "TASK-91: song_len=0 play stops immediately at bar boundary" {
 
     const buf = try testing.allocator.alloc(f32, 4800 * 2);
     defer testing.allocator.free(buf);
-    // 1 bar 以上進めて applySongBar を踏ませる
+    // Advance ≥1 bar so applySongBar runs
     var rendered: u64 = 0;
     while (rendered < 48000 * 3) : (rendered += 4800) {
         patch.render(buf, 4800, 2);
@@ -3018,13 +3018,13 @@ test "TASK-91: song_len=0 play stops immediately at bar boundary" {
 }
 
 // ----------------------------------------------------------------------------
-// TASK-106.1: evolve authority / pattern_state immediate apply
+// evolve authority / pattern_state immediate apply
 // ----------------------------------------------------------------------------
 
-test "TASK-106.1: client evolve authority skips mutate (mutation_count stays 0)" {
+test "client evolve authority skips mutate (mutation_count stays 0)" {
     const patch = try LofiPatch.create(testing.allocator, 48000);
     defer patch.destroy();
-    // evolve ON だが client authority → mutate/density しない
+    // evolve ON but client authority → no mutate/density
     var evo = PatternCommand.default();
     evo.rev = 1;
     evo.evolve = true;
@@ -3041,10 +3041,10 @@ test "TASK-106.1: client evolve authority skips mutate (mutation_count stays 0)"
     try testing.expect(patch.readStepSeqEvolve());
 }
 
-test "TASK-106.1: host pattern_state snapshot applies immediately (quantize_bar=false)" {
+test "host pattern_state snapshot applies immediately (quantize_bar=false)" {
     const patch = try LofiPatch.create(testing.allocator, 48000);
     defer patch.destroy();
-    // client authority: 自 mutate なし。remote snapshot を即反映。
+    // client authority: no local mutate. Apply remote snapshot immediately.
     patch.controls.evolve_host_authority.store(0, .release);
     var freeze = PatternCommand.default();
     freeze.rev = 1;
@@ -3086,10 +3086,10 @@ test "TASK-106.1: host pattern_state snapshot applies immediately (quantize_bar=
 }
 
 // ----------------------------------------------------------------------------
-// TASK-160.2: per-StepSeq evolve/lock/density
+// per-StepSeq evolve/lock/density
 // ----------------------------------------------------------------------------
 
-test "TASK-160.2: four StepSeqs have independent density" {
+test "four StepSeqs have independent density" {
     const patch = try LofiPatch.create(testing.allocator, 48000);
     defer patch.destroy();
     var batch = ParamBatch{};
@@ -3108,7 +3108,7 @@ test "TASK-160.2: four StepSeqs have independent density" {
     try testing.expectApproxEqAbs(@as(f32, 0.5), patch.snapshotState().density_target, 1e-5);
 }
 
-test "TASK-160.2: changing one track density does not affect others" {
+test "changing one track density does not affect others" {
     const patch = try LofiPatch.create(testing.allocator, 48000);
     defer patch.destroy();
     const hat_before = testSeq(patch, patch.hat_seq_h).density;
@@ -3126,7 +3126,7 @@ test "TASK-160.2: changing one track density does not affect others" {
     try testing.expectApproxEqAbs(bass_before, testSeq(patch, patch.bass_seq_h).density, 1e-6);
 }
 
-test "TASK-160.2: lock/evolve via setParam on StepSeq" {
+test "lock/evolve via setParam on StepSeq" {
     const patch = try LofiPatch.create(testing.allocator, 48000);
     defer patch.destroy();
     var batch = ParamBatch{};
@@ -3147,7 +3147,7 @@ test "TASK-160.2: lock/evolve via setParam on StepSeq" {
     try testing.expectEqual(@as(usize, 1), (try modular.getParam(patch.graph, patch.bass_seq_h, "lock")).choice);
 }
 
-test "TASK-160.2: seed CRC / mutation sequence stays deterministic" {
+test "seed CRC / mutation sequence stays deterministic" {
     const a = try LofiPatch.create(testing.allocator, 48000);
     defer a.destroy();
     const b = try LofiPatch.create(testing.allocator, 48000);
@@ -3163,18 +3163,18 @@ test "TASK-160.2: seed CRC / mutation sequence stays deterministic" {
 }
 
 // ----------------------------------------------------------------------------
-// TASK-115.3: MIDI note routing（NoteQueue → held → ChordPad）。CommandLog/recipe 非経由。
+// MIDI note routing (NoteQueue → held → ChordPad). Not via CommandLog/recipe.
 // ----------------------------------------------------------------------------
 
-test "TASK-115.3: NoteQueue(256,16) reuses synth NoteQueue type" {
-    // cache-line 分離は libs/synth/src/ring.zig の既存テストが固定。ここでは型再利用のみ確認。
+test "NoteQueue(256,16) reuses synth NoteQueue type" {
+    // cache-line separation is pinned by existing tests in libs/synth/src/ring.zig; here only type reuse.
     const patch = try LofiPatch.create(testing.allocator, 48000);
     defer patch.destroy();
     const Q = synth.NoteQueue(256, 16);
     try testing.expect(@TypeOf(patch.note_queue) == Q);
 }
 
-test "TASK-115.3: note_on/note_off FIFO and last-note priority" {
+test "note_on/note_off FIFO and last-note priority" {
     const patch = try LofiPatch.create(testing.allocator, 48000);
     defer patch.destroy();
     var buf: [128]f32 = undefined;
@@ -3189,29 +3189,29 @@ test "TASK-115.3: note_on/note_off FIFO and last-note priority" {
     try testing.expect(pad.midi_active);
     try testing.expectApproxEqAbs(@as(f32, 0.5), pad.midi_velocity, 1e-6);
 
-    // 現在ノート(64)を離す → 60 に戻る
+    // Release current note (64) → fall back to 60
     patch.sendMidiNoteOff(64);
     patch.render(&buf, 64, 2);
     try testing.expectEqual(@as(?u8, 60), patch.midi_current_note);
     try testing.expect(pad.midi_active);
 
-    // 全解放 → MIDI clear / ambient 復帰
+    // All released → MIDI clear / ambient resumes
     patch.sendMidiNoteOff(60);
     patch.render(&buf, 64, 2);
     try testing.expectEqual(@as(?u8, null), patch.midi_current_note);
     try testing.expect(!pad.midi_active);
 }
 
-test "TASK-115.3: note_off overflow triggers panicAllNotesOff" {
+test "note_off overflow triggers panicAllNotesOff" {
     const patch = try LofiPatch.create(testing.allocator, 48000);
     defer patch.destroy();
-    // capacity 256 を note_off で満杯にしてからさらに off → panic
+    // Fill capacity 256 with note_off, then one more off → panic
     var i: usize = 0;
     while (i < 256) : (i += 1) {
         try testing.expect(patch.note_queue.sendNoteOff(@truncate(i)));
     }
-    try testing.expect(!patch.note_queue.sendNoteOff(0)); // 満杯確認
-    patch.sendMidiNoteOff(0); // push 失敗 → panicAllNotesOff
+    try testing.expect(!patch.note_queue.sendNoteOff(0)); // Confirm full
+    patch.sendMidiNoteOff(0); // push fails → panicAllNotesOff
     var buf: [64]f32 = undefined;
     patch.midi_held[60] = true;
     patch.midi_current_note = 60;
@@ -3221,16 +3221,16 @@ test "TASK-115.3: note_off overflow triggers panicAllNotesOff" {
     try testing.expect(!testPad(patch).midi_active);
 }
 
-test "TASK-115.3: panic after queued note_on does not leave stuck note" {
-    // overflow 時キューに note_on が残っていても、drain→panic（Synth と同順）で最終的に全解除。
+test "panic after queued note_on does not leave stuck note" {
+    // Even if note_on remains in the queue on overflow, drain→panic (same order as Synth) clears all.
     const patch = try LofiPatch.create(testing.allocator, 48000);
     defer patch.destroy();
-    // note_on を reserve 枠手前まで積む（capacity 256, off_reserve 16 → note_on は used+16>=256 で拒否）
+    // Fill note_on up to just before the reserve (capacity 256, off_reserve 16 → note_on refused when used+16>=256)
     var i: usize = 0;
     while (i < 240) : (i += 1) {
         try testing.expect(patch.note_queue.sendNoteOn(@truncate(i % 128), 1.0));
     }
-    // 残りを note_off で埋めて満杯にし、さらに off → panic
+    // Fill the rest with note_off to capacity, then one more off → panic
     i = 0;
     while (i < 16) : (i += 1) {
         try testing.expect(patch.note_queue.sendNoteOff(@truncate(i)));
@@ -3245,16 +3245,16 @@ test "TASK-115.3: panic after queued note_on does not leave stuck note" {
     while (n < 128) : (n += 1) {
         try testing.expect(!patch.midi_held[n]);
     }
-    // 次 block の新規 note は通常どおり受理される
+    // A new note on the next block is accepted normally
     patch.sendMidiNoteOn(72, 0.8);
     patch.render(&buf, 32, 2);
     try testing.expectEqual(@as(?u8, 72), patch.midi_current_note);
     try testing.expect(testPad(patch).midi_active);
 }
 
-test "TASK-115.3: MIDI note path does not touch ParamBatch/recipe surface" {
-    // 構造契約: sendMidiNote* は NoteQueue のみ。ParamBatch revision は不変。
-    // CommandLog/Executor は LofiPatch が import すらしない（recipe 非記録の固定）。
+test "MIDI note path does not touch ParamBatch/recipe surface" {
+    // Structural contract: sendMidiNote* touches NoteQueue only. ParamBatch revision is unchanged.
+    // LofiPatch does not even import CommandLog/Executor (recipe non-recording is fixed).
     const patch = try LofiPatch.create(testing.allocator, 48000);
     defer patch.destroy();
     const before = patch.controls.param_db.acquire().revision;
@@ -3263,7 +3263,7 @@ test "TASK-115.3: MIDI note path does not touch ParamBatch/recipe surface" {
     try testing.expectEqual(before, patch.controls.param_db.acquire().revision);
 }
 
-test "TASK-115.3: multi-target ParamBatch publishes in one revision" {
+test "multi-target ParamBatch publishes in one revision" {
     const patch = try LofiPatch.create(testing.allocator, 48000);
     defer patch.destroy();
     var batch = ParamBatch{};
@@ -3278,12 +3278,12 @@ test "TASK-115.3: multi-target ParamBatch publishes in one revision" {
     try testing.expectEqual(@as(u64, 7), patch.controls.param_db.acquire().revision);
 }
 
-test "TASK-115.3: mapMidiCcValue linear/exponential boundaries" {
+test "mapMidiCcValue linear/exponential boundaries" {
     try testing.expectApproxEqAbs(@as(f32, 60.0), mapMidiCcValue(0, .linear, 60.0, 180.0), 1e-4);
     try testing.expectApproxEqAbs(@as(f32, 180.0), mapMidiCcValue(127, .linear, 60.0, 180.0), 1e-4);
     try testing.expectApproxEqAbs(@as(f32, 80.0), mapMidiCcValue(0, .exponential, 80.0, 18000.0), 1e-3);
     try testing.expectApproxEqAbs(@as(f32, 18000.0), mapMidiCcValue(127, .exponential, 80.0, 18000.0), 1e-1);
-    // 中間値は範囲内
+    // Mid-range values stay in range
     const mid = mapMidiCcValue(64, .exponential, 80.0, 18000.0);
     try testing.expect(mid > 80.0 and mid < 18000.0);
     const lin_mid = mapMidiCcValue(64, .linear, 0.0, 1.5);

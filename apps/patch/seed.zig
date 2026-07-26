@@ -1,18 +1,18 @@
-//! modular の生成 RNG 用 base seed + 用途別 derive（TASK-62.5.7）。
+//! modular: base seed for generative RNG plus per-purpose derivation.
 //!
-//! ホットパス宣言: derive はイベント時（action seed）と初期化時、および bar 境界での
-//! PRNG 再構築時のみ。毎サンプル RT 経路では呼ばない。
+//! Hot-path declaration: derive runs only at event time (action seed), at init time, and when the PRNG is
+//! rebuilt at a bar boundary. Never called on the per-sample RT path.
 //!
-//! std のみ依存（単体テスト可能）。音色用 fixed seed（Kick/Hat/Clap の "KICK" 等）は
-//! 対象外（音色の同一性のため base seed から独立）。
+//! Depends only on std (unit-testable). Timbre fixed seeds (e.g. Kick/Hat/Clap's "KICK") are
+//! out of scope (kept independent of the base seed to preserve timbre identity).
 
 const std = @import("std");
 
-/// 既定 base seed。`deriveU32(DEFAULT, *)` は現行 fixed seed 群と bit 互換
-/// （既存 offline CRC 決定性テストを壊さない）。
+/// Default base seed. `deriveU32(DEFAULT, *)` is bit-compatible with the current fixed-seed set
+/// (doesn't break the existing offline CRC determinism tests).
 pub const DEFAULT_BASE_SEED: u64 = 0;
 
-/// 用途タグ（base と XOR して splitmix64 へ渡す）。DEFAULT 時は legacy 定数を返す。
+/// Purpose tag (XORed with base and passed to splitmix64). Returns the legacy constant when DEFAULT.
 pub const Purpose = enum(u64) {
     mutate = 1,
     ambient_random = 2,
@@ -20,7 +20,7 @@ pub const Purpose = enum(u64) {
     ambient_turing_register = 4,
 };
 
-/// splitmix64（Steele / Vigna）。決定的・alloc なし。
+/// splitmix64 (Steele / Vigna). Deterministic, no alloc.
 pub fn splitmix64(x: u64) u64 {
     var z = x +% 0x9E3779B97F4A7C15;
     z = (z ^ (z >> 30)) *% 0xBF58476D1CE4E5B9;
@@ -28,8 +28,8 @@ pub fn splitmix64(x: u64) u64 {
     return z ^ (z >> 31);
 }
 
-/// base seed から用途別 u32 を導出する。
-/// DEFAULT_BASE_SEED では現行 LofiPatch の fixed seed（"MUT1"/"RAND"/"TURN"/0xB5）を返す。
+/// Derives a per-purpose u32 from the base seed.
+/// With DEFAULT_BASE_SEED, returns the current LofiPatch fixed seeds ("MUT1"/"RAND"/"TURN"/0xB5).
 pub fn deriveU32(base: u64, purpose: Purpose) u32 {
     if (base == DEFAULT_BASE_SEED) {
         return switch (purpose) {
@@ -55,7 +55,7 @@ test "seed derive: same base yields same stream; different base differs" {
     const b = deriveU32(43, .mutate);
     try testing.expect(a1 != b);
 
-    // 用途が違えば同 base でも相違
+    // Differs even with the same base if the purpose differs
     try testing.expect(deriveU32(42, .mutate) != deriveU32(42, .ambient_random));
     try testing.expect(deriveU32(42, .ambient_turing) != deriveU32(42, .ambient_turing_register));
 }

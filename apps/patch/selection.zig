@@ -1,7 +1,7 @@
-//! apps/patch: 複数ノード選択集合（TASK-173.3）。
+//! apps/patch: multi-node selection set.
 //!
-//! 固定 bool 配列の純粋操作。App.selected には依存しないローカル UI 状態。
-//! platform / gui / modular を import しない（test-patch で単体テスト可能）。
+//! Pure operations on a fixed bool array. Local UI state independent of App.selected.
+//! Does not import platform / gui / modular (unit-testable via test-patch).
 
 const std = @import("std");
 const testing = std.testing;
@@ -10,7 +10,7 @@ const group = @import("group.zig");
 
 pub const Handle = canvas.Handle;
 
-/// 実 handle（0..GROUP_HANDLE_BASE-1）と group 合成 handle（GROUP_HANDLE_BASE..）の両方を格納。
+/// Stores both real handles (0..GROUP_HANDLE_BASE-1) and composite group handles (GROUP_HANDLE_BASE..).
 pub const CAP: usize = group.GROUP_HANDLE_BASE + group.MAX_GROUPS;
 pub const MultiSelected = [CAP]bool;
 
@@ -41,7 +41,7 @@ pub fn toggle(ms: *MultiSelected, h: Handle) void {
 }
 
 // ============================================================================
-// 単体テスト
+// Unit tests
 // ============================================================================
 
 test "selection: toggle add/remove and contains" {
@@ -73,10 +73,10 @@ test "selection: clear then same handle reuse stays unselected" {
     const h: Handle = 11;
     toggle(&ms, h);
     try testing.expect(contains(&ms, h));
-    // 削除経路相当: clear または set false で陳腐化を防ぐ
+    // Equivalent to the delete path: clear or set false to prevent staleness
     set(&ms, h, false);
     try testing.expect(!contains(&ms, h));
-    // 同じ handle が新規ノードに再利用されても選択は引き継がない
+    // Selection is not carried over even if the same handle gets reused for a new node
     try testing.expect(!contains(&ms, h));
     clear(&ms);
     try testing.expect(empty(&ms));
@@ -95,7 +95,7 @@ test "selection: clear empties all slots including group handles" {
 }
 
 test "selection: multi ops do not require or mutate a single-selected value" {
-    // 集合操作は独立。呼び出し側の selected 相当値は触らない（並行 UI 状態）。
+    // Set operations are independent. Doesn't touch the caller's selected-equivalent value (concurrent UI state).
     var ms: MultiSelected = [_]bool{false} ** CAP;
     var fake_selected: ?Handle = 5;
     toggle(&ms, 9);

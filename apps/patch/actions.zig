@@ -1,13 +1,13 @@
-//! apps/patch の harness action（TASK-65 / TASK-106.2）向け純パーサ。
+//! apps/patch: pure parser for harness actions.
 //!
-//! ホットパス宣言: ここでパースした結果は「イベント時のみ」（harness の `action <name> [args]`
-//! コマンド1回につき1回）dispatch される。毎フレーム全画素ループ・毎サンプル RT 経路のいずれでもない
-//! ため、性能規約（SIMD 3点セット等）の適用対象外。
+//! Hot-path declaration: parsing here runs only "on events" (once per harness
+//! `action <name> [args]` command dispatch). Neither a per-frame all-pixel loop nor a per-sample RT path,
+//! so the performance rules (SIMD triad, etc.) do not apply.
 //!
-//! このファイルは **std のみに依存**し、App / kit / platform / modular を一切 import しない
-//! （pixie の `actions.zig` と同型。main.zig との circular import を避け、単体テスト可能にする）。
-//! `ModuleKind` 名の enum 解決は App の具象型を知る main.zig 側が行う（pixie の `ToolKind` 解決と
-//! 同じ分離方針。このファイルは kind 名を素通しする）。
+//! This file **depends only on std** and never imports App / kit / platform / modular
+//! (same shape as pixie's `actions.zig`. Avoids a circular import with main.zig and stays unit-testable).
+//! Resolving `ModuleKind` names as an enum is done by main.zig, which knows the App's concrete type (the same
+//! separation as pixie's `ToolKind` resolution. This file passes kind names through unchanged).
 
 const std = @import("std");
 
@@ -20,28 +20,28 @@ pub const ParseError = error{
     TooManyMacroMembers,
 };
 
-/// node 参照（TASK-106.2）: `#<id>`（安定 NodeId）または bare 数値（runtime handle・solo 互換）。
+/// Node reference: `#<id>` (stable NodeId) or a bare number (runtime handle, solo-compatible).
 pub const NodeRef = union(enum) {
     id: u64,
     handle: usize,
 };
 
-/// world 座標の許容範囲（NaN/Inf は別途拒否。極端な値で layout が壊れるのを防ぐ）。
+/// Accepted range for world coordinates (NaN/Inf are rejected separately; guards against extreme values breaking layout).
 pub const COORD_ABS_MAX: f32 = 1_000_000.0;
 
-/// remove_macro の member 上限（DynGraph MAX_MODULES と同値の実用上界）。
+/// Member cap for remove_macro (a practical upper bound equal to DynGraph MAX_MODULES).
 pub const MAX_REMOVE_MACRO_MEMBERS: usize = 48;
 
-/// `set_param` の node 形式: `#<NodeId>|bare-handle <name> <value>`（TASK-106.1）。
+/// Node form for `set_param`: `#<NodeId>|bare-handle <name> <value>`.
 pub const ParamOverride = struct { ref: NodeRef, name: []const u8, value: f32 };
 
-/// `select_node <handle>` 用の単一 handle parser（.local_only・runtime handle のまま）。
+/// Single-handle parser for `select_node <handle>` (.local_only, stays a runtime handle).
 pub fn parseSelectNode(args: []const u8) ParseError!usize {
     return parseUsize(args);
 }
 
-/// `set_param #<id>|handle <name> <value>` 用 parser。
-/// bare handle は solo 互換で受理。netsync 中の拒否は canonicalize / handler 側（`id_required`）。
+/// Parser for `set_param #<id>|handle <name> <value>`.
+/// A bare handle is accepted for solo compatibility. Rejection during netsync happens at canonicalize / the handler side (`id_required`).
 pub fn parseParamOverride(args: []const u8) ParseError!ParamOverride {
     var it = tokenize(args);
     const ref_tok = it.next() orelse return error.Empty;
@@ -55,7 +55,7 @@ pub fn parseParamOverride(args: []const u8) ParseError!ParamOverride {
     return .{ .ref = ref, .name = name, .value = value };
 }
 
-/// wire 用: `#<id> <canonical-name> <value>`。
+/// For wire: `#<id> <canonical-name> <value>`.
 pub fn formatParamOverride(buf: []u8, id: u64, name: []const u8, value: f32) error{TooLong}![]const u8 {
     return std.fmt.bufPrint(buf, "#{d} {s} {d}", .{ id, name, value }) catch return error.TooLong;
 }
@@ -68,7 +68,7 @@ fn expectExhausted(it: *std.mem.TokenIterator(u8, .any)) ParseError!void {
     if (it.next() != null) return error.TooManyTokens;
 }
 
-/// "<handle>" の1トークン（legacy / select_node 用）。
+/// A single "<handle>" token (for legacy / select_node).
 pub fn parseUsize(args: []const u8) ParseError!usize {
     var it = tokenize(args);
     const tok = it.next() orelse return error.Empty;
@@ -79,7 +79,7 @@ pub fn parseUsize(args: []const u8) ParseError!usize {
 
 pub const TwoUsize = struct { a: usize, b: usize };
 
-/// "<a> <b>" の2トークン（legacy disconnect 用）。
+/// Two "<a> <b>" tokens (for legacy disconnect).
 pub fn parseTwoUsize(args: []const u8) ParseError!TwoUsize {
     var it = tokenize(args);
     const a_tok = it.next() orelse return error.Empty;
@@ -92,7 +92,7 @@ pub fn parseTwoUsize(args: []const u8) ParseError!TwoUsize {
 
 pub const FourUsize = struct { a: usize, b: usize, c: usize, d: usize };
 
-/// "<src_h> <src_out> <dst_h> <dst_in>" の4トークン（legacy connect 用）。
+/// Four "<src_h> <src_out> <dst_h> <dst_in>" tokens (for legacy connect).
 pub fn parseFourUsize(args: []const u8) ParseError!FourUsize {
     var it = tokenize(args);
     const a_tok = it.next() orelse return error.Empty;
@@ -107,8 +107,8 @@ pub fn parseFourUsize(args: []const u8) ParseError!FourUsize {
     return .{ .a = a, .b = b, .c = c, .d = d };
 }
 
-/// `save_graph`/`load_graph` 用: 前後の空白のみ trim し、内部の空白はそのまま保持する
-/// （path は空白を含みうる1本の文字列として扱う。pixie/synth/modular の `parsePath` と同型）。
+/// For `save_graph`/`load_graph`: trims only leading/trailing whitespace, preserving internal whitespace as-is
+/// (treats path as a single string that may contain whitespace. Same shape as pixie/synth/modular's `parsePath`).
 pub fn parsePath(args: []const u8) ParseError![]const u8 {
     const trimmed = std.mem.trim(u8, args, " \t");
     if (trimmed.len == 0) return error.Empty;
@@ -124,7 +124,7 @@ fn parseFiniteCoord(tok: []const u8) ParseError!f32 {
     return v;
 }
 
-/// "<kind> <x> <y>" — kind 名 + world 座標必須（`add_node` wire。TASK-106.2）。
+/// "<kind> <x> <y>" — kind name plus world coordinates are required (`add_node` wire).
 pub fn parseAddNode(args: []const u8) ParseError!AddNode {
     var it = tokenize(args);
     const kind = it.next() orelse return error.Empty;
@@ -136,8 +136,8 @@ pub fn parseAddNode(args: []const u8) ParseError!AddNode {
     return .{ .kind = kind, .x = x, .y = y };
 }
 
-/// 単一トークンの node 参照: `#<id>` → `.id` / bare 数値 → `.handle`（TASK-106.2）。
-/// `#0` / bare のみの空は拒否。id=0 は invalid。
+/// Single-token node reference: `#<id>` → `.id` / bare number → `.handle`.
+/// Rejects `#0` and a bare empty token. id=0 is invalid.
 pub fn parseNodeRefToken(tok: []const u8) ParseError!NodeRef {
     if (tok.len == 0) return error.Empty;
     if (tok[0] == '#') {
@@ -150,7 +150,7 @@ pub fn parseNodeRefToken(tok: []const u8) ParseError!NodeRef {
     return .{ .handle = h };
 }
 
-/// "`#<id>` | `<handle>`" の1トークン（remove_node）。
+/// A single "`#<id>` | `<handle>`" token (remove_node).
 pub fn parseNodeRef(args: []const u8) ParseError!NodeRef {
     var it = tokenize(args);
     const tok = it.next() orelse return error.Empty;
@@ -161,7 +161,7 @@ pub fn parseNodeRef(args: []const u8) ParseError!NodeRef {
 
 pub const MoveNode = struct { ref: NodeRef, x: f32, y: f32 };
 
-/// "`#<id>`|`<handle>` <x> <y>"（move_node）。
+/// "`#<id>`|`<handle>` <x> <y>" (move_node).
 pub fn parseMoveNode(args: []const u8) ParseError!MoveNode {
     var it = tokenize(args);
     const ref_tok = it.next() orelse return error.Empty;
@@ -176,7 +176,7 @@ pub fn parseMoveNode(args: []const u8) ParseError!MoveNode {
 
 pub const DisconnectArgs = struct { dst: NodeRef, dst_in: usize };
 
-/// "`#<id>`|`<handle>` <dst_in>"（disconnect）。
+/// "`#<id>`|`<handle>` <dst_in>" (disconnect).
 pub fn parseDisconnect(args: []const u8) ParseError!DisconnectArgs {
     var it = tokenize(args);
     const ref_tok = it.next() orelse return error.Empty;
@@ -192,12 +192,12 @@ pub const ConnectArgs = struct {
     src_out: usize,
     dst: NodeRef,
     dst_in: usize,
-    /// 任意: drag-off 元入力（同一 COMMIT 内で detach）。無ければ null。
+    /// Optional: the drag-off source input (detach within the same COMMIT). null if absent.
     detach_dst: ?NodeRef = null,
     detach_in: ?usize = null,
 };
 
-/// "`#src` <out> `#dst` <in> [`#detach` <in>]"（connect。detach は任意）。
+/// "`#src` <out> `#dst` <in> [`#detach` <in>]" (connect; detach is optional).
 pub fn parseConnect(args: []const u8) ParseError!ConnectArgs {
     var it = tokenize(args);
     const src_tok = it.next() orelse return error.Empty;
@@ -230,7 +230,7 @@ pub fn parseConnect(args: []const u8) ParseError!ConnectArgs {
 
 pub const AddMacro = struct { kind: []const u8, x: f32, y: f32 };
 
-/// "<macro-kind> <x> <y>"（add_macro）。
+/// "<macro-kind> <x> <y>" (add_macro).
 pub fn parseAddMacro(args: []const u8) ParseError!AddMacro {
     var it = tokenize(args);
     const kind = it.next() orelse return error.Empty;
@@ -247,7 +247,7 @@ pub const RemoveMacro = struct {
     count: usize,
 };
 
-/// "`#id` ..." — 1 個以上の member NodeRef（remove_macro）。
+/// "`#id` ..." — one or more member NodeRefs (remove_macro).
 pub fn parseRemoveMacro(args: []const u8) ParseError!RemoveMacro {
     var it = tokenize(args);
     var out: RemoveMacro = .{ .members = undefined, .count = 0 };
@@ -260,7 +260,7 @@ pub fn parseRemoveMacro(args: []const u8) ParseError!RemoveMacro {
     return out;
 }
 
-/// `#<id>` を buf に書く。
+/// Writes `#<id>` into buf.
 pub fn formatNodeId(buf: []u8, id: u64) error{TooLong}![]const u8 {
     return std.fmt.bufPrint(buf, "#{d}", .{id}) catch return error.TooLong;
 }
@@ -297,21 +297,21 @@ pub fn formatAddMacro(buf: []u8, kind: []const u8, x: f32, y: f32) error{TooLong
     return std.fmt.bufPrint(buf, "{s} {d} {d}", .{ kind, x, y }) catch return error.TooLong;
 }
 
-/// netsync 中の .relay graph op は `#<id>` 必須（bare handle は誤ターゲット）。
+/// A `.relay` graph op during netsync requires `#<id>` (a bare handle could target the wrong node).
 pub fn nodeRefRejectDuringNetsync(ref: NodeRef, netsync_active: bool) bool {
     return netsync_active and ref == .handle;
 }
 
-/// canonicalize が bare handle を #id に変換してよいか（netsync 中は禁止）。
+/// Whether canonicalize may convert a bare handle to #id (forbidden during netsync).
 pub fn allowNodeCanonFill(netsync_active: bool) bool {
     return !netsync_active;
 }
 
-/// digest 末尾の trunc マーカー（pixie と同型。`" trunc=1"` = 8 bytes）。
+/// Truncation marker at the end of a digest (same shape as pixie. `" trunc=1"` = 8 bytes).
 pub const DIGEST_TRUNC_MARKER = " trunc=1";
 
-/// `truncated=false` なら `buf[0..written]` をそのまま返す。
-/// `truncated=true` なら末尾に ` trunc=1` を書き、必要なら written を削って領域を確保する。
+/// If `truncated=false`, returns `buf[0..written]` as-is.
+/// If `truncated=true`, appends ` trunc=1` at the end, trimming written if needed to make room.
 pub fn finishDigestWithTrunc(buf: []u8, written: usize, truncated: bool) []const u8 {
     if (!truncated) return buf[0..written];
     const marker = DIGEST_TRUNC_MARKER;
@@ -331,7 +331,7 @@ pub fn finishDigestWithTrunc(buf: []u8, written: usize, truncated: bool) []const
 
 const testing = std.testing;
 
-test "parseUsize: 有効値 / 空 / 不正数値 / 余剰トークン" {
+test "parseUsize: valid value / empty / invalid number / extra token" {
     try testing.expectEqual(@as(usize, 0), try parseUsize("0"));
     try testing.expectEqual(@as(usize, 7), try parseUsize("  7  "));
     try testing.expectError(error.Empty, parseUsize(""));
@@ -340,7 +340,7 @@ test "parseUsize: 有効値 / 空 / 不正数値 / 余剰トークン" {
     try testing.expectError(error.TooManyTokens, parseUsize("1 2"));
 }
 
-test "parseSelectNode / parseParamOverride: handle と値" {
+test "parseSelectNode / parseParamOverride: handle and value" {
     try testing.expectEqual(@as(usize, 17), try parseSelectNode(" 17 "));
     const p = try parseParamOverride("17 cutoff 2000");
     try testing.expectEqual(NodeRef{ .handle = 17 }, p.ref);
@@ -352,7 +352,7 @@ test "parseSelectNode / parseParamOverride: handle と値" {
     try testing.expectError(error.InvalidNumber, parseParamOverride("17 cutoff nan"));
 }
 
-test "parseParamOverride: #<NodeId> / #0 / Inf / 空 name" {
+test "parseParamOverride: #<NodeId> / #0 / Inf / empty name" {
     const p = try parseParamOverride("#123 cutoff 2000");
     try testing.expectEqual(NodeRef{ .id = 123 }, p.ref);
     try testing.expectEqualStrings("cutoff", p.name);
@@ -364,12 +364,12 @@ test "parseParamOverride: #<NodeId> / #0 / Inf / 空 name" {
     try testing.expectError(error.InvalidNumber, parseParamOverride("#1 cutoff nan"));
     try testing.expectError(error.Empty, parseParamOverride("#1"));
     try testing.expectError(error.TooManyTokens, parseParamOverride("#1 cutoff 1 extra"));
-    // TASK-160.3: 旧 Transport alias 2 トークンは 3 トークン必須のため拒否
+    // The legacy Transport alias (2 tokens) is rejected because 3 tokens are now required.
     try testing.expectError(error.InvalidNumber, parseParamOverride("tempo 140"));
     try testing.expectError(error.InvalidNumber, parseParamOverride("cutoff 0.5"));
 }
 
-test "parseParamOverride: 余白と浮動小数点" {
+test "parseParamOverride: whitespace and floating point" {
     const p = try parseParamOverride(" 3 resonance 0.75 ");
     try testing.expectEqual(NodeRef{ .handle = 3 }, p.ref);
     try testing.expectEqualStrings("resonance", p.name);
@@ -387,7 +387,7 @@ test "formatParamOverride: round-trip with parseParamOverride" {
     try testing.expectEqual(@as(f32, 2000), p.value);
 }
 
-test "parseTwoUsize: 有効値 / 不正数値 / 余剰トークン" {
+test "parseTwoUsize: valid value / invalid number / extra token" {
     const r = try parseTwoUsize("3 1");
     try testing.expectEqual(@as(usize, 3), r.a);
     try testing.expectEqual(@as(usize, 1), r.b);
@@ -396,7 +396,7 @@ test "parseTwoUsize: 有効値 / 不正数値 / 余剰トークン" {
     try testing.expectError(error.TooManyTokens, parseTwoUsize("3 1 5"));
 }
 
-test "parseFourUsize: 有効値 / 不足 / 余剰トークン" {
+test "parseFourUsize: valid value / insufficient / extra token" {
     const r = try parseFourUsize("1 0 2 1");
     try testing.expectEqual(@as(usize, 1), r.a);
     try testing.expectEqual(@as(usize, 0), r.b);
@@ -406,14 +406,14 @@ test "parseFourUsize: 有効値 / 不足 / 余剰トークン" {
     try testing.expectError(error.TooManyTokens, parseFourUsize("1 0 2 1 9"));
 }
 
-test "parsePath: 前後 trim / 内部空白保持 / 空は拒否" {
+test "parsePath: trims leading/trailing / preserves internal whitespace / rejects empty" {
     try testing.expectEqualStrings("/tmp/out.ptcg", try parsePath("  /tmp/out.ptcg  "));
     try testing.expectEqualStrings("/tmp/my graph.ptcg", try parsePath("/tmp/my graph.ptcg"));
     try testing.expectError(error.Empty, parsePath(""));
     try testing.expectError(error.Empty, parsePath("   "));
 }
 
-test "parseAddNode: kind+xy 必須 / NaN Inf 範囲外拒否" {
+test "parseAddNode: kind+xy required / rejects NaN, Inf, out-of-range" {
     const r2 = try parseAddNode("vco 10 20");
     try testing.expectEqualStrings("vco", r2.kind);
     try testing.expectEqual(@as(f32, 10), r2.x);
@@ -429,20 +429,20 @@ test "parseAddNode: kind+xy 必須 / NaN Inf 範囲外拒否" {
     try testing.expectError(error.TooManyTokens, parseAddNode("vco 10 20 30"));
 }
 
-test "parseAddNode: step_seq_bass wire alias / unknown kind token は素通し" {
-    // パーサは kind を素通し。ModuleKind 解決は main 側。alias も通常トークンとして受理。
+test "parseAddNode: step_seq_bass wire alias / unknown kind token passes through unchanged" {
+    // The parser passes kind through unchanged. ModuleKind resolution happens on the main side. Aliases are also accepted as ordinary tokens.
     const bass = try parseAddNode("step_seq_bass 1.5 2.5");
     try testing.expectEqualStrings("step_seq_bass", bass.kind);
     try testing.expectEqual(@as(f32, 1.5), bass.x);
     try testing.expectEqual(@as(f32, 2.5), bass.y);
     const drum = try parseAddNode("step_seq 0 0");
     try testing.expectEqualStrings("step_seq", drum.kind);
-    // 未知トークンも parse は成功（UnknownKind は action 側）
+    // Parsing an unknown token still succeeds (UnknownKind is handled on the action side).
     const unk = try parseAddNode("not_a_module 3 4");
     try testing.expectEqualStrings("not_a_module", unk.kind);
 }
 
-test "parseNodeRef: #<id> と bare handle / 0 拒否 / 余剰トークン" {
+test "parseNodeRef: #<id> and bare handle / rejects 0 / extra token" {
     try testing.expectEqual(NodeRef{ .id = 1 }, try parseNodeRef("#1"));
     try testing.expectEqual(NodeRef{ .id = 42 }, try parseNodeRef("  #42  "));
     try testing.expectEqual(NodeRef{ .handle = 0 }, try parseNodeRef("0"));
@@ -525,7 +525,7 @@ test "formatNodeId* / connect detach: round-trip with parsers" {
     try testing.expectEqualStrings("vco", pan.kind);
 }
 
-test "finishDigestWithTrunc: 非 trunc は bit 一致 / trunc 時は末尾に trunc=1" {
+test "finishDigestWithTrunc: non-trunc is bit-identical / trunc appends trunc=1 at the end" {
     var buf: [64]u8 = undefined;
     const base = "{\"nodes\":[]}";
     @memcpy(buf[0..base.len], base);
@@ -537,7 +537,7 @@ test "finishDigestWithTrunc: 非 trunc は bit 一致 / trunc 時は末尾に tr
     try testing.expect(std.mem.endsWith(u8, out, " trunc=1"));
 }
 
-test "canonical args: 同じ入力は常に同じ format 結果" {
+test "canonical args: the same input always yields the same format result" {
     var a: [64]u8 = undefined;
     var b: [64]u8 = undefined;
     const s1 = try formatConnect(&a, 3, 1, 5, 0);

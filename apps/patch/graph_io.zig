@@ -1,30 +1,30 @@
-//! apps/patch: DynGraph のノード/エッジ構成の直列化（TASK-65 serialize / TASK-105.4 旧 PTCG）。
+//! apps/patch: serialization of the DynGraph node/edge topology (legacy PTCG format).
 //!
-//! libs/serde の versioned container（TASK-62.2）に NODE chunk × N（ノード=kind+world 座標）と
-//! EDGE chunk × M（接続）を繰り返し載せる（`libs/paint` の `document_io.zig` が LAYR chunk を
-//! layer 数ぶん繰り返すのと同じ「可変個の小さい chunk を repeated tag で並べる」流儀）。
+//! On top of libs/serde's versioned container, lay NODE chunk × N (node = kind + world coordinates) and
+//! EDGE chunk × M (connections) repeatedly (the same convention `document_io.zig` in `libs/paint` uses to repeat LAYR chunk
+//! once per layer — laying a variable number of small chunks under a repeated tag).
 //!
-//! **TASK-105.4**: 正規のプロジェクト保存は `project_io.zig`（VPRJ）。本 file は旧 PTCG の
-//! reader/encoder（fixture・統合 reader からの変換）と NODE/EDGE layout の単一ソースを維持する。
-//! 新 path の writer は VPRJ に寄せ、PTCG writer を新しい保存経路から呼ばない。
+//! The canonical project save path is `project_io.zig` (VPRJ). This file maintains the legacy PTCG
+//! reader/encoder (fixture and conversion from the unified reader) and remains the single source for NODE/EDGE layout.
+//! New save paths should use the VPRJ writer; do not call the PTCG writer from a new save path.
 //!
-//! **ModuleKind 互換**: enum ordinal は永続化フォーマットの一部。新しい ModuleKind は enum の
-//! 末尾にのみ追加する。既存 tag の並べ替え・削除・名前変更は禁止。未知 ordinal は NODE 単位で
-//! skip（対応 EDGE は load 側 mapping 欠落で自然除外）。
+//! **ModuleKind compatibility**: the enum ordinal is part of the persisted format. New ModuleKind values must be
+//! appended only at the end of the enum. Reordering, removing, or renaming existing tags is forbidden. Unknown ordinals are
+//! skipped per NODE (the corresponding EDGE is naturally excluded by the missing mapping on load).
 //!
-//! **スコープ**: 生ノード（`DynGraph.add/removeModule/connect/disconnect`）のみを対象とする。
-//! マクロ（DrumMachine/BassMachine）の折り畳み情報（`group.Ledger`）は対象外
-//! （既存 action set が `add_node`/`remove_node`/`connect`/`disconnect` という「生ノード」操作のみを
-//! 提供するのと同じスコープ。load 後、元マクロのメンバーは折り畳まれていない生ノードとして復元される）。
-//! master 出力（`DynGraph.setOutput`）も対象外（既存 action に `set_output` が無く、現状は起動時の
-//! 既定パッチにのみ存在するため。今後 action 化されたら本 file に OUTP chunk を追加する）。
+//! **Scope**: covers only raw nodes (`DynGraph.add/removeModule/connect/disconnect`).
+//! Macro (DrumMachine/BassMachine) folding info (`group.Ledger`) is out of scope
+//! (the existing action set only provides "raw node" operations — `add_node`/`remove_node`/`connect`/`disconnect` —
+//! matching that same scope. After load, the original macro's members are restored as unfolded raw nodes).
+//! Master output (`DynGraph.setOutput`) is also out of scope (there is no `set_output` action; it currently exists only in the
+//! default startup patch. If it becomes an action later, add an OUTP chunk to this file).
 //!
-//! **循環 import 回避**: `App`/`Handle`/`Vec2f`（apps/patch/main.zig・canvas.zig 具体型）は import
-//! しない。`modular`（`ModuleKind` の単一ソース）のみ依存する（main.zig も既に直 import 済みの
-//! 「流動 lib・app_direct_ok」なので、この file が使うのと同じ依存で完結する）。
+//! **Avoiding circular imports**: does not import `App`/`Handle`/`Vec2f` (concrete types from apps/patch/main.zig and
+//! canvas.zig). Depends only on `modular` (the single source for `ModuleKind`) (since main.zig already directly imports it
+//! as a "flowing lib, app_direct_ok", this file is self-contained with the same dependency it uses).
 //!
-//! ホットパス宣言: encode/decode/save/load は **イベント時のみ**（`save_graph`/`load_graph` action
-//! 1回につき1回）。RT 経路（`DynGraph.processBlock`）には一切触れない。
+//! Hot-path declaration: encode/decode/save/load run **only on events** (once per `save_graph`/`load_graph` action
+//! invocation). Never touches the RT path (`DynGraph.processBlock`).
 
 const std = @import("std");
 const serde = @import("serde");
@@ -33,8 +33,8 @@ const modular = @import("modular");
 pub const Handle = u16;
 pub const ModuleKind = modular.ModuleKind;
 
-/// 安定 node 参照（TASK-106.2）。runtime `DynGraph.Handle` とは分離。
-/// `0 = invalid`、単調増加・再利用なし（pixie `LayerId` と同型）。
+/// Stable node reference. Separate from the runtime `DynGraph.Handle`.
+/// `0 = invalid`, monotonically increasing with no reuse (same shape as pixie's `LayerId`).
 pub const NodeId = enum(u64) {
     invalid = 0,
     _,
@@ -48,7 +48,7 @@ pub const NodeId = enum(u64) {
     }
 };
 
-/// stable export 用 node（equality / digest。runtime handle は載せない）。
+/// Node for stable export (equality / digest; does not carry the runtime handle).
 pub const StableNode = struct {
     id: NodeId,
     kind: ModuleKind,
@@ -56,7 +56,7 @@ pub const StableNode = struct {
     y: f32,
 };
 
-/// stable export 用 edge（NodeId ベース。ソートキーは src_id, src_out, dst_id, dst_in）。
+/// Edge for stable export (NodeId-based; sort key is src_id, src_out, dst_id, dst_in).
 pub const StableEdge = struct {
     src_id: NodeId,
     src_out: u8,
@@ -88,8 +88,8 @@ fn lessStableEdge(ctx: void, a: StableEdge, b: StableEdge) bool {
     return a.dst_in < b.dst_in;
 }
 
-/// nodes/edges を NodeId 昇順・edge キー順にソートした canonical export を返す（caller が free）。
-/// `handle_to_id[h]` が null の active 相当 entry は skip（呼び出し側が割当済みを渡す前提）。
+/// Returns a canonical export with nodes/edges sorted by ascending NodeId and edge key (caller frees).
+/// Skips active-equivalent entries where `handle_to_id[h]` is null (assumes the caller passes only allocated entries).
 pub fn canonicalizeStableGraph(
     gpa: std.mem.Allocator,
     nodes: []const StableNode,
@@ -105,8 +105,8 @@ pub fn canonicalizeStableGraph(
     return .{ .nodes = n_out, .edges = e_out, .output_id = output_id };
 }
 
-/// 旧 NodeEntry 並び（出現順）から決定的に NodeId を採番する（schema 1 / PTCG fallback）。
-/// 戻り値の ids[i] は nodes[i] に対応。next = max+1（空なら 1）。
+/// Deterministically assigns NodeId from the legacy NodeEntry order (appearance order) (schema 1 / PTCG fallback).
+/// The returned ids[i] correspond to nodes[i]. next = max+1 (1 if empty).
 pub fn assignFallbackNodeIds(nodes: []const NodeEntry, ids_out: []NodeId) u64 {
     std.debug.assert(ids_out.len >= nodes.len);
     var next: u64 = 1;
@@ -117,9 +117,9 @@ pub fn assignFallbackNodeIds(nodes: []const NodeEntry, ids_out: []NodeId) u64 {
     return next;
 }
 
-/// stable topology JSON（digest / snapshot 共通本体）。
-/// 形式: `{"nodes":[{"id":N,"kind":"...","x":..,"y":..},...],"edges":[[sid,so,did,di],...],"output":OID}`
-/// `nodes`/`edges` は呼び出し側でソート済みであること。
+/// Stable topology JSON (shared body for digest / snapshot).
+/// Format: `{"nodes":[{"id":N,"kind":"...","x":..,"y":..},...],"edges":[[sid,so,did,di],...],"output":OID}`
+/// `nodes`/`edges` must already be sorted by the caller.
 pub fn appendStableTopologyJson(
     list: *std.ArrayList(u8),
     gpa: std.mem.Allocator,
@@ -150,7 +150,7 @@ pub fn appendStableTopologyJson(
     try list.appendSlice(gpa, t);
 }
 
-/// 固定バッファ版（digest 用）。収まらなければ truncated=true（書き込みは途中まで）。
+/// Fixed-buffer version (for digest). If it doesn't fit, truncated=true (partial write).
 pub fn formatStableTopologyInto(
     buf: []u8,
     nodes: []const StableNode,
@@ -196,16 +196,16 @@ pub fn formatStableTopologyInto(
     return .{ .len = off, .truncated = truncated };
 }
 
-/// 'PTCG'（patch graph）の little-endian u32。serde の expected_magic に渡す。
+/// Little-endian u32 for 'PTCG' (patch graph). Passed to serde's expected_magic.
 pub const magic: u32 = @as(u32, 'P') | (@as(u32, 'T') << 8) | (@as(u32, 'C') << 16) | (@as(u32, 'G') << 24);
 pub const schema_version: u16 = 1;
 
 const TAG_NODE: [4]u8 = "NODE".*;
 const TAG_EDGE: [4]u8 = "EDGE".*;
 
-// NODE payload layout（little-endian・固定 11B）: handle u16 | kind u8(ModuleKind ordinal) | x f32 | y f32
+// NODE payload layout (little-endian, fixed 11B): handle u16 | kind u8(ModuleKind ordinal) | x f32 | y f32
 const NODE_SIZE: usize = 11;
-// EDGE payload layout（固定 6B）: src_handle u16 | src_out u8 | dst_handle u16 | dst_in u8
+// EDGE payload layout (fixed 6B): src_handle u16 | src_out u8 | dst_handle u16 | dst_in u8
 const EDGE_SIZE: usize = 6;
 
 pub const NodeEntry = struct { handle: Handle, kind: ModuleKind, x: f32, y: f32 };
@@ -231,9 +231,9 @@ fn packEdge(e: EdgeEntry, out: *[EDGE_SIZE]u8) void {
     out[5] = e.dst_in;
 }
 
-/// `ModuleKind` は exhaustive enum なので `@enumFromInt` は範囲外値で safety-checked illegal
-/// behavior（panic）になる。`std.meta.intToEnum` 相当を手書きし、宣言済み tag 値との一致を
-/// 確認してから `@enumFromInt` する（前方互換: 未知 kind ordinal は null を返し caller が skip する）。
+/// `ModuleKind` is an exhaustive enum, so `@enumFromInt` triggers safety-checked illegal
+/// behavior (panic) on out-of-range values. Hand-write the `std.meta.intToEnum` equivalent and check the value against
+/// declared tag values before calling `@enumFromInt` (forward compatible: unknown kind ordinals return null and the caller skips them).
 fn moduleKindFromU8(v: u8) ?ModuleKind {
     inline for (@typeInfo(ModuleKind).@"enum".fields) |f| {
         if (f.value == v) return @enumFromInt(v);
@@ -241,7 +241,7 @@ fn moduleKindFromU8(v: u8) ?ModuleKind {
     return null;
 }
 
-/// nodes/edges を NODE×N/EDGE×M の container へ組み立てる（caller が free する）。
+/// Assembles nodes/edges into a NODE×N/EDGE×M container (caller frees).
 pub fn encodeGraph(gpa: std.mem.Allocator, nodes: []const NodeEntry, edges: []const EdgeEntry) ![]u8 {
     var w = try serde.Writer.init(gpa, magic, schema_version);
     errdefer w.deinit();
@@ -260,8 +260,8 @@ pub fn encodeGraph(gpa: std.mem.Allocator, nodes: []const NodeEntry, edges: []co
 }
 
 pub const DecodedGraph = struct {
-    nodes: []NodeEntry, // gpa 確保（caller が free）
-    edges: []EdgeEntry, // gpa 確保（caller が free）
+    nodes: []NodeEntry, // gpa-allocated (caller frees)
+    edges: []EdgeEntry, // gpa-allocated (caller frees)
 
     pub fn deinit(self: *DecodedGraph, gpa: std.mem.Allocator) void {
         gpa.free(self.nodes);
@@ -269,9 +269,9 @@ pub const DecodedGraph = struct {
     }
 };
 
-/// バイト列から nodes/edges を復元する。**未知 `ModuleKind`（将来の schema 拡張）の NODE は
-/// skip する**（前方互換。その handle を参照する EDGE は main.zig 側のロード処理が
-/// 「対応する新 handle が見つからない」として自然に無視する）。
+/// Restores nodes/edges from a byte slice. **NODE entries with an unknown `ModuleKind` (future schema extension) are
+/// skipped** (forward compatible; EDGE entries referencing that handle are naturally ignored by main.zig's load
+/// logic as "no matching new handle found").
 pub fn decodeGraph(gpa: std.mem.Allocator, bytes: []const u8) !DecodedGraph {
     const container = try serde.Container.parse(bytes, magic);
     if (container.schemaVersion() > schema_version) return error.UnsupportedSchemaVersion;
@@ -286,7 +286,7 @@ pub fn decodeGraph(gpa: std.mem.Allocator, bytes: []const u8) !DecodedGraph {
         if (std.mem.eql(u8, &chunk.tag, &TAG_NODE)) {
             if (chunk.payload.len != NODE_SIZE) return error.CorruptNode;
             const handle = std.mem.readInt(u16, chunk.payload[0..2], .little);
-            const kind = moduleKindFromU8(chunk.payload[2]) orelse continue; // 未知 kind: skip
+            const kind = moduleKindFromU8(chunk.payload[2]) orelse continue; // Unknown kind: skip
             const x: f32 = @bitCast(std.mem.readInt(u32, chunk.payload[3..7], .little));
             const y: f32 = @bitCast(std.mem.readInt(u32, chunk.payload[7..11], .little));
             try nodes.append(gpa, .{ .handle = handle, .kind = kind, .x = x, .y = y });
@@ -298,7 +298,7 @@ pub fn decodeGraph(gpa: std.mem.Allocator, bytes: []const u8) !DecodedGraph {
             const dst_in = chunk.payload[5];
             try edges.append(gpa, .{ .src_handle = src_handle, .src_out = src_out, .dst_handle = dst_handle, .dst_in = dst_in });
         }
-        // 未知 tag は無視（serde iterator は全 chunk を返すが match しないものは skip）
+        // Unknown tags are ignored (the serde iterator returns every chunk; non-matching ones are skipped)
     }
 
     return .{ .nodes = try nodes.toOwnedSlice(gpa), .edges = try edges.toOwnedSlice(gpa) };
@@ -320,7 +320,7 @@ pub fn loadGraph(io: std.Io, gpa: std.mem.Allocator, path: []const u8) !DecodedG
 
 const testing = std.testing;
 
-test "encode/decode: round-trip nodes + edges（出現順保持）" {
+test "encode/decode: round-trip nodes + edges (preserves appearance order)" {
     const gpa = testing.allocator;
     const nodes = [_]NodeEntry{
         .{ .handle = 0, .kind = .vco, .x = 10, .y = 20 },
@@ -343,7 +343,7 @@ test "encode/decode: round-trip nodes + edges（出現順保持）" {
     for (edges, got.edges) |want, have| try testing.expectEqual(want, have);
 }
 
-test "encode/decode: 空グラフ（0 ノード・0 エッジ）" {
+test "encode/decode: empty graph (0 nodes, 0 edges)" {
     const gpa = testing.allocator;
     const bytes = try encodeGraph(gpa, &.{}, &.{});
     defer gpa.free(bytes);
@@ -353,14 +353,14 @@ test "encode/decode: 空グラフ（0 ノード・0 エッジ）" {
     try testing.expectEqual(@as(usize, 0), got.edges.len);
 }
 
-test "前方互換: 未知 kind の NODE と未知 chunk tag を skip する" {
+test "forward compat: skips NODE with unknown kind and unknown chunk tags" {
     const gpa = testing.allocator;
     var w = try serde.Writer.init(gpa, magic, schema_version);
     defer w.deinit();
     var buf: [NODE_SIZE]u8 = undefined;
     packNode(.{ .handle = 0, .kind = .vco, .x = 1, .y = 2 }, &buf);
     try w.addChunk(TAG_NODE, &buf);
-    // 未知 kind ordinal（ModuleKind の tag 数を超える値）
+    // Unknown kind ordinal (a value beyond ModuleKind's tag count)
     var bad: [NODE_SIZE]u8 = undefined;
     std.mem.writeInt(u16, bad[0..2], 99, .little);
     bad[2] = 255;
@@ -373,13 +373,13 @@ test "前方互換: 未知 kind の NODE と未知 chunk tag を skip する" {
 
     var got = try decodeGraph(gpa, bytes);
     defer got.deinit(gpa);
-    try testing.expectEqual(@as(usize, 1), got.nodes.len); // 未知 kind は skip
+    try testing.expectEqual(@as(usize, 1), got.nodes.len); // Unknown kind is skipped
     try testing.expectEqual(ModuleKind.vco, got.nodes[0].kind);
 }
 
-test "後方互換: 107 実装前の sidechain(ordinal 25) fixture と新 kind 末尾追加" {
+test "backward compat: legacy sidechain(ordinal 25) fixture plus a new kind appended at the end" {
     const gpa = testing.allocator;
-    // TASK-107 前に保存された固定バイト列。NODE(sidechain, ordinal=25) + EDGE。
+    // Legacy fixed byte fixture. NODE(sidechain, ordinal=25) + EDGE.
     const legacy = [_]u8{
         0x50, 0x54, 0x43, 0x47, 0x01, 0x00, 0x01, 0x00,
         0x4E, 0x4F, 0x44, 0x45, 0x0B, 0x00, 0x00, 0x00,
@@ -404,7 +404,7 @@ test "後方互換: 107 実装前の sidechain(ordinal 25) fixture と新 kind �
     try testing.expectEqual(@as(u8, 30), @intFromEnum(ModuleKind.logic));
 }
 
-test "破損検出: UnsupportedSchemaVersion / CorruptNode / CorruptEdge / BadMagic" {
+test "corruption detection: UnsupportedSchemaVersion / CorruptNode / CorruptEdge / BadMagic" {
     const gpa = testing.allocator;
 
     {
@@ -458,9 +458,9 @@ test "file I/O: save→load round-trip" {
     try testing.expectEqual(@as(usize, 0), got.edges.len);
 }
 
-test "stable export: runtime handle が違っても NodeId ベースで一致" {
+test "stable export: matches on a NodeId basis even when runtime handles differ" {
     const gpa = testing.allocator;
-    // 同じ topology・異なる runtime handle
+    // Same topology, different runtime handles
     const a_nodes = [_]StableNode{
         .{ .id = NodeId.fromRaw(2), .kind = .vcf, .x = 100, .y = 0 },
         .{ .id = NodeId.fromRaw(1), .kind = .vco, .x = 0, .y = 0 },
@@ -486,7 +486,7 @@ test "stable export: runtime handle が違っても NodeId ベースで一致" {
     try testing.expectEqual(ga.output_id, gb.output_id);
 }
 
-test "stable export: 入力順が違っても canonical 一致 / fallback 採番" {
+test "stable export: canonical match even with differing input order / fallback numbering" {
     const gpa = testing.allocator;
     const edges_a = [_]StableEdge{
         .{ .src_id = NodeId.fromRaw(2), .src_out = 0, .dst_id = NodeId.fromRaw(3), .dst_in = 1 },
@@ -513,7 +513,7 @@ test "stable export: 入力順が違っても canonical 一致 / fallback 採番
     try testing.expectEqual(@as(u64, 3), next);
 }
 
-test "stable topology JSON: id 昇順・kind/x/y・output・trunc" {
+test "stable topology JSON: ascending id order, kind/x/y, output, trunc" {
     const gpa = testing.allocator;
     const nodes = [_]StableNode{
         .{ .id = NodeId.fromRaw(1), .kind = .vco, .x = 10, .y = 20 },
@@ -531,23 +531,23 @@ test "stable topology JSON: id 昇順・kind/x/y・output・trunc" {
     try testing.expect(std.mem.indexOf(u8, full, "\"x\":10.0") != null);
     try testing.expect(std.mem.indexOf(u8, full, "[1,0,2,0]") != null);
     try testing.expect(std.mem.endsWith(u8, full, "\"output\":2}"));
-    // camera/fb は含めない
+    // Does not include camera/fb
     try testing.expect(std.mem.indexOf(u8, full, "camera") == null);
     try testing.expect(std.mem.indexOf(u8, full, "fb") == null);
 
-    // 小バッファ → truncated
+    // Small buffer → truncated
     var tiny: [32]u8 = undefined;
     const fmt = formatStableTopologyInto(&tiny, &nodes, &edges, 2);
     try testing.expect(fmt.truncated);
 
-    // 十分なバッファ → 非 trunc・ArrayList と bit 一致
+    // Sufficiently large buffer → not truncated, bit-identical to the ArrayList version
     var big: [512]u8 = undefined;
     const fmt2 = formatStableTopologyInto(&big, &nodes, &edges, 2);
     try testing.expect(!fmt2.truncated);
     try testing.expectEqualStrings(full, big[0..fmt2.len]);
 }
 
-test "stable topology snapshot-sized: 多 node でも JSON 完全（trunc なし）" {
+test "stable topology snapshot-sized: JSON stays complete even with many nodes (no trunc)" {
     const gpa = testing.allocator;
     var nodes: [30]StableNode = undefined;
     var i: usize = 0;
@@ -562,7 +562,7 @@ test "stable topology snapshot-sized: 多 node でも JSON 完全（trunc なし
     var list: std.ArrayList(u8) = .empty;
     defer list.deinit(gpa);
     try appendStableTopologyJson(&list, gpa, &nodes, &.{}, 1);
-    try testing.expect(list.items.len > 1024); // digest 上限を超えるサイズでも完全
+    try testing.expect(list.items.len > 1024); // Complete even at sizes beyond the digest cap
     try testing.expect(list.items[0] == '{');
     try testing.expect(list.items[list.items.len - 1] == '}');
     try testing.expect(std.mem.indexOf(u8, list.items, "\"id\":30") != null);

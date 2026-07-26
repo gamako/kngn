@@ -1,12 +1,12 @@
-//! apps/patch: 表示グラフの Sugiyama 系レイヤードレイアウト（TASK-173.1）。
+//! apps/patch: a Sugiyama-style layered layout for the display graph.
 //!
-//! mapNodesForCollapsed / buildDisplayEdges が返す表示ノード・辺に対し rank 付けと縦積みを行い、
-//! 実ノードは layout[handle]、畳みマクロ箱は ledger.groups[gid].pos、展開中マクロのヘッダーは
-//! メンバー bbox に追従させる。
+//! Ranks and vertically stacks the display nodes/edges returned by mapNodesForCollapsed / buildDisplayEdges,
+//! writing real nodes to layout[handle], collapsed macro boxes to ledger.groups[gid].pos, and making an
+//! expanded macro's header track its members' bbox.
 //!
-//! ホットパス宣言: auto_layout / auto_layout_selected action 呼び出し時のみ（イベント時）。
-//! フレーム毎描画・RT 経路には触れない。
-//! platform / gui / modular を import しない純 Zig（canvas / group のみ。test-patch で単体テスト可）。
+//! Hot-path declaration: runs only when the auto_layout / auto_layout_selected action is invoked (event time).
+//! It never touches per-frame drawing or the RT path.
+//! Pure Zig with no platform / gui / modular imports (only canvas / group). Unit-testable via test-patch.
 
 const std = @import("std");
 const canvas = @import("canvas.zig");
@@ -17,25 +17,25 @@ pub const Vec2f = canvas.Vec2f;
 pub const NodeGeom = canvas.NodeGeom;
 pub const Edge = canvas.Edge;
 
-/// world 原点 X / 列間ギャップ（plan: x = 24 + rank * (NODE_W + 40)）。
+/// The world-space origin X and the gap between rank columns: x = 24 + rank * (NODE_W + 40).
 pub const ORIGIN_X: f32 = 24;
 pub const COL_GAP: f32 = 40;
-/// 各 rank 列の先頭 Y のテスト用既定値。実行時は呼び出し側がパレット帯を避けた world Y を渡す。
+/// A default starting Y for each rank column, used in tests. At runtime the caller passes a world Y that avoids the palette band.
 pub const ORIGIN_Y: f32 = 24;
 pub const ROW_GAP: f32 = 24;
-/// 展開ヘッダーとメンバー bbox の余白（drawExpandedGroupFrame と同じ margin=10）。
+/// The margin between an expanded header and the member bbox (margin=10, matching drawExpandedGroupFrame).
 pub const EXPANDED_HEADER_MARGIN: f32 = 10;
 
 const MAX_NODES: usize = group.GROUP_HANDLE_BASE + group.MAX_GROUPS;
 
-/// 選択表示ノードだけをトポロジー無視の単純グリッドへ再配置する（TASK-173.4）。
+/// Repositions only the selected display nodes into a simple, topology-agnostic grid.
 ///
-/// - `nodes`: 表示ノード全体（対象のみ pos を更新。未選択は不変）
-/// - `target_handles`: 再配置対象 handle（表示ノードとの照合済み想定）
-/// - `layout` / `ledger`: 対象限定の書き戻し（合成 handle は groups[gid].pos のみ）
+/// - `nodes`: all display nodes (only the targeted ones get pos updated; unselected ones are unchanged)
+/// - `target_handles`: the handles to reposition (assumed already matched against the display nodes)
+/// - `layout` / `ledger`: write-back is limited to the targets (a synthetic handle writes only to groups[gid].pos)
 ///
-/// 0〜1 件は no-op。`repositionExpandedHeaders` は呼ばない（未選択ヘッダーを動かさない）。
-/// ホットパス: action 呼び出し時のみ。edges / order_keys は参照しない。
+/// A no-op for 0 or 1 targets. `repositionExpandedHeaders` is not called, so unselected headers are not moved.
+/// Hot path: only at action invocation time. edges / order_keys are not referenced.
 pub fn applySelectedGrid(
     nodes: []NodeGeom,
     target_handles: []const Handle,
@@ -45,7 +45,7 @@ pub fn applySelectedGrid(
     std.debug.assert(layout.len >= group.GROUP_HANDLE_BASE);
     if (target_handles.len == 0) return;
 
-    // 対象 index 収集（表示 nodes 内で handle 一致したものだけ）
+    // Collect target indices (only those whose handle matches within the display nodes)
     var target_idx: [MAX_NODES]u16 = undefined;
     var tn: usize = 0;
     for (nodes, 0..) |ng, i| {
@@ -54,9 +54,9 @@ pub fn applySelectedGrid(
         target_idx[tn] = @intCast(i);
         tn += 1;
     }
-    if (tn <= 1) return; // 0 件（表示に無い）/ 1 件は no-op
+    if (tn <= 1) return; // 0 matches (not in the display) or 1 match is a no-op
 
-    // アンカー = 対象 bbox 左上、行バケット用 max_h
+    // anchor = the top-left of the target bbox; max_h is for row bucketing
     var anchor_x: f32 = nodes[target_idx[0]].pos.x;
     var anchor_y: f32 = nodes[target_idx[0]].pos.y;
     var max_h: f32 = canvas.nodeSize(nodes[target_idx[0]]).y;
@@ -70,7 +70,7 @@ pub fn applySelectedGrid(
     }
     const row_stride = max_h + ROW_GAP;
 
-    // 決定的ソート: row_bucket 昇順 → pos.x 昇順 → handle 昇順
+    // Deterministic sort: ascending row_bucket -> ascending pos.x -> ascending handle
     const sort_ctx = SelectedSortCtx{
         .nodes = nodes,
         .anchor_y = anchor_y,
@@ -78,7 +78,7 @@ pub fn applySelectedGrid(
     };
     std.mem.sort(u16, target_idx[0..tn], sort_ctx, SelectedSortCtx.less);
 
-    // セルサイズ = 対象の最大幅・最大高
+    // cell size = the targets' max width and max height
     var cell_w: f32 = 0;
     var cell_h: f32 = 0;
     ti = 0;
@@ -88,7 +88,7 @@ pub fn applySelectedGrid(
         cell_h = @max(cell_h, sz.y);
     }
 
-    // cols = ceil(sqrt(n))、rows は ceil(n/cols) 相当で配置
+    // cols = ceil(sqrt(n)); rows are laid out at roughly ceil(n/cols)
     const cols_f = @ceil(@sqrt(@as(f32, @floatFromInt(tn))));
     const cols: usize = @max(@as(usize, @intFromFloat(cols_f)), 1);
 
@@ -134,7 +134,7 @@ fn containsHandle(handles: []const Handle, h: Handle) bool {
     return false;
 }
 
-/// 対象 handle だけ writeBack（未選択の layout / group.pos は触らない）。
+/// Writes back only the target handles (unselected layout / group.pos entries are untouched).
 fn writeBackTargets(
     nodes: []const NodeGeom,
     target_handles: []const Handle,
@@ -153,16 +153,16 @@ fn writeBackTargets(
     }
 }
 
-/// 表示グラフをレイヤードレイアウトし、layout / ledger へ書き戻す。
+/// Applies a layered layout to the display graph and writes the result back into layout / ledger.
 ///
-/// - `nodes`: 表示ノード（pos を更新する。入力の n_in/n_out/grid_rows は nodeSize に使う）
-/// - `edges`: 表示辺（DisplayEdge.visual。フィードバック辺も含めて渡してよいが rank 計算からは除外）
-/// - `order_keys`: nodes と並行。DynGraph view.order 添字（collapsed group はメンバー最小 key）
-/// - `layout`: 実 handle のみ index（合成 handle は絶対に書かない）
-/// - `ledger`: collapsed 箱 pos / expanded ヘッダー pos の書き戻し先
-/// - `origin_y`: rank0 列の先頭 world Y（main が paletteBottom 相当を world 変換して渡す）
+/// - `nodes`: display nodes (pos is updated; the input n_in/n_out/grid_rows are used by nodeSize)
+/// - `edges`: display edges (DisplayEdge.visual; feedback edges may be included but are excluded from rank computation)
+/// - `order_keys`: parallel to nodes; the DynGraph view.order index (a collapsed group uses its minimum member key)
+/// - `layout`: indexed by real handles only (a synthetic handle is never written here)
+/// - `ledger`: the write-back target for a collapsed box's pos and an expanded header's pos
+/// - `origin_y`: the starting world Y for the rank-0 column (main passes the world-transformed value corresponding to paletteBottom)
 ///
-/// 事前条件: nodes.len == order_keys.len。layout.len >= GROUP_HANDLE_BASE。
+/// Preconditions: nodes.len == order_keys.len, and layout.len >= GROUP_HANDLE_BASE.
 pub fn apply(
     nodes: []NodeGeom,
     edges: []const Edge,
@@ -184,8 +184,8 @@ pub fn apply(
     repositionExpandedHeaders(nodes, layout, ledger);
 }
 
-/// src_key < dst_key の順方向辺だけを使い rank を計算する。
-/// 表示ノードを order key 昇順で処理し、rank[dst] = max(rank[dst], rank[src]+1)。
+/// Computes rank using only forward edges where src_key < dst_key.
+/// Processes display nodes in ascending order-key order, setting rank[dst] = max(rank[dst], rank[src]+1).
 fn computeRanks(
     nodes: []const NodeGeom,
     edges: []const Edge,
@@ -193,14 +193,14 @@ fn computeRanks(
     ranks: []u32,
 ) void {
     const n = nodes.len;
-    // order key 昇順の処理順（第二キーは元 index で決定性）
+    // Processed in ascending order-key order (the original index is the secondary key, for determinism)
     var order_idx: [MAX_NODES]u16 = undefined;
     var i: usize = 0;
     while (i < n) : (i += 1) order_idx[i] = @intCast(i);
     std.mem.sort(u16, order_idx[0..n], SortByOrderKey{ .keys = order_keys }, SortByOrderKey.less);
 
-    // handle → nodes 内 index（辺の端点解決用。同一 handle は表示上 1 回のみ想定）
-    // 合成 handle は GROUP_HANDLE_BASE + gid。
+    // handle -> index within nodes (used to resolve edge endpoints; a handle is assumed to appear at most once in the display)
+    // A synthetic handle is GROUP_HANDLE_BASE + gid.
     var handle_to_idx: [group.GROUP_HANDLE_BASE + group.MAX_GROUPS]?u16 =
         [_]?u16{null} ** (group.GROUP_HANDLE_BASE + group.MAX_GROUPS);
     i = 0;
@@ -217,7 +217,7 @@ fn computeRanks(
             const di_opt = if (e.dst_handle < handle_to_idx.len) handle_to_idx[e.dst_handle] else null;
             const di = di_opt orelse continue;
             const dst_key = order_keys[di];
-            if (src_key >= dst_key) continue; // フィードバック辺は rank 計算から除外
+            if (src_key >= dst_key) continue; // Feedback edges are excluded from rank computation
             ranks[di] = @max(ranks[di], ranks[si] + 1);
         }
     }
@@ -233,7 +233,7 @@ const SortByOrderKey = struct {
     }
 };
 
-/// rank 昇順に座標を確定。同一 rank 内は average source center-Y（無ければ order key）でソート。
+/// Fixes coordinates in ascending rank order. Within the same rank, nodes are sorted by average source center-Y, falling back to order key when unavailable.
 fn placeByRank(
     nodes: []NodeGeom,
     edges: []const Edge,
@@ -266,7 +266,7 @@ fn placeByRank(
         }
         if (bn == 0) continue;
 
-        // 同一 rank 内ソート用キー
+        // The sort key used within the same rank
         var sort_y: [MAX_NODES]f32 = undefined;
         var has_src: [MAX_NODES]bool = undefined;
         var bi: usize = 0;
@@ -284,7 +284,7 @@ fn placeByRank(
         };
         std.mem.sort(u16, bucket[0..bn], ctx, RankSortCtx.less);
 
-        // 縦積み（各 rank 列の先頭 Y は呼び出し側の origin_y）
+        // Vertical stacking (each rank column starts at the caller's origin_y)
         var prev_y: f32 = origin_y;
         var prev_h: f32 = 0;
         bi = 0;
@@ -308,14 +308,14 @@ const RankSortCtx = struct {
     has_src: []const bool,
 
     fn less(ctx: RankSortCtx, a: u16, b: u16) bool {
-        // 入辺あり同士: average_source_y 昇順。片方のみ: 入辺ありを先（y 比較より order に寄せない）。
-        // 両方なし: order key。第二キーは常に order key。
+        // Between two nodes that both have inbound edges: sorted by ascending average_source_y. If only one has inbound edges, it comes first (order is preferred over a y comparison).
+        // If neither has inbound edges: order key. The secondary key is always order key.
         const a_has = ctx.has_src[a];
         const b_has = ctx.has_src[b];
         if (a_has and b_has) {
             if (ctx.sort_y[a] != ctx.sort_y[b]) return ctx.sort_y[a] < ctx.sort_y[b];
         } else if (a_has != b_has) {
-            // 片方が order-key フォールバック。決定性のため order key 比較へ。
+            // When one side falls back to order key, the comparison switches to order key for determinism.
         }
         const ka = ctx.order_keys[a];
         const kb = ctx.order_keys[b];
@@ -324,7 +324,7 @@ const RankSortCtx = struct {
     }
 };
 
-/// 順方向入辺の接続元矩形中心 Y の平均。入辺が無ければ null（order key フォールバック）。
+/// The average center-Y of the rects connected via forward inbound edges. null if there are no inbound edges (falls back to order key).
 fn averageSourceCenterY(
     nodes: []const NodeGeom,
     edges: []const Edge,
@@ -341,7 +341,7 @@ fn averageSourceCenterY(
         const si_opt = if (e.src_handle < handle_to_idx.len) handle_to_idx[e.src_handle] else null;
         const si = si_opt orelse continue;
         const src_key = order_keys[si];
-        if (src_key >= dst_key) continue; // フィードバック辺はソート参照からも除外
+        if (src_key >= dst_key) continue; // Feedback edges are also excluded from the sort reference
         const src = nodes[si];
         const sz = canvas.nodeSize(src);
         sum += src.pos.y + sz.y * 0.5;
@@ -351,7 +351,7 @@ fn averageSourceCenterY(
     return sum / @as(f32, @floatFromInt(count));
 }
 
-/// 実ノード → layout[handle]、合成 handle → groups[gid].pos。合成を layout に index しない。
+/// A real node writes to layout[handle]; a synthetic handle writes to groups[gid].pos. A synthetic handle is never used to index layout.
 fn writeBack(nodes: []const NodeGeom, layout: []Vec2f, ledger: *group.Ledger) void {
     for (nodes) |ng| {
         if (group.groupIdFromHandle(ng.handle)) |gid| {
@@ -364,10 +364,10 @@ fn writeBack(nodes: []const NodeGeom, layout: []Vec2f, ledger: *group.Ledger) vo
     }
 }
 
-/// 展開中 group のヘッダーを、再配置後メンバー bbox の上（margin=10）へ追従。
-/// メンバー無し group は変更しない。collapsed は対象外（箱は表示ノードとして既に配置済み）。
+/// Makes an expanded group's header track above the members' bbox after repositioning (margin=10).
+/// A group with no members is left unchanged. A collapsed group is out of scope (its box is already placed as a display node).
 fn repositionExpandedHeaders(nodes: []const NodeGeom, layout: []const Vec2f, ledger: *group.Ledger) void {
-    _ = layout; // メンバー座標は nodes 側（writeBack 前に place 済み）を正とする
+    _ = layout; // Member coordinates are taken from the nodes side, which is already placed before writeBack
     var gi: group.GroupId = 0;
     while (gi < group.MAX_GROUPS) : (gi += 1) {
         const g = &ledger.groups[gi];
@@ -376,7 +376,7 @@ fn repositionExpandedHeaders(nodes: []const NodeGeom, layout: []const Vec2f, led
         var bbox_min = Vec2f{ .x = std.math.floatMax(f32), .y = std.math.floatMax(f32) };
         var any = false;
 
-        // plan: group_of[h]==gid の実ノードを列挙。表示に居るメンバーの NodeGeom で nodeSize を取る。
+        // Enumerates the real nodes where group_of[h]==gid, taking nodeSize from the NodeGeom of the members present in the display.
         for (ledger.group_of, 0..) |go, h| {
             if (go == null or go.? != gi) continue;
             const ng = findNode(nodes, @intCast(h)) orelse continue;
@@ -408,7 +408,7 @@ fn findNode(nodes: []const NodeGeom, h: Handle) ?NodeGeom {
 }
 
 // ============================================================================
-// tests（display/audio 不要。test-patch）
+// tests (no display/audio needed; test-patch)
 // ============================================================================
 const testing = std.testing;
 
@@ -446,7 +446,7 @@ test "layout: single node places at finite origin column" {
 }
 
 test "layout: branch-join DAG no overlap and forward edges increase x" {
-    // A(0) → B(1), A → C(2), B → D(3), C → D。order key = handle。
+    // A(0) -> B(1), A -> C(2), B -> D(3), C -> D. order key = handle.
     var nodes = [_]NodeGeom{
         .{ .handle = 0, .pos = .{ .x = 0, .y = 0 }, .n_in = 0, .n_out = 1 },
         .{ .handle = 1, .pos = .{ .x = 0, .y = 0 }, .n_in = 1, .n_out = 1 },
@@ -464,7 +464,7 @@ test "layout: branch-join DAG no overlap and forward edges increase x" {
     var ledger: group.Ledger = .{};
     apply(&nodes, &edges, &keys, &layout_arr, &ledger, ORIGIN_Y);
 
-    // 全矩形が重ならない
+    // No rects overlap
     var i: usize = 0;
     while (i < nodes.len) : (i += 1) {
         var j: usize = i + 1;
@@ -472,18 +472,18 @@ test "layout: branch-join DAG no overlap and forward edges increase x" {
             try testing.expect(!rectsOverlap(nodes[i], nodes[j]));
         }
     }
-    // 順方向辺は x(src) < x(dst)
+    // A forward edge satisfies x(src) < x(dst)
     for (edges) |e| {
         const s = findNode(&nodes, e.src_handle).?;
         const d = findNode(&nodes, e.dst_handle).?;
         try testing.expect(s.pos.x < d.pos.x);
     }
-    // rank0 は A のみ
+    // rank0 contains only A
     try testing.expectApproxEqAbs(ORIGIN_X, nodes[0].pos.x, 1e-4);
 }
 
 test "layout: rank0 nodes ordered by order key" {
-    // 非接続 3 ノード。order key 2,0,1 → Y は key 昇順 0,1,2。
+    // 3 disconnected nodes. order key 2,0,1 -> Y follows ascending key order: 0,1,2.
     var nodes = [_]NodeGeom{
         .{ .handle = 10, .pos = .{ .x = 0, .y = 0 }, .n_in = 0, .n_out = 0 },
         .{ .handle = 11, .pos = .{ .x = 0, .y = 0 }, .n_in = 0, .n_out = 0 },
@@ -499,7 +499,7 @@ test "layout: rank0 nodes ordered by order key" {
 }
 
 test "layout: cycle A-B-C-A finishes with finite positions and keeps feedback edge input" {
-    // A→B→C→A。order key 0,1,2。forward: A→B, B→C。feedback: C→A は rank 除外。
+    // A->B->C->A. order key 0,1,2. forward: A->B, B->C. feedback: C->A is excluded from rank.
     var nodes = [_]NodeGeom{
         .{ .handle = 0, .pos = .{ .x = 50, .y = 50 }, .n_in = 1, .n_out = 1 },
         .{ .handle = 1, .pos = .{ .x = 50, .y = 50 }, .n_in = 1, .n_out = 1 },
@@ -516,10 +516,10 @@ test "layout: cycle A-B-C-A finishes with finite positions and keeps feedback ed
     apply(&nodes, &edges, &keys, &layout_arr, &ledger, ORIGIN_Y);
 
     for (nodes) |ng| try testing.expect(isFinitePos(ng.pos));
-    // forward 辺は x 単調
+    // Forward edges are monotonic in x
     try testing.expect(nodes[0].pos.x < nodes[1].pos.x);
     try testing.expect(nodes[1].pos.x < nodes[2].pos.x);
-    // 入力 edges は不変（layout は edges を書き換えない＝呼び出し側が表示用に保持）
+    // The input edges are unchanged (layout never rewrites edges; the caller keeps them for display)
     try testing.expectEqual(@as(Handle, 2), edges[2].src_handle);
     try testing.expectEqual(@as(Handle, 0), edges[2].dst_handle);
 }
@@ -527,7 +527,7 @@ test "layout: cycle A-B-C-A finishes with finite positions and keeps feedback ed
 test "layout: collapsed synthetic group is one node and writes group.pos only" {
     const gid: group.GroupId = 0;
     const box_h = group.handleOfGroup(gid);
-    // 外部 0 → 箱、箱 → 外部 1。箱の order key = メンバー最小 = 5（メンバー handle は 5,6 だが非表示）
+    // external 0 -> box, box -> external 1. The box's order key is the minimum member key, 5 (member handles are 5,6 but are hidden)
     var nodes = [_]NodeGeom{
         .{ .handle = 0, .pos = .{ .x = 0, .y = 0 }, .n_in = 0, .n_out = 1 },
         .{ .handle = box_h, .pos = .{ .x = 0, .y = 0 }, .n_in = 1, .n_out = 1, .grid_rows = 2 },
@@ -539,7 +539,7 @@ test "layout: collapsed synthetic group is one node and writes group.pos only" {
         .{ .src_handle = box_h, .src_out = 0, .dst_handle = 1, .dst_in = 0 },
     };
     var layout_arr = [_]Vec2f{.{ .x = 42, .y = 42 }} ** group.GROUP_HANDLE_BASE;
-    // 合成 handle 用スロットは layout に無い（長さ GROUP_HANDLE_BASE）。番兵として別配列は触らない。
+    // layout has no slot for synthetic handles (its length is GROUP_HANDLE_BASE); it is left untouched as a sentinel array.
     var ledger: group.Ledger = .{};
     ledger.groups[gid] = .{
         .active = true,
@@ -547,11 +547,11 @@ test "layout: collapsed synthetic group is one node and writes group.pos only" {
         .pos = .{ .x = -1, .y = -1 },
         .kind = .drum_machine,
     };
-    // メンバー登録（order key 構築のシミュ。layout 本体はメンバーを表示しない）
+    // Member registration (simulating order-key construction; layout itself does not display members)
     ledger.assign(5, gid);
     ledger.assign(6, gid);
 
-    // layout の合成 index 相当を壊していないことの検証用スナップショット
+    // A snapshot verifying that the synthetic-index-equivalent part of layout is untouched
     const layout_before = layout_arr;
 
     apply(&nodes, &edges, &keys, &layout_arr, &ledger, ORIGIN_Y);
@@ -559,13 +559,13 @@ test "layout: collapsed synthetic group is one node and writes group.pos only" {
     try testing.expect(isFinitePos(ledger.groups[gid].pos));
     try testing.expectApproxEqAbs(nodes[1].pos.x, ledger.groups[gid].pos.x, 1e-4);
     try testing.expectApproxEqAbs(nodes[1].pos.y, ledger.groups[gid].pos.y, 1e-4);
-    // 実ノードは layout に書かれる
+    // Real nodes are written into layout
     try testing.expectApproxEqAbs(nodes[0].pos.x, layout_arr[0].x, 1e-4);
     try testing.expectApproxEqAbs(nodes[2].pos.x, layout_arr[1].x, 1e-4);
-    // メンバー handle 5,6 の layout は表示対象外なので変更されない（書き戻し先分離）
+    // The layout for member handles 5,6 is out of the display and stays unchanged (write-back targets are separated)
     try testing.expectApproxEqAbs(layout_before[5].x, layout_arr[5].x, 1e-4);
     try testing.expectApproxEqAbs(layout_before[6].x, layout_arr[6].x, 1e-4);
-    // 順方向 x 単調
+    // Monotonic in x for forward edges
     try testing.expect(nodes[0].pos.x < nodes[1].pos.x);
     try testing.expect(nodes[1].pos.x < nodes[2].pos.x);
 }
@@ -584,7 +584,7 @@ test "layout: synthetic handle never indexes layout array" {
 
     apply(&nodes, &.{}, &keys, &layout_arr, &ledger, ORIGIN_Y);
 
-    // 全 layout スロット不変（合成 handle を index していない）
+    // Every layout slot is unchanged (a synthetic handle is never used to index it)
     for (before, layout_arr) |b, a| {
         try testing.expectEqual(b.x, a.x);
         try testing.expectEqual(b.y, a.y);
@@ -594,7 +594,7 @@ test "layout: synthetic handle never indexes layout array" {
 
 test "layout: expanded group header follows member bbox without overlap" {
     const gid: group.GroupId = 0;
-    // メンバー 10 → 11。expanded なので両方が表示ノード。ヘッダーは groups[gid].pos。
+    // member 10 -> 11. Since it is expanded, both are display nodes. The header is groups[gid].pos.
     var nodes = [_]NodeGeom{
         .{ .handle = 10, .pos = .{ .x = 0, .y = 0 }, .n_in = 0, .n_out = 1 },
         .{ .handle = 11, .pos = .{ .x = 0, .y = 0 }, .n_in = 1, .n_out = 0 },
@@ -616,11 +616,11 @@ test "layout: expanded group header follows member bbox without overlap" {
 
     apply(&nodes, &edges, &keys, &layout_arr, &ledger, ORIGIN_Y);
 
-    // メンバーは layout に
+    // Members go into layout
     try testing.expectApproxEqAbs(nodes[0].pos.x, layout_arr[10].x, 1e-4);
     try testing.expectApproxEqAbs(nodes[1].pos.x, layout_arr[11].x, 1e-4);
 
-    // ヘッダーは bbox 上端の上
+    // The header sits above the top of the bbox
     var bbox_min_y = nodes[0].pos.y;
     bbox_min_y = @min(bbox_min_y, nodes[1].pos.y);
     var bbox_min_x = nodes[0].pos.x;
@@ -630,7 +630,7 @@ test "layout: expanded group header follows member bbox without overlap" {
     try testing.expectApproxEqAbs(bbox_min_x, ledger.groups[gid].pos.x, 1e-4);
     try testing.expectApproxEqAbs(bbox_min_y - header_h - EXPANDED_HEADER_MARGIN, ledger.groups[gid].pos.y, 1e-4);
 
-    // ヘッダー矩形とメンバーが重ならない
+    // The header rect and the members do not overlap
     const hsz = canvas.nodeSize(header);
     for (nodes) |ng| {
         const msz = canvas.nodeSize(ng);
@@ -659,17 +659,17 @@ test "layout: real node vs group writeback separation" {
 
     apply(&nodes, &edges, &keys, &layout_arr, &ledger, ORIGIN_Y);
 
-    // 実ノード 3 → layout[3]
+    // Real node 3 -> layout[3]
     try testing.expectApproxEqAbs(nodes[0].pos.x, layout_arr[3].x, 1e-4);
     try testing.expectApproxEqAbs(nodes[0].pos.y, layout_arr[3].y, 1e-4);
-    // 箱 → group.pos のみ（layout の他スロットは 9,9 のまま。handle 3 以外）
+    // The box writes only to group.pos (all other layout slots, other than handle 3, remain at 9,9)
     try testing.expectApproxEqAbs(nodes[1].pos.x, ledger.groups[gid].pos.x, 1e-4);
     try testing.expectApproxEqAbs(layout_arr[0].x, 9, 1e-4);
     try testing.expectApproxEqAbs(layout_arr[4].x, 9, 1e-4);
 }
 
 test "layout: caller origin_y is used as rank0 top Y" {
-    // main が paletteBottom 相当の大きい world Y を渡したとき、rank0 先頭がその値と一致する。
+    // When main passes a large world Y corresponding to paletteBottom, rank0's start matches that value.
     const caller_origin_y: f32 = 100;
     var nodes = [_]NodeGeom{
         .{ .handle = 0, .pos = .{ .x = 0, .y = 0 }, .n_in = 0, .n_out = 1 },
@@ -684,14 +684,14 @@ test "layout: caller origin_y is used as rank0 top Y" {
     apply(&nodes, &edges, &keys, &layout_arr, &ledger, caller_origin_y);
 
     try testing.expectApproxEqAbs(caller_origin_y, nodes[0].pos.y, 1e-4);
-    // rank1 も同じ origin_y から縦積み開始（単一ノード列なので先頭 = origin_y）
+    // rank1 also starts vertical stacking from the same origin_y (with a single node column, its start equals origin_y)
     try testing.expectApproxEqAbs(caller_origin_y, nodes[1].pos.y, 1e-4);
     try testing.expect(nodes[0].pos.y >= caller_origin_y);
     try testing.expect(nodes[1].pos.y >= caller_origin_y);
 }
 
 // ============================================================================
-// applySelectedGrid（TASK-173.4）
+// applySelectedGrid
 // ============================================================================
 
 test "layout selected: empty targets leave nodes/layout/ledger unchanged" {
@@ -743,8 +743,8 @@ test "layout selected: single target is no-op" {
 }
 
 test "layout selected: multi grid keeps anchor, max cell size, and gaps" {
-    // 3 選択 + 1 未選択。cols = ceil(sqrt(3)) = 2。
-    // 位置: A(100,50), B(180,55), C(120,200) → anchor=(100,50)
+    // 3 selected + 1 unselected. cols = ceil(sqrt(3)) = 2.
+    // positions: A(100,50), B(180,55), C(120,200) -> anchor=(100,50)
     var nodes = [_]NodeGeom{
         .{ .handle = 0, .pos = .{ .x = 100, .y = 50 }, .n_in = 0, .n_out = 1 },
         .{ .handle = 1, .pos = .{ .x = 180, .y = 55 }, .n_in = 0, .n_out = 1 },
@@ -758,27 +758,27 @@ test "layout selected: multi grid keeps anchor, max cell size, and gaps" {
 
     applySelectedGrid(&nodes, &.{ 0, 1, 2 }, &layout_arr, &ledger);
 
-    const cell_w = canvas.NODE_W; // 全 node 同幅
-    const cell_h = canvas.nodeSize(nodes[0]).y; // n_out=1 は同高
-    // ソート後: row0 は A then B、row1 は C → 配置 index 0=A, 1=B, 2=C
+    const cell_w = canvas.NODE_W; // All nodes have the same width
+    const cell_h = canvas.nodeSize(nodes[0]).y; // n_out=1 gives the same height
+    // After sorting: row0 is A then B, row1 is C -> placement index 0=A, 1=B, 2=C
     try testing.expectApproxEqAbs(100, nodes[0].pos.x, 1e-4);
     try testing.expectApproxEqAbs(50, nodes[0].pos.y, 1e-4);
     try testing.expectApproxEqAbs(100 + cell_w + COL_GAP, nodes[1].pos.x, 1e-4);
     try testing.expectApproxEqAbs(50, nodes[1].pos.y, 1e-4);
     try testing.expectApproxEqAbs(100, nodes[2].pos.x, 1e-4);
     try testing.expectApproxEqAbs(50 + cell_h + ROW_GAP, nodes[2].pos.y, 1e-4);
-    // layout 書き戻し
+    // Written back into layout
     try testing.expectApproxEqAbs(nodes[0].pos.x, layout_arr[0].x, 1e-4);
     try testing.expectApproxEqAbs(nodes[1].pos.x, layout_arr[1].x, 1e-4);
     try testing.expectApproxEqAbs(nodes[2].pos.y, layout_arr[2].y, 1e-4);
-    // 未選択不変
+    // The unselected node is unchanged
     try testing.expectApproxEqAbs(unsel_before.x, nodes[3].pos.x, 1e-4);
     try testing.expectApproxEqAbs(unsel_before.y, nodes[3].pos.y, 1e-4);
     try testing.expectApproxEqAbs(unsel_before.x, layout_arr[3].x, 1e-4);
 }
 
 test "layout selected: sort order is row_bucket then x then handle" {
-    // 同一 row バケット内: x が同じなら handle 昇順。Y 差が row_stride 未満で同 bucket。
+    // Within the same row bucket: ties in x are broken by ascending handle. A Y difference under row_stride puts nodes in the same bucket.
     var nodes = [_]NodeGeom{
         .{ .handle = 5, .pos = .{ .x = 200, .y = 10 }, .n_in = 0, .n_out = 0 },
         .{ .handle = 3, .pos = .{ .x = 100, .y = 12 }, .n_in = 0, .n_out = 0 },
@@ -790,7 +790,7 @@ test "layout selected: sort order is row_bucket then x then handle" {
 
     applySelectedGrid(&nodes, &.{ 5, 3, 7, 1 }, &layout_arr, &ledger);
 
-    // cols = ceil(sqrt(4)) = 2。row0: handle3 (x=100), handle7 (x=100,h>3), handle5 (x=200)
+    // cols = ceil(sqrt(4)) = 2. row0: handle3 (x=100), handle7 (x=100,h>3), handle5 (x=200)
     // wait: sort is x then handle. So row0: (100,h3), (100,h7), (200,h5) — that's 3 in row0 before
     // row_bucket for h1 is higher so it goes last.
     // With 4 items and cols=2: index0=h3, index1=h7, index2=h5, index3=h1
@@ -864,7 +864,7 @@ test "layout selected: real node vs collapsed group writeback separation" {
     try testing.expectApproxEqAbs(nodes[0].pos.y, layout_arr[4].y, 1e-4);
     try testing.expectApproxEqAbs(nodes[1].pos.x, ledger.groups[gid].pos.x, 1e-4);
     try testing.expectApproxEqAbs(nodes[1].pos.y, ledger.groups[gid].pos.y, 1e-4);
-    // 未選択 real handle と無関係スロット不変
+    // Unselected real handles and unrelated slots are unchanged
     try testing.expectApproxEqAbs(layout8_before.x, layout_arr[8].x, 1e-4);
     try testing.expectApproxEqAbs(layout0_before.x, layout_arr[0].x, 1e-4);
     try testing.expectApproxEqAbs(800, nodes[2].pos.x, 1e-4);
@@ -914,7 +914,7 @@ test "layout selected: moving expanded members leaves unselected header unchange
 
     applySelectedGrid(&nodes, &.{ 10, 11 }, &layout_arr, &ledger);
 
-    // repositionExpandedHeaders を呼ばないのでヘッダー不変
+    // repositionExpandedHeaders is not called, so the header is unchanged
     try testing.expectApproxEqAbs(header_before.x, ledger.groups[gid].pos.x, 1e-4);
     try testing.expectApproxEqAbs(header_before.y, ledger.groups[gid].pos.y, 1e-4);
     try testing.expectApproxEqAbs(500, nodes[2].pos.x, 1e-4);
@@ -943,7 +943,7 @@ test "layout selected: selected rectangles do not overlap" {
 }
 
 test "layout selected: topology-agnostic — same positions yield same result" {
-    // 接続の有無に依存しない（edges を受け取らない API）。同じ初期位置なら結果同一。
+    // Independent of whether connections exist (this API does not take edges). The same initial position yields the same result.
     var a = [_]NodeGeom{
         .{ .handle = 0, .pos = .{ .x = 40, .y = 40 }, .n_in = 0, .n_out = 1 },
         .{ .handle = 1, .pos = .{ .x = 200, .y = 50 }, .n_in = 1, .n_out = 0 },

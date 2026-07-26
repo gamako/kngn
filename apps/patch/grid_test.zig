@@ -1,4 +1,4 @@
-//! patch macro box / standalone step_seq の canvas grid adapter と shared stepgrid の hit-test 契約。
+//! Canvas grid adapter for the patch macro box / standalone step_seq and the shared stepgrid's hit-test contract.
 
 const std = @import("std");
 const canvas = @import("canvas.zig");
@@ -36,7 +36,7 @@ test "patch: box-local macro grid geometry round-trips through stepgrid hit-test
         }
     }
 
-    // cell 間の horizontal gap は、旧 hitTestGridCell と同様にどのセルにもならない。
+    // The horizontal gap between cells doesn't belong to any cell, same as the former hitTestGridCell.
     const first = local_geometry.cellRect(0, 0);
     try std.testing.expectEqual(
         @as(?stepgrid.GridCell, null),
@@ -87,7 +87,7 @@ test "patch: 1-row inline grid hits 16 cells as row 0; row 1 is out of range" {
         try std.testing.expectEqual(stepgrid.GridCell{ .row = 0, .step = step }, cell);
     }
 
-    // row 1 は clickable_rows=1 では対象外
+    // Row 1 is out of scope when clickable_rows=1
     const row1 = geometry.cellRect(1, 0);
     try std.testing.expectEqual(
         @as(?stepgrid.GridCell, null),
@@ -193,25 +193,25 @@ test "patch: pan+zoom leaves inter-cell gap and outside-grid as null" {
     try std.testing.expectEqual(stepgrid.GridCell{ .row = 0, .step = 0 }, cell);
 }
 
-test "TASK-160.2: macro evolve/lock toggle geometry sits above step grid" {
+test "macro evolve/lock toggle geometry sits above step grid" {
     const e = canvas.macroEvolveToggleRect();
     try std.testing.expect(canvas.macroToggleAboveGrid(e));
     var lane: u8 = 0;
     while (lane < 3) : (lane += 1) {
         const lr = canvas.macroLockToggleRect(lane);
         try std.testing.expect(canvas.macroToggleAboveGrid(lr));
-        // lock は evolve の右に並ぶ
+        // lock sits to the right of evolve
         try std.testing.expect(lr.x >= e.x + e.w);
     }
-    // collapse toggle 領域（右端）と evolve/lock 帯は重ならない
+    // The collapse-toggle area (right edge) and the evolve/lock band don't overlap
     const collapse_x = canvas.NODE_W - canvas.TOGGLE_SIZE - canvas.TOGGLE_MARGIN;
     try std.testing.expect(canvas.macroLockToggleRect(2).x + canvas.MACRO_MUT_TOGGLE_W < collapse_x);
 }
 
-test "TASK-160.2: macro toggle rects do not collide with step-grid cells" {
+test "macro toggle rects do not collide with step-grid cells" {
     const geometry = asStepgrid(canvas.gridGeometry(.{ .zoom = 1.0 }, .{ .x = 0, .y = 0 }));
     const e = canvas.macroEvolveToggleRect();
-    // toggle 中心は clickable grid に当たらない
+    // The toggle's center doesn't fall inside the clickable grid
     try std.testing.expectEqual(
         @as(?stepgrid.GridCell, null),
         stepgrid.hitTest(geometry, e.x + e.w * 0.5, e.y + e.h * 0.5, 3),
@@ -224,7 +224,7 @@ test "TASK-160.2: macro toggle rects do not collide with step-grid cells" {
             stepgrid.hitTest(geometry, lr.x + lr.w * 0.5, lr.y + lr.h * 0.5, 3),
         );
     }
-    // grid cell 中心はトグル矩形の外
+    // The grid cell's center is outside the toggle rect
     const cell0 = geometry.cellRect(0, 0);
     const cx = cell0.x + cell0.w * 0.5;
     const cy = cell0.y + cell0.h * 0.5;

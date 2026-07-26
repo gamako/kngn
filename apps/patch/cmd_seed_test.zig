@@ -1,8 +1,8 @@
-//! modular / patch の CommandRecord 配線契約テスト（TASK-62.5.7 / TASK-106.3）。
+//! Wiring contract test for modular / patch's CommandRecord.
 //!
-//! main.zig の `recordedGraphAction` / `recordedAction` + `dispatchModularAction` と同じ
-//! `Executor.executeAction` → CommandLog 経路を mock で再現し、記録契約を固定する。
-//! （undo/tx なし・記録のみ。command.zig は既存 API の利用のみ。）
+//! Mocks the same `Executor.executeAction` → CommandLog path used by main.zig's `recordedGraphAction` /
+//! `recordedAction` + `dispatchModularAction`, fixing the recording contract.
+//! (No undo/tx, recording only. command.zig only uses its existing API.)
 
 const std = @import("std");
 const command = @import("command");
@@ -17,7 +17,7 @@ const graph_actions = [_]struct { name: []const u8, args: []const u8 }{
     .{ .name = "remove_macro", .args = "#33 #34 #35 #36 #37" },
 };
 
-/// main.zig で Executor 非経由（`recordedAction` / `recordedGraphAction` ラッパー無し）の action。
+/// An action that bypasses Executor in main.zig (no `recordedAction` / `recordedGraphAction` wrapper).
 const meta_actions = [_][]const u8{
     "save_graph",
     "save_pattern",

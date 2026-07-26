@@ -1,11 +1,11 @@
-//! 選択中の DynGraph primitive node の parameter inspector。
+//! Parameter inspector for the selected DynGraph primitive node.
 //!
-//! ホットパス宣言: descriptor 列挙と slider/radio 評価は frame-rate（main thread）、変更 callback は
-//! 操作時のみ（event-rate）。RT へは callback の固定長 Mailbox publish だけを渡し、
-//! このファイルから `params.setParam()` を直接呼ばない。
-//! 外形・header・open は PanelHost が所有し、ここでは body のみを構築する（TASK-149.1）。
+//! Hot-path declaration: descriptor enumeration and slider/radio evaluation run at frame-rate (main thread); the change callback
+//! runs only on interaction (event-rate). Only passes the callback's fixed-length Mailbox publish to RT;
+//! this file never calls `params.setParam()` directly.
+//! PanelHost owns the outer shape/header/open; only the body is built here.
 //!
-//! TASK-149.2: group 選択時は内部 primitive 一覧 → member drill-down。choice は radioId 群。
+//! On group selection: an internal primitive list → member drill-down. choice is a set of radioIds.
 
 const std = @import("std");
 const kit = @import("kit");
@@ -22,21 +22,21 @@ pub const MemberSelectFn = *const fn (ctx: *anyopaque, handle: modular.dyn.Handl
 const SUBTLE = gui.Color.rgba(0x9A, 0xA4, 0xB0, 0xFF);
 const TITLE = gui.Color.rgba(0xE0, 0xE6, 0xEE, 0xFF);
 
-/// group member 一覧の 1 行（呼び出し側が固定バッファで列挙。毎フレーム alloc なし）。
+/// One row of the group member list (the caller enumerates it into a fixed buffer; no per-frame alloc).
 pub const MemberInfo = struct {
     handle: modular.dyn.Handle,
     kind_name: []const u8,
 };
 
-/// Inspector が描画する view。canvas selected と inspector_target から main が組み立てる。
+/// The view the Inspector draws. main assembles it from canvas selected and inspector_target.
 pub const View = union(enum) {
     empty,
-    /// group 選択かつ target 未選択: member 一覧。
+    /// Group selected but no target selected: the member list.
     group_members: struct {
         group_name: []const u8,
         members: []const MemberInfo,
     },
-    /// primitive または group drill-down 後: 実 handle の descriptor。
+    /// After selecting a primitive or drilling into a group: the descriptor of the actual handle.
     params: modular.dyn.Handle,
 };
 
@@ -45,14 +45,14 @@ pub fn paramId(ctx: *const gui.Context, handle: modular.dyn.Handle, index: usize
     return ctx.id_stack.makeInt(key);
 }
 
-/// choice radio 用。handle + descriptor index + option index で衝突回避。
+/// For choice radios. Avoids collisions via handle + descriptor index + option index.
 pub fn paramOptionId(ctx: *const gui.Context, handle: modular.dyn.Handle, desc_index: usize, option_index: usize) gui.Id {
-    // 上位バイト 0xC0 で paramId（slider）と名前空間分離。
+    // The high byte 0xC0 separates the namespace from paramId (slider).
     const key = (@as(u64, 0xC0) << 56) | (@as(u64, handle) << 40) | (@as(u64, @intCast(desc_index & 0xFF)) << 16) | @as(u64, @intCast(option_index & 0xFFFF));
     return ctx.id_stack.makeInt(key);
 }
 
-/// member 選択 button 用 ID（paramId / paramOptionId と衝突しない 0xB0 名前空間）。
+/// ID for the member-selection button (0xB0 namespace, distinct from paramId / paramOptionId).
 pub fn memberButtonId(ctx: *const gui.Context, handle: modular.dyn.Handle) gui.Id {
     const key = (@as(u64, 0xB0) << 56) | (@as(u64, handle) << 32) | 1;
     return ctx.id_stack.makeInt(key);
@@ -63,10 +63,10 @@ fn labelWithUnit(buf: []u8, name: []const u8, unit: []const u8) []const u8 {
     return std.fmt.bufPrint(buf, "{s} ({s})", .{ name, unit }) catch name;
 }
 
-/// Mixer の `inX_gain` / `inX_mute` を `input_labels[X]` 付き表示名へ。frame-local buf、alloc なし。
-/// canonical 名以外・非 Mixer は null（呼び出し側が descriptor name を使う）。
+/// Turns Mixer's `inX_gain` / `inX_mute` into a display name with `input_labels[X]`. Frame-local buf, no alloc.
+/// null for anything other than canonical names / non-Mixer (the caller falls back to the descriptor name).
 fn mixerParamDisplayName(buf: []u8, mixer: *const modular.Mixer, name: []const u8) ?[]const u8 {
-    // "in0_gain" / "in0_mute"（長さ 8）
+    // "in0_gain" / "in0_mute" (length 8)
     if (name.len != 8) return null;
     if (name[0] != 'i' or name[1] != 'n') return null;
     if (name[2] < '0' or name[2] > '3') return null;
@@ -81,7 +81,7 @@ fn mixerParamDisplayName(buf: []u8, mixer: *const modular.Mixer, name: []const u
     return null;
 }
 
-/// descriptor canonical name → Inspector 表示名。set_param/NPRM は常に canonical。
+/// descriptor canonical name → Inspector display name. set_param/NPRM always use the canonical form.
 fn paramDisplayName(buf: []u8, graph: *const modular.DynGraph, kind: modular.ModuleKind, h: modular.dyn.Handle, name: []const u8) []const u8 {
     if (kind == .mixer) {
         if (mixerParamDisplayName(buf, graph.ptrOfConst(.mixer, h), name)) |display| return display;
@@ -89,7 +89,7 @@ fn paramDisplayName(buf: []u8, graph: *const modular.DynGraph, kind: modular.Mod
     return name;
 }
 
-/// BitmapFont のコードポイント境界を保ったまま、指定 pixel 幅に収める。
+/// Fits into the given pixel width while preserving BitmapFont codepoint boundaries.
 fn truncateLabel(label: []const u8, max_w: i32, font: gui.Font) []const u8 {
     if (max_w <= 0) return "";
     if (font.measure(label) <= @as(u32, @intCast(max_w))) return label;
@@ -178,7 +178,7 @@ fn drawParams(
                 const current: usize = @min(raw, c.options.len -| 1);
                 var name_buf: [64]u8 = undefined;
                 const display_name = paramDisplayName(&name_buf, graph, kind, h, desc.name);
-                // パラメータ名ラベル + option ごとの radio（.fixed 幅の column 内）。
+                // Parameter name label plus one radio per option (inside a .fixed-width column).
                 ctx.beginBox(.{
                     .direction = .column,
                     .width = .{ .fixed = @max(1, avail) },
@@ -217,7 +217,7 @@ fn drawGroupMembers(
         ctx.labelEx("No active members", SUBTLE);
         return;
     }
-    // button 行は .fixed 幅（grow-in-fit 回避）。
+    // The button row is .fixed width (avoids grow-in-fit).
     for (members) |m| {
         var label_buf: [64]u8 = undefined;
         const label = std.fmt.bufPrint(&label_buf, "#{d} {s}", .{ m.handle, m.kind_name }) catch "member";
@@ -228,8 +228,8 @@ fn drawGroupMembers(
     }
 }
 
-/// PanelHost callback から呼ばれる body のみ。
-/// `body_w` は panel rect 由来の外側幅。Collapsible body は width=.fit のため .fixed で構築する。
+/// Only the body, called from the PanelHost callback.
+/// `body_w` is the outer width from the panel rect. Collapsible body has width=.fit, so it's built with .fixed.
 pub fn drawBody(
     ctx: *gui.Context,
     graph: *const modular.DynGraph,

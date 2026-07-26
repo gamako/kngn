@@ -1,16 +1,16 @@
-//! apps/patch の生成レイヤ harness action（TASK-65 / TASK-93）向け純パーサ。
+//! A pure parser for the generation-layer harness actions of apps/patch.
 //!
-//! ホットパス宣言: ここでパースした結果は「イベント時のみ」（harness の `action <name> [args]`
-//! コマンド1回につき1回）dispatch される。毎フレーム全画素ループ・毎サンプル RT 経路のいずれでもない
-//! ため、性能規約（SIMD 3点セット等）の適用対象外。
+//! Hot-path declaration: parsing results here are dispatched only at event time (once per harness
+//! `action <name> [args]` command). It is neither a per-frame per-pixel loop nor a per-sample RT path,
+//! so the performance rules (SIMD triple-set, etc.) do not apply.
 //!
-//! このファイルは **std のみに依存**し、App / kit / platform / modular を一切 import しない
-//! （pixie の `actions.zig` と同型。main.zig との circular import を避け、単体テスト可能にする）。
-//! track 名（kick/hat/clap/bass 等）の enum 解決は App の具象型を知る main.zig 側が行う
-//! （pixie の `ToolKind` 解決と同じ分離方針。このファイルは name を素通しする）。
+//! This file **depends only on std** and never imports App / kit / platform / modular
+//! (mirroring pixie's `actions.zig`; this avoids a circular import with main.zig and keeps it unit-testable).
+//! Resolving track names (kick/hat/clap/bass, etc.) to an enum is done on the main.zig side, which knows App's concrete type
+//! (the same separation used for pixie's `ToolKind` resolution; this file just passes the name through).
 //!
-//! TASK-93 mini-notation: `parseNotation` / `evalNotation` も本ファイルに閉じる（固定容量・alloc なし・
-//! 決定的）。評価は action 実行時のみ。RT には評価済み mask だけが publish される。
+//! The mini-notation `parseNotation` / `evalNotation` are also self-contained in this file (fixed capacity, no allocation,
+//! deterministic). Evaluation happens only when the action runs; only the evaluated mask is published to RT.
 
 const std = @import("std");
 
@@ -21,7 +21,7 @@ pub const ParseError = error{
     TooManyTokens,
     UnknownBool,
     OutOfRange,
-    // TASK-93 mini-notation
+    // mini-notation
     InvalidNotation,
     NestTooDeep,
     Unbalanced,
@@ -39,9 +39,9 @@ fn expectExhausted(it: *std.mem.TokenIterator(u8, .any)) ParseError!void {
 
 pub const NameF32 = struct { name: []const u8, value: f32 };
 
-/// "<name> <value>" の2トークン（汎用 f32 setter。mute/lock 等の兄弟パーサと同型）。
-/// TASK-160.3: `set_param` 本体は NodeId 3 トークンのみ受け付ける。本関数は他 action / テスト用。
-/// NaN/Inf は `error.NonFinite` で拒否する（fail-fast）。
+/// Two tokens, "<name> <value>" (a generic f32 setter; the same shape as sibling parsers like mute/lock).
+/// `set_param` itself accepts only the 3-token NodeId form; this function is for other actions and tests.
+/// NaN/Inf are rejected with `error.NonFinite` (fail-fast).
 pub fn parseNameF32(args: []const u8) ParseError!NameF32 {
     var it = tokenize(args);
     const name = it.next() orelse return error.Empty;
@@ -54,7 +54,7 @@ pub fn parseNameF32(args: []const u8) ParseError!NameF32 {
 
 pub const NameBool = struct { name: []const u8, on: bool };
 
-/// "<name> <0|1>" の2トークン（`set_mute`/`set_lock` 用）。
+/// Two tokens, "<name> <0|1>" (for `set_mute`/`set_lock`).
 pub fn parseNameBool(args: []const u8) ParseError!NameBool {
     var it = tokenize(args);
     const name = it.next() orelse return error.Empty;
@@ -71,7 +71,7 @@ pub fn parseNameBool(args: []const u8) ParseError!NameBool {
 
 pub const NameU8 = struct { name: []const u8, value: u8 };
 
-/// "<name> <0-255>" の2トークン（`toggle_step` 用: track 名 + step index）。
+/// Two tokens, "<name> <0-255>" (for `toggle_step`: track name + step index).
 pub fn parseNameU8(args: []const u8) ParseError!NameU8 {
     var it = tokenize(args);
     const name = it.next() orelse return error.Empty;
@@ -83,7 +83,7 @@ pub fn parseNameU8(args: []const u8) ParseError!NameU8 {
 
 pub const TwoU8 = struct { a: u8, b: u8 };
 
-/// "<a> <b>" の2トークン（`set_pitch <step> <deg>` 用）。
+/// Two tokens, "<a> <b>" (for `set_pitch <step> <deg>`).
 pub fn parseTwoU8(args: []const u8) ParseError!TwoU8 {
     var it = tokenize(args);
     const a_tok = it.next() orelse return error.Empty;
@@ -94,7 +94,7 @@ pub fn parseTwoU8(args: []const u8) ParseError!TwoU8 {
     return .{ .a = a, .b = b };
 }
 
-/// "<0|1>" の1トークン（`set_evolve` 用）。
+/// One token, "<0|1>" (for `set_evolve`).
 pub fn parseBool01(args: []const u8) ParseError!bool {
     var it = tokenize(args);
     const tok = it.next() orelse return error.Empty;
@@ -108,7 +108,7 @@ pub fn parseBool01(args: []const u8) ParseError!bool {
     return on;
 }
 
-/// "<u64>" の1トークン（`seed` 用。10 進）。
+/// One token, "<u64>" (for `seed`; decimal).
 pub fn parseU64(args: []const u8) ParseError!u64 {
     var it = tokenize(args);
     const tok = it.next() orelse return error.Empty;
@@ -117,8 +117,8 @@ pub fn parseU64(args: []const u8) ParseError!u64 {
     return value;
 }
 
-/// `save_pattern`/`load_pattern` 用: 前後の空白のみ trim し、内部の空白はそのまま保持する
-/// （path は空白を含みうる1本の文字列として扱う。pixie/synth の `parsePath` と同型）。
+/// For `save_pattern`/`load_pattern`: only leading/trailing whitespace is trimmed; internal whitespace is preserved
+/// (a path is treated as a single string that may contain spaces; the same shape as pixie/synth's `parsePath`).
 pub fn parsePath(args: []const u8) ParseError![]const u8 {
     const trimmed = std.mem.trim(u8, args, " \t");
     if (trimmed.len == 0) return error.Empty;
@@ -130,8 +130,8 @@ pub const RenderArgs = struct {
     seconds: u32,
 };
 
-/// `render <path> <seconds>` 用: path=空白を含まない1トークン + seconds=u32（範囲 1..=600）。
-/// 範囲外は `error.OutOfRange`（clamp せず fail-fast。TASK-86）。
+/// For `render <path> <seconds>`: path is one token with no spaces, seconds is a u32 in range 1..=600.
+/// Out-of-range values yield `error.OutOfRange` (fail-fast, not clamped).
 pub fn parseRender(args: []const u8) ParseError!RenderArgs {
     var it = tokenize(args);
     const path = it.next() orelse return error.Empty;
@@ -143,10 +143,10 @@ pub fn parseRender(args: []const u8) ParseError!RenderArgs {
 }
 
 // ============================================================================
-// TASK-91: Song/Chain/Phrase action パーサ（std のみ・固定容量・fail-fast）
+// Song/Chain/Phrase action parsers (std only, fixed capacity, fail-fast)
 // ============================================================================
 
-/// `phrase_capture <idx>` / `song_len <n>` / `song_goto <row>` 用: u8 1 トークン。
+/// For `phrase_capture <idx>` / `song_len <n>` / `song_goto <row>`: one u8 token.
 pub fn parseU8(args: []const u8) ParseError!u8 {
     var it = tokenize(args);
     const tok = it.next() orelse return error.Empty;
@@ -157,12 +157,12 @@ pub fn parseU8(args: []const u8) ParseError!u8 {
 
 pub const ChainSetArgs = struct {
     chain_idx: u8,
-    /// phrase index 列（1..16）
+    /// A phrase index list (1..16)
     phrases: [16]u8 = undefined,
     len: u8 = 0,
 };
 
-/// `chain_set <chain_idx> <phrase_idx...>`（phrase 1..16 個）。
+/// `chain_set <chain_idx> <phrase_idx...>` (1..16 phrase indices).
 pub fn parseChainSet(args: []const u8) ParseError!ChainSetArgs {
     var it = tokenize(args);
     const c_tok = it.next() orelse return error.Empty;
@@ -186,7 +186,7 @@ pub const SongRowArgs = struct {
     bass: u8,
 };
 
-/// `song_row <row_idx> <kick_chain> <hat_chain> <clap_chain> <bass_chain>`。
+/// `song_row <row_idx> <kick_chain> <hat_chain> <clap_chain> <bass_chain>`.
 pub fn parseSongRow(args: []const u8) ParseError!SongRowArgs {
     var it = tokenize(args);
     const r = it.next() orelse return error.Empty;
@@ -204,14 +204,14 @@ pub fn parseSongRow(args: []const u8) ParseError!SongRowArgs {
 }
 
 // ============================================================================
-// TASK-106.1: pattern_state 固定 wire format（host evolve snapshot）
+// pattern_state's fixed wire format (a host evolve snapshot)
 //
-// トークン列（空白区切り・固定 28 要素）:
+// A whitespace-separated token list, fixed at 28 elements:
 //   kick_on hat_on clap_on bass_on bass_accent bass_slide
 //   kick_lock hat_lock clap_lock bass_lock evolve mutation_count
 //   deg0 .. deg15
-// masks は u16 の 4 桁 hex。lock/evolve は 0|1。mutation_count は u32 10 進。
-// deg は i8 10 進。4096B action frame 上限内に収まる。
+// masks are 4-digit hex u16 values. lock/evolve are 0|1. mutation_count is a decimal u32.
+// deg is a decimal i8. This fits within the 4096B action-frame limit.
 // ============================================================================
 
 pub const PatternStateArgs = struct {
@@ -245,7 +245,7 @@ fn parseI8Tok(tok: []const u8) ParseError!i8 {
     return std.fmt.parseInt(i8, tok, 10) catch return error.InvalidNumber;
 }
 
-/// `pattern_state` wire args を固定形式で decode。
+/// Decodes `pattern_state`'s wire args from the fixed format.
 pub fn parsePatternState(args: []const u8) ParseError!PatternStateArgs {
     var it = tokenize(args);
     const kick_on = try parseHexU16(it.next() orelse return error.Empty);
@@ -284,7 +284,7 @@ pub fn parsePatternState(args: []const u8) ParseError!PatternStateArgs {
     };
 }
 
-/// `pattern_state` wire args を固定形式で encode（masks=4 桁 hex 小文字）。
+/// Encodes `pattern_state`'s wire args into the fixed format (masks as lowercase 4-digit hex).
 pub fn formatPatternState(buf: []u8, p: PatternStateArgs) error{TooLong}![]const u8 {
     return std.fmt.bufPrint(buf, "{x:0>4} {x:0>4} {x:0>4} {x:0>4} {x:0>4} {x:0>4} {d} {d} {d} {d} {d} {d} {d} {d} {d} {d} {d} {d} {d} {d} {d} {d} {d} {d} {d} {d} {d} {d}", .{
         p.kick_on,
@@ -319,10 +319,10 @@ pub fn formatPatternState(buf: []u8, p: PatternStateArgs) error{TooLong}![]const
 }
 
 // ============================================================================
-// TASK-106.1: network_policy 表（register + 単体テストの単一ソース。std のみ）
+// network_policy table (the single source for register and unit tests; std only)
 // ============================================================================
 
-/// platform.NetworkPolicy と同義のタグ（kit/platform 非依存で共有するため別 enum）。
+/// A tag synonymous with platform.NetworkPolicy (a separate enum so it can be shared without depending on kit/platform).
 pub const NetworkPolicyTag = enum { relay, local_only, reject_when_synced };
 
 pub const PolicyEntry = struct {
@@ -330,7 +330,7 @@ pub const PolicyEntry = struct {
     policy: NetworkPolicyTag,
 };
 
-/// patch 全登録 action の network_policy（TASK-106.1）。register* と回帰テストが参照する。
+/// The network_policy for every registered patch action. Referenced by register* and the regression tests.
 pub const PATCH_NETWORK_POLICIES = [_]PolicyEntry{
     .{ .name = "select_node", .policy = .local_only },
     .{ .name = "observe_param", .policy = .local_only },
@@ -369,7 +369,7 @@ pub const PATCH_NETWORK_POLICIES = [_]PolicyEntry{
 };
 
 pub fn policyOf(name: []const u8) ?NetworkPolicyTag {
-    // inline for + comptime eql でビルド時 lookup も成立させる（通常 for だと comptime で null になりうる）。
+    // Using inline for + comptime eql also makes a build-time lookup work (a regular for could resolve to null at comptime).
     inline for (PATCH_NETWORK_POLICIES) |e| {
         if (std.mem.eql(u8, e.name, name)) return e.policy;
     }
@@ -377,37 +377,37 @@ pub fn policyOf(name: []const u8) ?NetworkPolicyTag {
 }
 
 // ============================================================================
-// TASK-93: mini-notation パーサ + 評価器（std のみ・固定容量・alloc なし・決定的）
+// mini-notation parser + evaluator (std only, fixed capacity, no allocation, deterministic)
 //
-// 文法（空白区切りトークン列）:
-//   x = hit / ~ = 休符 / 0..9 = bass 度数（hit + deg）
-//   [a b] = スロット内サブ分割（ネスト深さ 2 まで）
-//   <a b> = 評価ごと交代（alt_index % N。bar ごと連続交代は将来スコープ）
-//   a*2 = スロット内反復 / a? = 50% 確率 / x(k,n) = スパン内ユークリッド
-// 評価: bar を有理数分割し round(pos*16) で最寄り step へ量子化。衝突は OR。
+// Grammar (a whitespace-separated token list):
+//   x = hit / ~ = rest / 0..9 = bass degree (hit + deg)
+//   [a b] = subdivision within a slot (nesting depth up to 2)
+//   <a b> = alternates per evaluation (alt_index % N; alternating every bar is a future scope)
+//   a*2 = repetition within a slot / a? = 50% probability / x(k,n) = Euclidean rhythm within the span
+// Evaluation: the bar is split into rational fractions, and round(pos*16) quantizes each to the nearest step. Collisions are OR'd.
 // ============================================================================
 
-/// root 1 + トークン最大 64 = 65。ネスト group ノードもここに入る。
+/// root 1 + up to 64 tokens = 65. Nested group nodes are also counted here.
 pub const MAX_NOTATION_NODES: usize = 65;
-/// 子参照スロット（木の辺数 ≤ nodes-1）。64 トークンまで可を成立させる。
+/// Child-reference slots (tree edge count <= nodes-1), sized to support up to 64 tokens.
 pub const MAX_CHILD_SLOTS: usize = 64;
 pub const MAX_TOKENS: usize = 64;
 pub const MAX_NEST_DEPTH: u8 = 2;
 
 pub const NodeKind = enum { rest, hit, deg, seq, alt };
 
-/// 固定長 AST ノード。子は `Ast.child_indices[child_start .. child_start+child_count]` の
-/// **明示 index リスト**（連続ノード範囲ではない。ネスト後の兄弟を誤拾いしない）。
+/// A fixed-size AST node. Children are
+/// an **explicit index list** in `Ast.child_indices[child_start .. child_start+child_count]` (not a contiguous node range, so nested siblings are never picked up by mistake).
 pub const Node = struct {
     kind: NodeKind,
     deg: i8 = 0,
     child_start: u16 = 0,
     child_count: u16 = 0,
-    /// `*n`（既定 1）。euclid 指定時は評価で無視。
+    /// `*n` (default 1); ignored during evaluation when euclid is specified.
     repeat: u8 = 1,
-    /// `?` = 50% 確率間引き。
+    /// `?` = 50% probability of being dropped.
     prob: bool = false,
-    /// `(k,n)` の n。0 = 未指定。
+    /// The n in `(k,n)`. 0 means unspecified.
     euclid_n: u8 = 0,
     euclid_k: u8 = 0,
 };
@@ -416,7 +416,7 @@ pub const Ast = struct {
     nodes: [MAX_NOTATION_NODES]Node = undefined,
     count: u16 = 0,
     root: u16 = 0,
-    /// 各 seq/alt ノードの子 node index を連続格納する arena。
+    /// An arena that stores each seq/alt node's child node indices contiguously.
     child_indices: [MAX_CHILD_SLOTS]u16 = undefined,
     child_index_count: u16 = 0,
 
@@ -428,12 +428,12 @@ pub const Ast = struct {
 pub const NotationResult = struct {
     on: u16 = 0,
     deg: [16]i8 = [_]i8{0} ** 16,
-    /// deg を上書きすべき step の bit mask（bass 用。hit しない step は立てない）。
+    /// A bit mask of steps whose deg should be overridden (for bass; a step without a hit is never set).
     deg_set: u16 = 0,
 };
 
-/// `action pattern <track> <notation>` の args を track + notation に分割する。
-/// notation は空白を含む生テキスト（trim のみ。再トークン化しない）。
+/// Splits `action pattern <track> <notation>`'s args into track + notation.
+/// notation is raw text that may contain spaces (only trimmed, never re-tokenized).
 pub fn parsePatternArgs(args: []const u8) ParseError!struct { track: []const u8, notation: []const u8 } {
     const trimmed = std.mem.trim(u8, args, " \t");
     if (trimmed.len == 0) return error.Empty;
@@ -446,7 +446,7 @@ pub fn parsePatternArgs(args: []const u8) ParseError!struct { track: []const u8,
     return .{ .track = track, .notation = notation };
 }
 
-/// splitmix64（Steele / Vigna）。seed.zig と同式。actions は std のみ依存のためここにも置く。
+/// splitmix64 (Steele / Vigna), the same formula as seed.zig. Duplicated here since actions depends only on std.
 fn splitmix64(x: u64) u64 {
     var z = x +% 0x9E3779B97F4A7C15;
     z = (z ^ (z >> 30)) *% 0xBF58476D1CE4E5B9;
@@ -454,7 +454,7 @@ fn splitmix64(x: u64) u64 {
     return z ^ (z >> 31);
 }
 
-/// Bresenham 系ユークリッド判定（libs/modular EuclideanSeq.hitAt と同式。依存は張らない）。
+/// A Bresenham-style Euclidean-rhythm check, the same formula as libs/modular's EuclideanSeq.hitAt (with no dependency on it).
 fn euclidHit(steps: u8, pulses: u8, s: u8) bool {
     if (steps == 0 or pulses == 0) return false;
     const st: u32 = steps;
@@ -470,7 +470,7 @@ const Parser = struct {
     count: u16 = 0,
     child_indices: [MAX_CHILD_SLOTS]u16 = undefined,
     child_index_count: u16 = 0,
-    /// トップレベル空白区切り item 数（上限 MAX_TOKENS）。
+    /// The number of top-level whitespace-separated items (capped at MAX_TOKENS).
     items: u16 = 0,
 
     fn peek(self: *const Parser) ?u8 {
@@ -549,7 +549,7 @@ const Parser = struct {
         }
     }
 
-    /// atom + modifiers。depth は現在の括弧深さ（0=トップ）。
+    /// An atom plus modifiers. depth is the current bracket nesting depth (0 = top level).
     fn parseItem(self: *Parser, depth: u8) ParseError!u16 {
         self.skipWs();
         const c = self.peek() orelse return error.Empty;
@@ -575,8 +575,8 @@ const Parser = struct {
         return node_idx;
     }
 
-    /// 直接子 index をローカルに集め、ネスト側の arena push が終わってから一括で arena に書く。
-    /// （ネスト group が先に arena を埋めるため、親の child_start を parse 開始時に取る方式は壊れる）
+    /// Direct child indices are collected locally and written to the arena all at once, after any nested arena pushes have completed
+    /// (a nested group fills the arena first, so taking the parent's child_start at parse start would break).
     fn commitChildren(self: *Parser, node_idx: u16, local: []const u16) ParseError!void {
         const child_start = self.child_index_count;
         for (local) |cidx| {
@@ -594,7 +594,7 @@ const Parser = struct {
         var child_count: u16 = 0;
         self.skipWs();
         if (self.peek() == closer) {
-            // 空グループは拒否（意味が無い）
+            // An empty group is rejected (it is meaningless)
             return error.InvalidNotation;
         }
         while (true) {
@@ -625,7 +625,7 @@ const Parser = struct {
         while (true) {
             self.skipWs();
             if (self.peek() == null) break;
-            // トップレベルで閉じ括弧が来たら不均衡
+            // A closing bracket at the top level means the brackets are unbalanced
             const p = self.peek().?;
             if (p == ']' or p == '>') return error.Unbalanced;
             const cidx = try self.parseItem(0);
@@ -648,7 +648,7 @@ const Parser = struct {
     }
 };
 
-/// mini-notation 文字列を固定容量 AST にパースする（alloc なし）。
+/// Parses a mini-notation string into a fixed-capacity AST (no allocation).
 pub fn parseNotation(notation: []const u8) ParseError!Ast {
     var p: Parser = .{ .src = notation };
     return p.parseTop();
@@ -662,7 +662,7 @@ const EvalCtx = struct {
     result: NotationResult = .{},
 
     fn place(self: *EvalCtx, t: f64, deg: ?i8) void {
-        // round(pos*16) → 最寄り step。端点は 0..15 に clamp。衝突は OR。
+        // round(pos*16) -> nearest step; endpoints are clamped to 0..15; collisions are OR'd.
         var s_f = t * 16.0;
         if (s_f < 0) s_f = 0;
         if (s_f > 15.0) s_f = 15.0;
@@ -699,7 +699,7 @@ const EvalCtx = struct {
         if (n.child_count == 0) return;
         if (is_alt) {
             const pick = self.alt_index % n.child_count;
-            // 明示 child_indices 経由（連続ノード index ではない）
+            // Via the explicit child_indices list (not a contiguous node index range)
             const child_idx = self.ast.childAt(n, @intCast(pick));
             // modifiers on the alt group itself
             self.evalWithMods(child_idx, n, t0, t1);
@@ -715,12 +715,12 @@ const EvalCtx = struct {
         }
     }
 
-    /// alt グループに modifiers が付いている場合、選ばれた子に対して leaf 的に再適用するのではなく
-    /// 子ノード自体を [t0,t1) で評価し、グループの modifiers は子が leaf のときと同様に扱う。
-    /// 簡略: グループ modifiers は選ばれた子の評価スパン上で `evalLeaf`-like wrap する。
+    /// When an alt group has modifiers, they are not simply reapplied leaf-style to the chosen child;
+    /// instead, the child node itself is evaluated over [t0,t1), and the group's modifiers are handled the same way as when the child is a leaf.
+    /// In short: the group's modifiers wrap the chosen child's evaluation span the way `evalLeaf` would.
     fn evalWithMods(self: *EvalCtx, child_idx: u16, group: Node, t0: f64, t1: f64) void {
-        // グループに euclid/repeat/prob があれば、子を leaf として扱うのではなく
-        // まず modifiers でスパンを分割し各サブスパンで子を評価する。
+        // If a group has euclid/repeat/prob, its child is not treated as a leaf;
+        // instead the modifiers first split the span, and the child is evaluated within each sub-span.
         if (group.prob and !self.chance()) return;
         if (group.euclid_n > 0) {
             const en = group.euclid_n;
@@ -781,7 +781,7 @@ const EvalCtx = struct {
     }
 };
 
-/// AST を 16-step mask（+ bass deg）へ評価する。同じ (ast, rng_seed, alt_index) で bit 決定的。
+/// Evaluates an AST into a 16-step mask (plus bass deg). Bit-deterministic for the same (ast, rng_seed, alt_index).
 pub fn evalNotation(ast: Ast, rng_seed: u64, alt_index: u32) NotationResult {
     var ctx: EvalCtx = .{
         .ast = &ast,
@@ -798,7 +798,7 @@ pub fn evalNotation(ast: Ast, rng_seed: u64, alt_index: u32) NotationResult {
 
 const testing = std.testing;
 
-test "parseNameF32: 有効値 / 空 / 不正数値 / 非有限 / 余剰トークン" {
+test "parseNameF32: valid / empty / bad number / non-finite / trailing tokens" {
     const r = try parseNameF32("tempo 128");
     try testing.expectEqualStrings("tempo", r.name);
     try testing.expectEqual(@as(f32, 128), r.value);
@@ -810,7 +810,7 @@ test "parseNameF32: 有効値 / 空 / 不正数値 / 非有限 / 余剰トーク
     try testing.expectError(error.TooManyTokens, parseNameF32("tempo 128 extra"));
 }
 
-test "parseNameBool: 0/1 のみ許容" {
+test "parseNameBool: only 0/1 accepted" {
     const r = try parseNameBool("kick 1");
     try testing.expectEqualStrings("kick", r.name);
     try testing.expectEqual(true, r.on);
@@ -819,7 +819,7 @@ test "parseNameBool: 0/1 のみ許容" {
     try testing.expectError(error.TooManyTokens, parseNameBool("kick 1 extra"));
 }
 
-test "parseNameU8: 有効値 / 範囲外 / 余剰トークン" {
+test "parseNameU8: valid / out of range / trailing tokens" {
     const r = try parseNameU8("kick 5");
     try testing.expectEqualStrings("kick", r.name);
     try testing.expectEqual(@as(u8, 5), r.value);
@@ -828,7 +828,7 @@ test "parseNameU8: 有効値 / 範囲外 / 余剰トークン" {
     try testing.expectError(error.TooManyTokens, parseNameU8("kick 5 6"));
 }
 
-test "parseTwoU8: 有効値 / 不正数値" {
+test "parseTwoU8: valid / bad number" {
     const r = try parseTwoU8("3 5");
     try testing.expectEqual(@as(u8, 3), r.a);
     try testing.expectEqual(@as(u8, 5), r.b);
@@ -837,7 +837,7 @@ test "parseTwoU8: 有効値 / 不正数値" {
     try testing.expectError(error.TooManyTokens, parseTwoU8("3 5 7"));
 }
 
-test "parseBool01: 0/1 のみ許容" {
+test "parseBool01: only 0/1 accepted" {
     try testing.expectEqual(true, try parseBool01("1"));
     try testing.expectEqual(false, try parseBool01("0"));
     try testing.expectError(error.UnknownBool, parseBool01("yes"));
@@ -845,7 +845,7 @@ test "parseBool01: 0/1 のみ許容" {
     try testing.expectError(error.TooManyTokens, parseBool01("1 0"));
 }
 
-test "parseU64: 有効値 / 空 / 不正 / 余剰トークン" {
+test "parseU64: valid / empty / bad / trailing tokens" {
     try testing.expectEqual(@as(u64, 42), try parseU64("42"));
     try testing.expectEqual(@as(u64, 0), try parseU64("0"));
     try testing.expectError(error.Empty, parseU64(""));
@@ -854,14 +854,14 @@ test "parseU64: 有効値 / 空 / 不正 / 余剰トークン" {
     try testing.expectError(error.TooManyTokens, parseU64("42 1"));
 }
 
-test "parsePath: 前後 trim / 内部空白保持 / 空は拒否" {
+test "parsePath: trim ends / keep internal spaces / reject empty" {
     try testing.expectEqualStrings("/tmp/out.mdlp", try parsePath("  /tmp/out.mdlp  "));
     try testing.expectEqualStrings("/tmp/my pattern.mdlp", try parsePath("/tmp/my pattern.mdlp"));
     try testing.expectError(error.Empty, parsePath(""));
     try testing.expectError(error.Empty, parsePath("   "));
 }
 
-test "parseRender: 正常系 / 秒数 0・601・非数値・トークン不足の fail-fast" {
+test "parseRender: happy path / fail-fast on seconds 0, 601, non-numeric, missing tokens" {
     const r = try parseRender("/tmp/out.wav 4");
     try testing.expectEqualStrings("/tmp/out.wav", r.path);
     try testing.expectEqual(@as(u32, 4), r.seconds);
@@ -881,7 +881,7 @@ fn evalStr(notation: []const u8, seed: u64, alt: u32) !NotationResult {
 }
 
 test "notation: x ~ x ~ → steps 0,8 (0x0101)" {
-    // 4 等分: pos 0, 0.25, 0.5, 0.75 → step 0,4,8,12。hit は 0 と 8。
+    // Split into 4: pos 0, 0.25, 0.5, 0.75 -> steps 0,4,8,12. Hits are at 0 and 8.
     const r = try evalStr("x ~ x ~", 0, 0);
     try testing.expectEqual(@as(u16, 0x0101), r.on);
 }
@@ -899,13 +899,13 @@ test "notation: rest only → on=0" {
 }
 
 test "notation: [x x] subdivision quantize" {
-    // トップ 1 slot [0,1) を 2 分割 → pos 0 と 0.5 → steps 0, 8
+    // The top-level 1 slot [0,1) split in 2 -> pos 0 and 0.5 -> steps 0, 8
     const r = try evalStr("[x x]", 0, 0);
     try testing.expectEqual(@as(u16, 0x0101), r.on);
 }
 
 test "notation: x*2 within single slot" {
-    // トップ 1 slot を *2 → pos 0 と 0.5 → steps 0, 8
+    // The top-level 1 slot with *2 -> pos 0 and 0.5 -> steps 0, 8
     const r = try evalStr("x*2", 0, 0);
     try testing.expectEqual(@as(u16, 0x0101), r.on);
 }
@@ -918,7 +918,7 @@ test "notation: x(3,8) euclidean" {
 }
 
 test "notation: bass degrees 0 3 5 ~" {
-    // 4 等分: hit+deg at 0,4,8; rest at 12
+    // Split into 4: hit+deg at 0,4,8; rest at 12
     const r = try evalStr("0 3 5 ~", 0, 0);
     try testing.expectEqual(@as(u16, 0x0111), r.on); // steps 0,4,8
     try testing.expectEqual(@as(i8, 0), r.deg[0]);
@@ -939,27 +939,27 @@ test "notation: fail-fast empty / unknown / nest / euclid k>n / unbalanced" {
 }
 
 test "notation: ? and <a b> deterministic under same (seed, alt_index)" {
-    // ? は seed 依存。同じ seed で bit 再現、異なる seed で変化しうる。
+    // `?` depends on the seed: bit-reproducible for the same seed, may vary with a different seed.
     const a1 = try evalStr("x?", 42, 0);
     const a2 = try evalStr("x?", 42, 0);
     try testing.expectEqual(a1.on, a2.on);
 
-    // 複数スロットで確率を振ると seed 差が出やすい
+    // Rolling probability across multiple slots makes seed differences more likely to show
     const b1 = try evalStr("x? x? x? x? x? x? x? x?", 1, 0);
     const b2 = try evalStr("x? x? x? x? x? x? x? x?", 1, 0);
     const b3 = try evalStr("x? x? x? x? x? x? x? x?", 2, 0);
     try testing.expectEqual(b1.on, b2.on);
-    // seed が違えば高確率で異なる（万一一致しても alt は別経路で担保）
+    // A different seed makes the result differ with high probability (even in the rare case of a match, alt is covered by a separate path)
     _ = b3;
 
-    // <a b>: alt_index % 2 で交代。RNG 不要で決定的。
+    // <a b>: alternates via alt_index % 2. Deterministic, no RNG needed.
     const c0 = try evalStr("<x ~>", 0, 0); // pick x
     const c1 = try evalStr("<x ~>", 0, 1); // pick ~
     try testing.expectEqual(@as(u16, 0x0001), c0.on); // step 0
     try testing.expectEqual(@as(u16, 0), c1.on);
-    const c0b = try evalStr("<x ~>", 99, 0); // seed 無関係
+    const c0b = try evalStr("<x ~>", 99, 0); // Independent of the seed
     try testing.expectEqual(c0.on, c0b.on);
-    // alt_index=2 → また x
+    // alt_index=2 -> back to x
     const c2 = try evalStr("<x ~>", 0, 2);
     try testing.expectEqual(c0.on, c2.on);
 }
@@ -974,38 +974,38 @@ test "notation: parsePatternArgs splits track and notation" {
 }
 
 test "notation: 16-resolution overflow rounds and ORs" {
-    // 32 等分相当: x*32 は 32 点を 16 step に丸めて OR → 全 step に寄りやすい
+    // Equivalent to a 32-way split: x*32 rounds 32 points onto 16 steps and OR's them, so it tends to fill most steps
     const r = try evalStr("x*32", 0, 0);
-    // 32 点: i/32 → round(i/32*16)=round(i/2)。i=0..31 → steps 0,0,1,2,...,15,16→15
-    // ほぼ全 bit が立つ
+    // 32 points: i/32 -> round(i/32*16)=round(i/2). i=0..31 -> steps 0,0,1,2,...,15,16->15
+    // Nearly all bits end up set
     try testing.expect(r.on != 0);
     try testing.expectEqual(@as(u16, 0xFFFF), r.on);
 }
 
 test "notation P1-1: nested group mid/start/composite sibling placement" {
-    // 'x [x x] x': 3 等分。slot0 x@0→0 / slot1 [x x]@1/3,1/2 → round 5.33→5, 8 / slot2 x@2/3→round 10.67→11
+    // 'x [x x] x': split into 3. slot0 x@0->0 / slot1 [x x]@1/3,1/2 -> round 5.33->5, 8 / slot2 x@2/3->round 10.67->11
     const mid = try evalStr("x [x x] x", 0, 0);
     const expect_mid: u16 = (@as(u16, 1) << 0) | (@as(u16, 1) << 5) | (@as(u16, 1) << 8) | (@as(u16, 1) << 11);
     try testing.expectEqual(expect_mid, mid.on);
 
-    // '[x x] x': 2 等分。slot0 [x x]@0,0.25→0,4 / slot1 x@0.5→8
+    // '[x x] x': split into 2. slot0 [x x]@0,0.25->0,4 / slot1 x@0.5->8
     const lead = try evalStr("[x x] x", 0, 0);
     const expect_lead: u16 = (@as(u16, 1) << 0) | (@as(u16, 1) << 4) | (@as(u16, 1) << 8);
     try testing.expectEqual(expect_lead, lead.on);
 
-    // 'x <x ~> [x x]' alt=0: 3 等分。x@0→0 / <x>@1/3→5 / [x x]@2/3,5/6 →11,13
+    // 'x <x ~> [x x]' alt=0: split into 3. x@0->0 / <x>@1/3->5 / [x x]@2/3,5/6 ->11,13
     const comp = try evalStr("x <x ~> [x x]", 0, 0);
     const expect_comp: u16 = (@as(u16, 1) << 0) | (@as(u16, 1) << 5) | (@as(u16, 1) << 11) | (@as(u16, 1) << 13);
     try testing.expectEqual(expect_comp, comp.on);
 
-    // alt=1 で中間が休符 → steps 0,11,13
+    // With alt=1 the middle becomes a rest -> steps 0,11,13
     const comp1 = try evalStr("x <x ~> [x x]", 0, 1);
     const expect_comp1: u16 = (@as(u16, 1) << 0) | (@as(u16, 1) << 11) | (@as(u16, 1) << 13);
     try testing.expectEqual(expect_comp1, comp1.on);
 }
 
 test "notation: 64 tokens exact capacity" {
-    // "x " * 63 + "x" = 64 hits。root+64 leaves = 65 nodes ちょうど。
+    // "x " * 63 + "x" = 64 hits. root+64 leaves = exactly 65 nodes.
     var buf: [256]u8 = undefined;
     var n: usize = 0;
     var t: usize = 0;
@@ -1020,15 +1020,15 @@ test "notation: 64 tokens exact capacity" {
     const ast = try parseNotation(buf[0..n]);
     try testing.expectEqual(@as(u16, 65), ast.count); // root + 64
     const r = evalNotation(ast, 0, 0);
-    // 64 等分 → 各 i/64 *16 を round → 全 16 step が OR で立つ
+    // Split into 64 -> rounding i/64*16 for each -> all 16 steps end up set via OR
     try testing.expectEqual(@as(u16, 0xFFFF), r.on);
 }
 
 // ============================================================================
-// TASK-91 parsers
+// Song/Chain/Phrase parsers
 // ============================================================================
 
-test "parseU8: 有効値 / 空 / 不正 / 余剰" {
+test "parseU8: valid / empty / bad / trailing" {
     try testing.expectEqual(@as(u8, 0), try parseU8("0"));
     try testing.expectEqual(@as(u8, 63), try parseU8("63"));
     try testing.expectError(error.Empty, parseU8(""));
@@ -1079,7 +1079,7 @@ test "parseBool01 / parseU8 for song_loop / song_play / song_len / song_goto" {
     try testing.expectEqual(@as(u8, 0), try parseU8("0"));
 }
 
-test "pattern_state: round-trip / 余剰トークン / 非 hex / 4096B 上限" {
+test "pattern_state: round-trip / trailing tokens / non-hex / 4096B cap" {
     const sample = PatternStateArgs{
         .kick_on = 0x1111,
         .hat_on = 0x2222,
@@ -1116,18 +1116,18 @@ test "pattern_state: round-trip / 余剰トークン / 非 hex / 4096B 上限" {
     try testing.expectError(error.Empty, parsePatternState(""));
     try testing.expectError(error.InvalidNumber, parsePatternState("zzzz 0000 0000 0000 0000 0000 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0"));
     try testing.expectError(error.TooManyTokens, parsePatternState("1111 2222 3333 4444 5555 6666 0 0 0 0 1 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 extra"));
-    // deg 不足
+    // deg is missing
     try testing.expectError(error.Empty, parsePatternState("1111 2222 3333 4444 5555 6666 0 0 0 0 1 0 0 0 0"));
 }
 
-test "pattern_state: parseBool01Tok 不正値は UnknownBool" {
-    // lock/evolve 欄が 0|1 以外
+test "pattern_state: parseBool01Tok bad value is UnknownBool" {
+    // The lock/evolve field is something other than 0|1
     try testing.expectError(error.UnknownBool, parsePatternState("1111 2222 3333 4444 5555 6666 2 0 0 0 1 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0"));
     try testing.expectError(error.UnknownBool, parsePatternState("1111 2222 3333 4444 5555 6666 0 true 0 0 1 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0"));
     try testing.expectError(error.UnknownBool, parsePatternState("1111 2222 3333 4444 5555 6666 0 0 0 0 yes 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0"));
 }
 
-test "TASK-106.1 policy table: relay / reject_when_synced / local_only buckets" {
+test "policy table: relay / reject_when_synced / local_only buckets" {
     const relays = [_][]const u8{
         "add_node",  "remove_node",    "connect",   "disconnect", "move_node",   "add_macro", "remove_macro",
         "set_param", "set_mute",       "set_lock",  "set_evolve", "toggle_step", "set_pitch", "seed",
@@ -1148,9 +1148,9 @@ test "TASK-106.1 policy table: relay / reject_when_synced / local_only buckets" 
         try testing.expectEqual(NetworkPolicyTag.local_only, policyOf(name).?);
     }
 
-    // 表に無い名前は null
+    // A name not in the table yields null
     try testing.expect(policyOf("no_such_action") == null);
-    // 全エントリが一意
+    // All entries are unique
     for (PATCH_NETWORK_POLICIES, 0..) |a, i| {
         for (PATCH_NETWORK_POLICIES[i + 1 ..]) |b| {
             try testing.expect(!std.mem.eql(u8, a.name, b.name));

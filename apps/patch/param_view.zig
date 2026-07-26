@@ -1,7 +1,7 @@
-//! Inspector の parameter projection と編集状態（TASK-160.3: Transport 専用投影は撤去）。
+//! Inspector's parameter projection and edit state (the Transport-only projection has been removed).
 //!
-//! ホットパス宣言: ここで扱う列挙・比較は GUI の frame-rate、override purge と
-//! pending 更新は event/frame-rate で走る。全画素 loop / RT loop は新設しない。
+//! Hot-path declaration: the enumeration/comparison handled here runs at the GUI's frame-rate; override purge and
+//! pending updates run at event/frame-rate. No new all-pixel loop or RT loop is introduced.
 
 const std = @import("std");
 const modular = @import("modular");
@@ -32,8 +32,8 @@ pub fn sameFieldParts(key: FieldKey, handle: usize, name: []const u8) bool {
     return key.handle == handle and std.mem.eql(u8, key.name, name);
 }
 
-/// Action/replay 由来の一時 slice を descriptor 表の static name へ正規化する。
-/// 戻り値は入力 slice を保持せず、descriptor 自身の name slice を返す。
+/// Normalizes a temporary slice from action/replay to the descriptor table's static name.
+/// The return value doesn't retain the input slice; it returns the descriptor's own name slice.
 pub fn canonicalDescriptorName(descs: []const modular.ParamDesc, name: []const u8) ?[]const u8 {
     for (descs) |desc| {
         if (std.mem.eql(u8, desc.name, name)) return desc.name;
@@ -41,8 +41,8 @@ pub fn canonicalDescriptorName(descs: []const modular.ParamDesc, name: []const u
     return null;
 }
 
-/// kind 別の「主要パラメータ」descriptor を選ぶ（cutoff 優先・無ければ先頭）。TASK-170。
-/// main.zig の observedFieldForNode（Inspector 追従）と drawNodeParamValues（ノード内値表示）が共有する。
+/// Picks the "primary parameter" descriptor per kind (cutoff preferred, otherwise the first).
+/// Shared by main.zig's observedFieldForNode (Inspector follow) and drawNodeParamValues (in-node value display).
 pub fn primaryDescriptor(descs: []const modular.ParamDesc) ?modular.ParamDesc {
     if (descs.len == 0) return null;
     const name = canonicalDescriptorName(descs, "cutoff") orelse descs[0].name;
@@ -52,7 +52,7 @@ pub fn primaryDescriptor(descs: []const modular.ParamDesc) ?modular.ParamDesc {
     return descs[0];
 }
 
-/// SPRM `cutoff_norm` ↔ Master VCF Hz の互換変換（load_pattern / offline の one-shot bridge 用）。
+/// Compatibility conversion between SPRM `cutoff_norm` and Master VCF Hz (for the load_pattern / offline one-shot bridge).
 pub const CutoffRange = struct {
     min: f32,
     max: f32,

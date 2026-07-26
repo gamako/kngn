@@ -1,32 +1,32 @@
-//! apps/patch の scalar パラメータ + grid/303 pattern 直列化（TASK-65 serialize / TASK-105.4 旧 MDLP）。
+//! apps/patch: serialization of scalar parameters plus the grid/303 pattern (legacy MDLP).
 //!
-//! libs/serde の versioned container（TASK-62.2）に 2 chunk を載せる:
-//!   - SPRM: scalar `Params`（tempo/gain/mute 等）。main.zig の具体型を comptime で汎用直列化
-//!     （patch_io.zig(apps/synth) と同じ「f32/bool/usize のみのフラット struct」汎用パッカー。
-//!     コードは小さいため per-app 複製方針で重複させている＝pixie/synth/modular/patch の
-//!     actions.zig 群と同じ「std のみの小さい純ロジックを app ごとに持つ」既存パターンに揃える）。
-//!   - PTRN: grid/303 pattern（`PatternPayload`。固定 layout・明示 offset。document_io.zig の
-//!     DOCH と同じ流儀）。
+//! Places 2 chunks in libs/serde's versioned container:
+//!   - SPRM: scalar `Params` (tempo/gain/mute, etc). Generically serializes main.zig's concrete type via comptime
+//!     (the same generic packer for a "flat struct of only f32/bool/usize" as patch_io.zig (apps/synth).
+//!     Since the code is small, it's duplicated per app on purpose — matching the existing pattern of
+//!     pixie/synth/modular/patch's actions.zig group, each app keeping its own small std-only pure logic).
+//!   - PTRN: grid/303 pattern (`PatternPayload`. Fixed layout, explicit offsets. Same convention as
+//!     document_io.zig's DOCH).
 //!
-//! **TASK-105.4**: 正規のプロジェクト保存は `project_io.zig`（VPRJ）。本 file は旧 MDLP の
-//! reader/encoder と PTRN/SPRM layout の単一ソースを維持する。VPRJ の PTRN/SPRM は同一 33B /
-//! フラット Params layout。統合 reader が MDLP magic を検出して本 decode へ委譲する。
+//! The canonical project save path is `project_io.zig` (VPRJ). This file maintains the legacy MDLP
+//! reader/encoder and remains the single source for PTRN/SPRM layout. VPRJ's PTRN/SPRM use the same 33B /
+//! flat Params layout. The unified reader detects the MDLP magic and delegates to this decode.
 //!
-//! **循環 import 回避**: `Params`/`PatternCommand`（apps/patch/main.zig・lofi.zig 具体型）は
-//! import しない。main.zig 側が `PatternPayload` との変換（`patternToPayload`/`payloadToPatternCommand`）
-//! を行う。
+//! **Avoiding circular imports**: does not import `Params`/`PatternCommand` (concrete types from
+//! apps/patch/main.zig, lofi.zig). main.zig performs the conversion with `PatternPayload`
+//! (`patternToPayload`/`payloadToPatternCommand`).
 //!
-//! スコープ: 保存対象は「pattern の中身」（on/lock/accent/slide/deg + evolve）のみ。`rev`（revision
-//! counter）は保存しない（load 時に app 側の `pattern_rev` を 1 回 increment して払い出す。他の
-//! pattern 編集 action と同じ revision 採番経路を共有し二重採番を防ぐ）。
+//! Scope: only the "contents of the pattern" (on/lock/accent/slide/deg + evolve) are saved. `rev` (the revision
+//! counter) is not saved (on load, the app side increments `pattern_rev` once and hands it out. This shares the
+//! same revision numbering path as other pattern-editing actions, preventing double numbering).
 //!
-//! ホットパス宣言: encode/decode/save/load は **イベント時のみ**（`save_pattern`/`load_pattern`
-//! action 1回につき1回）。RT 経路（`LofiPatch.render`→graph `processBlock`）には一切触れない。
+//! Hot-path declaration: encode/decode/save/load run **only on events** (once per `save_pattern`/`load_pattern`
+//! action invocation). Never touches the RT path (`LofiPatch.render` → graph `processBlock`).
 
 const std = @import("std");
 const serde = @import("serde");
 
-/// 'MDLP'（modular pattern）の little-endian u32。serde の expected_magic に渡す。
+/// Little-endian u32 for 'MDLP' (modular pattern). Passed to serde's expected_magic.
 pub const magic: u32 = @as(u32, 'M') | (@as(u32, 'D') << 8) | (@as(u32, 'L') << 16) | (@as(u32, 'P') << 24);
 pub const schema_version: u16 = 1;
 
@@ -42,7 +42,7 @@ pub const DecodeError = error{
     NonFiniteField,
 };
 
-// ── scalar Params の汎用フラットパッカー（f32/bool/usize のみ。patch_io.zig(apps/synth) と同型）───
+// ── Generic flat packer for scalar Params (f32/bool/usize only; same shape as patch_io.zig(apps/synth)) ───
 
 fn fieldSize(comptime T: type) usize {
     if (T == f32 or T == usize) return 4;
@@ -73,9 +73,9 @@ fn packInto(comptime T: type, value: T, out: []u8) void {
     }
 }
 
-/// **f32 field は non-finite（NaN/Inf）を `error.NonFiniteField` で拒否する**（fail-fast。
-/// `actions.zig` の `parseNameF32` が action 経路で行っている検査を file load 経路にも課す。
-/// synth の `patch_io.zig` と同じ理由）。
+/// **f32 fields reject non-finite values (NaN/Inf) with `error.NonFiniteField`** (fail-fast.
+/// Applies the same check `actions.zig`'s `parseNameF32` performs on the action path to the file-load path too.
+/// Same reason as synth's `patch_io.zig`).
 fn unpackFrom(comptime T: type, bytes: []const u8) error{NonFiniteField}!T {
     var value: T = .{};
     comptime var off: usize = 0;
@@ -96,10 +96,10 @@ fn unpackFrom(comptime T: type, bytes: []const u8) error{NonFiniteField}!T {
     return value;
 }
 
-// ── grid/303 pattern（固定 layout。PatternCommand の中身相当。rev は含まない）───────────────────
+// ── grid/303 pattern (fixed layout, equivalent to PatternCommand's contents; rev not included) ───────────────────
 
-/// `PatternCommand`（apps/patch/lofi.zig）の中身を app 非依存の形で保持する plain struct。
-/// main.zig が `PatternCommand` との変換を行う。
+/// Plain struct holding `PatternCommand`'s (apps/patch/lofi.zig) contents in an app-independent form.
+/// main.zig performs the conversion with `PatternCommand`.
 pub const PatternPayload = struct {
     evolve: bool = true,
     kick_on: u16 = 0,
@@ -115,7 +115,7 @@ pub const PatternPayload = struct {
     bass_deg: [16]i8 = [_]i8{0} ** 16,
 };
 
-// layout（little-endian・明示 offset。バイト数 = 1+2+1+2+1+2+1+2+2+2+1+16 = 33）:
+// layout (little-endian, explicit offsets. Byte count = 1+2+1+2+1+2+1+2+2+2+1+16 = 33):
 const PTRN_SIZE: usize = 33;
 
 fn packPattern(p: PatternPayload, out: *[PTRN_SIZE]u8) void {
@@ -154,8 +154,8 @@ pub fn Decoded(comptime P: type) type {
     return struct { params: P, pattern: PatternPayload };
 }
 
-/// `P`（scalar Params）+ `PatternPayload` を SPRM/PTRN の 2 chunk にして container を組み立てる
-/// （caller が free する）。
+/// Assembles `P` (scalar Params) + `PatternPayload` into a container as SPRM/PTRN's 2 chunks
+/// (caller frees).
 pub fn encode(comptime P: type, gpa: std.mem.Allocator, params: P, pattern: PatternPayload) ![]u8 {
     var w = try serde.Writer.init(gpa, magic, schema_version);
     errdefer w.deinit();
@@ -171,7 +171,7 @@ pub fn encode(comptime P: type, gpa: std.mem.Allocator, params: P, pattern: Patt
     return w.finish();
 }
 
-/// バイト列から `P`/`PatternPayload` を復元する。v1 は固定長 chunk。
+/// Restores `P`/`PatternPayload` from a byte slice. v1 uses fixed-length chunks.
 pub fn decode(comptime P: type, bytes: []const u8) !Decoded(P) {
     const container = try serde.Container.parse(bytes, magic);
     if (container.schemaVersion() > schema_version) return error.UnsupportedSchemaVersion;
@@ -232,7 +232,7 @@ test "encode/decode: round-trip scalar Params + pattern payload" {
     try testing.expectEqual(pattern, got.pattern);
 }
 
-test "decode: 破損検出 (BadMagic/UnsupportedSchemaVersion/MissingSprm/MissingPtrn/CorruptPtrn)" {
+test "decode: corruption detection (BadMagic/UnsupportedSchemaVersion/MissingSprm/MissingPtrn/CorruptPtrn)" {
     const gpa = testing.allocator;
 
     // BadMagic
@@ -285,7 +285,7 @@ test "decode: 破損検出 (BadMagic/UnsupportedSchemaVersion/MissingSprm/Missin
         defer gpa.free(bytes);
         try testing.expectError(error.MissingPtrn, decode(TestParams, bytes));
     }
-    // CorruptPtrn（長さ不一致）
+    // CorruptPtrn (length mismatch)
     {
         var w = try serde.Writer.init(gpa, magic, schema_version);
         defer w.deinit();
@@ -297,7 +297,7 @@ test "decode: 破損検出 (BadMagic/UnsupportedSchemaVersion/MissingSprm/Missin
         defer gpa.free(bytes);
         try testing.expectError(error.CorruptPtrn, decode(TestParams, bytes));
     }
-    // NonFiniteField（SPRM 内の f32 field が NaN。CRC 的には正当だが復元を拒否する）
+    // NonFiniteField (an f32 field inside SPRM is NaN; valid per CRC but rejected on restore)
     {
         var w = try serde.Writer.init(gpa, magic, schema_version);
         defer w.deinit();
@@ -316,9 +316,9 @@ test "decode: 破損検出 (BadMagic/UnsupportedSchemaVersion/MissingSprm/Missin
 test "file I/O: save→load round-trip" {
     const gpa = testing.allocator;
     const io = testing.io;
-    // このテストは pattern_io 単体 root と project_io root（@import 経由）の 2 バイナリに
-    // 含まれ `zig build test` で並列実行される。cwd 固定名だと同一ファイルを取り合って
-    // race する（TASK-96 で実測）ため tmpDir のランダム sub_path で分離する。
+    // This test is included in both the pattern_io standalone root and the project_io root (via @import), so it runs
+    // as 2 binaries under `zig build test` in parallel. A fixed cwd name would make them contend for the same file
+    // and race, so it's isolated with tmpDir's random sub_path.
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     var path_buf: [64]u8 = undefined;

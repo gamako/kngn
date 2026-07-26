@@ -1,8 +1,8 @@
-//! apps/patch: パッチキャンバスの純粋幾何/ヒットテストロジック（TASK-40.6.2）。
+//! apps/patch: pure geometry / hit-test logic for the patch canvas.
 //!
-//! platform / gui / modular を import しない純 Zig。camera 変換・ノード/ポート幾何・ヒットテスト・
-//! ビューポート内包判定（見切れ自動検出）を提供し、display/audio 無しで単体テストできる（test-patch）。
-//! 描画/入力（main.zig）はこのロジックの上に window・DrawList・イベントを載せるだけ。
+//! Pure Zig with no platform / gui / modular imports. Camera transforms, node/port geometry, hit-testing,
+//! and viewport-containment checks (automatic off-screen detection) are provided here, unit-testable without display/audio (test-patch).
+//! Drawing/input (main.zig) only layers window, DrawList, and events on top of this logic.
 
 const std = @import("std");
 
@@ -22,23 +22,23 @@ pub const Vec2f = struct {
     }
 };
 
-// --- レイアウト定数（world 単位） ---
+// --- Layout constants (world units) ---
 pub const NODE_W: f32 = 120;
 pub const TITLE_H: f32 = 22;
 pub const PORT_SPACING: f32 = 20;
-pub const BODY_PAD: f32 = 8; // ポート帯の下の余白
+pub const BODY_PAD: f32 = 8; // Margin below the port band
 pub const WORLD_PORT_R: f32 = 6;
 pub const PORT_R_MIN: f32 = 3;
 pub const PORT_R_MAX: f32 = 10;
 pub const ZOOM_MIN: f32 = 0.25;
 pub const ZOOM_MAX: f32 = 4.0;
-pub const CABLE_HIT_SLOP: f32 = 6; // world 単位のケーブル当たり判定しきい値
+pub const CABLE_HIT_SLOP: f32 = 6; // Cable hit-test threshold, in world units
 
-// Inspector の slider 行は GUI widget の [label] [track] [value] 構造に合わせる。
-// value_w は最大値文字列（f32 の小数表示）を収める固定予約幅、track_min は短い
-// ラベルでも操作領域を残すための下限。通常の inspector content 幅（260px）では
-// value_w/track_min とも固定値になる。
-// 外形（right/bottom slot）は PanelHost が所有する（TASK-149.1）。
+// Inspector slider rows match the GUI widget's [label] [track] [value] structure.
+// value_w is the fixed reserved width for the max value string (f32 decimal display); track_min is the lower
+// bound that keeps an operable track area even for short labels. At the usual inspector content width (260px),
+// both value_w and track_min stay at their fixed values.
+// The outer frame (right/bottom slot) is owned by PanelHost.
 pub const INSPECTOR_PARAM_GAP: i32 = 6;
 pub const INSPECTOR_PARAM_VALUE_W: i32 = 64;
 pub const INSPECTOR_PARAM_TRACK_MIN: i32 = 48;
@@ -53,11 +53,11 @@ pub const ParamRowLayout = struct {
     }
 };
 
-/// Inspector content 幅に収まる slider 行の純粋な横方向レイアウトを返す。
+/// Returns the pure horizontal layout of a slider row that fits within the inspector content width.
 ///
-/// label_w は測定済みラベル幅。長いラベルは value_w + track_min + gap を先に
-/// 確保して切り詰め、残りを track に渡す。極端に狭い viewport では value/track
-/// を縮めるが、通常の panel 幅では value_w=64, track_min=48 を維持する。
+/// label_w is the measured label width. For long labels, value_w + track_min + gap are reserved first,
+/// and the label is truncated; the remainder goes to the track. In extremely narrow viewports, value/track
+/// are shrunk, but at the usual panel width value_w=64 and track_min=48 are kept.
 pub fn inspectorParamRowLayout(avail: i32, label_w: i32) ParamRowLayout {
     const width = @max(avail, 0);
     const gap_w = 2 * INSPECTOR_PARAM_GAP;
@@ -69,10 +69,10 @@ pub fn inspectorParamRowLayout(avail: i32, label_w: i32) ParamRowLayout {
     return .{ .label_w = fitted_label, .track_w = track_w, .value_w = value_w };
 }
 
-/// 描画側が渡すノード幾何。pos は world 左上。
-/// grid_rows>0 は本体に step grid を描く箱（畳みマクロ箱 / 選択中の単体 step_seq）:
-/// ポート数由来の高さに加えて grid 行数ぶんを nodeSize で確保する（ヒットテスト矩形も同じ高さで整合）。
-/// 0 = grid なし。1 = drum 単体 on 行。4 = bass 単体 on/accent/slide/pitch。マクロ箱は group metadata 由来。
+/// Node geometry passed in by the drawing side. pos is the world-space top-left.
+/// grid_rows>0 marks a box that draws a step grid in its body (a collapsed macro box, or a selected standalone step_seq):
+/// nodeSize reserves height for the grid rows in addition to the port-count-derived height (the hit-test rect stays consistent with the same height).
+/// 0 = no grid. 1 = drum standalone on row. 4 = bass standalone on/accent/slide/pitch. Macro boxes derive this from group metadata.
 pub const NodeGeom = struct {
     handle: Handle,
     pos: Vec2f,
@@ -81,7 +81,7 @@ pub const NodeGeom = struct {
     grid_rows: u8 = 0,
 };
 
-/// 出力ポート src_out → 入力ポート dst_in の接続（単一接続なので dst で一意）。
+/// A connection from output port src_out to input port dst_in (unique by dst since each input has a single connection).
 pub const Edge = struct {
     src_handle: Handle,
     src_out: u8,
@@ -95,8 +95,8 @@ pub const PortRef = struct {
     index: u8,
 };
 
-/// ケーブルの安定 ID（単一接続なので入力ポートで一意）。選択/削除に使う（フレーム内 edge index は
-/// add/remove/publish で別ケーブルを指し得るため使わない）。
+/// A cable's stable ID (unique by input port since each input has a single connection). Used for select/delete (the per-frame edge index
+/// is not used for this because add/remove/publish can make it refer to a different cable).
 pub const CableRef = struct {
     dst_handle: Handle,
     dst_in: u8,
@@ -104,16 +104,16 @@ pub const CableRef = struct {
 
 pub const ScreenRect = struct { x: f32, y: f32, w: f32, h: f32 };
 
-/// world 座標の軸平行矩形（w/h は非負を前提。normalizeWorldRect が保証）。
+/// An axis-aligned rectangle in world coordinates (w/h are assumed non-negative; normalizeWorldRect guarantees this).
 pub const WorldRect = struct { x: f32, y: f32, w: f32, h: f32 };
 
-/// モジュールパレットのボタン（screen 座標・pan/zoom 非依存）。
+/// A module palette button (screen coordinates, independent of pan/zoom).
 pub const PaletteButton = struct {
     kind_index: u8,
     rect: ScreenRect,
 };
 
-/// 2 点から正規化 world 矩形（正方向ドラッグ / 逆方向ドラッグどちらでも w,h >= 0）。
+/// Builds a normalized world rect from two points (w,h >= 0 regardless of drag direction).
 pub fn normalizeWorldRect(a: Vec2f, b: Vec2f) WorldRect {
     const x0 = @min(a.x, b.x);
     const y0 = @min(a.y, b.y);
@@ -122,13 +122,13 @@ pub fn normalizeWorldRect(a: Vec2f, b: Vec2f) WorldRect {
     return .{ .x = x0, .y = y0, .w = x1 - x0, .h = y1 - y0 };
 }
 
-/// 表示ノードの world bbox（pos + nodeSize）。
+/// The world-space bbox of a display node (pos + nodeSize).
 pub fn nodeWorldBBox(g: NodeGeom) WorldRect {
     const sz = nodeSize(g);
     return .{ .x = g.pos.x, .y = g.pos.y, .w = sz.x, .h = sz.y };
 }
 
-/// 正の面積を持つ部分交差（完全内包・部分交差は hit、境界接触のみ・zero-size は miss）。
+/// An intersection with positive area (full containment and partial overlap are a hit; boundary-only touch or zero-size is a miss).
 pub fn rectsIntersectPositive(a: WorldRect, b: WorldRect) bool {
     if (a.w <= 0 or a.h <= 0 or b.w <= 0 or b.h <= 0) return false;
     const ix = @min(a.x + a.w, b.x + b.w) - @max(a.x, b.x);
@@ -136,11 +136,11 @@ pub fn rectsIntersectPositive(a: WorldRect, b: WorldRect) bool {
     return ix > 0 and iy > 0;
 }
 
-/// 2 ポートからケーブルの src(出力)/dst(入力) を決める。一方が出力・他方が入力のときのみ有効。
-/// 同方向（out-out / in-in、同一 PortRef 含む）は null。同一ノードの out→in（別ポート＝self-loop）は許可
-/// （エンジンが遅延辺として扱う）。種別一致は呼び出し側（dyn.outKindOf/inKindOf）で事前検証する。
+/// Determines a cable's src (output) / dst (input) from two ports. Valid only when one is an output and the other is an input.
+/// Same-direction pairs (out-out / in-in, including the same PortRef) yield null. An out->in pair on the same node (a different port, i.e. a self-loop) is allowed
+/// (the engine treats it as a delay edge). Kind matching is validated beforehand by the caller (dyn.outKindOf/inKindOf).
 pub fn resolveConnection(a: PortRef, b: PortRef) ?struct { src: PortRef, dst: PortRef } {
-    if (a.is_input == b.is_input) return null; // 同方向（同一 PortRef もここで弾かれる）
+    if (a.is_input == b.is_input) return null; // Same direction (the same PortRef is also rejected here)
     const src = if (!a.is_input) a else b;
     const dst = if (a.is_input) a else b;
     return .{ .src = src, .dst = dst };
@@ -150,7 +150,7 @@ fn pointInScreenRect(mx: f32, my: f32, r: ScreenRect) bool {
     return mx >= r.x and mx <= r.x + r.w and my >= r.y and my <= r.y + r.h;
 }
 
-/// screen 座標のマウスがどのパレットボタン上か（world hit より先に判定する）。
+/// Which palette button the mouse is over, in screen coordinates (checked before the world hit-test).
 pub fn hitTestPalette(mouse: Vec2f, buttons: []const PaletteButton) ?u8 {
     for (buttons) |btn| {
         if (pointInScreenRect(mouse.x, mouse.y, btn.rect)) return btn.kind_index;
@@ -165,19 +165,19 @@ pub const OffscreenCounts = struct {
 };
 
 // ============================================================================
-// ノード/ポート幾何（world 座標）
+// Node/port geometry (world coordinates)
 // ============================================================================
 
-/// ポート行数（入力/出力の多い方。最低 1）。
+/// The number of port rows (the larger of input/output count; at least 1).
 fn rowCount(g: NodeGeom) f32 {
     const rows = @max(g.n_in, g.n_out);
     return @floatFromInt(@max(rows, 1));
 }
 
-/// ノードの world サイズ（幅固定・高さはポート数依存＝見切れ防止のため十分な高さ）。
-/// grid_rows>0（マクロ箱 / 選択中 standalone step_seq）は grid が収まる高さと比べて大きい方を採る。
-/// TASK-170: n_out>0 のノードは、ミニスコープ/パラメータ値の帯（MINI_H+MINI_GAP）を高さへ常時加算する
-/// （tap の有無で高さを変えない＝drag 中の cable 追従を不安定にしないため。tap されていない時は空帯）。
+/// A node's world-space size (fixed width; height depends on port count, tall enough to avoid clipping).
+/// When grid_rows>0 (a macro box or a selected standalone step_seq), the larger of the port height and the grid height is used.
+/// A node with n_out>0 always adds the mini-scope/parameter-value band (MINI_H+MINI_GAP) to its height
+/// (the height does not change with whether a tap is active, so cable tracking stays stable during drag; the band is empty when untapped).
 pub fn nodeSize(g: NodeGeom) Vec2f {
     const port_h = TITLE_H + PORT_SPACING * rowCount(g) + BODY_PAD;
     const base_h = if (g.grid_rows == 0) port_h else @max(port_h, TITLE_H + gridBlockHeight(g.grid_rows) + BODY_PAD);
@@ -185,13 +185,13 @@ pub fn nodeSize(g: NodeGeom) Vec2f {
     return .{ .x = NODE_W, .y = base_h + band };
 }
 
-/// 入力ポート i の world 中心（左辺）。
+/// The world-space center of input port i (on the left edge).
 pub fn inPortPos(g: NodeGeom, i: u8) Vec2f {
     const fi: f32 = @floatFromInt(i);
     return .{ .x = g.pos.x, .y = g.pos.y + TITLE_H + PORT_SPACING * (fi + 0.5) };
 }
 
-/// 出力ポート j の world 中心（右辺）。
+/// The world-space center of output port j (on the right edge).
 pub fn outPortPos(g: NodeGeom, j: u8) Vec2f {
     const fj: f32 = @floatFromInt(j);
     return .{ .x = g.pos.x + NODE_W, .y = g.pos.y + TITLE_H + PORT_SPACING * (fj + 0.5) };
@@ -214,7 +214,7 @@ fn findNode(nodes: []const NodeGeom, h: Handle) ?NodeGeom {
 }
 
 // ============================================================================
-// Camera（world <-> screen 変換）
+// Camera (world <-> screen transform)
 // ============================================================================
 pub const Camera = struct {
     pan: Vec2f = .{ .x = 0, .y = 0 },
@@ -227,10 +227,10 @@ pub const Camera = struct {
         return .{ .x = (s.x - c.pan.x) / c.zoom, .y = (s.y - c.pan.y) / c.zoom };
     }
 
-    /// カーソル下の world 点を固定したまま zoom する（zoom は [ZOOM_MIN,ZOOM_MAX] に clamp）。
+    /// Zooms while keeping the world point under the cursor fixed (zoom is clamped to [ZOOM_MIN,ZOOM_MAX]).
     pub fn zoomAt(c: *Camera, cursor_screen: Vec2f, factor: f32) void {
         const new_zoom = std.math.clamp(c.zoom * factor, ZOOM_MIN, ZOOM_MAX);
-        const eff = new_zoom / c.zoom; // clamp 後の実効倍率
+        const eff = new_zoom / c.zoom; // Effective scale after clamping
         c.pan = .{
             .x = cursor_screen.x - (cursor_screen.x - c.pan.x) * eff,
             .y = cursor_screen.y - (cursor_screen.y - c.pan.y) * eff,
@@ -238,17 +238,17 @@ pub const Camera = struct {
         c.zoom = new_zoom;
     }
 
-    /// ポートの screen 描画半径（zoom 0.25 で消えず zoom 4 で肥大しないよう clamp）。
+    /// A port's screen-space draw radius, clamped so it neither vanishes at zoom 0.25 nor bloats at zoom 4.
     pub fn portScreenRadius(c: Camera) f32 {
         return std.math.clamp(WORLD_PORT_R * c.zoom, PORT_R_MIN, PORT_R_MAX);
     }
 };
 
 // ============================================================================
-// ヒットテスト（world 座標で判定。呼び出し側で screenToWorld してから渡す）
+// Hit-testing (evaluated in world coordinates; the caller applies screenToWorld before calling)
 // ============================================================================
 
-/// world 点を含む最前面ノード（描画順の逆＝末尾優先）。
+/// The frontmost node containing a world point (reverse draw order, i.e. last wins).
 pub fn hitTestNode(world_pt: Vec2f, nodes: []const NodeGeom) ?Handle {
     var i: usize = nodes.len;
     while (i > 0) {
@@ -259,7 +259,7 @@ pub fn hitTestNode(world_pt: Vec2f, nodes: []const NodeGeom) ?Handle {
     return null;
 }
 
-/// world 点近傍のポート（当たり半径 = WORLD_PORT_R。最前面優先）。
+/// The port nearest a world point (hit radius = WORLD_PORT_R; frontmost wins).
 pub fn hitTestPort(world_pt: Vec2f, nodes: []const NodeGeom) ?PortRef {
     var i: usize = nodes.len;
     while (i > 0) {
@@ -278,14 +278,14 @@ pub fn hitTestPort(world_pt: Vec2f, nodes: []const NodeGeom) ?PortRef {
 }
 
 // ----------------------------------------------------------------------------
-// 折り畳みトグル [±]（TASK-40.7.1）: タイトル行右端の小矩形。group.zig の畳み箱・展開枠のヘッダーが
-// NodeGeom 形状で表現される前提で、位置決め/ヒットテストのみをここに置く（group.zig は modular 非依存の
-// ため合成 handle の意味は main.zig 側の責務。ここは純幾何）。
+// Collapse toggle [+/-]: a small rect at the right end of the title row. This assumes group.zig's collapsed box / expanded-frame header is
+// represented as a NodeGeom shape, and only places positioning/hit-testing here (since group.zig is modular-independent,
+// the meaning of a synthetic handle is main.zig's responsibility; this file is pure geometry).
 // ----------------------------------------------------------------------------
 pub const TOGGLE_SIZE: f32 = 14;
 pub const TOGGLE_MARGIN: f32 = 4;
 
-/// タイトル行内の折り畳みトグルの world 左上位置（ノード右端寄せ、固定 NODE_W 基準）。
+/// The world-space top-left position of the collapse toggle within the title row (right-aligned to the node, based on the fixed NODE_W).
 pub fn togglePos(g: NodeGeom) Vec2f {
     return .{ .x = g.pos.x + NODE_W - TOGGLE_SIZE - TOGGLE_MARGIN, .y = g.pos.y + (TITLE_H - TOGGLE_SIZE) / 2 };
 }
@@ -294,7 +294,7 @@ fn pointInToggle(world_pt: Vec2f, g: NodeGeom) bool {
     return pointInRect(world_pt, togglePos(g), .{ .x = TOGGLE_SIZE, .y = TOGGLE_SIZE });
 }
 
-/// world 点近傍のトグルを持つノード（最前面優先）。
+/// The node whose toggle is near a world point (frontmost wins).
 pub fn hitTestToggle(world_pt: Vec2f, nodes: []const NodeGeom) ?Handle {
     var i: usize = nodes.len;
     while (i > 0) {
@@ -306,23 +306,23 @@ pub fn hitTestToggle(world_pt: Vec2f, nodes: []const NodeGeom) ?Handle {
 }
 
 // ----------------------------------------------------------------------------
-// step grid レイアウト定数（マクロ箱 / 単体 step_seq 共通。TASK-40.7.2 / TASK-110.2）。
-// セル矩形とヒットテストは libs/gui.stepgrid が一元管理し、main.zig が camera 変換前後の
-// adapter を担当する。
+// Step-grid layout constants (shared by macro boxes and standalone step_seq).
+// Cell rects and hit-testing are centrally managed by libs/gui.stepgrid; main.zig acts as the adapter
+// before/after the camera transform.
 // ----------------------------------------------------------------------------
 pub const GRID_STEPS: u8 = 16;
-pub const GRID_SIDE_PAD: f32 = 10; // 左右マージン（左右ポート dot を避ける）
-pub const GRID_TOP_PAD: f32 = 4; // タイトル下からグリッド先頭までの余白
-pub const GRID_CELL_H: f32 = 8; // セル高
-pub const GRID_ROW_GAP: f32 = 2; // 行間
-/// マクロ箱タイトル帯の evolve/lock トグル（step grid と非衝突。TASK-160.2）。
+pub const GRID_SIDE_PAD: f32 = 10; // Left/right margin (avoids the left/right port dots)
+pub const GRID_TOP_PAD: f32 = 4; // Gap from below the title to the start of the grid
+pub const GRID_CELL_H: f32 = 8; // Cell height
+pub const GRID_ROW_GAP: f32 = 2; // Row spacing
+/// The evolve/lock toggles in a macro box's title band (do not collide with the step grid).
 pub const MACRO_MUT_TOGGLE_W: f32 = 12;
 pub const MACRO_MUT_TOGGLE_H: f32 = 10;
 pub const MACRO_MUT_TOGGLE_GAP: f32 = 4;
 
 pub const MacroToggleRect = struct { x: f32, y: f32, w: f32, h: f32 };
 
-/// box-local: evolve トグル矩形（タイトル帯左端。collapse [±] と非衝突）。
+/// Box-local: the evolve toggle rect (at the left end of the title band; does not collide with the collapse [+/-]).
 pub fn macroEvolveToggleRect() MacroToggleRect {
     return .{
         .x = GRID_SIDE_PAD,
@@ -332,30 +332,30 @@ pub fn macroEvolveToggleRect() MacroToggleRect {
     };
 }
 
-/// box-local: lane 番目の lock トグル（evolve の右に横並び）。
+/// Box-local: the lock toggle for the given lane (laid out to the right of evolve).
 pub fn macroLockToggleRect(lane: u8) MacroToggleRect {
     const e = macroEvolveToggleRect();
     const x = e.x + e.w + MACRO_MUT_TOGGLE_GAP + @as(f32, @floatFromInt(lane)) * (MACRO_MUT_TOGGLE_W + MACRO_MUT_TOGGLE_GAP);
     return .{ .x = x, .y = e.y, .w = MACRO_MUT_TOGGLE_W, .h = MACRO_MUT_TOGGLE_H };
 }
 
-/// トグル帯が step grid 原点より上にあること（衝突しない）を保証する判定。
+/// A check guaranteeing the toggle band sits above the step grid origin (no collision).
 pub fn macroToggleAboveGrid(r: MacroToggleRect) bool {
     return r.y + r.h <= TITLE_H + GRID_TOP_PAD - 0.5;
 }
 
-/// evolve + lock(n レーン分) トグル帯がタイトル帯左端から占有する幅（box-local）。
-/// タイトルテキストの描画 x をこの分だけ右へ逃がし、トグルとの視覚的な重なりを防ぐ
-/// （TASK-160.2 実装直後の実機フィードバックで発覚: トグルとタイトル文字が同じ x 帯に
-/// 描画され判読不能だった。n=0 なら 0 を返しテキストは従来どおり）。
+/// The width the evolve + lock (n lanes) toggle band occupies from the left end of the title band (box-local).
+/// The title text's draw x is offset to the right by this amount to avoid visually overlapping the toggles
+/// (without this, the toggles and title text land in the same x band and
+/// become unreadable; when n=0 this returns 0 and the text position is unchanged).
 pub fn macroToggleReservedWidth(n: u8) f32 {
     if (n == 0) return 0;
     const e = macroEvolveToggleRect();
     return e.x + e.w + MACRO_MUT_TOGGLE_GAP + @as(f32, @floatFromInt(n)) * (MACRO_MUT_TOGGLE_W + MACRO_MUT_TOGGLE_GAP);
 }
 
-/// stepgrid へ渡す前の box-local / screen grid 幾何。gui を import しない canvas 側でも、描画と
-/// hit-test が同じ定数を使う adapter の入力を単一化する。
+/// Box-local / screen grid geometry computed before handing off to stepgrid. Even on the canvas side, which does not import gui,
+/// this unifies the adapter input so drawing and hit-testing use the same constants.
 pub const GridGeometry = struct {
     origin_x: f32,
     origin_y: f32,
@@ -365,19 +365,19 @@ pub const GridGeometry = struct {
     row_pitch: f32,
 };
 
-/// 1 step の水平ピッチ（cell 幅 + gap 込み）。16 step が箱内幅に収まる。
+/// The horizontal pitch of one step (cell width plus gap). 16 steps fit within the box's inner width.
 pub fn gridStepWidth() f32 {
     return (NODE_W - 2 * GRID_SIDE_PAD) / @as(f32, @floatFromInt(GRID_STEPS));
 }
 
-/// タイトル下端からグリッド下端までの高さ（rows 行）。nodeSize の箱高さ拡張に使う。
+/// The height from the bottom of the title to the bottom of the grid, for the given row count. Used by nodeSize to extend the box height.
 pub fn gridBlockHeight(rows: u8) f32 {
     const fr: f32 = @floatFromInt(rows);
     return GRID_TOP_PAD + fr * (GRID_CELL_H + GRID_ROW_GAP);
 }
 
-/// ノード/マクロ箱共通の grid geometry。camera 変換済み origin / cell size / pitch。
-/// box-local の呼び出しでは box_pos = (0, 0)・zoom=1 を渡す。
+/// Grid geometry shared by nodes and macro boxes: camera-transformed origin / cell size / pitch.
+/// For a box-local call, pass box_pos = (0, 0) and zoom = 1.
 pub fn gridGeometry(cam: Camera, box_pos: Vec2f) GridGeometry {
     const top_left = cam.worldToScreen(box_pos);
     const step_pitch = gridStepWidth() * cam.zoom;
@@ -391,7 +391,7 @@ pub fn gridGeometry(cam: Camera, box_pos: Vec2f) GridGeometry {
     };
 }
 
-/// world 点近傍のケーブル（点と線分の距離 <= CABLE_HIT_SLOP）。edge index を返す。
+/// The cable near a world point (point-to-segment distance <= CABLE_HIT_SLOP). Returns an edge index.
 pub fn hitTestCable(world_pt: Vec2f, nodes: []const NodeGeom, edges: []const Edge) ?usize {
     var idx: usize = edges.len;
     while (idx > 0) {
@@ -412,7 +412,7 @@ fn dist(a: Vec2f, b: Vec2f) f32 {
     return @sqrt(dx * dx + dy * dy);
 }
 
-/// 点 p と線分 ab の距離。
+/// The distance from point p to segment ab.
 fn distPointSegment(p: Vec2f, a: Vec2f, b: Vec2f) f32 {
     const abx = b.x - a.x;
     const aby = b.y - a.y;
@@ -425,23 +425,23 @@ fn distPointSegment(p: Vec2f, a: Vec2f, b: Vec2f) f32 {
 }
 
 // ============================================================================
-// ミニ oscilloscope（TASK-40.8 D）: 出力ポート別の直近波形小窓の幾何 + tap 対象選択（純ロジック）。
-// 表示は 1 ノード 1 窓（out0 を代表）。ノード矩形の直下に screen 固定サイズで置き、ノード位置に追従する。
-// modular / dyn 非依存（global port id 解決は main.zig 側の責務）。
+// Mini oscilloscope: geometry for a small recent-waveform window per output port, plus tap-target selection (pure logic).
+// One window is shown per node (out0 is the representative), placed at a fixed screen size inside the node's rect near its bottom edge, and it tracks the node position.
+// Independent of modular / dyn (resolving the global port id is main.zig's responsibility).
 // ============================================================================
-pub const MINI_W: f32 = 64; // world 単位（TASK-170: screen 固定 px から world 単位へ変更。ノードの
-// 他の幾何(NODE_W 等)と同じ scale 前提に揃え、nodeSize() へ帯として組み込めるようにする）
-pub const MINI_H: f32 = 28; // world 単位
-pub const MINI_GAP: f32 = 4; // world 単位（ノード下端 - スコープ帯上端の内側マージン）
-pub const MINI_ZOOM_MIN: f32 = 0.5; // これ未満の zoom では非表示（視認不能な窓のため RT tap を払わない）
-/// selectTapPortsStable の候補一時バッファ上限（TASK-170）。呼び出し側の TAP_SLOTS(16) を
-/// 十分に超える固定値。canvas.zig は modular/dyn 非依存のため TAP_SLOTS を直接 import しない。
+pub const MINI_W: f32 = 64; // World units (changed from fixed screen px to world units, to align with the node's
+// other geometry (NODE_W etc.) under the same scale assumption, so it can be folded into nodeSize() as a band)
+pub const MINI_H: f32 = 28; // World units
+pub const MINI_GAP: f32 = 4; // World units (inner margin between the node's bottom edge and the top of the scope band)
+pub const MINI_ZOOM_MIN: f32 = 0.5; // Hidden below this zoom level (an unreadable window, so no RT tap is allocated for it)
+/// The upper bound of selectTapPortsStable's temporary candidate buffer. It comfortably exceeds
+/// the caller's TAP_SLOTS(16); canvas.zig does not import TAP_SLOTS directly since it is modular/dyn-independent.
 const MAX_TAP_CANDIDATES: usize = 32;
 
-/// ノード内側・下端に置くミニスコープ矩形（screen 座標）。TASK-170: ノード枠外ではなく枠内（下端から
-/// band=MINI_H+MINI_GAP 分だけ上）に描くよう変更。`node_tl_screen`/`node_size_screen` は呼び出し側で
-/// zoom 適用済み（screen 座標）、`MINI_W`/`MINI_H`/`MINI_GAP` は world 単位定数のためここで `zoom` を
-/// 乗じる（二重 scale/未 scale を避けるためこの関数内でのみ乗算する契約）。
+/// The mini-scope rect placed inside the node, near its bottom edge (screen coordinates). It is drawn inside the node frame rather than outside it (a band
+/// of MINI_H+MINI_GAP above the bottom edge). `node_tl_screen`/`node_size_screen` are already
+/// zoom-applied by the caller (screen coordinates), while `MINI_W`/`MINI_H`/`MINI_GAP` are world-unit constants, so `zoom` is
+/// multiplied in here (the contract is that this multiplication happens only inside this function, to avoid double- or un-scaling).
 pub fn miniScopeRect(node_tl_screen: Vec2f, node_size_screen: Vec2f, zoom: f32) ScreenRect {
     return .{
         .x = node_tl_screen.x,
@@ -451,24 +451,24 @@ pub fn miniScopeRect(node_tl_screen: Vec2f, node_size_screen: Vec2f, zoom: f32) 
     };
 }
 
-/// ミニスコープの表示開始 index（立ち上がりゼロ交差トリガ）。oldest→newest 並びの `samples` から、末尾 `disp`
-/// 点を表示するとき、その表示窓を「最新の rising zero-crossing」に揃えて周期波形を静止させる。交差が無い
-/// （＝gate/単極 cv のようにゼロを跨がない）場合は最新窓（= 非ロック・流れる表示）へ自然降格する。
-/// 返す start は必ず start+disp<=samples.len（呼び出し側の slice が安全）。
+/// The mini-scope's display start index (rising zero-crossing trigger). Given `samples` ordered oldest->newest, when showing the trailing `disp`
+/// points, the display window is aligned to the most recent rising zero-crossing so a periodic waveform appears still. If there is no crossing
+/// (e.g. a gate/unipolar CV signal that never crosses zero), it naturally falls back to the newest window (unlocked, scrolling display).
+/// The returned start always satisfies start+disp<=samples.len, so the caller's slice is safe.
 pub fn findTriggerStart(samples: []const f32, disp: usize) usize {
     const n = samples.len;
     if (disp >= n or disp < 2) return if (n > disp) n - disp else 0;
-    const newest = n - disp; // 非ロック時の開始（最新 disp 点）
+    const newest = n - disp; // Start when unlocked (the newest disp points)
     var t = newest;
     while (t > 0) : (t -= 1) {
-        if (samples[t - 1] < 0.0 and samples[t] >= 0.0) return t; // newest 以下で最も新しい rising 交差
+        if (samples[t - 1] < 0.0 and samples[t] >= 0.0) return t; // The most recent rising crossing at or before newest
     }
     return newest;
 }
 
-/// tap 候補か: 出力ポートを持ち、ノード矩形が viewport と交差する（TASK-170: ミニスコープはノード内側に
-/// 描くようになったため、完全内包ではなく「ノード自体が viewport と交差するか」のみを見る。下端付近で
-/// 一部だけ見えているノードも対象にする。vh はキャンバス有効高）。
+/// Whether a node is a tap candidate: it has an output port and its rect intersects the viewport (since the mini-scope is now drawn inside the node,
+/// this checks only whether the node itself intersects the viewport, not full containment. A node that is only
+/// partially visible near the bottom edge is still included. vh is the canvas's usable height).
 fn isTapCandidate(cam: Camera, vw: f32, vh: f32, g: NodeGeom) bool {
     if (g.n_out == 0) return false;
     if (cam.zoom < MINI_ZOOM_MIN) return false;
@@ -484,9 +484,9 @@ fn containsHandle(list: []const Handle, h: Handle) bool {
     return false;
 }
 
-/// ミニスコープ表示対象（＝tap 対象）のノード handle を優先度順に out へ最大 out.len 個選ぶ。
-/// zoom<MINI_ZOOM_MIN は 0 本（tap を張らない）。優先順位: selected > hover > nodes の並び順。
-/// 返す handle は display node の handle（collapsed 箱＝合成 handle 可。global port id 解決は呼び出し側）。
+/// Selects up to out.len node handles for mini-scope display (i.e. tap targets) into `out`, in priority order.
+/// At zoom<MINI_ZOOM_MIN, zero taps are selected. Priority order: selected > hover > the nodes list order.
+/// The returned handles are display-node handles (a collapsed box's synthetic handle is allowed; resolving the global port id is the caller's job).
 pub fn selectTapPorts(
     cam: Camera,
     vw: f32,
@@ -533,18 +533,18 @@ fn keptElsewhere(slots: []const ?Handle, h: Handle) bool {
     return false;
 }
 
-/// TASK-170: 安定版 tap 対象選択。`prev`（前回の各 slot の display handle。空きは null）のうち
-/// 今フレームも `isTapCandidate` を満たすものは**同じ slot 番号のまま**維持し、無関係な hover/selected
-/// の変化で巻き添えリセットしない（TASK-170 の実機フィードバックで発覚した回帰の根治）。
+/// Stable tap-target selection. Of `prev` (the previous display handle for each slot; empty slots are null),
+/// entries that still satisfy `isTapCandidate` this frame are kept **in the same slot number**, so unrelated hover/selected
+/// changes do not cause a collateral reset.
 ///
-/// **置換できるのは selected/hover のみ**（v2 修正。codex レビューで検出: 通常候補〈走査順のみで
-/// 選ばれる優先度の低い候補〉にも置換権を与えると、候補数が cap を超える環境で「今フレーム A・B が
-/// 通常候補 C・D に置換され、次フレームは C・D が A・B に置換され…」というフレーム間の永久
-/// ローテーションが起き、tap config の republish/RT リング reset が毎フレーム走ってしまう）。
-/// 空いた slot は selected > hover > nodes 走査順の優先度で新規候補を割り当てるが、**空き slot が無い
-/// 場合に既存の温存 slot を明け渡させて良いのは selected/hover だけ**（selected でも hover でもない
-/// 通常候補は、空きが無ければそのフレームでは表示されず脱落する＝安定第一）。
-/// `prev`/`out` は同じ長さ（呼び出し側の TAP_SLOTS 相当）。`out` は `prev` と別バッファでも同一でも良い。
+/// **Only selected/hover entries may be evicted.** Giving eviction rights to ordinary candidates too (those chosen
+/// only by scan order, with lower priority) would, once candidates exceed the cap, cause frame A/B to be
+/// evicted by ordinary candidates C/D one frame, then C/D evicted by A/B the next, and so on: a perpetual
+/// rotation across frames that would republish the tap config and reset the RT ring on every frame.
+/// Empty slots get new candidates assigned in priority order selected > hover > nodes scan order, but **when there is no empty slot,
+/// only selected/hover candidates may reclaim an existing retained slot** (an ordinary candidate that is
+/// neither selected nor hover is dropped for that frame if no slot is free; stability comes first).
+/// `prev`/`out` have the same length (matching the caller's TAP_SLOTS). `out` may be the same buffer as `prev` or a different one.
 pub fn selectTapPortsStable(
     cam: Camera,
     vw: f32,
@@ -563,7 +563,7 @@ pub fn selectTapPortsStable(
         return;
     }
 
-    // 1. 既存 slot の温存判定（slot 番号を維持する）。
+    // 1. Determine which existing slots are retained (keeping their slot numbers).
     for (prev, 0..) |maybe_h, idx| {
         out[idx] = null;
         if (maybe_h) |h| {
@@ -573,7 +573,7 @@ pub fn selectTapPortsStable(
         }
     }
 
-    // 2a. 優先候補（selected/hover のみ。既に温存された handle は除く）。最大2件。
+    // 2a. Priority candidates (selected/hover only, excluding already-retained handles). At most 2 entries.
     std.debug.assert(cap <= MAX_TAP_CANDIDATES);
     var priority: [2]Handle = undefined;
     var nprio: usize = 0;
@@ -596,7 +596,7 @@ pub fn selectTapPortsStable(
         }
     }
 
-    // 2b. 通常候補（nodes 走査順。優先候補・温存済み handle は除く。cap で切る）。
+    // 2b. Ordinary candidates (nodes scan order, excluding priority candidates and retained handles; capped).
     var plain: [MAX_TAP_CANDIDATES]Handle = undefined;
     var nplain: usize = 0;
     for (nodes) |g| {
@@ -609,15 +609,15 @@ pub fn selectTapPortsStable(
         }
     }
 
-    // 3. 空き slot への充填（優先候補 → 通常候補の順）。`locked` は「この呼び出し内で新規に
-    // 割り当てた slot」だけに立てる（step1 で温存された既存 slot は locked にしない＝引き続き
-    // 満杯時置換〈優先候補のみ〉の victim になれる。容量1で旧 hover を新 selected が置換する
-    // ケースはこの経路を通る）。
+    // 3. Fill empty slots (priority candidates first, then ordinary candidates). `locked` is set only on slots
+    // newly assigned within this call (slots retained in step 1 are not locked, so they can still be
+    // evicted, by a priority candidate only, when full. This is the path taken when a new selected
+    // replaces an old hover at capacity 1).
     var locked: [MAX_TAP_CANDIDATES]bool = [_]bool{false} ** MAX_TAP_CANDIDATES;
     var pi: usize = 0; // priority index
     var qi: usize = 0; // plain index
     for (out, 0..) |*o, idx| {
-        if (o.* != null) continue; // step1 で温存済み（locked にはしない）
+        if (o.* != null) continue; // Retained in step 1 (not locked)
         if (pi < nprio) {
             o.* = priority[pi];
             pi += 1;
@@ -625,10 +625,10 @@ pub fn selectTapPortsStable(
             o.* = plain[qi];
             qi += 1;
         } else continue;
-        locked[idx] = true; // 新規充填。直後の反復で同じ slot を再度置換しない
+        locked[idx] = true; // Newly filled. The same slot is not evicted again in a later iteration of this call
     }
 
-    // 4. 満杯時の置換（**優先候補のみ**。未割当の通常候補は空きが無ければ脱落する＝安定第一）。
+    // 4. Eviction when full (**priority candidates only**; unassigned ordinary candidates are dropped when there is no free slot, prioritizing stability).
     while (pi < nprio) {
         var victim: ?usize = null;
         for (out, 0..) |o, idx| {
@@ -639,23 +639,23 @@ pub fn selectTapPortsStable(
             victim = idx;
             break;
         }
-        const v = victim orelse break; // 置換対象なし（cap が selected+hover で埋まっている等）
+        const v = victim orelse break; // No eviction target (e.g. the cap is already filled by selected+hover)
         out[v] = priority[pi];
-        locked[v] = true; // 直後の反復で同じ slot を再度 victim にしない
+        locked[v] = true; // The same slot is not chosen as a victim again in a later iteration
         pi += 1;
     }
 }
 
 // ============================================================================
-// ビューポート内包判定（見切れ自動検出。TASK-43 教訓）
+// Viewport-containment check (automatic off-screen detection)
 // ============================================================================
 
 fn pointInViewport(p: Vec2f, vw: f32, vh: f32) bool {
     return p.x >= 0 and p.x <= vw and p.y >= 0 and p.y <= vh;
 }
 
-/// screen 空間で、全ノード矩形・全ポート円・全ケーブル端点が viewport [0,vw]x[0,vh] 内に収まるか。
-/// offscreen 件数を返す（0 = 見切れ無し）。初期／制御された代表配置での不変条件チェックに使う。
+/// Whether, in screen space, all node rects, port circles, and cable endpoints fit within the viewport [0,vw]x[0,vh].
+/// Returns the offscreen count (0 = nothing clipped). Used to check the invariant for initial or controlled representative layouts.
 pub fn viewportContains(cam: Camera, vw: f32, vh: f32, nodes: []const NodeGeom, edges: []const Edge) OffscreenCounts {
     var out = OffscreenCounts{};
     const r = cam.portScreenRadius();
@@ -689,7 +689,7 @@ fn portCircleInside(center: Vec2f, r: f32, vw: f32, vh: f32) bool {
 }
 
 // ============================================================================
-// tests（display/audio 不要。test-patch）
+// tests (no display/audio needed; test-patch)
 // ============================================================================
 const testing = std.testing;
 
@@ -717,12 +717,12 @@ test "canvas: zoomAt keeps cursor world point fixed" {
     c.zoomAt(cursor, 1.5);
     const w_after = c.screenToWorld(cursor);
     try expectApproxVec(w_before, w_after);
-    // clamp: 極端 zoom-in でも上限、zoom-out でも下限
+    // clamp: an upper bound even at extreme zoom-in, a lower bound even at zoom-out
     c.zoomAt(cursor, 100.0);
     try testing.expectApproxEqAbs(ZOOM_MAX, c.zoom, 1e-6);
     c.zoomAt(cursor, 0.0001);
     try testing.expectApproxEqAbs(ZOOM_MIN, c.zoom, 1e-6);
-    // clamp してもカーソル world 点は不変
+    // The world point under the cursor stays fixed even when clamped
     const w2 = c.screenToWorld(cursor);
     c.zoomAt(cursor, 2.0);
     try expectApproxVec(w2, c.screenToWorld(cursor));
@@ -731,13 +731,13 @@ test "canvas: zoomAt keeps cursor world point fixed" {
 test "canvas: hitTestNode inside/outside and topmost on overlap" {
     const nodes = [_]NodeGeom{
         .{ .handle = 0, .pos = .{ .x = 0, .y = 0 }, .n_in = 1, .n_out = 1 },
-        .{ .handle = 1, .pos = .{ .x = 50, .y = 20 }, .n_in = 2, .n_out = 1 }, // 0 と重なる
+        .{ .handle = 1, .pos = .{ .x = 50, .y = 20 }, .n_in = 2, .n_out = 1 }, // Overlaps with 0
     };
-    // 重なり領域は末尾（handle 1）が最前面
+    // In the overlap region, the last one (handle 1) is frontmost
     try testing.expectEqual(@as(?Handle, 1), hitTestNode(.{ .x = 60, .y = 30 }, &nodes));
-    // node0 だけの領域
+    // Region belonging only to node0
     try testing.expectEqual(@as(?Handle, 0), hitTestNode(.{ .x = 10, .y = 10 }, &nodes));
-    // どのノードにも無い
+    // Not inside any node
     try testing.expectEqual(@as(?Handle, null), hitTestNode(.{ .x = 500, .y = 500 }, &nodes));
 }
 
@@ -747,13 +747,13 @@ test "canvas: port positions lie on node edges within node rect" {
     var i: u8 = 0;
     while (i < g.n_in) : (i += 1) {
         const p = inPortPos(g, i);
-        try testing.expectApproxEqAbs(g.pos.x, p.x, 1e-4); // 左辺
+        try testing.expectApproxEqAbs(g.pos.x, p.x, 1e-4); // Left edge
         try testing.expect(p.y > g.pos.y and p.y < g.pos.y + sz.y);
     }
     var j: u8 = 0;
     while (j < g.n_out) : (j += 1) {
         const p = outPortPos(g, j);
-        try testing.expectApproxEqAbs(g.pos.x + NODE_W, p.x, 1e-4); // 右辺
+        try testing.expectApproxEqAbs(g.pos.x + NODE_W, p.x, 1e-4); // Right edge
         try testing.expect(p.y > g.pos.y and p.y < g.pos.y + sz.y);
     }
 }
@@ -764,17 +764,17 @@ test "canvas: hitTestPort / hitTestCable" {
         .{ .handle = 1, .pos = .{ .x = 200, .y = 0 }, .n_in = 1, .n_out = 0 },
     };
     const edges = [_]Edge{.{ .src_handle = 0, .src_out = 0, .dst_handle = 1, .dst_in = 0 }};
-    // node0 の出力ポート近傍
+    // Near node0's output port
     const op = outPortPos(nodes[0], 0);
     try testing.expect(hitTestPort(op, &nodes) != null);
     const pr = hitTestPort(op, &nodes).?;
     try testing.expectEqual(@as(Handle, 0), pr.handle);
     try testing.expect(!pr.is_input);
-    // ケーブル中点近傍
+    // Near the cable midpoint
     const ip = inPortPos(nodes[1], 0);
     const mid = Vec2f{ .x = (op.x + ip.x) / 2, .y = (op.y + ip.y) / 2 };
     try testing.expectEqual(@as(?usize, 0), hitTestCable(mid, &nodes, &edges));
-    // ケーブルから離れた点は当たらない
+    // A point far from the cable does not hit
     try testing.expectEqual(@as(?usize, null), hitTestCable(.{ .x = mid.x, .y = mid.y + 100 }, &nodes, &edges));
 }
 
@@ -785,18 +785,18 @@ test "canvas: hitTestToggle hits the toggle box and misses node body / outside" 
     const tp = togglePos(nodes[0]);
     const inside = Vec2f{ .x = tp.x + TOGGLE_SIZE / 2, .y = tp.y + TOGGLE_SIZE / 2 };
     try testing.expectEqual(@as(?Handle, 5), hitTestToggle(inside, &nodes));
-    // ノード内だがトグル外（左端付近）。
+    // Inside the node but outside the toggle (near the left edge).
     const node_body = Vec2f{ .x = nodes[0].pos.x + 5, .y = nodes[0].pos.y + 5 };
     try testing.expectEqual(@as(?Handle, null), hitTestToggle(node_body, &nodes));
-    // ノード外。
+    // Outside the node.
     try testing.expectEqual(@as(?Handle, null), hitTestToggle(.{ .x = 900, .y = 900 }, &nodes));
 }
 
 test "canvas: nodeSize grows for grid box (grid_rows>0) and matches gridBlockHeight" {
     const plain = NodeGeom{ .handle = 0, .pos = .{ .x = 0, .y = 0 }, .n_in = 1, .n_out = 1 };
     const box = NodeGeom{ .handle = 0, .pos = .{ .x = 0, .y = 0 }, .n_in = 1, .n_out = 1, .grid_rows = 2 };
-    try testing.expect(nodeSize(box).y > nodeSize(plain).y); // grid 行ぶん拡張
-    // 明示式と一致（port 高さより grid 高さが大きいケース）。TASK-170: n_out>0 の帯(MINI_H+MINI_GAP)込み。
+    try testing.expect(nodeSize(box).y > nodeSize(plain).y); // Extended by the grid row count
+    // Matches the explicit formula (case where the grid height exceeds the port height); includes the n_out>0 band (MINI_H+MINI_GAP).
     const expect_h = TITLE_H + gridBlockHeight(2) + BODY_PAD + MINI_H + MINI_GAP;
     try testing.expectApproxEqAbs(expect_h, nodeSize(box).y, 1e-4);
 }
@@ -804,9 +804,9 @@ test "canvas: nodeSize grows for grid box (grid_rows>0) and matches gridBlockHei
 test "canvas: nodeSize contains 1-row inline grid (drum standalone)" {
     const g = NodeGeom{ .handle = 0, .pos = .{ .x = 0, .y = 0 }, .n_in = 1, .n_out = 1, .grid_rows = 1 };
     const geom = gridGeometry(.{ .zoom = 1.0 }, g.pos);
-    const last_y = geom.origin_y + geom.cell_h; // row 0 下端
+    const last_y = geom.origin_y + geom.cell_h; // Bottom of row 0
     try testing.expect(last_y <= g.pos.y + nodeSize(g).y);
-    // port 高さと grid 高さの max（1 行 grid は port 高より低いことが多い）+ TASK-170 の n_out>0 帯。
+    // The max of port height and grid height (a 1-row grid is often shorter than the port height), plus the n_out>0 band.
     const port_h = TITLE_H + PORT_SPACING * 1.0 + BODY_PAD;
     const grid_h = TITLE_H + gridBlockHeight(1) + BODY_PAD;
     try testing.expectApproxEqAbs(@max(port_h, grid_h) + MINI_H + MINI_GAP, nodeSize(g).y, 1e-4);
@@ -815,10 +815,10 @@ test "canvas: nodeSize contains 1-row inline grid (drum standalone)" {
 test "canvas: nodeSize contains 4-row inline grid (bass standalone)" {
     const g = NodeGeom{ .handle = 0, .pos = .{ .x = 0, .y = 0 }, .n_in = 1, .n_out = 3, .grid_rows = 4 };
     const geom = gridGeometry(.{ .zoom = 1.0 }, g.pos);
-    // row 3 下端が node 下端以内
+    // The bottom of row 3 is within the node's bottom edge
     const last_y = geom.origin_y + 3.0 * geom.row_pitch + geom.cell_h;
     try testing.expect(last_y <= g.pos.y + nodeSize(g).y);
-    // bass は n_out=3 の port 高と 4 行 grid 高の max + TASK-170 の n_out>0 帯。
+    // For bass, the max of the n_out=3 port height and the 4-row grid height, plus the n_out>0 band.
     const port_h = TITLE_H + PORT_SPACING * 3.0 + BODY_PAD;
     const grid_h = TITLE_H + gridBlockHeight(4) + BODY_PAD;
     try testing.expectApproxEqAbs(@max(port_h, grid_h) + MINI_H + MINI_GAP, nodeSize(g).y, 1e-4);
@@ -827,7 +827,7 @@ test "canvas: nodeSize contains 4-row inline grid (bass standalone)" {
 test "canvas: gridGeometry is shared by macro box and standalone node positions" {
     const cam = Camera{ .pan = .{ .x = 12, .y = -4 }, .zoom = 1.5 };
     const pos = Vec2f{ .x = 160, .y = 470 };
-    // 同一 adapter・同一入力なら同一セル矩形（macro / standalone の意味差は呼び出し側のみ）。
+    // The same adapter and input always yield the same cell rect (the macro/standalone distinction is meaningful only to the caller).
     const a = gridGeometry(cam, pos);
     const b = gridGeometry(cam, pos);
     try testing.expectEqual(a.origin_x, b.origin_x);
@@ -836,7 +836,7 @@ test "canvas: gridGeometry is shared by macro box and standalone node positions"
     try testing.expectEqual(a.cell_h, b.cell_h);
     try testing.expectEqual(a.step_pitch, b.step_pitch);
     try testing.expectEqual(a.row_pitch, b.row_pitch);
-    // 代表セル中心が box 内（standalone 1 行 / macro 3 行とも同じ定数）
+    // A representative cell center falls inside the box (same constants for standalone 1-row and macro 3-row)
     const cx = a.origin_x + a.cell_w * 0.5;
     const cy = a.origin_y + a.cell_h * 0.5;
     try testing.expect(cx > pos.x * cam.zoom + cam.pan.x);
@@ -853,16 +853,16 @@ test "canvas: resolveConnection direction rules (self-loop allowed, same-dir rej
         try testing.expectEqual(@as(Handle, 1), rc.dst.handle);
         try testing.expect(!rc.src.is_input and rc.dst.is_input);
     }
-    // in→out（順不同でも src=出力）
+    // in->out (regardless of argument order, src is the output)
     {
         const rc = resolveConnection(in0, out0).?;
         try testing.expectEqual(@as(Handle, 0), rc.src.handle);
         try testing.expectEqual(@as(Handle, 1), rc.dst.handle);
     }
-    // out-out / in-in は無効
+    // out-out / in-in are invalid
     try testing.expect(resolveConnection(out0, .{ .handle = 2, .is_input = false, .index = 0 }) == null);
     try testing.expect(resolveConnection(in0, .{ .handle = 2, .is_input = true, .index = 1 }) == null);
-    // 同一ノードの out→in（別ポート = self-loop）は許可
+    // An out->in pair on the same node (a different port, i.e. a self-loop) is allowed
     {
         const s_out = PortRef{ .handle = 5, .is_input = false, .index = 0 };
         const s_in = PortRef{ .handle = 5, .is_input = true, .index = 1 };
@@ -882,10 +882,10 @@ test "canvas: hitTestPalette inside/outside" {
     try testing.expectEqual(@as(?u8, null), hitTestPalette(.{ .x = 500, .y = 30 }, &buttons));
 }
 
-test "canvas: miniScopeRect sits inside the node's bottom edge (TASK-170)" {
+test "canvas: miniScopeRect sits inside the node's bottom edge" {
     const tl = Vec2f{ .x = 100, .y = 50 };
     const zoom: f32 = 1.0;
-    // n_out>0 のノードは nodeSize() が既に帯込みなので、そのまま sz として渡す。
+    // For a node with n_out>0, nodeSize() already includes the band, so it is passed through as sz directly.
     const g = NodeGeom{ .handle = 0, .pos = .{ .x = 0, .y = 0 }, .n_in = 1, .n_out = 1 };
     const sz = nodeSize(g).scale(zoom);
     const r = miniScopeRect(tl, sz, zoom);
@@ -893,7 +893,7 @@ test "canvas: miniScopeRect sits inside the node's bottom edge (TASK-170)" {
     try testing.expectApproxEqAbs(tl.y + sz.y - (MINI_H + MINI_GAP) * zoom, r.y, 1e-4);
     try testing.expectApproxEqAbs(MINI_W * zoom, r.w, 1e-4);
     try testing.expectApproxEqAbs(MINI_H * zoom, r.h, 1e-4);
-    // ノードの内側（下端からはみ出さない）に収まること。
+    // It fits inside the node (does not spill past the bottom edge).
     try testing.expect(r.y >= tl.y);
     try testing.expect(r.y + r.h <= tl.y + sz.y + 1e-4);
     try testing.expect(r.x + r.w <= tl.x + sz.x + 1e-4);
@@ -916,32 +916,32 @@ test "canvas: selectTapPorts — priority selected>hover>order, cap, zoom gate, 
     const nodes = [_]NodeGeom{
         .{ .handle = 0, .pos = .{ .x = 40, .y = 60 }, .n_in = 0, .n_out = 1 },
         .{ .handle = 1, .pos = .{ .x = 260, .y = 60 }, .n_in = 1, .n_out = 1 },
-        .{ .handle = 2, .pos = .{ .x = 480, .y = 60 }, .n_in = 1, .n_out = 0 }, // 出力なし → 非候補
+        .{ .handle = 2, .pos = .{ .x = 480, .y = 60 }, .n_in = 1, .n_out = 0 }, // No output -> not a candidate
     };
     const cam = Camera{ .zoom = 1.0 };
     const vw: f32 = 800;
     const vh: f32 = 400;
     var out: [8]Handle = undefined;
-    // selected=1, hover=0 → [1, 0, ...残り順]。handle 2 は n_out=0 で除外。
+    // selected=1, hover=0 -> [1, 0, ...remaining order]. handle 2 is excluded since n_out=0.
     {
         const n = selectTapPorts(cam, vw, vh, &nodes, 1, 0, &out);
         try testing.expectEqual(@as(usize, 2), n);
-        try testing.expectEqual(@as(Handle, 1), out[0]); // selected 先頭
-        try testing.expectEqual(@as(Handle, 0), out[1]); // hover 次
+        try testing.expectEqual(@as(Handle, 1), out[0]); // selected comes first
+        try testing.expectEqual(@as(Handle, 0), out[1]); // hover comes next
     }
-    // 選択/hover なし → node 並び順（handle 2 除外）。
+    // No selection/hover -> node list order (handle 2 excluded).
     {
         const n = selectTapPorts(cam, vw, vh, &nodes, null, null, &out);
         try testing.expectEqual(@as(usize, 2), n);
         try testing.expectEqual(@as(Handle, 0), out[0]);
         try testing.expectEqual(@as(Handle, 1), out[1]);
     }
-    // zoom < MINI_ZOOM_MIN → 0 本。
+    // zoom < MINI_ZOOM_MIN -> zero taps.
     {
         const n = selectTapPorts(.{ .zoom = 0.3 }, vw, vh, &nodes, 1, 0, &out);
         try testing.expectEqual(@as(usize, 0), n);
     }
-    // cap: out 長 1 → 1 本（selected 優先）。
+    // cap: out length 1 -> 1 tap (selected takes priority).
     {
         var one: [1]Handle = undefined;
         const n = selectTapPorts(cam, vw, vh, &nodes, 1, 0, &one);
@@ -951,24 +951,24 @@ test "canvas: selectTapPorts — priority selected>hover>order, cap, zoom gate, 
 }
 
 test "canvas: findTriggerStart locks periodic signal to a rising zero crossing; free-runs otherwise" {
-    // 1 周期 64 サンプルの正弦を 3 周期ぶん。disp=64 の表示窓は rising 交差に揃う。
+    // A sine wave with a 64-sample period, spanning 3 periods. The disp=64 display window aligns to a rising crossing.
     var sine: [192]f32 = undefined;
     for (&sine, 0..) |*s, i| s.* = @sin(2.0 * std.math.pi * @as(f32, @floatFromInt(i)) / 64.0);
     const start = findTriggerStart(&sine, 64);
-    try testing.expect(start + 64 <= sine.len); // slice 安全
-    try testing.expect(sine[start - 1] < 0.0 and sine[start] >= 0.0); // rising 交差に揃う
-    // 単極（ゼロを跨がない）は交差無し → 最新窓（非ロック）へ降格。
+    try testing.expect(start + 64 <= sine.len); // Slice is safe
+    try testing.expect(sine[start - 1] < 0.0 and sine[start] >= 0.0); // Aligns to a rising crossing
+    // A unipolar signal (never crosses zero) has no crossing -> falls back to the newest window (unlocked).
     var uni: [192]f32 = undefined;
     for (&uni, 0..) |*s, i| s.* = 0.5 + 0.4 * @sin(2.0 * std.math.pi * @as(f32, @floatFromInt(i)) / 64.0);
     try testing.expectEqual(uni.len - 64, findTriggerStart(&uni, 64));
-    // disp>=n はロック不能 → 0（全窓表示）。
+    // disp>=n cannot lock -> 0 (the whole window is shown).
     try testing.expectEqual(@as(usize, 0), findTriggerStart(sine[0..32], 32));
 }
 
 test "canvas: selectTapPorts — offscreen node (out0 outside viewport) is not tapped" {
     const nodes = [_]NodeGeom{
         .{ .handle = 0, .pos = .{ .x = 40, .y = 60 }, .n_in = 0, .n_out = 1 },
-        .{ .handle = 1, .pos = .{ .x = 4000, .y = 60 }, .n_in = 0, .n_out = 1 }, // 画面外
+        .{ .handle = 1, .pos = .{ .x = 4000, .y = 60 }, .n_in = 0, .n_out = 1 }, // Off-screen
     };
     var out: [8]Handle = undefined;
     const n = selectTapPorts(.{ .zoom = 1.0 }, 800, 400, &nodes, null, null, &out);
@@ -977,28 +977,28 @@ test "canvas: selectTapPorts — offscreen node (out0 outside viewport) is not t
 }
 
 // ============================================================================
-// selectTapPortsStable（TASK-170）: hover/selected の切替で既存 slot が無関係に巻き添えリセット
-// されないことを固定する table test 群。
+// selectTapPortsStable: a table-test group pinning down that switching hover/selected does not
+// collaterally reset unrelated existing slots.
 // ============================================================================
 
-test "canvas: selectTapPortsStable —既存 slot は候補のままなら維持される（hover 切替の巻き添えなし）" {
+test "canvas: selectTapPortsStable — existing slots stay if still candidates (no collateral from hover changes)" {
     const nodes = [_]NodeGeom{
         .{ .handle = 0, .pos = .{ .x = 40, .y = 60 }, .n_in = 0, .n_out = 1 },
         .{ .handle = 1, .pos = .{ .x = 260, .y = 60 }, .n_in = 1, .n_out = 1 },
         .{ .handle = 2, .pos = .{ .x = 480, .y = 60 }, .n_in = 1, .n_out = 1 },
     };
     const cam = Camera{ .zoom = 1.0 };
-    // 前回: slot0=handle0（例えば以前 hover していたノード）。
+    // Previous: slot0=handle0 (e.g. a node that was hovered).
     var prev = [_]?Handle{ 0, null, null };
     var out: [3]?Handle = undefined;
-    // 今回 hover が handle2 に変わっても、handle0 は今も候補（isTapCandidate を満たす）なので
-    // slot0 のまま維持され、handle2 は空き slot（slot1）へ新規追加される。
+    // Even if hover now changes to handle2, handle0 still satisfies isTapCandidate, so it
+    // stays in slot0, and handle2 is newly added into the empty slot (slot1).
     selectTapPortsStable(cam, 800, 400, &nodes, null, 2, &prev, &out);
-    try testing.expectEqual(@as(?Handle, 0), out[0]); // 維持
-    try testing.expectEqual(@as(?Handle, 2), out[1]); // 新規（hover）
+    try testing.expectEqual(@as(?Handle, 0), out[0]); // Retained
+    try testing.expectEqual(@as(?Handle, 2), out[1]); // New (hover)
 }
 
-test "canvas: selectTapPortsStable — selected と hover が同時に新規候補でも両方表示される" {
+test "canvas: selectTapPortsStable — both selected and hover show when both are new candidates" {
     const nodes = [_]NodeGeom{
         .{ .handle = 0, .pos = .{ .x = 40, .y = 60 }, .n_in = 0, .n_out = 1 },
         .{ .handle = 1, .pos = .{ .x = 260, .y = 60 }, .n_in = 1, .n_out = 1 },
@@ -1020,38 +1020,38 @@ test "canvas: selectTapPortsStable — selected と hover が同時に新規候�
     try testing.expect(has2);
 }
 
-test "canvas: selectTapPortsStable — 容量1で旧 hover を新 selected が置換する" {
+test "canvas: selectTapPortsStable — with capacity 1, new selected replaces old hover" {
     const nodes = [_]NodeGeom{
         .{ .handle = 0, .pos = .{ .x = 40, .y = 60 }, .n_in = 0, .n_out = 1 },
         .{ .handle = 1, .pos = .{ .x = 260, .y = 60 }, .n_in = 1, .n_out = 1 },
     };
     const cam = Camera{ .zoom = 1.0 };
-    // 前回: slot0 = handle0（旧 hover が占有していた想定）。容量1のテスト用バッファ。
+    // Previous: slot0 = handle0 (assumed to have been occupied by the old hover). A capacity-1 test buffer.
     var prev = [_]?Handle{0};
     var out: [1]?Handle = undefined;
-    // 今回 selected=handle1（新規）、hover=null（旧 hover は外れた）。
+    // Now selected=handle1 (new), hover=null (the old hover is gone).
     selectTapPortsStable(cam, 800, 400, &nodes, 1, null, &prev, &out);
-    try testing.expectEqual(@as(?Handle, 1), out[0]); // 旧 handle0 を置換して選択が入る
+    try testing.expectEqual(@as(?Handle, 1), out[0]); // The old handle0 is evicted and the selection takes its place
 }
 
-test "canvas: selectTapPortsStable — 満杯時に selected と hover を両方置換する（同一 slot 二重上書きの回帰防止）" {
-    // 前回 slot0/slot1 を占有していた A・B は今回どちらも selected/hover ではない（=置換可能な
-    // 最低優先度）。selected=C・hover=D が両方新規候補で、容量が2しかない（空き slot 0個）ため
-    // 両方とも満杯時置換（step4）を通る。1つ目の置換で使った slot をすぐ2つ目の victim に選び直して
-    // しまうと、2つ目の slot（B）が手つかずのまま残り、1つ目の置換結果（C）まで消えてしまう回帰が
-    // あった（codex レビューで検出。`locked` による同一 slot 再選出防止で修正済み）。
+test "canvas: selectTapPortsStable — when full, replaces both selected and hover (no double-write same slot)" {
+    // A and B, which occupied slot0/slot1 previously, are now neither selected nor hover (i.e. they are at the
+    // lowest priority and thus evictable). selected=C and hover=D are both new candidates, and since capacity is only 2 (zero free slots),
+    // both go through the full-eviction path (step 4). If the slot used for the first eviction is immediately
+    // re-chosen as the victim for the second eviction, the second slot (B) is left untouched while the first
+    // eviction's result (C) is lost; `locked` prevents re-selecting the same slot to guard against this.
     const nodes = [_]NodeGeom{
-        .{ .handle = 0, .pos = .{ .x = 40, .y = 60 }, .n_in = 0, .n_out = 1 }, // A（旧・非選択非hover）
-        .{ .handle = 1, .pos = .{ .x = 260, .y = 60 }, .n_in = 1, .n_out = 1 }, // B（旧・非選択非hover）
-        .{ .handle = 2, .pos = .{ .x = 480, .y = 60 }, .n_in = 1, .n_out = 1 }, // C（新・selected）
-        .{ .handle = 3, .pos = .{ .x = 700, .y = 60 }, .n_in = 1, .n_out = 1 }, // D（新・hover）
+        .{ .handle = 0, .pos = .{ .x = 40, .y = 60 }, .n_in = 0, .n_out = 1 }, // A (old, neither selected nor hover)
+        .{ .handle = 1, .pos = .{ .x = 260, .y = 60 }, .n_in = 1, .n_out = 1 }, // B (old, neither selected nor hover)
+        .{ .handle = 2, .pos = .{ .x = 480, .y = 60 }, .n_in = 1, .n_out = 1 }, // C (new, selected)
+        .{ .handle = 3, .pos = .{ .x = 700, .y = 60 }, .n_in = 1, .n_out = 1 }, // D (new, hover)
     };
     const cam = Camera{ .zoom = 1.0 };
-    var prev = [_]?Handle{ 0, 1 }; // 前回: slot0=A, slot1=B（両方今回も isTapCandidate を満たす）
+    var prev = [_]?Handle{ 0, 1 }; // Previous: slot0=A, slot1=B (both still satisfy isTapCandidate this time)
     var out: [2]?Handle = undefined;
     selectTapPortsStable(cam, 800, 400, &nodes, 2, 3, &prev, &out);
-    // A・B はどちらも selected/hover ではないため両方置換対象になり、C（selected）・D（hover）が
-    // それぞれ別の slot へ正しく入る（二重上書きで C か D の片方が消えることがない）。
+    // Since neither A nor B is selected/hover, both are eviction targets, and C (selected) and D (hover)
+    // each correctly land in a separate slot (a double-overwrite that loses one of C or D does not happen).
     var has_selected = false;
     var has_hover = false;
     for (out) |m| {
@@ -1062,7 +1062,7 @@ test "canvas: selectTapPortsStable — 満杯時に selected と hover を両方
     }
     try testing.expect(has_selected);
     try testing.expect(has_hover);
-    // A・B（旧候補）はどちらも残っていない（両方置換された）。
+    // Neither A nor B (the old candidates) remains; both were evicted.
     for (out) |m| {
         if (m) |h| {
             try testing.expect(h != 0);
@@ -1071,27 +1071,27 @@ test "canvas: selectTapPortsStable — 満杯時に selected と hover を両方
     }
 }
 
-test "canvas: selectTapPortsStable — selected/hover 無しで通常候補が cap を超えても既存 slot を置換しない（フレーム間ローテーション回帰防止）" {
-    // v1 修正（同一 slot 二重上書き防止）だけでは、selected/hover が無い状態で候補数が cap を
-    // 超えると「今フレーム A・B → C・D、次フレーム C・D → A・B …」という永久ローテーションが
-    // 残っていた（codex 2回目レビューで検出）。通常候補（selected でも hover でもないもの）には
-    // 置換権を与えず、空き slot が無ければそのフレームでは脱落させることで、既存 slot は
-    // selected/hover が変化しない限り安定させる。
+test "canvas: selectTapPortsStable — without selected/hover, ordinary candidates past cap do not replace existing slots (no frame-to-frame rotation)" {
+    // The v1 fix alone (preventing a double overwrite of the same slot) is not enough: when there is no selected/hover
+    // and the candidate count exceeds the cap, a perpetual rotation remained (frame A/B -> C/D, next frame C/D -> A/B, ...).
+    // Ordinary candidates (neither selected nor hover) are
+    // not given eviction rights and are dropped for that frame when no slot is free, so that existing slots stay
+    // stable as long as selected/hover do not change.
     const nodes = [_]NodeGeom{
         .{ .handle = 0, .pos = .{ .x = 40, .y = 60 }, .n_in = 0, .n_out = 1 }, // A
         .{ .handle = 1, .pos = .{ .x = 260, .y = 60 }, .n_in = 1, .n_out = 1 }, // B
-        .{ .handle = 2, .pos = .{ .x = 480, .y = 60 }, .n_in = 1, .n_out = 1 }, // C（通常候補。selected/hover ではない）
-        .{ .handle = 3, .pos = .{ .x = 700, .y = 60 }, .n_in = 1, .n_out = 1 }, // D（同上）
+        .{ .handle = 2, .pos = .{ .x = 480, .y = 60 }, .n_in = 1, .n_out = 1 }, // C (an ordinary candidate, neither selected nor hover)
+        .{ .handle = 3, .pos = .{ .x = 700, .y = 60 }, .n_in = 1, .n_out = 1 }, // D (same as above)
     };
     const cam = Camera{ .zoom = 1.0 };
-    var prev = [_]?Handle{ 0, 1 }; // 前回: slot0=A, slot1=B
+    var prev = [_]?Handle{ 0, 1 }; // Previous: slot0=A, slot1=B
     var out: [2]?Handle = undefined;
-    // selected=null, hover=null。C・D は通常候補だが空き slot が無いので置換されない。
+    // selected=null, hover=null. C and D are ordinary candidates but are not admitted since no slot is free.
     selectTapPortsStable(cam, 800, 400, &nodes, null, null, &prev, &out);
     try testing.expectEqual(@as(?Handle, 0), out[0]);
     try testing.expectEqual(@as(?Handle, 1), out[1]);
 
-    // 「次フレーム」を模して out をそのまま prev として再度呼んでも、結果は不変（ローテーションしない）。
+    // Simulating the "next frame" by calling again with out reused as prev yields the same result (no rotation).
     var prev2 = out;
     var out2: [2]?Handle = undefined;
     selectTapPortsStable(cam, 800, 400, &nodes, null, null, &prev2, &out2);
@@ -1099,25 +1099,25 @@ test "canvas: selectTapPortsStable — selected/hover 無しで通常候補が c
     try testing.expectEqual(@as(?Handle, 1), out2[1]);
 }
 
-test "canvas: selectTapPortsStable と resolveTapPort 相当（handle 変化と port ID 変化の分離）" {
-    // selectTapPortsStable 自体は port ID を解決しない（呼び出し側=main.zig の責務）ため、
-    // ここでは「handle の安定化」と「実 port ID の変化検出」が別軸であることを、
-    // slot の handle 遷移パターンで固定する（handle が変わるケース／変わらないケースの両方を
-    // selectTapPortsStable のレベルで確認し、実 port ID 側の republish 判定は main.zig の
-    // updateViz が new_ports[]!=tap_ports[] で行う契約を plan として明記済み）。
+test "canvas: selectTapPortsStable vs resolveTapPort equivalent (handle change vs port-ID change are separate)" {
+    // selectTapPortsStable itself does not resolve port IDs (that is the caller's, i.e. main.zig's, responsibility), so
+    // here we pin down that "handle stabilization" and "detecting a change in the actual port ID" are separate axes,
+    // via the slot handle transition patterns (covering both the case where the handle changes and the case where it doesn't),
+    // confirmed at the selectTapPortsStable level. The republish decision on the actual port ID is
+    // made by main.zig's updateViz via new_ports[]!=tap_ports[].
     const nodes = [_]NodeGeom{
         .{ .handle = 0, .pos = .{ .x = 40, .y = 60 }, .n_in = 0, .n_out = 1 },
         .{ .handle = 1, .pos = .{ .x = 260, .y = 60 }, .n_in = 1, .n_out = 1 },
     };
     const cam = Camera{ .zoom = 1.0 };
-    // ケース A: handle が変わらない（同じノードが選択され続ける）→ slot0 は同じ handle を維持。
+    // Case A: the handle does not change (the same node stays selected) -> slot0 keeps the same handle.
     {
         var prev = [_]?Handle{0};
         var out: [1]?Handle = undefined;
         selectTapPortsStable(cam, 800, 400, &nodes, 0, null, &prev, &out);
         try testing.expectEqual(@as(?Handle, 0), out[0]);
     }
-    // ケース B: handle が変わる（selected が別ノードへ移る）→ slot0 の handle は新しい方に変わる。
+    // Case B: the handle changes (selected moves to a different node) -> slot0's handle changes to the new one.
     {
         var prev = [_]?Handle{0};
         var out: [1]?Handle = undefined;
@@ -1127,7 +1127,7 @@ test "canvas: selectTapPortsStable と resolveTapPort 相当（handle 変化と 
 }
 
 test "canvas: viewportContains — fit layout has zero offscreen at representative zoom" {
-    // 3 ノードを画面内に収まるよう配置。
+    // 3 nodes positioned so they fit on screen.
     const nodes = [_]NodeGeom{
         .{ .handle = 0, .pos = .{ .x = 40, .y = 60 }, .n_in = 0, .n_out = 1 },
         .{ .handle = 1, .pos = .{ .x = 260, .y = 60 }, .n_in = 2, .n_out = 1 },
@@ -1139,22 +1139,22 @@ test "canvas: viewportContains — fit layout has zero offscreen at representati
     };
     const vw: f32 = 800;
     const vh: f32 = 400;
-    // zoom=1（pan 0）で全て収まる
+    // All fit at zoom=1 (pan 0)
     {
         const oc = viewportContains(.{ .zoom = 1.0 }, vw, vh, &nodes, &edges);
         try testing.expectEqual(@as(u32, 0), oc.node);
         try testing.expectEqual(@as(u32, 0), oc.port);
         try testing.expectEqual(@as(u32, 0), oc.cable);
     }
-    // 見切れ検出: 大きく右へ pan するとノードが画面外へ → offscreen>0
+    // Off-screen detection: panning far to the right pushes nodes off-screen -> offscreen>0
     {
         const oc = viewportContains(.{ .pan = .{ .x = 700, .y = 0 }, .zoom = 1.0 }, vw, vh, &nodes, &edges);
         try testing.expect(oc.node > 0 or oc.port > 0 or oc.cable > 0);
     }
 }
 
-test "canvas: inspector param row は長いラベルでも value を content 幅内に収める" {
-    const avail: i32 = 260; // 典型的な Inspector content 幅（PanelHost right extent − padding）
+test "canvas: inspector param row keeps value within content width even with a long label" {
+    const avail: i32 = 260; // A typical inspector content width (PanelHost right extent minus padding)
     const longest_labels = [_]i32{
         8 * "cutoff_mod_oct (oct)".len,
         8 * "level_mod_depth".len,
@@ -1175,7 +1175,7 @@ test "canvas: inspector param row は長いラベルでも value を content 幅
 }
 
 // ============================================================================
-// 矩形選択（TASK-173.3）: 正規化・交差判定
+// Rectangle selection: normalization and intersection checks
 // ============================================================================
 
 test "canvas: normalizeWorldRect forward and reverse drag" {
@@ -1195,14 +1195,14 @@ test "canvas: normalizeWorldRect forward and reverse drag" {
 
 test "canvas: rectsIntersectPositive containment / partial / miss / edge / zero-size" {
     const node = WorldRect{ .x = 100, .y = 100, .w = 120, .h = 80 };
-    // 完全内包
+    // Full containment
     try testing.expect(rectsIntersectPositive(WorldRect{ .x = 90, .y = 90, .w = 200, .h = 200 }, node));
     try testing.expect(rectsIntersectPositive(node, WorldRect{ .x = 110, .y = 110, .w = 20, .h = 20 }));
-    // 部分交差
+    // Partial intersection
     try testing.expect(rectsIntersectPositive(WorldRect{ .x = 200, .y = 120, .w = 50, .h = 50 }, node));
-    // 非交差
+    // No intersection
     try testing.expect(!rectsIntersectPositive(WorldRect{ .x = 300, .y = 300, .w = 10, .h = 10 }, node));
-    // 境界接触のみ（面積 0）→ miss
+    // Boundary touch only (zero area) -> miss
     try testing.expect(!rectsIntersectPositive(WorldRect{ .x = 220, .y = 100, .w = 10, .h = 80 }, node));
     try testing.expect(!rectsIntersectPositive(WorldRect{ .x = 100, .y = 180, .w = 120, .h = 10 }, node));
     // zero-size → miss

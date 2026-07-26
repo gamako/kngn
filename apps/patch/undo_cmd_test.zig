@@ -1,5 +1,5 @@
-//! TASK-106.4 / TASK-150: CommandAdapter + PatchUndoStore 契約テスト（main.zig 非 import）。
-//! pattern/param/mute の値スナップ undo、ring overflow、no-op、redo epoch、履歴分類を固定する。
+//! Contract test for CommandAdapter + PatchUndoStore (does not import main.zig).
+//! Fixes value-snapshot undo for pattern/param/mute, ring overflow, no-op, redo epoch, and history classification.
 
 const std = @import("std");
 const testing = std.testing;
@@ -12,7 +12,7 @@ const MockPatch = struct {
     pattern: undo.PatternSnap = .{},
     tempo: f32 = 122.0,
     kick_mute: bool = false,
-    /// add_node / move_node の簡易状態（非 harness Executor 直行経路の回帰用）。
+    /// Simplified add_node / move_node state (for regression on the direct-to-Executor path bypassing harness).
     node_count: u32 = 0,
     last_move_id: u64 = 0,
     last_name: []const u8 = "",
@@ -30,7 +30,7 @@ const MockPatch = struct {
             return write(buf, "ok");
         }
         if (std.mem.eql(u8, name, "set_param")) {
-            // TASK-160.3: "#<id> <name> <value>" のみ（旧 Transport alias 2 トークンは拒否）。
+            // The legacy Transport alias (2 tokens) is rejected; only "#<id> <name> <value>" is accepted.
             var it = std.mem.tokenizeAny(u8, args, " \t");
             const id_tok = it.next() orelse return error.Empty;
             const pname = it.next() orelse return error.Empty;
@@ -67,7 +67,7 @@ const MockPatch = struct {
             return write(buf, "ok");
         }
         if (std.mem.eql(u8, name, "add_node")) {
-            // GUI palette / routeUiActionInto 非 netsync 分岐相当: registry 無しで Executor 直行。
+            // Equivalent to the GUI palette / routeUiActionInto non-netsync branch: goes straight to Executor with no registry.
             self.node_count += 1;
             const id: u64 = self.node_count;
             const ref = self.store.push(.{ .add_node = .{ .id = id, .kind_tag = 0, .x = 0, .y = 0 } });
@@ -91,7 +91,7 @@ const MockPatch = struct {
             return write(buf, "ok");
         }
         if (std.mem.eql(u8, name, "camera_pan")) {
-            // 非 undoable（camera/selection/panel 相当）
+            // Non-undoable (equivalent to camera/selection/panel)
             return write(buf, "ok");
         }
         return error.UnknownAction;
@@ -146,7 +146,7 @@ fn wireExec(app: *MockPatch, log: *command.CommandLog, exec: *command.Executor) 
     exec.adapter = .{ .ctx = app, .canUndo = MockPatch.canUndo, .applyUndo = MockPatch.applyUndo, .summarize = MockPatch.summarize };
 }
 
-/// History 行分類（main.zig historyCmdRowColor と対応）。
+/// History row classification (corresponds to main.zig's historyCmdRowColor).
 const HistoryRowClass = enum { normal, reverted, revert };
 
 fn classifyHistoryRow(kind: command.CommandKind, reverted: bool) HistoryRowClass {
@@ -156,8 +156,8 @@ fn classifyHistoryRow(kind: command.CommandKind, reverted: bool) HistoryRowClass
     };
 }
 
-/// main.zig `takePendingParamUndoBefore` と同契約の pending slot。
-/// param 名一致時のみ消費し、不一致なら pending を残す。
+/// Pending slot under the same contract as main.zig's `takePendingParamUndoBefore`.
+/// Only consumed when the param name matches; otherwise the pending value is retained.
 const PendingParamUndo = struct {
     pending: ?undo.ParamValueSnap = null,
 
@@ -356,7 +356,7 @@ test "history row class mapping" {
 }
 
 test "pending param before is not consumed by mismatched param name" {
-    // pending に param A (bpm) の before を積んだ状態で param B (cutoff) が来ても消費されない。
+    // With pending holding param A (bpm)'s before value, it is not consumed when param B (cutoff) arrives.
     var slot: PendingParamUndo = .{};
     var before_a = undo.ParamValueSnap{ .mode = 1, .node_id = 1 };
     before_a.setName("bpm");
@@ -377,9 +377,9 @@ test "pending param before is not consumed by mismatched param name" {
     try testing.expectEqual(@as(f32, 122.0), @as(f32, @bitCast(taken_a.?.value_bits)));
 }
 
-// main.zig `routeUiActionInto` の非 netsync 分岐相当: registry / router 無しで
-// `Executor.executeAction` 直行が add_node / set_param / move_node を成功させ CommandLog に記録する。
-// harness 無効時 registerAction が no-op でも GUI が UnknownAction にならない契約を固定する。
+// Equivalent to main.zig `routeUiActionInto`'s non-netsync branch: with no registry / router,
+// going straight to `Executor.executeAction` succeeds for add_node / set_param / move_node and records them in CommandLog.
+// Fixes the contract that when harness is disabled and registerAction is a no-op, the GUI still doesn't produce UnknownAction.
 test "non-harness routeUiAction path: Executor executeAction without registry" {
     var app: MockPatch = .{};
     var log: command.CommandLog = .{};
@@ -408,10 +408,10 @@ test "non-harness routeUiAction path: Executor executeAction without registry" {
     try testing.expectEqualStrings("move_node", log.latest().?.name());
     try testing.expect(log.latest().?.undoable);
 
-    // CommandLog に 3 件（いずれも registry を経由していない）
+    // 3 entries in CommandLog (none of them went through the registry)
     try testing.expectEqual(@as(u32, 3), log.filled);
 
-    // undo で move → set_param → add_node
+    // undo in order: move → set_param → add_node
     _ = try exec.undoOne(.local_user, &buf);
     _ = try exec.undoOne(.local_user, &buf);
     try testing.expectEqual(@as(f32, 122.0), app.tempo);

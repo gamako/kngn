@@ -1,12 +1,12 @@
-//! apps/patch の固定長 undo ペイロード store（TASK-106.4）。
+//! apps/patch: fixed-length undo payload store.
 //!
-//! ホットパス: **イベント時のみ**（GUI 操作 / action 適用の主スレッド経路）。フレーム毎ループにも
-//! RT（毎サンプル）経路にも一切乗らない。操作毎の allocator も mutex も持たず、固定容量の値型で完結する。
-//! store 本体（~1.16MiB）のみ起動時に heap 確保する（App スタック常駐を避け Windows 既定 1MB stack を守る）。
+//! Hot path: **event-time only** (the main-thread path for GUI operations / action application). Never runs on a
+//! per-frame loop or an RT (per-sample) path. Holds no per-operation allocator or mutex; self-contained with fixed-capacity value types.
+//! Only the store body (~1.16MiB) is heap-allocated at startup (avoids living on the App stack, preserving Windows' default 1MB stack).
 //!
-//! pattern/song は lofi.zig を import せず（synth/dsp を引き込む重依存を避けるため）、フィールド配置を
-//! ミラーした `PatternSnap` / `SongSnap` を持つ。main.zig 側で `lofi.PatternCommand` ⇄ `PatternSnap`、
-//! `lofi.SongData` ⇄ `SongSnap` を相互変換する。ModuleKind は `u8` タグとして保持する。
+//! pattern/song does not import lofi.zig (to avoid pulling in the heavy synth/dsp dependency); it holds
+//! `PatternSnap` / `SongSnap`, whose field layout mirrors it. main.zig converts between `lofi.PatternCommand` and `PatternSnap`,
+//! and between `lofi.SongData` and `SongSnap`. ModuleKind is kept as a `u8` tag.
 
 const std = @import("std");
 const group = @import("group.zig");
@@ -23,7 +23,7 @@ pub const MAX_CHAINS = 32;
 pub const MAX_CHAIN_LEN = 16;
 pub const MAX_SONG_ROWS = 64;
 
-/// lofi.PatternCommand のフィールドをミラーした snapshot（rev/quantize_bar 含む）。
+/// Snapshot mirroring lofi.PatternCommand's fields (includes rev/quantize_bar).
 pub const PatternSnap = struct {
     rev: u32 = 0,
     evolve: bool = true,
@@ -41,7 +41,7 @@ pub const PatternSnap = struct {
     quantize_bar: bool = false,
 };
 
-/// lofi.BassPhrase のミラー。
+/// Mirror of lofi.BassPhrase.
 pub const BassPhraseSnap = struct {
     on: u16 = 0,
     accent: u16 = 0,
@@ -49,13 +49,13 @@ pub const BassPhraseSnap = struct {
     deg: [16]i8 = [_]i8{0} ** 16,
 };
 
-/// lofi.Chain のミラー。
+/// Mirror of lofi.Chain.
 pub const ChainSnap = struct {
     entries: [MAX_CHAIN_LEN]u8 = [_]u8{0} ** MAX_CHAIN_LEN,
     len: u8 = 0,
 };
 
-/// lofi.SongRow のミラー。
+/// Mirror of lofi.SongRow.
 pub const SongRowSnap = struct {
     kick: u8 = 0,
     hat: u8 = 0,
@@ -63,7 +63,7 @@ pub const SongRowSnap = struct {
     bass: u8 = 0,
 };
 
-/// lofi.SongData のフィールドをミラーした snapshot（rev 含む）。
+/// Snapshot mirroring lofi.SongData's fields (includes rev).
 pub const SongSnap = struct {
     rev: u32 = 0,
     phrases_kick: [MAX_DRUM_PHRASES]u16 = [_]u16{0} ** MAX_DRUM_PHRASES,
@@ -123,7 +123,7 @@ pub const SeedSnap = struct {
 };
 
 pub const ParamValueSnap = struct {
-    /// 0 = legacy transport alias（TASK-160.3 で廃止・undo 復元は no-op）、1 = node override
+    /// 0 = legacy transport alias (removed; undo restore is a no-op), 1 = node override
     mode: u8 = 0,
     node_id: u64 = 0,
     name_buf: [MAX_UNDO_NAME]u8 = undefined,
@@ -263,19 +263,19 @@ pub const PatchUndoStore = struct {
     }
 };
 
-/// NodeId 生存 / free handle 容量を app 側から注入するためのフック（main.zig の patchCanUndo 用）。
+/// Hook for the app side to inject NodeId liveness / free-handle capacity (used by main.zig's patchCanUndo).
 pub const NodePresence = struct {
     ctx: *anyopaque,
     exists: *const fn (*anyopaque, u64) bool,
     free_handles: usize,
 };
 
-/// payload 種別ごとの canUndo 判定（構造系の衝突・生存・容量）。
-/// redo 後に新 id が付き、旧 id を指す古い undo payload はここが false を返す。
+/// canUndo judgment per payload kind (structural conflicts, liveness, capacity).
+/// After redo assigns a new id, an old undo payload pointing at the old id returns false here.
 pub fn canUndoPayload(payload: PatchUndoPayload, presence: NodePresence) bool {
     switch (payload) {
         .add_node => |s| {
-            // undo = remove: 対象が生きていること
+            // undo = remove: the target must be alive
             return presence.exists(presence.ctx, s.id);
         },
         .remove_node => |s| {
@@ -301,7 +301,7 @@ pub fn canUndoPayload(payload: PatchUndoPayload, presence: NodePresence) bool {
             return true;
         },
         .connect => |s| {
-            // undo = disconnect new + restore replaced: dst（と置換辺の端点）が生存していること
+            // undo = disconnect new + restore replaced: dst (and the endpoint of the replaced edge) must be alive
             if (!presence.exists(presence.ctx, s.new_edge.dst_id)) return false;
             var ri: u8 = 0;
             while (ri < s.replaced_count) : (ri += 1) {
@@ -325,7 +325,7 @@ pub fn canUndoPayload(payload: PatchUndoPayload, presence: NodePresence) bool {
     }
 }
 
-/// group.MacroKind → u8 タグ（AddMacroSnap/RemoveMacroSnap の kind に格納する用）。
+/// group.MacroKind → u8 tag (stored in AddMacroSnap/RemoveMacroSnap's kind).
 pub fn macroKindTag(kind: group.MacroKind) u8 {
     return @intFromEnum(kind);
 }
@@ -350,7 +350,7 @@ pub fn songContentEql(a: SongSnap, b: SongSnap) bool {
     return std.meta.eql(x, y);
 }
 
-/// storage 用に rev をクリアした copy を返す（差分検知の基準を rev 非依存にする）。
+/// Returns a copy with rev cleared for storage (making the diff-detection baseline rev-independent).
 pub fn patternForStore(p: PatternSnap) PatternSnap {
     var c = p;
     c.rev = 0;
@@ -367,7 +367,7 @@ test "entry size and capacity bounds" {
     const size = @sizeOf(PatchUndoEntry);
     try std.testing.expect(size < 64 * 1024);
     try std.testing.expectEqual(@as(usize, 128), MAX_UNDO);
-    // store 全体が App スタックに乗ると Windows 既定 1MB と衝突する規模
+    // The scale at which the whole store landing on the App stack would collide with Windows' default 1MB
     try std.testing.expect(@sizeOf(PatchUndoStore) > 512 * 1024);
     try std.testing.expect(@sizeOf(PatchUndoStore) < 2 * 1024 * 1024);
 }
@@ -477,7 +477,7 @@ test "canUndoPayload survival checks for connect disconnect move param" {
 }
 
 test "canUndoPayload rejects stale id after fresh-id redo scenario" {
-    // add→undo→redo で新 id が付き、旧 add_node / move の payload は死 id を指す
+    // After add→undo→redo, a new id is assigned, and the old add_node / move payload points at the dead id
     var alive = AliveSet{ .ids = &[_]u64{100}, .free = 8 }; // only new id after redo
     const presence = NodePresence{ .ctx = &alive, .exists = AliveSet.exists, .free_handles = alive.free };
     try std.testing.expect(!canUndoPayload(.{ .add_node = .{ .id = 31, .kind_tag = 0, .x = 0, .y = 0 } }, presence));

@@ -1,26 +1,26 @@
-//! apps/patch のオフライン WAV 書き出し（TASK-86）。
+//! apps/patch: offline WAV export.
 //!
-//! ホットパス宣言: イベント時のみ（`action render` / 単体テスト）。main thread で offline
-//! LofiPatch をチャンクループする。RT 再生経路（live patch の render / onAudioSamples）には
-//! 一切関与しない。
+//! Hot-path declaration: event-time only (`action render` / unit tests). Chunk-loops LofiPatch offline
+//! on the main thread. Never touches the RT playback path (live patch's render / onAudioSamples)
+//! at all.
 //!
-//! 設計: core/control/harness.zig の encodeWav（PCM16 RIFF/WAVE・44B ヘッダ・clamp*32767）を
-//! 手本に移植したストリーミング版。ヘッダは total_frames から事前計算して先に書き、
-//! `writeChunk` で f32 interleaved を i16 化して追記する。全バッファ確保（数百 MB）はしない。
-//! std のみ・kit/platform/modular 非依存。
+//! Design: a streaming port modeled on core/control/harness.zig's encodeWav (PCM16 RIFF/WAVE, 44B header,
+//! clamp*32767). Precomputes the header from total_frames and writes it first, then
+//! `writeChunk` converts f32 interleaved data to i16 and appends it. Never allocates a full buffer (hundreds of MB).
+//! std-only; independent of kit/platform/modular.
 
 const std = @import("std");
 
 pub const Error = error{
-    /// `finish` 時に書き込みフレーム数が `total_frames` と一致しない。
-    /// または `writeChunk` が total を超えようとしたとき（finish 前検出）。
+    /// The number of frames written at `finish` doesn't match `total_frames`.
+    /// Or `writeChunk` would exceed total (detected before finish).
     FrameCountMismatch,
-    /// data_size / byte_rate が RIFF u32 制約を超える（u64 計算後に検出。panic 回避）。
+    /// data_size / byte_rate exceed the RIFF u32 limit (detected after u64 computation, avoiding a panic).
     TooLong,
     WriteFailed,
 };
 
-/// PCM16 little-endian RIFF/WAVE を `*std.Io.Writer` へストリーミング書き込みする。
+/// Streams PCM16 little-endian RIFF/WAVE writes to a `*std.Io.Writer`.
 pub const WavWriter = struct {
     writer: *std.Io.Writer,
     channels: u32,
@@ -28,8 +28,8 @@ pub const WavWriter = struct {
     total_frames: u32,
     frames_written: u32 = 0,
 
-    /// ヘッダを先に書き、残りは `writeChunk` で埋める。
-    /// サイズは u64 で計算し、`36 + data_size > maxInt(u32)` なら `error.TooLong`。
+    /// Writes the header first, then fills the rest via `writeChunk`.
+    /// Sizes are computed as u64; returns `error.TooLong` if `36 + data_size > maxInt(u32)`.
     pub fn init(writer: *std.Io.Writer, channels: u32, sample_rate: u32, total_frames: u32) Error!WavWriter {
         const data_size_u64: u64 = @as(u64, total_frames) * @as(u64, channels) * 2;
         if (36 + data_size_u64 > std.math.maxInt(u32)) return error.TooLong;
@@ -62,9 +62,9 @@ pub const WavWriter = struct {
         };
     }
 
-    /// interleaved f32（-1..1）を PCM16 に変換して追記する。
-    /// `interleaved.len` は `channels` の倍数でなければならない。
-    /// total 超過は即 `error.FrameCountMismatch`（書き込まずに返す）。
+    /// Converts interleaved f32 (-1..1) to PCM16 and appends it.
+    /// `interleaved.len` must be a multiple of `channels`.
+    /// Exceeding total immediately returns `error.FrameCountMismatch` (without writing).
     pub fn writeChunk(self: *WavWriter, interleaved: []const f32) Error!void {
         std.debug.assert(self.channels > 0);
         std.debug.assert(interleaved.len % self.channels == 0);
@@ -82,7 +82,7 @@ pub const WavWriter = struct {
         self.frames_written += frames;
     }
 
-    /// 書き込みフレーム数と total の一致を検証し、writer を flush する。
+    /// Verifies the written frame count matches total and flushes the writer.
     pub fn finish(self: *WavWriter) Error!void {
         if (self.frames_written != self.total_frames) return error.FrameCountMismatch;
         self.writer.flush() catch return error.WriteFailed;
@@ -95,8 +95,8 @@ pub const WavWriter = struct {
 
 const testing = std.testing;
 
-test "WavWriter: PCM16 RIFF/WAVE ヘッダの byte offset を絶対値 assert" {
-    // 4 samples, 2ch → 2 frames（harness encodeWav テストと同型）
+test "WavWriter: PCM16 RIFF/WAVE header byte offsets asserted as absolute values" {
+    // 4 samples, 2ch → 2 frames (same shape as the harness encodeWav test)
     var aw: std.Io.Writer.Allocating = .init(testing.allocator);
     defer aw.deinit();
     var ww = try WavWriter.init(&aw.writer, 2, 48000, 2);
@@ -120,7 +120,7 @@ test "WavWriter: PCM16 RIFF/WAVE ヘッダの byte offset を絶対値 assert" {
     try testing.expectEqual(@as(u32, 8), std.mem.readInt(u32, bytes[40..44], .little)); // data_size
 }
 
-test "WavWriter: 既知サンプルの i16 変換（clamp * 32767）" {
+test "WavWriter: known-sample i16 conversion (clamp * 32767)" {
     var aw: std.Io.Writer.Allocating = .init(testing.allocator);
     defer aw.deinit();
     // mono 3 samples: 1.0 / -1.0 / 0.5
@@ -134,28 +134,28 @@ test "WavWriter: 既知サンプルの i16 変換（clamp * 32767）" {
     try testing.expectEqual(@as(i16, 16383), std.mem.readInt(i16, bytes[48..50], .little)); // 0.5*32767
 }
 
-test "WavWriter: total_frames 不一致で FrameCountMismatch" {
+test "WavWriter: total_frames mismatch yields FrameCountMismatch" {
     var aw: std.Io.Writer.Allocating = .init(testing.allocator);
     defer aw.deinit();
     var ww = try WavWriter.init(&aw.writer, 2, 48000, 4);
-    // 2 frames only（total は 4）
+    // 2 frames only (total is 4)
     try ww.writeChunk(&[_]f32{ 0, 0, 0, 0 });
     try testing.expectError(error.FrameCountMismatch, ww.finish());
 }
 
-test "WavWriter: writeChunk が total 超過なら即 FrameCountMismatch" {
+test "WavWriter: writeChunk exceeding total yields FrameCountMismatch immediately" {
     var aw: std.Io.Writer.Allocating = .init(testing.allocator);
     defer aw.deinit();
     var ww = try WavWriter.init(&aw.writer, 2, 48000, 2);
     try ww.writeChunk(&[_]f32{ 0, 0, 0, 0 }); // 2 frames = total
-    // これ以上書けない
+    // Cannot write any more
     try testing.expectError(error.FrameCountMismatch, ww.writeChunk(&[_]f32{ 0, 0, 0, 0 }));
-    try ww.finish(); // frames_written == total のまま finish 可
+    try ww.finish(); // Can finish while frames_written == total
 }
 
-test "WavWriter: data_size が RIFF u32 上限超過なら TooLong" {
+test "WavWriter: data_size exceeding the RIFF u32 limit yields TooLong" {
     var aw: std.Io.Writer.Allocating = .init(testing.allocator);
     defer aw.deinit();
-    // stereo: data_size = total_frames * 2 * 2。maxInt(u32) frames は 36+data が u32 超過。
+    // stereo: data_size = total_frames * 2 * 2. At maxInt(u32) frames, 36+data exceeds u32.
     try testing.expectError(error.TooLong, WavWriter.init(&aw.writer, 2, 48000, std.math.maxInt(u32)));
 }

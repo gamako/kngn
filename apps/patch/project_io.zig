@@ -1,27 +1,27 @@
-//! apps/patch 統合プロジェクト直列化（TASK-105.4 / TASK-143 / TASK-106.2）。
+//! apps/patch: unified project serialization.
 //!
-//! libs/serde の versioned container に次の chunk を載せる（magic = `VPRJ`、schema_version=2）:
-//!   - SPRM: scalar Params（既存 MPRJ フラットパッカー）
-//!   - PTRN: grid/303 pattern（PatternPayload 33B）
-//!   - SEED: base_seed + notation_seed + notation_counter（20B）
-//!   - SONG: Phrase/Chain/Song（1890B）
-//!   - NODE×N / EDGE×M: 生グラフ（既存 PTCG の 11B/6B layout）
-//!   - NPRM: per-node DSP parameter（descriptor name + scalar/choice。任意 chunk）
-//!   - NIDM: next_node_id（schema 2。TASK-106.2）
-//!   - NREF: saved_handle ↔ NodeId 対応（schema 2。TASK-106.2）
-//!   - LEDG: group.Ledger 全体（固定長）
-//!   - GENR: LofiPatch 生成 role → 保存 handle 対応（統合形式のみ）
+//! Chunks placed in a libs/serde versioned container (magic = `VPRJ`, schema_version=2):
+//!   - SPRM: scalar Params (the existing MPRJ flat packer)
+//!   - PTRN: grid/303 pattern (PatternPayload, 33B)
+//!   - SEED: base_seed + notation_seed + notation_counter (20B)
+//!   - SONG: Phrase/Chain/Song (1890B)
+//!   - NODE x N / EDGE x M: the raw graph (the existing PTCG 11B/6B layout)
+//!   - NPRM: per-node DSP parameters (descriptor name + scalar/choice; an optional chunk)
+//!   - NIDM: next_node_id (schema 2)
+//!   - NREF: the saved_handle <-> NodeId mapping (schema 2)
+//!   - LEDG: the entire group.Ledger (fixed length)
+//!   - GENR: LofiPatch's generation-role -> saved-handle mapping (unified format only)
 //!
-//! writer は VPRJ のみ。reader は VPRJ + 旧 MDLP / MPRJ / PTCG を自動判定する。
-//! schema 1（NIDM/NREF 無し）は node 出現順の決定的 fallback 採番。
+//! The writer emits only VPRJ. The reader auto-detects VPRJ plus the legacy MDLP / MPRJ / PTCG formats.
+//! Schema 1 (no NIDM/NREF) falls back to deterministic numbering by node appearance order.
 //!
-//! **ModuleKind 互換**: enum ordinal は永続化の一部。新 kind は末尾追加のみ。
-//! 並べ替え・削除・名前変更は禁止。未知 ordinal は NODE 単位で skip（PTCG 互換）。
+//! **ModuleKind compatibility**: the enum ordinal is part of the persisted format. New kinds may only be appended at the end.
+//! Reordering, deleting, or renaming is forbidden. An unknown ordinal is skipped per NODE (for PTCG compatibility).
 //!
-//! **循環 import 回避**: Params/SongData/LofiPatch は import しない。
-//! Ledger は group.Ledger、graph は graph_io の NodeEntry/EdgeEntry で受け渡し。
+//! **Avoiding a circular import**: Params/SongData/LofiPatch are not imported.
+//! The Ledger is passed as group.Ledger; the graph is passed as graph_io's NodeEntry/EdgeEntry.
 //!
-//! ホットパス宣言: encode/decode/save/load は **イベント時のみ**。RT 経路には触れない。
+//! Hot-path declaration: encode/decode/save/load run **only at event time**. They never touch the RT path.
 
 const std = @import("std");
 const serde = @import("serde");
@@ -30,11 +30,11 @@ const pattern_io = @import("pattern_io.zig");
 const graph_io = @import("graph_io.zig");
 const group = @import("group.zig");
 
-/// 'VPRJ'（video-proto project）little-endian u32。
+/// 'VPRJ' (video-proto project), a little-endian u32.
 pub const magic: u32 = @as(u32, 'V') | (@as(u32, 'P') << 8) | (@as(u32, 'R') << 16) | (@as(u32, 'J') << 24);
-/// 旧 MPRJ magic（読込互換のみ。writer は使わない）。
+/// The legacy MPRJ magic (read compatibility only; the writer never emits it).
 pub const mprj_magic: u32 = @as(u32, 'M') | (@as(u32, 'P') << 8) | (@as(u32, 'R') << 16) | (@as(u32, 'J') << 24);
-/// schema 2 = NIDM/NREF（TASK-106.2）。読込は 1 も受理（fallback 採番）。
+/// schema 2 means NIDM/NREF are present. The reader also accepts schema 1 (falling back to numbering).
 pub const schema_version: u16 = 2;
 pub const schema_version_v1: u16 = 1;
 
@@ -51,16 +51,16 @@ const TAG_LEDG: [4]u8 = "LEDG".*;
 const TAG_GENR: [4]u8 = "GENR".*;
 
 pub const NPRM_VERSION: u16 = 1;
-/// DynGraph 枠（group.GROUP_HANDLE_BASE == modular.dyn.MAX_MODULES）。
+/// The DynGraph frame (group.GROUP_HANDLE_BASE == modular.dyn.MAX_MODULES).
 pub const MAX_NPRM_NODES: usize = group.GROUP_HANDLE_BASE;
-/// descriptor 数の実用上界（params.zig の uniqueness 検査と同規模）。
+/// A practical upper bound on the descriptor count (on the same scale as params.zig's uniqueness check).
 pub const MAX_PARAMS_PER_NODE: usize = 64;
 pub const VALUE_KIND_SCALAR: u8 = 0;
 pub const VALUE_KIND_CHOICE: u8 = 1;
 
 pub const NodeId = graph_io.NodeId;
 
-/// NREF の 1 エントリ（保存時 runtime handle ↔ 安定 NodeId）。
+/// One NREF entry: the save-time runtime handle <-> the stable NodeId.
 pub const NodeIdRef = struct {
     saved_handle: u16,
     id: NodeId,
@@ -102,10 +102,10 @@ pub const NodeEntry = graph_io.NodeEntry;
 pub const EdgeEntry = graph_io.EdgeEntry;
 pub const Handle = graph_io.Handle;
 
-/// 存在しない role の sentinel（DynGraph.isActive(0xffff)==false）。
+/// The sentinel for a nonexistent role (DynGraph.isActive(0xffff)==false).
 pub const INVALID_ROLE_HANDLE: u16 = 0xffff;
 
-/// LofiPatch 生成 role の固定順（GENR payload）。追加は末尾のみ。
+/// The fixed order of LofiPatch generation roles (the GENR payload). New roles may only be appended at the end.
 pub const GenRole = enum(u8) {
     clock,
     kick_seq,
@@ -152,7 +152,7 @@ pub const GenRoleHandles = struct {
     }
 };
 
-/// NPRM の 1 parameter（name は encode 時は呼び出し側 lifetime、Decoded 内では gpa ownership）。
+/// One NPRM parameter (name has the caller's lifetime during encode; inside Decoded it is gpa-owned).
 pub const NodeParam = struct {
     name: []const u8,
     value_kind: u8,
@@ -160,7 +160,7 @@ pub const NodeParam = struct {
     value: u32,
 };
 
-/// NPRM の 1 node 分。
+/// One node's worth of NPRM.
 pub const NodeParamRecord = struct {
     saved_handle: u16,
     params: []const NodeParam,
@@ -173,20 +173,20 @@ const SEED_SIZE: usize = 20;
 const SONG_SIZE: usize = 1890;
 const GENR_SIZE: usize = GenRole.count * 2;
 // LEDG: group_of[GROUP_HANDLE_BASE]u8 + groups[MAX_GROUPS] * (16 header + 8*13*2 exposed)
-// 既定 N=48 では 48 + 8*224 = 1840。N は -Dmax-modules で可変（TASK-146）。
+// At the default N=48, this is 48 + 8*224 = 1840. N is configurable via -Dmax-modules.
 const LEDG_GROUP_SIZE: usize = 224;
 const LEDG_SIZE: usize = group.GROUP_HANDLE_BASE + group.MAX_GROUPS * LEDG_GROUP_SIZE;
 
 comptime {
     if (GenRole.count != 30) @compileError("GENR role count changed; update schema or tests");
-    // 公式の自己整合 + 既定 N=48 の既知サイズ固定（N 可変時は公式のみ）。
+    // Self-consistency of the formula, plus a fixed known size at the default N=48 (only the formula applies when N varies).
     if (LEDG_SIZE != group.GROUP_HANDLE_BASE + group.MAX_GROUPS * LEDG_GROUP_SIZE)
         @compileError("LEDG size formula mismatch");
     if (group.GROUP_HANDLE_BASE == 48 and LEDG_SIZE != 1840)
         @compileError("LEDG size mismatch for default N=48");
 }
 
-// ── scalar Params パッカー ───────────────────────────────────────────────────
+// -- scalar Params packer --
 
 fn fieldSize(comptime T: type) usize {
     if (T == f32 or T == usize) return 4;
@@ -440,7 +440,7 @@ fn validateSong(s: SongPayload, loop_raw: u8) error{CorruptSong}!void {
     }
 }
 
-// ── NODE / EDGE（PTCG layout 再利用）─────────────────────────────────────────
+// -- NODE / EDGE (reusing the PTCG layout) --
 
 fn packNode(n: NodeEntry, out: *[NODE_SIZE]u8) void {
     std.mem.writeInt(u16, out[0..2], n.handle, .little);
@@ -597,7 +597,7 @@ fn unpackLedger(bytes: []const u8) error{ CorruptLedger, NonFiniteField }!group.
             off += 13;
         }
         if (g.active) {
-            // exposed の member は group_of と整合（先頭 n_* 件のみ検証）
+            // An exposed member is consistent with group_of (only the first n_* entries are validated)
             var i: u8 = 0;
             while (i < g.n_in) : (i += 1) {
                 const m = g.exposed_in[i].member;
@@ -611,7 +611,7 @@ fn unpackLedger(bytes: []const u8) error{ CorruptLedger, NonFiniteField }!group.
             }
         }
     }
-    // group_of が指す group は active であること
+    // The group referenced by group_of must be active
     for (ledger.group_of) |gid_opt| {
         if (gid_opt) |gid| {
             if (!ledger.groups[gid].active) return error.CorruptLedger;
@@ -620,7 +620,7 @@ fn unpackLedger(bytes: []const u8) error{ CorruptLedger, NonFiniteField }!group.
     return ledger;
 }
 
-/// 旧 handle → 新 handle 対応で Ledger を remap する（slot/順序/座標はそのまま）。
+/// Remaps the Ledger using an old-handle -> new-handle mapping (slots, order, and coordinates are left unchanged).
 pub fn remapLedger(src: *const group.Ledger, mapping: *const [group.GROUP_HANDLE_BASE]?Handle) error{CorruptLedger}!group.Ledger {
     var out: group.Ledger = .{};
     out.groups = src.groups;
@@ -666,7 +666,7 @@ fn unpackGenr(bytes: []const u8) error{CorruptGenr}!GenRoleHandles {
     return g;
 }
 
-/// mapping で GENR handles を remap。INVALID はそのまま。未対応 handle は INVALID へ落とす。
+/// Remaps GENR handles via the mapping. INVALID is left unchanged; an unmapped handle is downgraded to INVALID.
 pub fn remapGenr(src: GenRoleHandles, mapping: *const [group.GROUP_HANDLE_BASE]?Handle) GenRoleHandles {
     var out: GenRoleHandles = .{};
     for (src.handles, 0..) |h, i| {
@@ -802,9 +802,9 @@ fn unpackNprm(gpa: std.mem.Allocator, payload: []const u8) ![]NodeParamRecord {
     return try records.toOwnedSlice(gpa);
 }
 
-/// NODE の kind を参照し、既知 descriptor について `modular.validateParam`（= setParam 同一判定）で検証する。
-/// 未知 name は skip。saved_handle が NODE に無い / 範囲外は skip。
-/// clearGraph 前に呼ぶ（不正値で graph を壊さない）。
+/// Looks at each NODE's kind and validates known descriptors via `modular.validateParam` (the same check as setParam).
+/// An unknown name is skipped. A saved_handle that is missing from NODE or out of range is skipped.
+/// Call this before clearGraph, so an invalid value never corrupts the graph.
 pub fn validateNodeParams(nodes: []const NodeEntry, records: []const NodeParamRecord) DecodeError!void {
     var kinds = [_]?graph_io.ModuleKind{null} ** MAX_NPRM_NODES;
     for (nodes) |n| {
@@ -840,7 +840,7 @@ comptime {
     }
 }
 
-// ── NIDM / NREF（TASK-106.2）────────────────────────────────────────────────
+// -- NIDM / NREF --
 
 const NIDM_SIZE: usize = 8;
 const NREF_ENTRY_SIZE: usize = 10; // handle u16 + id u64
@@ -890,7 +890,7 @@ fn unpackNref(gpa: std.mem.Allocator, payload: []const u8) ![]NodeIdRef {
     return refs;
 }
 
-/// NREF と nodes / next_node_id の整合を検証する。
+/// Validates that NREF is consistent with nodes / next_node_id.
 pub fn validateNodeIdRefs(nodes: []const NodeEntry, refs: []const NodeIdRef, next_node_id: u64) DecodeError!void {
     if (next_node_id == 0) return error.CorruptNidm;
     var seen_handle = [_]bool{false} ** MAX_NPRM_NODES;
@@ -904,7 +904,7 @@ pub fn validateNodeIdRefs(nodes: []const NodeEntry, refs: []const NodeIdRef, nex
     for (refs) |r| {
         if (r.id.raw() == 0) return error.CorruptNref;
         if (r.saved_handle >= MAX_NPRM_NODES or !seen_handle[r.saved_handle]) return error.CorruptNref;
-        if (used_saved[r.saved_handle]) return error.CorruptNref; // bijection: saved_handle 二重使用禁止
+        if (used_saved[r.saved_handle]) return error.CorruptNref; // bijection: a saved_handle must not be used twice
         used_saved[r.saved_handle] = true;
         var j: usize = 0;
         while (j < id_n) : (j += 1) {
@@ -915,12 +915,12 @@ pub fn validateNodeIdRefs(nodes: []const NodeEntry, refs: []const NodeIdRef, nex
         id_n += 1;
         if (r.id.raw() > max_id) max_id = r.id.raw();
     }
-    // 全 node に対応する ref が必要（空グラフは refs 空で可）
+    // Every node needs a corresponding ref (an empty graph may have empty refs)
     if (refs.len != nodes.len) return error.CorruptNref;
     if (next_node_id <= max_id) return error.CorruptNidm;
 }
 
-/// schema 1 / PTCG: node 出現順で NodeId を採番し、refs と next を返す（caller が free）。
+/// schema 1 / PTCG: assigns NodeIds by node appearance order, returning refs and next (caller frees them).
 pub fn buildFallbackNodeIdRefs(gpa: std.mem.Allocator, nodes: []const NodeEntry) !struct { refs: []NodeIdRef, next: u64 } {
     const refs = try gpa.alloc(NodeIdRef, nodes.len);
     errdefer gpa.free(refs);
@@ -945,12 +945,12 @@ pub fn Decoded(comptime P: type) type {
         nodes: []NodeEntry,
         edges: []EdgeEntry,
         node_params: []NodeParamRecord,
-        /// saved_handle → NodeId（nodes と同順とは限らない。gpa 所有）。
+        /// saved_handle -> NodeId (not necessarily in the same order as nodes; gpa-owned).
         node_id_refs: []NodeIdRef,
         next_node_id: u64,
         ledger: group.Ledger,
         genr: GenRoleHandles,
-        /// 部分形式で「このフィールド群を適用すべきか」
+        /// Whether this group of fields should be applied, for a partial format
         apply_params_pattern: bool,
         apply_seed_song: bool,
         apply_graph: bool,
@@ -982,7 +982,7 @@ pub const EncodeInput = struct {
     genr: GenRoleHandles,
 };
 
-/// VPRJ 全体を encode（caller が free）。
+/// Encodes an entire VPRJ (caller frees the result).
 pub fn encode(comptime P: type, gpa: std.mem.Allocator, params: P, input: EncodeInput) ![]u8 {
     var w = try serde.Writer.init(gpa, magic, schema_version);
     errdefer w.deinit();
@@ -1041,7 +1041,7 @@ pub fn encode(comptime P: type, gpa: std.mem.Allocator, params: P, input: Encode
     return w.finish();
 }
 
-/// 旧 MPRJ fixture 生成用（テスト専用。本番 writer は VPRJ のみ）。
+/// For generating legacy MPRJ fixtures (test-only; the production writer emits only VPRJ).
 pub fn encodeMprj(
     comptime P: type,
     gpa: std.mem.Allocator,
@@ -1162,7 +1162,7 @@ fn decodeVprj(comptime P: type, gpa: std.mem.Allocator, bytes: []const u8) !Deco
         } else if (std.mem.eql(u8, &chunk.tag, &TAG_EDGE)) {
             try edges.append(gpa, try unpackEdge(chunk.payload));
         }
-        // 未知 tag は無視
+        // An unknown tag is ignored
     }
 
     const sprm_b = sprm orelse return error.MissingSprm;
@@ -1196,19 +1196,19 @@ fn decodeVprj(comptime P: type, gpa: std.mem.Allocator, bytes: []const u8) !Deco
     var next_node_id: u64 = 1;
     errdefer if (node_id_refs.len > 0) gpa.free(node_id_refs);
     if (nidm_c != null or nref_c != null) {
-        // 片方だけは不正
+        // Having only one of the pair is invalid
         const nidm_payload = nidm_c orelse return error.CorruptNidm;
         const nref_payload = nref_c orelse return error.CorruptNref;
         next_node_id = try unpackNidm(nidm_payload);
         node_id_refs = try unpackNref(gpa, nref_payload);
         try validateNodeIdRefs(owned_nodes, node_id_refs, next_node_id);
     } else if (file_schema >= schema_version) {
-        // schema 2+ で NIDM/NREF 欠落は空グラフのみ許容
+        // At schema 2+, missing NIDM/NREF is allowed only for an empty graph
         if (owned_nodes.len != 0) return error.CorruptNidm;
         next_node_id = 1;
         node_id_refs = &.{};
     } else {
-        // schema 1: 決定的 fallback
+        // schema 1: deterministic fallback
         const fb = try buildFallbackNodeIdRefs(gpa, owned_nodes);
         node_id_refs = fb.refs;
         next_node_id = fb.next;
@@ -1285,14 +1285,14 @@ fn decodeFromPtcg(comptime P: type, gpa: std.mem.Allocator, bytes: []const u8) !
     out.node_id_refs = fb.refs;
     out.next_node_id = fb.next;
     out.apply_graph = true;
-    out.apply_ledger = true; // 空 Ledger へリセット
+    out.apply_ledger = true; // Reset to an empty Ledger
     out.apply_genr = true; // invalidate
     out.ledger = .{};
     out.genr = .{}; // all INVALID
     return out;
 }
 
-/// magic 自動判定で decode。nodes/edges は gpa 確保（caller が deinit）。
+/// Decodes by auto-detecting the magic. nodes/edges are gpa-allocated (caller must deinit).
 pub fn decode(comptime P: type, gpa: std.mem.Allocator, bytes: []const u8) !Decoded(P) {
     if (bytes.len < 4) return error.BadMagic;
     const m = std.mem.readInt(u32, bytes[0..4], .little);
@@ -1710,8 +1710,8 @@ fn appendNidmNref(w: *serde.Writer, input: EncodeInput) !void {
     try w.addChunk(TAG_NREF, nref_buf[0..nref_size]);
 }
 
-/// NPRM fixture 用: 非デフォルト寄りかつ validateParam が受理する scalar。
-/// 整数バック field では mid が分数になりうるので @trunc 候補を優先する。
+/// For NPRM fixtures: a scalar that leans non-default while still being accepted by validateParam.
+/// For an integer-backed field, mid can be fractional, so a @trunc'd candidate is preferred.
 fn scalarFixtureValue(kind: graph_io.ModuleKind, name: []const u8, s: modular.ScalarDesc) f32 {
     const mid = s.min + (s.max - s.min) * 0.5;
     const candidates = [_]f32{
@@ -1734,7 +1734,7 @@ fn scalarFixtureValue(kind: graph_io.ModuleKind, name: []const u8, s: modular.Sc
 test "NPRM round-trip: all ModuleKind descriptors + 303 fixture bit-identical" {
     const gpa = testing.allocator;
 
-    // (1) 全 ModuleKind の descriptor を NodeParamRecord 化（scalar=非デフォルト、choice=全 index）
+    // (1) Turn every ModuleKind's descriptors into NodeParamRecords (scalar = non-default, choice = every index)
     var records: std.ArrayList(NodeParamRecord) = .empty;
     defer {
         for (records.items) |rec| gpa.free(@constCast(rec.params));
@@ -1759,9 +1759,9 @@ test "NPRM round-trip: all ModuleKind descriptors + 303 fixture bit-identical" {
                     });
                 },
                 .choice => |c| {
-                    // 全 choice index を別 param 行としては書けない（name 重複禁止）ので、
-                    // 各 index を別 node（同 kind）に載せるのではなく、ここでは default 以外の
-                    // 最大 index を 1 件保存。全 index は下の専用ブロックで検証する。
+                    // Every choice index cannot be written as separate param rows (duplicate names are forbidden), so
+                    // instead of putting each index on a separate node of the same kind, here we save only the
+                    // single highest non-default index; every index is validated in the dedicated block below.
                     const idx: u32 = if (c.options.len > 1)
                         @intCast(c.options.len - 1)
                     else
@@ -1780,7 +1780,7 @@ test "NPRM round-trip: all ModuleKind descriptors + 303 fixture bit-identical" {
         handle += 1;
     }
 
-    // choice 全 index: VCO waveform / antialias（bool）を別 handle で網羅
+    // Every choice index: VCO waveform / antialias (bool) are covered on separate handles
     {
         const wave_opts = modular.descriptors(.vco)[1].kind.choice.options;
         var wi: u32 = 0;
@@ -1801,7 +1801,7 @@ test "NPRM round-trip: all ModuleKind descriptors + 303 fixture bit-identical" {
         }
     }
 
-    // 303 相当: VCF + VCA
+    // The 303-equivalent: VCF + VCA
     const vcf_params = [_]NodeParam{
         .{ .name = "cutoff", .value_kind = VALUE_KIND_SCALAR, .value = @bitCast(@as(f32, 600.0)) },
         .{ .name = "resonance", .value_kind = VALUE_KIND_SCALAR, .value = @bitCast(@as(f32, 0.9)) },
@@ -1859,11 +1859,11 @@ test "NPRM round-trip: all ModuleKind descriptors + 303 fixture bit-identical" {
 test "NPRM absent: legacy VPRJ keeps apply_node_params=false" {
     const gpa = testing.allocator;
     const input = sampleInput();
-    // schema 1（NIDM/NREF 無し）= fallback 採番
+    // schema 1 (no NIDM/NREF) = fallback numbering
     var w = try serde.Writer.init(gpa, magic, schema_version_v1);
     defer w.deinit();
     try appendRequiredChunks(&w, input);
-    // NPRM 無し
+    // No NPRM
     try appendLedgGenr(&w, input);
     const bytes = try w.finish();
     defer gpa.free(bytes);
@@ -1884,7 +1884,7 @@ test "NPRM absent: legacy VPRJ keeps apply_node_params=false" {
 test "NPRM unknown name / descriptor count mismatch: decode ok, validate skips unknown" {
     const gpa = testing.allocator;
     const nodes = [_]NodeEntry{.{ .handle = 0, .kind = .vca, .x = 0, .y = 0 }};
-    // VCA は gain のみ。余分な unknown + 欠落は OK
+    // VCA has only gain. Extra unknown fields plus omissions are fine
     const params = [_]NodeParam{
         .{ .name = "gain", .value_kind = VALUE_KIND_SCALAR, .value = @bitCast(@as(f32, 0.5)) },
         .{ .name = "future_param", .value_kind = VALUE_KIND_SCALAR, .value = @bitCast(@as(f32, 1.0)) },
@@ -2006,24 +2006,24 @@ test "NPRM corrupt: duplicate chunk / version / short / dup name / NaN / choice 
         defer gpa.free(bytes);
         try testing.expectError(error.NonFiniteField, decode(TestParams, gpa, bytes));
     }
-    // choice index out of range（validate）
+    // choice index out of range (validate)
     {
         const nodes = [_]NodeEntry{.{ .handle = 0, .kind = .vca, .x = 0, .y = 0 }};
-        // VCA gain は scalar。WrongValueKind ではなく、VCO waveform で OOR
+        // VCA gain is a scalar. Not a WrongValueKind; the OOR case uses VCO waveform
         const nodes2 = [_]NodeEntry{.{ .handle = 1, .kind = .vco, .x = 0, .y = 0 }};
         const bad = [_]NodeParam{.{ .name = "waveform", .value_kind = VALUE_KIND_CHOICE, .value = 99 }};
         const rec = [_]NodeParamRecord{.{ .saved_handle = 1, .params = &bad }};
         try testing.expectError(error.ChoiceIndexOutOfRange, validateNodeParams(&nodes2, &rec));
         _ = nodes;
     }
-    // OutOfRange scalar（validate）
+    // OutOfRange scalar (validate)
     {
         const nodes = [_]NodeEntry{.{ .handle = 0, .kind = .vca, .x = 0, .y = 0 }};
         const bad = [_]NodeParam{.{ .name = "gain", .value_kind = VALUE_KIND_SCALAR, .value = @bitCast(@as(f32, 99.0)) }};
         const rec = [_]NodeParamRecord{.{ .saved_handle = 0, .params = &bad }};
         try testing.expectError(error.OutOfRange, validateNodeParams(&nodes, &rec));
     }
-    // 整数バック field の分数値（TuringMachine.bits）は validate で拒否
+    // A fractional value for an integer-backed field (TuringMachine.bits) is rejected by validate
     {
         const nodes = [_]NodeEntry{.{ .handle = 0, .kind = .turing, .x = 0, .y = 0 }};
         const bad = [_]NodeParam{.{ .name = "bits", .value_kind = VALUE_KIND_SCALAR, .value = @bitCast(@as(f32, 8.5)) }};
@@ -2079,7 +2079,7 @@ test "NIDM/NREF: round-trip + corrupt duplicate/zero/unknown/next" {
         .{ .saved_handle = 0, .id = NodeId.fromRaw(1) },
         .{ .saved_handle = 9, .id = NodeId.fromRaw(2) },
     }, 3));
-    // duplicate saved_handle（bijection 穴）
+    // duplicate saved_handle (a hole in the bijection)
     try testing.expectError(error.CorruptNref, validateNodeIdRefs(input.nodes, &.{
         .{ .saved_handle = 0, .id = NodeId.fromRaw(1) },
         .{ .saved_handle = 0, .id = NodeId.fromRaw(2) },

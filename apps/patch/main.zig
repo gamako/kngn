@@ -1,34 +1,34 @@
-//! apps/patch (run-patch): 動的グラフエンジン（40.6.1 DynGraph）の最小パッチをビジュアルに表示する
-//! パッチキャンバス UI（TASK-40.6.2）。
+//! apps/patch (run-patch): visually displays a minimal patch on the dynamic graph engine (DynGraph)
+//! as a patch-canvas UI.
 //!
-//! モジュール=ノード矩形＋ポート丸（種別色 audio/cv/gate）＋ケーブル線で描画し、pan（背景 drag）/
-//! zoom（scroll・カーソル基準）/ノード drag 移動 /node・port・cable の hover・選択ができる。
-//! ケーブルの付け外し（ライブ再配線）と音は 40.6.3。
+//! Modules are drawn as node rectangles plus port dots (kind colours audio/cv/gate) plus cable lines; pan (background drag) /
+//! zoom (scroll, cursor-anchored) / node drag / hover and selection of node, port, and cable are supported.
+//! Live cable rewiring and audio are also supported.
 //!
-//! UI レイアウト状態（ノード world 座標・camera・hover・selected・グループ台帳）は GUI(メインスレッド)側が
-//! 持ち、RT のグラフ記述（接続/順序）とは分離する（publish に載せない。AC#3）。currentView() の
-//! publish 済みトポロジを読んで描画する。
-//! 幾何/ヒットテスト/見切れ判定の純ロジックは canvas.zig（platform 非依存・test-patch で単体テスト）。
+//! UI layout state (node world positions, camera, hover, selected, group ledger) lives on the GUI (main thread)
+//! and is kept separate from the RT graph description (connections/order) — not published. Drawing reads currentView()'s
+//! published topology for display.
+//! Pure geometry / hit-test / clip logic lives in canvas.zig (platform-free; unit-tested via test-patch).
 //!
-//! TASK-40.7.1: グループ/マクロ（DrumMachine）を『畳んだ 1 ノード箱』として表示し、展開すると内部
-//! プリミティブのサブグラフが見える（1 レベル入れ子）。マクロのメンバーは通常のプリミティブモジュールとして
-//! dyn 上に存在し、「どの handle がどのマクロに属すか / 畳んでいるか / 外向きポートはどれか」は
-//! `group.Ledger`（このファイルの App.ledger）が持つ純 UI 状態（publish 非対象）。合成 handle
-//! （`>= group.GROUP_HANDLE_BASE`）は canvas 幾何関数の引数/返り値の中だけで使い、dyn accessor・
-//! `app.layout[h]` の index・`dyn.disconnect` へは決して渡さない（`group.resolvePort` で実 PortRef へ
-//! 解決してから既存の commitConnect 等へ渡す）。詳細は group.zig のコメントを参照。
-//! ESC/閉じるで終了。
+//! Groups/macros (DrumMachine) display as a single collapsed node box; expanding reveals the internal
+//! primitive subgraph (one level of nesting). Macro members exist as ordinary primitive modules on
+//! dyn; which handle belongs to which macro / whether it is collapsed / which ports face outward is
+//! pure UI state in `group.Ledger` (App.ledger in this file; not published). Synthetic handles
+//! (`>= group.GROUP_HANDLE_BASE`) are used only as arguments/return values of canvas geometry helpers — never as
+//! dyn accessors, `app.layout[h]` indices, or `dyn.disconnect` targets (resolve to a real PortRef via
+//! `group.resolvePort` before existing commitConnect paths). See comments in group.zig.
+//! ESC / close quits.
 
 const std = @import("std");
 const builtin = @import("builtin");
-const kit = @import("kit"); // 公開 umbrella（ADR-007 R4/R5: apps は kit-only 消費者）
+const kit = @import("kit"); // Public umbrella (ADR-007 R4/R5: apps are kit-only consumers)
 const platform = kit.platform;
 const gui = kit.gui;
 const appshell = kit.appshell;
 const stepgrid = gui.stepgrid;
 const modular = @import("modular");
 const audio = kit.audio;
-const synth = kit.synth; // SampleTap（Audio→GUI 出力タップ。C の master 可視化）
+const synth = kit.synth; // SampleTap (Audio→GUI output tap; C master visualisation)
 const midi = kit.midi;
 const dsp = kit.dsp; // mono downmix
 const spectrogram = @import("spectrogram");
@@ -70,12 +70,12 @@ const MAX_MODULES = modular.dyn.MAX_MODULES;
 const MAX_OUT = modular.signal.MAX_OUT;
 const MAX_IN = modular.signal.MAX_IN;
 const MAX_EDGES = MAX_MODULES * MAX_IN;
-// TASK-40.8 D: per-port tap 定数（modular が単一ソース）。
+// Per-port tap constants (modular is the single source).
 const TAP_SLOTS = modular.graph_core.TAP_SLOTS;
 const TAP_RING = modular.graph_core.TAP_RING;
 
-// group.zig は modular 非依存のため GROUP_HANDLE_BASE(=48) を定数複製している。数値の食い違い
-// （dyn.zig の MAX_MODULES 変更を group.zig 側へ反映し忘れる等）を compile time に検出する。
+// group.zig does not import modular, so GROUP_HANDLE_BASE comes from build_options.max_modules (same source as MAX_MODULES).
+// A comptime check catches mismatches if dyn.zig MAX_MODULES and group.zig GROUP_HANDLE_BASE diverge.
 comptime {
     if (group.GROUP_HANDLE_BASE != MAX_MODULES) {
         @compileError("group.GROUP_HANDLE_BASE must equal modular.dyn.MAX_MODULES");
@@ -86,7 +86,7 @@ comptime {
 }
 
 // ----------------------------------------------------------------------------
-// TASK-115.3: 固定 MIDI CC → GenRole/descriptor マッピング（学習 UI なし MVP）
+// Fixed MIDI CC → GenRole/descriptor map (MVP; no learn UI)
 // ----------------------------------------------------------------------------
 const MidiParamTarget = struct {
     role: project_io.GenRole,
@@ -146,7 +146,7 @@ const MIDI_CC_MAP = [_]MidiCcBinding{
 };
 
 comptime {
-    // controller 重複禁止。descriptor 対応は midiBindingDescriptorsExist() で実行時確認。
+    // Controllers must not duplicate. Descriptor coverage is checked at runtime by midiBindingDescriptorsExist().
     for (MIDI_CC_MAP, 0..) |a, i| {
         for (MIDI_CC_MAP[i + 1 ..]) |b| {
             if (a.controller == b.controller) @compileError("MIDI_CC_MAP: duplicate controller");
@@ -161,12 +161,12 @@ fn midiRoleKind(role: project_io.GenRole) modular.ModuleKind {
         .sidechain => .sidechain,
         .master_mixer => .mixer,
         .master_vcf => .vcf,
-        else => .clock, // 表に無い role は到達しない（MIDI_CC_MAP の target のみ）。
+        else => .clock, // Roles absent from the table are unreachable (only MIDI_CC_MAP targets).
     };
 }
 
 fn midiBindingDescriptorsExist() bool {
-    // 全 target が既知 descriptor を指す（plan §8）。
+    // Every target points at a known descriptor.
     for (MIDI_CC_MAP) |binding| {
         for (binding.targets) |t| {
             const kind = midiRoleKind(t.role);
@@ -186,28 +186,28 @@ fn midiBindingDescriptorsExist() bool {
     return true;
 }
 
-/// recipe / diagnostics の canonical app name（既存 modular recipe 互換。TASK-105.4）。
+/// Canonical app name for recipe / diagnostics (compatible with existing modular recipes).
 const APP_NAME = "modular";
 
 const WIN_W = 960;
-// TASK-40.8: 下部に可視化帯（VIS_H）を足したぶん高くする（キャンバス有効高 = fb_h - VIS_H）。
+// Add a visualisation strip (VIS_H) at the bottom (canvas usable height = fb_h - VIS_H).
 const WIN_H = 760;
 const BG: u32 = 0xFF12161B;
 
-// ---- 可視化帯（C: master scope/spectrogram/level meter）。画面下端の固定帯。----
-/// 目標フレーム周期（60fps）。pacing は deadline ベース（TASK-176）。
+// ---- Visualisation strip (C: master scope/spectrogram/level meter). Fixed band at the screen bottom. ----
+/// Target frame period (60fps). Pacing is deadline-based.
 const FRAME_PERIOD_S: f64 = 1.0 / 60.0;
-const VIS_H = 150; // 帯の高さ（キャンバス有効領域 = fb_h - VIS_H）
-const VIS_LABEL_H = 16; // 帯上端のラベル行
-const VIS_MARGIN = 6; // 帯内の下端余白
-const VIS_DRAW_H = VIS_H - VIS_LABEL_H - VIS_MARGIN; // spec/scope の描画高（comptime）
+const VIS_H = 150; // Strip height (canvas usable area = fb_h - VIS_H)
+const VIS_LABEL_H = 16; // Label row at the top of the strip
+const VIS_MARGIN = 6; // Bottom padding inside the strip
+const VIS_DRAW_H = VIS_H - VIS_LABEL_H - VIS_MARGIN; // Spec/scope draw height (comptime)
 const SPEC_X0 = 16;
 const SPEC_W = 500;
 const SCOPE_X0 = SPEC_X0 + SPEC_W + 12; // 528
 const SCOPE_W = 300;
 const METER_X0 = SCOPE_X0 + SCOPE_W + 12; // 840
 const METER_W = 48;
-const VIS_BG: u32 = 0xFF0A0E12; // 帯の下地
+const VIS_BG: u32 = 0xFF0A0E12; // Strip background
 const Spec = spectrogram.Spectrogram(SPEC_W, VIS_DRAW_H);
 const Scope = scope.Oscilloscope(SCOPE_W, VIS_DRAW_H);
 const Tap = synth.SampleTap(8192);
@@ -216,7 +216,7 @@ const NODE_BG = gui.Color.rgba(0x24, 0x2A, 0x33, 0xFF);
 const BORDER_COL = gui.Color.rgba(0x50, 0x58, 0x64, 0xFF);
 const HOVER_COL = gui.Color.rgba(0x90, 0xA0, 0xB0, 0xFF);
 const SEL_COL = gui.Color.rgba(0xE0, 0xC0, 0x50, 0xFF);
-/// ラバーバンド矩形（TASK-173.3）: 半透明青塗り + 青枠。
+/// Rubber-band rectangle: translucent blue fill + blue border.
 const RECT_SEL_FILL = gui.Color.rgba(0x40, 0x80, 0xE0, 0x40);
 const RECT_SEL_OUTLINE = gui.Color.rgba(0x50, 0xA0, 0xF0, 0xFF);
 const TITLE_COL = gui.Color.rgba(0xE0, 0xE6, 0xEE, 0xFF);
@@ -224,13 +224,13 @@ const GRID_COL = gui.Color.rgba(0x1A, 0x20, 0x28, 0xFF);
 
 fn portColor(k: PortKind) gui.Color {
     return switch (k) {
-        .audio => gui.Color.rgba(0xE0, 0x90, 0x40, 0xFF), // 橙
-        .cv => gui.Color.rgba(0x50, 0x90, 0xE0, 0xFF), // 青
-        .gate => gui.Color.rgba(0x60, 0xC0, 0x70, 0xFF), // 緑
+        .audio => gui.Color.rgba(0xE0, 0x90, 0x40, 0xFF), // orange
+        .cv => gui.Color.rgba(0x50, 0x90, 0xE0, 0xFF), // blue
+        .gate => gui.Color.rgba(0x60, 0xC0, 0x70, 0xFF), // green
     };
 }
 
-/// A: ポート色を活性度 level(0..1+) で明滅させる。base を 0.30..1.0 の範囲で明度スケール（消灯でも視認可）。
+/// A: blink port colour by activity level (0..1+). Scale base lightness in 0.30..1.0 (still visible when idle).
 fn litColor(base: gui.Color, level: f32) gui.Color {
     const t = 0.30 + 0.70 * std.math.clamp(level, 0.0, 1.0);
     const sc = struct {
@@ -244,36 +244,36 @@ fn litColor(base: gui.Color, level: f32) gui.Color {
 const CableRef = canvas.CableRef;
 
 const Item = union(enum) {
-    node: Handle, // 常に実 handle（合成 handle は .group）
-    port: PortRef, // 表示/ハイライト用は synthetic 可（畳み箱ポート）。dyn/commit へ渡す前に resolvePort で実 PortRef へ解決する
-    cable: CableRef, // 安定 ID（dst_handle,dst_in）。常に実 CableRef（DisplayEdge.actual 経由）
-    group: group.GroupId, // 畳み箱 or 展開枠のヘッダーの選択
+    node: Handle, // Always a real handle (synthetic handles use .group)
+    port: PortRef, // Display/highlight may be synthetic (collapsed-box ports). Resolve to a real PortRef via resolvePort before dyn/commit
+    cable: CableRef, // Stable id (dst_handle,dst_in). Always a real CableRef (via DisplayEdge.actual)
+    group: group.GroupId, // Selection of a collapsed-box or expanded-frame header
 };
 
 const Drag = union(enum) {
     none,
     pan: struct { start_pan: Vec2f, start_mouse: Vec2f },
-    node: struct { handle: Handle, grab_offset: Vec2f }, // node.pos = mouseWorld + grab_offset（常に実 handle）
-    // 畳み箱ドラッグ: ledger.groups[gid].pos を更新し layout には触らない（合成 handle を app.layout[h] へ
-    // 絶対に index しない。展開時の枠ヘッダーはドラッグ不可＝選択のみ、40.7.1 のスコープ）。
+    node: struct { handle: Handle, grab_offset: Vec2f }, // node.pos = mouseWorld + grab_offset (always a real handle)
+    // Collapsed-box drag: update ledger.groups[gid].pos; do not touch layout (never index a synthetic handle into
+    // app.layout[h]. Expanded-frame headers are not draggable = selection only.
     group: struct { gid: group.GroupId, grab_offset: Vec2f },
-    // 接続 pending（origin ポートからカーソルへ仮ケーブル）。detach!=null は「接続済み入力から
-    // 拾い上げた drag-off」で、切断は commit（mouse_up）まで遅延する（1 操作=最大 1 publish・
-    // 失敗/無効ドロップで既存接続を壊さない）。origin は表示/ハイライト用に synthetic 可（畳み箱ポートを
-    // 掴んだ場合）。commit（mouse_up）で dyn/commitConnect へ渡す前に resolvePort で実 PortRef へ解決する。
-    // detach は接続済み入力を掴んだときのみ設定され、その時点で resolvePort 済み＝常に実 CableRef。
+    // Connection pending (ghost cable from origin port to cursor). detach!=null means a drag-off from a connected
+    // input; disconnect is deferred until commit (mouse_up) so one gesture = at most one publish and a failed/
+    // invalid drop does not break the existing connection. origin may be synthetic for display/highlight (when
+    // grabbing a collapsed-box port). On commit (mouse_up), resolvePort to a real PortRef before dyn/commitConnect.
+    // detach is set only when grabbing a connected input, and is already resolvePort'd = always a real CableRef.
     cable: struct { origin: PortRef, detach: ?CableRef = null },
-    /// 空白キャンバス左ドラッグの矩形選択（TASK-173.3）。additive=Shift/Cmd 押下時は集合へ追加。
-    /// Option(Alt) 押下時はこの variant にならず `.pan` になる（トラックパッド向けの pan 代替手段）。
+    /// Rubber-band rect select on empty-canvas left-drag. additive=Shift/Cmd adds to the set.
+    /// With Option(Alt) held this variant is not used — becomes `.pan` (trackpad pan alternative).
     rect_select: struct { start_world: Vec2f, additive: bool },
 };
 
-// モジュールパレット（画面固定・pan/zoom 非依存）。クリックで primitive は add(kind,.{})、macro は
-// マクロ builder（preflight+add+connect+1publish→台帳登録）を呼ぶ（TASK-40.7.1）。
+// Module palette (screen-fixed; independent of pan/zoom). Click runs add(kind,.{}) for primitives, or the
+// macro builder (preflight+add+connect+1publish → ledger register) for macros.
 const PaletteEntry = union(enum) {
     primitive: modular.ModuleKind,
     macro_kind: group.MacroKind,
-    /// TASK-133: bass kind の standalone step_seq（既存 `.primitive = .step_seq` は drum のまま）。
+    /// Standalone step_seq of bass kind (existing `.primitive = .step_seq` remains drum).
     step_seq_bass: void,
 };
 const PALETTE = [_]PaletteEntry{
@@ -306,8 +306,8 @@ const PAL_BG_HOVER = gui.Color.rgba(0x3A, 0x44, 0x52, 0xFF);
 const PENDING_COL = gui.Color.rgba(0xC0, 0xC0, 0xC0, 0xFF);
 const MAX_PARAM_EDITS: usize = patchmod.MAX_PARAM_OVERRIDES;
 
-// ── File メニュー（TASK-136）──────────────────────────────────────────────
-// GUI fallback 行の高さ（box padding 4+4 + button ≈24）。native 時は OS メニューバーのため 0。
+// ── File menu ──────────────────────────────────────────────────────────────
+// GUI-fallback row height (box padding 4+4 + button ≈24). Native: 0 (OS menu bar).
 const MENU_GUI_H: f32 = 32;
 const MENU_CMD_CAP: usize = 24;
 const MenuFileOp = enum { save_project, open_project };
@@ -320,13 +320,13 @@ const CmdId = struct {
     pub const toggle_history: platform.CommandId = 6;
 };
 
-// TASK-149.3: History 表示用 local-only meta ring（CommandLog に入らない操作）。
+// Local-only meta ring for History display (ops that do not enter CommandLog).
 const MAX_META_EVENTS: usize = 64;
 const META_SUMMARY_CAP: usize = 96;
 const HISTORY_LINE_CAP: usize = 160;
 const HISTORY_SCROLL_ID: gui.Id = 0x1493_0001;
 const MetaEvent = struct {
-    /// 追加時点の cmd_log 最新 seq（0=コマンド未記録）。merge 表示の順序キー。
+    /// Latest cmd_log seq at append time (0 = no command recorded). Merge-display order key.
     after_seq: u64 = 0,
     summary_buf: [META_SUMMARY_CAP]u8 = undefined,
     summary_len: u8 = 0,
@@ -336,7 +336,7 @@ const MetaEvent = struct {
     }
 };
 
-/// canvas 幅に収まる列数（button.x + button.w <= canvas_w。最大 PAL_COLS_MAX）。
+/// Column count that fits the canvas width (button.x + button.w <= canvas_w; max PAL_COLS_MAX).
 fn paletteCols(canvas_w: f32) usize {
     const cell = PAL_W + PAL_GAP;
     if (canvas_w <= PAL_X0 + PAL_W) return 1;
@@ -350,13 +350,13 @@ fn paletteRowCount(canvas_w: f32) usize {
     return (PALETTE.len + cols - 1) / cols;
 }
 
-/// パレット帯の下端（screen 絶対座標。行数は center 幅依存。clampMacroPos の上限に使う）。
+/// Bottom of the palette band (absolute screen coords. Row count depends on center width. Upper bound for clampMacroPos).
 fn paletteBottom(app: *const App) f32 {
     const rows: f32 = @floatFromInt(paletteRowCount(app.canvasW()));
     return app.canvas_rect.y + PAL_Y + rows * (PAL_H + PAL_GAP);
 }
 
-/// center rect 基準のモジュールパレット（screen 絶対座標）。
+/// Module palette in center-rect space (absolute screen coords).
 fn paletteButtons(app: *const App) [PALETTE.len]canvas.PaletteButton {
     const canvas_w = app.canvasW();
     const cols = paletteCols(canvas_w);
@@ -382,8 +382,8 @@ const CUTOFF_MIN: f32 = patchmod.MASTER_CUTOFF_MIN;
 const CUTOFF_MAX: f32 = patchmod.MASTER_CUTOFF_MAX;
 
 const Params = struct {
-    // TASK-160.3: 以下 tempo〜mute は SPRM v1 互換の deprecated storage。
-    // live graph の正は NPRM descriptor / param_db。Transport UI からは読み書きしない。
+    // The following tempo..mute fields are deprecated SPRM v1-compatible storage.
+    // The live graph authority is NPRM descriptors / param_db. Transport UI does not read or write them.
     tempo: f32 = 122.0,
     cutoff_norm: f32 = 1.0,
     density: f32 = 0.25,
@@ -428,8 +428,8 @@ fn cutoffHz(norm: f32) f32 {
     return param_view.cutoffHz(norm, cutoffRange());
 }
 
-/// tone macros のみ Controls へ publish（TASK-160.3）。
-/// tempo/cutoff/swing/sidechain/density/gain/mute は graph descriptor（NPRM / param_db）が正。
+/// Publish tone macros only into Controls.
+/// tempo/cutoff/swing/sidechain/density/gain/mute are owned by graph descriptors (NPRM / param_db).
 fn publishControls(patch: *LofiPatch, p: Params) void {
     const c = &patch.controls;
     c.kick_punch.store(p.kick_punch);
@@ -441,9 +441,9 @@ fn publishControls(patch: *LofiPatch, p: Params) void {
     c.ambient_move.store(p.ambient_move);
 }
 
-/// SPRM / Params の旧 transport 系 field を graph param_db へ one-shot 反映。
-/// load_pattern（NPRM 無し）と offline render 用。フル VPRJ load では NPRM が正なので呼ばない。
-/// Params は deprecated storage（live の authoritative source ではない）。
+/// One-shot apply of legacy SPRM / Params transport fields into graph param_db.
+/// For load_pattern (no NPRM) and offline render. Not called on a full VPRJ load where NPRM is authoritative.
+/// Params is deprecated storage (not the live authoritative source).
 fn publishDeprecatedGraphFromParams(patch: *LofiPatch, p: Params) void {
     var batch: patchmod.ParamBatch = .{};
     batch.revision = 1;
@@ -487,12 +487,12 @@ fn b01(v: bool) u8 {
     return if (v) 1 else 0;
 }
 
-/// TASK-106.4: inspector slider の drag 開始時 before 値を保持し、release 時に 1 つの
-/// undoable な set_param として記録する（drag 中の連続 override は記録しない）。
+/// Hold the inspector-slider before-value at drag start; on release record one
+/// undoable set_param (do not record the continuous overrides during the drag).
 const App = struct {
-    /// 生成レイヤと DynGraph の唯一の所有者。patch 自体は heap 上で固定し、RT userdata から動かさない。
+    /// Sole owner of the generation layer and DynGraph. The patch is heap-fixed and not moved from RT userdata.
     patch: *LofiPatch,
-    /// canvas の既存コードが参照する非所有 alias。実体は常に patch.graph。
+    /// Non-owning alias that existing canvas code references. The real object is always patch.graph.
     dyn: *DynGraph,
     layout: [MAX_MODULES]Vec2f = [_]Vec2f{.{ .x = 0, .y = 0 }} ** MAX_MODULES,
     ledger: group.Ledger = .{},
@@ -500,67 +500,67 @@ const App = struct {
     mouse: Vec2f = .{ .x = 0, .y = 0 },
     hover: ?Item = null,
     selected: ?Item = null,
-    /// TASK-173.3: 複数ノード選択集合（実 handle + group 合成 handle）。App.selected と独立。
+    /// Multi-node selection set (real handles + group synthetic handles). Independent of App.selected.
     multi_selected: [group.GROUP_HANDLE_BASE + group.MAX_GROUPS]bool =
         [_]bool{false} ** (group.GROUP_HANDLE_BASE + group.MAX_GROUPS),
-    /// TASK-149.2: Inspector 用 drill-down target（canvas selected とは独立）。
-    /// group 選択時は member 選択で埋まり、node 選択時は selected node と一致。
+    /// Inspector drill-down target (independent of canvas selected).
+    /// When a group is selected, filled by member selection; when a node is selected, matches the selected node.
     inspector_target: ?Handle = null,
     drag: Drag = .none,
     fb_w: u32 = WIN_W,
     fb_h: u32 = WIN_H,
-    // TASK-149.1/160.3: PanelHost が History(left)/Inspector(right) の外形・open/visible の正。
-    // ポインタは main の stack 上 host/panels/gui_ctx を指す（App より長く生きる）。
+    // PanelHost owns the outer shape / open / visible of History(left) / Inspector(right).
+    // Pointers into host/panels/gui_ctx on main's stack (outlive App).
     panel_host: *gui.PanelHost = undefined,
     panels: []gui.Panel = &.{},
     gui_ctx: *gui.Context = undefined,
-    /// ノードタイトル用の小フォント（TASK-170。kit.GuiFont が所有する OutlineFont の借用 view。
-    /// 未ロード時は gui.default_font にフォールバック）。
+    /// Small font for node titles (borrowed OutlineFont view owned by kit.GuiFont.
+    /// Falls back to gui.default_font when not loaded).
     title_font: gui.Font = gui.default_font,
-    /// PanelHost center rect（screen 絶対座標）。描画・hit・palette・camera の共通原点。
+    /// PanelHost center rect (absolute screen coords). Shared origin for draw / hit / palette / camera.
     canvas_rect: canvas.ScreenRect = .{ .x = 0, .y = 0, .w = WIN_W, .h = WIN_H - VIS_H },
-    /// TASK-173.2: 起動時 1-shot auto-layout 済みフラグ。
-    /// centerRect は前フレーム endFrame 後に非 null になるため、メインループ内で初回適用する。
+    /// One-shot auto-layout-done flag at startup.
+    /// centerRect becomes non-null after the previous frame's endFrame, so the first apply runs inside the main loop.
     initial_layout_done: bool = false,
-    // TASK-125: H キー全 hide。slot visible の一時 override。解除時に pre_hide_* を復元し open は保持。
+    // H key hides all. Temporary override of slot visible; on release restore pre_hide_* and keep open.
     panels_hidden: bool = false,
     pre_hide_left_visible: bool = true,
     pre_hide_right_visible: bool = true,
-    // TASK-149.3: History panel ScrollArea と local-only meta ring。
+    // History panel ScrollArea and local-only meta ring.
     history_scroll: gui.Vec2f = .{},
     meta_events: [MAX_META_EVENTS]MetaEvent = [_]MetaEvent{.{}} ** MAX_META_EVENTS,
     meta_head: u32 = 0,
     meta_filled: u32 = 0,
-    // appshell Preferences（panel/slot 永続化。VP_APPSHELL_DIR 対応）。
+    // appshell Preferences (panel/slot persistence; VP_APPSHELL_DIR).
     prefs: appshell.preferences.Preferences = undefined,
     prefs_dir: ?std.Io.Dir = null,
     prefs_dirty: bool = false,
 
-    // TASK-40.8 C: master 出力タップ + 直近ブロックの rms/peak（viz probe 用。GUI スレッド更新）。
+    // C: master output tap + latest-block rms/peak (for viz probe; updated on GUI thread).
     tap: Tap = .{},
     master_rms: f32 = 0,
     master_peak: f32 = 0,
 
-    // TASK-40.8 A: 出力ポート活性度の peak-hold（GUI ローカル・RT 影響ゼロ）。[handle][out]。
+    // A: output-port activity peak-hold (GUI-local; zero RT impact). [handle][out].
     port_level: [MAX_MODULES][MAX_OUT]f32 = [_][MAX_OUT]f32{[_]f32{0} ** MAX_OUT} ** MAX_MODULES,
 
-    // TASK-40.8 D: per-port tap 状態（GUI 所有）。slot i は tap_display[i]（描画用 display handle）を
-    // tap_ports[i]（実 global port id・-1=空き）へ写す。tap_slot_seq[i] = その割当を publish した seq。
+    // D: per-port tap state (GUI-owned). Slot i maps tap_display[i] (display handle for drawing) to
+    // tap_ports[i] (real global port id; -1=empty). tap_slot_seq[i] = seq that published that assignment.
     tap_display: [TAP_SLOTS]Handle = [_]Handle{0} ** TAP_SLOTS,
     tap_ports: [TAP_SLOTS]i32 = [_]i32{-1} ** TAP_SLOTS,
     tap_slot_seq: [TAP_SLOTS]u32 = [_]u32{0} ** TAP_SLOTS,
     tap_count: usize = 0,
     tap_seq: u32 = 0,
 
-    /// `save_graph`/`load_graph` action（TASK-65 serialize）が使うファイル I/O ハンドル
-    /// （`std.process.Init.io`。イベント時のみ使用。RT 経路には一切渡さない）。
+    /// File I/O handle used by the `save_graph`/`load_graph` actions
+    /// (`std.process.Init.io`. Event only. Never passed onto the RT path).
     io: std.Io,
 
-    // 生成アプリの command/action 状態（action はイベント時のみ）。
+    // Generation-app command/action state (actions are event-only).
     params: Params = .{},
     pattern_rev: u32 = 0,
-    /// main thread が最後に publish した pattern。RT が Mailbox を acquire する前の連続編集でも、
-    /// 次の pattern action が RT snapshot を基底にして先行編集を捨てないために使う。
+    /// Last pattern main published. Even across consecutive edits before RT acquires the Mailbox,
+    /// the next pattern action must not discard prior edits by basing itself on the RT snapshot.
     pending_pattern: ?PatternCommand = null,
     sample_rate: u32 = 48000,
     cmd_log: platform.command.CommandLog = .{},
@@ -570,41 +570,41 @@ const App = struct {
     notation_counter: u32 = 0,
     last_quantized_cmd: ?PatternCommand = null,
     song: SongData = .{},
-    // TASK-110.4: main thread が所有する累積 override 表（Mailbox payload の source）。
+    // Cumulative override table owned by main (Mailbox payload source).
     param_batch: patchmod.ParamBatch = .{},
-    // TASK-115.3: 固定 CC 表の直近 raw 値（未受信は null。digest midi_map 用）。
+    // Latest raw values from the fixed CC table (null if never received; for digest midi_map).
     midi_cc_raw: [MIDI_CC_MAP.len]?u8 = [_]?u8{null} ** MIDI_CC_MAP.len,
-    // TASK-124: field 単位で Inspector が共有する pending 操作値。
+    // Pending op values shared by the Inspector, keyed per field.
     param_edits: [MAX_PARAM_EDITS]param_view.ParamEditState = [_]param_view.ParamEditState{.{}} ** MAX_PARAM_EDITS,
-    // params probe の observed は既定で master VCF cutoff。action observe_param で切替可能。
+    // params probe observed defaults to master VCF cutoff. Switchable via action observe_param.
     observed_field: param_view.FieldKey = .{},
     frame_snapshots: [MAX_PARAM_EDITS]FrameParamSnapshot = [_]FrameParamSnapshot{.{}} ** MAX_PARAM_EDITS,
     frame_snapshot_count: usize = 0,
     param_rows: [MAX_PARAM_EDITS]ParamRowSnapshot = [_]ParamRowSnapshot{.{}} ** MAX_PARAM_EDITS,
     param_row_count: usize = 0,
 
-    // TASK-106.2: 安定 NodeId（relay/保存/digest）。runtime Handle とは分離・単調・再利用なし。
+    // Stable NodeId (relay/save/digest). Separate from runtime Handle; monotonic; never reused.
     next_node_id: u64 = 1,
     handle_to_id: [MAX_MODULES]?graph_io.NodeId = [_]?graph_io.NodeId{null} ** MAX_MODULES,
-    // TASK-106.1: host が最後に pattern_state で配った mutation_count（変化検出用）。
+    // Last mutation_count the host distributed via pattern_state (change detection).
     last_pattern_state_mut: u32 = 0,
-    // TASK-106.1: 直前 frame の peer 数。増加時は join 強制 pattern_state 配信。
+    // Peer count last frame. On increase, force a join pattern_state broadcast.
     last_broadcast_peer_count: usize = 0,
 
-    // TASK-106.4: 固定長 undo payload（CommandLog.undo_ref = gen）。~1.16MiB のため heap（Windows 1MB stack 回避）。
+    // Fixed-length undo payload (CommandLog.undo_ref = gen). ~1.16MiB so heap-allocated (avoids Windows 1MB stack).
     undo_store: *patch_undo.PatchUndoStore,
-    /// Local GUI release が set_param に渡す before-state。param 名でキー付けし、
-    /// actionSetParam は受信 args の param 名が一致するときだけ消費する（remote COMMIT の別
-    /// param 適用が pending を奪わない）。単一 Optional: 同時複数 drag は無く 1 本分のみ。
-    /// 既知限界: 自分の pending 中に他 peer が同じ param 名を変更した場合、before が僅かに
-    /// 古くなるだけで破壊はしない（消費は名前一致時のみ・不一致なら現在値 before にフォールバック）。
+    /// Before-state that a local GUI release passes into set_param. Keyed by param name;
+    /// actionSetParam consumes it only when the incoming args param name matches (so a remote COMMIT for a
+    /// different param cannot steal the pending). Single Optional: no concurrent multi-drag; one slider only.
+    /// Known limit: if another peer changes the same param name while ours is pending, before may be slightly
+    /// stale but not destructive (consume only on name match; otherwise fall back to the current value as before).
     pending_param_undo_before: ?patch_undo.ParamValueSnap = null,
-    /// Inspector (mode=1) drag 開始時の before 捕捉。
-    /// release で pending_param_undo_before へ移し routeUiAction("set_param") する。
-    /// 単一 Optional: 同時に複数 slider を drag する UI は無く、1 本分のみ保持する制約。
+    /// Capture before at Inspector (mode=1) drag start.
+    /// On release move into pending_param_undo_before and routeUiAction("set_param").
+    /// Single Optional: the UI never drags multiple sliders at once; hold one only.
     slider_drag_before: ?patch_undo.ParamValueSnap = null,
 
-    // TASK-136: File メニュー（native NSMenu / GUI fallback）+ dialog 経由 save/load。
+    // File menu (native NSMenu / GUI fallback) + dialog-mediated save/load.
     menu_commands: [MENU_CMD_CAP]platform.Command = undefined,
     menu_command_count: usize = 0,
     menu_bar_state: gui.MenuBarState = .{},
@@ -613,7 +613,7 @@ const App = struct {
     menu_last_op: ?MenuFileOp = null,
     running: bool = true,
 
-    /// GUI fallback メニュー行の高さ。native 有効時は OS メニューバーに任せて 0。
+    /// GUI-fallback menu row height. When native is on, defer to the OS menu bar (0).
     fn menuTopH(self: *const App) f32 {
         return if (self.native_menu_active) 0 else MENU_GUI_H;
     }
@@ -622,28 +622,28 @@ const App = struct {
         return !self.native_menu_active and self.mouse.y < self.menuTopH();
     }
 
-    /// PanelHost center の幅（canvas viewport）。見切れ判定・hit・tap・palette で共通。
+    /// PanelHost center width (canvas viewport). Shared by clip / hit / tap / palette.
     fn canvasW(self: *const App) f32 {
         return @max(0.0, self.canvas_rect.w);
     }
 
-    /// PanelHost center の高さ（canvas viewport）。
+    /// PanelHost center height (canvas viewport).
     fn canvasH(self: *const App) f32 {
         return @max(0.0, self.canvas_rect.h);
     }
 
-    /// 画面下端可視化帯の y 開始（絶対座標。VIS_H は PanelHost の外）。
+    /// Y start of the bottom visualisation strip (absolute; VIS_H is outside PanelHost).
     fn vizBandY0(self: *const App) f32 {
         const fh: f32 = @floatFromInt(self.fb_h);
         return @max(0.0, fh - VIS_H);
     }
 
-    /// screen 絶対 → center ローカル（camera 空間）。
+    /// Absolute screen → center-local (camera space).
     fn toCanvasLocal(self: *const App, screen: Vec2f) Vec2f {
         return .{ .x = screen.x - self.canvas_rect.x, .y = screen.y - self.canvas_rect.y };
     }
 
-    /// center ローカル → screen 絶対。
+    /// Center-local → absolute screen.
     fn fromCanvasLocal(self: *const App, local: Vec2f) Vec2f {
         return .{ .x = local.x + self.canvas_rect.x, .y = local.y + self.canvas_rect.y };
     }
@@ -671,7 +671,7 @@ const App = struct {
         return if (self.findPanel(name)) |p| p.visible else false;
     }
 
-    /// PanelHost hit が center のときのみ canvas 操作を許可（panel/splitter/outside は遮断）。
+    /// Allow canvas ops only when PanelHost hit is center (block panel/splitter/outside).
     fn allowsCanvasInput(self: *const App) bool {
         if (self.pointInMenuBar()) return false;
         if (self.gui_ctx.state.active_id != 0) return false;
@@ -713,7 +713,7 @@ const App = struct {
     }
 
     fn metaAt(self: *const App, i: u32) *const MetaEvent {
-        // i: 0 = 最古 … filled-1 = 最新
+        // i: 0 = oldest … filled-1 = newest
         const idx = (self.meta_head + MAX_META_EVENTS - self.meta_filled + i) % MAX_META_EVENTS;
         return &self.meta_events[idx];
     }
@@ -725,18 +725,18 @@ const App = struct {
         return @max(1, self.panel_host.slotExtent(.left) - 24);
     }
 
-    /// History ScrollArea の外側高さ。
+    /// Outer height of the History ScrollArea.
     ///
-    /// left slot は `height=.grow` で実高を持つが、History wrap は fit のため
-    /// `panelRect` は内容高（注入した固定高）に縮む。その値を再注入すると最小高（~2 行）に
-    /// 張り付く鶏卵になる。正は前フレームの **left slotRect** 実高 − chrome。
+    /// The left slot has real height via `height=.grow`, but the History wrap is fit, so
+    /// `panelRect` shrinks to content height (the injected fixed height). Re-injecting that value sticks
+    /// at the minimum (~2 rows) — a chicken-and-egg. The authority is the previous frame's **left slotRect** height − chrome.
     fn historyBodyHeight(self: *const App) i32 {
-        // slot pad(4×2) + Collapsible header + gap/余白。pixie Layers chrome と同クラスの概算。
+        // slot pad(4×2) + Collapsible header + gap/padding. Same class of estimate as pixie Layers chrome.
         const chrome: i32 = 44;
         if (self.panel_host.slotRect(self.gui_ctx, .left)) |sr| {
             return @max(40, @as(i32, @intCast(sr.h)) - chrome);
         }
-        // 初回フレーム等: slot rect 未確定時の仮置き（次フレームで slot 実高へ収束）。
+        // First frame etc.: provisional while the slot rect is unset (converges to real slot height next frame).
         return 200;
     }
 
@@ -760,8 +760,8 @@ const App = struct {
         }
     }
 
-    /// Inspector body 外側幅（panel rect − 余白）。初回は right slot extent ベース。
-    /// Collapsible body は fit のため、drawBody へ .fixed 注入する（grow-in-fit collapse 回避）。
+    /// Outer width of the Inspector body (panel rect − padding). First frame based on right slot extent.
+    /// Collapsible body is fit, so inject .fixed into drawBody (avoid grow-in-fit collapse).
     fn inspectorBodyAvail(self: *const App) i32 {
         if (self.panel_host.panelRect(self.gui_ctx, "Inspector")) |r| {
             return @max(1, @as(i32, @intCast(r.w)) - 16);
@@ -769,7 +769,7 @@ const App = struct {
         return @max(1, self.panel_host.slotExtent(.right) - 24);
     }
 
-    /// 旧 TASK-123/125 digest キー互換: !visible→hidden / visible&&!open→closed / else open。
+    /// Legacy digest-key compat: !visible→hidden / visible&&!open→closed / else open.
     fn panelStateName(self: *const App, name: []const u8) []const u8 {
         const p = self.findPanel(name) orelse return "hidden";
         if (!p.visible) return "hidden";
@@ -777,7 +777,7 @@ const App = struct {
         return "open";
     }
 
-    /// selected と整合するよう inspector_target を毎フレーム同期（stale は null）。
+    /// Sync inspector_target to selected every frame (stale → null).
     fn syncInspectorTarget(self: *App) void {
         if (self.inspector_target) |t| {
             if (t >= MAX_MODULES or !self.dyn.slotActive(t)) {
@@ -787,11 +787,11 @@ const App = struct {
         if (self.selected) |item| {
             switch (item) {
                 .node => |h| {
-                    // primitive 選択は target をその handle に固定。
+                    // Primitive selection pins target to that handle.
                     self.inspector_target = h;
                 },
                 .group => |gid| {
-                    // group 選択: target は当該 group の active member のときだけ維持。
+                    // Group selection: keep target only while it is an active member of that group.
                     if (self.inspector_target) |t| {
                         if (t >= group.GROUP_HANDLE_BASE or self.ledger.group_of[t] != gid or !self.dyn.slotActive(t)) {
                             self.inspector_target = null;
@@ -805,7 +805,7 @@ const App = struct {
         }
     }
 
-    /// descriptor を表示する実 handle（params モード）。member list 中は null。
+    /// Real handle whose descriptors are shown (params mode). Null while in the member list.
     fn inspectorParamHandle(self: *const App) ?Handle {
         if (self.selected) |item| {
             switch (item) {
@@ -817,7 +817,7 @@ const App = struct {
         return null;
     }
 
-    /// group の active member を handle 昇順で out へ（alloc なし）。
+    /// Write the group's active members into out in handle order (no alloc).
     fn collectGroupMembers(self: *const App, gid: group.GroupId, out: []inspector.MemberInfo) usize {
         var n: usize = 0;
         var h: Handle = 0;
@@ -880,7 +880,7 @@ const App = struct {
 
     fn captureParamRows(self: *App, ctx: *const gui.Context) void {
         self.param_row_count = 0;
-        // ghost marker は scalar row のみ（choice radio は除外）。
+        // Ghost marker on scalar rows only (choice radios excluded).
         const h = self.inspectorParamHandle() orelse return;
         const kind = self.dyn.kindOf(h) orelse return;
         const descs = switch (kind) {
@@ -917,16 +917,16 @@ const App = struct {
     fn releaseParamEdits(self: *App) void {
         const before = self.slider_drag_before;
         self.slider_drag_before = null;
-        // entry ごとに記録する。1 操作 = 1 record の coalesce は dragging→release で既に担保
-        // （drag 中の中間値は pending 更新のみで CommandLog に載せない）。
-        // 旧 committed 共有ガードは「同一呼び出し内の別 slot の記録を黙って落とす」誤動作だった。
+        // Record per entry. One gesture = one record is already coalesced by dragging→release
+        // (mid-drag values only update pending; they do not enter CommandLog).
+        // The old shared committed guard silently dropped records for other slots in the same call — a bug.
         for (&self.param_edits) |*state| {
             const was_dragging = state.dragging;
             state.release();
             if (!was_dragging) continue;
             if (before) |b| {
                 if (b.mode == 1) {
-                    // Inspector slider: NodeId 形式で set_param（queueParamOverride 経路）。
+                    // Inspector slider: set_param in NodeId form (queueParamOverride path).
                     if (state.key.invalid()) continue;
                     const final_raw: f32 = blk: {
                         if (state.pending) |pv| break :blk switch (pv) {
@@ -945,7 +945,7 @@ const App = struct {
                         self.pending_param_undo_before = null;
                         continue;
                     };
-                    // recordedAction 経由で CommandLog へ 1 record + notePatchUndo。
+                    // Via recordedAction: one CommandLog record + notePatchUndo.
                     routeUiAction(self, "set_param", args);
                 }
             }
@@ -982,9 +982,9 @@ const App = struct {
         }
     }
 
-    /// 実 handle の生ノード列（dyn 由来。合成 handle は含まない）。フレーム毎。
-    /// selected な step_seq（standalone / 展開中 group member）に inline grid 用 grid_rows を付与する。
-    /// collapsed group の member は mapNodesForCollapsed で箱へ隠れるため従来どおり macro grid のみ（TASK-133）。
+    /// Raw node list of real handles (from dyn; no synthetic handles). Per frame.
+    /// Attach grid_rows for the inline grid on a selected step_seq (standalone / expanded group member).
+    /// Collapsed-group members stay hidden in the box via mapNodesForCollapsed, so only the macro grid as before.
     fn buildRawNodes(self: *const App, out: []NodeGeom) usize {
         var n: usize = 0;
         var h: Handle = 0;
@@ -1007,16 +1007,16 @@ const App = struct {
         return n;
     }
 
-    /// 表示用ノード列（フレーム毎。collapsed グループのメンバーは箱 1 個に畳まれる。写像は
-    /// group.Ledger.mapNodesForCollapsed に委譲。§3.1/§3.3）。
+    /// Display node list (per frame. Collapsed-group members fold into one box. Mapping is
+    /// delegated to group.Ledger.mapNodesForCollapsed).
     fn buildNodes(self: *const App, out: []NodeGeom) usize {
         var raw_buf: [MAX_MODULES]NodeGeom = undefined;
         const raw = raw_buf[0..self.buildRawNodes(&raw_buf)];
         return self.ledger.mapNodesForCollapsed(raw, out);
     }
 
-    /// flat edge（実 handle のみ。view.in_src をそのまま並べたもの）。deriveExposed・境界判定・
-    /// edgeForInput/commitConnect はこの flat を読む（合成 handle を混ぜない。§3.3）。
+    /// Flat edges (real handles only; view.in_src laid out as-is). deriveExposed, boundary checks,
+    /// edgeForInput/commitConnect read this flat list (no synthetic handles mixed in).
     fn buildFlatEdges(self: *const App, out: []Edge) usize {
         const view = self.dyn.currentView();
         var n: usize = 0;
@@ -1041,15 +1041,15 @@ const App = struct {
         return n;
     }
 
-    /// 表示用 edge 列（フレーム毎。collapsed グループの境界を箱ポートへ写像。描画/ヒットテスト/選択に使う）。
+    /// Display edge list (per frame. Map collapsed-group boundaries onto box ports. Used for draw/hit-test/selection).
     fn buildDisplayEdges(self: *const App, out: []group.DisplayEdge) usize {
         var flat_buf: [MAX_EDGES]Edge = undefined;
         const flat = flat_buf[0..self.buildFlatEdges(&flat_buf)];
         return self.ledger.buildDisplayEdges(flat, out);
     }
 
-    /// 展開中の group のヘッダー（タイトル+トグルのみ。ポート無し n_in=n_out=0）。collapsed な group は
-    /// buildNodes 側の箱に既に含まれるのでここには出さない。フレーム毎（group 数個規模）。
+    /// Headers of expanded groups (title+toggle only; no ports n_in=n_out=0). Collapsed groups are
+    /// already in the buildNodes box, so they do not appear here. Per frame (a handful of groups).
     fn buildGroupHeaders(self: *const App, out: []NodeGeom) usize {
         var n: usize = 0;
         for (self.ledger.groups, 0..) |g, i| {
@@ -1061,8 +1061,8 @@ const App = struct {
         return n;
     }
 
-    /// イベント時のみ。接続が変わるたびに全 active group の expose 表を再導出する（group 数<=8 なので
-    /// 毎回全走査しても安い。deriveExposed は実 handle edge のみを事前条件とする＝flat edge を渡す）。
+    /// Event only. Re-derive every active group's expose table whenever connections change (group count<=8 so
+    /// a full scan is cheap. deriveExposed requires real-handle edges only = pass the flat edge list).
     fn refreshAllExposed(self: *App) void {
         var flat_buf: [MAX_EDGES]Edge = undefined;
         const flat = flat_buf[0..self.buildFlatEdges(&flat_buf)];
@@ -1071,7 +1071,7 @@ const App = struct {
         }
     }
 
-    // ── File メニュー（TASK-136）──────────────────────────────────────────
+    // ── File menu ──────────────────────────────────────────────────────────
     fn rebuildMenuCommands(self: *App) void {
         const accel_mod: platform.ModifierFlags = if (builtin.os.tag == .macos)
             .{ .cmd = true }
@@ -1119,7 +1119,7 @@ const App = struct {
             .label = "Quit",
             .menu = .{ .title = "File", .order = 103 },
         });
-        // TASK-149.3: View → History（Cmd/Ctrl+Shift+H。modifier 無し H の全 hide と分離）。
+        // View → History (Cmd/Ctrl+Shift+H. Separate from modifier-less H hide-all).
         var hist_mod = accel_mod;
         hist_mod.shift = true;
         const hist_checked = if (self.findPanel("History")) |p| p.visible else false;
@@ -1169,7 +1169,7 @@ const App = struct {
         }
     }
 
-    /// GUI fallback 環境のショートカット照合（native メニュー有効時は keyEquivalent が所有）。
+    /// Shortcut matching for the GUI-fallback environment (when native menu is on, keyEquivalent owns it).
     fn matchMenuShortcut(self: *const App, k: platform.KeyEvent) ?platform.CommandId {
         const accel = k.modifiers.cmd or k.modifiers.ctrl;
         for (self.menu_commands[0..self.menu_command_count]) |cmd| {
@@ -1186,7 +1186,7 @@ const App = struct {
         return null;
     }
 
-    /// 拡張子欠落時に `.vprj` を付加（dialog 戻り path。caller が free）。
+    /// Append `.vprj` when the extension is missing (dialog return path; caller frees).
     fn ensureVprjExt(gpa: std.mem.Allocator, path: []const u8) ![]u8 {
         if (path.len >= 5 and std.ascii.eqlIgnoreCase(path[path.len - 5 ..], ".vprj")) {
             return gpa.dupe(u8, path);
@@ -1194,7 +1194,7 @@ const App = struct {
         return std.fmt.allocPrint(gpa, "{s}.vprj", .{path});
     }
 
-    /// framebuffer unlock 後の安全点で pending File 操作を実行（dialog は lock 中禁止）。
+    /// Run pending File ops at a safe point after framebuffer unlock (dialogs forbidden while locked).
     fn runPendingMenuFileOp(self: *App) void {
         const op = self.pending_menu_op orelse return;
         self.pending_menu_op = null;
@@ -1204,7 +1204,7 @@ const App = struct {
                 const maybe = platform.saveFileDialog(gpa, self.io, .{
                     .default_name = "untitled.vprj",
                     .allowed_ext = "vprj",
-                }) catch return; // DialogFailed（headless）等は無視して RT 継続
+                }) catch return; // Ignore DialogFailed (headless) etc. and keep RT running
                 const path = maybe orelse return;
                 defer gpa.free(path);
                 const final_path = ensureVprjExt(gpa, path) catch return;
@@ -1215,7 +1215,7 @@ const App = struct {
                 const maybe = platform.openFileDialog(gpa, self.io, .{ .allowed_ext = "vprj" }) catch return;
                 const path = maybe orelse return;
                 defer gpa.free(path);
-                // actionLoadProject と同じ経路（args = path）を呼ぶ。
+                // Same path as actionLoadProject (args = path).
                 var buf: [256]u8 = undefined;
                 _ = actionLoadProject(self, path, &buf) catch {};
             },
@@ -1223,8 +1223,8 @@ const App = struct {
     }
 };
 
-// RT audio callback: dyn.processBlock のみ（同期/alloc/lock/IO/panic なし）。facade が audio probe を自動 tap。
-// C 用の master 可視化タップ（SampleTap.write。空き不足は丸ごと drop・非ブロッキング。RT 実績パターン）。
+// RT audio callback: dyn.processBlock only (no sync/alloc/lock/IO/panic). The facade auto-taps the audio probe.
+// Master visualisation tap for C (SampleTap.write. Drop whole writes when full; non-blocking. Established RT pattern).
 fn audioCallback(buf: []f32, frames: u32, channels: u32, sample_rate: u32, userdata: ?*anyopaque) void {
     _ = sample_rate;
     const app: *App = @ptrCast(@alignCast(userdata orelse {
@@ -1236,7 +1236,7 @@ fn audioCallback(buf: []f32, frames: u32, channels: u32, sample_rate: u32, userd
 }
 
 // ----------------------------------------------------------------------------
-// TASK-115.3: main-thread MIDI drain（イベント時のみ。Executor/CommandLog 非経由）
+// main-thread MIDI drain (event only; not via Executor/CommandLog)
 // ----------------------------------------------------------------------------
 
 fn handleForGenRole(app: *const App, role: project_io.GenRole) ?Handle {
@@ -1252,7 +1252,7 @@ fn midiTargetActive(app: *const App, role: project_io.GenRole, param: []const u8
     return paramDescFor(kind, param) != null;
 }
 
-/// CC → ParamBatch 更新。CommandLog / History / undo / recipe には一切触らない。
+/// CC → ParamBatch update. Does not touch CommandLog / History / undo / recipe at all.
 fn applyMidiCc(app: *App, controller: u8, value: u8) void {
     const v: u8 = @min(value, 127);
     for (MIDI_CC_MAP, 0..) |binding, bi| {
@@ -1294,8 +1294,8 @@ fn applyMidiCc(app: *App, controller: u8, value: u8) void {
     }
 }
 
-/// main thread: MIDI FIFO を drain し note→NoteQueue / CC→ParamBatch へ振り分ける。
-/// Executor.executeAction を通さない（CommandLog/recipe 非記録）。
+/// main thread: drain the MIDI FIFO and route note→NoteQueue / CC→ParamBatch.
+/// Does not go through Executor.executeAction (not recorded in CommandLog/recipe).
 fn drainMidiEvents(app: *App, device: *midi.Device) void {
     while (device.pollMidi()) |ev| {
         switch (ev) {
@@ -1315,8 +1315,8 @@ fn midiMapDigest(ctx: *anyopaque, buf: []u8) []const u8 {
     const head = std.fmt.bufPrint(buf[off..], "map_version=1", .{}) catch return buf[0..0];
     off += head.len;
     for (MIDI_CC_MAP, 0..) |binding, bi| {
-        const raw: u8 = app.midi_cc_raw[bi] orelse 0; // ccN_value = raw CC 0..127（mapped Hz/BPM ではない）
-        // 1 CC 1 target（MVP）。将来 multi-target でも先頭 target を digest の代表にする。
+        const raw: u8 = app.midi_cc_raw[bi] orelse 0; // ccN_value = raw CC 0..127 (not mapped Hz/BPM)
+        // 1 CC → 1 target (MVP). Even with future multi-target, digest uses the first target as representative.
         const t0 = binding.targets[0];
         const active: u8 = if (midiTargetActive(app, t0.role, t0.param)) 1 else 0;
         const curve_s: []const u8 = switch (binding.curve) {
@@ -1347,9 +1347,9 @@ fn midiMapDigest(ctx: *anyopaque, buf: []u8) []const u8 {
 }
 
 // ============================================================================
-// 描画ヘルパー
+// Draw helpers
 // ============================================================================
-/// f32 screen 座標 → i32（NaN/Inf/範囲外を安全化。極端 zoom/pan で panic させない）。
+/// f32 screen coords → i32 (NaN/Inf/OOB safe. Do not panic on extreme zoom/pan).
 fn safeI32(v: f32) i32 {
     if (!std.math.isFinite(v)) return 0;
     return @intFromFloat(std.math.clamp(@round(v), -1_000_000.0, 1_000_000.0));
@@ -1372,7 +1372,7 @@ fn vec2i(p: Vec2f) gui.Vec2 {
     return .{ .x = safeI32(p.x), .y = safeI32(p.y) };
 }
 
-/// 水平スパンで塗る簡易な塗り円（DrawList に circle が無いため）。半径は呼び出し側で 3..10 に clamp 済み。
+/// Simple filled circle painted as horizontal spans (DrawList has no circle). Caller already clamps radius to 3..10.
 fn fillCircle(dl: *gui.DrawList, center: Vec2f, r: f32, col: gui.Color) void {
     if (!std.math.isFinite(center.x) or !std.math.isFinite(center.y)) return;
     const rr = std.math.clamp(r, 0.0, 64.0);
@@ -1401,8 +1401,8 @@ fn drawFrame(app: *App, dl: *gui.DrawList) void {
     const cam = app.camera;
     const r = cam.portScreenRadius();
 
-    // ケーブル（ノードの下）。visual（写像済み）端点で描画し、選択/hover 判定は actual（実 CableRef）で行う
-    // （合成 handle は描画座標の中だけで使う）。座標は center origin を加えた screen 絶対。
+    // Cables (under nodes). Draw at visual (mapped) endpoints; select/hover against actual (real CableRef)
+    // (synthetic handles stay inside draw coordinates only). Coords are absolute screen = center origin added.
     for (dedges) |de| {
         const e = de.visual;
         const sg = findNode(nodes, e.src_handle) orelse continue;
@@ -1414,8 +1414,8 @@ fn drawFrame(app: *App, dl: *gui.DrawList) void {
         dl.line(vec2i(a), vec2i(b), portColor(kind), thick) catch {};
     }
 
-    // ノード + ポート（畳み箱＝合成 handle はタイトル/ポート種別を台帳経由で解決。box handle は dyn へ
-    // 直接渡さない＝§3.1 の閉じ込め）。
+    // Nodes + ports (collapsed box = synthetic handle resolves title/port kinds via the ledger. Never pass the box
+    // handle straight into dyn — keep synthetic handles confined).
     for (nodes) |g| {
         const tl = app.worldToAbs(g.pos);
         const sz = canvas.nodeSize(g).scale(cam.zoom);
@@ -1425,9 +1425,9 @@ fn drawFrame(app: *App, dl: *gui.DrawList) void {
         const hovered = itemIsHandle(app.hover, g.handle);
         const border = if (selected) SEL_COL else if (hovered) HOVER_COL else BORDER_COL;
         dl.rectOutline(rect, border, if (selected) 2 else 1) catch {};
-        // タイトル帯（TITLE_H * zoom）内で ink 高さ基準の縦中央（TASK-167）。
-        // マクロ箱の evolve/lock トグル（TASK-160.2）はタイトル帯左端に描くため、その分だけ
-        // テキスト開始 x を右へ逃がして重なりを防ぐ（実機フィードバックで発覚した見た目の不具合）。
+        // Vertically centre by ink height inside the title band (TITLE_H * zoom).
+        // Macro-box evolve/lock toggles are drawn at the left of the title band, so shift
+        // the text start x right by that amount to avoid overlap.
         {
             var title_x_pad: i32 = 6;
             if (group.groupIdFromHandle(g.handle)) |title_gid| {
@@ -1438,22 +1438,22 @@ fn drawFrame(app: *App, dl: *gui.DrawList) void {
                 }
             }
             const title_band_h: i32 = @intFromFloat(@round(canvas.TITLE_H * cam.zoom));
-            // TASK-170: ノードタイトルは小フォント（title_font）で描く。ink centering も同じ
-            // 小フォントのメトリクスに揃える（textEx 渡しの font と centering 計算の font を一致させる）。
+            // Node titles use the small font (title_font). Ink centering uses the same
+            // small-font metrics (the font passed to textEx must match the font used for centering).
             const text_h = gui.fontInkHeight(app.title_font);
             const text_y = gui.centeredTextY(rect.y, title_band_h, text_h);
-            // トグル分の title_x_pad がノード幅を圧迫しても、隣接ノードへ文字が溢れないよう
-            // ノード自身の rect でクリップする（実機フィードバックで発覚した回帰の暫定対処。
-            // 恒久対応はノード表示全体の見直しで検討）。
+            // Even when title_x_pad for toggles squeezes the node width, clip to the node's own
+            // rect so glyphs do not spill into neighbouring nodes
+            // (a temporary mitigation; a fuller node-display rethink is future work).
             dl.pushClip(rect) catch {};
             dl.textEx(.{ .x = rect.x + title_x_pad, .y = text_y }, nodeTitle(app, g.handle), TITLE_COL, app.title_font) catch {};
             dl.popClip();
         }
         if (group.groupIdFromHandle(g.handle)) |gid| {
-            drawToggle(app, dl, g, true); // 畳み箱は常に collapsed 側
-            drawMacroGrid(app, dl, g, gid); // 本体に TR/303 grid + playhead（TASK-40.7.2）
+            drawToggle(app, dl, g, true); // Collapsed boxes always use the collapsed side
+            drawMacroGrid(app, dl, g, gid); // TR/303 grid + playhead in the body
         } else if (g.grid_rows > 0) {
-            // selected standalone step_seq の inline grid（TASK-110.2。マクロ箱経路とは分離）
+            // Inline grid for a selected standalone step_seq (separate from the macro-box path)
             drawInlineStepSeqGrid(app, dl, g);
         }
         var i: u8 = 0;
@@ -1467,7 +1467,7 @@ fn drawFrame(app: *App, dl: *gui.DrawList) void {
         while (i < g.n_out) : (i += 1) {
             const p = app.worldToAbs(canvas.outPortPos(g, i));
             const kind = portKindOut(app, g.handle, i);
-            // A: 出力ポート丸を活性度で明滅（peak-hold + decay。RT 影響ゼロ）。活性時は halo を先に、その上に明るい dot。
+            // A: blink output-port dots by activity (peak-hold + decay; zero RT impact). When active, halo first then a bright dot on top.
             const lvl = outPortLevel(app, g.handle, i);
             const base = portColor(kind);
             if (lvl > 0.12) fillCircle(dl, p, r + 2, litColor(base, lvl * 0.5));
@@ -1476,18 +1476,18 @@ fn drawFrame(app: *App, dl: *gui.DrawList) void {
         }
     }
 
-    // 展開中グループの薄い枠（矩形+タイトル+トグル）。中身の grid 描画は 40.7.2。
+    // Thin frame for an expanded group (rect+title+toggle). Inner grid drawing is separate.
     for (app.ledger.groups, 0..) |gr, gi| {
         if (!gr.active or gr.collapsed) continue;
         drawExpandedGroupFrame(app, dl, nodes, @intCast(gi), gr);
     }
 
-    // D: tap 中ポートのミニ oscilloscope（ノード内側下端の帯。TASK-170）。
+    // D: mini oscilloscope for tapped ports (band along the inner bottom of the node).
     drawMiniScopes(app, dl, nodes);
-    // TASK-170: 主要パラメータ値のコンパクト表示（同じ帯の scope 右側）。tap 有無に関係なく毎フレーム。
+    // Compact display of key parameter values (right of the same scope band). Every frame regardless of tap.
     drawNodeParamValues(app, dl, nodes);
 
-    // pending cable（接続 drag 中: origin ポート → カーソル）
+    // pending cable (during connection drag: origin port → cursor)
     if (app.drag == .cable) {
         const origin = app.drag.cable.origin;
         if (portScreenPos(app, nodes, origin)) |op| {
@@ -1495,7 +1495,7 @@ fn drawFrame(app: *App, dl: *gui.DrawList) void {
         }
     }
 
-    // ラバーバンド矩形（TASK-173.3）: 半透明青塗り + 青枠（ドラッグ中のみ）。
+    // Rubber-band rectangle: translucent blue fill + blue border (while dragging only).
     if (app.drag == .rect_select) {
         const rs = app.drag.rect_select;
         const wr = canvas.normalizeWorldRect(rs.start_world, app.mouseWorld());
@@ -1511,14 +1511,14 @@ fn drawFrame(app: *App, dl: *gui.DrawList) void {
         dl.rectOutline(rect, RECT_SEL_OUTLINE, 1) catch {};
     }
 
-    // モジュールパレット（center rect 基準オーバーレイ。PanelHost panel にはしない）。
+    // Module palette (center-rect overlay; not a PanelHost panel).
     const buttons = paletteButtons(app);
     for (buttons) |btn| {
         const rect = gui.Rect{ .x = safeI32(btn.rect.x), .y = safeI32(btn.rect.y), .w = safeU32(btn.rect.w), .h = safeU32(btn.rect.h) };
         const hov = canvas.hitTestPalette(app.mouse, &buttons) == btn.kind_index;
         dl.rectFilled(rect, if (hov) PAL_BG_HOVER else PAL_BG) catch {};
         dl.rectOutline(rect, BORDER_COL, 1) catch {};
-        // palette 行高 PAL_H 内で ink 中央（TASK-167）。
+        // Ink-centre within palette row height PAL_H.
         {
             const text_h = gui.fontInkHeight(app.gui_ctx.font);
             const text_y = gui.centeredTextY(rect.y, @as(i32, @intFromFloat(PAL_H)), text_h);
@@ -1527,7 +1527,7 @@ fn drawFrame(app: *App, dl: *gui.DrawList) void {
     }
 }
 
-/// origin ポートの screen 絶対位置（node が消えていれば null）。pending cable 描画用。
+/// Absolute screen position of the origin port (null if the node is gone). For pending-cable drawing.
 fn portScreenPos(app: *const App, nodes: []const NodeGeom, p: PortRef) ?Vec2f {
     const g = findNode(nodes, p.handle) orelse return null;
     const wp = if (p.is_input) canvas.inPortPos(g, p.index) else canvas.outPortPos(g, p.index);
@@ -1541,7 +1541,7 @@ fn cableItemMatches(item: ?Item, actual: CableRef) bool {
     return false;
 }
 
-/// selected/hover の Item が handle h（実ノード or 畳み箱/枠ヘッダーの合成 handle）を指しているか。
+/// Whether the selected/hover Item points at handle h (real node or synthetic handle of a collapsed box/frame header).
 fn itemIsHandle(item: ?Item, h: Handle) bool {
     if (item) |it| {
         return switch (it) {
@@ -1577,15 +1577,15 @@ fn findNode(nodes: []const NodeGeom, h: Handle) ?NodeGeom {
     return null;
 }
 
-/// ノードタイトル文字列。畳み箱/枠ヘッダー（合成 handle）は台帳の MacroKind 名、実ノードは dyn.kindOf。
+/// Node title string. Collapsed box/frame header (synthetic handle) → ledger MacroKind name; real node → dyn.kindOf.
 fn nodeTitle(app: *const App, h: Handle) []const u8 {
     if (group.groupIdFromHandle(h)) |gid| return app.ledger.groups[gid].kind.displayName();
     if (app.dyn.kindOf(h)) |k| return @tagName(k);
     return "?";
 }
 
-/// 入力ポート種別。合成 handle（畳み箱）は exposed_in[i] の実メンバーポートを dyn.inKindOf で解決する
-/// （box handle を dyn へ直接渡さない）。
+/// Input port kind. Synthetic handle (collapsed box) resolves exposed_in[i]'s real member port via dyn.inKindOf
+/// (do not pass the box handle straight into dyn).
 fn portKindIn(app: *const App, h: Handle, i: u8) PortKind {
     if (group.groupIdFromHandle(h)) |gid| {
         const g = app.ledger.groups[gid];
@@ -1595,7 +1595,7 @@ fn portKindIn(app: *const App, h: Handle, i: u8) PortKind {
     return app.dyn.inKindOf(h, i) orelse .audio;
 }
 
-/// 出力ポート種別。合成 handle（畳み箱）は exposed_out[i] の実メンバーポートを dyn.outKindOf で解決する。
+/// Output port kind. Synthetic handle (collapsed box) resolves exposed_out[i]'s real member port via dyn.outKindOf.
 fn portKindOut(app: *const App, h: Handle, i: u8) PortKind {
     if (group.groupIdFromHandle(h)) |gid| {
         const g = app.ledger.groups[gid];
@@ -1613,14 +1613,14 @@ fn paletteLabel(entry: PaletteEntry) []const u8 {
     };
 }
 
-/// 折り畳みトグル [±] を描画する（g は箱 or 枠ヘッダーの NodeGeom。collapsed で表示ラベルを切替）。
+/// Draw the collapse toggle [±] (g is the box or frame-header NodeGeom; collapsed switches the label).
 fn drawToggle(app: *const App, dl: *gui.DrawList, g: NodeGeom, collapsed: bool) void {
     const tl = app.worldToAbs(canvas.togglePos(g));
     const size = canvas.TOGGLE_SIZE * app.camera.zoom;
     const rect = gui.Rect{ .x = safeI32(tl.x), .y = safeI32(tl.y), .w = safeU32(size), .h = safeU32(size) };
     dl.rectFilled(rect, PAL_BG) catch {};
     dl.rectOutline(rect, BORDER_COL, 1) catch {};
-    // トグル正方形内で ink 中央（TASK-167）。
+    // Ink-centre inside the toggle square.
     {
         const text_h = gui.fontInkHeight(app.gui_ctx.font);
         const text_y = gui.centeredTextY(rect.y, @as(i32, @intCast(rect.h)), text_h);
@@ -1628,8 +1628,8 @@ fn drawToggle(app: *const App, dl: *gui.DrawList, g: NodeGeom, collapsed: bool) 
     }
 }
 
-/// 展開中グループの薄い枠（現在のメンバー配置の bbox 外周）+ ヘッダー（タイトル+トグル、group.pos アンカー）。
-/// 中身（TR grid 等）の描画は 40.7.2。
+/// Thin frame of an expanded group (bbox around current member layout) + header (title+toggle, anchored at group.pos).
+/// Inner content (TR grid etc.) is drawn separately.
 fn drawExpandedGroupFrame(app: *const App, dl: *gui.DrawList, nodes: []const NodeGeom, gid: group.GroupId, gr: group.Group) void {
     var bbox_min = Vec2f{ .x = std.math.floatMax(f32), .y = std.math.floatMax(f32) };
     var bbox_max = Vec2f{ .x = -std.math.floatMax(f32), .y = -std.math.floatMax(f32) };
@@ -1660,7 +1660,7 @@ fn drawExpandedGroupFrame(app: *const App, dl: *gui.DrawList, nodes: []const Nod
     const hsel = itemIsHandle(app.selected, header.handle) or selection.contains(&app.multi_selected, header.handle);
     dl.rectFilled(hrect, NODE_BG) catch {};
     dl.rectOutline(hrect, if (hsel) SEL_COL else BORDER_COL, if (hsel) 2 else 1) catch {};
-    // 展開グループヘッダも TITLE_H 帯で ink 中央（TASK-167）。TASK-170: 通常ノードと同じ小フォント。
+    // Expanded-group headers also ink-centre in the TITLE_H band. Same small font as ordinary nodes.
     {
         const title_band_h: i32 = @intFromFloat(@round(canvas.TITLE_H * app.camera.zoom));
         const text_h = gui.fontInkHeight(app.title_font);
@@ -1671,13 +1671,13 @@ fn drawExpandedGroupFrame(app: *const App, dl: *gui.DrawList, nodes: []const Nod
 }
 
 // ============================================================================
-// 畳みマクロ箱の TR/303 grid（TASK-40.7.2）。member は台帳経由で解決した実 handle のみを dyn.ptrOf へ渡し、
-// mask/step は atomic load で読む（合成 handle を dyn へ渡さない規約踏襲）。フレーム毎（1 箱で最大 4 行×16 セル）。
+// Collapsed-macro TR/303 grid. Members: only real handles resolved via the ledger go to dyn.ptrOf;
+// mask/step are atomic-loaded (keep the no-synthetic-handle-into-dyn rule). Per frame (at most 4 rows×16 cells per box).
 // ============================================================================
 const StepSeqPtr = *modular.StepSeq;
 
-/// gid の step_seq メンバーを handle 昇順で最大 3 個集める（drum: [seqK, seqH, seqClap] / bass: [seq]）。
-/// active + step_seq + 当該 gid 所属のみ（stale handle を弾く。台帳同期）。
+/// Collect up to 3 step_seq members of gid in handle order (drum: [seqK, seqH, seqClap] / bass: [seq]).
+/// Only active + step_seq + belonging to that gid (drop stale handles; stay in sync with the ledger).
 fn collectStepSeqMembers(app: *const App, gid: group.GroupId) struct { items: [3]Handle, n: usize } {
     var items: [3]Handle = .{ 0, 0, 0 };
     var n: usize = 0;
@@ -1692,7 +1692,7 @@ fn collectStepSeqMembers(app: *const App, gid: group.GroupId) struct { items: [3
     return .{ .items = items, .n = n };
 }
 
-/// クリック可能な mask 行数（drum は group metadata の lane 数、bass は on/accent/slide の 3 行）。
+/// Clickable mask row count (drum = lane count from group metadata; bass = on/accent/slide = 3 rows).
 fn clickableRows(g: group.Group) u8 {
     return switch (g.kind) {
         .drum_machine => @min(if (g.grid_rows == 0) 2 else g.grid_rows, 3),
@@ -1711,12 +1711,12 @@ fn toStepgridGeometry(g: canvas.GridGeometry) stepgrid.Geometry {
     };
 }
 
-/// camera 変換済みの共通 grid geometry（macro box / standalone node 共用 adapter）。
+/// Shared camera-transformed grid geometry (adapter shared by macro box / standalone node).
 fn gridGeometry(cam: Camera, box_pos: Vec2f) stepgrid.Geometry {
     return toStepgridGeometry(canvas.gridGeometry(cam, box_pos));
 }
 
-/// 描画用: center origin を加えた screen 絶対 grid geometry。
+/// For drawing: grid geometry in absolute screen coords (center origin added).
 fn absGridGeometry(app: *const App, box_pos: Vec2f) stepgrid.Geometry {
     var g = gridGeometry(app.camera, box_pos);
     g.origin_x += app.canvas_rect.x;
@@ -1724,14 +1724,14 @@ fn absGridGeometry(app: *const App, box_pos: Vec2f) stepgrid.Geometry {
     return g;
 }
 
-/// 畳み箱本体に TR grid（drum 2 レーン）/ 303 行（on/accent/slide + pitch 段）+ playhead を描く。
-/// タイトル帯に evolve（全体）/ lock（per-lane）トグルを描く（生成マクロのみ。TASK-160.2）。
+/// Draw the TR grid (drum 2 lanes) / 303 rows (on/accent/slide + pitch) + playhead into the collapsed-box body.
+/// Draw evolve (global) / lock (per-lane) toggles in the title band (generation macros only).
 fn drawMacroGrid(app: *App, dl: *gui.DrawList, box: NodeGeom, gid: group.GroupId) void {
     const kind = app.ledger.groups[gid].kind;
     const seqs = collectStepSeqMembers(app, gid);
     if (seqs.n == 0) return;
 
-    // playhead 列: process は現 step 評価後に step++ するので、直近発音した列は (step + STEPS-1) % STEPS。
+    // Playhead column: process does step++ after evaluating the current step, so the last-sounded column is (step + STEPS-1) % STEPS.
     const head_seq: StepSeqPtr = app.dyn.ptrOf(.step_seq, seqs.items[0]);
     const playhead: u8 = (head_seq.loadStep() + stepgrid.STEP_COUNT - 1) % stepgrid.STEP_COUNT;
     const geometry = absGridGeometry(app, box.pos);
@@ -1740,7 +1740,7 @@ fn drawMacroGrid(app: *App, dl: *gui.DrawList, box: NodeGeom, gid: group.GroupId
 
     switch (kind) {
         .drum_machine => {
-            // 既存パレット macro は 2 レーン、生成 DrumMachine は 3 レーン。
+            // Legacy palette macros are 2 lanes; generated DrumMachine is 3 lanes.
             var rows: [3]stepgrid.DrawRow = undefined;
             var lane: u8 = 0;
             const row_count = @min(@as(usize, if (box.grid_rows == 0) 2 else box.grid_rows), seqs.n);
@@ -1864,7 +1864,7 @@ fn applyMacroMutationToggle(app: *App, hit: MacroMutationHit) void {
     }
 }
 
-/// 選択中 standalone step_seq の inline grid 描画（pattern_db 非経由・atomic load のみ。TASK-110.2）。
+/// Inline grid for a selected standalone step_seq (not via pattern_db; atomic load only).
 fn drawInlineStepSeqGrid(app: *App, dl: *gui.DrawList, box: NodeGeom) void {
     const seq: StepSeqPtr = app.dyn.ptrOf(.step_seq, box.handle);
     const playhead: u8 = (seq.loadStep() + stepgrid.STEP_COUNT - 1) % stepgrid.STEP_COUNT;
@@ -1888,7 +1888,7 @@ fn drawInlineStepSeqGrid(app: *App, dl: *gui.DrawList, box: NodeGeom) void {
     }
 }
 
-/// world 点がどの collapsed マクロ箱の grid セルに当たるか（クリック可能行のみ）。
+/// Which collapsed-macro grid cell a world point hits (clickable rows only).
 const GridHit = struct { gid: group.GroupId, cell: stepgrid.GridCell };
 fn hitMacroGrid(app: *const App, world_pt: Vec2f) ?GridHit {
     for (app.ledger.groups, 0..) |g, i| {
@@ -1901,8 +1901,8 @@ fn hitMacroGrid(app: *const App, world_pt: Vec2f) ?GridHit {
     return null;
 }
 
-/// selected step_seq の inline grid ヒット（mask 行のみ。pitch は対象外。
-/// standalone / 展開中 group member 両方。collapsed member は表示されないのでここに来ない。TASK-133）。
+/// Hit-test the selected step_seq inline grid (mask rows only; pitch out of scope.
+/// Both standalone and expanded group members. Collapsed members are not shown, so they never reach here).
 const InlineGridHit = struct { handle: Handle, cell: stepgrid.GridCell };
 fn hitInlineStepSeqGrid(app: *const App, world_pt: Vec2f) ?InlineGridHit {
     const sel = app.selected orelse return null;
@@ -1915,7 +1915,7 @@ fn hitInlineStepSeqGrid(app: *const App, world_pt: Vec2f) ?InlineGridHit {
     const seq = app.dyn.ptrOfConst(.step_seq, h);
     const clickable: u8 = switch (seq.kind) {
         .drum => 1,
-        .bass => 3, // on/accent/slide。pitch(row 3) は表示専用
+        .bass => 3, // on/accent/slide. pitch (row 3) is display-only
     };
     const local = world_pt.sub(app.layout[h]);
     const geometry = gridGeometry(.{ .zoom = 1.0 }, .{ .x = 0, .y = 0 });
@@ -1932,8 +1932,8 @@ fn isGeneratedStepSeq(app: *const App, h: Handle) bool {
         h == app.patch.bass_seq_h;
 }
 
-/// inline step_seq の mask トグル。生成 handle は patternEditBase → publishPatternCommand、
-/// standalone は atomic accessor のみ（TASK-133）。
+/// Toggle an inline step_seq mask. Generation handles go patternEditBase → publishPatternCommand;
+/// standalone uses atomic accessors only.
 fn toggleInlineStepSeqCell(app: *App, hit: InlineGridHit) void {
     if (isGeneratedStepSeq(app, hit.handle)) {
         const target: ?[]const u8 = blk: {
@@ -1983,8 +1983,8 @@ fn generatedMacroGroup(app: *const App, gid: group.GroupId) bool {
         app.ledger.memberOf(gid, app.patch.bass_seq_h);
 }
 
-/// RT 未適用の直近 publish を編集基底にする。RT が rev を acquire 済みなら pending を破棄し、
-/// evolve 等の RT authoritative な現在値へ戻す。quantize は呼び出し側が明示的に再設定する。
+/// Use the latest publish not yet applied by RT as the edit base. If RT has already acquired the rev, drop pending and
+/// fall back to the RT-authoritative current values (evolve etc.). The caller re-sets quantize explicitly.
 fn patternEditBase(app: *App) PatternCommand {
     const st = app.patch.snapshotState();
     var base = stateToCommand(st);
@@ -1999,8 +1999,8 @@ fn patternEditBase(app: *App) PatternCommand {
     return base;
 }
 
-/// pattern を publish し、RT 未適用の最新 command を GUI 側へ保持する。
-/// graph topology / RT view は変更せず、次の block 先頭で既存 applyControls() が取り込む。
+/// Publish a pattern and keep the latest not-yet-RT-applied command on the GUI side.
+/// Does not change graph topology / RT view; existing applyControls() takes it in at the next block start.
 fn publishPatternCommand(app: *App, cmd: PatternCommand) PatternCommand {
     var next = cmd;
     app.pattern_rev +%= 1;
@@ -2011,7 +2011,7 @@ fn publishPatternCommand(app: *App, cmd: PatternCommand) PatternCommand {
     return next;
 }
 
-/// grid セルクリック → 生成 macro は PatternCommand、既存パレット macro は atomic accessor でトグル。
+/// Grid-cell click → PatternCommand for generation macros; atomic accessors for legacy palette macros.
 fn toggleMacroGridCell(app: *App, hit: GridHit) void {
     const group_state = app.ledger.groups[hit.gid];
     const kind = group_state.kind;
@@ -2058,7 +2058,7 @@ fn toggleMacroGridCell(app: *App, hit: GridHit) void {
 }
 
 // ============================================================================
-// 入力
+// Input
 // ============================================================================
 fn edgeForInput(app: *const App, dst: Handle, dst_in: u8) ?Edge {
     var edge_buf: [MAX_EDGES]Edge = undefined;
@@ -2069,7 +2069,7 @@ fn edgeForInput(app: *const App, dst: Handle, dst_in: u8) ?Edge {
     return null;
 }
 
-/// world 点近傍のトグルを持つ group（畳み箱 or 展開枠ヘッダーの両方を見る）。
+/// Group whose toggle is near a world point (looks at both collapsed boxes and expanded-frame headers).
 fn hitToggle(app: *const App, world_pt: Vec2f) ?group.GroupId {
     var node_buf: [MAX_MODULES]NodeGeom = undefined;
     const nodes = node_buf[0..app.buildNodes(&node_buf)];
@@ -2082,7 +2082,7 @@ fn hitToggle(app: *const App, world_pt: Vec2f) ?group.GroupId {
     return null;
 }
 
-/// world 点近傍の展開枠ヘッダー（タイトル部分。ポートは無い）。
+/// Expanded-frame header near a world point (title area; no ports).
 fn hitGroupHeader(app: *const App, world_pt: Vec2f) ?group.GroupId {
     var hdr_buf: [group.MAX_GROUPS]NodeGeom = undefined;
     const headers = hdr_buf[0..app.buildGroupHeaders(&hdr_buf)];
@@ -2090,7 +2090,7 @@ fn hitGroupHeader(app: *const App, world_pt: Vec2f) ?group.GroupId {
     return null;
 }
 
-/// 表示用ケーブル（visual 端点でヒットテストし、実 CableRef=actual を返す）。
+/// Display cable (hit-test at visual endpoints; return the real CableRef=actual).
 fn hitTestDisplayCable(world_pt: Vec2f, nodes: []const NodeGeom, dedges: []const group.DisplayEdge) ?CableRef {
     var visual_buf: [MAX_EDGES]Edge = undefined;
     for (dedges, 0..) |de, i| visual_buf[i] = de.visual;
@@ -2099,7 +2099,7 @@ fn hitTestDisplayCable(world_pt: Vec2f, nodes: []const NodeGeom, dedges: []const
 }
 
 fn updateHover(app: *App) void {
-    // panel / splitter / outside / 可視化帯上ではキャンバスの hover を出さない。
+    // Do not raise canvas hover over panel / splitter / outside / the visualisation strip.
     if (!app.allowsCanvasInput()) {
         app.hover = null;
         return;
@@ -2125,16 +2125,16 @@ fn routeUiAction(app: *App, name: []const u8, args: []const u8) void {
     _ = routeUiActionInto(app, name, args, &buf);
 }
 
-/// GUI → action 入口。`out_buf` に応答を書き、その slice を返す（失敗時 null）。
+/// GUI → action entry. Write the response into `out_buf` and return that slice (null on failure).
 ///
-/// - netsync 中: `platform.routeAction`（PROPOSE/COMMIT・canonicalize は registry 経路）。
-/// - それ以外: `cmd_exec.executeAction` を直接呼ぶ。
-///   harness 無効時は `registerAction` が no-op で registry が空のため、`routeAction`→dispatch
-///   は UnknownAction になる（実機 Critical）。Executor は app 所有・harness 非依存。
+/// - During netsync: `platform.routeAction` (PROPOSE/COMMIT; canonicalize via the registry path).
+/// - Otherwise: call `cmd_exec.executeAction` directly.
+///   When harness is off, `registerAction` is a no-op and the registry is empty, so `routeAction`→dispatch
+///   would return UnknownAction (critical on real hardware). Executor is owned by app and harness-independent.
 fn routeUiActionInto(app: *App, name: []const u8, args: []const u8, out_buf: []u8) ?[]const u8 {
     if (platform.netsyncActive()) {
         return platform.routeAction(name, args, out_buf) catch |err| {
-            std.debug.print("patch: routeAction {s} 失敗: {s}\n", .{ name, @errorName(err) });
+            std.debug.print("patch: routeAction {s} failed: {s}\n", .{ name, @errorName(err) });
             return null;
         };
     }
@@ -2142,13 +2142,13 @@ fn routeUiActionInto(app: *App, name: []const u8, args: []const u8, out_buf: []u
         .actor = .local_user,
         .record_policy = .record,
     }, out_buf) catch |err| {
-        std.debug.print("patch: executeAction {s} 失敗: {s}\n", .{ name, @errorName(err) });
+        std.debug.print("patch: executeAction {s} failed: {s}\n", .{ name, @errorName(err) });
         return null;
     };
     return res.output;
 }
 
-/// `ok id=#N` 応答なら NodeId → handle を解決して selected を設定（client の `proposed` は無視）。
+/// If the response is `ok id=#N`, resolve NodeId → handle and set selected (ignore client `proposed`).
 fn selectNodeFromOkIdResponse(app: *App, resp: []const u8) void {
     const prefix = "ok id=#";
     if (!std.mem.startsWith(u8, resp, prefix)) return;
@@ -2162,10 +2162,10 @@ fn selectNodeFromOkIdResponse(app: *App, resp: []const u8) void {
     }
 }
 
-/// パレット index → add_node / add_macro action（world 座標付き）。
+/// Palette index → add_node / add_macro action (with world coords).
 fn routePaletteAdd(app: *App, ki: u8) void {
     const casc: f32 = @floatFromInt(app.dyn.activeCount() % 8);
-    // center ローカル座標（camera 空間）で配置点を決める。
+    // Place in center-local coords (camera space).
     const cx: f32 = app.canvasW() * 0.45 + casc * 18;
     const cy: f32 = app.canvasH() * 0.4 + casc * 18;
     if (ki >= PALETTE.len) return;
@@ -2179,9 +2179,9 @@ fn routePaletteAdd(app: *App, ki: u8) void {
             selectNodeFromOkIdResponse(app, resp);
         },
         .macro_kind => |mk| {
-            // clamp 後の world を wire に載せる（peer 間で同一座標）
+            // Put the clamped world coords on the wire (same coords across peers)
             const anchor: Vec2f = .{ .x = cx, .y = cy };
-            // footprint は kind 固定 OFFSETS で概算（members 未確定のため header のみ近似）
+            // Footprint estimated from kind-fixed OFFSETS (members not yet known; header-only approx)
             const fp = switch (mk) {
                 .drum_machine => Vec2f{ .x = 450 + 80, .y = MACRO_HEADER_BAND + 120 },
                 .bass_machine => Vec2f{ .x = 450 + 80, .y = MACRO_HEADER_BAND + 120 },
@@ -2189,13 +2189,13 @@ fn routePaletteAdd(app: *App, ki: u8) void {
             const pos = clampMacroPos(app, anchor, fp);
             var args_buf: [128]u8 = undefined;
             const args = std.fmt.bufPrint(&args_buf, "{s} {d} {d}", .{ @tagName(mk), pos.x, pos.y }) catch return;
-            // solo/host: actionAddMacro 内で selected=.group を設定。client proposed は未選択のまま。
+            // solo/host: actionAddMacro sets selected=.group. client proposed stays unselected.
             _ = routeUiActionInto(app, "add_macro", args, &resp_buf);
         },
         .step_seq_bass => {
             const pos = app.camera.screenToWorld(.{ .x = cx, .y = cy });
             var args_buf: [128]u8 = undefined;
-            // wire トークン `step_seq_bass`（drum の `step_seq` と分離。全 peer 同一 COMMIT args）。
+            // Wire token `step_seq_bass` (separate from drum `step_seq`. Same COMMIT args on every peer).
             const args = std.fmt.bufPrint(&args_buf, "step_seq_bass {d} {d}", .{ pos.x, pos.y }) catch return;
             const resp = routeUiActionInto(app, "add_node", args, &resp_buf) orelse return;
             selectNodeFromOkIdResponse(app, resp);
@@ -2230,7 +2230,7 @@ fn onMouseUp(app: *App) void {
             routeUiAction(app, "move_node", args);
         }
     } else if (app.drag == .rect_select) {
-        // 矩形選択確定: buildNodes の表示ノード bbox と正面積交差する handle を集合へ反映。
+        // Confirm rect select: put handles whose display-node bbox (from buildNodes) positively intersects into the set.
         const rs = app.drag.rect_select;
         const sel_rect = canvas.normalizeWorldRect(rs.start_world, app.mouseWorld());
         if (!rs.additive) selection.clear(&app.multi_selected);
@@ -2245,10 +2245,10 @@ fn onMouseUp(app: *App) void {
     app.drag = .none;
 }
 
-/// 接続を全事前検証してから 1 publish で確定する。drag-off の旧接続(detach)も同じ commit で処理し、
-/// 「1 操作=最大 1 publish」「無効/失敗時は既存接続を壊さない」を守る（切断を先行させない）。
-/// a/b/detach は常に実 PortRef/CableRef（呼び出し側が resolvePort 済み。合成 handle はここに来ない）。
-/// TASK-106.2: UI は routeCommitConnect → `connect` action。同等ロジックは `actionConnect` に集約。
+/// Fully pre-validate a connection, then commit in one publish. A drag-off's old connection (detach) is handled in the same commit,
+/// keeping "one gesture = at most one publish" and "invalid/failed drop does not break existing connections" (do not disconnect first).
+/// a/b/detach are always real PortRef/CableRef (caller already resolvePort'd. Synthetic handles never reach here).
+/// UI goes routeCommitConnect → `connect` action. Equivalent logic is centralised in `actionConnect`.
 fn routeCommitConnect(app: *App, a: PortRef, b: PortRef, detach: ?CableRef) void {
     const rc = canvas.resolveConnection(a, b) orelse return;
     const src = rc.src;
@@ -2273,12 +2273,12 @@ fn routeDisconnect(app: *App, dst_h: Handle, dst_in: u8) void {
     routeUiAction(app, "disconnect", args);
 }
 
-/// Shift または Cmd（macOS の multi-select 修飾。TASK-173.3）。
+/// Shift or Cmd (macOS multi-select modifier).
 fn multiSelectModifier(m: platform.ModifierFlags) bool {
     return m.shift or m.cmd;
 }
 
-/// multi_selected が空のとき、現在の app.selected の node/group を集合へ取り込む（Shift/Cmd トグル前処理）。
+/// When multi_selected is empty, seed the set from the current app.selected node/group (Shift/Cmd toggle preprocess).
 fn seedMultiFromSelectedIfEmpty(app: *App) void {
     if (!selection.empty(&app.multi_selected)) return;
     if (app.selected) |it| switch (it) {
@@ -2289,9 +2289,9 @@ fn seedMultiFromSelectedIfEmpty(app: *App) void {
 }
 
 fn onMouseDown(app: *App, modifiers: platform.ModifierFlags) void {
-    // panel / splitter / outside の mouse は GUI Context 側へ渡す。canvas と競合させない。
+    // panel / splitter / outside mouse goes to the GUI Context. Do not compete with the canvas.
     if (!app.allowsCanvasInput()) return;
-    // パレットは screen 絶対座標で world hit より先に判定（TASK-106.2: action route 経由）。
+    // Palette is hit-tested in absolute screen coords before world hits (via the action route).
     const buttons = paletteButtons(app);
     if (canvas.hitTestPalette(app.mouse, &buttons)) |ki| {
         routePaletteAdd(app, ki);
@@ -2300,7 +2300,7 @@ fn onMouseDown(app: *App, modifiers: platform.ModifierFlags) void {
     const mw = app.mouseWorld();
     const multi_mod = multiSelectModifier(modifiers);
 
-    // 折り畳みトグル [±] はノード本体のクリックより優先する（畳み箱 / 展開枠ヘッダーの両方）。
+    // Collapse toggle [±] takes priority over clicking the node body (both collapsed box and expanded-frame header).
     if (hitToggle(app, mw)) |gid| {
         app.ledger.groups[gid].collapsed = !app.ledger.groups[gid].collapsed;
         app.selected = .{ .group = gid };
@@ -2310,7 +2310,7 @@ fn onMouseDown(app: *App, modifiers: platform.ModifierFlags) void {
         return;
     }
 
-    // 生成マクロの evolve/lock トグル（step cell より優先・非衝突矩形。TASK-160.2）。
+    // Generation-macro evolve/lock toggles (priority over step cells; non-overlapping rects).
     if (hitMacroMutationToggle(app, mw)) |hit| {
         applyMacroMutationToggle(app, hit);
         app.selected = .{ .group = hit.gid };
@@ -2319,8 +2319,8 @@ fn onMouseDown(app: *App, modifiers: platform.ModifierFlags) void {
         return;
     }
 
-    // 畳み箱本体の TR/303 grid セルクリック → mask ビットトグル（atomic store・publish 無し）。box 本体の
-    // node hit（グループ drag 開始）より優先する。ポートは箱の左右端でグリッドと重ならない（順序不問だが先に処理）。
+    // Collapsed-box TR/303 grid cell click → toggle mask bit (atomic store; no publish). Takes priority over
+    // node hit on the box body (group drag start). Ports sit on the left/right edges and do not overlap the grid (order free, but handle first).
     if (hitMacroGrid(app, mw)) |hit| {
         toggleMacroGridCell(app, hit);
         app.selected = .{ .group = hit.gid };
@@ -2329,8 +2329,8 @@ fn onMouseDown(app: *App, modifiers: platform.ModifierFlags) void {
         return;
     }
 
-    // selected step_seq の inline grid（standalone / 展開中 member。TASK-133）。port/node drag より前。
-    // ヒット時は mask toggle のみ・selected 維持・node drag を開始しない。
+    // Selected step_seq inline grid (standalone / expanded member). Before port/node drag.
+    // On hit: mask toggle only; keep selected; do not start node drag.
     if (hitInlineStepSeqGrid(app, mw)) |hit| {
         toggleInlineStepSeqCell(app, hit);
         app.selected = .{ .node = hit.handle };
@@ -2344,14 +2344,14 @@ fn onMouseDown(app: *App, modifiers: platform.ModifierFlags) void {
     const nodes = node_buf[0..app.buildNodes(&node_buf)];
     const dedges = edge_buf[0..app.buildDisplayEdges(&edge_buf)];
     if (canvas.hitTestPort(mw, nodes)) |pr| {
-        // pr は as-hit の PortRef（畳み箱ポートなら合成 handle）。選択/pending 描画にはそのまま使い
-        // （box のポート dot をハイライトするため）、実接続の判定・変更にだけ resolvePort を通す。
+        // pr is the as-hit PortRef (synthetic handle if a collapsed-box port). Use it as-is for selection/pending drawing
+        // (to highlight the box's port dots); run resolvePort only for real connection checks/changes.
         selection.clear(&app.multi_selected);
         app.selected = .{ .port = pr };
         if (app.ledger.resolvePort(pr)) |real| {
             if (real.is_input) {
                 if (edgeForInput(app, real.handle, real.index)) |e| {
-                    // 接続済み入力からの drag-off: その元出力から pending を張り、切断は commit(mouse_up)まで遅延。
+                    // Drag-off from a connected input: pend from that source output; defer disconnect until commit(mouse_up).
                     app.drag = .{ .cable = .{
                         .origin = .{ .handle = e.src_handle, .is_input = false, .index = e.src_out },
                         .detach = .{ .dst_handle = real.handle, .dst_in = real.index },
@@ -2360,10 +2360,10 @@ fn onMouseDown(app: *App, modifiers: platform.ModifierFlags) void {
                 }
             }
         }
-        app.drag = .{ .cable = .{ .origin = pr } }; // 出力 or 未接続入力から pending 開始
+        app.drag = .{ .cable = .{ .origin = pr } }; // Start pending from an output or an unconnected input
     } else if (canvas.hitTestNode(mw, nodes)) |h| {
         if (multi_mod) {
-            // Shift/Cmd: 集合へトグル。drag は開始しない。
+            // Shift/Cmd: toggle in the set. Do not start a drag.
             seedMultiFromSelectedIfEmpty(app);
             selection.toggle(&app.multi_selected, h);
             if (group.groupIdFromHandle(h)) |gid| {
@@ -2373,8 +2373,8 @@ fn onMouseDown(app: *App, modifiers: platform.ModifierFlags) void {
             }
             app.drag = .none;
         } else if (group.groupIdFromHandle(h)) |gid| {
-            // 畳み箱本体のドラッグ: ledger.groups[gid].pos を更新し、app.layout には触らない
-            // （合成 handle を app.layout[h] へ絶対に index しない）。
+            // Collapsed-box body drag: update ledger.groups[gid].pos; do not touch app.layout
+            // (never index a synthetic handle into app.layout[h]).
             selection.clear(&app.multi_selected);
             app.selected = .{ .group = gid };
             app.drag = .{ .group = .{ .gid = gid, .grab_offset = app.ledger.groups[gid].pos.sub(mw) } };
@@ -2385,7 +2385,7 @@ fn onMouseDown(app: *App, modifiers: platform.ModifierFlags) void {
             app.drag = .{ .node = .{ .handle = h, .grab_offset = npos.sub(mw) } };
         }
     } else if (hitGroupHeader(app, mw)) |gid| {
-        // 展開枠ヘッダー本体のクリック: 選択のみ（40.7.1 はドラッグ非対応）。Shift/Cmd でトグル。
+        // Click on an expanded-frame header body: selection only (not draggable). Shift/Cmd toggles.
         const gh = group.handleOfGroup(gid);
         if (multi_mod) {
             seedMultiFromSelectedIfEmpty(app);
@@ -2400,11 +2400,11 @@ fn onMouseDown(app: *App, modifiers: platform.ModifierFlags) void {
         selection.clear(&app.multi_selected);
         app.selected = .{ .cable = actual };
     } else if (modifiers.alt) {
-        // Option(Alt)+空白左ドラッグ = pan（中央ボタンと同じ経路。トラックパッドに物理中ボタンが無い
-        // Mac 向けの代替手段）。選択状態には触れない（中央ボタン pan と同じ規約）。
+        // Option(Alt)+empty left-drag = pan (same path as middle button. Alternative for trackpads with no
+        // physical middle button on Mac). Does not touch selection (same rule as middle-button pan).
         app.drag = .{ .pan = .{ .start_pan = app.camera.pan, .start_mouse = app.toCanvasLocal(app.mouse) } };
     } else {
-        // 空白左ドラッグ = 矩形選択。pan は中央ボタン or Option+左ドラッグへ移行（TASK-173.3）。
+        // Empty left-drag = rect select. Pan moved to middle button or Option+left-drag.
         if (!multi_mod) {
             selection.clear(&app.multi_selected);
             app.selected = null;
@@ -2413,28 +2413,28 @@ fn onMouseDown(app: *App, modifiers: platform.ModifierFlags) void {
     }
 }
 
-/// マクロ展開時のメンバー相対配置（group.pos 基準の world offset）。y は展開ヘッダー（group.pos に
-/// タイトル+[−]）とメンバーが重ならないよう MACRO_HEADER_BAND の下から始める。各 OFFSETS は
-/// macro.zig の Handles 構造体のフィールド順と同順。
+/// Relative member layout when a macro is expanded (world offsets from group.pos). y starts below
+/// MACRO_HEADER_BAND so the expand header (title+[−] at group.pos) does not overlap members. OFFSETS order
+/// matches the field order of the Handles struct in macro.zig.
 const MACRO_HEADER_BAND: f32 = 58;
 const DRUM_OFFSETS = [_]Vec2f{
-    .{ .x = 0, .y = MACRO_HEADER_BAND + 40 }, // cdiv（左・中段）
-    .{ .x = 150, .y = MACRO_HEADER_BAND }, // seqK（上段）
-    .{ .x = 150, .y = MACRO_HEADER_BAND + 80 }, // seqH（下段）
-    .{ .x = 300, .y = MACRO_HEADER_BAND }, // kick（上段）
-    .{ .x = 300, .y = MACRO_HEADER_BAND + 80 }, // hat（下段）
-    .{ .x = 450, .y = MACRO_HEADER_BAND + 40 }, // mix（右・中段）
+    .{ .x = 0, .y = MACRO_HEADER_BAND + 40 }, // cdiv (left, mid)
+    .{ .x = 150, .y = MACRO_HEADER_BAND }, // seqK (top)
+    .{ .x = 150, .y = MACRO_HEADER_BAND + 80 }, // seqH (bottom)
+    .{ .x = 300, .y = MACRO_HEADER_BAND }, // kick (top)
+    .{ .x = 300, .y = MACRO_HEADER_BAND + 80 }, // hat (bottom)
+    .{ .x = 450, .y = MACRO_HEADER_BAND + 40 }, // mix (right, mid)
 };
 const BASS_OFFSETS = [_]Vec2f{
-    .{ .x = 0, .y = MACRO_HEADER_BAND + 40 }, // seq（左・中段）
-    .{ .x = 150, .y = MACRO_HEADER_BAND }, // vco（上段）
-    .{ .x = 300, .y = MACRO_HEADER_BAND + 40 }, // vcf（中段）
-    .{ .x = 150, .y = MACRO_HEADER_BAND + 80 }, // env（下段）
-    .{ .x = 450, .y = MACRO_HEADER_BAND + 40 }, // vca（右・中段）
+    .{ .x = 0, .y = MACRO_HEADER_BAND + 40 }, // seq (left, mid)
+    .{ .x = 150, .y = MACRO_HEADER_BAND }, // vco (top)
+    .{ .x = 300, .y = MACRO_HEADER_BAND + 40 }, // vcf (mid)
+    .{ .x = 150, .y = MACRO_HEADER_BAND + 80 }, // env (bottom)
+    .{ .x = 450, .y = MACRO_HEADER_BAND + 40 }, // vca (right, mid)
 };
 
-// LofiPatch が起動時に既に所有している生成 graph の展開時レイアウト。
-// ここでは add/connect/publish を行わず、group.Ledger の UI 座標だけを設定する。
+// Expanded layout for the generation graph LofiPatch already owns at startup.
+// No add/connect/publish here — only set UI coordinates on group.Ledger.
 const GENERATED_DRUM_OFFSETS = [_]Vec2f{
     .{ .x = 150, .y = MACRO_HEADER_BAND }, // kick_seq
     .{ .x = 150, .y = MACRO_HEADER_BAND + 80 }, // hat_seq
@@ -2451,8 +2451,8 @@ const GENERATED_BASS_OFFSETS = [_]Vec2f{
     .{ .x = 510, .y = MACRO_HEADER_BAND + 40 }, // vca
 };
 
-/// 生成 macro を既存 handle のまま台帳へ登録する（初期化時のみ）。
-/// DynGraph の topology、publish 済み view、RT view には一切変更を加えない。
+/// Register a generation macro onto the ledger with existing handles (init only).
+/// Does not change DynGraph topology, the published view, or the RT view at all.
 fn registerGeneratedMacro(
     app: *App,
     gid: group.GroupId,
@@ -2475,8 +2475,8 @@ fn registerGeneratedMacro(
     }
 }
 
-/// LofiPatch の生成 handle を DrumMachine/BassMachine として台帳へ登録する（初期化時のみ）。
-/// 生成 builder を再実行しないため、DynGraph の node 数・handle・topology は不変のまま表示だけが macro 化される。
+/// Register LofiPatch generation handles as DrumMachine/BassMachine on the ledger (init only).
+/// Does not re-run the generation builder, so DynGraph node count / handles / topology stay unchanged; only the display becomes a macro.
 fn registerGeneratedMacros(app: *App) void {
     const drum_gid = app.ledger.alloc() orelse return;
     const bass_gid = app.ledger.alloc() orelse {
@@ -2517,11 +2517,11 @@ fn registerGeneratedMacros(app: *App) void {
         &bass_members,
         &GENERATED_BASS_OFFSETS,
     );
-    // 共有 clock と外部 mixer/voice 境界を実 graph edge から再導出する。
+    // Re-derive the shared clock and external mixer/voice boundary from real graph edges.
     app.refreshAllExposed();
 }
 
-/// パレット index からモジュール or マクロを追加（comptime kind ディスパッチ）→ 画面中央付近へ配置 → publish。
+/// Add a module or macro from a palette index (comptime kind dispatch) → place near screen centre → publish.
 fn addByPaletteIndex(app: *App, ki: u8) !void {
     const casc: f32 = @floatFromInt(app.dyn.activeCount() % 8);
     const cx: f32 = app.canvasW() * 0.45 + casc * 18;
@@ -2530,7 +2530,7 @@ fn addByPaletteIndex(app: *App, ki: u8) !void {
         if (i == ki) {
             switch (entry) {
                 .primitive => |kind| {
-                    // primitive は従来どおり（見切れ clamp なし＝挙動不変）。
+                    // Primitives stay as before (no clip clamp = behaviour unchanged).
                     const pos = app.camera.screenToWorld(.{ .x = cx, .y = cy });
                     const h = try app.dyn.add(kind, .{});
                     app.layout[h] = pos;
@@ -2538,7 +2538,7 @@ fn addByPaletteIndex(app: *App, ki: u8) !void {
                     _ = allocNodeId(app, h);
                     app.selected = .{ .node = h };
                 },
-                // macro は展開時 footprint が既定 fb に収まるよう screen anchor を clamp してから配置する。
+                // Macros clamp the screen anchor so the expanded footprint fits the default fb, then place.
                 .macro_kind => |mk| try addMacro(app, mk, .{ .x = cx, .y = cy }),
                 .step_seq_bass => {
                     const pos = app.camera.screenToWorld(.{ .x = cx, .y = cy });
@@ -2554,8 +2554,8 @@ fn addByPaletteIndex(app: *App, ki: u8) !void {
     }
 }
 
-/// マクロ展開サブグラフの footprint（group.pos 基準の world 幅・高さ）。header 箱 + 全メンバー node 実サイズを
-/// 内包する bbox の右下端（左上端は必ず (0,0)）。members/offsets は同順・同長。
+/// Macro-expand subgraph footprint (world width/height from group.pos). Bottom-right of the bbox that contains
+/// the header box + every member's real node size (top-left is always (0,0)). members/offsets are same order and length.
 fn macroFootprint(app: *const App, members: []const Handle, offsets: []const Vec2f) Vec2f {
     const header = NodeGeom{ .handle = group.GROUP_HANDLE_BASE, .pos = .{ .x = 0, .y = 0 }, .n_in = 0, .n_out = 0 };
     var w: f32 = canvas.nodeSize(header).x; // = NODE_W
@@ -2569,13 +2569,13 @@ fn macroFootprint(app: *const App, members: []const Handle, offsets: []const Vec
     return .{ .x = w, .y = h };
 }
 
-/// footprint を screen サイズ（world × zoom）に換算し、右下が fb 内に収まるよう anchor(screen) を clamp
-/// してから world 座標へ（codex #4 と同型）。footprint が fb より広くても max が下限を割らないよう @max で保護。
+/// Convert footprint to screen size (world × zoom) and clamp anchor(screen) so the bottom-right stays inside the fb,
+/// then convert to world. Protect with @max so the lower bound is not breached even when the footprint is wider than the fb.
 fn clampMacroPos(app: *const App, anchor: Vec2f, fp: Vec2f) Vec2f {
-    // anchor は center ローカル screen 座標。
+    // anchor is center-local screen coords.
     const zoom = app.camera.zoom;
     const margin: f32 = 16;
-    const top_limit: f32 = (paletteBottom(app) - app.canvas_rect.y) + margin; // パレット帯下端（ローカル）
+    const top_limit: f32 = (paletteBottom(app) - app.canvas_rect.y) + margin; // Bottom of the palette band (local)
     const fbw: f32 = app.canvasW();
     const fbh: f32 = app.canvasH();
     const max_x = @max(margin, fbw - fp.x * zoom - margin);
@@ -2585,17 +2585,17 @@ fn clampMacroPos(app: *const App, anchor: Vec2f, fp: Vec2f) Vec2f {
     return app.camera.screenToWorld(.{ .x = sx, .y = sy });
 }
 
-/// マクロ（DrumMachine / BassMachine）をパレットから追加する。preflight+add+connect+1publish は macro.zig が
-/// 担い、publish 成功を確認してから台帳登録（group_of/exposed_in/out/collapsed=true）する（§3.2/§3.3）。
-/// `anchor` は追加位置の screen 座標。展開時 footprint が既定 fb に収まるよう clamp してから配置する。
+/// Add a macro (DrumMachine / BassMachine) from the palette. macro.zig owns preflight+add+connect+1publish;
+/// register on the ledger (group_of/exposed_in/out/collapsed=true) only after publish succeeds.
+/// `anchor` is the add position in screen coords. Clamp so the expanded footprint fits the default fb, then place.
 fn addMacro(app: *App, kind: group.MacroKind, anchor: Vec2f) !void {
     switch (kind) {
         .drum_machine => {
-            const h = try macro.buildDrumMachine(app.dyn); // 失敗時は何も残らない（macro.zig 側の rollback）
+            const h = try macro.buildDrumMachine(app.dyn); // On failure nothing remains (rollback inside macro.zig)
             const members = [_]Handle{ h.cdiv, h.seq_k, h.seq_h, h.kick, h.hat, h.mix };
             for (members) |m| _ = allocNodeId(app, m);
             const gid = app.ledger.alloc() orelse {
-                // 台帳枯渇（MAX_GROUPS 上限。極めて稀）: 公開済みメンバーを畳んで戻す（1 publish）。
+                // Ledger exhaustion (MAX_GROUPS cap; very rare): fold published members back (1 publish).
                 for (members) |m| {
                     clearNodeIdMapping(app, m);
                     selection.set(&app.multi_selected, m, false);
@@ -2626,8 +2626,8 @@ fn addMacro(app: *App, kind: group.MacroKind, anchor: Vec2f) !void {
     }
 }
 
-/// wire `add_macro` 用: world 座標をそのまま group.pos に使う（clamp なし。peer 決定性のため）。
-/// NodeId は常に `allocNodeId` の単調採番（redo も fresh id。pixie 同型）。
+/// For wire `add_macro`: use world coords as group.pos directly (no clamp; for peer determinism).
+/// NodeId is always monotonic from `allocNodeId` (redo also gets a fresh id; same shape as pixie).
 fn addMacroAtWorld(app: *App, kind: group.MacroKind, pos: Vec2f, out_ids: *[patch_undo.MAX_MACRO_MEMBERS]u64, out_n: *u8) !void {
     const assignIds = struct {
         fn go(a: *App, members: []const Handle, out: *[patch_undo.MAX_MACRO_MEMBERS]u64, on: *u8) void {
@@ -2717,7 +2717,7 @@ fn finishBassMacroLedger(app: *App, gid: group.GroupId, h: macro.BassMachineHand
     app.selected = .{ .group = gid };
 }
 
-/// 選択中のノード/ケーブル/グループを削除（Delete/Backspace）。TASK-106.2: action route 経由。
+/// Delete the selected node/cable/group (Delete/Backspace). Via the action route.
 fn deleteSelected(app: *App) void {
     if (app.selected) |it| {
         switch (it) {
@@ -2731,7 +2731,7 @@ fn deleteSelected(app: *App) void {
                 routeDisconnect(app, cr.dst_handle, cr.dst_in);
             },
             .group => |gid| {
-                // remove_macro: member #id 一覧
+                // remove_macro: list of member #id
                 var args_buf: [512]u8 = undefined;
                 var off: usize = 0;
                 var first = true;
@@ -2761,7 +2761,7 @@ fn onMouseMove(app: *App) void {
     switch (app.drag) {
         .none => updateHover(app),
         .pan => |p| {
-            // pan/start_mouse は center ローカル screen 座標。
+            // pan/start_mouse are center-local screen coords.
             const local = app.toCanvasLocal(app.mouse);
             app.camera.pan = p.start_pan.add(local.sub(p.start_mouse));
         },
@@ -2773,21 +2773,21 @@ fn onMouseMove(app: *App) void {
             const mw = app.mouseWorld();
             app.ledger.groups[gd.gid].pos = mw.add(gd.grab_offset);
         },
-        .cable => {}, // pending は app.mouse を使って毎フレーム描画（状態更新なし）
-        .rect_select => {}, // 矩形は drawFrame が mouseWorld で描く（状態更新なし）
+        .cable => {}, // pending is drawn every frame from app.mouse (no state update)
+        .rect_select => {}, // Rect is drawn by drawFrame from mouseWorld (no state update)
     }
 }
 
 // ============================================================================
-// TASK-40.8 A/D: ポート活性度の更新 + tap 対象の選択・publish。
+// A/D: update port activity + select/publish tap targets.
 // ============================================================================
 const MINI_BG = gui.Color.rgba(0x0A, 0x0E, 0x12, 0xFF);
-const VALUE_COL = gui.Color.rgba(0x90, 0x98, 0xA0, 0xFF); // TASK-170: パラメータ値のコンパクト表示色
-// ミニスコープの表示サンプル数（間引き後）。トリガ探索の余地（残り窓）を残すため TAP_RING より小さくする。
-// 128 点(間引き後)≒10.6ms は 110Hz(周期 9ms)なら 1 周期以上を探索範囲に含みロックできる。
+const VALUE_COL = gui.Color.rgba(0x90, 0x98, 0xA0, 0xFF); // Compact parameter-value display colour
+// Mini-scope display sample count (after decimation). Kept smaller than TAP_RING so trigger search has remaining window.
+// 128 post-decimation points ≈ 10.6ms; at 110Hz (period 9ms) the search window covers ≥1 cycle and can lock.
 const MINI_DISP: usize = 128;
 
-/// selected/hover の Item から tap 優先度に使う display handle を取り出す（node/group のみ）。
+/// Extract the display handle used for tap priority from a selected/hover Item (node/group only).
 fn itemHandle(item: ?Item) ?Handle {
     if (item) |it| {
         return switch (it) {
@@ -2799,21 +2799,21 @@ fn itemHandle(item: ?Item) ?Handle {
     return null;
 }
 
-/// display handle（実 or 合成箱）を実 global 出力 port id（handle*MAX_OUT+out）へ解決。out0 を代表とする。
-/// 解決不能（出力なし/非 active/合成箱の expose なし）は -1。合成 handle を dyn へ渡さない規約を守る。
+/// Resolve a display handle (real or synthetic box) to a real global output port id (handle*MAX_OUT+out). out0 is representative.
+/// Unresolvable (no output / inactive / no expose on synthetic box) → -1. Keep the no-synthetic-handle-into-dyn rule.
 ///
-/// TASK-170 の tap slot 安定化契約: この関数の戻り値（実 port id）と display handle（安定化キー）は
-/// 意図的に別軸である。①合成箱の handle が同じでも `exposed_out[0]` の member/port が変われば戻り値が
-/// 変わる（updateViz は republish する）。②別の display handle が同じ実 member/port を expose していれば
-/// 戻り値は同じになりうる（updateViz は republish しない）。updateViz の変化検出は
-/// `new_ports[]（この関数の戻り値）!= app.tap_ports[]` で行い、slot 温存（handle 一致）とは別に判定する。
-/// 本体は `group.resolveExposedPort`（TASK-171 で App 非依存に抽出し test-patch で固定）。
+/// Tap-slot stability contract: this function's return (real port id) and the display handle (stability key) are
+/// intentionally separate axes. (1) Same synthetic-box handle but a changed `exposed_out[0]` member/port → return changes
+/// (updateViz republishes). (2) Different display handles exposing the same real member/port → return may match
+/// (updateViz does not republish). updateViz detects change by
+/// `new_ports[] (this return) != app.tap_ports[]`, separately from slot retention (handle match).
+/// Body is `group.resolveExposedPort` (extracted App-free and pinned by test-patch).
 fn resolveTapPort(app: *const App, dh: Handle) i32 {
-    // app.dyn は *DynGraph（既にポインタ）。&app.dyn は ** になり duck-typed method 解決が失敗する。
+    // app.dyn is already *DynGraph. &app.dyn would be ** and duck-typed method resolve would fail.
     return group.resolveExposedPort(&app.ledger, app.dyn, dh);
 }
 
-/// display handle の出力ポート i の活性度（合成箱は exposed_out[i] の実メンバー活性度へ解決）。
+/// Activity of output port i on a display handle (synthetic box resolves to the real member's activity via exposed_out[i]).
 fn outPortLevel(app: *const App, dh: Handle, i: u8) f32 {
     if (group.groupIdFromHandle(dh)) |gid| {
         const g = app.ledger.groups[gid];
@@ -2826,9 +2826,9 @@ fn outPortLevel(app: *const App, dh: Handle, i: u8) f32 {
     return app.port_level[dh][i];
 }
 
-/// フレーム毎: A（全出力ポート活性度の peak-hold 減衰）+ D（tap 対象選択・変化時のみ config publish）。
+/// Per frame: A (peak-hold decay of every output port's activity) + D (tap-target select; config publish only on change).
 fn updateViz(app: *App) void {
-    // A: 全 active ノードの出力ポート活性度を peak-hold + 減衰（RT 影響ゼロの sigLevel を読むだけ）。
+    // A: peak-hold + decay activity of every active node's output ports (read-only sigLevel; zero RT impact).
     const decay: f32 = 0.90;
     var h: Handle = 0;
     while (h < MAX_MODULES) : (h += 1) {
@@ -2843,8 +2843,8 @@ fn updateViz(app: *App) void {
         }
     }
 
-    // D: tap 対象選択（安定版。TASK-170）。既存 slot（tap_ports>=0 のもの）は今フレームも候補なら
-    // 同じ slot 番号のまま温存し、無関係な hover/selected の変化で巻き添えリセットしない。
+    // D: tap-target select (stable). Existing slots (tap_ports>=0) that are still candidates this frame
+    // keep the same slot number — unrelated hover/selected changes must not reset them as collateral.
     var node_buf: [MAX_MODULES]NodeGeom = undefined;
     const nodes = node_buf[0..app.buildNodes(&node_buf)];
     const sel = itemHandle(app.selected);
@@ -2856,7 +2856,7 @@ fn updateViz(app: *App) void {
     canvas.selectTapPortsStable(app.camera, app.canvasW(), app.canvasH(), nodes, sel, hov, &prev, &handles);
 
     var new_ports: [TAP_SLOTS]i32 = [_]i32{-1} ** TAP_SLOTS;
-    // ポート種別ごとに間引き率・reduce を決める（audio=細かい波形 / cv=粗い変調 / gate=粗い peak バー）。
+    // Per port kind: choose decimation and reduce (audio=fine waveform / cv=coarse modulation / gate=coarse peak bar).
     var new_decim: [TAP_SLOTS]u32 = [_]u32{modular.graph_core.TAP_DECIM} ** TAP_SLOTS;
     var new_peak: [TAP_SLOTS]bool = [_]bool{false} ** TAP_SLOTS;
     for (0..TAP_SLOTS) |s| {
@@ -2879,10 +2879,10 @@ fn updateViz(app: *App) void {
         }
     }
 
-    // 変化検出は slot 単位で「実 global port ID（new_ports）」が変わったかで判定する（TASK-170）。
-    // slot 温存の安定化キーは display handle だが、republish/tap_slot_seq 更新のトリガーは実 port ID
-    // の方に分離する（handle が変わっても実 port ID が同じなら republish しない。handle が同じでも
-    // 合成ノードの exposed port 変更等で実 port ID が変われば republish する）。
+    // Change detection is per-slot: whether the real global port ID (new_ports) changed.
+    // Slot-retention stability key is the display handle, but republish/tap_slot_seq update triggers on the real port ID
+    // (no republish if the handle changes but the real port ID stays the same; republish if the handle stays the same but
+    // the real port ID changes, e.g. a synthetic node's exposed port change).
     var changed = false;
     var s: usize = 0;
     while (s < TAP_SLOTS) : (s += 1) {
@@ -2900,8 +2900,8 @@ fn updateViz(app: *App) void {
         app.tap_ports = new_ports;
         app.dyn.publishTapConfig(.{ .seq = app.tap_seq, .ports = new_ports, .decim = new_decim, .peak = new_peak });
     }
-    // 描画用 display handle は毎フレーム更新（ノード drag に座標追従。publish とは独立）。
-    // TASK-170: slot に穴を許容する（連続 0..tap_count 前提をやめる）。
+    // Update display handles for drawing every frame (follow node drag; independent of publish).
+    // Allow holes in slots (drop the contiguous 0..tap_count assumption).
     var count: usize = 0;
     s = 0;
     while (s < TAP_SLOTS) : (s += 1) {
@@ -2913,10 +2913,10 @@ fn updateViz(app: *App) void {
     app.tap_count = count;
 }
 
-/// tap 中の各ポートのミニ oscilloscope をノード内側下端の帯に描く（フレーム毎・≤16 個 × 64×28px）。
-/// applied_seq gate: RT が当該 slot の port 割当を反映済みでなければトレースを描かない（旧 port 混入防止）。
-/// TASK-170: slot 安定化で穴が生じうるため `slot < TAP_SLOTS` 全域を走査する（`tap_count` は
-/// 連続前提の bound には使わない。digest/snapshot 側の既存ループと同じ規約）。
+/// Draw a mini oscilloscope for each tapped port along the inner bottom band of the node (per frame; ≤16 × 64×28px).
+/// applied_seq gate: do not draw the trace until RT has applied that slot's port assignment (prevents stale-port bleed).
+/// Slot stability can leave holes, so scan the full `slot < TAP_SLOTS` range (`tap_count` is
+/// not a contiguous-bound; same rule as the existing digest/snapshot loops).
 fn drawMiniScopes(app: *App, dl: *gui.DrawList, nodes: []const NodeGeom) void {
     const applied = app.dyn.tapAppliedSeq();
     var win: [TAP_RING]f32 = undefined;
@@ -2933,11 +2933,11 @@ fn drawMiniScopes(app: *App, dl: *gui.DrawList, nodes: []const NodeGeom) void {
         const col = portColor(kind);
         dl.rectFilled(rect, MINI_BG) catch {};
         dl.rectOutline(rect, col, 1) catch {};
-        if (applied < app.tap_slot_seq[slot]) continue; // 未適用 slot は空窓（枠のみ）
+        if (applied < app.tap_slot_seq[slot]) continue; // Unapplied slots get an empty window (frame only)
         const nsamp = app.dyn.tapWindow(slot, &win);
         if (nsamp >= 2) {
-            // audio は rising zero-crossing トリガで波形を静止（形が読みやすい・探索の余地に MINI_DISP 窓）。
-            // cv/gate は非ロックで全窓を流す（gate=peak バーのタイミング、cv=ゆっくりした変調をなるべく長く見せる）。
+            // audio: rising zero-crossing trigger freezes the waveform (readable shape; search room is the MINI_DISP window).
+            // cv/gate: free-running full window (gate=peak-bar timing; cv=show slow modulation as long as possible).
             const disp = if (kind == .audio) @min(nsamp, MINI_DISP) else nsamp;
             const start = if (kind == .audio) canvas.findTriggerStart(win[0..nsamp], disp) else 0;
             drawMiniTrace(dl, rect, kind, win[start .. start + disp], col);
@@ -2945,16 +2945,16 @@ fn drawMiniScopes(app: *App, dl: *gui.DrawList, nodes: []const NodeGeom) void {
     }
 }
 
-/// 主要パラメータ値のコンパクト表示（値のみ・パラメータ名は付けない。TASK-170）。
-/// n_out>0 のノードに常時確保済みのミニスコープ帯（nodeSize 参照）の内部・scope rect の右側へ描く。
-/// 合成/畳みグループ handle（DynGraph の実 handle ではない）は対象外。tap の有無に関係なく毎フレーム
-/// 全ノードを対象にする（GUI フレーム毎処理。ノード数程度のオーダーで RT 経路には触れない）。
-/// 文字列は per-frame arena（`app.gui_ctx.allocator()`）で確保し、長い値はノード自身の rect でクリップ
-/// して隣接ノードへ溢れないようにする（TASK-160.2 follow-up と同じ手法）。
+/// Compact display of key parameter values (value only; no parameter names).
+/// Drawn inside the always-reserved mini-scope band of nodes with n_out>0 (see nodeSize), to the right of the scope rect.
+/// Synthetic/collapsed-group handles (not real DynGraph handles) are out of scope. Every frame regardless of tap,
+/// over all nodes (GUI per-frame work; O(node count); does not touch the RT path).
+/// Strings come from the per-frame arena (`app.gui_ctx.allocator()`); long values are clipped to the node's own rect
+/// so they do not spill into neighbouring nodes.
 fn drawNodeParamValues(app: *App, dl: *gui.DrawList, nodes: []const NodeGeom) void {
     for (nodes) |g| {
         if (g.n_out == 0) continue;
-        if (group.groupIdFromHandle(g.handle) != null) continue; // 合成 handle は値表示なし
+        if (group.groupIdFromHandle(g.handle) != null) continue; // Synthetic handles get no value display
         const kind = app.dyn.kindOf(g.handle) orelse continue;
         const descs = switch (kind) {
             inline else => |comptime_kind| modular.descriptors(comptime_kind),
@@ -2978,9 +2978,9 @@ fn drawNodeParamValues(app: *App, dl: *gui.DrawList, nodes: []const NodeGeom) vo
     }
 }
 
-/// ParamValue を値のみのコンパクト文字列へ整形する（パラメータ名は付けない）。
-/// scalar は ScalarDesc.step から桁数を決める（固定小数点1桁決め打ちにしない）。
-/// choice は ChoiceDesc.options[idx] をそのまま使う（範囲外・finite でない値は null=非表示）。
+/// Format a ParamValue into a compact value-only string (no parameter name).
+/// scalar: digit count from ScalarDesc.step (do not hard-code one decimal place).
+/// choice: use ChoiceDesc.options[idx] as-is (OOB / non-finite → null = hide).
 fn formatParamValueCompact(alloc: std.mem.Allocator, desc: modular.ParamDesc, value: modular.ParamValue) ?[]const u8 {
     return switch (value) {
         .scalar => |v| blk: {
@@ -3012,8 +3012,8 @@ fn decimalsForStep(step: f32) u8 {
     return 2;
 }
 
-/// ミニスコープのトレース。audio は中央線基準(-1..1)の polyline、cv は下基準(0..1)の polyline、
-/// gate は下基準のインパルス・バー（high の列を baseline から縦線で塗る＝疎なパルス列を見やすく）。
+/// Mini-scope trace. audio = centre-line (-1..1) polyline; cv = bottom-based (0..1) polyline;
+/// gate = bottom-based impulse bars (paint high columns as verticals from the baseline = sparse pulses stay readable).
 fn drawMiniTrace(dl: *gui.DrawList, rect: gui.Rect, kind: PortKind, samples: []const f32, col: gui.Color) void {
     const n = samples.len;
     if (n < 2 or rect.w < 2) return;
@@ -3025,8 +3025,8 @@ fn drawMiniTrace(dl: *gui.DrawList, rect: gui.Rect, kind: PortKind, samples: []c
     const by = safeI32(bottom);
 
     if (kind == .gate) {
-        // 疎なパルス列は polyline だと 1px スパイクで見えにくい → high の列を baseline から縦バーで塗る。
-        // 列側から間引くと疎な high を取りこぼすので、全サンプルを走査して列へ写す（どの high も必ず 1 本になる）。
+        // Sparse pulse trains look like 1px spikes as a polyline → paint high columns as vertical bars from the baseline.
+        // Thinning from the column side can miss sparse highs, so scan every sample into columns (every high becomes ≥1 bar).
         var si: usize = 0;
         while (si < n) : (si += 1) {
             const s = std.math.clamp(samples[si], 0.0, 1.0);
@@ -3053,10 +3053,10 @@ fn drawMiniTrace(dl: *gui.DrawList, rect: gui.Rect, kind: PortKind, samples: []c
 }
 
 // ============================================================================
-// C: master 出力の可視化帯（画面下端）。TASK-156.4: 2 層描画。
-// 層 A: 論理解像度固定 bitmap に Spec/Scope/Meter を描き、DrawList.image で nearest 拡大。
-// 層 B: ラベル・目盛りを gui_ctx.draw_list に論理座標で追加し、gui.render(scale) で物理 px 後描画。
-// 中間 bitmap は起動時に一度だけ確保（frame 毎 allocation 無し）。comptime Spec/Scope 寸法は不変。
+// C: master-output visualisation strip (screen bottom). Two-layer draw.
+// Layer A: draw Spec/Scope/Meter into a fixed logical-resolution bitmap; DrawList.image nearest-scales it.
+// Layer B: add labels/ticks to gui_ctx.draw_list in logical coords; gui.render(scale) draws them in physical px afterwards.
+// Intermediate bitmap is allocated once at startup (no per-frame allocation). comptime Spec/Scope sizes are fixed.
 // ============================================================================
 const FreqLabel = struct { hz: f32, text: []const u8 };
 const FREQ_LABELS = [_]FreqLabel{
@@ -3064,10 +3064,10 @@ const FREQ_LABELS = [_]FreqLabel{
     .{ .hz = 1000, .text = "1kHz" },
     .{ .hz = 10000, .text = "10kHz" },
 };
-/// 可視化帯の論理 bitmap 幅（起動時固定。resize でも作り直さない。TASK-156.4）。
+/// Logical bitmap width of the visualisation strip (fixed at startup; not rebuilt on resize).
 const VIZ_BITMAP_W: u32 = WIN_W;
 
-/// 層 A: 論理 bitmap に背景 + Spec/Scope/Meter（ラベル無し）。
+/// Layer A: background + Spec/Scope/Meter on the logical bitmap (no labels).
 fn drawVizBitmap(
     viz_pixels: []u32,
     spec: *const Spec,
@@ -3075,23 +3075,23 @@ fn drawVizBitmap(
     meter: *const scope.LevelMeter,
 ) void {
     std.debug.assert(viz_pixels.len >= VIZ_BITMAP_W * VIS_H);
-    // 帯下地: 行連続 @memset（全画素ループを書かない）。
+    // Strip background: row-contiguous @memset (do not write a per-pixel loop).
     @memset(viz_pixels[0 .. VIZ_BITMAP_W * VIS_H], VIS_BG);
     const draw_y: usize = VIS_LABEL_H;
-    // y=0..VIS_LABEL_H は背景のみ。描画領域は y=VIS_LABEL_H..VIS_H。
+    // y=0..VIS_LABEL_H is background only. Draw area is y=VIS_LABEL_H..VIS_H.
     spec.draw(viz_pixels, VIZ_BITMAP_W, VIS_H, SPEC_X0, draw_y);
     osc.draw(viz_pixels, VIZ_BITMAP_W, VIS_H, SCOPE_X0, draw_y);
     meter.draw(viz_pixels, VIZ_BITMAP_W, VIS_H, METER_X0, draw_y, METER_W, VIS_DRAW_H);
 }
 
-/// 層 B: ラベル・周波数目盛りを論理座標で DrawList へ（gui.render が scale 適用・P3 font）。
+/// Layer B: labels and frequency ticks onto DrawList in logical coords (gui.render applies scale; P3 font).
 fn drawVizLabels(app: *const App, dl: *gui.DrawList, spec: *const Spec) void {
     const band_y0: i32 = @intFromFloat(app.vizBandY0());
     if (band_y0 < 0) return;
     const label_col = gui.Color.rgba(0xC8, 0xD0, 0xD8, 0xFF);
     const tick_col = gui.Color.rgba(0xFF, 0xFF, 0xFF, 0xFF);
     const ly: i32 = band_y0 + 3;
-    // 静的文字列は DrawList より長く生きる。
+    // Static strings must outlive the DrawList.
     dl.text(.{ .x = SPEC_X0, .y = ly }, "SPECTROGRAM", label_col) catch {};
     dl.text(.{ .x = SCOPE_X0, .y = ly }, "SCOPE (master)", label_col) catch {};
     dl.text(.{ .x = @intCast(METER_X0), .y = ly }, "LVL", label_col) catch {};
@@ -3100,7 +3100,7 @@ fn drawVizLabels(app: *const App, dl: *gui.DrawList, spec: *const Spec) void {
     for (FREQ_LABELS) |fl| {
         const off = spec.rowOffsetForFreq(fl.hz) orelse continue;
         const tick_y: i32 = draw_y + @as(i32, @intCast(off));
-        // 目盛り線（論理 6px。render が thickness を scale）
+        // Tick marks (logical 6px. render scales thickness)
         dl.line(
             .{ .x = SPEC_X0, .y = tick_y },
             .{ .x = SPEC_X0 + 6, .y = tick_y },
@@ -3112,23 +3112,23 @@ fn drawVizLabels(app: *const App, dl: *gui.DrawList, spec: *const Spec) void {
 }
 
 pub fn main(init: std.process.Init) !void {
-    std.debug.print("apps/patch: パッチキャンバス（drag=move/pan, scroll=zoom, ESC で終了）\n", .{});
+    std.debug.print("apps/patch: patch canvas (drag=move/pan, scroll=zoom, ESC quits)\n", .{});
     const allocator = std.heap.c_allocator;
 
     try platform.init();
     defer platform.shutdown();
 
-    // TASK-156.4: .physical fb（HiDPI）。レイアウトは logical_size、描画出口で content_scale。
+    // .physical fb (HiDPI). Layout uses logical_size; content_scale at the draw exit.
     var window = try platform.Window.createWithOptions(WIN_W, WIN_H, "patch canvas (modular)", .{
         .fb_mode = .physical,
     });
     defer window.destroy();
 
-    // TASK-136: native menu facade は Window.create 直後に手動で 1 回（app_runtime へは移行しない）。
-    // app は直後に stack 確定するので、menu 登録は app 初期化後に行う。
+    // Native menu facade: call once manually right after Window.create (do not migrate into app_runtime).
+    // app is stack-settled immediately after, so register the menu after app init.
 
-    // audio: open で sample rate を確定 → LofiPatch 構築 → 初期 publish → その後 start（初手から発音）。
-    // RT callback は start 後にのみ発火するので、start 前に app を確定させれば安全（app は stack 固定・非ムーブ）。
+    // audio: open fixes the sample rate → build LofiPatch → initial publish → then start (sound from the first beat).
+    // The RT callback fires only after start, so settling app before start is safe (app is stack-fixed and never moved).
     var app: App = undefined;
     const device = audio.open(allocator, .{
         .sample_rate = 48000,
@@ -3159,12 +3159,12 @@ pub fn main(init: std.process.Init) !void {
     app = App{ .patch = patch, .dyn = patch.graph, .io = init.io, .sample_rate = sr_u32, .undo_store = undo_store };
     app.observed_field = defaultObservedField(&app);
     std.debug.assert(midiBindingDescriptorsExist());
-    // 初期配置は main loop 内で centerRect 有効化後に runAutoLayout で焼き込む（TASK-173.2）。
+    // Initial placement is baked via runAutoLayout in the main loop after centerRect becomes valid.
     registerGeneratedMacros(&app);
-    // 初期 graph の runtime handle 昇順で決定的に NodeId を割当（TASK-106.2）。
+    // Assign NodeIds deterministically in ascending runtime-handle order of the initial graph.
     assignInitialNodeIds(&app);
 
-    // TASK-136: native menu（headless は false → GUI fallback）。
+    // Native menu (headless → false → GUI fallback).
     app.rebuildMenuCommands();
     if (window.nativeMenuAvailable()) {
         app.native_menu_active = true;
@@ -3174,7 +3174,7 @@ pub fn main(init: std.process.Init) !void {
 
     var dl = gui.DrawList.init(allocator);
     defer dl.deinit();
-    // GuiFont は stack 最終配置。defer を gui_ctx より先に登録し、LIFO で ctx→font の順に解放（TASK-138）。
+    // GuiFont is placed last on the stack. Register its defer before gui_ctx so LIFO frees ctx→font.
     var gui_font: kit.GuiFont = .{};
     defer gui_font.deinit();
     var gui_ctx = gui.Context.init(allocator, gui.default_font);
@@ -3183,7 +3183,7 @@ pub fn main(init: std.process.Init) !void {
     gui_ctx.font = gui_font.asFont();
     app.title_font = gui_font.asTitleFont();
 
-    // TASK-149.1/149.3/160.3: PanelHost registry — History=left, Inspector=right（Transport 撤去）。
+    // PanelHost registry — History=left, Inspector=right (Transport removed).
     var panels = [_]gui.Panel{
         .{ .name = "History", .slot = .left, .build = buildHistoryPanel, .user_data = &app },
         .{ .name = "Inspector", .slot = .right, .build = buildInspectorPanel, .user_data = &app },
@@ -3199,24 +3199,24 @@ pub fn main(init: std.process.Init) !void {
     app.panels = panels[0..];
     app.gui_ctx = &gui_ctx;
 
-    // appshell Preferences（panel/slot 永続化）。
+    // appshell Preferences (panel/slot persistence).
     app.prefs = appshell.preferences.Preferences.init(allocator);
     const override_path = if (std.c.getenv("VP_APPSHELL_DIR")) |v| std.mem.span(v) else null;
     if (appshell.paths.openAppDataDir(app.io, allocator, "patch", override_path)) |dir| {
         app.prefs_dir = dir;
         _ = app.prefs.load(app.io, dir, "preferences.ash") catch {};
         panel_host.restore(panelPersistence(&app));
-        // TASK-149.3 移行: 旧 prefs が left.visible=false（149.1 時代）だと History が永久に出ない。
-        // History panel が visible なら left slot を有効化（個別 OFF は panel_toggle history）。
+        // Migrate: if old prefs left left.visible=false, History would never appear.
+        // If the History panel is visible, enable the left slot (per-panel OFF is panel_toggle history).
         if (app.panelVisible("History")) {
             panel_host.setSlotVisible(.left, true);
         }
     } else |err| {
         std.debug.print("apps/patch: preferences dir open failed: {s}\n", .{@errorName(err)});
     }
-    // 起動時 auto-layout は main loop 内（centerRect が非 null になった初回）で 1-shot 適用（TASK-173.2）。
+    // Startup auto-layout is a 1-shot apply inside the main loop (first time centerRect is non-null).
 
-    // C: master 可視化（spectrogram/oscilloscope/level meter）。comptime サイズが大きいので heap 確保。
+    // C: master visualisation (spectrogram/oscilloscope/level meter). comptime size is large → heap-allocate.
     const spec = try allocator.create(Spec);
     defer allocator.destroy(spec);
     spec.init(48000);
@@ -3225,7 +3225,7 @@ pub fn main(init: std.process.Init) !void {
     defer allocator.destroy(osc);
     osc.* = .{};
     var meter = scope.LevelMeter{};
-    // TASK-156.4: 論理解像度の viz 中間 bitmap（起動時 1 回。frame 毎 alloc 無し。App に埋め込まない）。
+    // Logical-resolution viz intermediate bitmap (once at startup; no per-frame alloc; not embedded in App).
     const viz_pixels = try allocator.alloc(u32, VIZ_BITMAP_W * VIS_H);
     defer allocator.free(viz_pixels);
 
@@ -3237,17 +3237,17 @@ pub fn main(init: std.process.Init) !void {
     platform.registerProbe(.{ .name = "params", .ctx = &app, .ext = "json", .snapshot = paramsSnapshot, .digest = paramsDigest });
     platform.registerProbe(.{ .name = "menu", .ctx = &app, .ext = "txt", .digest = menuDigest, .desc = "menu open/items/enabled/checked/pending/last_op/native" });
     platform.registerProbe(.{ .name = "midi_map", .ctx = &app, .ext = "txt", .snapshot = null, .digest = midiMapDigest, .desc = "fixed MIDI CC map v1" });
-    // ヘッドレス検証 harness の custom action を登録（harness 無効時は no-op。TASK-65）。
+    // Register harness custom actions (no-op when harness is off).
     app.cmd_exec = platform.command.Executor.init(.{ .ctx = &app, .run = dispatchModularAction });
     app.cmd_exec.log = &app.cmd_log;
-    // TASK-106.4: undo 逆適用アダプタ。
+    // Undo inverse-apply adapter.
     app.cmd_exec.adapter = .{ .ctx = &app, .canUndo = patchCanUndo, .applyUndo = patchApplyUndo, .summarize = patchSummarize };
     platform.setCommandExecutor(&app.cmd_exec);
     registerPatchActions(&app);
     registerActions(&app);
     registerIntegratedStateSync(&app);
 
-    // TASK-115.3: MIDI device（harness 時は synthetic FIFO。native は CoreMIDI）。
+    // MIDI device (harness → synthetic FIFO; native → CoreMIDI).
     var midi_device = midi.open(allocator) catch |err| {
         std.debug.print("midi.open failed: {s}\n", .{@errorName(err)});
         return;
@@ -3259,23 +3259,23 @@ pub fn main(init: std.process.Init) !void {
         return;
     };
     defer device.stop();
-    std.debug.print("apps/patch: ドラッグでポート間を配線 / パレットで追加 / Delete で削除 / scroll=zoom。音が鳴ります。\n", .{});
+    std.debug.print("apps/patch: drag between ports to patch / add from the palette / Delete removes / scroll=zoom. Audio is running.\n", .{});
 
     var stereo: [2048]f32 = undefined;
     var mono: [1024]f32 = undefined;
     main_loop: while (app.running and window.pollEvents()) {
-        // TASK-176: deadline ベース pacing。**lockFramebuffer が null で continue する経路でも
-        // 1 回だけ待つ**よう loop body 先頭で defer 登録する（旧: 末尾の固定 frameDelay(16ms) は
-        // lock miss 時に通らず busy loop になっていた）。defer は LIFO なので内側ブロックの
-        // fb.unlock() より後に走る＝framebuffer lock 中に sleep しない。
+        // Deadline-based pacing. Register defer at the top of the loop body so the path that
+        // continues when lockFramebuffer is null still waits once (a trailing fixed frameDelay
+        // would be skipped on lock miss and busy-loop). defer is LIFO, so it runs after the
+        // inner block's fb.unlock() — never sleep while the framebuffer is locked.
         const frame_t0 = platform.getTime();
         defer platform.framePaceUntil(frame_t0 + FRAME_PERIOD_S);
-        // イベント時のみ: MIDI FIFO drain（空なら即 return。フレーム毎の常時走査ではない）。
+        // Event only: drain the MIDI FIFO (return immediately if empty. Not a per-frame always-on scan).
         drainMidiEvents(&app, &midi_device);
         {
             const fb = window.lockFramebuffer() orelse continue :main_loop;
             defer fb.unlock();
-            // TASK-156.4: layout/input は論理、RenderTarget は物理。同一 snapshot の scale のみ使用。
+            // Layout/input are logical; RenderTarget is physical. Use only the scale from the same snapshot.
             const logical_w = fb.logical_size.width;
             const logical_h = fb.logical_size.height;
             const content_scale = fb.content_scale;
@@ -3285,7 +3285,7 @@ pub fn main(init: std.process.Init) !void {
             app.fb_h = logical_h;
             gui_ctx.beginFrame(logical_w, logical_h);
 
-            // C: master タップを読み → mono downmix → spec/osc/meter へ供給。直近ブロックの rms/peak を latch。
+            // C: read the master tap → mono downmix → feed spec/osc/meter. Latch latest-block rms/peak.
             var frame_sumsq: f64 = 0;
             var frame_n: usize = 0;
             var frame_peak: f32 = 0;
@@ -3314,7 +3314,7 @@ pub fn main(init: std.process.Init) !void {
                 switch (ev) {
                     .quit => app.running = false,
                     .key_down => |k| {
-                        // GUI fallback: メニューショートカット（Cmd/Ctrl+S/O）。native 時は OS が所有。
+                        // GUI fallback: menu shortcuts (Cmd/Ctrl+S/O). Native: the OS owns them.
                         if (!app.native_menu_active) {
                             if (app.matchMenuShortcut(k)) |cmd_id| {
                                 app.dispatchCommand(cmd_id);
@@ -3338,7 +3338,7 @@ pub fn main(init: std.process.Init) !void {
                             },
                             .DELETE, .BACKSPACE => deleteSelected(&app),
                             .H => {
-                                // TASK-125: modifier なし H のみ。Cmd/Ctrl/Alt/Shift+H は無視。
+                                // Modifier-less H only. Ignore Cmd/Ctrl/Alt/Shift+H.
                                 if (!(k.modifiers.shift or k.modifiers.ctrl or k.modifiers.alt or k.modifiers.cmd)) {
                                     app.togglePanelsHidden();
                                 }
@@ -3348,14 +3348,14 @@ pub fn main(init: std.process.Init) !void {
                     },
                     .key_up => {},
                     .char_input => {},
-                    .gamepad_connected, .gamepad_disconnected => {}, // TASK-80.1: 本 app 未消費（cross-cutting Event 追加）
-                    .composition_changed => {}, // TASK-79.6.1: composition 未消費（inline preedit は 79.6.2）
+                    .gamepad_connected, .gamepad_disconnected => {}, // This app does not consume this cross-cutting Event
+                    .composition_changed => {}, // composition not consumed (inline preedit is separate)
                     .menu_command => |id| app.dispatchCommand(id),
-                    .file_drop => {}, // TASK-113.4: patch 未消費
+                    .file_drop => {}, // patch does not consume this
                     .mouse_move => |m| {
                         app.mouse = .{ .x = @floatFromInt(m.x), .y = @floatFromInt(m.y) };
                         gui_ctx.pushEvent(.{ .mouse_move = .{ .x = m.x, .y = m.y, .modifiers = m.modifiers.toC() } });
-                        // drag 中は panel 上でも追従（node/pan を panel 境界で切らない）。開始は allowsCanvasInput。
+                        // While dragging, keep following even over a panel (do not cut node/pan at the panel edge). Start requires allowsCanvasInput.
                         if (app.drag != .none or app.allowsCanvasInput()) onMouseMove(&app);
                     },
                     .mouse_down => |m| {
@@ -3365,7 +3365,7 @@ pub fn main(init: std.process.Init) !void {
                         if (m.button == .left) {
                             if (app.allowsCanvasInput()) onMouseDown(&app, m.modifiers);
                         } else if (m.button == .middle) {
-                            // 中央ボタン: hit-test cascade を経由せず pan 開始（allowsCanvasInput ゲート）。
+                            // Middle button: start pan without the hit-test cascade (allowsCanvasInput gate).
                             if (app.allowsCanvasInput()) {
                                 app.drag = .{ .pan = .{
                                     .start_pan = app.camera.pan,
@@ -3373,14 +3373,14 @@ pub fn main(init: std.process.Init) !void {
                                 } };
                             }
                         }
-                        // 右ボタンはキャンバス側で何もしない（将来コンテキストメニュー予約）。
+                        // Right button does nothing on the canvas (reserved for a future context menu).
                     },
                     .mouse_up => |m| {
                         const button: u8 = if (m.button == .left) 0 else if (m.button == .right) 1 else 2;
                         gui_ctx.pushEvent(.{ .mouse_up = .{ .x = m.x, .y = m.y, .button = button, .modifiers = m.modifiers.toC() } });
                         app.mouse = .{ .x = @floatFromInt(m.x), .y = @floatFromInt(m.y) };
                         if (m.button == .left) {
-                            // cable/node/rect_select の commit は panel 上でも受け付ける（開始は center のみ）。
+                            // Accept cable/node/rect_select commit even over a panel (start is center-only).
                             if (app.drag != .none or app.allowsCanvasInput()) onMouseUp(&app);
                         } else if (m.button == .middle) {
                             if (app.drag == .pan) app.drag = .none;
@@ -3398,8 +3398,8 @@ pub fn main(init: std.process.Init) !void {
                 }
             }
 
-            // A/D: 活性度更新 + tap 対象の選択・publish（描画の直前・イベント反映後）。
-            // 生成レイヤ scalar は GUI/action の最新値を制御レートで atomic publish する。
+            // A/D: update activity + select/publish tap targets (just before draw, after event handling).
+            // Generation-layer scalars: atomic-publish the latest GUI/action values at control rate.
             publishControls(app.patch, app.params);
             updateViz(&app);
             app.syncInspectorTarget();
@@ -3409,13 +3409,13 @@ pub fn main(init: std.process.Init) !void {
             dl.reset(logical_w, logical_h);
             drawFrame(&app, &dl);
 
-            // 層 A: 論理 viz bitmap → DrawList.image（1 回目 render で nearest 拡大）。
-            // PanelHost は content_h = logical_h - menu - VIS_H で VIS_H 帯に描かない前提
-            // （スペーサで帯領域を確保。popup が帯へ侵入しないことを snapshot で確認）。
+            // Layer A: logical viz bitmap → DrawList.image (first render nearest-scales it).
+            // PanelHost assumes content_h = logical_h - menu - VIS_H and does not draw into the VIS_H band
+            // (a spacer reserves the strip; snapshots confirm popups do not invade the strip).
             drawVizBitmap(viz_pixels, spec, osc, &meter);
             const band_y0_i: i32 = @intFromFloat(app.vizBandY0());
             const band_bg_col = gui.Color.rgba(0x0A, 0x0E, 0x12, 0xFF);
-            // ウィンドウ幅 > VIZ_BITMAP_W でも帯全域は全幅 VIS_BG。
+            // Even when window width > VIZ_BITMAP_W, fill the whole strip width with VIS_BG.
             if (band_y0_i >= 0) {
                 dl.rectFilled(.{
                     .x = 0,
@@ -3434,7 +3434,7 @@ pub fn main(init: std.process.Init) !void {
             const target: gui.RenderTarget = .{ .pixels = fb.pixels, .width = phys_w, .height = phys_h };
             gui.render(target, &dl, gui_ctx.font, content_scale);
 
-            // menu → PanelHost content（VIS_H より上）→ VIS_H スペーサ。論理サイズ基準。
+            // menu → PanelHost content (above VIS_H) → VIS_H spacer. Logical-size basis.
             const mtop_i: i32 = @intFromFloat(app.menuTopH());
             const vis_h_i: i32 = VIS_H;
             const content_h_i: i32 = @max(0, @as(i32, @intCast(logical_h)) - mtop_i - vis_h_i);
@@ -3464,7 +3464,7 @@ pub fn main(init: std.process.Init) !void {
                 std.debug.print("apps/patch: PanelHost.build failed: {s}\n", .{@errorName(err)});
             };
             gui_ctx.endBox();
-            // VIS_H 分のスペーサ（PanelHost が帯と重ならないよう content を上に限定）。
+            // VIS_H spacer (keeps PanelHost content above the strip so they do not overlap).
             if (vis_h_i > 0) {
                 gui_ctx.beginBox(.{ .width = .{ .grow = 1 }, .height = .{ .fixed = vis_h_i } });
                 gui_ctx.endBox();
@@ -3473,8 +3473,8 @@ pub fn main(init: std.process.Init) !void {
             if (!gui_ctx.input.mouse_buttons.left) app.releaseParamEdits();
             gui_ctx.endFrame();
             app.syncCanvasRect();
-            // TASK-173.2: GUI rect cache が有効になった最初のフレームで auto-layout を焼き込む。
-            // （init 時点の centerRect は常に null → canvas がフル幅のままになりパレット重なりが再発する）
+            // Bake auto-layout on the first frame the GUI rect cache is valid.
+            // (centerRect is always null at init → canvas would stay full-width and the palette would overlap again)
             if (!app.initial_layout_done) {
                 if (app.panel_host.centerRect(app.gui_ctx)) |_| {
                     runAutoLayout(&app);
@@ -3488,20 +3488,20 @@ pub fn main(init: std.process.Init) !void {
             app.captureParamRows(&gui_ctx);
             app.advanceParamEdits();
             app.drawGhostMarkers(&gui_ctx.draw_list);
-            // 層 B: ラベルを 2 回目 render の末尾に（層 A の nearest 拡大の後・物理 font）。
+            // Layer B: labels at the end of the second render (after layer A's nearest scale; physical font).
             drawVizLabels(&app, &gui_ctx.draw_list, spec);
             gui.render(target, &gui_ctx.draw_list, gui_ctx.font, content_scale);
 
             window.present();
         }
-        // dialog は framebuffer unlock 後の安全点（platform.h 契約。TASK-136）。
+        // Dialogs at the safe point after framebuffer unlock (platform.h contract).
         if (app.running) app.runPendingMenuFileOp();
-        // TASK-106.1: evolve authority と host pattern_state 配信（main thread イベント境界のみ）。
+        // evolve authority and host pattern_state broadcast (main-thread event boundary only).
         updateEvolveAuthority(&app);
         maybeBroadcastPatternState(&app);
-        // pacing は loop body 先頭の defer（framePaceUntil）が担う（TASK-176）。
+        // Pacing is owned by the defer (framePaceUntil) at the top of the loop body.
     }
-    // panel/slot 状態を Preferences へ保存（終了時）。
+    // Persist panel/slot state to Preferences (on exit).
     persistPanelPrefs(&app);
     if (app.prefs_dir) |*dir| {
         dir.close(app.io);
@@ -3512,17 +3512,17 @@ pub fn main(init: std.process.Init) !void {
 }
 
 // ============================================================================
-// harness custom probe（TASK-32.3）: topology（node 一覧・接続）+ 見切れカウントを公開。
-// digest は framework 固定 1024B 以内。
-// TASK-40.7.1: `patch` probe は不変＝常に flat（実 handle・collapsed の影響を受けない）トポロジを見せる。
-// 入れ子構造は `group` probe（groupDigest）と組み合わせて機械検証する（digest patch × digest group）。
+// harness custom probe: publish topology (node list + connections) + offscreen counts.
+// digest stays within the framework's fixed 1024B.
+// The `patch` probe is invariant = always shows the flat topology (real handles; unaffected by collapsed).
+// Nesting is machine-checked by pairing with the `group` probe (groupDigest) — digest patch × digest group.
 // ============================================================================
 fn offscreenOf(app: *const App) canvas.OffscreenCounts {
     var node_buf: [MAX_MODULES]NodeGeom = undefined;
     var edge_buf: [MAX_EDGES]Edge = undefined;
     const nodes = node_buf[0..app.buildRawNodes(&node_buf)];
     const edges = edge_buf[0..app.buildFlatEdges(&edge_buf)];
-    // 見切れ判定の有効領域はキャンバス高（下端の可視化帯を除く）。帯に隠れるノードも「見切れ」に数える。
+    // Offscreen checks use the canvas height (excluding the bottom viz strip). Nodes hidden by the strip still count as offscreen.
     return canvas.viewportContains(app.camera, app.canvasW(), app.canvasH(), nodes, edges);
 }
 
@@ -3589,7 +3589,7 @@ fn errDigest(buf: []u8) []const u8 {
     return std.fmt.bufPrint(buf, "{{\"error\":\"digest overflow\"}}", .{}) catch buf[0..0];
 }
 
-/// menu digest（TASK-136）: 開閉・項目数・enabled/checked mask・pending/last_op/native。
+/// menu digest: open/close, item count, enabled/checked masks, pending/last_op/native.
 /// `open=<title|none> items=<n> enabled=<hex> checked=<hex> pending=<op|none> last_op=<op|none> native=<0|1>`
 fn menuDigest(ctx: *anyopaque, buf: []u8) []const u8 {
     const app: *App = @ptrCast(@alignCast(ctx));
@@ -3612,7 +3612,7 @@ fn menuDigest(ctx: *anyopaque, buf: []u8) []const u8 {
     }) catch buf[0..0];
 }
 
-/// snapshot patch: digest の 1024B 制限と独立に、全 nodes/edges + layout を raw JSON で返す。
+/// snapshot patch: independent of digest's 1024B limit; return all nodes/edges + layout as raw JSON.
 fn patchSnapshot(ctx: *anyopaque, allocator: std.mem.Allocator) anyerror![]u8 {
     const app: *App = @ptrCast(@alignCast(ctx));
     var sn_buf: [MAX_MODULES]graph_io.StableNode = undefined;
@@ -3622,9 +3622,9 @@ fn patchSnapshot(ctx: *anyopaque, allocator: std.mem.Allocator) anyerror![]u8 {
     var list: std.ArrayList(u8) = .empty;
     errdefer list.deinit(allocator);
 
-    // topology 本体は `}` なしで組み立て、layout を差し込んで閉じる。
+    // Build the topology body without the closing `}`, splice in layout, then close.
     try graph_io.appendStableTopologyJson(&list, allocator, topo.nodes, topo.edges, topo.output_id);
-    // 末尾の `}` を落として layout を追記
+    // Drop the trailing `}` and append layout
     if (list.items.len == 0 or list.items[list.items.len - 1] != '}') return error.OutOfMemory;
     list.items.len -= 1;
     try list.appendSlice(allocator, ",\"layout\":[");
@@ -3641,9 +3641,9 @@ fn patchSnapshot(ctx: *anyopaque, allocator: std.mem.Allocator) anyerror![]u8 {
 }
 
 // ============================================================================
-// harness custom probe（TASK-32.3/40.7.1）: `group` — グループ台帳（入れ子 topology）を公開。
-// `digest patch`（flat topology）× `digest group`（グループ所属/expose）の組で入れ子構造を機械検証できる。
-// digest は framework 固定 1024B 以内・snapshot 無し（null）。
+// harness custom probe: `group` — publish the group ledger (nested topology).
+// Pair `digest patch` (flat topology) × `digest group` (membership/expose) to machine-check nesting.
+// digest stays within the framework's fixed 1024B; no snapshot (null).
 // ============================================================================
 fn groupDigest(ctx: *anyopaque, buf: []u8) []const u8 {
     const app: *App = @ptrCast(@alignCast(ctx));
@@ -3703,16 +3703,16 @@ fn groupDigest(ctx: *anyopaque, buf: []u8) []const u8 {
 }
 
 // ============================================================================
-// harness custom probe（TASK-40.8）: `viz` — 信号可視化データ。
-//   C: master rms/peak（下帯 scope/spectrogram の実信号レベル）
-//   A: per-port レベル（ports[]。sigLevel 由来・RT 影響ゼロの torn read）
-//   D: tap 中の port と直近窓の状態（taps[]。wpos / applied 済みか）
-// digest は framework 固定 1024B 以内。snapshot は各 tap 窓の min/max/nz を追加。
+// harness custom probe: `viz` — signal visualisation data.
+//   C: master rms/peak (real signal level for the bottom-band scope/spectrogram)
+//   A: per-port levels (ports[]. from sigLevel; zero-RT-impact torn read)
+//   D: tapped ports and latest-window state (taps[]. wpos / whether applied)
+// digest stays within the framework's fixed 1024B. snapshot adds min/max/nz per tap window.
 // ============================================================================
 fn vizDigest(ctx: *anyopaque, buf: []u8) []const u8 {
     const app: *App = @ptrCast(@alignCast(ctx));
-    // 末尾 "]}" 用に 2B 予約して常に閉じた JSON を返す（overflow でも壊れた断片を返さない）。
-    // キーは短縮（h/o/k/w/ap/lv）。16 tap × 最悪 wpos 10 桁でも 1024B 内に収まる見積り。
+    // Reserve 2B for the trailing close ("]}") so the JSON is always closed (never return a broken fragment on overflow).
+    // Short keys (h/o/k/w/ap/lv). Sized so 16 taps × worst-case 10-digit wpos still fit in 1024B.
     if (buf.len < 8) return errDigest(buf);
     const cap = buf.len - 2;
     var off: usize = 0;
@@ -3735,16 +3735,16 @@ fn vizDigest(ctx: *anyopaque, buf: []u8) []const u8 {
         const sep: []const u8 = if (first) "" else ",";
         const piece = std.fmt.bufPrint(buf[off..cap], "{s}{{\"h\":{d},\"o\":{d},\"k\":\"{s}\",\"w\":{d},\"ap\":{d},\"lv\":{d:.4}}}", .{
             sep, h, out, kn, wpos, @as(u8, if (applied_ok) 1 else 0), lvl,
-        }) catch break; // 入り切らなければそこで打ち切り（tail で必ず閉じる）
+        }) catch break; // If it does not fit, stop there (tail always closes)
         off += piece.len;
         first = false;
     }
-    const tail = std.fmt.bufPrint(buf[off..], "]}}", .{}) catch return errDigest(buf); // 予約済みなので必ず成功
+    const tail = std.fmt.bufPrint(buf[off..], "]}}", .{}) catch return errDigest(buf); // Reserved, so this must succeed
     off += tail.len;
     return buf[0..off];
 }
 
-/// 実 handle/out の信号種別（合成 handle は来ない＝tap_ports は実 global port id のみ）。
+/// Signal kind of a real handle/out (synthetic handles never arrive — tap_ports hold real global port ids only).
 fn portKindOfReal(app: *const App, h: Handle, out: u8) PortKind {
     return app.dyn.outKindOf(h, out) orelse .audio;
 }
@@ -3788,26 +3788,26 @@ fn vizSnapshot(ctx: *anyopaque, allocator: std.mem.Allocator) anyerror![]u8 {
 }
 
 // ============================================================================
-// ヘッドレス検証 harness の custom action（TASK-65。TASK-62.1 の registerAction を patch が採用。
-// pixie(TASK-64)/synth・modular(TASK-65) と同じ「probe(read) に対称な write 口。既存の UI 操作
-// （パレット追加・drag 配線・Delete）と同じ `DynGraph` メソッド列をそのまま辿る」構図）。
+// harness custom actions (patch adopts registerAction.
+// Same shape as pixie/synth/modular: a write mouth symmetric to probe(read). Walks the same
+// `DynGraph` method sequence as existing UI ops (palette add, drag-wire, Delete)).
 //
-// ホットパス宣言: 全 action の `run()` は「イベント時のみ」（harness `action` コマンド1回につき1回、
-// main thread の pollGate 内で実行）。フレーム毎・毎サンプルのいずれでもないため性能規約の適用対象外。
-// `DynGraph.add/removeModule/connect/disconnect/publish` はいずれも非RT・staging→triple-buffer
-// publish（既存の `commitConnect`/`deleteSelected`/`addByPaletteIndex` と全く同じ経路）で、RT 経路
-// （`DynGraph.processBlock`）へ新たな同期/alloc/lock/panic は一切追加しない。
+// Hot-path declaration: every action `run()` is event-only (once per harness `action` command,
+// inside main-thread pollGate). Neither per-frame nor per-sample, so the performance rules do not apply.
+// `DynGraph.add/removeModule/connect/disconnect/publish` are all non-RT staging→triple-buffer
+// publish (the exact same path as existing `commitConnect`/`deleteSelected`/`addByPaletteIndex`). No new
+// sync/alloc/lock/panic is added to the RT path (`DynGraph.processBlock`).
 //
-// パーサは `actions.zig`（std のみ・App/kit/modular 非依存）に切り出し単体テストする。`ModuleKind`
-// 名の enum 解決は App の具象型を知るこのファイル側で行う（pixie の `ToolKind` 解決と同じ分離方針）。
+// Parsers live in `actions.zig` (std only; no App/kit/modular) and are unit-tested. Resolving
+// `ModuleKind` names stays in this file, which knows App's concrete types (same split as pixie's `ToolKind`).
 //
-// スコープ: ノード add/remove/connect/disconnect のみ（task description が明示する範囲）。
-// マクロ（DrumMachine/BassMachine）の action 化は別議論として見送る。
+// Scope: node add/remove/connect/disconnect only.
+// Macro (DrumMachine/BassMachine) actions are out of scope here.
 // ============================================================================
 
 // ============================================================================
-// TASK-106.4: undo payload capture / CommandAdapter / inverse apply
-// ホットパス: イベント時のみ（action dispatch / Cmd+Z）。RT 経路には触れない。
+// undo payload capture / CommandAdapter / inverse apply
+// Hot path: event only (action dispatch / Cmd+Z). Does not touch the RT path.
 // ============================================================================
 
 fn patternToSnap(cmd: PatternCommand) patch_undo.PatternSnap {
@@ -4002,7 +4002,7 @@ fn reconnectEdgeSnap(app: *App, edge: patch_undo.EdgeSnap) void {
 fn removeNodeByHandleForUndo(app: *App, h: Handle) void {
     if (app.ledger.group_of[h] != null) app.ledger.unassign(h);
     purgeParamOverrides(app, h);
-    // handle 再利用で stale multi 選択が引き継がれないよう、remove 前に落とす（TASK-173.3）。
+    // Drop multi-selection before remove so a reused handle cannot inherit a stale multi select.
     selection.set(&app.multi_selected, h, false);
     app.dyn.removeModule(h);
     clearNodeIdMapping(app, h);
@@ -4059,7 +4059,7 @@ fn patchApplyUndo(ctx: *anyopaque, rec: *const platform.command.CommandRecord) v
             }
         },
         .param => |s| {
-            // mode=0 は旧 Transport alias（TASK-160.3 で廃止）。無視して NodeId 形式のみ復元。
+            // mode=0 is the old Transport alias (removed). Ignore it; restore NodeId form only.
             if (s.mode != 1) return;
             const h = handleOfNodeId(app, NodeId.fromRaw(s.node_id)) orelse return;
             const raw: f32 = if (s.value_kind == 0) @bitCast(s.value_bits) else @floatFromInt(s.value_bits);
@@ -4227,8 +4227,8 @@ fn actionRedo(ctx: *anyopaque, args: []const u8, buf: []u8) anyerror![]const u8 
     return outcome.message;
 }
 
-/// undo/redo 後に UI-only 参照（selection/hover/inspector/param edit）を document と再整合する。
-/// graph snapshot には含めない状態。イベント時のみ。
+/// After undo/redo, re-align UI-only refs (selection/hover/inspector/param edit) with the document.
+/// State not included in the graph snapshot. Event only.
 fn resyncUiAfterHistoryChange(app: *App) void {
     if (app.selected) |it| {
         if (!itemStillValid(app, it)) app.selected = null;
@@ -4236,8 +4236,8 @@ fn resyncUiAfterHistoryChange(app: *App) void {
     if (app.hover) |it| {
         if (!itemStillValid(app, it)) app.hover = null;
     }
-    // syncInspectorTarget / refreshAllExposed は毎フレーム経路にもあるが、
-    // undo 直後の同一フレーム内で probe/digest が読む可能性があるためここで即時再同期する。
+    // syncInspectorTarget / refreshAllExposed also run on the per-frame path, but
+    // probe/digest may read in the same frame right after undo, so re-sync immediately here.
     app.syncInspectorTarget();
     for (&app.param_edits) |*state| {
         if (state.key.invalid()) continue;
@@ -4295,7 +4295,7 @@ fn displayInspectorValue(ctx: *anyopaque, key: param_view.FieldKey, snapshot: pa
     return param_view.displayValue(snapshot, app.findEditState(key), key);
 }
 
-/// scalar/choice の UI 値を descriptor の ParamValue へ変換し、累積表を publish する。
+/// Convert a scalar/choice UI value to a descriptor ParamValue and publish the cumulative table.
 fn queueParamOverride(app: *App, handle: usize, name: []const u8, raw: f32) !void {
     if (handle >= MAX_MODULES) return error.InvalidHandle;
     const h: Handle = @intCast(handle);
@@ -4331,7 +4331,7 @@ fn queueParamOverride(app: *App, handle: usize, name: []const u8, raw: f32) !voi
 
 fn inspectorChanged(ctx: *anyopaque, handle: modular.dyn.Handle, name: []const u8, value: modular.ParamValue) void {
     const app: *App = @ptrCast(@alignCast(ctx));
-    // drag 開始時のみ before を捕捉（release で set_param へ渡す）
+    // Capture before only at drag start (pass to set_param on release)
     if (app.slider_drag_before == null) {
         var s = patch_undo.ParamValueSnap{
             .mode = 1,
@@ -4417,7 +4417,7 @@ fn handleOfNodeId(app: *const App, id: NodeId) ?Handle {
     return null;
 }
 
-/// 初期 graph: active handle 昇順で決定的採番。
+/// Initial graph: deterministic ids in ascending active-handle order.
 fn assignInitialNodeIds(app: *App) void {
     clearAllNodeIdMappings(app);
     app.next_node_id = 1;
@@ -4441,7 +4441,7 @@ fn restoreNodeIdsFromRefs(app: *App, mapping: []const ?Handle, refs: []const pro
     if (app.next_node_id == 0) app.next_node_id = 1;
 }
 
-/// NodeRef → runtime Handle。netsync 中の bare handle / group synthetic / stale id を拒否。
+/// NodeRef → runtime Handle. Reject bare handle / group synthetic / stale id during netsync.
 fn resolveNodeRef(app: *const App, ref: actions.NodeRef, require_id_during_netsync: bool) !Handle {
     if (require_id_during_netsync and actions.nodeRefRejectDuringNetsync(ref, platform.netsyncActive())) {
         platform.setActionErrorDetail("id_required", "use #<id> from digest patch during netsync");
@@ -4502,13 +4502,13 @@ fn observedFieldForNode(app: *const App, h: Handle) ?param_view.FieldKey {
     const descs = switch (kind) {
         inline else => |comptime_kind| modular.descriptors(comptime_kind),
     };
-    // select_node の追従も action args 由来の slice を保持せず、descriptor static name を使う。
+    // select_node follow-up also uses the descriptor's static name, not a slice from action args.
     const d = param_view.primaryDescriptor(descs) orelse return null;
     return param_view.fieldKey(h, d.name);
 }
 
-/// palette / wire 共通の bass step_seq 初期値（solo `addByPaletteIndex` と同一。TASK-106.2 P1-1）。
-/// drum 版 `step_seq` は `ModuleKind` 既定（`.kind=.drum` 等の `.{}`）で palette と一致。
+/// Shared bass step_seq defaults for palette / wire (same as solo `addByPaletteIndex`).
+/// Drum `step_seq` uses `ModuleKind` defaults (`.{}` including `.kind=.drum`) matching the palette.
 const stepSeqBassInit = modular.StepSeq{
     .kind = .bass,
     .on_mask = 0,
@@ -4518,17 +4518,17 @@ const stepSeqBassInit = modular.StepSeq{
     .octaves = 2,
 };
 
-/// `modular.ModuleKind` → comptime dispatch で `dyn.add(k, .{})`。`addByPaletteIndex` の
-/// `inline for` と同型の「runtime enum → comptime 呼び出し」パターン（`switch (kind) { inline else
-/// => |k| ... }` は各 tag ごとに comptime 特殊化された分岐を生成し、分岐内の `k` は comptime 値になる）。
-/// `actionAddNode`（kind 名）と `load_graph`（`graph_io.decodeGraph` が返す typed kind）の両方が使う。
+/// `modular.ModuleKind` → comptime dispatch into `dyn.add(k, .{})`. Same "runtime enum → comptime call"
+/// pattern as `addByPaletteIndex`'s `inline for` (`switch (kind) { inline else
+/// => |k| ... }` generates a comptime-specialised branch per tag; `k` inside the branch is comptime).
+/// Used by both `actionAddNode` (kind name) and `load_graph` (typed kind from `graph_io.decodeGraph`).
 fn addNodeByKind(app: *App, kind: modular.ModuleKind) !Handle {
     return switch (kind) {
         inline else => |k| app.dyn.add(k, .{}),
     };
 }
 
-/// kind 名（`ModuleKind` tag 名、または wire alias `step_seq_bass`）→ add。
+/// Kind name (`ModuleKind` tag, or wire alias `step_seq_bass`) → add.
 fn addNodeByKindName(app: *App, name: []const u8) !Handle {
     if (std.mem.eql(u8, name, "step_seq_bass")) {
         return app.dyn.add(.step_seq, stepSeqBassInit);
@@ -4547,7 +4547,7 @@ fn actionAddNode(ctx: *anyopaque, args: []const u8, buf: []u8) anyerror![]const 
     }
     app.layout[h] = .{ .x = p.x, .y = p.y };
     try app.dyn.publish();
-    // redo も通常再実行: 全 peer が allocNodeId の単調採番で一致（COMMIT 全順序）。
+    // Redo is a normal re-exec: every peer agrees via monotonic allocNodeId (total COMMIT order).
     const id = allocNodeId(app, h);
     const kind = app.dyn.kindOf(h).?;
     notePatchUndo(app, .{ .add_node = .{
@@ -4559,16 +4559,16 @@ fn actionAddNode(ctx: *anyopaque, args: []const u8, buf: []u8) anyerror![]const 
     return std.fmt.bufPrint(buf, "ok id=#{d}", .{id.raw()}) catch "ok";
 }
 
-/// item が削除対象 handle `h` を参照しているか（remove 後 stale になる selected/hover の判定）。
-/// **`removeModule(h)` の前に**呼ぶこと（cable の src 側判定に削除前の flat edge を引くため）。
-///   - node: 直接一致。
-///   - port: `PortRef.handle` は collapsed group では合成 handle になりうるので `resolvePort` で
-///     実 member へ解決してから比較する。解決不能（既に stale）な port は保守的に落とす（true）。
-///   - cable: `CableRef` は dst しか持たないため、dst 一致に加えて削除前の実 edge を `edgeForInput` で
-///     引き src 側が h の cable も検出する（src 削除で `removeModule` がその接続を消すため stale になる）。
-///   - group: 単一ノード削除では group は消えないので保持（false）。
-/// `deleteSelected` の node 分岐は selected==削除対象前提で無条件 null にするが、action は任意 handle を
-/// 消せるため参照判定で限定する。
+/// Whether item refers to the about-to-be-removed handle `h` (detect selected/hover that would go stale).
+/// Call **before** `removeModule(h)` (src-side cable checks need the pre-remove flat edges).
+///   - node: direct match.
+///   - port: `PortRef.handle` may be synthetic on a collapsed group, so `resolvePort` to the
+///     real member before comparing. Unresolvable (already stale) ports are dropped conservatively (true).
+///   - cable: `CableRef` only holds dst, so besides dst match, pull the pre-remove real edge via `edgeForInput`
+///     and also detect cables whose src is h (removeModule clears that connection → would go stale).
+///   - group: a single-node remove does not delete the group, so keep (false).
+/// `deleteSelected`'s node branch unconditionally nulls when selected==target, but actions can remove an
+/// arbitrary handle, so narrow by reference check.
 fn refsHandleForRemoval(app: *const App, it: Item, h: Handle) bool {
     return switch (it) {
         .node => |sh| sh == h,
@@ -4608,7 +4608,7 @@ fn actionRemoveNode(ctx: *anyopaque, args: []const u8, buf: []u8) anyerror![]con
     const clear_hover = if (app.hover) |it| refsHandleForRemoval(app, it, h) else false;
     if (app.ledger.group_of[h] != null) app.ledger.unassign(h);
     purgeParamOverrides(app, h);
-    // handle 再利用で stale multi 選択が引き継がれないよう、remove 前に落とす（TASK-173.3）。
+    // Drop multi-selection before remove so a reused handle cannot inherit a stale multi select.
     selection.set(&app.multi_selected, h, false);
     app.dyn.removeModule(h);
     clearNodeIdMapping(app, h);
@@ -4620,8 +4620,8 @@ fn actionRemoveNode(ctx: *anyopaque, args: []const u8, buf: []u8) anyerror![]con
     return "ok";
 }
 
-/// `commitConnect` と同じ「検証してから壊す」順序（active/種別一致を先に検証 → 検証 OK なら
-/// 宛先の既存接続を置換）で、無効な接続要求で既存接続を壊さない。
+/// Same "validate then break" order as `commitConnect` (check active/kind match first → only if OK,
+/// replace any existing connection on the destination) so an invalid request does not break an existing one.
 fn actionConnect(ctx: *anyopaque, args: []const u8, buf: []u8) anyerror![]const u8 {
     _ = buf;
     const app = actionApp(ctx);
@@ -4806,11 +4806,11 @@ fn actionRemoveMacro(ctx: *anyopaque, args: []const u8, buf: []u8) anyerror![]co
 }
 
 // ============================================================================
-// save_graph / load_graph（TASK-105.4: VPRJ 互換 alias。旧 PTCG も読込可）。
+// save_graph / load_graph (VPRJ-compatible aliases; legacy PTCG still loads).
 //
-// ホットパス宣言: save/load はイベント時のみ。RT 経路には触れない。
-// save_graph = VPRJ 全体保存（save_project と同内容）。
-// load_graph = VPRJ から graph/Ledger/GENR を適用。PTCG も読込（Ledger 空リセット・GENR 無効化）。
+// Hot-path declaration: save/load are event only. Do not touch the RT path.
+// save_graph = full VPRJ save (same content as save_project).
+// load_graph = apply graph/Ledger/GENR from VPRJ. PTCG also loads (empty Ledger reset; GENR disabled).
 // ============================================================================
 
 fn collectNodesEdges(app: *App, node_buf: *[MAX_MODULES]project_io.NodeEntry, edge_buf: *[MAX_EDGES]project_io.EdgeEntry) struct { nodes: []project_io.NodeEntry, edges: []project_io.EdgeEntry } {
@@ -4830,8 +4830,8 @@ fn collectNodesEdges(app: *App, node_buf: *[MAX_MODULES]project_io.NodeEntry, ed
     return .{ .nodes = node_buf[0..nn], .edges = edge_buf[0..flat.len] };
 }
 
-/// active node の descriptor source field を NPRM 用に収集（instant は保存しない）。
-/// `param_bufs` は各 node の parameter 値 scratch（name は descriptor 静的文字列を指す）。
+/// Collect active-node descriptor source fields for NPRM (do not persist instant).
+/// `param_bufs` is per-node parameter-value scratch (names point at descriptor static strings).
 fn collectNodeParams(
     app: *App,
     record_buf: *[MAX_MODULES]project_io.NodeParamRecord,
@@ -4919,7 +4919,7 @@ fn actionSaveProjectFile(app: *App, path: []const u8) !void {
     try project_io.save(app.io, path, Params, app.params, input, std.heap.c_allocator);
 }
 
-/// 置換意味論の容量: クリア予定の active 分も空きとして数える。
+/// Capacity under replace semantics: count slots about to be cleared as free too.
 fn ensureReplaceCapacity(app: *App, nodes: []const project_io.NodeEntry) !void {
     const free = app.dyn.freeHandleCount();
     const active = app.dyn.activeCount();
@@ -4939,7 +4939,7 @@ fn ensureReplaceCapacity(app: *App, nodes: []const project_io.NodeEntry) !void {
     }
 }
 
-/// clearGraph + publish 後、RT の processBlock が grace を進めるまで待つ（上限付き）。
+/// After clearGraph + publish, wait (bounded) for RT's processBlock to advance grace.
 fn waitGraphReclaim(app: *App, need_nodes: usize) !void {
     var spins: usize = 0;
     while (app.dyn.freeHandleCount() < need_nodes and spins < 200_000) : (spins += 1) {
@@ -4960,7 +4960,7 @@ fn applyGraphReplace(
     node_id_refs: ?[]const project_io.NodeIdRef,
     next_node_id: ?u64,
 ) !GraphApplyResult {
-    // 不正 NPRM は clearGraph 前に reject（graph を破壊しない）
+    // Reject bad NPRM before clearGraph (do not destroy the graph)
     if (node_params) |records| {
         try project_io.validateNodeParams(nodes, records);
     }
@@ -4997,7 +4997,7 @@ fn applyGraphReplace(
         nodes_restored += 1;
     }
 
-    // NPRM: node 再生成後・最終 publish 前に source field を適用（型デフォルトの 1-block transient 回避）
+    // NPRM: apply source fields after node rebuild, before the final publish (avoid a 1-block type-default transient)
     if (node_params) |records| {
         for (records) |rec| {
             if (rec.saved_handle >= MAX_MODULES) continue;
@@ -5009,7 +5009,7 @@ fn applyGraphReplace(
                     else => continue,
                 };
                 modular.setParam(app.dyn, nh, p.name, value) catch |err| {
-                    // validate 済みなので本来到達不能。グラフを空のまま放置しない。
+                    // Unreachable after validate. Do not leave the graph empty.
                     std.log.warn("applyGraphReplace: setParam skipped h={d} name={s} err={s}", .{ nh, p.name, @errorName(err) });
                     continue;
                 };
@@ -5029,7 +5029,7 @@ fn applyGraphReplace(
 
     if (ledger_src) |src| {
         app.ledger = try project_io.remapLedger(src, &mapping);
-        // 復元直後: deriveExposed で整合確認（値はグラフ+membership が一致すれば不変）
+        // Right after restore: deriveExposed for consistency (values are unchanged if graph+membership match)
         app.refreshAllExposed();
     } else {
         app.ledger = .{};
@@ -5041,7 +5041,7 @@ fn applyGraphReplace(
         app.patch.invalidateGenRoles();
     }
 
-    // stable NodeId: NREF があれば復元、無ければ決定的 fallback
+    // stable NodeId: restore from NREF if present, else deterministic fallback
     if (node_id_refs) |refs| {
         restoreNodeIdsFromRefs(app, &mapping, refs, next_node_id orelse 1);
     } else {
@@ -5054,8 +5054,8 @@ fn applyGraphReplace(
         restoreNodeIdsFromRefs(app, &mapping, refs_buf[0..nodes.len], next);
     }
 
-    // master output は VPRJ chunk 対象外だが、GENR の output role から staging output を復元する
-    // （無いと load 後 silent。旧 PTCG 経路は GENR 無効のため setOutput しない）。
+    // master output is outside VPRJ chunks; restore staging output from the GENR output role
+    // (without it, load is silent. Legacy PTCG has no GENR so does not setOutput).
     if (app.patch.output_h != project_io.INVALID_ROLE_HANDLE and app.dyn.isActive(app.patch.output_h)) {
         app.dyn.setOutput(app.patch.output_h);
         try app.dyn.publish();
@@ -5064,19 +5064,19 @@ fn applyGraphReplace(
     return .{ .nodes_restored = nodes_restored, .edges_restored = edges_restored };
 }
 
-/// params + pattern を publish する。
-/// `quantize_bar=true`: 同一 load で seed も適用される場合に必須（seed の anchor リセットに pattern が潰されないよう、
-/// bar 境界で seed→pending_bar_cmd の後勝ち適用）。VPRJ/MPRJ load / SYNC が該当。
-/// `quantize_bar=false`: pattern-only（load_pattern）。即時適用（従来どおり）。
-/// 呼び出し側が `loaded.apply_seed_song` を渡すのは「pattern と seed が同居するフォーマットだけ量子化」の意図借用。
-/// `apply_params_pattern=true` かつ `apply_seed_song=false` の組合せは現行フォーマットに存在しない。
+/// Publish params + pattern.
+/// `quantize_bar=true`: required when the same load also applies seed (so seed's anchor reset does not wipe the pattern;
+/// at the bar boundary, seed→pending_bar_cmd last-wins). VPRJ/MPRJ load / SYNC.
+/// `quantize_bar=false`: pattern-only (load_pattern). Apply immediately (as before).
+/// Callers pass `loaded.apply_seed_song` to mean "quantize only when pattern and seed share a format".
+/// The combo `apply_params_pattern=true` and `apply_seed_song=false` does not exist in current formats.
 fn applyParamsPattern(app: *App, params: Params, pattern: pattern_io.PatternPayload, quantize_bar: bool) void {
     app.params = params;
     publishControls(app.patch, app.params);
     var cmd = payloadToPatternCommand(0, pattern);
     cmd.quantize_bar = quantize_bar;
     const published = publishPatternCommand(app, cmd);
-    // load の quantized pattern を last_quantized_cmd に載せ、stale mini-notation の再利用を防ぐ。
+    // Put the load's quantized pattern into last_quantized_cmd so a stale mini-notation is not reused.
     if (quantize_bar) app.last_quantized_cmd = published;
 }
 
@@ -5096,7 +5096,7 @@ fn actionSaveGraph(ctx: *anyopaque, args: []const u8, buf: []u8) anyerror![]cons
     return "ok";
 }
 
-/// 既存グラフを全消去する（load の「置換」意味論。台帳/選択/hover も併せてリセット）。
+/// Erase the whole existing graph (load's "replace" semantics. Also reset ledger/selection/hover).
 fn clearGraph(app: *App) void {
     purgeParamOverrides(app, null);
     var h: Handle = 0;
@@ -5108,7 +5108,7 @@ fn clearGraph(app: *App) void {
     }
     app.ledger = .{};
     clearAllNodeIdMappings(app);
-    // next_node_id は load/SYNC 側が restore する（clear 単体では単調性を壊さない）
+    // next_node_id is restored by load/SYNC (clear alone must not break monotonicity)
     selection.clear(&app.multi_selected);
     app.selected = null;
     app.hover = null;
@@ -5127,7 +5127,7 @@ fn actionLoadGraph(ctx: *anyopaque, args: []const u8, buf: []u8) anyerror![]cons
     const ledger_ptr: ?*const group.Ledger = if (decoded.apply_ledger and decoded.format == .vprj) &decoded.ledger else null;
     const genr_opt: ?project_io.GenRoleHandles = if (decoded.apply_genr and decoded.format == .vprj) decoded.genr else null;
     const nprm_opt: ?[]const project_io.NodeParamRecord = if (decoded.apply_node_params) decoded.node_params else null;
-    // PTCG: apply_ledger/genr は true だが空/INVALID（decodeFromPtcg）
+    // PTCG: apply_ledger/genr are true but empty/INVALID (decodeFromPtcg)
     const result = if (decoded.format == .ptcg)
         try applyGraphReplace(app, decoded.nodes, decoded.edges, null, null, null, decoded.node_id_refs, decoded.next_node_id)
     else
@@ -5138,12 +5138,12 @@ fn actionLoadGraph(ctx: *anyopaque, args: []const u8, buf: []u8) anyerror![]cons
     }) catch "ok";
 }
 
-/// graph relay action を一括登録する（TASK-106.2）。`.relay` + canonicalize。undoable なし。
-/// network_policy は `gen_actions.PATCH_NETWORK_POLICIES` が単一ソース。
+/// Register graph relay actions in bulk. `.relay` + canonicalize. Not undoable.
+/// network_policy's single source is `gen_actions.PATCH_NETWORK_POLICIES`.
 fn registerPatchActions(app: *App) void {
     platform.registerAction(.{ .name = "select_node", .ctx = app, .run = actionSelectNode, .network_policy = patchPolicy("select_node") });
     platform.registerAction(.{ .name = "observe_param", .ctx = app, .run = actionObserveParam, .network_policy = patchPolicy("observe_param") });
-    // TASK-149.1/149.3: panel visible トグル（local_only。recipe/CommandLog 非記録→meta ring）。
+    // Panel visible toggle (local_only. Not recorded in recipe/CommandLog → meta ring).
     platform.registerAction(.{
         .name = "panel_toggle",
         .ctx = app,
@@ -5215,7 +5215,7 @@ fn registerPatchActions(app: *App) void {
         .network_policy = patchPolicy("load_graph"),
         .desc = "load graph/Ledger/GENR from VPRJ (or legacy PTCG); reject while synced",
     });
-    // TASK-173.1: 表示グラフの全再レイアウト（local_only・引数なし・undo/履歴化なし）
+    // Full re-layout of the display graph (local_only; no args; no undo/history)
     platform.registerAction(.{
         .name = "auto_layout",
         .ctx = app,
@@ -5224,7 +5224,7 @@ fn registerPatchActions(app: *App) void {
         .args = &.{},
         .desc = "Sugiyama layered layout of display graph (real nodes + collapsed boxes)",
     });
-    // TASK-173.4: 選択表示ノードのみトポロジー無視グリッド（local_only・引数なし）
+    // Topology-ignoring grid of selected display nodes only (local_only; no args)
     platform.registerAction(.{
         .name = "auto_layout_selected",
         .ctx = app,
@@ -5235,9 +5235,9 @@ fn registerPatchActions(app: *App) void {
     });
 }
 
-/// 表示グラフに Sugiyama 系レイヤードレイアウトを適用する（action / 起動時初期配置の共有本体）。
-/// 合成 handle は groups[gid].pos のみへ書き、App.layout[] には実 handle だけを書く。
-/// ホットパス: イベント時のみ / 初期化時のみ。camera fit / undo は行わない。
+/// Apply a Sugiyama-style layered layout to the display graph (shared body for the action and startup placement).
+/// Synthetic handles write only groups[gid].pos; App.layout[] gets real handles only.
+/// Hot path: event only / init only. No camera fit / undo.
 fn runAutoLayout(app: *App) void {
     var node_buf: [MAX_MODULES + group.MAX_GROUPS]NodeGeom = undefined;
     const n_nodes = app.buildNodes(&node_buf);
@@ -5250,7 +5250,7 @@ fn runAutoLayout(app: *App) void {
         edge_buf[ei] = dedge_buf[ei].visual;
     }
 
-    // order key: 実ノードは view.order 添字。collapsed group は所属メンバーの最小 order key。
+    // order key: real nodes use view.order index. collapsed groups use the min order key of their members.
     const view = app.dyn.currentView();
     var handle_order: [MAX_MODULES]?u32 = [_]?u32{null} ** MAX_MODULES;
     var k: usize = 0;
@@ -5280,7 +5280,7 @@ fn runAutoLayout(app: *App) void {
         }
     }
 
-    // パレット帯を避ける origin_y（clampMacroPos と同型: paletteBottom + margin → world Y）
+    // origin_y that clears the palette band (same shape as clampMacroPos: paletteBottom + margin → world Y)
     const margin: f32 = 16;
     const top_limit_local = (paletteBottom(app) - app.canvas_rect.y) + margin;
     const origin_y = app.camera.screenToWorld(.{ .x = 0, .y = top_limit_local }).y;
@@ -5295,7 +5295,7 @@ fn runAutoLayout(app: *App) void {
     );
 }
 
-/// `auto_layout`: runAutoLayout の薄いラッパー。camera fit / undo は行わない。
+/// `auto_layout`: thin wrapper around runAutoLayout. No camera fit / undo.
 fn actionAutoLayout(ctx: *anyopaque, args: []const u8, buf: []u8) anyerror![]const u8 {
     _ = args;
     _ = buf;
@@ -5303,8 +5303,8 @@ fn actionAutoLayout(ctx: *anyopaque, args: []const u8, buf: []u8) anyerror![]con
     return "ok";
 }
 
-/// multi_selected を最優先し、空なら App.selected の .node/.group を単体対象にする。
-/// 表示 nodes に存在する handle だけを out へ書き、件数を返す（.port/.cable/null は 0）。
+/// Prefer multi_selected; if empty, take App.selected .node/.group as a single target.
+/// Write only handles that exist in the display nodes into out; return the count (.port/.cable/null → 0).
 fn collectSelectedLayoutTargets(app: *const App, nodes: []const NodeGeom, out: []Handle) usize {
     var n: usize = 0;
     if (!selection.empty(&app.multi_selected)) {
@@ -5335,8 +5335,8 @@ fn collectSelectedLayoutTargets(app: *const App, nodes: []const NodeGeom, out: [
     return 0;
 }
 
-/// 選択表示ノードのみ単純グリッド配置（TASK-173.4）。0 件は empty_selection、1 件は no-op 成功。
-/// ホットパス: action 呼び出し時のみ。camera fit / undo / ヘッダー追従は行わない。
+/// Simple grid of selected display nodes only. 0 → empty_selection; 1 → successful no-op.
+/// Hot path: action call only. No camera fit / undo / header follow.
 fn runAutoLayoutSelected(app: *App) anyerror!void {
     var node_buf: [MAX_MODULES + group.MAX_GROUPS]NodeGeom = undefined;
     const n_nodes = app.buildNodes(&node_buf);
@@ -5355,7 +5355,7 @@ fn runAutoLayoutSelected(app: *App) anyerror!void {
     );
 }
 
-/// `auto_layout_selected`: runAutoLayoutSelected の薄いラッパー。
+/// `auto_layout_selected`: thin wrapper around runAutoLayoutSelected.
 fn actionAutoLayoutSelected(ctx: *anyopaque, args: []const u8, buf: []u8) anyerror![]const u8 {
     _ = args;
     _ = buf;
@@ -5372,19 +5372,19 @@ fn toPlatformPolicy(tag: gen_actions.NetworkPolicyTag) platform.NetworkPolicy {
 }
 
 fn patchPolicy(comptime name: []const u8) platform.NetworkPolicy {
-    // gen_actions.policyOf を comptime で確実に解決する（表欠落はビルド時エラー）。
+    // Resolve gen_actions.policyOf at comptime (a missing table entry is a build error).
     const tag = comptime gen_actions.policyOf(name) orelse @compileError("missing PATCH_NETWORK_POLICIES entry: " ++ name);
     return toPlatformPolicy(tag);
 }
 
-/// graph relay action の CommandLog 記録ラッパー（TASK-106.2/106.3）。
+/// CommandLog recording wrapper for graph relay actions.
 ///
-/// 保存契約: `platform.routeAction` の canonicalize 後 args（NodeId は `#<id>` 形式）が
-/// `CommandRecord.args` にそのまま入る。`recordedGraphAction` 内で再 canonicalize はしない
-/// （remote COMMIT は host 側 canonicalize 済み wire args を受け取るため）。
+/// Persistence contract: args after `platform.routeAction` canonicalize (NodeId as `#<id>`) go
+/// straight into `CommandRecord.args`. `recordedGraphAction` does not re-canonicalize
+/// (remote COMMIT already receives host-canonicalised wire args).
 ///
-/// fresh replay 前提: NodeId 採番は起動時 active handle 昇順の初期割当と、publish 成功後の
-/// 単調増分（削除後も再利用なし）により、同じ操作列なら同じ `#id` が再現される。
+/// Fresh-replay assumption: NodeId allocation is the startup ascending-active-handle initial assign plus
+/// monotonic increments after successful publish (never reused after delete), so the same op sequence reproduces the same `#id`.
 fn recordedGraphAction(comptime name: []const u8) *const fn (*anyopaque, []const u8, []u8) anyerror![]const u8 {
     return &struct {
         fn run(ctx: *anyopaque, args: []const u8, buf: []u8) anyerror![]const u8 {
@@ -5499,10 +5499,10 @@ fn integratedStateSyncImport(ctx: *anyopaque, bytes: []const u8) anyerror!void {
     defer decoded.deinit(gpa);
     if (decoded.format != .vprj) return error.UnsupportedFormat;
 
-    // 検証完了後にのみ破壊的適用（capacity は applyGraphReplace 内）
+    // Destructive apply only after validation completes (capacity is inside applyGraphReplace)
     const nprm_opt: ?[]const project_io.NodeParamRecord = if (decoded.apply_node_params) decoded.node_params else null;
     _ = try applyGraphReplace(app, decoded.nodes, decoded.edges, &decoded.ledger, decoded.genr, nprm_opt, decoded.node_id_refs, decoded.next_node_id);
-    // TASK-151: SYNC も VPRJ load と同じく pattern を pending（quantize_bar）で staging → seed 後勝ち。
+    // SYNC, like VPRJ load, stages pattern as pending (quantize_bar) → seed last-wins.
     applyParamsPattern(app, decoded.params, decoded.pattern, true);
     applySeedSong(app, decoded.seed, decoded.song);
 }
@@ -5542,7 +5542,7 @@ fn selectedParamDigest(app: *const App, buf: []u8) []const u8 {
 }
 
 fn defaultObservedField(app: *const App) param_view.FieldKey {
-    // Master VCF cutoff（Inspector 経路の既定 observe）。
+    // Master VCF cutoff (default observe for the Inspector path).
     const name = param_view.canonicalDescriptorName(modular.descriptors(.vcf), "cutoff") orelse "cutoff";
     return param_view.fieldKey(app.patch.master_vcf_h, name);
 }
@@ -5588,7 +5588,7 @@ fn optionalF32Text(buf: []u8, value: ?f32) []const u8 {
 fn panelDigest(ctx: *anyopaque, buf: []u8) []const u8 {
     const app: *const App = @ptrCast(@alignCast(ctx));
     const host = app.panel_host;
-    // TASK-160.3: Transport / bottom slot キーを削除。History + Inspector のみ。
+    // Removed Transport / bottom-slot keys. History + Inspector only.
     return std.fmt.bufPrint(buf, "inspector_visible={d} inspector_open={d} inspector_state={s} panels_hidden={d} history_visible={d} history_open={d} history_count={d} history_latest_seq={d} history_scroll_y={d} left_extent={d} right_extent={d} bottom_extent={d} center_x={d} center_y={d} center_w={d} center_h={d} canvas_w={d} canvas_h={d}", .{
         @intFromBool(app.panelVisible("Inspector")),
         @intFromBool(app.panelOpen("Inspector")),
@@ -5611,7 +5611,7 @@ fn panelDigest(ctx: *anyopaque, buf: []u8) []const u8 {
     }) catch return buf[0..0];
 }
 
-// ── PanelHost body callbacks + Preferences adapter（TASK-149.1/149.3）────────
+// ── PanelHost body callbacks + Preferences adapter ────────
 
 fn actorLabel(actor: platform.command.ActorId, buf: []u8) []const u8 {
     return switch (actor) {
@@ -5622,9 +5622,9 @@ fn actorLabel(actor: platform.command.ActorId, buf: []u8) []const u8 {
     };
 }
 
-/// recipeEntriesFromLog と履歴 badge の単一ソース。除外名を増やすときはここだけ触る。
+/// Single source for recipeEntriesFromLog and history badges. Touch only here when adding excluded names.
 fn isRecipeEligibleCommandName(name: []const u8) bool {
-    // TASK-106.1: 内部 snapshot。意味的 recipe に含めない。
+    // Internal snapshot. Not included in semantic recipes.
     if (std.mem.eql(u8, name, "pattern_state")) return false;
     return true;
 }
@@ -5665,7 +5665,7 @@ fn formatHistoryCmdLine(rec: *const platform.command.CommandRecord, buf: []u8) [
     };
 }
 
-/// History 行色（pixie と同様: reverted=subtle / revert=meta 色 / normal=本文）。
+/// History row colour (as in pixie: reverted=subtle / revert=meta colour / normal=body).
 fn historyCmdRowColor(ctx: *const gui.Context, rec: *const platform.command.CommandRecord) gui.Color {
     return switch (rec.kind) {
         .revert => gui.Color.rgba(0x88, 0x9A, 0xB0, 0xFF),
@@ -5677,11 +5677,11 @@ fn formatHistoryMetaLine(meta: *const MetaEvent, buf: []u8) []const u8 {
     return std.fmt.bufPrint(buf, "— user {s} [local_only]", .{meta.summary()}) catch "—";
 }
 
-/// History 行の merge 表示用（cmd + meta）。fixed stack、per-frame alloc なし。
+/// For History row merge display (cmd + meta). Fixed stack; no per-frame alloc.
 const HistoryDisplayLine = struct {
     primary_seq: u64,
     is_meta: bool,
-    /// meta なら meta ring index（0=oldest）、cmd なら recordAt index。
+    /// meta → meta ring index (0=oldest); cmd → recordAt index.
     src_index: u32,
 };
 
@@ -5696,11 +5696,11 @@ fn buildHistoryDisplayLines(app: *const App, out: []HistoryDisplayLine) usize {
     i = 0;
     while (i < app.meta_filled and n < out.len) : (i += 1) {
         const m = app.metaAt(i);
-        // after_seq の直後に差し込む（同じ primary なら meta を後＝表示上は上側に寄りやすいよう is_meta で tie-break）。
+        // Splice in right after after_seq (same primary → tie-break with is_meta so meta sits above visually).
         out[n] = .{ .primary_seq = m.after_seq, .is_meta = true, .src_index = i };
         n += 1;
     }
-    // 新しい順: primary_seq desc、同 seq なら meta を cmd より新（上）に。
+    // Newest first: primary_seq desc; same seq → meta newer (above) than cmd.
     std.mem.sort(HistoryDisplayLine, out[0..n], {}, struct {
         fn less(_: void, a: HistoryDisplayLine, b: HistoryDisplayLine) bool {
             if (a.primary_seq != b.primary_seq) return a.primary_seq > b.primary_seq;
@@ -5727,7 +5727,7 @@ fn buildHistoryPanel(ctx: *gui.Context, user_data: *anyopaque) anyerror!void {
         .gap = 2,
     });
 
-    // ScrollArea: viewport 固定幅・固定高、content は fit（grow-in-fit 回避）。
+    // ScrollArea: fixed-width/height viewport; content is fit (avoid grow-in-fit).
     ctx.beginScrollArea(HISTORY_SCROLL_ID, &app.history_scroll, .{
         .width = .{ .fixed = content_w },
         .height = .{ .fixed = @max(20, body_h - pad * 2) },
@@ -5764,10 +5764,10 @@ fn buildHistoryPanel(ctx: *gui.Context, user_data: *anyopaque) anyerror!void {
 
 fn inspectorMemberSelected(ctx: *anyopaque, handle: modular.dyn.Handle) void {
     const app: *App = @ptrCast(@alignCast(ctx));
-    // canvas selection / group collapsed / RT は触らない。target のみ。
+    // Do not touch canvas selection / group collapsed / RT. target only.
     if (handle >= MAX_MODULES or !app.dyn.slotActive(handle)) return;
     app.inspector_target = handle;
-    // observe も drill-down 対象へ（params digest の choice 確認用）。
+    // Point observe at the drill-down target too (for params-digest choice checks).
     app.observed_field = observedFieldForNode(app, handle) orelse app.observed_field;
 }
 
@@ -5835,7 +5835,7 @@ fn panelPersistence(app: *App) gui.Persistence {
 
 fn persistPanelPrefs(app: *App) void {
     const dir = app.prefs_dir orelse return;
-    // H 全 hide は slot の一時 override。persist 前に pre-hide 値へ戻し、終了後に再適用する。
+    // H hide-all is a temporary slot override. Restore pre-hide values before persist; re-apply after.
     const was_hidden = app.panels_hidden;
     if (was_hidden) {
         app.panel_host.setSlotVisible(.left, app.pre_hide_left_visible);
@@ -5863,7 +5863,7 @@ fn persistPanelPrefs(app: *App) void {
 fn actionPanelToggle(ctx: *anyopaque, args: []const u8, buf: []u8) ![]const u8 {
     const app: *App = @ptrCast(@alignCast(ctx));
     const name_raw = std.mem.trim(u8, args, " \t");
-    // harness は小文字名。PanelHost name は PascalCase。local_only（CommandLog 非記録→meta ring）。
+    // harness uses lowercase names. PanelHost names are PascalCase. local_only (not in CommandLog → meta ring).
     const panel_name: []const u8 = blk: {
         if (std.mem.eql(u8, name_raw, "inspector") or std.mem.eql(u8, name_raw, "Inspector")) break :blk "Inspector";
         if (std.mem.eql(u8, name_raw, "history") or std.mem.eql(u8, name_raw, "History")) break :blk "History";
@@ -5878,8 +5878,8 @@ fn actionPanelToggle(ctx: *anyopaque, args: []const u8, buf: []u8) ![]const u8 {
     return std.fmt.bufPrint(buf, "ok panel_toggle {s}={d}", .{ name_raw, @intFromBool(visible) }) catch error.BufferTooSmall;
 }
 
-/// GUI 操作の undoable 記録は `routeUiAction` → `recordedAction` / `notePatchUndo` 経路を使う。
-/// 表示専用の `recordExecuted(..., undo_ref=null)` は TASK-150 で廃止した。
+/// Undoable recording of GUI ops goes through `routeUiAction` → `recordedAction` / `notePatchUndo`.
+/// Display-only `recordExecuted(..., undo_ref=null)` has been removed.
 const ChoiceDigestInfo = struct {
     name: []const u8,
     index: i32,
@@ -5888,14 +5888,14 @@ const ChoiceDigestInfo = struct {
     const none: ChoiceDigestInfo = .{ .name = "none", .index = -1, .option = "none" };
 };
 
-/// target handle の choice パラメータ情報（digest 用）。observed が choice なら優先し、なければ先頭 choice。
+/// Choice-parameter info for the target handle (for digest). Prefer observed if it is a choice; else the first choice.
 fn targetChoiceInfo(app: *const App, target: Handle) ChoiceDigestInfo {
     const kind = app.dyn.kindOf(target) orelse return ChoiceDigestInfo.none;
     const descs = switch (kind) {
         inline else => |comptime_kind| modular.descriptors(comptime_kind),
     };
     const observed = observedField(app);
-    // 1) observed がこの target の choice ならそれを優先
+    // 1) If observed is a choice on this target, prefer it
     if (param_view.sameFieldParts(observed, target, observed.name)) {
         if (paramDescFor(kind, observed.name)) |desc| switch (desc.kind) {
             .choice => |c| {
@@ -5904,7 +5904,7 @@ fn targetChoiceInfo(app: *const App, target: Handle) ChoiceDigestInfo {
                     .choice => |v| @min(v, c.options.len -| 1),
                     .scalar => return ChoiceDigestInfo.none,
                 };
-                // pending があれば表示値
+                // If pending exists, use it as the display value
                 const shown_idx: usize = blk: {
                     if (app.findEditState(param_view.fieldKey(target, desc.name))) |st| {
                         if (st.pending) |p| switch (p) {
@@ -5983,7 +5983,7 @@ fn paramsDigest(ctx: *anyopaque, buf: []u8) []const u8 {
     const field_text = optionalF32Text(&field_buf, field);
     const inspector_text = optionalF32Text(&inspector_buf, inspector_value);
     const shown_text = optionalF32Text(&shown_buf, shown);
-    // TASK-160.3: transport= キー削除。Inspector 経路のみ。
+    // transport= key removed. Inspector path only.
     const result = std.fmt.bufPrint(buf, "selected_h={d} selected_kind={s} inspector_target={d} target_kind={s} choice_name={s} choice_index={d} choice_option={s} observed_h={d} observed_name={s} field={s} instant={s} inspector={s} shown={s} dragging={d} override={d} ghost={d}", .{
         selected_h,
         selected_kind,
@@ -6046,7 +6046,7 @@ fn modularDigest(ctx: *anyopaque, buf: []u8) []const u8 {
     const app: *App = @ptrCast(@alignCast(ctx));
     const p = app.patch;
     const st = p.snapshotState();
-    // 3 ピースに分けて同じ buf へ連結（bufPrint は 1 呼び出し 32 引数上限）。
+    // Concatenate into the same buf in 3 pieces (bufPrint caps one call at 32 args).
     const a = std.fmt.bufPrint(buf, "{{\"playing\":true,\"bpm\":{d:.0},\"clock_phase\":{d:.3},\"density\":{d:.3},\"density_target\":{d:.3}," ++
         "\"swing\":{d:.3},\"sidechain\":{d:.3},\"master_cutoff\":{d:.0},\"bass_pitch_cv\":{d:.4}," ++
         "\"steps\":{{\"kick\":{d},\"hat\":{d},\"clap\":{d},\"bass\":{d}}}," ++
@@ -6069,8 +6069,8 @@ fn modularDigest(ctx: *anyopaque, buf: []u8) []const u8 {
         st.master_drive,     st.pre_clip_peak,   st.clip_rate,  st.ambient_move,
         st.ambient_register, st.ambient_root_cv,
     }) catch return buf[0..a.len];
-    // Ph5 pattern（masks は hex。bass_deg 配列は snapshot 側）+ TASK-91 song 要約。
-    // 末尾は 1 つの `}` で JSON を閉じる（1024B 注意）。
+    // Ph5 pattern (masks as hex. bass_deg array is on the snapshot side) + song summary.
+    // Close JSON with a single trailing `}` (watch the 1024B budget).
     const selected = selectedParamDigest(app, buf[a.len + b.len ..]);
     const c = std.fmt.bufPrint(buf[a.len + b.len + selected.len ..], "\"patterns\":{{\"kick\":\"{x:0>4}\",\"hat\":\"{x:0>4}\"," ++
         "\"clap\":\"{x:0>4}\",\"bass_on\":\"{x:0>4}\",\"bass_accent\":\"{x:0>4}\",\"bass_slide\":\"{x:0>4}\"}}," ++
@@ -6090,10 +6090,10 @@ fn modularSnapshot(ctx: *anyopaque, allocator: std.mem.Allocator) anyerror![]u8 
     const app: *App = @ptrCast(@alignCast(ctx));
     const p = app.patch;
     const st = p.snapshotState();
-    // digest（1024B 以内）に bass_deg 配列 + song 詳細を足した詳細スナップショット（固定 buf に組み立て→dupe）。
+    // Detailed snapshot = digest (within 1024B) plus bass_deg array + song detail (build in a fixed buf → dupe).
     var dbuf: [1024]u8 = undefined;
     const d = modularDigest(ctx, &dbuf);
-    const body = if (d.len > 0 and d[d.len - 1] == '}') d[0 .. d.len - 1] else d; // 末尾 '}' を外す
+    const body = if (d.len > 0 and d[d.len - 1] == '}') d[0 .. d.len - 1] else d; // Drop the trailing '}'
     var out: [2048]u8 = undefined;
     var off: usize = 0;
     {
@@ -6105,7 +6105,7 @@ fn modularSnapshot(ctx: *anyopaque, allocator: std.mem.Allocator) anyerror![]u8 
         const piece = std.fmt.bufPrint(out[off..], "{s}{d}", .{ sep, dg }) catch break;
         off += piece.len;
     }
-    // TASK-91: song 詳細（rows 要約 + chain lens + loop）
+    // song detail (row summary + chain lens + loop)
     {
         const piece = std.fmt.bufPrint(out[off..], "],\"song_detail\":{{\"loop\":{d},\"rev\":{d},\"rows\":[", .{
             b01(st.song_loop),
@@ -6118,7 +6118,7 @@ fn modularSnapshot(ctx: *anyopaque, allocator: std.mem.Allocator) anyerror![]u8 
         off += piece.len;
     }
     const song = p.song;
-    const n_rows: usize = @min(@as(usize, st.song_rows), 8); // 要約: 先頭 8 row
+    const n_rows: usize = @min(@as(usize, st.song_rows), 8); // Summary: first 8 rows
     var ri: usize = 0;
     while (ri < n_rows) : (ri += 1) {
         const row = song.rows[ri];
@@ -6144,23 +6144,23 @@ fn modularSnapshot(ctx: *anyopaque, allocator: std.mem.Allocator) anyerror![]u8 
 }
 
 // ============================================================================
-// ヘッドレス検証 harness の custom action（TASK-65。TASK-62.1 の registerAction を modular が採用。
-// pixie(TASK-64)/synth(TASK-65) と同じ「probe(read) に対称な write 口。既存の GUI 編集経路と同じ
-// publish 呼び出しをそのまま辿る」構図）。
+// harness custom actions (modular adopts registerAction.
+// Same shape as pixie/synth: a write mouth symmetric to probe(read). Walks the same
+// publish calls as the existing GUI edit path).
 //
-// ホットパス宣言: 全 action の `run()` は「イベント時のみ」（harness `action` コマンド1回につき1回、
-// main thread の pollGate 内で実行）。フレーム毎・毎サンプルのいずれでもないため性能規約の適用対象外。
-// action が触れる状態伝播は既存の RT-safe cross-thread hand-off をそのまま使うだけで、RT 経路
-// （`LofiPatch.render`→graph `processBlock`）へ新たな同期/alloc/lock/panic は一切追加しない:
-//   - graph param: `queueParamOverride` → param_db Mailbox。
-//   - tone macros: `publishControls`（atomic store）。
-//   - pattern 編集(lock/evolve/step/pitch): `patch.snapshotState()` で最新 pattern を読み
-//     `stateToCommand` で編集用 base に変換 → 該当 field を書換 → `app.pattern_rev` を1回だけ increment
-//     → `patch.controls.pattern_db.publish(cmd)`（triple-buffer Mailbox。GUI の「1 フレームで edited=true
-//     のときだけ publish」と全く同じ経路・同じ revision カウンタを共有するため二重採番が起きない）。
+// Hot-path declaration: every action `run()` is event-only (once per harness `action` command,
+// inside main-thread pollGate). Neither per-frame nor per-sample, so the performance rules do not apply.
+// State propagation only reuses the existing RT-safe cross-thread hand-off; no new
+// sync/alloc/lock/panic is added to the RT path (`LofiPatch.render`→graph `processBlock`):
+//   - graph param: `queueParamOverride` → param_db Mailbox.
+//   - tone macros: `publishControls` (atomic store).
+//   - pattern edits (lock/evolve/step/pitch): read the latest pattern via `patch.snapshotState()`,
+//     convert to an edit base with `stateToCommand` → rewrite the field → increment `app.pattern_rev` once
+//     → `patch.controls.pattern_db.publish(cmd)` (triple-buffer Mailbox. Same path and revision
+//     counter as the GUI's "publish only when edited=true in a frame", so there is no double numbering).
 //
-// パーサは `gen_actions.zig`（std のみ・App/kit/modular 非依存）に切り出し単体テストする。track 名の enum
-// 解決は App の具象型を知るこのファイル側で行う（pixie の `ToolKind` 解決と同じ分離方針）。
+// Parsers live in `gen_actions.zig` (std only; no App/kit/modular) and are unit-tested. Resolving track names
+// stays in this file, which knows App's concrete types (same split as pixie's `ToolKind`).
 // ============================================================================
 
 fn setMuteAndPublish(app: *App, name: []const u8, muted: bool) error{UnknownTrack}!void {
@@ -6186,8 +6186,8 @@ fn trackMixerMuteTarget(app: *const App, track: MuteTrack) struct { handle: usiz
     };
 }
 
-/// pending_param_undo_before を param 名一致のときだけ消費して返す。
-/// 不一致なら null（pending は残す）→ 呼び出し側は現在値 before にフォールバックする。
+/// Consume pending_param_undo_before only when the param name matches, and return it.
+/// On mismatch return null (leave pending) → caller falls back to the current value as before.
 fn takePendingParamUndoBefore(app: *App, param_name: []const u8) ?patch_undo.ParamValueSnap {
     const pending = app.pending_param_undo_before orelse return null;
     if (!std.mem.eql(u8, pending.name(), param_name)) return null;
@@ -6198,7 +6198,7 @@ fn takePendingParamUndoBefore(app: *App, param_name: []const u8) ?patch_undo.Par
 fn actionSetParam(ctx: *anyopaque, args: []const u8, buf: []u8) anyerror![]const u8 {
     _ = buf;
     const app = actionApp(ctx);
-    // TASK-160.3: `#NodeId|handle + descriptor + value` のみ（旧 Transport alias 2 トークンは拒否）。
+    // `#NodeId|handle + descriptor + value` only (reject the old 2-token Transport alias).
     const p = try actions.parseParamOverride(args);
     const h = try resolveNodeRef(app, p.ref, true);
     const cname = canonicalParamName(app, h, p.name) orelse return error.UnknownParam;
@@ -6232,7 +6232,7 @@ fn actionSetParam(ctx: *anyopaque, args: []const u8, buf: []u8) anyerror![]const
 
 fn canonicalizeSetParam(ctx: *anyopaque, args: []const u8, scratch: []u8) anyerror![]const u8 {
     const app: *App = @ptrCast(@alignCast(ctx));
-    // TASK-160.3: NodeId 形式のみ（2 トークン Transport alias は拒否）。
+    // NodeId form only (reject the 2-token Transport alias).
     const forbid = !actions.allowNodeCanonFill(platform.netsyncActive());
     const p = try actions.parseParamOverride(args);
     const id = try nodeRefToId(app, p.ref, forbid);
@@ -6294,7 +6294,7 @@ fn actionSetEvolve(ctx: *anyopaque, args: []const u8, buf: []u8) anyerror![]cons
     return "ok";
 }
 
-/// TASK-106.1: host evolve 結果の内部 snapshot。quantize_bar=false で即 publish。
+/// Internal snapshot of the host evolve result. Publish immediately with quantize_bar=false.
 fn actionPatternState(ctx: *anyopaque, args: []const u8, buf: []u8) anyerror![]const u8 {
     _ = buf;
     const app = actionApp(ctx);
@@ -6314,18 +6314,18 @@ fn actionPatternState(ctx: *anyopaque, args: []const u8, buf: []u8) anyerror![]c
     cmd.quantize_bar = false;
     _ = publishPatternCommand(app, cmd);
     app.patch.controls.remote_mutation_count.store(p.mutation_count, .release);
-    // host が自 COMMIT を適用した場合も broadcast 済 mutation を揃える。
+    // Also align the already-broadcast mutation when the host applies its own COMMIT.
     if (platform.netsyncIsHost()) app.last_pattern_state_mut = p.mutation_count;
     return "ok";
 }
 
-/// netsync 無効 or host → mutate 可。client → pattern_state 受信のみ。
+/// netsync off or host → may mutate. client → pattern_state receive only.
 fn updateEvolveAuthority(app: *App) void {
     const host = !platform.netsyncActive() or platform.netsyncIsHost();
     app.patch.controls.evolve_host_authority.store(@intFromBool(host), .release);
 }
 
-/// host main thread: mutation_count 変化、または peer 増加（join）時に pattern_state を COMMIT 配信。
+/// host main thread: on mutation_count change, or peer increase (join), COMMIT-broadcast pattern_state.
 fn maybeBroadcastPatternState(app: *App) void {
     if (!platform.netsyncActive() or !platform.netsyncIsHost()) {
         app.last_broadcast_peer_count = 0;
@@ -6406,14 +6406,14 @@ fn actionSetPitch(ctx: *anyopaque, args: []const u8, buf: []u8) anyerror![]const
 }
 
 // ============================================================================
-// save_pattern / load_pattern（TASK-105.4: VPRJ 互換 alias。旧 MDLP も読込可）。
+// save_pattern / load_pattern (VPRJ-compatible aliases; legacy MDLP still loads).
 //
-// ホットパス宣言: save/load はイベント時のみ。RT 経路には触れない。
-// save_pattern = VPRJ 全体保存（save_project と同内容）。
-// load_pattern = VPRJ/MDLP から SPRM/PTRN のみ適用。
+// Hot-path declaration: save/load are event only. Do not touch the RT path.
+// save_pattern = full VPRJ save (same content as save_project).
+// load_pattern = apply SPRM/PTRN only from VPRJ/MDLP.
 // ============================================================================
 
-/// 現在の `PatternCommand` を `pattern_io.PatternPayload`（app 非依存の plain struct）へ写す。
+/// Map the current `PatternCommand` into `pattern_io.PatternPayload` (app-free plain struct).
 fn patternToPayload(cmd: PatternCommand) pattern_io.PatternPayload {
     return .{
         .evolve = cmd.evolve,
@@ -6431,8 +6431,8 @@ fn patternToPayload(cmd: PatternCommand) pattern_io.PatternPayload {
     };
 }
 
-/// `pattern_io.PatternPayload` を `rev` 付きで `PatternCommand` へ復元する（rev は payload に
-/// 含めず、他の pattern 編集 action と同じ「app.pattern_rev を1回 increment」で払い出す）。
+/// Restore `pattern_io.PatternPayload` into a `PatternCommand` with `rev` (rev is not in the payload;
+/// allocate it the same way as other pattern-edit actions: increment `app.pattern_rev` once).
 fn payloadToPatternCommand(rev: u32, p: pattern_io.PatternPayload) PatternCommand {
     return .{
         .rev = rev,
@@ -6460,15 +6460,15 @@ fn actionLoadPattern(ctx: *anyopaque, args: []const u8, buf: []u8) anyerror![]co
     var loaded = try project_io.load(app.io, gpa, path, Params);
     defer loaded.deinit(gpa);
     if (!loaded.apply_params_pattern) return error.UnsupportedFormat;
-    // pattern-only: seed 無しのため即時適用（quantize_bar=false）。
+    // pattern-only: no seed → apply immediately (quantize_bar=false).
     applyParamsPattern(app, loaded.params, loaded.pattern, false);
-    // NPRM が無いので SPRM 旧 transport field を graph へ one-shot 反映。
+    // No NPRM, so one-shot apply legacy SPRM transport fields into the graph.
     publishDeprecatedGraphFromParams(app.patch, app.params);
     return "ok";
 }
 
-/// `action seed <n>`: main thread で parse → lock-free publish → 次 bar 境界で RT が適用（TASK-62.5.7）。
-/// TASK-93: app.notation_seed も同期（mini-notation の `?` / 交代が seed 規約と整合する）。
+/// `action seed <n>`: parse on main → lock-free publish → RT applies at the next bar boundary.
+/// Also sync app.notation_seed (so mini-notation `?` / alternation stay consistent with the seed contract).
 fn actionSeed(ctx: *anyopaque, args: []const u8, buf: []u8) anyerror![]const u8 {
     _ = buf;
     const app = actionApp(ctx);
@@ -6493,8 +6493,8 @@ fn actionSeed(ctx: *anyopaque, args: []const u8, buf: []u8) anyerror![]const u8 
 }
 
 // ============================================================================
-// TASK-91: Song/Chain/Phrase actions（recorded = seed+recipe 決定性に整合）
-// 編集は app.song を書き換え → rev++ → song_db.publish（宣言的全置換粒度 = SongData 全体）。
+// Song/Chain/Phrase actions (recorded = consistent with seed+recipe determinism)
+// Edits rewrite app.song → rev++ → song_db.publish (declarative whole-SongData replace).
 // ============================================================================
 
 fn publishSong(app: *App, patch: *LofiPatch) void {
@@ -6502,7 +6502,7 @@ fn publishSong(app: *App, patch: *LofiPatch) void {
     patch.controls.song_db.publish(app.song);
 }
 
-/// `phrase_capture <idx>`: 現在パターンを drum pool[idx]×3 + bass pool[idx] へ取り込み。
+/// `phrase_capture <idx>`: capture the current pattern into drum pool[idx]×3 + bass pool[idx].
 fn actionPhraseCapture(ctx: *anyopaque, args: []const u8, buf: []u8) anyerror![]const u8 {
     _ = buf;
     const app = actionApp(ctx);
@@ -6531,7 +6531,7 @@ fn actionPhraseCapture(ctx: *anyopaque, args: []const u8, buf: []u8) anyerror![]
     return "ok";
 }
 
-/// `chain_set <chain_idx> <phrase_idx...>`（1..16）。
+/// `chain_set <chain_idx> <phrase_idx...>` (1..16).
 fn actionChainSet(ctx: *anyopaque, args: []const u8, buf: []u8) anyerror![]const u8 {
     _ = buf;
     const app = actionApp(ctx);
@@ -6561,7 +6561,7 @@ fn actionChainSet(ctx: *anyopaque, args: []const u8, buf: []u8) anyerror![]const
     return "ok";
 }
 
-/// `song_row <row_idx> <kick_chain> <hat_chain> <clap_chain> <bass_chain>`。
+/// `song_row <row_idx> <kick_chain> <hat_chain> <clap_chain> <bass_chain>`.
 fn actionSongRow(ctx: *anyopaque, args: []const u8, buf: []u8) anyerror![]const u8 {
     _ = buf;
     const app = actionApp(ctx);
@@ -6592,7 +6592,7 @@ fn actionSongRow(ctx: *anyopaque, args: []const u8, buf: []u8) anyerror![]const 
     return "ok";
 }
 
-/// `song_len <n>`（0..64）。
+/// `song_len <n>` (0..64).
 fn actionSongLen(ctx: *anyopaque, args: []const u8, buf: []u8) anyerror![]const u8 {
     _ = buf;
     const app = actionApp(ctx);
@@ -6612,7 +6612,7 @@ fn actionSongLen(ctx: *anyopaque, args: []const u8, buf: []u8) anyerror![]const 
     return "ok";
 }
 
-/// `song_loop <0|1>`。
+/// `song_loop <0|1>`.
 fn actionSongLoop(ctx: *anyopaque, args: []const u8, buf: []u8) anyerror![]const u8 {
     _ = buf;
     const app = actionApp(ctx);
@@ -6628,7 +6628,7 @@ fn actionSongLoop(ctx: *anyopaque, args: []const u8, buf: []u8) anyerror![]const
     return "ok";
 }
 
-/// `song_play <0|1>`。開始時は RT が position リセット（applyControls の rising edge）。
+/// `song_play <0|1>`. On start, RT resets position (applyControls rising edge).
 fn actionSongPlay(ctx: *anyopaque, args: []const u8, buf: []u8) anyerror![]const u8 {
     _ = buf;
     const app = actionApp(ctx);
@@ -6637,13 +6637,13 @@ fn actionSongPlay(ctx: *anyopaque, args: []const u8, buf: []u8) anyerror![]const
         platform.setActionErrorDetail("bad_args", "usage: song_play <0|1>");
         return error.BadArgs;
     };
-    // SongData 最新を載せてから play（編集後の unpublish 漏れ防止）
+    // Publish the latest SongData before play (avoid leaking unpublished edits)
     publishSong(app, patch);
     patch.controls.song_playing.store(@intFromBool(on), .release);
     return "ok";
 }
 
-/// `song_goto <row>`。
+/// `song_goto <row>`.
 fn actionSongGoto(ctx: *anyopaque, args: []const u8, buf: []u8) anyerror![]const u8 {
     _ = buf;
     const app = actionApp(ctx);
@@ -6700,7 +6700,7 @@ fn payloadToSong(rev: u32, p: project_io.SongPayload) SongData {
     return out;
 }
 
-/// `save_project <path>`: VPRJ 全体（graph+Ledger+pattern+Song+Params+seed+GENR）。local_only・非記録。
+/// `save_project <path>`: full VPRJ (graph+Ledger+pattern+Song+Params+seed+GENR). local_only; not recorded.
 fn actionSaveProject(ctx: *anyopaque, args: []const u8, buf: []u8) anyerror![]const u8 {
     _ = buf;
     const app = actionApp(ctx);
@@ -6710,7 +6710,7 @@ fn actionSaveProject(ctx: *anyopaque, args: []const u8, buf: []u8) anyerror![]co
     return "ok";
 }
 
-/// `load_project <path>`: VPRJ または旧 MDLP/MPRJ/PTCG を自動判定。local_only・非記録。
+/// `load_project <path>`: auto-detect VPRJ or legacy MDLP/MPRJ/PTCG. local_only; not recorded.
 fn actionLoadProject(ctx: *anyopaque, args: []const u8, buf: []u8) anyerror![]const u8 {
     const app = actionApp(ctx);
     const path = try gen_actions.parsePath(args);
@@ -6731,7 +6731,7 @@ fn actionLoadProject(ctx: *anyopaque, args: []const u8, buf: []u8) anyerror![]co
             try applyGraphReplace(app, loaded.nodes, loaded.edges, null, null, null, loaded.node_id_refs, loaded.next_node_id)
         else
             try applyGraphReplace(app, loaded.nodes, loaded.edges, ledger_ptr, genr_opt, nprm_opt, loaded.node_id_refs, loaded.next_node_id);
-        // TASK-151: apply_seed_song を quantize_bar 代理にする（同居フォーマットのみ後勝ち量子化。doc は applyParamsPattern）。
+        // Use apply_seed_song as the quantize_bar proxy (last-wins quantize only for co-resident formats. See applyParamsPattern).
         if (loaded.apply_params_pattern) applyParamsPattern(app, loaded.params, loaded.pattern, loaded.apply_seed_song);
         if (loaded.apply_seed_song) applySeedSong(app, loaded.seed, loaded.song);
         app.pushMetaEvent("load_project");
@@ -6740,19 +6740,19 @@ fn actionLoadProject(ctx: *anyopaque, args: []const u8, buf: []u8) anyerror![]co
         }) catch "ok";
     }
 
-    // 同上: apply_seed_song → quantize_bar（現行フォーマットに pattern-only+seed なしの組合せは無い）。
+    // Same: apply_seed_song → quantize_bar (current formats have no pattern-only+seed combo).
     if (loaded.apply_params_pattern) applyParamsPattern(app, loaded.params, loaded.pattern, loaded.apply_seed_song);
     if (loaded.apply_seed_song) applySeedSong(app, loaded.seed, loaded.song);
     app.pushMetaEvent("load_project");
     return std.fmt.bufPrint(buf, "format={s}", .{@tagName(loaded.format)}) catch "ok";
 }
 
-/// `action render <path> <seconds>`: offline LofiPatch で master を PCM16 WAV に書き出す（TASK-86）。
+/// `action render <path> <seconds>`: write master to a PCM16 WAV via an offline LofiPatch.
 ///
-/// ホットパス宣言: イベント時・main thread のみ。live patch の RT 経路には触らない。
-/// offline は完全別インスタンス。複製は seed + 公開済み編集状態（params + snapshot pattern）。
-/// live の bar 途中の変異位置（クロック位相・step）は複製しない（完全再現は seed+recipe）。
-/// レンダー中 main thread がブロックし UI が止まるのは MVP 割り切り。
+/// Hot-path declaration: event / main thread only. Does not touch the live patch's RT path.
+/// offline is a completely separate instance. Copy seed + published edit state (params + snapshot pattern).
+/// Does not copy live mid-bar mutation position (clock phase / step). Full reproduce needs seed+recipe.
+/// Blocking the main thread (and thus the UI) during render is an accepted MVP trade-off.
 fn actionRender(ctx: *anyopaque, args: []const u8, buf: []u8) anyerror![]const u8 {
     const app = actionApp(ctx);
     const live = app.patch;
@@ -6764,7 +6764,7 @@ fn actionRender(ctx: *anyopaque, args: []const u8, buf: []u8) anyerror![]const u
 
     const sr_u32 = app.sample_rate;
     const sr_f32: f32 = @floatFromInt(sr_u32);
-    // u64 で秒×sr を計算し RIFF u32 制約を先に検査（seconds<=600 では通常到達しない防御）。
+    // Compute seconds×sr in u64 and check the RIFF u32 limit first (defensive; normally unreachable for seconds<=600).
     const total_frames_u64: u64 = @as(u64, parsed.seconds) * @as(u64, sr_u32);
     const data_size_u64: u64 = total_frames_u64 * 2 * 2; // stereo PCM16
     if (total_frames_u64 > std.math.maxInt(u32) or 36 + data_size_u64 > std.math.maxInt(u32)) {
@@ -6782,11 +6782,11 @@ fn actionRender(ctx: *anyopaque, args: []const u8, buf: []u8) anyerror![]const u
     };
     defer offline.destroy();
 
-    // live.base_seed は digest と同じ best-effort torn read（新規同期を足さない）。
+    // live.base_seed is the same best-effort torn read as digest (do not add new synchronisation).
     offline.resetWithSeed(live.base_seed);
     publishControls(offline, app.params);
     publishDeprecatedGraphFromParams(offline, app.params);
-    // snapshot pattern を offline に載せ、rev をずらして必ず apply させる。
+    // Put the snapshot pattern onto offline and bump rev so it always applies.
     var cmd = stateToCommand(live.snapshotState());
     cmd.rev = offline.applied_rev +% 1;
     offline.controls.pattern_db.publish(cmd);
@@ -6795,7 +6795,7 @@ fn actionRender(ctx: *anyopaque, args: []const u8, buf: []u8) anyerror![]const u
         platform.setActionErrorDetail("write_failed", "cannot create output path");
         return err;
     };
-    defer file.close(app.io); // File.close は void（error union ではない）
+    defer file.close(app.io); // File.close is void (not an error union)
 
     var wbuf: [8192]u8 = undefined;
     var fwriter = file.writerStreaming(app.io, &wbuf);
@@ -6833,11 +6833,11 @@ fn actionRender(ctx: *anyopaque, args: []const u8, buf: []u8) anyerror![]const u
 }
 
 // ============================================================================
-// TASK-93: `action pattern <track> <notation>`（mini-notation → pattern_db、小節境界適用）
+// `action pattern <track> <notation>` (mini-notation → pattern_db, applied at the bar boundary)
 //
-// ホットパス宣言: parse/eval は action 実行時（main thread・イベント時）のみ。RT へは評価済み
-// PatternCommand（quantize_bar=true）を publish するだけ。RT 追加分は patch.zig の bar 境界
-// 固定長コピー（alloc/lock なし）。
+// Hot-path declaration: parse/eval runs only at action time (main thread, event). RT only receives the
+// evaluated PatternCommand (quantize_bar=true) via publish. RT-side work is the fixed-length copy at the
+// bar boundary in lofi.zig (no alloc/lock).
 // ============================================================================
 
 const PatternTrack = enum { kick, hat, clap, bass };
@@ -6859,18 +6859,18 @@ fn actionPattern(ctx: *anyopaque, args: []const u8, buf: []u8) anyerror![]const 
         platform.setActionErrorDetail("invalid_notation", "check mini-notation syntax");
         return error.InvalidNotation;
     };
-    // rng_seed = splitmix64(notation_seed ^ counter)、alt_index = counter。評価後に ++。
+    // rng_seed = splitmix64(notation_seed ^ counter), alt_index = counter. ++ after eval.
     const alt_index = app.notation_counter;
     const rng_seed = seedmod.splitmix64(app.notation_seed ^ @as(u64, alt_index));
     app.notation_counter +%= 1;
     const result = gen_actions.evalNotation(ast, rng_seed, alt_index);
 
-    // P1-3: bar 待ち中（または publish 済みで RT 未 acquire）は last_quantized_cmd を base にし、
-    // 連続 pattern で先行 track を潰さない。
+    // While waiting on a bar (or published but RT has not acquired): base on last_quantized_cmd so
+    // consecutive pattern actions do not wipe an earlier track.
     const st = patch.snapshotState();
     var cmd = patternEditBase(app);
     if (app.last_quantized_cmd) |lq| {
-        // 我々の最新 quantize がまだ bar 反映前: bar_pending、または applied_rev 未到達
+        // Our latest quantize is not yet bar-applied: bar_pending, or applied_rev not reached
         if (lq.rev == app.pattern_rev and (st.bar_pending or st.pattern_rev != lq.rev)) {
             cmd = lq;
         }
@@ -6880,7 +6880,7 @@ fn actionPattern(ctx: *anyopaque, args: []const u8, buf: []u8) anyerror![]const 
         .hat => cmd.hat.on = result.on,
         .clap => cmd.clap.on = result.on,
         .bass => {
-            // 宣言的全置換: on は全置換、deg は deg_set の step のみ上書き（accent/slide は維持）
+            // Declarative full replace: on is fully replaced; deg overwrites only deg_set steps (accent/slide kept)
             cmd.bass.on = result.on;
             var s: u8 = 0;
             while (s < 16) : (s += 1) {
@@ -6891,7 +6891,7 @@ fn actionPattern(ctx: *anyopaque, args: []const u8, buf: []u8) anyerror![]const 
             }
         },
     }
-    // lock されていても明示編集は通す（GUI toggle_step と同挙動）
+    // Explicit edits go through even when locked (same behaviour as GUI toggle_step)
     cmd.quantize_bar = true;
     const published = publishPatternCommand(app, cmd);
     app.last_quantized_cmd = published;
@@ -6899,8 +6899,8 @@ fn actionPattern(ctx: *anyopaque, args: []const u8, buf: []u8) anyerror![]const 
     return "ok";
 }
 
-/// CommandLog の kind=normal を seq 順で Entry 化（TASK-62.5.8）。name/args は log 借用。
-/// 除外判定は `isRecipeEligibleCommandName`（履歴 badge と共有）。
+/// Turn CommandLog kind=normal into Entry in seq order. name/args are borrowed from the log.
+/// Exclusion uses `isRecipeEligibleCommandName` (shared with history badges).
 fn recipeEntriesFromLog(log: *const platform.command.CommandLog, gpa: std.mem.Allocator) ![]recipe.Entry {
     var views_buf: [platform.command.MAX_CMD_LOG]recipe.RecordView = undefined;
     var n: usize = 0;
@@ -6919,7 +6919,7 @@ fn recipeEntriesFromLog(log: *const platform.command.CommandLog, gpa: std.mem.Al
     return recipe.collectNormalEntries(gpa, views_buf[0..n]);
 }
 
-/// `recipe_save <path>`: CommandLog → recipe（app_name=APP_NAME）。記録しない。
+/// `recipe_save <path>`: CommandLog → recipe (app_name=APP_NAME). Not recorded.
 fn actionRecipeSave(ctx: *anyopaque, args: []const u8, buf: []u8) anyerror![]const u8 {
     _ = buf;
     const app = actionApp(ctx);
@@ -6932,8 +6932,8 @@ fn actionRecipeSave(ctx: *anyopaque, args: []const u8, buf: []u8) anyerror![]con
     return "ok";
 }
 
-/// `recipe_replay <path>`: load → app_name 検証 → routeLocalAction 逐次適用。入れ子拒否。
-/// TASK-93: notation_counter を 0 から再評価（seed+pattern 列の決定性）。
+/// `recipe_replay <path>`: load → verify app_name → apply routeLocalAction in order. Reject nesting.
+/// Re-evaluate from notation_counter = 0 (determinism of the seed+pattern sequence).
 fn actionRecipeReplay(ctx: *anyopaque, args: []const u8, buf: []u8) anyerror![]const u8 {
     const app = actionApp(ctx);
     const gpa = std.heap.c_allocator;
@@ -6941,7 +6941,7 @@ fn actionRecipeReplay(ctx: *anyopaque, args: []const u8, buf: []u8) anyerror![]c
         platform.setActionErrorDetail("nested_replay", "wait for current recipe_replay to finish");
         return error.NestedReplay;
     };
-    // mini-notation の `?` / `<a b>` を recipe 先頭から決定的に再評価する。
+    // Re-evaluate mini-notation `?` / `<a b>` deterministically from the start of the recipe.
     app.notation_counter = 0;
     const path = try gen_actions.parsePath(args);
     var loaded = recipe.load(app.io, gpa, path) catch |err| {
@@ -6975,10 +6975,10 @@ fn actionRecipeReplay(ctx: *anyopaque, args: []const u8, buf: []u8) anyerror![]c
 }
 
 // ============================================================================
-// command model 統合（TASK-62.5.7: 記録のみ。pixie 62.5.3 の最小版）
+// command-model integration (record only; minimal form)
 //
-// App が CommandLog + Executor を所有し、registerAction 経由の harness/copilot action を
-// executeAction(actor=.local_user) で dispatch + 記録する（TASK-106.4: GUI と harness/MCP を同一 undo 対象に統一）。
+// App owns CommandLog + Executor and dispatches harness/copilot actions from registerAction via
+// executeAction(actor=.local_user) with recording (GUI and harness/MCP share one undo target).
 // ============================================================================
 
 const ActionEntry = struct {
@@ -6996,7 +6996,7 @@ const MODULAR_ACTIONS = [_]ActionEntry{
     .{ .name = "seed", .run = actionSeed },
     .{ .name = "pattern", .run = actionPattern },
     .{ .name = "pattern_state", .run = actionPatternState },
-    // TASK-91: Song/Chain/Phrase（recorded）
+    // Song/Chain/Phrase (recorded)
     .{ .name = "phrase_capture", .run = actionPhraseCapture },
     .{ .name = "chain_set", .run = actionChainSet },
     .{ .name = "song_row", .run = actionSongRow },
@@ -7004,7 +7004,7 @@ const MODULAR_ACTIONS = [_]ActionEntry{
     .{ .name = "song_loop", .run = actionSongLoop },
     .{ .name = "song_play", .run = actionSongPlay },
     .{ .name = "song_goto", .run = actionSongGoto },
-    // TASK-106.2: graph relay（executor / COMMIT 経路）
+    // graph relay (executor / COMMIT path)
     .{ .name = "add_node", .run = actionAddNode },
     .{ .name = "remove_node", .run = actionRemoveNode },
     .{ .name = "connect", .run = actionConnect },
@@ -7034,9 +7034,9 @@ fn recordedAction(comptime name: []const u8) *const fn (*anyopaque, []const u8, 
     }.run;
 }
 
-/// 全 action を一括登録する（`platform.init()` 後・main loop 前に呼ぶ。harness 無効時は
-/// `registerAction` 自体が no-op なので通常実行に影響しない）。記録 wrapper 経由。
-/// network_policy は `gen_actions.PATCH_NETWORK_POLICIES` が単一ソース（TASK-106.1）。
+/// Register every action in bulk (call after `platform.init()`, before the main loop. When harness is off,
+/// `registerAction` itself is a no-op so normal runs are unaffected). Via the recording wrapper.
+/// network_policy's single source is `gen_actions.PATCH_NETWORK_POLICIES`.
 fn registerActions(app: *App) void {
     platform.registerAction(.{ .name = "undo", .ctx = app, .run = actionUndo, .network_policy = .undo_own, .desc = "undo last local undoable action" });
     platform.registerAction(.{ .name = "redo", .ctx = app, .run = actionRedo, .network_policy = .redo_own, .desc = "redo last local revert" });
@@ -7067,9 +7067,9 @@ fn registerActions(app: *App) void {
         .desc = "load SPRM/PTRN from VPRJ (or legacy MDLP); reject while synced",
     });
     platform.registerAction(.{ .name = "seed", .ctx = app, .run = recordedAction("seed"), .network_policy = patchPolicy("seed") });
-    // TASK-93: mini-notation。レシピには記法の生テキストを記録（replay 時 counter 順で再評価→決定的）。
+    // mini-notation. Recipes record the raw notation text (replay re-evaluates in counter order → deterministic).
     platform.registerAction(.{ .name = "pattern", .ctx = app, .run = recordedAction("pattern"), .network_policy = patchPolicy("pattern") });
-    // TASK-106.1: host 内部 snapshot。非 relay → client PROPOSE は汎用 not relayable。
+    // Host-internal snapshot. Not relay → client PROPOSE gets the generic not-relayable.
     platform.registerAction(.{
         .name = "pattern_state",
         .ctx = app,
@@ -7077,7 +7077,7 @@ fn registerActions(app: *App) void {
         .network_policy = patchPolicy("pattern_state"),
         .desc = "host-internal pattern snapshot (not for client propose)",
     });
-    // TASK-91: Song/Chain/Phrase（recorded。seed+recipe 決定性に整合）
+    // Song/Chain/Phrase (recorded; consistent with seed+recipe determinism)
     platform.registerAction(.{ .name = "phrase_capture", .ctx = app, .run = recordedAction("phrase_capture"), .network_policy = patchPolicy("phrase_capture") });
     platform.registerAction(.{ .name = "chain_set", .ctx = app, .run = recordedAction("chain_set"), .network_policy = patchPolicy("chain_set") });
     platform.registerAction(.{ .name = "song_row", .ctx = app, .run = recordedAction("song_row"), .network_policy = patchPolicy("song_row") });
@@ -7085,12 +7085,12 @@ fn registerActions(app: *App) void {
     platform.registerAction(.{ .name = "song_loop", .ctx = app, .run = recordedAction("song_loop"), .network_policy = patchPolicy("song_loop") });
     platform.registerAction(.{ .name = "song_play", .ctx = app, .run = recordedAction("song_play"), .network_policy = patchPolicy("song_play") });
     platform.registerAction(.{ .name = "song_goto", .ctx = app, .run = recordedAction("song_goto"), .network_policy = patchPolicy("song_goto") });
-    // recipe（TASK-62.5.8）: メタ操作のため executor 非経由・CommandLog 非記録。
+    // recipe: meta-op, so not via executor; not recorded in CommandLog.
     platform.registerAction(.{ .name = "recipe_save", .ctx = app, .run = actionRecipeSave, .network_policy = patchPolicy("recipe_save") });
     platform.registerAction(.{ .name = "recipe_replay", .ctx = app, .run = actionRecipeReplay, .network_policy = patchPolicy("recipe_replay") });
-    // render: session 中は reject（offline 複製が host 変異ストリームを再現できない）。solo は可。
+    // render: reject during a session (offline copy cannot reproduce the host mutation stream). solo is OK.
     platform.registerAction(.{ .name = "render", .ctx = app, .run = actionRender, .network_policy = patchPolicy("render") });
-    // TASK-105.4: 統合プロジェクト直列化（VPRJ）。非記録。
+    // Integrated project serialisation (VPRJ). Not recorded.
     platform.registerAction(.{
         .name = "save_project",
         .ctx = app,
@@ -7107,4 +7107,4 @@ fn registerActions(app: *App) void {
     });
 }
 
-// (TASK-105.4: pattern/graph の二重 registerStateSync は廃止。integrated のみ)
+// (Dual registerStateSync for pattern/graph is retired. integrated only)
