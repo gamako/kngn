@@ -227,7 +227,7 @@ const LAYER_ROW_PART_IME: gui.Id = 5;
 const HISTORY_PANEL_ID_BASE: gui.Id = 0xA431_0000;
 /// Explicit IDs for tool / symmetry icons. Offsets 0..13 are a fixed assignment.
 const TOOL_ICON_ID_BASE: gui.Id = 0xA148_2000;
-// Layer-panel thumbnail (nearest-neighbor downscale of the raw layer onto a checker, then 1:1 blit)
+// Layer-panel thumbnail (alpha-weighted downscale of the raw layer onto a checker, then 1:1 blit)
 const LAYER_THUMB_W: i32 = 24;
 const LAYER_THUMB_H: i32 = 24;
 const LAYER_THUMB_CELL: usize = 4; // Checker cell size in px inside the thumbnail
@@ -5488,9 +5488,9 @@ const LAYER_NAME_DISPLAY_MAX: usize = 7;
 /// Allocations use `ctx.allocator()` (frame arena); when it fits, return name with no
 /// allocation.
 ///
-/// Called every frame (part of immediate-mode GUI build), but the work is at most "layer count × a few dozen chars" —
-/// not a full-pixel loop (same class of small per-frame UI cost as the existing `fillLayerThumb`
-/// that buildLayerPanel already calls every frame. The performance-rules SIMD checklist does not apply).
+/// Called every frame (part of immediate-mode GUI build), but the work here is at most
+/// "layer count × a few dozen chars" — not a full-pixel loop, so the performance-rules SIMD
+/// checklist does not apply to this function (`fillLayerThumb` scans the source canvas and is separate).
 fn truncateForDisplay(alloc: std.mem.Allocator, name: []const u8, max_total_chars: usize) []const u8 {
     const view = std.unicode.Utf8View.init(name) catch return name; // Return invalid UTF-8 as-is (defensive)
     var total: usize = 0;
