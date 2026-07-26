@@ -4,8 +4,8 @@
 //! but driving it with harness `inject gamepad_connect/disconnect/button/axis` shows connection, point motion and
 //! colour changes (headless replay can self-check; see AGENT.md "headless verification harness").
 //!
-//! The originally intended number was `examples/20_gamepad`, but `20_capture_demo` already existed, so
-//! this lives at `examples/22_gamepad` (`run-example_22`).
+//! The demo lives in `examples/22_gamepad`; run it from the repository root with
+//! `zig build run-example_22`.
 //!
 //! Checks:
 //! - Connection indicators for `platform.MAX_GAMEPADS` pads (top-left squares; connected=green / disconnected=dark grey)
@@ -15,7 +15,7 @@
 //! Hot path declaration: `Window.getGamepadState` is called `MAX_GAMEPADS` times per frame (4 times for pad0..3).
 //! pad0's state is fetched once and reused for move / button / indicator (do not read pad0 twice).
 //! Fixed-length copies of a few fields × 4 pads (no alloc/lock); neither an all-pixel loop nor RT, so outside the
-//! performance rules (SIMD three-point set etc.; see docs/adr/009).
+//! performance rules (SIMD three-point set etc.; see docs/adr/009_gamepad-input.md).
 
 const std = @import("std");
 const platform = @import("platform");
