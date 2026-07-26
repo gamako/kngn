@@ -1,14 +1,14 @@
-//! 単一行テキストのレイアウト、hit-test、選択状態（TASK-132 契約明文化）。
+//! Single-line text layout, hit-test, and selection state.
 //!
-//! 本タスク時点の観測: default font では codepoint 単位の logical advance（通常 8px）で
-//! measure / TextLayout / caret / selection / hit-test を行う。grapheme cluster・複数行・
-//! glyph fallback は未実装。改行は TextBuffer 編集経路では挿入拒否、label 表示では
-//! 1 codepoint 分の advance を持つが行送りはしない。
+//! Under the default font, per-codepoint logical advance (usually 8px) drives
+//! measure / TextLayout / caret / selection / hit-test. Grapheme clusters, multi-line layout, and
+//! glyph fallback are not implemented. Newlines are rejected on the TextBuffer edit path; label display
+//! still advances one codepoint but does not wrap to the next line.
 //!
-//! ホットパス宣言:
-//! - hitTest と layout 構築の codepoint 走査は widget 呼び出し時の O(codepoint)。
-//! - SelectionState の更新と単語選択はイベント時のみ。
-//! - このファイルは画素を直接描画せず、widgets.zig が rect/text DrawCmd を発行する。
+//! Hot-path note:
+//! - hitTest and layout-build codepoint walks are O(codepoint) at widget-call time.
+//! - SelectionState updates and word selection run on events only.
+//! - This file does not paint pixels; widgets.zig emits the rect/text DrawCmds.
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
@@ -24,7 +24,7 @@ pub const CopyKind = enum { copy, cut };
 pub const CopyRequest = struct {
     id: Id,
     text: []const u8,
-    /// 既定は `.copy`（既存呼び出しの後方互換）。
+    /// Default is `.copy` (backward compatible with existing call sites).
     kind: CopyKind = .copy,
 };
 
@@ -33,10 +33,10 @@ pub const TextRange = struct {
     end: usize,
 };
 
-/// codepoint 境界と累積 logical width の対応表。
-/// `byte_offsets[i]` / `prefix_widths[i]` は codepoint index `i` の先頭。
-/// `count()` = codepoint 数。caret / selection / hitTest の index は byte offset ではなく
-/// この codepoint index を使う（UTF-8 継続 byte 内には入らない）。
+/// Mapping between codepoint boundaries and cumulative logical width.
+/// `byte_offsets[i]` / `prefix_widths[i]` are the start of codepoint index `i`.
+/// `count()` = codepoint count. caret / selection / hitTest indices are codepoint indices, not byte offsets
+/// (they never land inside a UTF-8 continuation byte).
 pub const TextLayout = struct {
     byte_offsets: []const usize,
     prefix_widths: []const u32,
@@ -48,9 +48,9 @@ pub const TextLayout = struct {
     }
 };
 
-/// UTF-8 text の codepoint 境界と各 codepoint の logical advance（Font.measure）を構築する。
-/// valid UTF-8 は codepoint 単位、不正 UTF-8 は不正位置の 1 byte 単位で進む（Font 契約と一致）。
-/// default font では各 advance は通常 8px。戻り値の配列は allocator 上に確保される。
+/// Build codepoint boundaries of a UTF-8 text and each codepoint's logical advance (Font.measure).
+/// Valid UTF-8 advances per codepoint; invalid UTF-8 advances one byte at the bad position (matches the Font contract).
+/// With the default font each advance is usually 8px. Returned arrays are allocator-owned.
 pub fn buildTextLayout(a: Allocator, font: Font, text: []const u8) !TextLayout {
     var count: usize = 0;
     var pos: usize = 0;
@@ -85,9 +85,9 @@ pub fn buildTextLayout(a: Allocator, font: Font, text: []const u8) !TextLayout {
     };
 }
 
-/// local_x（widget 左上原点）から codepoint index を返す。
-/// 各 codepoint の logical advance（prefix_widths の差分）の中点を境界とする。
-/// 戻り値は byte offset ではなく codepoint index（0..count）。範囲外は [0, count] に clamp。
+/// Return a codepoint index from local_x (origin at the widget top-left).
+/// Boundaries are midpoints of each codepoint's logical advance (prefix_widths deltas).
+/// Return value is a codepoint index (0..count), not a byte offset. Out of range clamps to [0, count].
 pub fn hitTest(layout: TextLayout, local_x: i32) usize {
     const count = layout.count();
     if (count == 0 or local_x <= 0) return 0;
@@ -101,8 +101,8 @@ pub fn hitTest(layout: TextLayout, local_x: i32) usize {
     return count;
 }
 
-/// codepoint index から元テキストの UTF-8 byte offset へ変換する。
-/// selection の byte slice 抽出（copy 等）に使う。index は codepoint 単位。
+/// Convert a codepoint index to a UTF-8 byte offset in the source text.
+/// Used to extract selection byte slices (copy etc.). index is in codepoints.
 pub fn byteIndex(text: []const u8, index: usize) usize {
     var pos: usize = 0;
     var i: usize = 0;
@@ -112,9 +112,9 @@ pub fn byteIndex(text: []const u8, index: usize) usize {
     return pos;
 }
 
-/// ダブルクリック用の単語範囲（codepoint index）。
-/// ASCII 英数字/_ の連続、または ASCII 区切りに挟まれた非 ASCII（CJK/emoji 等）の連続列を
-/// 1 word とする。grapheme cluster / 言語別分割規則は実装しない。
+/// Word range for double-click (codepoint indices).
+/// A run of ASCII alphanumerics/_ , or a run of non-ASCII (CJK/emoji etc.) bounded by ASCII separators,
+/// counts as one word. No grapheme-cluster or language-specific segmentation.
 pub fn wordRange(layout: TextLayout, index: usize) TextRange {
     const count = layout.count();
     if (count == 0 or index >= count) return .{ .start = index, .end = index };
@@ -167,7 +167,7 @@ pub const SelectionState = struct {
             .{ .start = self.extent, .end = self.anchor };
     }
 
-    /// 選択範囲を保った caret 移動。非 Shift 移動では既存選択を先に collapse する。
+    /// Caret move that preserves the selection. Non-Shift moves collapse any existing selection first.
     pub fn moveCaret(self: *SelectionState, count: usize, key: MoveKey, shift: bool) void {
         const range = self.normalized();
         const target = switch (key) {
@@ -185,8 +185,8 @@ pub const SelectionState = struct {
         self.setExtent(target, shift);
     }
 
-    /// wordRange と同じ分類で単語境界へ移動する（イベント時のみ）。
-    /// 区切り（ASCII 非 word）は連続して越え、非 Shift では既存選択を collapse する。
+    /// Move to word boundaries with the same classification as wordRange (events only).
+    /// ASCII non-word separators are crossed as a run; non-Shift collapses any existing selection.
     pub fn moveWord(self: *SelectionState, layout: TextLayout, direction: WordDirection, shift: bool) void {
         const range = self.normalized();
         const target = blk: {
@@ -215,25 +215,25 @@ pub const SelectionState = struct {
 pub const MoveKey = enum { left, right, home, end };
 pub const WordDirection = enum { left, right };
 
-/// Option+← 相当: 直前の単語先頭（区切り列はまとめて越える）。
+/// Option+Left equivalent: start of the previous word (cross separator runs together).
 fn wordBoundaryLeft(layout: TextLayout, index: usize) usize {
     if (index == 0) return 0;
     var i = index - 1;
-    // 区切り上にいるなら区切り列を左へ越える。
+    // If on a separator, cross the separator run leftward.
     while (i > 0 and isWordSeparator(codepointAt(layout, i))) : (i -= 1) {}
-    // 単語文字の連続の先頭まで戻る。
+    // Step back to the start of the current word-character run.
     while (i > 0 and isWordChar(codepointAt(layout, i - 1))) : (i -= 1) {}
     return i;
 }
 
-/// Option+→ 相当: 次の単語末尾（途中なら現在語の末尾。区切り列はまとめて越える）。
+/// Option+Right equivalent: end of the next word (or end of the current word if mid-word; cross separator runs together).
 fn wordBoundaryRight(layout: TextLayout, index: usize) usize {
     const count = layout.count();
     if (index >= count) return count;
     var i = index;
-    // 区切り上にいるなら先に区切りを越えて次語へ。
+    // If on a separator, cross separators first to reach the next word.
     while (i < count and isWordSeparator(codepointAt(layout, i))) : (i += 1) {}
-    // 単語文字の連続の末尾まで進む。
+    // Advance to the end of the word-character run.
     while (i < count and isWordChar(codepointAt(layout, i))) : (i += 1) {}
     return i;
 }
@@ -246,10 +246,10 @@ fn isWordSeparator(cp: u32) bool {
     return !isWordChar(cp);
 }
 
-/// caller が所有する単一行 UTF-8 buffer。caret/selection は codepoint index、
-/// 実体の ArrayList は UTF-8 byte 列を保持する。
-/// 単一行契約: typed char / paste / selection replacement は ASCII 制御文字（0x00-0x1F, 0x7F）
-/// と改行を挿入しない（isInsertableCodepoint / replaceSelectionWithTextLimited 参照）。
+/// Caller-owned single-line UTF-8 buffer. caret/selection are codepoint indices;
+/// the underlying ArrayList holds the UTF-8 byte sequence.
+/// Single-line contract: typed char / paste / selection replacement never insert ASCII controls (0x00-0x1F, 0x7F)
+/// or newlines (see isInsertableCodepoint / replaceSelectionWithTextLimited).
 pub const TextBuffer = struct {
     bytes: std.ArrayList(u8),
     alloc: Allocator,
@@ -269,7 +269,7 @@ pub const TextBuffer = struct {
         return self.bytes.items;
     }
 
-    /// codepoint を index の位置へ挿入し、新しい caret index を返す。
+    /// Insert a codepoint at index and return the new caret index.
     pub fn insertCodepoint(self: *TextBuffer, index: usize, cp: u32) !usize {
         if (cp > 0x10FFFF or (cp >= 0xD800 and cp <= 0xDFFF)) return error.InvalidCodepoint;
         var encoded: [4]u8 = undefined;
@@ -321,18 +321,18 @@ pub const TextBuffer = struct {
         self.deleteRange(.{ .start = selection.extent, .end = selection.extent + 1 });
     }
 
-    /// 選択範囲を UTF-8 text で置換し、caret/selection を置換後末尾へ collapse する。
-    /// 単一行契約: ASCII 制御文字（0x00-0x1F, 0x7F）と改行は除外。不正 UTF-8 はスキップ。
-    /// 戻り値は buffer が変わったか。無制限（max_len=null）版。
+    /// Replace the selection with UTF-8 text and collapse caret/selection to the end of the replacement.
+    /// Single-line contract: ASCII controls (0x00-0x1F, 0x7F) and newlines are excluded. Invalid UTF-8 is skipped.
+    /// Return value is whether the buffer changed. Unlimited (max_len=null) variant.
     pub fn replaceSelectionWithText(self: *TextBuffer, selection: *SelectionState, text: []const u8) !bool {
         return replaceSelectionWithTextLimited(self, selection, text, null);
     }
 
-    /// `max_len` 付き selection replacement。
-    /// - `null`: 無制限（既存 `replaceSelectionWithText` と同等）
-    /// - `0`: 挿入をすべて拒否（buffer/selection 不変）
-    /// - `n`: 選択解除後の基底文字数を差し引いた残り容量まで codepoint を挿入し、超過分は末尾から捨てる
-    /// 既存 buffer が既に max_len 超の場合も自動切り詰めはしない（編集結果にのみ適用）。
+    /// Selection replacement with `max_len`.
+    /// - `null`: unlimited (same as existing `replaceSelectionWithText`)
+    /// - `0`: reject all insertion (buffer/selection unchanged)
+    /// - `n`: insert codepoints up to remaining capacity after clearing the selection; excess is dropped from the end
+    /// An existing buffer already over max_len is not auto-truncated (the limit applies only to edit results).
     pub fn replaceSelectionWithTextLimited(
         self: *TextBuffer,
         selection: *SelectionState,
@@ -348,7 +348,7 @@ pub const TextBuffer = struct {
         else
             null;
 
-        // 残り 0 なら挿入不能 → buffer/selection を触らない（初期超過分の自動切り詰めもしない）
+        // Remaining 0 → cannot insert; leave buffer/selection untouched (also no auto-truncate of a prior overshoot)
         if (remaining) |r| {
             if (r == 0) return false;
         }
@@ -387,8 +387,8 @@ pub const TextBuffer = struct {
         return changed;
     }
 
-    /// 選択範囲を 1 codepoint で置換（typed char / IME commit 経路）。
-    /// `max_len` 到達時は buffer・caret・selection を変更せず false を返す。
+    /// Replace the selection with one codepoint (typed char / IME commit path).
+    /// When `max_len` is already reached, leave buffer/caret/selection unchanged and return false.
     pub fn replaceSelectionWithCodepoint(
         self: *TextBuffer,
         selection: *SelectionState,
@@ -415,20 +415,20 @@ pub const TextBuffer = struct {
     }
 
     // ----------------------------------------------------------
-    // UTF-16 document adapter（TASK-79.6.3。IME reconversion）
+    // UTF-16 document adapter (IME reconversion)
     // ----------------------------------------------------------
 
-    /// document 全体の UTF-16 code unit 数。
+    /// UTF-16 code-unit count of the whole document.
     pub fn utf16Length(self: *const TextBuffer) u64 {
         return utf16LengthOf(self.slice());
     }
 
-    /// codepoint index → UTF-16 code unit offset。
+    /// codepoint index → UTF-16 code-unit offset.
     pub fn codepointIndexToUtf16(self: *const TextBuffer, index: usize) u64 {
         return codepointIndexToUtf16Offset(self.slice(), index);
     }
 
-    /// 現在の selection を UTF-16 range で返す。
+    /// Current selection as a UTF-16 range.
     pub fn selectedRangeUtf16(self: *const TextBuffer, selection: SelectionState) Utf16Range {
         const range = selection.normalized();
         const start = codepointIndexToUtf16Offset(self.slice(), range.start);
@@ -436,10 +436,10 @@ pub const TextBuffer = struct {
         return .{ .location = start, .length = end - start };
     }
 
-    /// proposed UTF-16 range を document へ clamp し、scalar 境界の actual range と UTF-8 slice を返す。
-    /// - `location == doc`（末尾 caret）は空 slice + actual `{location=doc,length=0}`（再変換の主経路）。
-    /// - `location == doc, length > 0` も末尾へ clamp した空 range（Apple intersection と同型）。
-    /// - `location > doc` は完全範囲外として null。空 document の (0,0) は空 slice。
+    /// Clamp a proposed UTF-16 range to the document and return the scalar-aligned actual range plus UTF-8 slice.
+    /// - `location == doc` (end caret) → empty slice + actual `{location=doc,length=0}` (primary reconversion path).
+    /// - `location == doc, length > 0` also clamps to an empty range at the end (same shape as Apple intersection).
+    /// - `location > doc` → null (fully out of range). Empty document (0,0) → empty slice.
     pub fn substringForUtf16Range(self: *const TextBuffer, proposed: Utf16Range) ?Utf16Substring {
         const text = self.slice();
         const actual = clampUtf16RangeToScalars(text, proposed) orelse return null;
@@ -453,8 +453,8 @@ pub const TextBuffer = struct {
         };
     }
 
-    /// UTF-16 replacement range で置換。範囲外・scalar 途中・不正 UTF-8 は拒否して buffer 不変。
-    /// 成功時 selection は置換後末尾へ collapse（`replaceSelectionWithTextLimited` と同契約）。
+    /// Replace via a UTF-16 replacement range. Out of range, mid-scalar, or invalid UTF-8 is rejected with buffer unchanged.
+    /// On success, selection collapses to the end of the replacement (same contract as `replaceSelectionWithTextLimited`).
     pub fn replaceUtf16RangeLimited(
         self: *TextBuffer,
         selection: *SelectionState,
@@ -469,7 +469,7 @@ pub const TextBuffer = struct {
         return replaceSelectionWithTextLimited(self, selection, text, max_len);
     }
 
-    /// document access / TextInput 共通: 置換後に caret を selection.extent へ collapse。
+    /// Shared by document access / TextInput: after replacement, collapse caret to selection.extent.
     pub fn replaceUtf16RangeAndCollapseCaret(
         self: *TextBuffer,
         selection: *SelectionState,
@@ -484,7 +484,7 @@ pub const TextBuffer = struct {
     }
 };
 
-/// UTF-16 code unit range（NSRange / PlatformTextInputRange と同型の意味）。
+/// UTF-16 code-unit range (same meaning as NSRange / PlatformTextInputRange).
 pub const Utf16Range = struct {
     location: u64,
     length: u64,
@@ -530,7 +530,7 @@ fn codepointIndexToUtf16Offset(text: []const u8, index: usize) u64 {
     return utf16;
 }
 
-/// UTF-16 offset → codepoint index。mid-surrogate または範囲外は null。
+/// UTF-16 offset → codepoint index. Mid-surrogate or out of range → null.
 fn utf16OffsetToCodepointIndex(text: []const u8, offset: u64) ?usize {
     var pos: usize = 0;
     var cp_i: usize = 0;
@@ -548,16 +548,16 @@ fn utf16OffsetToCodepointIndex(text: []const u8, offset: u64) ?usize {
     return null;
 }
 
-/// offset が mid-surrogate なら pair 先頭へ下げる。範囲外は doc 末尾。
+/// If offset is mid-surrogate, step down to the pair start. Out of range → end of doc.
 fn alignUtf16OffsetDown(text: []const u8, offset: u64) u64 {
     const doc = utf16LengthOf(text);
     if (offset >= doc) return doc;
     if (utf16OffsetToCodepointIndex(text, offset) != null) return offset;
-    // mid-surrogate → 1 下げて pair 先頭
+    // mid-surrogate → step down 1 to the pair start
     return offset -| 1;
 }
 
-/// offset が mid-surrogate なら pair 末尾へ上げる。
+/// If offset is mid-surrogate, step up to the pair end.
 fn alignUtf16OffsetUp(text: []const u8, offset: u64) u64 {
     const doc = utf16LengthOf(text);
     if (offset >= doc) return doc;
@@ -565,9 +565,9 @@ fn alignUtf16OffsetUp(text: []const u8, offset: u64) u64 {
     return @min(offset + 1, doc);
 }
 
-/// substring 用: document へ clamp + scalar 境界へ調整。
-/// `location > doc` のみ完全範囲外（null）。`location == doc` は末尾の空 range として受理
-/// （`validateUtf16RangeForReplace` の `>` 判定と整合。再変換時の末尾 caret クエリ用）。
+/// For substring: clamp to the document and align to scalar boundaries.
+/// Only `location > doc` is fully out of range (null). `location == doc` is accepted as an empty end range
+/// (consistent with the `>` check in `validateUtf16RangeForReplace`; for end-caret queries during reconversion).
 fn clampUtf16RangeToScalars(text: []const u8, proposed: Utf16Range) ?Utf16Range {
     const doc = utf16LengthOf(text);
     if (doc == 0) {
@@ -584,7 +584,7 @@ fn clampUtf16RangeToScalars(text: []const u8, proposed: Utf16Range) ?Utf16Range 
     return .{ .location = start, .length = end - start };
 }
 
-/// replacement 用: 範囲外・mid-scalar は拒否。
+/// For replacement: reject out of range and mid-scalar.
 fn validateUtf16RangeForReplace(text: []const u8, range: Utf16Range) ?TextRange {
     const doc = utf16LengthOf(text);
     const end_off = range.location +| range.length;
@@ -633,7 +633,7 @@ fn isAsciiWord(cp: u32) bool {
 
 const testing = std.testing;
 
-test "TextLayout: ASCII / 可変幅 / 日本語混在の prefix と byte 境界" {
+test "TextLayout: ASCII / variable-width / mixed-Japanese prefix and byte boundaries" {
     const TestFont = struct {
         const value: Font = .{ .ptr = undefined, .vtable = &.{
             .measure = measure,
@@ -662,7 +662,7 @@ test "TextLayout: ASCII / 可変幅 / 日本語混在の prefix と byte 境界"
     try testing.expectEqual(@as(usize, 5), byteIndex(text, 3));
 }
 
-test "TextLayout: 不正 UTF-8 は byte 単位で境界を保つ" {
+test "TextLayout: invalid UTF-8 keeps boundaries per byte" {
     const layout = try buildTextLayout(testing.allocator, font_mod.default_font, &.{ 0xFF, 'a', 0xC3, 0x28 });
     defer testing.allocator.free(layout.byte_offsets);
     defer testing.allocator.free(layout.prefix_widths);
@@ -671,7 +671,7 @@ test "TextLayout: 不正 UTF-8 は byte 単位で境界を保つ" {
     try testing.expectEqual(@as(usize, 4), byteIndex(layout.text, 4));
 }
 
-test "SelectionState: 左右ドラッグ、Shift+click、空選択" {
+test "SelectionState: left/right drag, Shift+click, and empty selection" {
     var selection: SelectionState = .{};
     selection.beginDrag(4, false);
     selection.updateDrag(1);
@@ -682,7 +682,7 @@ test "SelectionState: 左右ドラッグ、Shift+click、空選択" {
     try testing.expectEqual(TextRange{ .start = 2, .end = 2 }, selection.normalized());
 }
 
-test "wordRange: ASCII word / 空白・句読点 / 日本語連続列" {
+test "wordRange: ASCII word / whitespace-punctuation / CJK runs" {
     const text = "hello, 日本語 world";
     const layout = try buildTextLayout(testing.allocator, font_mod.default_font, text);
     defer testing.allocator.free(layout.byte_offsets);
@@ -694,7 +694,7 @@ test "wordRange: ASCII word / 空白・句読点 / 日本語連続列" {
     try testing.expectEqual(TextRange{ .start = 11, .end = 16 }, wordRange(layout, 11));
 }
 
-test "TextBuffer: ASCII / 日本語 insert と前後削除" {
+test "TextBuffer: ASCII / Japanese insert and forward/back delete" {
     var buffer = try TextBuffer.init(testing.allocator, "Ab");
     defer buffer.deinit();
 
@@ -711,7 +711,7 @@ test "TextBuffer: ASCII / 日本語 insert と前後削除" {
     try testing.expectEqualStrings("A", buffer.slice());
 }
 
-test "TextBuffer: selection replacement と容量拡張" {
+test "TextBuffer: selection replacement and capacity growth" {
     var buffer = try TextBuffer.init(testing.allocator, "0123456789");
     defer buffer.deinit();
 
@@ -727,7 +727,7 @@ test "TextBuffer: selection replacement と容量拡張" {
     try testing.expectEqual(@as(usize, 3), selection.extent);
 }
 
-test "SelectionState: Left/Right/Home/End と Shift selection" {
+test "SelectionState: Left/Right/Home/End and Shift selection" {
     var selection: SelectionState = .{ .anchor = 2, .extent = 2 };
     selection.moveCaret(5, .left, false);
     try testing.expectEqual(TextRange{ .start = 1, .end = 1 }, selection.normalized());
@@ -741,8 +741,8 @@ test "SelectionState: Left/Right/Home/End と Shift selection" {
     try testing.expectEqual(TextRange{ .start = 0, .end = 0 }, selection.normalized());
 }
 
-test "TASK-119: SelectionState の word movement と Shift extension" {
-    // "hi, 日本語 ok" = h i , sp 日 本 語 sp o k  (10 codepoints)
+test "SelectionState word movement and Shift extension" {
+    // The Japanese fixture below: h i , sp + 3 CJK + sp o k (10 codepoints)
     const text = "hi, 日本語 ok";
     const layout = try buildTextLayout(testing.allocator, font_mod.default_font, text);
     defer testing.allocator.free(layout.byte_offsets);
@@ -751,20 +751,20 @@ test "TASK-119: SelectionState の word movement と Shift extension" {
     try testing.expectEqual(@as(usize, 10), count);
 
     var selection: SelectionState = .{ .anchor = 0, .extent = 0 };
-    // ASCII word 末尾へ
+    // To the end of the ASCII word
     selection.moveWord(layout, .right, false);
     try testing.expectEqual(TextRange{ .start = 2, .end = 2 }, selection.normalized());
-    // 区切り ", " を越えて日本語列の末尾へ
+    // Cross the ", " separators to the end of the CJK run
     selection.moveWord(layout, .right, false);
     try testing.expectEqual(TextRange{ .start = 7, .end = 7 }, selection.normalized());
-    // 空白を越えて "ok" 末尾へ
+    // Cross the space to the end of "ok"
     selection.moveWord(layout, .right, false);
     try testing.expectEqual(TextRange{ .start = 10, .end = 10 }, selection.normalized());
-    // 末尾で no-op
+    // no-op at the end
     selection.moveWord(layout, .right, false);
     try testing.expectEqual(TextRange{ .start = 10, .end = 10 }, selection.normalized());
 
-    // 左: "ok" 先頭 → 日本語先頭 → "hi" 先頭 → 先頭 no-op
+    // Left: start of "ok" → start of CJK run → start of "hi" → no-op at start
     selection.moveWord(layout, .left, false);
     try testing.expectEqual(TextRange{ .start = 8, .end = 8 }, selection.normalized());
     selection.moveWord(layout, .left, false);
@@ -774,7 +774,7 @@ test "TASK-119: SelectionState の word movement と Shift extension" {
     selection.moveWord(layout, .left, false);
     try testing.expectEqual(TextRange{ .start = 0, .end = 0 }, selection.normalized());
 
-    // 非 Shift: 既存選択は端へ collapse（追加移動なし）
+    // Non-Shift: existing selection collapses to an endpoint (no further move)
     selection = .{ .anchor = 0, .extent = 5 };
     selection.moveWord(layout, .right, false);
     try testing.expectEqual(TextRange{ .start = 5, .end = 5 }, selection.normalized());
@@ -782,7 +782,7 @@ test "TASK-119: SelectionState の word movement と Shift extension" {
     selection.moveWord(layout, .left, false);
     try testing.expectEqual(TextRange{ .start = 0, .end = 0 }, selection.normalized());
 
-    // Shift+Option: 選択拡張（anchor 固定）
+    // Shift+Option: extend selection (anchor fixed)
     selection = .{ .anchor = 2, .extent = 2 };
     selection.moveWord(layout, .right, true);
     try testing.expectEqual(TextRange{ .start = 2, .end = 7 }, selection.normalized());
@@ -790,7 +790,7 @@ test "TASK-119: SelectionState の word movement と Shift extension" {
     try testing.expectEqual(TextRange{ .start = 2, .end = 4 }, selection.normalized());
 }
 
-test "TASK-120: replaceSelectionWithText ASCII / 日本語 / 空選択 paste" {
+test "replaceSelectionWithText ASCII / Japanese / empty-selection paste" {
     var buffer = try TextBuffer.init(testing.allocator, "abXYZcd");
     defer buffer.deinit();
     var selection: SelectionState = .{ .anchor = 2, .extent = 5 };
@@ -804,7 +804,7 @@ test "TASK-120: replaceSelectionWithText ASCII / 日本語 / 空選択 paste" {
     try testing.expectEqual(@as(usize, 4), selection.extent);
 }
 
-test "TASK-120: replaceSelectionWithText は制御文字・改行を除外し不正 UTF-8 で壊れない" {
+test "replaceSelectionWithText excludes controls/newlines and stays intact on invalid UTF-8" {
     var buffer = try TextBuffer.init(testing.allocator, "X");
     defer buffer.deinit();
     var selection: SelectionState = .{ .anchor = 1, .extent = 1 };
@@ -812,13 +812,13 @@ test "TASK-120: replaceSelectionWithText は制御文字・改行を除外し不
     try testing.expectEqualStrings("XABC", buffer.slice());
 
     selection = .{ .anchor = 4, .extent = 4 };
-    // 不正先頭バイトはスキップ、後続 ASCII は入る
+    // Skip a bad leading byte; following ASCII still inserts
     _ = try buffer.replaceSelectionWithText(&selection, &.{ 0xFF, 'Z' });
     try testing.expectEqualStrings("XABCZ", buffer.slice());
     try testing.expect(std.unicode.utf8ValidateSlice(buffer.slice()));
 }
 
-test "TASK-120: cut 相当の deleteRange 後 selection collapse" {
+test "selection collapse after cut-equivalent deleteRange" {
     var buffer = try TextBuffer.init(testing.allocator, "hello");
     defer buffer.deinit();
     var selection: SelectionState = .{ .anchor = 1, .extent = 4 };
@@ -830,23 +830,23 @@ test "TASK-120: cut 相当の deleteRange 後 selection collapse" {
     try testing.expectEqual(TextRange{ .start = 1, .end = 1 }, selection.normalized());
 }
 
-test "TASK-128: ASCII max_len 直前・到達・超過" {
+test "ASCII max_len just-before / at / over the limit" {
     var buffer = try TextBuffer.init(testing.allocator, "ab");
     defer buffer.deinit();
     var selection: SelectionState = .{ .anchor = 2, .extent = 2 };
-    // 直前: max_len=3 で 1 文字挿入可
+    // Just before: max_len=3 allows one more character
     try testing.expect(try buffer.replaceSelectionWithCodepoint(&selection, 'c', 3));
     try testing.expectEqualStrings("abc", buffer.slice());
-    // 到達: これ以上は拒否
+    // At the limit: further inserts are rejected
     try testing.expect(!try buffer.replaceSelectionWithCodepoint(&selection, 'd', 3));
     try testing.expectEqualStrings("abc", buffer.slice());
     try testing.expectEqual(@as(usize, 3), selection.extent);
-    // 超過 paste は切り詰め
+    // Over-limit paste is truncated
     try testing.expect(!try buffer.replaceSelectionWithTextLimited(&selection, "XYZ", 3));
     try testing.expectEqualStrings("abc", buffer.slice());
 }
 
-test "TASK-128: max_len=0 は挿入拒否" {
+test "max_len=0 rejects insertion" {
     var buffer = try TextBuffer.init(testing.allocator, "");
     defer buffer.deinit();
     var selection: SelectionState = .{};
@@ -855,7 +855,7 @@ test "TASK-128: max_len=0 は挿入拒否" {
     try testing.expectEqualStrings("", buffer.slice());
 }
 
-test "TASK-128: max_len=null は無制限（既存同等）" {
+test "max_len=null is unlimited (same as before)" {
     var buffer = try TextBuffer.init(testing.allocator, "");
     defer buffer.deinit();
     var selection: SelectionState = .{};
@@ -864,7 +864,7 @@ test "TASK-128: max_len=null は無制限（既存同等）" {
     try testing.expectEqualStrings("ABC", buffer.slice());
 }
 
-test "TASK-128: 日本語 UTF-8 3byte は 1 codepoint" {
+test "Japanese UTF-8 3-byte is 1 codepoint" {
     var buffer = try TextBuffer.init(testing.allocator, "");
     defer buffer.deinit();
     var selection: SelectionState = .{};
@@ -875,7 +875,7 @@ test "TASK-128: 日本語 UTF-8 3byte は 1 codepoint" {
     try testing.expectEqualStrings("あ", buffer.slice());
 }
 
-test "TASK-128: 絵文字 UTF-8 4byte は 1 codepoint" {
+test "emoji UTF-8 4-byte is 1 codepoint" {
     var buffer = try TextBuffer.init(testing.allocator, "");
     defer buffer.deinit();
     var selection: SelectionState = .{};
@@ -886,17 +886,17 @@ test "TASK-128: 絵文字 UTF-8 4byte は 1 codepoint" {
     try testing.expectEqual(@as(usize, 4), buffer.slice().len);
 }
 
-test "TASK-128: 選択範囲置換 paste は空いた容量を使う" {
+test "selection-replacement paste uses remaining capacity" {
     var buffer = try TextBuffer.init(testing.allocator, "abcdef");
     defer buffer.deinit();
     var selection: SelectionState = .{ .anchor = 1, .extent = 5 }; // "bcde"
-    // base=2 ("a"+"f"), max_len=4 → 残り 2
+    // base=2 ("a"+"f"), max_len=4 → remaining 2
     try testing.expect(try buffer.replaceSelectionWithTextLimited(&selection, "XYZ", 4));
     try testing.expectEqualStrings("aXYf", buffer.slice());
     try testing.expectEqual(@as(usize, 3), selection.extent);
 }
 
-test "TASK-128: 選択範囲置換 typed char" {
+test "selection-replacement typed char" {
     var buffer = try TextBuffer.init(testing.allocator, "abcd");
     defer buffer.deinit();
     var selection: SelectionState = .{ .anchor = 1, .extent = 3 }; // "bc"
@@ -904,7 +904,7 @@ test "TASK-128: 選択範囲置換 typed char" {
     try testing.expectEqualStrings("aZd", buffer.slice());
 }
 
-test "TASK-128: paste 途中で max_len 到達時は切り詰め" {
+test "paste truncates when max_len is hit mid-paste" {
     var buffer = try TextBuffer.init(testing.allocator, "ab");
     defer buffer.deinit();
     var selection: SelectionState = .{ .anchor = 2, .extent = 2 };
@@ -913,23 +913,23 @@ test "TASK-128: paste 途中で max_len 到達時は切り詰め" {
     try testing.expectEqual(@as(usize, 4), selection.extent);
 }
 
-test "TASK-128: 制御文字・改行・不正 UTF-8 と max_len" {
+test "controls / newlines / invalid UTF-8 with max_len" {
     var buffer = try TextBuffer.init(testing.allocator, "");
     defer buffer.deinit();
     var selection: SelectionState = .{};
-    // 制御・改行は除外され、挿入可能 2 文字だけが入る（max_len=2）
+    // Controls/newlines excluded; only 2 insertable chars enter (max_len=2)
     try testing.expect(try buffer.replaceSelectionWithTextLimited(&selection, "A\nB\x00C", 2));
     try testing.expectEqualStrings("AB", buffer.slice());
-    // 不正 UTF-8 スキップ後の Z は上限で拒否
+    // After skipping invalid UTF-8, Z is rejected at the cap
     try testing.expect(!try buffer.replaceSelectionWithTextLimited(&selection, &.{ 0xFF, 'Z' }, 2));
     try testing.expectEqualStrings("AB", buffer.slice());
     try testing.expect(std.unicode.utf8ValidateSlice(buffer.slice()));
 }
 
-test "TASK-79.6.3: UTF-16 offset ASCII / BMP 日本語" {
+test "UTF-16 offset ASCII / BMP Japanese" {
     var buffer = try TextBuffer.init(testing.allocator, "AあB");
     defer buffer.deinit();
-    // A=1, あ=1, B=1 → total 3 UTF-16 units, 3 codepoints
+    // A=1, U+3042=1, B=1 → total 3 UTF-16 units, 3 codepoints
     try testing.expectEqual(@as(u64, 3), buffer.utf16Length());
     try testing.expectEqual(@as(u64, 0), buffer.codepointIndexToUtf16(0));
     try testing.expectEqual(@as(u64, 1), buffer.codepointIndexToUtf16(1));
@@ -941,7 +941,7 @@ test "TASK-79.6.3: UTF-16 offset ASCII / BMP 日本語" {
     try testing.expectEqual(@as(u64, 1), r.length);
 }
 
-test "TASK-79.6.3: UTF-16 offset 補助平面 emoji（surrogate pair）" {
+test "UTF-16 offset supplementary-plane emoji (surrogate pair)" {
     var buffer = try TextBuffer.init(testing.allocator, "");
     defer buffer.deinit();
     var selection: SelectionState = .{};
@@ -949,7 +949,7 @@ test "TASK-79.6.3: UTF-16 offset 補助平面 emoji（surrogate pair）" {
     try testing.expectEqual(@as(u64, 2), buffer.utf16Length());
     try testing.expectEqual(@as(u64, 0), buffer.codepointIndexToUtf16(0));
     try testing.expectEqual(@as(u64, 2), buffer.codepointIndexToUtf16(1));
-    // mid-surrogate は substring で clamp、replacement は拒否
+    // mid-surrogate: clamp for substring, reject for replacement
     const mid = buffer.substringForUtf16Range(.{ .location = 1, .length = 1 }) orelse unreachable;
     try testing.expectEqual(@as(u64, 0), mid.actual_range.location);
     try testing.expectEqual(@as(u64, 2), mid.actual_range.length);
@@ -958,7 +958,7 @@ test "TASK-79.6.3: UTF-16 offset 補助平面 emoji（surrogate pair）" {
     try testing.expectEqualStrings("😀", buffer.slice());
 }
 
-test "TASK-79.6.3: substring actual range と空 document" {
+test "substring actual range and empty document" {
     var empty = try TextBuffer.init(testing.allocator, "");
     defer empty.deinit();
     const e = empty.substringForUtf16Range(.{ .location = 0, .length = 0 }) orelse unreachable;
@@ -967,7 +967,7 @@ test "TASK-79.6.3: substring actual range と空 document" {
 
     var buffer = try TextBuffer.init(testing.allocator, "漢字");
     defer buffer.deinit();
-    // clamp 超過 length
+    // clamp overshoot length
     const sub = buffer.substringForUtf16Range(.{ .location = 1, .length = 99 }) orelse unreachable;
     try testing.expectEqual(@as(u64, 1), sub.actual_range.location);
     try testing.expectEqual(@as(u64, 1), sub.actual_range.length);
@@ -975,7 +975,7 @@ test "TASK-79.6.3: substring actual range と空 document" {
     try testing.expect(buffer.substringForUtf16Range(.{ .location = 10, .length = 1 }) == null);
 }
 
-test "TASK-79.6.3: substring 末尾 caret（location == doc, length == 0）は空 range" {
+test "substring end caret (location == doc, length == 0) is an empty range" {
     var buffer = try TextBuffer.init(testing.allocator, "AB");
     defer buffer.deinit();
     try testing.expectEqual(@as(u64, 2), buffer.utf16Length());
@@ -985,8 +985,8 @@ test "TASK-79.6.3: substring 末尾 caret（location == doc, length == 0）は�
     try testing.expectEqual(@as(u64, 0), at_end.actual_range.length);
 }
 
-test "TASK-79.6.3: substring location == doc で length > 0 は末尾へ clamp した空 range" {
-    // 仕様: location == doc は受理し、end を doc に clamp → 空 range（完全範囲外の location > doc のみ null）。
+test "substring location == doc with length > 0 clamps to an empty range at the end" {
+    // Spec: location == doc is accepted; clamp end to doc → empty range (only location > doc is fully out of range → null).
     var buffer = try TextBuffer.init(testing.allocator, "AB");
     defer buffer.deinit();
     const clamped = buffer.substringForUtf16Range(.{ .location = 2, .length = 5 }) orelse unreachable;
@@ -996,12 +996,12 @@ test "TASK-79.6.3: substring location == doc で length > 0 は末尾へ clamp �
     try testing.expect(buffer.substringForUtf16Range(.{ .location = 3, .length = 0 }) == null);
 }
 
-test "TASK-79.6.3: replacement 適用・selection collapse・max_len・拒否" {
+test "replacement apply / selection collapse / max_len / reject" {
     var buffer = try TextBuffer.init(testing.allocator, "ab漢字cd");
     defer buffer.deinit();
     var selection: SelectionState = .{ .anchor = 0, .extent = 0 };
     var caret: usize = 0;
-    // "漢字" = codepoints 2..4 = utf16 2..4
+    // The CJK fixture below = codepoints 2..4 = utf16 2..4
     try testing.expect(try buffer.replaceUtf16RangeAndCollapseCaret(
         &selection,
         &caret,
@@ -1013,21 +1013,21 @@ test "TASK-79.6.3: replacement 適用・selection collapse・max_len・拒否" {
     try testing.expectEqual(TextRange{ .start = 4, .end = 4 }, selection.normalized());
     try testing.expectEqual(@as(usize, 4), caret);
 
-    // 範囲外拒否
+    // Reject out of range
     try testing.expect(!try buffer.replaceUtf16RangeLimited(&selection, .{ .location = 0, .length = 99 }, "Z", null));
     try testing.expectEqualStrings("abXYcd", buffer.slice());
 
-    // 不正 UTF-8 拒否
+    // Reject invalid UTF-8
     try testing.expect(!try buffer.replaceUtf16RangeLimited(&selection, .{ .location = 2, .length = 0 }, &.{0xFF}, null));
     try testing.expectEqualStrings("abXYcd", buffer.slice());
 
-    // max_len: 既に上限なら挿入拒否
+    // max_len: already at the cap → reject insert
     selection = .{ .anchor = 6, .extent = 6 };
     try testing.expect(!try buffer.replaceUtf16RangeLimited(&selection, .{ .location = 6, .length = 0 }, "!", 6));
     try testing.expectEqualStrings("abXYcd", buffer.slice());
 }
 
-test "TASK-79.6.3: 空 document への replacement と caret 先頭/末尾" {
+test "replacement into an empty document and caret at start/end" {
     var buffer = try TextBuffer.init(testing.allocator, "");
     defer buffer.deinit();
     var selection: SelectionState = .{};
@@ -1041,7 +1041,7 @@ test "TASK-79.6.3: 空 document への replacement と caret 先頭/末尾" {
     ));
     try testing.expectEqualStrings("あ", buffer.slice());
     try testing.expectEqual(@as(usize, 1), caret);
-    // 末尾挿入
+    // Insert at end
     try testing.expect(try buffer.replaceUtf16RangeAndCollapseCaret(
         &selection,
         &caret,
