@@ -1,4 +1,4 @@
-//! 最近使ったファイルの MRU リスト。
+//! Most-recently-used file list.
 
 const std = @import("std");
 const serde = @import("serde");

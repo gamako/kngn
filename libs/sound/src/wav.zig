@@ -1,30 +1,30 @@
-//! WAV (RIFF/WAVE) デコーダ — PCM8 / PCM16 / IEEE float32、mono/stereo。
+//! WAV (RIFF/WAVE) decoder — PCM8 / PCM16 / IEEE float32, mono/stereo.
 //!
-//! ファイル I/O は持たない。呼び出し側が読み込んだ bytes を受け取る。
-//! ホットパス: 初期化時のみ（decode は main thread。RT では呼ばない）。
+//! No file I/O; takes bytes the caller already loaded.
+//! Hot path: init-time only (decode on the main thread; never call from RT).
 
 const std = @import("std");
 
 pub const Error = error{
-    /// RIFF マジックが無い / 切り詰め。
+    /// Missing / truncated RIFF magic.
     InvalidRiff,
-    /// WAVE フォームタイプが無い。
+    /// Missing WAVE form type.
     InvalidWave,
-    /// chunk 境界・pad・data 終端の切り詰め。
+    /// Truncation at a chunk boundary, pad, or data end.
     Truncated,
-    /// fmt 欠落。
+    /// Missing fmt.
     MissingFmt,
-    /// data 欠落。
+    /// Missing data.
     MissingData,
-    /// fmt が複数。
+    /// Duplicate fmt.
     DuplicateFmt,
-    /// data が複数。
+    /// Duplicate data.
     DuplicateData,
-    /// 非 PCM / 非 float32 / PCM24 等の未対応形式。
+    /// Unsupported format (non-PCM / non-float32 / PCM24, etc.).
     UnsupportedFormat,
-    /// bits / block_align / byte_rate / data サイズの不整合。
+    /// Inconsistent bits / block_align / byte_rate / data size.
     InvalidFormat,
-    /// float32 サンプルが非有限。
+    /// float32 sample is non-finite.
     NonFiniteSample,
     OutOfMemory,
 };
@@ -41,19 +41,19 @@ pub const DecodedWav = struct {
     }
 };
 
-/// `bytes` を RIFF/WAVE として decode し、f32 interleaved samples を返す。
+/// Decode `bytes` as RIFF/WAVE and return f32 interleaved samples.
 ///
-/// RIFF chunk size を厳密に検証する: 宣言サイズが実データ長を超える、または
-/// 宣言終端より後ろの chunk は受理しない（走査上限 = 8 + riff_size）。
+/// Strictly validate RIFF chunk size: a declared size past the real data length, or a
+/// chunk past the declared end, is not accepted (scan limit = 8 + riff_size).
 pub fn decodeWav(allocator: std.mem.Allocator, bytes: []const u8) Error!DecodedWav {
     if (bytes.len < 12) return error.Truncated;
     if (!std.mem.eql(u8, bytes[0..4], "RIFF")) return error.InvalidRiff;
 
     const riff_size = std.mem.readInt(u32, bytes[4..8], .little);
-    // 8 + riff_size が bytes を超えるなら Truncated（u64 で加算し overflow を回避）
+    // If 8 + riff_size exceeds bytes → Truncated (add in u64 to avoid overflow)
     const riff_end_u64: u64 = @as(u64, 8) + @as(u64, riff_size);
     if (riff_end_u64 > bytes.len) return error.Truncated;
-    // form type "WAVE" に最低 4 byte が必要
+    // form type "WAVE" needs at least 4 bytes
     if (riff_size < 4) return error.Truncated;
     const riff_end: usize = @intCast(riff_end_u64);
 
@@ -69,20 +69,20 @@ pub fn decodeWav(allocator: std.mem.Allocator, bytes: []const u8) Error!DecodedW
     var bits_per_sample: u16 = 0;
     var data_slice: []const u8 = &.{};
 
-    // 走査範囲は宣言 RIFF 終端まで（その後ろの chunk は見ない = 受理しない）
+    // Scan only up to the declared RIFF end (chunks beyond are unseen = not accepted)
     var pos: usize = 12;
     while (riff_end - pos >= 8) {
         const id = bytes[pos..][0..4];
         const chunk_size = std.mem.readInt(u32, bytes[pos + 4 ..][0..4], .little);
         pos += 8;
 
-        // remaining との比較で先に拒否（pos + chunk_size の overflow を避ける）
+        // Reject by comparing against remaining first (avoids pos + chunk_size overflow)
         const remaining = riff_end - pos;
         if (chunk_size > remaining) return error.Truncated;
         const payload = bytes[pos .. pos + chunk_size];
         pos += chunk_size;
 
-        // 奇数サイズ chunk は pad 1 byte（RIFF 仕様）
+        // Odd-sized chunks have a 1-byte pad (RIFF spec)
         if (chunk_size & 1 != 0) {
             if (riff_end - pos < 1) return error.Truncated;
             pos += 1;
@@ -103,10 +103,10 @@ pub fn decodeWav(allocator: std.mem.Allocator, bytes: []const u8) Error!DecodedW
             data_seen = true;
             data_slice = payload;
         }
-        // 未知 chunk はスキップ（JUNK 等）
+        // Skip unknown chunks (JUNK, etc.)
     }
 
-    // RIFF 終端内に 1..7 byte の端数（不完全な chunk ヘッダ）が残っていれば Truncated
+    // 1..7 leftover bytes inside the RIFF end (incomplete chunk header) → Truncated
     if (pos < riff_end) return error.Truncated;
 
     if (!fmt_seen) return error.MissingFmt;
@@ -145,7 +145,7 @@ pub fn decodeWav(allocator: std.mem.Allocator, bytes: []const u8) Error!DecodedW
         1 => switch (bits_per_sample) {
             8 => {
                 for (data_slice, 0..) |b, i| {
-                    // unsigned PCM8 → f32。0 → -1.0 / 128 → 0.0 / 255 → 127/128
+                    // unsigned PCM8 → f32. 0 → -1.0 / 128 → 0.0 / 255 → 127/128
                     samples[i] = (@as(f32, @floatFromInt(b)) - 128.0) / 128.0;
                 }
             },
@@ -157,7 +157,7 @@ pub fn decodeWav(allocator: std.mem.Allocator, bytes: []const u8) Error!DecodedW
                     i += 1;
                 }) {
                     const v = std.mem.readInt(i16, data_slice[off..][0..2], .little);
-                    // encode 側（harness encodeWav）の 32767.0 スケールと対称
+                    // Symmetric with the encode side (harness encodeWav) 32767.0 scale
                     samples[i] = @as(f32, @floatFromInt(v)) / 32767.0;
                 }
             },
@@ -193,9 +193,9 @@ pub fn decodeWav(allocator: std.mem.Allocator, bytes: []const u8) Error!DecodedW
 
 const testing = std.testing;
 
-/// テスト専用 PCM16 RIFF/WAVE encoder。
-/// `core/control/harness.zig` の `encodeWav`（PCM16・44B ヘッダ・clamp*32767）の形式ミラー。
-/// harness.zig は並行タスクが編集中のため抽出せず、ここにローカル実装を置く（TASK-111.6 設計レビュー修正1）。
+/// Test-only PCM16 RIFF/WAVE encoder.
+/// Mirrors `core/control/harness.zig` `encodeWav` (PCM16, 44B header, clamp*32767).
+/// Local copy kept here so tests do not depend on extracting harness helpers.
 fn encodeWavPcm16(interleaved: []const f32, channels: u32, sample_rate: u32, allocator: std.mem.Allocator) ![]u8 {
     const num_samples = interleaved.len;
     const data_size: u32 = @intCast(num_samples * 2);
@@ -227,10 +227,10 @@ fn encodeWavPcm16(interleaved: []const f32, channels: u32, sample_rate: u32, all
     return buf;
 }
 
-test "encodeWavPcm16: PCM16 RIFF/WAVE ヘッダの byte offset を絶対値 assert（harness 対称）" {
-    // harness.zig line ~3002 と同型。RIFF 仕様フィールド根拠:
+test "encodeWavPcm16: PCM16 RIFF/WAVE header byte offsets asserted absolutely (harness-symmetric)" {
+    // Same shape as harness.zig encodeWav. RIFF field layout:
     //   [0..4]  "RIFF" chunk id
-    //   [4..8]  chunk size = 36 + data_size（file size - 8）
+    //   [4..8]  chunk size = 36 + data_size (file size - 8)
     //   [8..12] "WAVE" form type
     //   [12..16] "fmt " subchunk
     //   [16..20] fmt size = 16 (PCM)
@@ -262,8 +262,8 @@ test "encodeWavPcm16: PCM16 RIFF/WAVE ヘッダの byte offset を絶対値 asse
     try testing.expectEqual(@as(u32, 8), std.mem.readInt(u32, bytes[40..44], .little)); // data_size
 }
 
-test "decodeWav: PCM16 encode→decode bit 一致 round-trip" {
-    // 量子化後の f32（encode が clamp*32767→i16 するため）と decode 結果が bit 一致
+test "decodeWav: PCM16 encode→decode bit-identical round-trip" {
+    // Quantized f32 (encode does clamp*32767→i16) must bit-match the decode result
     const src = [_]f32{ 0.0, 0.5, -0.5, 1.0, -1.0, 0.25 };
     const bytes = try encodeWavPcm16(&src, 2, 48000, testing.allocator);
     defer testing.allocator.free(bytes);
@@ -275,7 +275,7 @@ test "decodeWav: PCM16 encode→decode bit 一致 round-trip" {
     try testing.expectEqual(@as(u16, 2), decoded.channels);
     try testing.expectEqual(src.len, decoded.samples.len);
 
-    // encode が量子化した値を基準に bit 一致
+    // Bit-match against the values encode quantized
     for (src, decoded.samples) |s, d| {
         const clamped = std.math.clamp(s, -1.0, 1.0);
         const q: i16 = @intFromFloat(clamped * 32767.0);
@@ -284,7 +284,7 @@ test "decodeWav: PCM16 encode→decode bit 一致 round-trip" {
     }
 }
 
-/// 最小 PCM8 mono WAV を組み立てる（fmt→data 順）。奇数 data は RIFF pad 1 byte を付与。
+/// Build a minimal PCM8 mono WAV (fmt→data order). Odd data gets a 1-byte RIFF pad.
 fn buildPcm8Mono(allocator: std.mem.Allocator, pcm: []const u8, sample_rate: u32) ![]u8 {
     const data_size: u32 = @intCast(pcm.len);
     const pad: usize = if (pcm.len & 1 != 0) 1 else 0;
@@ -319,7 +319,7 @@ test "decodeWav: PCM8 0/128/255 → f32" {
     try testing.expectEqual(@as(f32, 127.0 / 128.0), decoded.samples[2]);
 }
 
-/// IEEE float32 mono WAV。
+/// IEEE float32 mono WAV.
 fn buildFloat32Mono(allocator: std.mem.Allocator, values: []const f32, sample_rate: u32) ![]u8 {
     const data_size: u32 = @intCast(values.len * 4);
     const total: usize = 44 + values.len * 4;
@@ -356,14 +356,14 @@ test "decodeWav: float32 bit-preserving" {
     }
 }
 
-test "decodeWav: float32 non-finite はエラー" {
+test "decodeWav: float32 non-finite is an error" {
     const src = [_]f32{std.math.nan(f32)};
     const bytes = try buildFloat32Mono(testing.allocator, &src, 44100);
     defer testing.allocator.free(bytes);
     try testing.expectError(error.NonFiniteSample, decodeWav(testing.allocator, bytes));
 }
 
-/// chunk を自由に並べた WAV を組み立てる（テスト用）。
+/// Build a WAV with freely ordered chunks (for tests).
 fn buildWavFromChunks(allocator: std.mem.Allocator, chunks: []const struct { id: *const [4]u8, payload: []const u8 }) ![]u8 {
     var body_len: usize = 0;
     for (chunks) |c| {
@@ -401,7 +401,7 @@ fn makeFmtPcm16(channels: u16, sample_rate: u32) [16]u8 {
     return f;
 }
 
-test "decodeWav: data が fmt の前でも decode できる" {
+test "decodeWav: can decode when data precedes fmt" {
     const fmt = makeFmtPcm16(1, 8000);
     // 1 frame mono PCM16 = 0x7FFF → ~1.0
     const data = [_]u8{ 0xFF, 0x7F };
@@ -416,7 +416,7 @@ test "decodeWav: data が fmt の前でも decode できる" {
     try testing.expectApproxEqAbs(@as(f32, 1.0), decoded.samples[0], 1e-4);
 }
 
-test "decodeWav: odd-size JUNK chunk + pad byte をスキップ" {
+test "decodeWav: skips odd-size JUNK chunk + pad byte" {
     const fmt = makeFmtPcm16(1, 8000);
     const data = [_]u8{ 0x00, 0x00 };
     // JUNK payload 3 bytes → pad 1
@@ -432,7 +432,7 @@ test "decodeWav: odd-size JUNK chunk + pad byte をスキップ" {
     try testing.expectEqual(@as(f32, 0.0), decoded.samples[0]);
 }
 
-test "decodeWav: unknown chunk スキップ" {
+test "decodeWav: skips unknown chunks" {
     const fmt = makeFmtPcm16(1, 8000);
     const data = [_]u8{ 0x00, 0x40 }; // 0x4000 → 16384/32767
     const list = [_]u8{ 0, 0, 0, 0 };
@@ -447,25 +447,25 @@ test "decodeWav: unknown chunk スキップ" {
     try testing.expectEqual(@as(usize, 1), decoded.samples.len);
 }
 
-test "decodeWav: 不正 RIFF/WAVE" {
+test "decodeWav: invalid RIFF/WAVE" {
     try testing.expectError(error.Truncated, decodeWav(testing.allocator, &[_]u8{1} ** 4));
-    // riff_size=4（"WAVE"/"WAXX" 分）で form type 不一致
+    // riff_size=4 ("WAVE"/"WAXX" worth) with form-type mismatch
     try testing.expectError(error.InvalidRiff, decodeWav(testing.allocator, "XIFF" ++ "\x04\x00\x00\x00" ++ "WAVE"));
     try testing.expectError(error.InvalidWave, decodeWav(testing.allocator, "RIFF" ++ "\x04\x00\x00\x00" ++ "WAXX"));
-    // riff_size=0 は form type 分も足りない → Truncated
+    // riff_size=0 lacks even the form type → Truncated
     try testing.expectError(error.Truncated, decodeWav(testing.allocator, "RIFF" ++ "\x00\x00\x00\x00" ++ "WAVE"));
 }
 
 test "decodeWav: truncated header/chunk/pad" {
-    // ヘッダ途中
+    // Truncated mid-header
     try testing.expectError(error.Truncated, decodeWav(testing.allocator, "RIFFWAVE"));
-    // chunk size が残バイト超過
+    // chunk size exceeds remaining bytes
     const fmt = makeFmtPcm16(1, 8000);
     const bad = try buildWavFromChunks(testing.allocator, &.{
         .{ .id = "fmt ", .payload = &fmt },
     });
     defer testing.allocator.free(bad);
-    // data chunk を途中で切る: "data" + size=4 だが payload 不足
+    // Cut data chunk short: "data" + size=4 but payload incomplete
     var short = try testing.allocator.alloc(u8, 12 + 8 + 16 + 8 + 2);
     defer testing.allocator.free(short);
     @memcpy(short[0..4], "RIFF");
@@ -491,7 +491,7 @@ test "decodeWav: truncated header/chunk/pad" {
     try testing.expectError(error.Truncated, decodeWav(testing.allocator, odd[0 .. odd.len - 1]));
 }
 
-test "decodeWav: 不正 format / bits / block_align / byte_rate" {
+test "decodeWav: invalid format / bits / block_align / byte_rate" {
     // PCM24 unsupported
     var fmt24: [16]u8 = undefined;
     std.mem.writeInt(u16, fmt24[0..2], 1, .little);
@@ -563,7 +563,7 @@ test "decodeWav: missing fmt / data / duplicate" {
     try testing.expectError(error.DuplicateData, decodeWav(testing.allocator, dup_data));
 }
 
-test "decodeWav: data サイズが block_align 非倍数" {
+test "decodeWav: data size not a multiple of block_align" {
     const fmt = makeFmtPcm16(1, 8000);
     const data = [_]u8{0}; // 1 byte, block_align=2
     // odd payload → pad; but data size 1 is invalid for PCM16
@@ -575,30 +575,30 @@ test "decodeWav: data サイズが block_align 非倍数" {
     try testing.expectError(error.InvalidFormat, decodeWav(testing.allocator, bytes));
 }
 
-test "decodeWav: 整数 overflow 境界（巨大 chunk size）" {
-    // chunk size = maxInt(u32) で remaining 超過 → Truncated（加算 overflow に頼らない）
+test "decodeWav: integer overflow boundary (huge chunk size)" {
+    // chunk size = maxInt(u32) exceeds remaining → Truncated (does not rely on add overflow)
     var buf: [20]u8 = undefined;
     @memcpy(buf[0..4], "RIFF");
-    std.mem.writeInt(u32, buf[4..8], 100, .little); // 8+100 > 20 → 先に Truncated
+    std.mem.writeInt(u32, buf[4..8], 100, .little); // 8+100 > 20 → Truncated first
     @memcpy(buf[8..12], "WAVE");
     @memcpy(buf[12..16], "fmt ");
     std.mem.writeInt(u32, buf[16..20], std.math.maxInt(u32), .little);
     try testing.expectError(error.Truncated, decodeWav(testing.allocator, &buf));
 }
 
-test "decodeWav: RIFF size が実データより大きい → Truncated" {
-    // 正しい fmt+data を作り、RIFF size だけ過大に書き換え
+test "decodeWav: RIFF size larger than real data → Truncated" {
+    // Build correct fmt+data, then rewrite only the RIFF size too large
     const src = [_]f32{ 0.0, 0.0 };
     var bytes = try encodeWavPcm16(&src, 1, 8000, testing.allocator);
     defer testing.allocator.free(bytes);
-    // 実長 = bytes.len。宣言を +100 にすると 8+riff_size > bytes.len
+    // Real length = bytes.len. Declaring +100 makes 8+riff_size > bytes.len
     std.mem.writeInt(u32, bytes[4..8], @as(u32, @intCast(bytes.len - 8 + 100)), .little);
     try testing.expectError(error.Truncated, decodeWav(testing.allocator, bytes));
 }
 
-test "decodeWav: RIFF 終端より後ろの data chunk は受理しない" {
-    // fmt のみを含む正当な RIFF を作り、その後ろに data chunk を追記する。
-    // 走査上限は宣言 riff_end までなので data は見えず MissingData。
+test "decodeWav: data chunk past RIFF end is not accepted" {
+    // Build a valid RIFF with fmt only, then append a data chunk after it.
+    // Scan limit is the declared riff_end, so data is unseen → MissingData.
     const fmt = makeFmtPcm16(1, 8000);
     const head = try buildWavFromChunks(testing.allocator, &.{
         .{ .id = "fmt ", .payload = &fmt },
@@ -613,20 +613,20 @@ test "decodeWav: RIFF 終端より後ろの data chunk は受理しない" {
     std.mem.writeInt(u32, full[head.len + 4 ..][0..4], @intCast(data_payload.len), .little);
     @memcpy(full[head.len + 8 ..], &data_payload);
 
-    // head の RIFF size は fmt まで。full はそれより長いが data は riff_end 外
+    // head RIFF size covers fmt only; full is longer but data lies past riff_end
     try testing.expectError(error.MissingData, decodeWav(testing.allocator, full));
 }
 
-test "decodeWav: pos 加算 overflow 境界（chunk_size が remaining 超過）" {
-    // riff_size はちょうどファイル終端まで。chunk header の size を maxInt にして
-    // remaining 比較で Truncated（usize 加算 overflow 経路を踏まない）。
+test "decodeWav: pos-add overflow boundary (chunk_size exceeds remaining)" {
+    // riff_size reaches exactly EOF. Set the chunk-header size to maxInt so
+    // remaining comparison yields Truncated (does not take the usize-add overflow path).
     var buf: [44]u8 = undefined;
     @memcpy(buf[0..4], "RIFF");
     std.mem.writeInt(u32, buf[4..8], 36, .little); // 8+36=44 = buf.len
     @memcpy(buf[8..12], "WAVE");
     @memcpy(buf[12..16], "fmt ");
     std.mem.writeInt(u32, buf[16..20], std.math.maxInt(u32), .little);
-    // 残りは未初期化でよい（size 超過で即 return）
+    // Trailing bytes may be uninitialized (immediate return on size overrun)
     try testing.expectError(error.Truncated, decodeWav(testing.allocator, &buf));
 }
 

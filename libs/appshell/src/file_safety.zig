@@ -1,7 +1,7 @@
-//! 本体を壊さない atomic save と一世代 backup。
+//! Atomic save that does not corrupt the original, plus one-generation backup.
 //!
-//! ホットパス宣言: 保存・backup・削除は明示 save または autosave の閾値到達時のみ。
-//! フレーム毎、RT、非同期保存 thread では実行しない。
+//! Hot-path note: save / backup / delete only on explicit save or when the autosave threshold is hit.
+//! Does not run per-frame, on RT, or on an async save thread.
 
 const std = @import("std");
 
@@ -9,17 +9,17 @@ pub const WriteOptions = struct {
     backup: bool = false,
 };
 
-/// path へ bytes を atomic に保存する。
+/// Atomically save bytes to path.
 ///
-/// 既存 path がある場合、`backup` が true なら置換前の bytes を path + ".bak"
-/// へ保存してから本体を置換する。backup 保存に失敗した場合、本体には触れない。
+/// If path already exists and `backup` is true, write the prior bytes to path + ".bak"
+/// before replacing the original. On backup failure, the original is left untouched.
 pub fn writeAtomic(io: std.Io, path: []const u8, bytes: []const u8, options: WriteOptions) !void {
     var parent = try openParent(io, path);
     defer if (parent.owns) parent.dir.close(io);
     return writeAtomicToDir(io, parent.dir, std.fs.path.basename(path), bytes, options);
 }
 
-/// 開いている directory 内のファイルを atomic に保存する。autosave が使用する。
+/// Atomically save a file inside an open directory. Used by autosave.
 pub fn writeAtomicToDir(io: std.Io, dir: std.Io.Dir, file_name: []const u8, bytes: []const u8, options: WriteOptions) !void {
     return writeAtomicToDirImpl(io, dir, file_name, bytes, options, false);
 }
@@ -49,8 +49,8 @@ fn writeAtomicToDirImpl(
     defer atomic.deinit(io);
     try atomic.file.writeStreamingAll(io, bytes);
     try atomic.file.sync(io);
-    // 親 directory の fsync は MVP では行わない。Zig 0.16 の portable Dir に
-    // directory sync API がなく、POSIX 固有 API を導入すると Windows 共通契約を崩す。
+    // Parent-directory fsync is not done in the MVP. Zig 0.16's portable Dir has no
+    // directory-sync API, and introducing a POSIX-only API would break the shared Windows contract.
     if (fail_before_replace) return error.TestInjectedFailure;
     try atomic.replace(io);
 }

@@ -9,8 +9,8 @@
 // Output format: canonical BGRA8888 (u32 per pixel)
 // Memory layout: Byte order [B, G, R, A] regardless of system endianness
 //
-// Encoding (TASK-33: apps/editor/core/io_png.zig から移設): RGBA8 / zlib stored blocks。
-// encodePNG / savePNG / crc32 を encode.zig から re-export する。
+// Encoding (paint's io_png.zig delegates here): RGBA8 / zlib stored blocks.
+// Re-export encodePNG / savePNG / crc32 from encode.zig.
 
 const std = @import("std");
 pub const png_parser = @import("png_parser.zig");
@@ -18,7 +18,7 @@ pub const flate = @import("flate.zig");
 pub const filter = @import("filter.zig");
 pub const format = @import("format.zig");
 
-// encode 側（PNG エンコーダ）。decode と合わせて PNG codec を構成する。
+// Encode side (PNG encoder). Together with decode, forms the PNG codec.
 pub const encode = @import("encode.zig");
 pub const encodePNG = encode.encodePNG;
 pub const savePNG = encode.savePNG;

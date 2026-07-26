@@ -383,7 +383,7 @@ void generate_16x16_rgba_gradient(LodePNGFilterStrategy filter_strategy, const c
 /* Pattern generation helper functions */
 
 void fill_gradient_rgb(unsigned char *image, unsigned width, unsigned height) {
-    /* X軸でR増加、Y軸でG増加、B固定 */
+    /* R increases along X, G along Y, B fixed */
     for (unsigned y = 0; y < height; y++) {
         for (unsigned x = 0; x < width; x++) {
             unsigned idx = (y * width + x) * 3;
@@ -395,7 +395,7 @@ void fill_gradient_rgb(unsigned char *image, unsigned width, unsigned height) {
 }
 
 void fill_checkerboard_rgb(unsigned char *image, unsigned width, unsigned height, unsigned block_size) {
-    /* block_size x block_size ブロックの黒/白チェッカーボード */
+    /* block_size x block_size black/white checkerboard */
     for (unsigned y = 0; y < height; y++) {
         for (unsigned x = 0; x < width; x++) {
             unsigned idx = (y * width + x) * 3;
@@ -410,7 +410,7 @@ void fill_checkerboard_rgb(unsigned char *image, unsigned width, unsigned height
 }
 
 void fill_noise_rgba(unsigned char *image, unsigned width, unsigned height, uint64_t seed) {
-    /* PCG32による再現可能なノイズ */
+    /* Reproducible noise via PCG32 */
     pcg32_state_t rng;
     pcg32_srandom_r(&rng, seed);
 
@@ -592,7 +592,7 @@ void generate_1920x1080_rgba_gradient(void) {
         return;
     }
 
-    /* X軸でR増加、Y軸でG増加、B固定、AはXと同じ */
+    /* R increases along X, G along Y, B fixed, A same as X */
     for (unsigned y = 0; y < height; y++) {
         for (unsigned x = 0; x < width; x++) {
             unsigned idx = (y * width + x) * 4;

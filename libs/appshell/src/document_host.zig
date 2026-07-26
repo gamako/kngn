@@ -1,7 +1,7 @@
-//! 文書フォーマットから独立した document lifecycle 管理。
+//! Document-format-independent document lifecycle management.
 //!
-//! ホットパス宣言: 状態遷移、callback、path の所有、タイトル生成はすべてイベント時のみ。
-//! フレーム毎・全画素・RT 経路では実行しない。
+//! Hot-path note: state transitions, callbacks, path ownership, and title generation are event-time only.
+//! Does not run on the per-frame / full-pixel / RT paths.
 
 const std = @import("std");
 
@@ -68,8 +68,8 @@ pub const DocumentHost = struct {
         return self.current_path;
     }
 
-    /// autosave から decode 済みの document metadata を採用する。
-    /// document bytes の decode/差し替えは caller が行い、この関数は callback/I/O を行わない。
+    /// Adopt decode-ready document metadata from autosave.
+    /// Caller does document-bytes decode/swap; this function performs no callback/I/O.
     pub fn adoptRecovered(self: *DocumentHost, path: ?[]const u8) !void {
         if (self.pending_kind != .none) return error.PendingConfirmation;
         if (path) |value| {
@@ -146,8 +146,8 @@ pub const DocumentHost = struct {
         return .confirmation_required;
     }
 
-    /// 保存確認を実行する。named 文書は現在 path、untitled 文書は path 必須。
-    /// pending new/open は保存成功後に対象 callback まで継続する。
+    /// Run the save confirmation. Named documents use the current path; untitled require a path.
+    /// Pending new/open continues to the target callback after a successful save.
     pub fn confirmSave(self: *DocumentHost, save_path: ?[]const u8) !Result {
         const pending = self.pending_kind;
         if (pending == .none) return .rejected;
@@ -214,7 +214,7 @@ pub const DocumentHost = struct {
         return .canceled;
     }
 
-    /// `buf` は呼び出し側が所有する。結果は `buf` 内の UTF-8 title slice。
+    /// `buf` is owned by the caller. Result is a UTF-8 title slice inside `buf`.
     pub fn title(self: *const DocumentHost, buf: []u8) []const u8 {
         const base = if (self.current_path) |path| basename(path) else "Untitled";
         if (self.dirty) return std.fmt.bufPrint(buf, "{s} — edited", .{base}) catch buf[0..0];
@@ -342,7 +342,7 @@ test "DocumentHost pending new/open all confirmation branches" {
     try std.testing.expectEqualStrings("opened.pix", host.currentPath().?);
     try std.testing.expect(!host.isDirty());
 
-    // named 文書は save_path が null でも現在 path へ保存して pending new を継続する。
+    // Named documents save to the current path even when save_path is null, then continue pending new.
     host.markDirty();
     try std.testing.expectEqual(Result.confirmation_required, try host.newDocument());
     try std.testing.expectEqual(Result.applied, try host.confirmSave(null));
@@ -357,7 +357,7 @@ test "DocumentHost pending new/open all confirmation branches" {
     try std.testing.expectEqual(Confirmation.open, host.confirmation());
     try std.testing.expect(host.isDirty());
 
-    // untitled 文書の close は save-as path が必須で、保存後に終了を許可する。
+    // Untitled close requires a save-as path; after save, exit is allowed.
     var untitled_state: CallbackState = .{};
     var untitled_host = testHost(&untitled_state);
     defer untitled_host.deinit();

@@ -1,11 +1,11 @@
-//! オシロスコープ + ピーク/RMS レベルメータ(メインスレッド専用の可視化、TASK-27.16)。
+//! Oscilloscope + peak/RMS level meter (main-thread-only visualization).
 //!
-//! 出力タップ(27.8)→ mono downmix したサンプルを `feed` で供給し、framebuffer の指定領域へ描画する。
-//! spectrogram.zig と同じ流儀(解析+描画を 1 ファイル、ロジックを単体テスト)。RT スレッドには関与しない。
+//! Output tap → mono-downmixed samples are supplied via `feed` and drawn into a framebuffer region.
+//! Same style as spectrogram.zig (analysis + draw in one file, logic unit-tested). Does not touch the RT thread.
 
 const std = @import("std");
 
-// framebuffer のピクセル packing(gui.Color と同じ: メモリ B,G,R,A = u32 0xAARRGGBB)。
+// Framebuffer pixel packing (same as gui.Color: memory B,G,R,A = u32 0xAARRGGBB).
 inline fn rgba(r: u8, g: u8, b: u8, a: u8) u32 {
     return @as(u32, b) | (@as(u32, g) << 8) | (@as(u32, r) << 16) | (@as(u32, a) << 24);
 }
@@ -23,7 +23,7 @@ fn putPixel(pixels: []u32, fb_w: usize, fb_h: usize, x: usize, y: usize, c: u32)
     pixels[y * fb_w + x] = c;
 }
 
-/// 列 x の ya..yb(両端含む)を縦線で塗る。
+/// Paint a vertical line on column x from ya..yb (inclusive).
 fn vline(pixels: []u32, fb_w: usize, fb_h: usize, x: usize, ya: usize, yb: usize, c: u32) void {
     const lo = @min(ya, yb);
     const hi = @max(ya, yb);
@@ -31,7 +31,7 @@ fn vline(pixels: []u32, fb_w: usize, fb_h: usize, x: usize, ya: usize, yb: usize
     while (y <= hi) : (y += 1) putPixel(pixels, fb_w, fb_h, x, y, c);
 }
 
-/// (x0,y0) 左上 w×h を bg で塗り、枠を frame で描く。
+/// Fill (x0,y0) top-left w×h with bg and draw a frame border.
 fn fillFramedRect(pixels: []u32, fb_w: usize, fb_h: usize, x0: usize, y0: usize, w: usize, h: usize) void {
     var yy: usize = 0;
     while (yy < h) : (yy += 1) {
@@ -43,14 +43,14 @@ fn fillFramedRect(pixels: []u32, fb_w: usize, fb_h: usize, x0: usize, y0: usize,
     }
 }
 
-/// 線形振幅(0..)を -60..0 dBFS の 0..1 へマップ(無音=log10(0) 回避の epsilon 付き)。
+/// Map linear amplitude (0..) to 0..1 over -60..0 dBFS (epsilon avoids log10(0) on silence).
 pub fn linearToMeter(v: f32) f32 {
     return std.math.clamp((20.0 * std.math.log10(@max(v, 1e-6)) + 60.0) / 60.0, 0.0, 1.0);
 }
 
-const RING_CAP: usize = 2048; // 直近サンプルのリング容量(2 の冪)
+const RING_CAP: usize = 2048; // Recent-sample ring capacity (power of two)
 
-/// `width`×`height` のオシロスコープ。直近サンプルをリングに保持し、立ち上がりゼロ交差トリガで描画。
+/// `width`×`height` oscilloscope. Keeps recent samples in a ring; draws on a rising zero-crossing trigger.
 pub fn Oscilloscope(comptime width: usize, comptime height: usize) type {
     if (width > RING_CAP) @compileError("Oscilloscope width must be <= RING_CAP");
     if (width < 2 or height < 2) @compileError("Oscilloscope needs width>=2, height>=2");
@@ -58,7 +58,7 @@ pub fn Oscilloscope(comptime width: usize, comptime height: usize) type {
         const Self = @This();
 
         ring: [RING_CAP]f32 = [_]f32{0} ** RING_CAP,
-        wpos: usize = 0, // 書き込んだ総サンプル数(単調増加)
+        wpos: usize = 0, // Total samples written (monotonic)
 
         pub fn reset(self: *Self) void {
             @memset(&self.ring, 0);
@@ -76,10 +76,10 @@ pub fn Oscilloscope(comptime width: usize, comptime height: usize) type {
             return self.ring[a % RING_CAP];
         }
 
-        /// 描画開始の絶対インデックス。[oldest, wpos-width] の範囲で最も新しい立ち上がりゼロ交差。
-        /// 無ければ wpos-width(直近 width サンプル)。width サンプル後続を保証。
+        /// Absolute start index for drawing. Newest rising zero-crossing in [oldest, wpos-width].
+        /// If none, wpos-width (most recent width samples). Guarantees width samples of follow-on.
         pub fn findTrigger(self: *const Self) usize {
-            if (self.wpos < width) return 0; // まだ width 揃わない
+            if (self.wpos < width) return 0; // Not enough samples for width yet
             const filled = @min(self.wpos, RING_CAP);
             const oldest = self.wpos - filled;
             const newest_start = self.wpos - width;
@@ -94,10 +94,10 @@ pub fn Oscilloscope(comptime width: usize, comptime height: usize) type {
             fillFramedRect(pixels, fb_w, fb_h, x0, y0, width, height);
             const half: usize = (height - 1) / 2;
             const center_y = y0 + half;
-            // 中央線(grid)
+            // Center line (grid)
             var gx: usize = 1;
             while (gx < width - 1) : (gx += 1) putPixel(pixels, fb_w, fb_h, x0 + gx, center_y, grid_color);
-            // 波形トレース
+            // Waveform trace
             const start = self.findTrigger();
             const halff: f32 = @floatFromInt(half);
             var prev_y: ?usize = null;
@@ -116,13 +116,13 @@ pub fn Oscilloscope(comptime width: usize, comptime height: usize) type {
     };
 }
 
-/// ピーク / RMS レベルメータ。`feed` でブロック毎に更新(アタック即時・リリース減衰)。
+/// Peak / RMS level meter. Updated per `feed` block (instant attack, decaying release).
 pub const LevelMeter = struct {
     disp_peak: f32 = 0,
     disp_rms: f32 = 0,
-    hold: f32 = 0, // ピークホールド(より遅い減衰)
+    hold: f32 = 0, // Peak hold (slower decay)
 
-    const release: f32 = 0.85; // 1 feed あたりの減衰率(RT 非関与の可視化なので feed 回数依存で割り切り)
+    const release: f32 = 0.85; // Decay rate per feed (visualization is not RT-coupled; feed-count dependence is fine)
     const hold_release: f32 = 0.99;
 
     pub fn reset(self: *LevelMeter) void {
@@ -137,7 +137,7 @@ pub const LevelMeter = struct {
             sumsq += s * s;
         }
         const rms = if (mono.len > 0) @sqrt(sumsq / @as(f32, @floatFromInt(mono.len))) else 0;
-        // アタック即時(max)、リリースは前値を release 倍して減衰
+        // Instant attack (max); release decays prior value by release factor
         self.disp_peak = @max(pk, self.disp_peak * release);
         self.disp_rms = @max(rms, self.disp_rms * release);
         self.hold = @max(pk, self.hold * hold_release);
@@ -145,12 +145,12 @@ pub const LevelMeter = struct {
 
     pub fn draw(self: *const LevelMeter, pixels: []u32, fb_w: usize, fb_h: usize, x0: usize, y0: usize, w: usize, h: usize) void {
         fillFramedRect(pixels, fb_w, fb_h, x0, y0, w, h);
-        const inner_h = h - 2; // 枠の内側の高さ
-        const bottom_y = y0 + h - 2; // バーの底(枠の内側)
-        // ピーク(明)を底から上端まで、その上に RMS(濃)を重ねる。下=無音/-60dB、上=0dBFS。
+        const inner_h = h - 2; // Inner height inside the frame
+        const bottom_y = y0 + h - 2; // Bottom of the bar (inside the frame)
+        // Peak (bright) from bottom to top, RMS (darker) overlaid. Bottom=silence/-60dB, top=0dBFS.
         drawBar(pixels, fb_w, fb_h, x0, w, bottom_y, inner_h, linearToMeter(self.disp_peak), peak_color);
         drawBar(pixels, fb_w, fb_h, x0, w, bottom_y, inner_h, linearToMeter(self.disp_rms), rms_color);
-        // ピークホールドの水平マーカ(レベル 0 のときは描かない)
+        // Peak-hold horizontal marker (not drawn when level is 0)
         const hold_f = filledPixels(linearToMeter(self.hold), inner_h);
         if (hold_f > 0) {
             const hy = bottom_y - (hold_f - 1);
@@ -159,13 +159,13 @@ pub const LevelMeter = struct {
         }
     }
 
-    // 正規化レベル(0..1)を inner_h ピクセル中の塗り高さに(0=無音→0px)。
+    // Map normalized level (0..1) to fill height in inner_h pixels (0=silence→0px).
     fn filledPixels(n: f32, inner_h: usize) usize {
         const f: usize = @intFromFloat(@round(n * @as(f32, @floatFromInt(inner_h))));
         return @min(f, inner_h);
     }
 
-    // 底 bottom_y から filled ピクセルぶん上に縦バーを描く(filled=0 なら何も描かない)。
+    // Draw a vertical bar upward from bottom_y for `filled` pixels (filled=0 draws nothing).
     fn drawBar(pixels: []u32, fb_w: usize, fb_h: usize, x0: usize, w: usize, bottom_y: usize, inner_h: usize, n: f32, color: u32) void {
         const f = filledPixels(n, inner_h);
         if (f == 0) return;
@@ -181,7 +181,7 @@ pub const LevelMeter = struct {
 const testing = std.testing;
 
 test "linearToMeter: -inf->0, 0dB->1, -60dB->0, monotonic" {
-    try testing.expectApproxEqAbs(@as(f32, 0.0), linearToMeter(0.0), 1e-6); // 無音 → 0(clamp)
+    try testing.expectApproxEqAbs(@as(f32, 0.0), linearToMeter(0.0), 1e-6); // Silence → 0 (clamped)
     try testing.expectApproxEqAbs(@as(f32, 1.0), linearToMeter(1.0), 1e-6); // 0dBFS → 1
     try testing.expectApproxEqAbs(@as(f32, 0.0), linearToMeter(0.001), 1e-3); // -60dB → ~0
     try testing.expect(linearToMeter(0.5) < linearToMeter(1.0));
@@ -194,7 +194,7 @@ test "LevelMeter: constant 0.5 -> peak~0.5 rms~0.5; silence decays" {
     m.feed(&block);
     try testing.expectApproxEqAbs(@as(f32, 0.5), m.disp_peak, 1e-4);
     try testing.expectApproxEqAbs(@as(f32, 0.5), m.disp_rms, 1e-4);
-    // 無音を流し続けると減衰して 0 に近づく
+    // Feeding silence decays toward 0
     const silence = [_]f32{0} ** 64;
     var i: u32 = 0;
     while (i < 50) : (i += 1) m.feed(&silence);
@@ -214,14 +214,14 @@ test "LevelMeter: full-scale sine -> peak~1, rms~0.707" {
 test "Oscilloscope: feed stores samples and trigger finds rising zero crossing" {
     const Scope = Oscilloscope(64, 32);
     var sc = Scope{};
-    // 1 周期 = 64 サンプルの正弦を十分供給(>= width)
+    // Supply enough of a 64-sample-period sine (>= width)
     var i: usize = 0;
     while (i < 256) : (i += 1) {
         const s = @sin(2.0 * std.math.pi * @as(f32, @floatFromInt(i)) / 64.0);
         sc.feed(&[_]f32{s});
     }
     const t = sc.findTrigger();
-    // トリガ位置は立ち上がりゼロ交差(prev<0, cur>=0)で、width サンプル後続できる
+    // Trigger is a rising zero-crossing (prev<0, cur>=0) with width samples of follow-on
     try testing.expect(sc.sampleAt(t -% 1) < 0.0 and sc.sampleAt(t) >= 0.0);
     try testing.expect(t <= sc.wpos - 64);
 }
@@ -238,7 +238,7 @@ test "Oscilloscope: draw renders a non-empty trace into the region" {
     const fb_h = 32;
     var pixels = [_]u32{0} ** (fb_w * fb_h);
     sc.draw(&pixels, fb_w, fb_h, 2, 2);
-    // トレース色のピクセルが描かれている
+    // Trace-colored pixels are present
     var found_trace = false;
     for (pixels) |p| {
         if (p == trace_color) found_trace = true;
@@ -248,7 +248,7 @@ test "Oscilloscope: draw renders a non-empty trace into the region" {
 
 test "LevelMeter: draw renders bars into the region" {
     var m = LevelMeter{};
-    // 正弦(peak~1 > rms~0.707)で peak バーが rms バーの上に見える(定数だと peak==rms で隠れる)
+    // With a sine (peak~1 > rms~0.707) the peak bar sits above the rms bar (a constant would hide peak==rms)
     var block: [1024]f32 = undefined;
     for (&block, 0..) |*s, i| s.* = @sin(2.0 * std.math.pi * @as(f32, @floatFromInt(i)) / 64.0);
     m.feed(&block);
@@ -260,14 +260,14 @@ test "LevelMeter: draw renders bars into the region" {
     var found_peak = false;
     for (pixels) |p| {
         if (p == rms_color) found_rms = true;
-        if (p == peak_color) found_peak = true; // peak > rms なので上端に残る
+        if (p == peak_color) found_peak = true; // peak > rms so it remains at the top
     }
     try testing.expect(found_rms);
     try testing.expect(found_peak);
 }
 
 test "LevelMeter: silence draws no bars/marker (level 0 -> nothing)" {
-    const m = LevelMeter{}; // 無音(disp_peak/rms/hold = 0)
+    const m = LevelMeter{}; // Silence (disp_peak/rms/hold = 0)
     const fb_w = 16;
     const fb_h = 40;
     var pixels = [_]u32{0} ** (fb_w * fb_h);
@@ -282,10 +282,10 @@ test "LevelMeter: silence draws no bars/marker (level 0 -> nothing)" {
 test "Oscilloscope: findTrigger picks the most recent rising zero crossing in range" {
     const Scope = Oscilloscope(8, 16);
     var sc = Scope{};
-    // 立ち上がりゼロ交差(prev<0, cur>=0)を index 4 と 7 に作り、末尾に width=8 ぶん後続を確保。
+    // Rising zero-crossings (prev<0, cur>=0) at indices 4 and 7; ensure width=8 of follow-on at the end.
     const pattern = [_]f32{ -1, 1, 1, -1, 1, 1, -1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1 };
     sc.feed(&pattern);
-    // wpos=20, width=8 → newest_start=12。[0,12] 内で最新の交差は index 7。
+    // wpos=20, width=8 → newest_start=12. Newest crossing in [0,12] is index 7.
     const t = sc.findTrigger();
     try testing.expectEqual(@as(usize, 7), t);
     try testing.expect(sc.sampleAt(t - 1) < 0.0 and sc.sampleAt(t) >= 0.0);

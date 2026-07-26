@@ -1,7 +1,7 @@
-//! dirty document の autosave と起動時 recovery candidate。
+//! Autosave for dirty documents and startup recovery candidates.
 //!
-//! ホットパス宣言: 編集イベントでは時刻更新だけ、tick では閾値判定だけを行う。
-//! envelope encode と file I/O は 1 秒の idle 閾値に到達した main thread 上でのみ行う。
+//! Hot-path note: edit events only update the timestamp; tick only checks the threshold.
+//! Envelope encode and file I/O run only on the main thread after the 1-second idle threshold.
 
 const std = @import("std");
 const file_safety = @import("file_safety.zig");
@@ -61,8 +61,8 @@ pub const Controller = struct {
         self.* = undefined;
     }
 
-    /// 文書切替後の autosave ID を変更する。既存ファイルの削除は caller が
-    /// 文書切替成功を確認してから `clear` と組み合わせて行う。
+    /// Change the autosave ID after a document switch. Deleting any existing file is the caller's
+    /// job, after confirming the switch succeeded, combined with `clear`.
     pub fn setPath(self: *Controller, path: ?[]const u8) !void {
         const owned = if (path) |value| try self.allocator.dupe(u8, value) else null;
         if (self.current_path) |old| self.allocator.free(old);
@@ -76,7 +76,7 @@ pub const Controller = struct {
         self.saved_revision = false;
     }
 
-    /// idle 閾値に達した dirty revision を一度だけ保存する。保存した場合 true。
+    /// Save a dirty revision that has reached the idle threshold at most once. Returns true if saved.
     pub fn tick(self: *Controller, now: f64, ctx: *anyopaque, snapshot: SnapshotFn) !bool {
         const since = self.dirty_since orelse return false;
         if (self.saved_revision or now - since < idle_interval) return false;
@@ -92,7 +92,7 @@ pub const Controller = struct {
         return true;
     }
 
-    /// active document の autosave を削除する。未作成または既に削除済みは成功扱い。
+    /// Delete the active document's autosave. Missing or already-deleted is treated as success.
     pub fn clear(self: *Controller) !void {
         try clearPath(self.io, self.dir, self.allocator, self.current_path);
         self.dirty_since = null;
@@ -134,8 +134,8 @@ pub fn decodeEnvelope(allocator: std.mem.Allocator, bytes: []const u8) !Envelope
     return .{ .allocator = allocator, .original_path = original_path, .snapshot = snapshot };
 }
 
-/// autosave directoryから最初の有効な candidate を返す。壊れた/未知 version の
-/// ファイルは recovery 候補にせず、次回起動時も診断用に残す。
+/// Return the first valid candidate from the autosave directory. Broken / unknown-version
+/// files are not recovery candidates and are left for diagnosis on later launches.
 pub fn scan(allocator: std.mem.Allocator, io: std.Io, dir: std.Io.Dir) !?Candidate {
     var it = dir.iterate();
     while (try it.next(io)) |entry| {

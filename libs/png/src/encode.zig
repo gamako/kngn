@@ -1,32 +1,32 @@
-//! PNG エンコーダ（zlib stored blocks のみ）
+//! PNG encoder (zlib stored blocks only)
 //!
 //! - PNG signature → IHDR(RGBA8) → IDAT(zlib stored) → IEND
-//! - CRC-32/ISO-HDLC を comptime テーブルで計算
-//! - Adler-32 をランタイム計算
-//! - 入力 pixels は canonical BGRA（u32 0xAARRGGBB, bytes [B,G,R,A]）
+//! - CRC-32/ISO-HDLC via a comptime lookup table
+//! - Adler-32 computed at runtime
+//! - input pixels are canonical BGRA (u32 0xAARRGGBB, bytes [B,G,R,A])
 //!
-//! TASK-33 で apps/editor/core/io_png.zig から本 lib へ移設（ロジック不変）。
-//! decode 側（lib.zig）と合わせて PNG codec を構成する。
+//! Owned by this lib; paint's io_png.zig delegates here with unchanged logic.
+//! Together with the decode side (lib.zig), forms the PNG codec.
 
 const std = @import("std");
 
 const PNG_SIG: [8]u8 = .{ 0x89, 'P', 'N', 'G', '\r', '\n', 0x1a, '\n' };
 
-/// stored block の最大サイズ（deflate 仕様: 65535 bytes）
+/// Max stored-block size (deflate spec: 65535 bytes)
 const BLOCK_MAX: u16 = 65535;
 
-/// encodePNG の出力バイト数（exact）。
+/// Exact output byte count for encodePNG.
 /// total = 8(sig) + 25(IHDR: 4len+4type+13data+4crc)
 ///       + IDAT(4len + 4type + zlib_size + 4crc) + 12(IEND)
 /// zlib_size = 2(zlib header) + n_blocks*5(stored block header) + raw_len + 4(adler)
-/// n_blocks = ceil(raw_len / BLOCK_MAX)。raw_len==0 でも空 final block を 1 個書く。
+/// n_blocks = ceil(raw_len / BLOCK_MAX). Even when raw_len==0, write one empty final block.
 fn encodedSizeExact(raw_len: usize) usize {
     const n_blocks: usize = if (raw_len == 0) 1 else (raw_len + BLOCK_MAX - 1) / BLOCK_MAX;
     const zlib_size: usize = 2 + n_blocks * 5 + raw_len + 4;
     return 8 + 25 + (4 + 4 + zlib_size + 4) + 12;
 }
 
-// CRC-32/ISO-HDLC ルックアップテーブル（poly 0xEDB88320）
+// CRC-32/ISO-HDLC lookup table (poly 0xEDB88320)
 const crc_table: [256]u32 = blk: {
     @setEvalBranchQuota(10000);
     var table: [256]u32 = undefined;
@@ -54,8 +54,8 @@ fn crc32Update(c: u32, data: []const u8) u32 {
     return crc;
 }
 
-/// CRC-32/ISO-HDLC を計算して返す（PNG chunk と同一の多項式）。
-/// harness の framebuffer digest 等、PNG 以外の用途でも使えるよう公開する。
+/// Compute CRC-32/ISO-HDLC (same polynomial as PNG chunks).
+/// Public so non-PNG callers (e.g. harness framebuffer digest) can use it.
 pub fn crc32(data: []const u8) u32 {
     return crc32Update(0xFFFFFFFF, data) ^ 0xFFFFFFFF;
 }
@@ -123,7 +123,7 @@ fn appendIDATChunk(gpa: std.mem.Allocator, buf: *std.ArrayList(u8), raw: []const
         pos = end;
     }
 
-    // raw.len==0 の場合のみ空の最終ブロックを書く
+    // Write an empty final block only when raw.len==0
     if (raw.len == 0) {
         try buf.append(gpa, 0x01); // BFINAL=1, stored
         try appendU16LE(gpa, buf, 0);
@@ -140,8 +140,8 @@ fn appendIDATChunk(gpa: std.mem.Allocator, buf: *std.ArrayList(u8), raw: []const
     try appendU32BE(gpa, buf, c ^ 0xFFFFFFFF);
 }
 
-/// PNG バイト列を生成して返す（呼び出し元が gpa.free() すること）。
-/// pixels は raw layer pixels（canonical BGRA, u32 0xAARRGGBB, bytes [B,G,R,A]）。
+/// Build and return PNG bytes (caller must gpa.free()).
+/// pixels are raw layer pixels (canonical BGRA, u32 0xAARRGGBB, bytes [B,G,R,A]).
 pub fn encodePNG(pixels: []const u32, width: u32, height: u32, gpa: std.mem.Allocator) ![]u8 {
     const scan_size: usize = 1 + @as(usize, width) * 4;
     const raw_size: usize = @as(usize, height) * scan_size;
@@ -154,7 +154,7 @@ pub fn encodePNG(pixels: []const u32, width: u32, height: u32, gpa: std.mem.Allo
         sl[0] = 0; // filter: None
         for (0..@as(usize, width)) |x| {
             const p = pixels[y * @as(usize, width) + x];
-            // canonical BGRA(0xAARRGGBB) から明示抽出して PNG RGBA バイト順へ詰める。
+            // Explicitly extract from canonical BGRA(0xAARRGGBB) into PNG RGBA byte order.
             sl[1 + x * 4 + 0] = @truncate(p >> 16); // R
             sl[1 + x * 4 + 1] = @truncate(p >> 8); // G
             sl[1 + x * 4 + 2] = @truncate(p); // B
@@ -164,7 +164,7 @@ pub fn encodePNG(pixels: []const u32, width: u32, height: u32, gpa: std.mem.Allo
 
     var buf: std.ArrayList(u8) = .empty;
     errdefer buf.deinit(gpa);
-    // 出力サイズは exact に計算できるため事前確保する（appendSlice 連発の再確保を排除。TASK-59）
+    // Output size is exact, so pre-reserve capacity (avoids repeated appendSlice realloc).
     try buf.ensureTotalCapacity(gpa, encodedSizeExact(raw_size));
 
     // PNG signature
@@ -190,7 +190,7 @@ pub fn encodePNG(pixels: []const u32, width: u32, height: u32, gpa: std.mem.Allo
     return buf.toOwnedSlice(gpa);
 }
 
-/// PNG ファイルに保存する。pixels は raw canvas layer pixels。
+/// Save to a PNG file. pixels are raw canvas layer pixels.
 pub fn savePNG(io: std.Io, path: []const u8, pixels: []const u32, width: u32, height: u32, gpa: std.mem.Allocator) !void {
     const png_bytes = try encodePNG(pixels, width, height, gpa);
     defer gpa.free(png_bytes);
@@ -198,35 +198,35 @@ pub fn savePNG(io: std.Io, path: []const u8, pixels: []const u32, width: u32, he
 }
 
 // ============================================================================
-// tests（decoder 非依存・純エンコーダ）
+// tests (encoder-only; decoder-independent)
 // ============================================================================
 
-test "encodePNG: 1px 赤 の生スキャンラインが PNG RGBA [R,G,B,A] 順 (decoder 非依存)" {
+test "encodePNG: 1px red raw scanline is PNG RGBA [R,G,B,A] order (decoder-independent)" {
     const allocator = std.testing.allocator;
 
-    // canonical BGRA 0xFFFF0000 = R=FF, G=00, B=00, A=FF（不透明赤）
+    // canonical BGRA 0xFFFF0000 = R=FF, G=00, B=00, A=FF (opaque red)
     const pixels = [_]u32{0xFFFF0000};
     const png_bytes = try encodePNG(&pixels, 1, 1, allocator);
     defer allocator.free(png_bytes);
 
-    // IDAT 内 zlib stored ブロックの生スキャンラインを取り出す。
-    // レイアウト: "IDAT" | 0x78 0x01(zlib hdr) | 0x01(BFINAL,stored) | LEN(2,LE) | NLEN(2,LE) | scanline
+    // Pull the raw scanline out of the zlib stored block inside IDAT.
+    // Layout: "IDAT" | 0x78 0x01(zlib hdr) | 0x01(BFINAL,stored) | LEN(2,LE) | NLEN(2,LE) | scanline
     const idat = std.mem.indexOf(u8, png_bytes, "IDAT") orelse return error.MissingIDAT;
     const scan = png_bytes[idat + 4 + 2 + 1 + 2 + 2 ..][0..5];
 
-    // filter None(00) + PNG RGBA バイト [R=FF, G=00, B=00, A=FF]。
+    // filter None(00) + PNG RGBA bytes [R=FF, G=00, B=00, A=FF].
     try std.testing.expectEqualSlices(u8, &[_]u8{ 0x00, 0xFF, 0x00, 0x00, 0xFF }, scan);
 }
 
-test "encodePNG: 1px 赤 の PNG 全バイトが現行 encoder の golden と一致 (byte-invariant)" {
+test "encodePNG: 1px red PNG bytes match the current encoder golden (byte-invariant)" {
     const allocator = std.testing.allocator;
 
     const pixels = [_]u32{0xFFFF0000};
     const png_bytes = try encodePNG(&pixels, 1, 1, allocator);
     defer allocator.free(png_bytes);
 
-    // golden は移設前の現行 encoder の実出力(73 bytes)を凍結したもの（手計算ではない）。
-    // CRC32 / Adler-32 / stored block header / RGBA byte order の退行を検出する。
+    // golden freezes the encoder's actual 73-byte output (not hand-computed).
+    // Catches regressions in CRC32 / Adler-32 / stored block header / RGBA byte order.
     const golden = [_]u8{
         0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, // PNG signature
         0x00, 0x00, 0x00, 0x0D, 0x49, 0x48, 0x44, 0x52, // IHDR len=13 + "IHDR"
@@ -242,14 +242,14 @@ test "encodePNG: 1px 赤 の PNG 全バイトが現行 encoder の golden と一
     try std.testing.expectEqualSlices(u8, &golden, png_bytes);
 }
 
-test "encodedSizeExact: encodePNG の実出力長と一致（境界含む）= 事前確保で再確保なし" {
+test "encodedSizeExact: matches encodePNG output length (incl. boundaries) = pre-reserve, no realloc" {
     const gpa = std.testing.allocator;
-    // width*height を変えて raw_len の境界（0 は仕様外なので 1px から、BLOCK_MAX 跨ぎ）を踏む
+    // Vary width*height to hit raw_len boundaries (0 is out of spec, so from 1px; also cross BLOCK_MAX)
     const cases = [_]struct { w: u32, h: u32 }{
         .{ .w = 1, .h = 1 },
         .{ .w = 16, .h = 16 },
-        .{ .w = 128, .h = 128 }, // raw = (1+512)*128 = 65,664 > BLOCK_MAX（2 ブロック）
-        .{ .w = 1, .h = 13107 }, // raw = (1+4)*13107 = 65,535 = BLOCK_MAX ちょうど（exact multiple 境界）
+        .{ .w = 128, .h = 128 }, // raw = (1+512)*128 = 65,664 > BLOCK_MAX (2 blocks)
+        .{ .w = 1, .h = 13107 }, // raw = (1+4)*13107 = 65,535 = BLOCK_MAX exactly (exact-multiple boundary)
     };
     for (cases) |c| {
         const pixels = try gpa.alloc(u32, @as(usize, c.w) * c.h);

@@ -1,7 +1,7 @@
 //! appshell — headless application state persistence.
 //!
-//! ホットパス宣言: I/O は起動時の load、終了時または設定変更時の save、明示的な
-//! prune のみ。フレーム毎・RT 経路では実行しない。
+//! Hot-path note: I/O only at startup load, shutdown or settings-change save, and explicit
+//! prune. Does not run on the per-frame or RT paths.
 
 pub const paths = @import("paths.zig");
 pub const preferences = @import("preferences.zig");
@@ -11,7 +11,7 @@ pub const document_host = @import("document_host.zig");
 pub const file_safety = @import("file_safety.zig");
 pub const autosave = @import("autosave.zig");
 
-// サブモジュールの test decl を test-appshell に収集するための明示的参照。
+// Explicit refs so submodule test decls are collected by test-appshell.
 test {
     _ = paths;
     _ = preferences;

@@ -29,31 +29,31 @@ fn readChunk(data: []const u8, offset: usize) !lib.png_parser.Chunk {
 test "All test cases - IHDR verification" {
     const allocator = std.testing.allocator;
 
-    // test_cases の全テストケースについて検証
+    // Verify every test case in test_cases
     for (test_cases.test_cases) |tc| {
-        // ファイルを読み込み
+        // Read the file
         const file_data = try std.Io.Dir.cwd().readFileAlloc(std.testing.io, tc.file_path, allocator, .unlimited);
         defer allocator.free(file_data);
 
-        // PNG署名を確認
+        // Confirm the PNG signature
         try std.testing.expect(lib.png_parser.verifySignature(file_data));
 
-        // 署名をスキップ（8バイト）
+        // Skip the signature (8 bytes)
         const after_signature = file_data[8..];
 
-        // 最初のチャンクを読み取り（IHDR）
+        // Read the first chunk (IHDR)
         const chunk = try readChunk(after_signature, 0);
 
-        // IHDRチャンクであることを確認
+        // Confirm it is an IHDR chunk
         try std.testing.expectEqualSlices(u8, "IHDR", &chunk.chunk_type);
         try std.testing.expect(chunk.data.len == 13);
 
-        // IHDR情報を解析して、期待値と一致することを確認
+        // Parse IHDR and check it matches expectations
         const ihdr = try lib.png_parser.parseIHDR(chunk);
         try std.testing.expectEqual(tc.width, ihdr.width);
         try std.testing.expectEqual(tc.height, ihdr.height);
 
-        // パターンに応じて期待値を取得（検証用）
+        // Fetch expected pixels for the pattern (for verification)
         const expected_pixels = switch (tc.pattern) {
             .hardcoded => |pixels| pixels,
             .gradient => |g| try test_cases.generateGradientExpected(
@@ -89,7 +89,7 @@ test "All test cases - IHDR verification" {
             }
         }
 
-        // テストケースが有効（ここでは期待値の存在確認）
+        // Test case is valid (here: expected pixels exist)
         try std.testing.expect(expected_pixels.len == tc.width * tc.height);
     }
 }
@@ -97,17 +97,17 @@ test "All test cases - IHDR verification" {
 test "ChunkIterator - iterate all chunks" {
     const allocator = std.testing.allocator;
 
-    // 1x1_grayscale.png を読み込み
+    // Load 1x1_grayscale.png
     const file_data = try std.Io.Dir.cwd().readFileAlloc(std.testing.io, "test-data/1x1_grayscale.png", allocator, .unlimited);
     defer allocator.free(file_data);
 
-    // PNG署名を確認
+    // Confirm the PNG signature
     try std.testing.expect(lib.png_parser.verifySignature(file_data));
 
-    // チャンクイテレータを初期化
+    // Initialise the chunk iterator
     var iter = lib.png_parser.ChunkIterator.init(file_data);
 
-    // チャンク列を読み取り
+    // Read the chunk sequence
     var chunks: std.ArrayList([4]u8) = .empty;
     defer chunks.deinit(allocator);
 
@@ -115,17 +115,17 @@ test "ChunkIterator - iterate all chunks" {
         try chunks.append(allocator, chunk.chunk_type);
     }
 
-    // チャンクの順序を検証
+    // Verify chunk order
     try std.testing.expect(chunks.items.len >= 3); // IHDR, IDAT, IEND
 
-    // 最初のチャンクがIHDR
+    // First chunk is IHDR
     try std.testing.expectEqualSlices(u8, "IHDR", chunks.items[0][0..]);
 
-    // 最後のチャンクがIEND
+    // Last chunk is IEND
     const last_chunk = chunks.items[chunks.items.len - 1];
     try std.testing.expectEqualSlices(u8, "IEND", last_chunk[0..]);
 
-    // IHDR と IEND の間に IDAT が存在
+    // An IDAT exists between IHDR and IEND
     var found_idat = false;
     for (chunks.items[1 .. chunks.items.len - 1]) |chunk| {
         if (std.mem.eql(u8, chunk[0..], "IDAT")) {
@@ -139,15 +139,15 @@ test "ChunkIterator - iterate all chunks" {
 test "Collect IDAT chunks" {
     const allocator = std.testing.allocator;
 
-    // 1x1_grayscale.png を読み込み
+    // Load 1x1_grayscale.png
     const file_data = try std.Io.Dir.cwd().readFileAlloc(std.testing.io, "test-data/1x1_grayscale.png", allocator, .unlimited);
     defer allocator.free(file_data);
 
-    // IDAT チャンクを収集
+    // Collect IDAT chunks
     const idat_data = try lib.png_parser.collectIDATChunks(allocator, file_data);
     defer allocator.free(idat_data);
 
-    // IDAT データが存在することを確認
+    // Confirm IDAT data is present
     try std.testing.expect(idat_data.len > 0);
 }
 

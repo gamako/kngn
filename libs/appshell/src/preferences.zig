@@ -1,4 +1,4 @@
-//! 型付き key-value 設定。
+//! Typed key-value preferences.
 
 const std = @import("std");
 const serde = @import("serde");

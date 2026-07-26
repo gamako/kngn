@@ -1,38 +1,38 @@
-//! serde — app 横断の versioned container 直列化基盤（TASK-62.2）。
+//! serde — cross-app versioned container serialization foundation.
 //!
-//! **系譜**: RIFF/IFF 系統（magic + little-endian + FOURCC タグの length-prefixed
-//! チャンク列）を土台に、前方/後方互換のための 2 段 version（container/schema）と
-//! footer CRC を上乗せしたもの。独自発明ではなく、リポジトリ既存の PNG チャンク慣習
-//! （tag/len/payload + CRC-32/ISO-HDLC）と probe snapshot（中身非解釈の raw bytes）の
-//! 延長に位置づける。重量級のスキーマ駆動シリアライザ（protobuf/flatbuffers 等）は
-//! 「無依存・純 Zig」方針と「framework は schema 非解釈」設計に反するため採らない。
+//! **Lineage**: RIFF/IFF family (magic + little-endian + FOURCC-tagged length-prefixed
+//! chunk sequence) as the base, plus a two-level version (container/schema) for forward/backward
+//! compat and a footer CRC. Extends this repo's existing PNG chunk convention
+//! (tag/len/payload + CRC-32/ISO-HDLC) and probe-snapshot style (opaque raw bytes).
+//! Heavy schema-driven serializers (protobuf/flatbuffers, etc.) are rejected: they fight
+//! the no-deps pure-Zig policy and the "framework does not interpret schema" design.
 //!
-//! **フォーマット**（little-endian 固定）:
+//! **Format** (little-endian fixed):
 //! ```
-//! header: magic u32（呼び出し側指定・app 毎） | container_version u16(=1) | schema_version u16(app 管理・非解釈)
-//! chunks: { tag [4]u8 | len u32 | payload [len]u8 } の連続（同一 tag 複数可・出現順保存）
-//! footer: crc32 u32（header + 全 chunk を CRC-32/ISO-HDLC）
+//! header: magic u32 (caller-chosen, per app) | container_version u16(=1) | schema_version u16 (app-owned, uninterpreted)
+//! chunks: sequence of { tag [4]u8 | len u32 | payload [len]u8 } (duplicate tags allowed; order preserved)
+//! footer: crc32 u32 (CRC-32/ISO-HDLC over header + all chunks)
 //! ```
-//! - 前方互換: reader は未知 tag chunk を len で skip できる。
-//! - 後方互換: 必須 chunk の欠落検出は app 責務（framework は列挙のみ）。
-//! - app schema 非解釈: payload は []const u8 のまま返す（framework は中身を解釈しない）。
+//! - Forward compat: reader can skip unknown-tag chunks by len.
+//! - Backward compat: detecting missing required chunks is the app's job (framework only enumerates).
+//! - App schema uninterpreted: payloads are returned as []const u8 (framework does not interpret contents).
 //!
-//! **ホットパス宣言**: 直列化/復元は初期化時/イベント時のみ（保存・読込の I/O 起点。
-//! フレーム毎ループ・RT では走らない）→ SIMD 3 点セット・cache_line 分離・bench 前後比較は
-//! 不要。大 payload は @memcpy の一括転送で扱い、per-要素 append はしない
-//! （Writer は chunk 単位で ensureUnusedCapacity → appendSliceAssumeCapacity）。
-//! parse は入力 bytes への view のみで allocator を受け取らない（復元側ゼロアロケーション）。
+//! **Hot-path note**: serialize/parse run only at init/event time (save/load I/O).
+//! They do not run per-frame or on the RT path → the SIMD three-point set, cache_line separation, and before/after bench are
+//! not required. Large payloads use bulk @memcpy; no per-element append
+//! (Writer does ensureUnusedCapacity → appendSliceAssumeCapacity per chunk).
+//! parse only views the input bytes and takes no allocator (zero-allocation on the restore path).
 
 const std = @import("std");
 
-/// framework 管理のコンテナ版。schema_version（app 管理）とは分離する。
+/// Framework-managed container version. Separate from schema_version (app-managed).
 pub const container_version: u16 = 1;
 
 const header_size: usize = 4 + 2 + 2; // magic u32 + container_version u16 + schema_version u16
 const chunk_header_size: usize = 4 + 4; // tag [4]u8 + len u32
 const footer_size: usize = 4; // crc32 u32
 
-/// parse（復元）側のエラー。Writer 側の OOM / payload 過大は別（addChunk の推論エラー集合）。
+/// Errors on the parse (restore) path. Writer OOM / oversized payload are separate (addChunk's inferred error set).
 pub const Error = error{
     BadMagic,
     UnsupportedContainerVersion,
@@ -40,21 +40,21 @@ pub const Error = error{
     CrcMismatch,
 };
 
-/// 1 チャンク（tag と payload への view）。
+/// One chunk (views of tag and payload).
 pub const Chunk = struct {
     tag: [4]u8,
     payload: []const u8,
 };
 
-/// versioned container を組み立てる Writer。
+/// Writer that builds a versioned container.
 ///
-/// chunk 単位で容量を確保してから一括コピーする（per-byte append をしない）。
-/// header は init で書き、CRC は finish で末尾 4B に追記する。
+/// Reserve capacity per chunk, then bulk-copy (no per-byte append).
+/// header is written in init; CRC is appended as the trailing 4B in finish.
 pub const Writer = struct {
     buf: std.ArrayList(u8),
     gpa: std.mem.Allocator,
 
-    /// header（magic / container_version / schema_version）を書いて Writer を返す。
+    /// Write the header (magic / container_version / schema_version) and return a Writer.
     pub fn init(gpa: std.mem.Allocator, magic: u32, schema_version: u16) std.mem.Allocator.Error!Writer {
         var buf: std.ArrayList(u8) = .empty;
         errdefer buf.deinit(gpa);
@@ -71,7 +71,7 @@ pub const Writer = struct {
         self.buf.deinit(self.gpa);
     }
 
-    /// チャンクを 1 個追記する（同一 tag の複数回追記も出現順に保存される）。
+    /// Append one chunk (repeated adds of the same tag are stored in appearance order).
     pub fn addChunk(self: *Writer, tag: [4]u8, payload: []const u8) error{ OutOfMemory, PayloadTooLarge }!void {
         if (payload.len > std.math.maxInt(u32)) return error.PayloadTooLarge;
         try self.buf.ensureUnusedCapacity(self.gpa, chunk_header_size + payload.len);
@@ -82,10 +82,10 @@ pub const Writer = struct {
         self.buf.appendSliceAssumeCapacity(payload);
     }
 
-    /// footer CRC を追記し、所有権つきバイト列を返す（caller が free する）。
-    /// 呼び出し後の Writer は空（deinit は引き続き安全）。
+    /// Append the footer CRC and return an owned byte slice (caller frees).
+    /// After this call the Writer is empty (deinit remains safe).
     pub fn finish(self: *Writer) std.mem.Allocator.Error![]u8 {
-        const crc = std.hash.Crc32.hash(self.buf.items); // header + 全 chunk
+        const crc = std.hash.Crc32.hash(self.buf.items); // header + all chunks
         try self.buf.ensureUnusedCapacity(self.gpa, footer_size);
         var f: [footer_size]u8 = undefined;
         std.mem.writeInt(u32, &f, crc, .little);
@@ -94,15 +94,15 @@ pub const Writer = struct {
     }
 };
 
-/// パース済み container。入力 bytes への view のみを保持し allocator を持たない
-/// （復元側ゼロアロケーションを API 形状で構造的に担保）。
+/// Parsed container. Holds only views into the input bytes; no allocator
+/// (API shape structurally guarantees zero-allocation on the restore path).
 pub const Container = struct {
-    bytes: []const u8, // container 全体（footer 含む）への view
+    bytes: []const u8, // view of the whole container (including footer)
     schema_version_value: u16,
 
-    /// magic / container_version / CRC / chunk framing を検証して Container を返す。
-    /// `expected_magic` は呼び出し側（app）が指定した magic。serde は magic を
-    /// 知らないと BadMagic を返せないため引数で受ける。
+    /// Validate magic / container_version / CRC / chunk framing and return a Container.
+    /// `expected_magic` is the magic chosen by the caller (app). serde cannot return BadMagic
+    /// without knowing the expected value, so it is passed as an argument.
     pub fn parse(bytes: []const u8, expected_magic: u32) Error!Container {
         if (bytes.len < header_size + footer_size) return error.Truncated;
 
@@ -114,13 +114,13 @@ pub const Container = struct {
 
         const sver = std.mem.readInt(u16, bytes[6..8], .little);
 
-        // footer=末尾 4B、body（=CRC 対象）=bytes[0..len-4]（header + 全 chunk）。
+        // footer = trailing 4B; body (=CRC input) = bytes[0..len-4] (header + all chunks).
         const body = bytes[0 .. bytes.len - footer_size];
 
-        // chunk framing を **CRC より先に** 完全検証する。こうすると
-        // 構造的欠落（tail 欠落・chunk header/payload 端数）は Truncated、内容/footer の
-        // bit 破損（framing 健全）は CrcMismatch に分離できる。かつ iterator が末尾を
-        // 踏み越えない不変条件も確立する。長さ判定は加算前に残り長で行う（cursor+len の wrap 回避）。
+        // Fully validate chunk framing **before** the CRC. That way
+        // structural loss (missing tail / truncated chunk header/payload) becomes Truncated, and content/footer
+        // bit corruption (framing intact) becomes CrcMismatch. Also establishes the invariant that the iterator
+        // never walks past the end. Length checks use remaining length before adding (avoids cursor+len wrap).
         var cursor: usize = header_size;
         const end = body.len;
         while (cursor < end) {
@@ -130,22 +130,22 @@ pub const Container = struct {
             if (len > end - cursor) return error.Truncated;
             cursor += len;
         }
-        // ちょうど end で終わるはず（framing 検証の帰結。防御的に確認）。
+        // Must end exactly at end (consequence of framing validation; checked defensively).
         if (cursor != end) return error.Truncated;
 
-        // framing OK の後に CRC 照合（内容/footer 破損を CrcMismatch に分離）。
+        // After framing OK, check CRC (separates content/footer corruption into CrcMismatch).
         const stored_crc = std.mem.readInt(u32, bytes[bytes.len - footer_size ..][0..4], .little);
         if (std.hash.Crc32.hash(body) != stored_crc) return error.CrcMismatch;
 
         return .{ .bytes = bytes, .schema_version_value = sver };
     }
 
-    /// app 管理の schema version。
+    /// App-managed schema version.
     pub fn schemaVersion(self: Container) u16 {
         return self.schema_version_value;
     }
 
-    /// チャンクを出現順に列挙する iterator。
+    /// Iterator that enumerates chunks in appearance order.
     pub fn iterator(self: Container) ChunkIterator {
         return .{
             .bytes = self.bytes,
@@ -154,7 +154,7 @@ pub const Container = struct {
         };
     }
 
-    /// 指定 tag の先頭一致 payload を返す（無ければ null）。複数出現があれば iterator を使う。
+    /// Return the first payload matching tag (or null). Use the iterator when there may be duplicates.
     pub fn find(self: Container, tag: [4]u8) ?[]const u8 {
         var it = self.iterator();
         while (it.next()) |c| {
@@ -164,8 +164,8 @@ pub const Container = struct {
     }
 };
 
-/// container のチャンクを出現順に返す iterator。framing は parse で検証済みなので
-/// next() は無検査で view を切り出す（bounds は parse が保証する不変条件）。
+/// Iterator over the container's chunks in appearance order. Framing was validated in parse, so
+/// next() slices views without checks (bounds are the invariant parse guarantees).
 pub const ChunkIterator = struct {
     bytes: []const u8,
     cursor: usize,
@@ -185,20 +185,20 @@ pub const ChunkIterator = struct {
 
 // ============================ tests ============================
 
-test "round-trip: 出現順・同一 tag・ゼロ長・大 payload を bit 復元" {
+test "round-trip: appearance order / same tag / zero-length / large payload bit-restore" {
     const gpa = std.testing.allocator;
     const magic: u32 = 0xA1B2C3D4;
 
-    // 256x256 級（pixie の 1 layer 相当）の大 payload。
+    // Large payload at 256x256 scale (one pixie layer).
     var big: [256 * 256 * 4]u8 = undefined;
     for (&big, 0..) |*b, i| b.* = @truncate(i * 7 + 3);
 
     var w = try Writer.init(gpa, magic, 42);
     defer w.deinit();
     try w.addChunk("DOCH".*, "meta-A");
-    try w.addChunk("LAYR".*, ""); // ゼロ長
-    try w.addChunk("LAYR".*, "layer-2"); // 同一 tag（出現順保存）
-    try w.addChunk("LPIX".*, &big); // 大 payload
+    try w.addChunk("LAYR".*, ""); // zero-length
+    try w.addChunk("LAYR".*, "layer-2"); // same tag (appearance order preserved)
+    try w.addChunk("LPIX".*, &big); // large payload
     const bytes = try w.finish();
     defer gpa.free(bytes);
 
@@ -220,15 +220,15 @@ test "round-trip: 出現順・同一 tag・ゼロ長・大 payload を bit 復�
     try std.testing.expectEqualSlices(u8, &big, c3.payload);
     try std.testing.expect(it.next() == null);
 
-    // find は先頭一致
+    // find returns the first match
     try std.testing.expectEqualSlices(u8, "meta-A", c.find("DOCH".*).?);
-    try std.testing.expectEqual(@as(usize, 0), c.find("LAYR".*).?.len); // 先頭 LAYR = zero-len
+    try std.testing.expectEqual(@as(usize, 0), c.find("LAYR".*).?.len); // first LAYR = zero-len
     try std.testing.expect(c.find("NOPE".*) == null);
 }
 
-test "Document 相当: DOCH + LAYR×N + LPIX の構成を round-trip" {
+test "Document-shaped: DOCH + LAYR×N + LPIX layout round-trip" {
     const gpa = std.testing.allocator;
-    const magic: u32 = 0x70697831; // 'pix1' 相当
+    const magic: u32 = 0x70697831; // 'pix1' equivalent
 
     var w = try Writer.init(gpa, magic, 1);
     defer w.deinit();
@@ -267,14 +267,14 @@ test "Document 相当: DOCH + LAYR×N + LPIX の構成を round-trip" {
     try std.testing.expect(it.next() == null);
 }
 
-test "前方互換: 未知 tag を挟んでも既知 chunk を読める（skip）" {
+test "Forward compat: known chunks readable with unknown tags in between (skip)" {
     const gpa = std.testing.allocator;
     const magic: u32 = 0x55667788;
 
     var w = try Writer.init(gpa, magic, 3);
     defer w.deinit();
     try w.addChunk("DOCH".*, "doc");
-    try w.addChunk("XxYy".*, "future-unknown-chunk-payload"); // 未知 tag
+    try w.addChunk("XxYy".*, "future-unknown-chunk-payload"); // unknown tag
     try w.addChunk("LPIX".*, "pixels");
     const bytes = try w.finish();
     defer gpa.free(bytes);
@@ -285,10 +285,10 @@ test "前方互換: 未知 tag を挟んでも既知 chunk を読める（skip�
     var count: usize = 0;
     var it = c.iterator();
     while (it.next()) |_| count += 1;
-    try std.testing.expectEqual(@as(usize, 3), count); // 未知 tag も列挙される
+    try std.testing.expectEqual(@as(usize, 3), count); // unknown tags are enumerated too
 }
 
-test "破損検出: BadMagic / UnsupportedContainerVersion / Truncated / CrcMismatch" {
+test "Corruption detection: BadMagic / UnsupportedContainerVersion / Truncated / CrcMismatch" {
     const gpa = std.testing.allocator;
     const magic: u32 = 0x11223344;
 
@@ -301,21 +301,21 @@ test "破損検出: BadMagic / UnsupportedContainerVersion / Truncated / CrcMism
     // BadMagic
     try std.testing.expectError(error.BadMagic, Container.parse(bytes, 0xDEADBEEF));
 
-    // UnsupportedContainerVersion（magic の次に検査＝crc より先）
+    // UnsupportedContainerVersion (checked right after magic = before crc)
     {
         const dup = try gpa.dupe(u8, bytes);
         defer gpa.free(dup);
-        dup[4] = 0x02; // container_version を 2 に
+        dup[4] = 0x02; // set container_version to 2
         try std.testing.expectError(error.UnsupportedContainerVersion, Container.parse(dup, magic));
     }
 
-    // 末尾 1 byte 欠落: 最終 chunk の宣言 len が残りを超えるため framing 検証が Truncated を返す
-    // （CRC より前に framing を検証するので、構造的欠落は Truncated に分離される）
+    // Missing trailing 1 byte: declared len of the last chunk exceeds remaining, so framing validation returns Truncated
+    // (framing is checked before CRC, so structural loss is separated into Truncated)
     try std.testing.expectError(error.Truncated, Container.parse(bytes[0 .. bytes.len - 1], magic));
-    // Truncated: header+footer より短い
+    // Truncated: shorter than header+footer
     try std.testing.expectError(error.Truncated, Container.parse(bytes[0..4], magic));
 
-    // CrcMismatch: payload 1bit 破壊
+    // CrcMismatch: flip 1 bit in the payload
     {
         const dup = try gpa.dupe(u8, bytes);
         defer gpa.free(dup);
@@ -323,24 +323,24 @@ test "破損検出: BadMagic / UnsupportedContainerVersion / Truncated / CrcMism
         try std.testing.expectError(error.CrcMismatch, Container.parse(dup, magic));
     }
 
-    // Truncated: chunk len が残りより過大（framing 検証 / overflow-safe）。CRC を正しく詰めても
-    // framing を先に検証するので Truncated が返る（CrcMismatch に化けない）ことも確認する。
+    // Truncated: chunk len larger than remaining (framing validation / overflow-safe). Even with a correct CRC,
+    // framing-first validation returns Truncated (does not morph into CrcMismatch).
     {
         var frame: [header_size + chunk_header_size + footer_size]u8 = undefined;
         std.mem.writeInt(u32, frame[0..4], magic, .little);
         std.mem.writeInt(u16, frame[4..6], container_version, .little);
         std.mem.writeInt(u16, frame[6..8], 0, .little);
         @memcpy(frame[8..12], "BBBB");
-        std.mem.writeInt(u32, frame[12..16], 999, .little); // payload 無しなのに len=999
+        std.mem.writeInt(u32, frame[12..16], 999, .little); // len=999 with no payload
         const crc = std.hash.Crc32.hash(frame[0 .. frame.len - footer_size]);
         std.mem.writeInt(u32, frame[frame.len - footer_size ..][0..4], crc, .little);
         try std.testing.expectError(error.Truncated, Container.parse(&frame, magic));
     }
 }
 
-test "固定 fixture: 手書き byte 列を既知 CRC 定数で検証（Writer 非依存）" {
-    // magic=0xAABBCCDD, container_version=1, schema=7, chunk 'TEST' payload "hi"。
-    // footer crc = 0x9F88F4D1（Python zlib.crc32 で算出した独立オラクル）。
+test "Fixed fixture: handwritten bytes checked against a known CRC constant (Writer-independent)" {
+    // magic=0xAABBCCDD, container_version=1, schema=7, chunk 'TEST' payload "hi".
+    // footer crc = 0x9F88F4D1 (independent oracle from Python zlib.crc32).
     const fixture = [_]u8{
         0xDD, 0xCC, 0xBB, 0xAA, // magic u32 LE
         0x01, 0x00, // container_version u16 LE
@@ -354,8 +354,8 @@ test "固定 fixture: 手書き byte 列を既知 CRC 定数で検証（Writer �
     try std.testing.expectEqual(@as(u16, 7), c.schemaVersion());
     try std.testing.expectEqualSlices(u8, "hi", c.find("TEST".*).?);
 
-    // 1 byte 破壊 → CrcMismatch
+    // Flip 1 byte → CrcMismatch
     var bad = fixture;
-    bad[17] ^= 0x01; // payload の 'i'
+    bad[17] ^= 0x01; // the 'i' in the payload
     try std.testing.expectError(error.CrcMismatch, Container.parse(&bad, 0xAABBCCDD));
 }

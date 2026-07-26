@@ -1,17 +1,17 @@
-//! スペクトログラム解析・描画（メインスレッド専用、TASK-27.8 / 対数軸・ラベル・カラーマップ改良 27.17）。
+//! Spectrogram analysis and drawing (main-thread only; log axis / labels / colormap).
 //!
-//! mono サンプルを溜めて FFT_SIZE 毎に Hann+FFT し、振幅を時間×周波数の列として蓄積。
-//! framebuffer の指定領域にヒートマップ（左=古い, 右=新しい / 下=低域, 上=高域）で描画する。
-//! 周波数軸は **対数**(低域が縦に広く見える)。配色は magma 風ランプ。Hz/dB ラベルは apps 側が描画する。
+//! Accumulates mono samples; every FFT_SIZE runs Hann+FFT and stores amplitude as time×frequency columns.
+//! Draws a heatmap into a framebuffer region (left=older, right=newer / bottom=low, top=high).
+//! Frequency axis is **logarithmic** (lows take more vertical space). Colormap is magma-like. Hz/dB labels are drawn by apps.
 
 const std = @import("std");
 const dsp = @import("dsp");
 
 pub const FFT_SIZE: usize = 512;
 pub const N_BINS: usize = FFT_SIZE / 2;
-pub const DB_FLOOR: f32 = -60.0; // 強度マップ/凡例の下限 dBFS
+pub const DB_FLOOR: f32 = -60.0; // Lower bound dBFS for the intensity map / legend
 
-/// `width` 時間列 × `height` 周波数行のスペクトログラム。サイズが大きいので heap 確保推奨。
+/// Spectrogram of `width` time columns × `height` frequency rows. Prefer heap allocation; the type is large.
 pub fn Spectrogram(comptime width: usize, comptime height: usize) type {
     if (height < 2) @compileError("Spectrogram height must be >= 2");
     return struct {
@@ -23,16 +23,16 @@ pub fn Spectrogram(comptime width: usize, comptime height: usize) type {
         scratch_im: [FFT_SIZE]f32 = undefined,
         mags: [N_BINS]f32 = undefined,
 
-        cols: [width * height]u8 = undefined, // intensity（init() で 0 クリア）
-        head: usize = 0, // 次に書く列（リング）
+        cols: [width * height]u8 = undefined, // intensity (zeroed in init())
+        head: usize = 0, // Next column to write (ring)
         filled: usize = 0,
 
-        // 周波数軸(setSampleRate/setSampleRateLinear で算出)
+        // Frequency axis (computed in setSampleRate/setSampleRateLinear)
         sample_rate: f32 = 48000,
         f_min: f32 = 50,
         f_max: f32 = 24000,
-        row_bin: [height]usize = undefined, // 表示行(0=低域) → FFT bin
-        log_scale: bool = true, // false ならリニア周波数軸（既定は対数=既存挙動と完全一致）
+        row_bin: [height]usize = undefined, // Display row (0=low) → FFT bin
+        log_scale: bool = true, // false → linear frequency axis (default log = fully matches prior behaviour)
 
         pub fn init(self: *Self, sample_rate: f32) void {
             self.accum_len = 0;
@@ -42,17 +42,17 @@ pub fn Spectrogram(comptime width: usize, comptime height: usize) type {
             self.setSampleRate(sample_rate);
         }
 
-        /// サンプルレートを設定し、行→bin の対数マッピングを再計算する(audio.open 後・start 前に呼ぶ)。
+        /// Set the sample rate and recompute the log row→bin map (call after audio.open, before start).
         pub fn setSampleRate(self: *Self, sample_rate: f32) void {
             self.log_scale = true;
             self.recomputeRowBin(sample_rate);
         }
 
-        /// サンプルレートを設定し、行→bin の**リニア**マッピングを再計算する。対数軸では高域ほど
-        /// 表示行が圧縮される(例: 48kHz サンプリングでの 16kHz 以上は上端のごく僅かな行にしかならない)ため、
-        /// 特定の高域バンドを監視する用途(例: 超高域アラート)ではリニア軸の方が帯域に見合った表示面積を
-        /// 確保できる。`init()` の後に呼んで軸だけリニアに上書きする使い方を想定
-        /// （`init()` 自体は既存呼び出し元との後方互換のため対数のまま）。
+        /// Set the sample rate and recompute the **linear** row→bin map. On a log axis, highs are
+        /// compressed into few display rows (e.g. ≥16kHz at 48kHz sampling occupies only the topmost rows),
+        /// so linear is better when watching a specific high band (e.g. ultrasonic alert) and you need
+        /// display area proportional to bandwidth. Intended use: call after `init()` to overwrite the axis only
+        /// (`init()` itself stays logarithmic for backward compatibility with existing callers).
         pub fn setSampleRateLinear(self: *Self, sample_rate: f32) void {
             self.log_scale = false;
             self.recomputeRowBin(sample_rate);
@@ -61,12 +61,12 @@ pub fn Spectrogram(comptime width: usize, comptime height: usize) type {
         fn recomputeRowBin(self: *Self, sample_rate: f32) void {
             self.sample_rate = sample_rate;
             const bin_hz = sample_rate / @as(f32, @floatFromInt(FFT_SIZE));
-            self.f_min = @max(bin_hz, 50.0); // 最低ビン(=bin_hz)未満は意味がない。ゼロ割回避
-            self.f_max = sample_rate * 0.5; // ナイキスト(ラベル範囲用の理論上限)
+            self.f_min = @max(bin_hz, 50.0); // Below the lowest bin (=bin_hz) is meaningless. Avoid division by zero
+            self.f_max = sample_rate * 0.5; // Nyquist (theoretical upper bound for label range)
             const denom: f32 = @floatFromInt(height - 1);
-            const ratio = self.f_max / self.f_min; // log_scale 時のみ使用
+            const ratio = self.f_max / self.f_min; // Used only when log_scale
             for (0..height) |r| {
-                const frac = @as(f32, @floatFromInt(r)) / denom; // 0..1(0=低域)
+                const frac = @as(f32, @floatFromInt(r)) / denom; // 0..1 (0=low)
                 const freq = if (self.log_scale)
                     self.f_min * std.math.pow(f32, ratio, frac)
                 else
@@ -76,8 +76,8 @@ pub fn Spectrogram(comptime width: usize, comptime height: usize) type {
             }
         }
 
-        /// 周波数 freq の描画行(上端からのオフセット, 0=上/高域)。範囲外は null。
-        /// 描画は py = y0 + (height-1-row) なので offset = height-1-row。
+        /// Display-row offset for frequency freq (from the top; 0=top/high). Out of range → null.
+        /// Drawing uses py = y0 + (height-1-row), so offset = height-1-row.
         pub fn rowOffsetForFreq(self: *const Self, freq: f32) ?usize {
             if (freq < self.f_min or freq > self.f_max) return null;
             const frac = if (self.log_scale)
@@ -95,7 +95,7 @@ pub fn Spectrogram(comptime width: usize, comptime height: usize) type {
             return self.f_max;
         }
 
-        /// mono サンプルを供給。FFT_SIZE 溜まるごとに 1 列計算する。
+        /// Feed mono samples. Every FFT_SIZE samples, one column is computed.
         pub fn feed(self: *Self, mono: []const f32) void {
             var i: usize = 0;
             while (i < mono.len) {
@@ -115,27 +115,27 @@ pub fn Spectrogram(comptime width: usize, comptime height: usize) type {
             const base = self.head * height;
             var row: usize = 0;
             while (row < height) : (row += 1) {
-                // 下(row 0)=低域, 上=高域。対数マッピングで表示行を周波数ビンへ。
+                // Bottom (row 0)=low, top=high. Log mapping places display rows onto frequency bins.
                 const bin = self.row_bin[row];
-                const mag = self.mags[bin] / @as(f32, FFT_SIZE); // 正規化
+                const mag = self.mags[bin] / @as(f32, FFT_SIZE); // Normalize
                 self.cols[base + row] = magToIntensity(mag);
             }
             self.head = (self.head + 1) % width;
             if (self.filled < width) self.filled += 1;
         }
 
-        /// framebuffer(`pixels`, 横幅 `fb_w`) の (x0,y0) を左上に width×height で描画。
+        /// Draw into framebuffer (`pixels`, width `fb_w`) with (x0,y0) as top-left of width×height.
         pub fn draw(self: *const Self, pixels: []u32, fb_w: usize, fb_h: usize, x0: usize, y0: usize) void {
             var cx: usize = 0;
             while (cx < self.filled) : (cx += 1) {
-                // 古い列→左、新しい列→右
+                // Older columns→left, newer→right
                 const col = (self.head + width - self.filled + cx) % width;
                 const base = col * height;
                 const px = x0 + cx;
                 if (px >= fb_w) break;
                 var row: usize = 0;
                 while (row < height) : (row += 1) {
-                    const py = y0 + (height - 1 - row); // 低域を下に
+                    const py = y0 + (height - 1 - row); // Lows at the bottom
                     if (py >= fb_h) continue;
                     pixels[py * fb_w + px] = intensityColor(self.cols[base + row]);
                 }
@@ -145,13 +145,13 @@ pub fn Spectrogram(comptime width: usize, comptime height: usize) type {
 }
 
 fn magToIntensity(mag: f32) u8 {
-    // dB 換算して [DB_FLOOR, 0]dB を 0..255 にマップ
+    // Convert to dB and map [DB_FLOOR, 0]dB onto 0..255
     const db = 20.0 * std.math.log10(mag + 1e-9);
     const norm = std.math.clamp((db - DB_FLOOR) / (-DB_FLOOR), 0.0, 1.0);
     return @intFromFloat(norm * 255.0);
 }
 
-// magma 風カラーランプの stop(黒→紫→赤→橙→黄白)。
+// Magma-like color-ramp stops (black→purple→red→orange→yellow-white).
 const color_stops = [_][3]u8{
     .{ 0, 0, 0 },
     .{ 60, 12, 80 },
@@ -166,10 +166,10 @@ fn lerpU8(a: u8, b: u8, t: f32) u8 {
     return @intFromFloat(@round(af + (bf - af) * t));
 }
 
-/// 強度 v(0..255) → framebuffer 形式 0xAARRGGBB(u32 = b|g<<8|r<<16|a<<24)。
-/// magma 風(黒→紫→赤→橙→黄白)。凡例描画でも同じ配色を使えるよう pub。
+/// Intensity v(0..255) → framebuffer form 0xAARRGGBB (u32 = b|g<<8|r<<16|a<<24).
+/// Magma-like (black→purple→red→orange→yellow-white). pub so legend drawing can share the ramp.
 pub fn intensityColor(v: u8) u32 {
-    const n_seg = color_stops.len - 1; // 4 区間
+    const n_seg = color_stops.len - 1; // 4 segments
     const seg_f = @as(f32, @floatFromInt(v)) / 255.0 * @as(f32, @floatFromInt(n_seg)); // 0..4
     var seg: usize = @intFromFloat(seg_f);
     if (seg >= n_seg) seg = n_seg - 1;
@@ -193,7 +193,7 @@ test "Spectrogram: feed produces columns and a tone lights a band" {
     spec.init(48000);
     try testing.expectEqual(@as(usize, 0), spec.filled);
 
-    // 周波数ビン k0 の正弦（FFT_SIZE 周期に合わせる）を数列ぶん供給
+    // Feed several columns of a sine at frequency bin k0 (period matched to FFT_SIZE)
     var buf: [FFT_SIZE]f32 = undefined;
     const k0 = 64;
     var i: usize = 0;
@@ -205,8 +205,8 @@ test "Spectrogram: feed produces columns and a tone lights a band" {
     while (c < 3) : (c += 1) spec.feed(&buf);
     try testing.expectEqual(@as(usize, 3), spec.filled);
 
-    // 直近列で最も明るい行が、k0(=64) 近傍の bin にマップされた行であること
-    // (= computeColumn が row_bin を使って対数軸に正しく配置している回帰検証)。
+    // Brightest row in the newest column must map near bin k0(=64)
+    // (= regression: computeColumn places energy on the log axis via row_bin).
     const last_col = (spec.head + 16 - 1) % 16;
     var max_row: usize = 0;
     var max_v: u8 = 0;
@@ -218,22 +218,22 @@ test "Spectrogram: feed produces columns and a tone lights a band" {
             max_row = row;
         }
     }
-    try testing.expect(max_v > 0); // 点灯している
+    try testing.expect(max_v > 0); // Lit
     const mapped_bin = spec.row_bin[max_row];
-    try testing.expect(mapped_bin >= 60 and mapped_bin <= 68); // k0=64 近傍(リーク許容)
+    try testing.expect(mapped_bin >= 60 and mapped_bin <= 68); // Near k0=64 (leakage allowed)
 }
 
 test "Spectrogram: log frequency axis (row_bin non-decreasing, low-freq emphasis)" {
     const Spec = Spectrogram(8, 64);
     var spec: Spec = undefined;
     spec.init(48000);
-    // 単調非減少(低域では複数行が同 bin に丸まる)
+    // Monotonic non-decreasing (several low rows can round to the same bin)
     var prev: usize = spec.row_bin[0];
     for (spec.row_bin[1..]) |b| {
         try testing.expect(b >= prev);
         prev = b;
     }
-    // 低域強調: bin <= N_BINS/8 にマップされる行数が、線形マップ時より多い
+    // Low-end emphasis: more rows map to bin <= N_BINS/8 than under a linear map
     var log_low: usize = 0;
     var lin_low: usize = 0;
     for (0..64) |r| {
@@ -249,26 +249,26 @@ test "Spectrogram: rowOffsetForFreq maps low->bottom, high->top, out-of-range nu
     spec.init(48000);
     const lo = spec.rowOffsetForFreq(spec.freqMin()).?;
     const hi = spec.rowOffsetForFreq(8000).?;
-    try testing.expect(lo > hi); // 低域=下(offset 大), 高域=上(offset 小)
+    try testing.expect(lo > hi); // Low=bottom (large offset), high=top (small offset)
     try testing.expect(lo <= 63 and hi <= 63);
-    try testing.expect(spec.rowOffsetForFreq(10.0) == null); // f_min 未満
-    try testing.expect(spec.rowOffsetForFreq(30000.0) == null); // f_max 超
+    try testing.expect(spec.rowOffsetForFreq(10.0) == null); // Below f_min
+    try testing.expect(spec.rowOffsetForFreq(30000.0) == null); // Above f_max
 }
 
 test "Spectrogram: linear frequency axis (row_bin non-decreasing, fewer low-freq rows than log)" {
     const Spec = Spectrogram(8, 64);
     var log_spec: Spec = undefined;
-    log_spec.init(48000); // 既定=対数
+    log_spec.init(48000); // Default = log
     var lin_spec: Spec = undefined;
     lin_spec.init(48000);
-    lin_spec.setSampleRateLinear(48000); // 軸だけリニアに上書き
-    // リニアでも単調非減少
+    lin_spec.setSampleRateLinear(48000); // Overwrite axis to linear only
+    // Linear is also monotonic non-decreasing
     var prev: usize = lin_spec.row_bin[0];
     for (lin_spec.row_bin[1..]) |b| {
         try testing.expect(b >= prev);
         prev = b;
     }
-    // リニアは低域強調しない: bin <= N_BINS/8 にマップされる行数が対数軸より少ない
+    // Linear has no low-end emphasis: fewer rows map to bin <= N_BINS/8 than on the log axis
     var log_low: usize = 0;
     var lin_low: usize = 0;
     for (0..64) |r| {
@@ -276,9 +276,9 @@ test "Spectrogram: linear frequency axis (row_bin non-decreasing, fewer low-freq
         if (lin_spec.row_bin[r] <= N_BINS / 8) lin_low += 1;
     }
     try testing.expect(lin_low < log_low);
-    // 線形性は「算術中点の周波数が縦のほぼ中央に来る」テスト（下記 rowOffsetForFreq linear）で固定する。
-    // 端点は clamp([1, N_BINS-1]) で歪む（FFT_SIZE=512 だと f_max=24kHz が bin 256→255 にクランプされ
-    // 上端数行がフラット化する）ため、隣接行の等間隔性は表示行全域では成り立たない。
+    // Linearity is pinned by the "arithmetic midpoint near vertical center" test below (rowOffsetForFreq linear).
+    // Endpoints distort under clamp([1, N_BINS-1]) (at FFT_SIZE=512, f_max=24kHz clamps bin 256→255 and
+    // flattens the top few rows), so equal spacing of adjacent rows does not hold across the full display.
 }
 
 test "Spectrogram: rowOffsetForFreq linear maps arithmetic mid to vertical middle" {
@@ -288,13 +288,13 @@ test "Spectrogram: rowOffsetForFreq linear maps arithmetic mid to vertical middl
     spec.setSampleRateLinear(48000);
     const lo = spec.rowOffsetForFreq(spec.freqMin()).?;
     const hi = spec.rowOffsetForFreq(spec.freqMax() * 0.999).?;
-    try testing.expect(lo > hi); // 低域=下(offset 大), 高域=上(offset 小)
-    // リニアでは算術中点の周波数が縦のほぼ中央に来る（対数では幾何中点が中央）
+    try testing.expect(lo > hi); // Low=bottom (large offset), high=top (small offset)
+    // Linear: arithmetic midpoint near vertical center (log: geometric midpoint at center)
     const mid_freq = (spec.freqMin() + spec.freqMax()) / 2.0;
     const mid_off = spec.rowOffsetForFreq(mid_freq).?;
-    try testing.expect(mid_off >= 28 and mid_off <= 35); // height=64 → 中央 ≈ 31
-    try testing.expect(spec.rowOffsetForFreq(spec.freqMin() - 1.0) == null); // 範囲外
-    try testing.expect(spec.rowOffsetForFreq(30000.0) == null); // f_max 超
+    try testing.expect(mid_off >= 28 and mid_off <= 35); // height=64 → center ≈ 31
+    try testing.expect(spec.rowOffsetForFreq(spec.freqMin() - 1.0) == null); // Out of range
+    try testing.expect(spec.rowOffsetForFreq(30000.0) == null); // Above f_max
 }
 
 test "magToIntensity: silence -> 0, loud -> high" {
@@ -308,11 +308,11 @@ test "intensityColor: black at 0, luminance increases across stops" {
             return (c & 0xFF) + ((c >> 8) & 0xFF) + ((c >> 16) & 0xFF);
         }
     };
-    try testing.expectEqual(@as(u32, 0), lum.f(intensityColor(0))); // 黒
+    try testing.expectEqual(@as(u32, 0), lum.f(intensityColor(0))); // Black
     var prev: u32 = 0;
     for ([_]u8{ 64, 128, 192, 255 }) |v| {
         const l = lum.f(intensityColor(v));
-        try testing.expect(l > prev); // 輝度が概ね単調増加
+        try testing.expect(l > prev); // Luminance is roughly monotonic increasing
         prev = l;
     }
 }

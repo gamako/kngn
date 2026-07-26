@@ -1,19 +1,19 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 
-/// ProfiledAllocator はメモリ割り当てを追跡し、統計情報を提供するアロケータラッパーです。
-/// ピークメモリ使用量、現在のメモリ使用量、割り当て回数を追跡します。
+/// ProfiledAllocator is an allocator wrapper that tracks memory-allocation statistics.
+/// It tracks peak memory use, current memory use, and allocation count.
 ///
-/// **注意**: このアロケータは単一スレッド専用です。
-/// 複数スレッドから同時にアクセスするとデータ競合が発生し、未定義動作となります。
-/// マルチスレッド環境では、各スレッドで独立した ProfiledAllocator インスタンスを使用してください。
+/// **Note**: this allocator is single-threaded only.
+/// Concurrent access from multiple threads causes data races and undefined behaviour.
+/// In multithreaded use, give each thread its own ProfiledAllocator instance.
 pub const ProfiledAllocator = struct {
     child_allocator: Allocator,
     current_bytes: usize,
     peak_bytes: usize,
     allocation_count: usize,
 
-    /// 子アロケータをラップして ProfiledAllocator を初期化します
+    /// Wrap a child allocator and initialise ProfiledAllocator
     pub fn init(child: Allocator) ProfiledAllocator {
         return .{
             .child_allocator = child,
@@ -23,7 +23,7 @@ pub const ProfiledAllocator = struct {
         };
     }
 
-    /// std.mem.Allocator インターフェースを返します
+    /// Return the std.mem.Allocator interface
     pub fn allocator(self: *ProfiledAllocator) Allocator {
         return .{
             .ptr = self,
@@ -36,24 +36,24 @@ pub const ProfiledAllocator = struct {
         };
     }
 
-    /// 統計情報をリセットします（ベンチマーク前に呼び出す）
+    /// Reset statistics (call before a benchmark)
     pub fn reset(self: *ProfiledAllocator) void {
         self.current_bytes = 0;
         self.peak_bytes = 0;
         self.allocation_count = 0;
     }
 
-    /// 統計情報の構造体
+    /// Statistics struct
     pub const Stats = struct {
-        /// 現在のメモリ使用量（バイト単位）
+        /// Current memory use in bytes
         current_bytes: usize,
-        /// ピークメモリ使用量（バイト単位）- reset() 以降の最大値
+        /// Peak memory use in bytes — maximum since reset()
         peak_bytes: usize,
-        /// 累積割り当て成功回数 - 解放時には減らない
+        /// Cumulative successful allocation count — not decreased on free
         allocation_count: usize,
     };
 
-    /// 現在の統計情報を取得します
+    /// Return the current statistics
     pub fn getStats(self: *ProfiledAllocator) Stats {
         return .{
             .current_bytes = self.current_bytes,
@@ -63,7 +63,7 @@ pub const ProfiledAllocator = struct {
     }
 
     // ========================================
-    // Allocator vtable の実装
+    // Allocator vtable implementation
     // ========================================
 
     fn alloc(
@@ -74,13 +74,13 @@ pub const ProfiledAllocator = struct {
     ) ?[*]u8 {
         const self: *ProfiledAllocator = @ptrCast(@alignCast(ctx));
 
-        // 子アロケータから割り当て
+        // Allocate from the child allocator
         const result = self.child_allocator.rawAlloc(len, ptr_align, ret_addr) orelse return null;
 
-        // 統計を更新（長さ 0 の割り当ては無視）
+        // Update stats (ignore zero-length allocations)
         if (len > 0) {
             self.current_bytes += len;
-            self.allocation_count += 1; // 累積カウント（解放時に減らさない）
+            self.allocation_count += 1; // Cumulative count (not decreased on free)
             if (self.current_bytes > self.peak_bytes) {
                 self.peak_bytes = self.current_bytes;
             }
@@ -100,7 +100,7 @@ pub const ProfiledAllocator = struct {
 
         const success = self.child_allocator.rawResize(buf, buf_align, new_len, ret_addr);
         if (success) {
-            // 統計を更新（差分を計算）
+            // Update stats (compute the delta)
             const old_len = buf.len;
             if (new_len > old_len) {
                 self.current_bytes += (new_len - old_len);
@@ -109,7 +109,7 @@ pub const ProfiledAllocator = struct {
                 }
             } else {
                 const delta = old_len - new_len;
-                std.debug.assert(self.current_bytes >= delta); // アンダーフロー検出
+                std.debug.assert(self.current_bytes >= delta); // Underflow detection
                 self.current_bytes -= delta;
             }
         }
@@ -127,7 +127,7 @@ pub const ProfiledAllocator = struct {
 
         const result = self.child_allocator.rawRemap(buf, buf_align, new_len, ret_addr) orelse return null;
 
-        // 統計を更新（差分を計算）
+        // Update stats (compute the delta)
         const old_len = buf.len;
         if (new_len > old_len) {
             self.current_bytes += (new_len - old_len);
@@ -136,7 +136,7 @@ pub const ProfiledAllocator = struct {
             }
         } else {
             const delta = old_len - new_len;
-            std.debug.assert(self.current_bytes >= delta); // アンダーフロー検出
+            std.debug.assert(self.current_bytes >= delta); // Underflow detection
             self.current_bytes -= delta;
         }
 
@@ -151,13 +151,13 @@ pub const ProfiledAllocator = struct {
     ) void {
         const self: *ProfiledAllocator = @ptrCast(@alignCast(ctx));
 
-        // 統計を更新（長さ 0 の解放は無視）
+        // Update stats (ignore zero-length frees)
         if (buf.len > 0) {
-            std.debug.assert(self.current_bytes >= buf.len); // アンダーフロー検出
+            std.debug.assert(self.current_bytes >= buf.len); // Underflow detection
             self.current_bytes -= buf.len;
         }
 
-        // 子アロケータで解放
+        // Free via the child allocator
         self.child_allocator.rawFree(buf, buf_align, ret_addr);
     }
 };

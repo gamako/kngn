@@ -1,4 +1,4 @@
-//! ウィンドウの保存状態と画面外判定。
+//! Saved window state and off-screen detection.
 
 const std = @import("std");
 const serde = @import("serde");

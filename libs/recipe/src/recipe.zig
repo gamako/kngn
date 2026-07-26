@@ -1,36 +1,36 @@
-//! recipe — CommandRecord 列（意味的コマンド列）の save/load（TASK-62.5.8）。
+//! recipe — save/load of a CommandRecord sequence (semantic command list).
 //!
-//! std + libs/serde のみ（core 非依存）。CommandLog→Entry の変換は app 側が
-//! `RecordView` を渡して `collectNormalEntries` を呼ぶ（型結合を避けて薄く保つ）。
+//! std + libs/serde only (no core dependency). App converts CommandLog→Entry by
+//! passing `RecordView` into `collectNormalEntries` (kept thin; avoids type coupling).
 //!
-//! フォーマット（serde versioned container。magic='RCP1'、schema=format_version）:
-//! - HEAD(1個・先頭): app_name UTF-8（≤ MAX_APP_NAME）
-//! - ENTR(N回・出現順): name_len u8 | name | args_len u16 LE | args
+//! Format (serde versioned container; magic='RCP1', schema=format_version):
+//! - HEAD (exactly one, first): app_name UTF-8 (≤ MAX_APP_NAME)
+//! - ENTR (N times, appearance order): name_len u8 | name | args_len u16 LE | args
 //!
-//! **サイズ上限（共有ファイル防御）**:
-//! - `MAX_RECIPE_BYTES`（4MiB）: ファイル全体 / 累積 ENTR payload の上限。action args は
-//!   CommandRecord 契約で ≤4096B（`MAX_CMD_ARGS`）なので、現実的なコマンド列（数千〜数万）を
-//!   余裕をもって収める値。共有・外部から渡される recipe を無制限に読むとメモリ枯渇を
-//!   誘発できるため、`load` の read と `decode` の双方で拒否する。
-//! - `MAX_ENTRIES`（65536）: 細切れ ENTR による alloc 嵐を防ぐ。CommandLog リングは 128 だが、
-//!   共有レシピはそれより長くなりうるため余裕を持たせつつ上限を設ける。
+//! **Size limits (defense for shared files)**:
+//! - `MAX_RECIPE_BYTES` (4MiB): cap on whole file / cumulative ENTR payload. Action args are
+//!   ≤4096B under the CommandRecord contract (`MAX_CMD_ARGS`), so this fits realistic command
+//!   sequences (thousands to tens of thousands) with headroom. Unbounded reads of shared/external
+//!   recipes can exhaust memory, so both `load` reads and `decode` reject oversize input.
+//! - `MAX_ENTRIES` (65536): caps alloc storms from tiny ENTR chunks. CommandLog ring is 128, but
+//!   shared recipes can be longer, so the cap is higher with headroom.
 //!
-//! ホットパス宣言: save/load/collect はすべてイベント時のみ（action 実行時・ファイル I/O）。
-//! フレーム毎・RT に触れない。
+//! Hot-path note: save/load/collect run only at event time (action execution / file I/O).
+//! They do not touch the per-frame or RT paths.
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const serde = @import("serde");
 
-/// .recipe の magic（FourCC 'RCP1' の little-endian u32）。
+/// .recipe magic (FourCC 'RCP1' as little-endian u32).
 pub const magic: u32 = @as(u32, 'R') | (@as(u32, 'C') << 8) | (@as(u32, 'P') << 16) | (@as(u32, '1') << 24);
-/// レシピ schema / format_version（serde の schema_version に載せる）。
+/// Recipe schema / format_version (carried in serde's schema_version).
 pub const format_version: u16 = 1;
-/// header.app_name の上限バイト数。
+/// Max byte length of header.app_name.
 pub const MAX_APP_NAME: usize = 64;
-/// レシピファイル全体（および decode 中の累積 ENTR payload）の上限バイト数。根拠はファイル先頭 doc。
+/// Max bytes for the whole recipe file (and cumulative ENTR payload during decode). See file-top doc.
 pub const MAX_RECIPE_BYTES: usize = 4 * 1024 * 1024;
-/// ENTR チャンク数の上限。根拠はファイル先頭 doc。
+/// Max number of ENTR chunks. See file-top doc.
 pub const MAX_ENTRIES: usize = 65536;
 
 const TAG_HEAD: [4]u8 = "HEAD".*;
@@ -58,19 +58,19 @@ pub const Entry = struct {
     args: []const u8,
 };
 
-/// CommandLog 相当の 1 record への view（core 非依存。app が埋める）。
+/// View of one CommandLog-equivalent record (no core dependency; filled by the app).
 pub const RecordView = struct {
     is_normal: bool,
     name: []const u8,
     args: []const u8,
 };
 
-/// load 結果（所有。caller が `deinit`）。
+/// load result (owned; caller `deinit`s).
 pub const Loaded = struct {
     header: RecipeHeader,
     entries: []Entry,
-    /// header.app_name と各 entry の name/args を含む単一 arena 相当の所有ブロック。
-    /// （簡易: 個別 alloc。deinit で全て free）
+    /// Owned block covering header.app_name and each entry's name/args (arena-like).
+    /// (Simple: per-field alloc; deinit frees them all.)
     alloc: Allocator,
 
     pub fn deinit(self: *Loaded) void {
@@ -84,9 +84,9 @@ pub const Loaded = struct {
     }
 };
 
-/// kind=normal のみを出現順（= seq 順。呼び出し側が seq 昇順で渡す）で Entry 化する。
-/// 返る Entry の name/args は `records` への借用（encode/save 完了まで records が生きていること）。
-/// スライス自体は caller が `gpa.free` する。
+/// Keep only kind=normal, in appearance order (= seq order; caller passes records ascending by seq).
+/// Returned Entry name/args borrow `records` (records must outlive encode/save).
+/// Caller `gpa.free`s the slice itself.
 pub fn collectNormalEntries(gpa: Allocator, records: []const RecordView) Allocator.Error![]Entry {
     var list: std.ArrayList(Entry) = .empty;
     errdefer list.deinit(gpa);
@@ -97,17 +97,17 @@ pub fn collectNormalEntries(gpa: Allocator, records: []const RecordView) Allocat
     return list.toOwnedSlice(gpa);
 }
 
-/// ファイルの app_name が期待値と一致するか（不一致は `error.AppMismatch`）。
+/// Whether the file's app_name matches the expected value (mismatch → `error.AppMismatch`).
 pub fn checkAppName(file_app: []const u8, expected: []const u8) Error!void {
     if (!std.mem.eql(u8, file_app, expected)) return error.AppMismatch;
 }
 
-/// recipe_replay 入れ子防止（既に replay 中なら `error.NestedReplay`）。
+/// Prevent nested recipe_replay (already replaying → `error.NestedReplay`).
 pub fn checkNotReplaying(replaying: bool) Error!void {
     if (replaying) return error.NestedReplay;
 }
 
-/// Recipe をバイト列へ直列化する（caller が free）。
+/// Serialize a Recipe to bytes (caller frees).
 pub fn encode(gpa: Allocator, header: RecipeHeader, entries: []const Entry) (Error || Allocator.Error || error{PayloadTooLarge})![]u8 {
     if (header.app_name.len > MAX_APP_NAME) return error.AppNameTooLong;
     if (header.format_version != format_version) return error.UnsupportedFormatVersion;
@@ -133,9 +133,9 @@ pub fn encode(gpa: Allocator, header: RecipeHeader, entries: []const Entry) (Err
     return w.finish();
 }
 
-/// バイト列から Recipe を復元する（所有。caller が `Loaded.deinit`）。
-/// `bytes.len > MAX_RECIPE_BYTES` / ENTR 数 > `MAX_ENTRIES` / 累積 ENTR payload >
-/// `MAX_RECIPE_BYTES` はそれぞれ `RecipeTooLarge` / `TooManyEntries` / `RecipeTooLarge`。
+/// Restore a Recipe from bytes (owned; caller `Loaded.deinit`s).
+/// `bytes.len > MAX_RECIPE_BYTES` / ENTR count > `MAX_ENTRIES` / cumulative ENTR payload >
+/// `MAX_RECIPE_BYTES` map to `RecipeTooLarge` / `TooManyEntries` / `RecipeTooLarge` respectively.
 pub fn decode(gpa: Allocator, bytes: []const u8) (Error || serde.Error || Allocator.Error)!Loaded {
     if (bytes.len > MAX_RECIPE_BYTES) return error.RecipeTooLarge;
 
@@ -161,7 +161,7 @@ pub fn decode(gpa: Allocator, bytes: []const u8) (Error || serde.Error || Alloca
     while (it.next()) |chunk| {
         if (std.mem.eql(u8, &chunk.tag, &TAG_HEAD)) {
             if (seen_head) return error.DuplicateHeader;
-            if (list.items.len != 0) return error.MissingHeader; // HEAD は先頭（ENTR より前）必須
+            if (list.items.len != 0) return error.MissingHeader; // HEAD must be first (before any ENTR)
             if (chunk.payload.len > MAX_APP_NAME) return error.AppNameTooLong;
             app_name = try gpa.dupe(u8, chunk.payload);
             seen_head = true;
@@ -174,8 +174,8 @@ pub fn decode(gpa: Allocator, bytes: []const u8) (Error || serde.Error || Alloca
             const e = try decodeEntry(gpa, chunk.payload);
             try list.append(gpa, e);
         }
-        // 未知 tag は serde 流儀で skip（前方互換）。ただし HEAD 前の未知 tag も
-        // 「先頭が HEAD」規約に反するため拒否する。
+        // Unknown tags are skipped serde-style (forward compat). But an unknown tag before HEAD also
+        // violates the "HEAD is first" rule, so it is rejected.
         else if (!seen_head) return error.MissingHeader;
     }
 
@@ -203,19 +203,19 @@ fn decodeEntry(gpa: Allocator, payload: []const u8) (Error || Allocator.Error)!E
     return .{ .name = name, .args = args };
 }
 
-/// path へ保存する（encode → writeFile）。
+/// Save to path (encode → writeFile).
 pub fn save(io: std.Io, path: []const u8, header: RecipeHeader, entries: []const Entry, gpa: Allocator) !void {
     const bytes = try encode(gpa, header, entries);
     defer gpa.free(bytes);
     try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = bytes });
 }
 
-/// path から読む（所有。caller が `Loaded.deinit`）。
-/// ファイルが `MAX_RECIPE_BYTES` を超えると `error.RecipeTooLarge`（read 上限は
-/// `MAX_RECIPE_BYTES+1` で「ちょうど上限は許可・超過は拒否」を区別）。
+/// Read from path (owned; caller `Loaded.deinit`s).
+/// File larger than `MAX_RECIPE_BYTES` → `error.RecipeTooLarge` (read limit is
+/// `MAX_RECIPE_BYTES+1` so "exactly at the cap is allowed; over is rejected").
 pub fn load(io: std.Io, gpa: Allocator, path: []const u8) !Loaded {
-    // +1: ちょうど MAX_RECIPE_BYTES は許可し、それより大きいときだけ拒否する
-    // （`.limited(N)` は N バイト読み切った時点で StreamTooLong になりうるため）。
+    // +1: allow exactly MAX_RECIPE_BYTES; reject only when larger
+    // (`.limited(N)` can raise StreamTooLong once N bytes have been read).
     const bytes = std.Io.Dir.cwd().readFileAlloc(io, path, gpa, .limited(MAX_RECIPE_BYTES + 1)) catch |err| {
         if (err == error.StreamTooLong) return error.RecipeTooLarge;
         return err;
@@ -244,11 +244,11 @@ fn expectRoundTrip(header: RecipeHeader, entries: []const Entry) !void {
     }
 }
 
-test "round-trip: 空 entries" {
+test "round-trip: empty entries" {
     try expectRoundTrip(.{ .app_name = "pixie" }, &.{});
 }
 
-test "round-trip: 1件 / args 空白 / 長大 args" {
+test "round-trip: one entry / blank args / long args" {
     var long_args: [4000]u8 = undefined;
     @memset(&long_args, 'x');
     try expectRoundTrip(.{ .app_name = "pixie" }, &.{
@@ -260,7 +260,7 @@ test "round-trip: 1件 / args 空白 / 長大 args" {
     });
 }
 
-test "round-trip: 多数 entries" {
+test "round-trip: many entries" {
     var bufs: [64][8]u8 = undefined;
     var entries: [64]Entry = undefined;
     for (&entries, 0..) |*e, i| {
@@ -270,16 +270,16 @@ test "round-trip: 多数 entries" {
     try expectRoundTrip(.{ .app_name = "pixie" }, &entries);
 }
 
-test "破損 CRC → CrcMismatch" {
+test "Corrupt CRC → CrcMismatch" {
     const gpa = testing.allocator;
     const bytes = try encode(gpa, .{ .app_name = "pixie" }, &.{.{ .name = "clear", .args = "" }});
     defer gpa.free(bytes);
-    // footer CRC を壊す
+    // Corrupt the footer CRC
     bytes[bytes.len - 1] ^= 0xff;
     try testing.expectError(error.CrcMismatch, decode(gpa, bytes));
 }
 
-test "版不一致 → UnsupportedFormatVersion" {
+test "Version mismatch → UnsupportedFormatVersion" {
     const gpa = testing.allocator;
     var w = try serde.Writer.init(gpa, magic, 99);
     defer w.deinit();
@@ -289,13 +289,13 @@ test "版不一致 → UnsupportedFormatVersion" {
     try testing.expectError(error.UnsupportedFormatVersion, decode(gpa, bytes));
 }
 
-test "app_name 長超過 → AppNameTooLong" {
+test "app_name too long → AppNameTooLong" {
     const gpa = testing.allocator;
     var long: [MAX_APP_NAME + 1]u8 = undefined;
     @memset(&long, 'a');
     try testing.expectError(error.AppNameTooLong, encode(gpa, .{ .app_name = &long }, &.{}));
 
-    // decode 側: HEAD payload が長すぎる
+    // decode path: HEAD payload too long
     var w = try serde.Writer.init(gpa, magic, format_version);
     defer w.deinit();
     try w.addChunk(TAG_HEAD, &long);
@@ -304,11 +304,11 @@ test "app_name 長超過 → AppNameTooLong" {
     try testing.expectError(error.AppNameTooLong, decode(gpa, bytes));
 }
 
-test "collectNormalEntries: normal のみ・出現順（seq 順）" {
+test "collectNormalEntries: normal only, appearance order (seq order)" {
     const gpa = testing.allocator;
     const views = [_]RecordView{
         .{ .is_normal = true, .name = "set_color", .args = "ff0000" },
-        .{ .is_normal = false, .name = "undo", .args = "" }, // revert 相当 → 除外
+        .{ .is_normal = false, .name = "undo", .args = "" }, // revert-equivalent → excluded
         .{ .is_normal = true, .name = "stroke", .args = "1 2 3 4" },
         .{ .is_normal = false, .name = "redo", .args = "" },
         .{ .is_normal = true, .name = "clear", .args = "" },
@@ -328,7 +328,7 @@ test "checkAppName / checkNotReplaying" {
     try testing.expectError(error.NestedReplay, checkNotReplaying(true));
 }
 
-test "file I/O: save→load 往復" {
+test "file I/O: save→load round-trip" {
     const gpa = testing.allocator;
     const io = std.testing.io;
     const path = ".task6258_recipe_test.recipe";
@@ -361,7 +361,7 @@ test "duplicate HEAD → DuplicateHeader" {
 test "corrupt ENTR payload → CorruptEntry" {
     const gpa = testing.allocator;
 
-    // payload 全体が短すぎる
+    // Whole payload too short
     {
         var w = try serde.Writer.init(gpa, magic, format_version);
         defer w.deinit();
@@ -373,7 +373,7 @@ test "corrupt ENTR payload → CorruptEntry" {
         try testing.expectError(error.CorruptEntry, decode(gpa, bytes));
     }
 
-    // name_len と実 payload 長が不一致
+    // name_len disagrees with actual payload length
     {
         var w = try serde.Writer.init(gpa, magic, format_version);
         defer w.deinit();
@@ -385,7 +385,7 @@ test "corrupt ENTR payload → CorruptEntry" {
         try testing.expectError(error.CorruptEntry, decode(gpa, bytes));
     }
 
-    // args_len と実 payload 長が不一致
+    // args_len disagrees with actual payload length
     {
         var w = try serde.Writer.init(gpa, magic, format_version);
         defer w.deinit();
@@ -398,10 +398,10 @@ test "corrupt ENTR payload → CorruptEntry" {
     }
 }
 
-test "HEAD が先頭でない / 欠落 → MissingHeader" {
+test "HEAD not first / missing → MissingHeader" {
     const gpa = testing.allocator;
 
-    // ENTR のみ（HEAD なし）
+    // ENTR only (no HEAD)
     {
         var w = try serde.Writer.init(gpa, magic, format_version);
         defer w.deinit();
@@ -415,7 +415,7 @@ test "HEAD が先頭でない / 欠落 → MissingHeader" {
         try testing.expectError(error.MissingHeader, decode(gpa, bytes));
     }
 
-    // ENTR → HEAD（順序違反）
+    // ENTR → HEAD (order violation)
     {
         var w = try serde.Writer.init(gpa, magic, format_version);
         defer w.deinit();
@@ -431,10 +431,10 @@ test "HEAD が先頭でない / 欠落 → MissingHeader" {
     }
 }
 
-test "バイト数超過 → RecipeTooLarge（decode / load）" {
+test "Byte-count oversize → RecipeTooLarge (decode / load)" {
     const gpa = testing.allocator;
 
-    // decode: 総バイト数が上限超（serde より先に拒否）
+    // decode: total byte count over the cap (rejected before serde)
     {
         const big = try gpa.alloc(u8, MAX_RECIPE_BYTES + 1);
         defer gpa.free(big);
@@ -442,7 +442,7 @@ test "バイト数超過 → RecipeTooLarge（decode / load）" {
         try testing.expectError(error.RecipeTooLarge, decode(gpa, big));
     }
 
-    // load: ファイルが上限超
+    // load: file over the cap
     {
         const io = std.testing.io;
         const path = ".task6258_recipe_too_large.recipe";
@@ -455,12 +455,12 @@ test "バイト数超過 → RecipeTooLarge（decode / load）" {
     }
 }
 
-test "エントリ数超過 → TooManyEntries" {
+test "Entry-count oversize → TooManyEntries" {
     const gpa = testing.allocator;
     var w = try serde.Writer.init(gpa, magic, format_version);
     defer w.deinit();
     try w.addChunk(TAG_HEAD, "pixie");
-    // 最小 ENTR: name_len=1, name='a', args_len=0
+    // Minimal ENTR: name_len=1, name='a', args_len=0
     const entr = [_]u8{ 1, 'a', 0, 0 };
     var i: usize = 0;
     while (i < MAX_ENTRIES + 1) : (i += 1) {
@@ -468,6 +468,6 @@ test "エントリ数超過 → TooManyEntries" {
     }
     const bytes = try w.finish();
     defer gpa.free(bytes);
-    try testing.expect(bytes.len <= MAX_RECIPE_BYTES); // 細切れでもファイル自体は上限内
+    try testing.expect(bytes.len <= MAX_RECIPE_BYTES); // Even when fragmented, the file itself stays within the size cap
     try testing.expectError(error.TooManyEntries, decode(gpa, bytes));
 }
