@@ -497,14 +497,14 @@ pub fn isHeadlessActive() bool {
 /// `true` only when the `VP_HARNESS_CAPTURE_SYNTHETIC` variable is set and harness is enabled (replay or live).
 /// By default (the variable unset) it is always `false` (zero regression).
 ///
-/// **A caution, and an important limitation**: `core/camera.zig` and `core/audio.zig` are untouched here, so even when
-/// this function returns `true`, `camera.open()` and `audio.openCapture()` still return
-/// `error.Unsupported` (the placeholder branch remains as it is). The synthetic
-/// capture here is `core/capture_synthetic.zig` plus the `capture` command and probe built into harness, and is
-/// **self-contained within this module**; wiring it into the facade is left to another piece of work
-/// (the "one-line substitution" of `docs/plans/capture-foundation-plan.md` chapter 5 was the original idea, but the
-/// public `VideoDevice` type on `camera.zig`'s side is a concrete alias, so a simple substitution turned out not to be
-/// enough, and the review settled it as out of scope).
+/// **A caution, and an important limitation**: `core/camera.zig` and `core/audio.zig` are not wired to this, so even
+/// when this function returns `true`, `camera.open()` and `audio.openCapture()` still return
+/// `error.Unsupported` (they take a placeholder branch). The synthetic capture here is
+/// `core/capture_synthetic.zig` plus the `capture` command and probe built into harness, and it is
+/// **self-contained within this module**.
+/// Wiring it into the facade is not a one-line substitution: the public `VideoDevice` type on `camera.zig`'s side
+/// is a concrete alias, so the facade needs a broader change than swapping one implementation in. That is why
+/// this module owns its own synthetic devices instead.
 ///
 /// The condition for enabling it follows the same rule as the existing audio output: harness's environment read
 /// (`parseConfig()`) runs only through `platform.init()`, so in a capture-only application that never calls

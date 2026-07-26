@@ -308,7 +308,7 @@ fn setNonblocking(fd: net.Socket.Handle) bool {
     return std.c.fcntl(fd, posix.F.SETFL, fl | nonblock) >= 0;
 }
 
-/// Reads whatever is available (a nonblocking read; EAGAIN and EINTR mean no progress this frame and carry over to the
+/// Reads whatever is available (a non-blocking read; EAGAIN and EINTR mean no progress this frame and carry over to the
 /// next, and read==0 settles the half-close). Raw `std.c.read` is used because `posix.read` retries EINTR internally
 /// without limit (matching the contract of never looping without limit within one pump).
 ///
@@ -340,7 +340,7 @@ fn pumpRead() void {
     }
 }
 
-/// Sends whatever fits (a nonblocking send, so a client that does not read cannot stall the main thread.
+/// Sends whatever fits (a non-blocking send, so a client that does not read cannot stall the main thread.
 /// EAGAIN and EINTR both mean "no progress this frame" = carried over to the next frame).
 fn pumpSend() void {
     while (conn.sent < conn.resp_len) {
