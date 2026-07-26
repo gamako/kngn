@@ -2,7 +2,7 @@
 //!
 //! - Layout: menu bar / PanelHost(left=History, center=canvas, right=Color/Palette/
 //!   Tool Options/Layers, bottom=Timeline) / status bar
-//! - Canvas input: press-start capture (canvas_input.zig state machine). During a stroke,
+//! - Canvas input: press-origin capture (canvas_input.zig state machine). During a stroke,
 //!   continue even if the pointer leaves over the GUI (unclamped transform + pixel-side clip)
 //! - Tool / Undo: core Tool(Pen/Eraser) / StrokeRecorder / UndoStack
 //! - File I/O: Cmd+S=save (remembered path) / Cmd+Shift+S=save as / Cmd+O=open.
