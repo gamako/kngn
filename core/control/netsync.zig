@@ -3180,6 +3180,30 @@ fn waitPeers(n: usize, timeout_ms: u64) !void {
     }
 }
 
+/// Waits until every host slot has finished teardown, meaning `state == .empty` with an emptied
+/// outbound queue. `peerCount()` is not enough on its own: it counts `.active` slots only, while
+/// teardown runs `.active` -> `.closing` -> (writer join, close) -> `.empty`. A test that waits on
+/// `peerCount() == 0` can therefore act while a slot is still `.closing`, and the acceptor reuses
+/// only `.empty` slots — so a reconnect lands in a different slot than the test expects.
+fn waitSlotsEmpty(timeout_ms: u64) !void {
+    var waited: u64 = 0;
+    while (true) {
+        peers_mutex.lockUncancelable(io_val);
+        var all_empty = true;
+        for (&slots) |*s| {
+            if (s.state != .empty or s.outbound.count != 0) {
+                all_empty = false;
+                break;
+            }
+        }
+        peers_mutex.unlock(io_val);
+        if (all_empty) return;
+        if (waited >= timeout_ms) return error.Timeout;
+        sleepMs(10);
+        waited += 10;
+    }
+}
+
 /// Handles ClientJoined and makes every active slot synced (including sending the empty SYNC).
 fn pumpUntilAllSynced(timeout_ms: u64) !void {
     var waited: u64 = 0;
@@ -3909,13 +3933,10 @@ test "netsync: reusing a slot after one client disconnects" {
         _ = try decodeFrame(&reader.interface, &pbuf);
         try waitPeers(1, 2000);
     }
-    // wait for the slot to be released after the close
-    var waited: u64 = 0;
-    while (peerCount() != 0) {
-        if (waited >= 3000) return error.Timeout;
-        sleepMs(10);
-        waited += 10;
-    }
+    // Wait for the slot to be released after the close. It must reach .empty, not merely leave
+    // .active: the acceptor reuses only .empty slots, so reconnecting against a .closing slot 0
+    // would land in slot 1 and the getPeer(0) assertion below would read the wrong peer.
+    try waitSlotsEmpty(3000);
 
     // reuse
     const s2 = try addr.connect(io_val, .{ .mode = .stream });
@@ -5258,8 +5279,9 @@ test "netsync: a big entry is freed even when the writer's encode or flush fails
 
     stream.close(io_val);
 
-    var waited: u64 = 0;
-    while (peerCount() != 0 and waited < 5000) : (waited += 10) sleepMs(10);
+    // .empty, not just "no longer .active": the big entry is freed during teardown, after the
+    // writer is joined, so peerCount() reaching 0 does not yet mean outbound has been emptied.
+    try waitSlotsEmpty(5000);
     try testing.expectEqual(@as(usize, 0), peerCount());
     peers_mutex.lockUncancelable(io_val);
     defer peers_mutex.unlock(io_val);
@@ -5289,8 +5311,8 @@ test "netsync: reusing a slot leaves behind no unsent big entry from the previou
     peers_mutex.unlock(io_val);
 
     stream.close(io_val);
-    var waited: u64 = 0;
-    while (peerCount() != 0 and waited < 5000) : (waited += 10) sleepMs(10);
+    // .empty, not just "no longer .active": slot 0 has to be free for the reconnect below to reuse it.
+    try waitSlotsEmpty(5000);
     try testing.expectEqual(@as(usize, 0), peerCount());
 
     var stream2 = try rawHelloConnect(addr, "reuse2");
