@@ -1,9 +1,9 @@
-//! harness no-op stub for wasm32-freestanding（TASK-73.1）
+//! A harness no-op stub for wasm32-freestanding
 //!
-//! 本番 harness（env/socket/thread/fs/png）を wasm 解析から外す。公開面は
-//! `core/platform.zig` / `core/audio.zig` / kit 経由の実参照を grep 網羅した no-op。
-//! command / action_registry は std のみなので実体を再利用。copilot / netsync は no-op namespace。
-//! png / capture_synthetic には依存しない（build 側も link しない）。
+//! Keeps the real harness (env, sockets, threads, the filesystem, png) out of the wasm analysis. The public
+//! surface is a no-op covering, by an exhaustive grep, every real reference made through `core/platform.zig`,
+//! `core/audio.zig` and kit. command and action_registry are std-only, so the real ones are reused; copilot and
+//! netsync are no-op namespaces. There is no dependency on png or capture_synthetic (the build does not link them either).
 
 const std = @import("std");
 const types = @import("platform_types");
@@ -112,7 +112,7 @@ pub fn findProbe(_: []const u8) ?*Probe {
 }
 
 // ============================================================================
-// copilot no-op namespace（platform.zig が触る面のみ）
+// A copilot no-op namespace (only the surface platform.zig touches)
 // ============================================================================
 
 pub const copilot = struct {
@@ -129,7 +129,7 @@ pub const copilot = struct {
 };
 
 // ============================================================================
-// netsync no-op namespace（platform.zig が触る面のみ）
+// A netsync no-op namespace (only the surface platform.zig touches)
 // ============================================================================
 
 pub const netsync = struct {
