@@ -2,9 +2,9 @@
 
 `libs/modular` (`@import("modular")`) is a **modular audio graph engine**. It wraps
 the DSP primitives as vtable modules and evaluates a node graph per sample. It is the
-foundation for an environment that keeps generating lo-fi minimal techno; the end goal
-is visual patching, and the authority on the design is
-`docs/plans/modular-synth-plan.md` at the top level.
+foundation for an environment that keeps generating lo-fi minimal techno, and the end
+goal is visual patching. This document is the authority on the contracts of that
+engine.
 
 ## The pieces
 

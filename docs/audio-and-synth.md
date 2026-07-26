@@ -1,8 +1,7 @@
 # The audio and synthesis layer
 
 A four-layer structure symmetric with the graphics side, forming the audio synthesiser
-foundation. The authority on the design is `docs/plans/synth-foundation-plan.md` at the
-top level.
+foundation. This document is the authority on the contracts of those layers.
 
 | Layer | Where | What |
 |---|---|---|
