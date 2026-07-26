@@ -1,19 +1,19 @@
-//! 論理座標 → 物理座標の描画専用変換（TASK-156.4 / ADR-011 R6）。
+//! Draw-only transform from logical coordinates → physical coordinates (ADR-011 R6).
 //!
-//! camera の視野計算には scale を混ぜない。論理 viewport のまま
-//! `visibleRect` 等を計算し、描画出口でのみ本モジュールで物理化する。
+//! Do not mix scale into the camera's view math. Keep `visibleRect` etc. in the logical viewport,
+//! and physicalize only at the draw exit via this module.
 //!
-//! 入力の物理→論理逆変換は持たない（facade = `core/platform.normalizeEventWithScale` の責務）。
+//! Does not own the physical→logical inverse for input (that is the facade = `core/platform.normalizeEventWithScale`).
 //!
-//! ホットパス宣言: per-primitive の定数演算のみ。全画素ループ・allocation・入力処理は無し。
-//! floor 規則は `gui.render` の scaleRect と同一（libs/gui は import せず独立実装）。
+//! Hot-path declaration: per-primitive constant-time ops only. No full-pixel loops, allocation, or input handling.
+//! Floor rule matches `gui.render` scaleRect (independent implementation; does not import libs/gui).
 
 const std = @import("std");
 const camera = @import("camera.zig");
 
-/// 描画専用の論理→物理変換。状態を持たない（scale/latch/queue は保持しない）。
+/// Draw-only logical→physical transform. Stateless (holds no scale/latch/queue).
 pub const ScreenTransform = struct {
-    /// 各座標を `floor(value * scale)`。返却値は整数値を表す f32。
+    /// Each coordinate is `floor(value * scale)`. Return values are f32 that represent integers.
     pub fn logicalPointToPhysical(point: camera.Vec2, scale: f32) camera.Vec2 {
         assertValidScale(scale);
         return .{
@@ -22,8 +22,8 @@ pub const ScreenTransform = struct {
         };
     }
 
-    /// 両エッジ floor の完全タイリング:
-    /// `x0 = floor(x*s)`, `x1 = floor((x+w)*s)`, `w = max(0, x1-x0)`（y も同様）。
+    /// Perfect tiling with floor on both edges:
+    /// `x0 = floor(x*s)`, `x1 = floor((x+w)*s)`, `w = max(0, x1-x0)` (same for y).
     pub fn logicalRectToPhysical(rect: camera.Rect, scale: f32) camera.Rect {
         assertValidScale(scale);
         const x0 = floorF32(rect.x * scale);
@@ -38,12 +38,12 @@ pub const ScreenTransform = struct {
         };
     }
 
-    /// camera の論理 viewport → 物理 target（`logicalRectToPhysical` と同一規則）。
+    /// Camera logical viewport → physical target (same rule as `logicalRectToPhysical`).
     pub fn logicalViewportToTarget(viewport: camera.Rect, scale: f32) camera.Rect {
         return logicalRectToPhysical(viewport, scale);
     }
 
-    /// sprite の論理位置・サイズ → 物理描画 rect。
+    /// Sprite logical position/size → physical draw rect.
     pub fn spriteDestRect(logical_pos: camera.Vec2, logical_size: camera.Vec2, scale: f32) camera.Rect {
         return logicalRectToPhysical(.{
             .x = logical_pos.x,
@@ -86,7 +86,7 @@ test "ScreenTransform point: scale 1.0 / 1.5 / 2.0" {
     try expectVec2Bits(ScreenTransform.logicalPointToPhysical(p, 2.0), .{ .x = 20, .y = 40 });
     // 10*1.5=15, 20*1.5=30
     try expectVec2Bits(ScreenTransform.logicalPointToPhysical(p, 1.5), .{ .x = 15, .y = 30 });
-    // 非整数: floor(3*1.5)=floor(4.5)=4
+    // Non-integer: floor(3*1.5)=floor(4.5)=4
     try expectVec2Bits(ScreenTransform.logicalPointToPhysical(.{ .x = 3, .y = 5 }, 1.5), .{ .x = 4, .y = 7 });
 }
 
@@ -104,7 +104,7 @@ test "ScreenTransform rect: seamless tiling of adjacent rects" {
         const b: camera.Rect = .{ .x = 10, .y = 0, .w = 10, .h = 8 };
         const pa = ScreenTransform.logicalRectToPhysical(a, s);
         const pb = ScreenTransform.logicalRectToPhysical(b, s);
-        // 隣接: pa.x+pa.w == pb.x（隙間も重複も無し）
+        // Adjacent: pa.x+pa.w == pb.x (no gap, no overlap)
         try testing.expectEqual(pa.x + pa.w, pb.x);
         try testing.expectEqual(pa.y, pb.y);
         try testing.expectEqual(pa.h, pb.h);
@@ -154,14 +154,14 @@ test "ScreenTransform logicalViewportToTarget physical width/height" {
 }
 
 test "ScreenTransform: camera visibleRect is independent of scale" {
-    // 視野不変: scale 前後で visible world rect が bit 一致。
+    // View invariant: visible world rect is bit-identical before/after scale.
     const cam = camera.Camera.init(.{ .x = 40, .y = 80 }, 2);
     const logical_vp: camera.Rect = .{ .x = 16, .y = 24, .w = 320, .h = 180 };
     const vis_before = cam.visibleRect(logical_vp);
     _ = ScreenTransform.logicalViewportToTarget(logical_vp, 2.0);
     const vis_after = cam.visibleRect(logical_vp);
     try expectRectBits(vis_before, vis_after);
-    // 物理 target 寸法は 2x だが、world 可視は logical viewport 由来のまま
+    // Physical target size is 2x, but world visibility still comes from the logical viewport
     try testing.expectEqual(@as(f32, 160), vis_after.w); // 320/2
     try testing.expectEqual(@as(f32, 90), vis_after.h); // 180/2
 }

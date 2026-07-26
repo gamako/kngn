@@ -1,11 +1,11 @@
-//! スプライトシート / アトラス（TASK-111.3）。
+//! Spritesheet / atlas.
 //!
-//! 1 枚の PremultipliedImage とフレーム矩形表（index / 名前引き）を所有する。
-//! 描画は `drawSpriteEx` に委譲（本ファイルに全画素ループは無い）。
+//! Owns one PremultipliedImage and a frame-rect table (by index / by name).
+//! Drawing delegates to `drawSpriteEx` (no full-pixel loop in this file).
 //!
-//! ホットパス宣言:
-//! - `drawFrame`: 毎フレーム描画パス（drawSpriteEx 委譲。アロケーション無し）
-//! - `indexOf`: 初期化・イベント時のみ想定（線形探索）
+//! Hot-path declaration:
+//! - `drawFrame`: every-frame draw path (delegates to drawSpriteEx; no allocation)
+//! - `indexOf`: init / event-time only (linear search)
 
 const std = @import("std");
 const sprite = @import("sprite");
@@ -16,34 +16,34 @@ pub const Sprite = sprite.Sprite;
 pub const SpriteDrawOptions = sprite.SpriteDrawOptions;
 pub const drawSpriteEx = sprite.drawSpriteEx;
 
-/// 初期化時に渡す 1 フレーム分の仕様（名前は任意）。
+/// Spec for one frame at init (name is optional).
 pub const FrameSpec = struct {
     rect: SourceRect,
     name: ?[]const u8 = null,
 };
 
 pub const AtlasError = error{
-    /// cell 幅または高さが 0
+    /// Cell width or height is 0
     ZeroCellSize,
-    /// 画像サイズがセルサイズで割り切れない
+    /// Image size is not divisible by the cell size
     ImageNotDivisible,
-    /// 矩形の幅/高さが 0
+    /// Rect width/height is 0
     EmptyRect,
-    /// 矩形が画像外、または座標加算が overflow
+    /// Rect is outside the image, or coordinate addition overflows
     RectOutOfBounds,
-    /// セル個数の乗算が overflow
+    /// Cell-count multiplication overflows
     GridOverflow,
 };
 
-/// スプライトシート。画像とフレーム矩形表を所有する。
+/// Spritesheet. Owns the image and the frame-rect table.
 pub const Atlas = struct {
     image: PremultipliedImage,
     frames: []SourceRect,
-    /// `frames` と同長。未命名フレームは null。各 non-null 名は allocator 所有。
+    /// Same length as `frames`. Unnamed frames are null. Each non-null name is allocator-owned.
     names: []?[]u8,
 
-    /// 画像とフレーム表を所有して Atlas を構築する。
-    /// `specs` の名前はコピーされ、呼び出し側の一時バッファに依存しない。
+    /// Build an Atlas that owns the image and frame table.
+    /// Spec names are copied; they do not depend on the caller's temporary buffer.
     pub fn init(allocator: std.mem.Allocator, image: PremultipliedImage, specs: []const FrameSpec) (AtlasError || std.mem.Allocator.Error)!Atlas {
         errdefer {
             var img = image;
@@ -74,8 +74,8 @@ pub const Atlas = struct {
         };
     }
 
-    /// 画像をセル等分割した Atlas を構築する（row-major）。
-    /// 画像幅/高さがセルで割り切れない、またはセルサイズが 0 の場合はエラー。
+    /// Build an Atlas by splitting the image into equal cells (row-major).
+    /// Errors if image width/height is not divisible by the cell, or cell size is 0.
     pub fn initGrid(
         allocator: std.mem.Allocator,
         image: PremultipliedImage,
@@ -136,18 +136,18 @@ pub const Atlas = struct {
         return self.frames.len;
     }
 
-    /// フレーム矩形。範囲外は null。
+    /// Frame rect. Out of range → null.
     pub fn frame(self: *const Atlas, index: usize) ?SourceRect {
         if (index >= self.frames.len) return null;
         return self.frames[index];
     }
 
-    /// フレーム矩形。範囲外は null（`frame` と同義の別名）。
+    /// Frame rect. Out of range → null (alias of `frame`).
     pub fn frameRect(self: *const Atlas, index: usize) ?SourceRect {
         return self.frame(index);
     }
 
-    /// 名前からフレーム index を探す。重複名は先頭一致。未発見は null。
+    /// Look up a frame index by name. Duplicate names match the first. Not found → null.
     pub fn indexOf(self: *const Atlas, name: []const u8) ?u32 {
         for (self.names, 0..) |n, i| {
             if (n) |s| {
@@ -157,9 +157,9 @@ pub const Atlas = struct {
         return null;
     }
 
-    /// 指定フレームを `drawSpriteEx` で描画する。
-    /// 範囲外 index は no-op。アロケーション無し。
-    /// `opts.src` はフレーム矩形で上書きされる。
+    /// Draw the given frame via `drawSpriteEx`.
+    /// Out-of-range index is a no-op. No allocation.
+    /// `opts.src` is overwritten with the frame rect.
     pub fn drawFrame(
         self: *const Atlas,
         framebuffer: []u32,
@@ -171,7 +171,7 @@ pub const Atlas = struct {
         opts: SpriteDrawOptions,
     ) void {
         const rect = self.frame(index) orelse return;
-        // 画像は Atlas が所有。Sprite.deinit は呼ばない。
+        // The Atlas owns the image. Do not call Sprite.deinit.
         const spr = Sprite{
             .image = self.image,
             .x = x,
@@ -274,7 +274,7 @@ test "Atlas frame bounds and empty atlas" {
     try testing.expect(atlas.frameRect(0) == null);
     try testing.expect(atlas.indexOf("x") == null);
 
-    // drawFrame は no-op（panic しない）
+    // drawFrame is a no-op (does not panic)
     var fb: [4]u32 = .{ 1, 2, 3, 4 };
     atlas.drawFrame(&fb, 2, 2, 0, 0, 0, .{});
     try testing.expectEqual(@as(u32, 1), fb[0]);

@@ -1,11 +1,11 @@
-//! ActionMap — 複数入力ソースを button/axis アクションへ写像（TASK-111.8）。
+//! ActionMap — map multiple input sources onto button/axis actions.
 //!
-//! keyboard / gamepad の binding を固定長配列で保持し、毎フレーム `update` で
-//! `isDown` / `justPressed` / `axisValue` を評価する。allocator 無し（評価・
-//! リバインドとも固定長のみ）。
+//! Holds keyboard / gamepad bindings in fixed-length arrays and, each frame via `update`,
+//! evaluates `isDown` / `justPressed` / `axisValue`. No allocator (evaluation and
+//! rebind use fixed length only).
 //!
-//! ホットパス宣言: 毎フレーム全 action × 固定上限 binding を走査。
-//! 全画素・audio RT・毎サンプル経路ではない。評価中の alloc / lock / IO / panic 無し。
+//! Hot-path declaration: every frame, scan all actions × the fixed binding cap.
+//! Not a full-pixel / audio-RT / per-sample path. No alloc / lock / IO / panic during evaluation.
 
 const std = @import("std");
 const keyboard = @import("keyboard");
@@ -20,15 +20,15 @@ pub const MAX_GAMEPADS = platform_types.MAX_GAMEPADS;
 
 pub const ActionKind = enum { button, axis };
 
-/// 固定長 action 配列の index。
+/// Index into the fixed-length action array.
 pub const ActionId = struct {
     index: u16,
 };
 
-/// スティック左右（left_stick / right_stick）。
+/// Stick sides (left_stick / right_stick).
 pub const StickSide = enum { left, right };
 
-/// スティックの軸成分。
+/// Stick axis component.
 pub const StickAxis = enum { x, y };
 
 pub const GamepadButtonBinding = struct {
@@ -48,7 +48,7 @@ pub const KeyPairBinding = struct {
     positive: KeyCode,
 };
 
-/// 1 binding のソース。
+/// Source of one binding.
 pub const Binding = union(enum) {
     key: KeyCode,
     gamepad_button: GamepadButtonBinding,
@@ -63,9 +63,9 @@ pub const Error = error{
     InvalidAction,
 };
 
-/// 最大 `max_actions` 個の action、各 action 最大 `max_bindings_per_action` 個の binding。
-/// 上限: max_actions は 1..=65535（action_count が u16）、max_bindings_per_action は
-/// 1..=255（binding_count が u8）。範囲外は comptime エラー。
+/// Up to `max_actions` actions, each with up to `max_bindings_per_action` bindings.
+/// Limits: max_actions is 1..=65535 (action_count is u16); max_bindings_per_action is
+/// 1..=255 (binding_count is u8). Out of range is a comptime error.
 pub fn ActionMap(comptime max_actions: usize, comptime max_bindings_per_action: usize) type {
     comptime {
         std.debug.assert(max_actions >= 1 and max_actions <= std.math.maxInt(u16));
@@ -184,7 +184,7 @@ pub fn ActionMap(comptime max_actions: usize, comptime max_bindings_per_action: 
             s.binding_count = 0;
         }
 
-        /// 容量検証後に binding を一括置換する。容量不足時は既存 binding を保持したままエラー。
+        /// Replace bindings in bulk after a capacity check. On capacity failure, keep existing bindings and return an error.
         pub fn replaceBindings(self: *Self, id: ActionId, new_bindings: []const Binding) Error!void {
             const s = try self.slot(id);
             if (new_bindings.len > max_bindings_per_action) return error.TooManyBindings;
@@ -201,7 +201,7 @@ pub fn ActionMap(comptime max_actions: usize, comptime max_bindings_per_action: 
             }
         }
 
-        /// 毎フレーム呼ぶ。`prev_pads` / `cur_pads` は呼び出し側が保持する固定長配列。
+        /// Call every frame. `prev_pads` / `cur_pads` are fixed-length arrays owned by the caller.
         pub fn update(
             self: *Self,
             kb: *const KeyboardState,
@@ -287,8 +287,8 @@ pub fn ActionMap(comptime max_actions: usize, comptime max_bindings_per_action: 
             kb: *const KeyboardState,
             cur_pads: *const [MAX_GAMEPADS]?GamepadState,
         ) f32 {
-            // スティック候補（deadzone 後に非ゼロ）と key pair 候補を登録順に走査し、
-            // 絶対値最大を採用。同値時は先勝ち（登録順）。
+            // Walk stick candidates (non-zero after deadzone) and key-pair candidates in registration order;
+            // take the largest absolute value. Ties keep first-wins (registration order).
             var best_stick: ?f32 = null;
             var best_stick_abs: f32 = -1;
             var best_key: ?f32 = null;
@@ -319,7 +319,7 @@ pub fn ActionMap(comptime max_actions: usize, comptime max_bindings_per_action: 
                 }
             }
 
-            // スティックが 1 つでも非ゼロならスティック優先（キー同時入力時もスティック勝ち）。
+            // If any stick is non-zero, stick wins (stick still beats simultaneous key input).
             if (best_stick) |v| return clampAxis(v);
             if (best_key) |v| return clampAxis(v);
             return 0;
@@ -375,7 +375,7 @@ fn makePads(pad0: ?GamepadState) [MAX_GAMEPADS]?GamepadState {
     return pads;
 }
 
-test "ActionMap: defineButton/defineAxis が ActionId を連番割当" {
+test "ActionMap: defineButton/defineAxis assign ActionId sequentially" {
     var map = TestMap.init();
     const jump = try map.defineButton("jump");
     const move_x = try map.defineAxis("move_x");
@@ -388,7 +388,7 @@ test "ActionMap: defineButton/defineAxis が ActionId を連番割当" {
     try testing.expectEqualStrings("jump", map.actionName(jump));
 }
 
-test "ActionMap: action 上限 / binding 上限 / 種別不一致エラー" {
+test "ActionMap: action cap / binding cap / type-mismatch errors" {
     var tiny = ActionMap(1, 1).init();
     const a = try tiny.defineButton("a");
     try testing.expectError(error.TooManyActions, tiny.defineButton("b"));
@@ -404,7 +404,7 @@ test "ActionMap: action 上限 / binding 上限 / 種別不一致エラー" {
     try testing.expectError(error.WrongKind, map.bindGamepadButton(axis, 0, .a));
 }
 
-test "ActionMap: key button の isDown / justPressed / hold edge" {
+test "ActionMap: key button isDown / justPressed / hold edge" {
     var map = TestMap.init();
     const jump = try map.defineButton("jump");
     try map.bindKey(jump, .SPACE);
@@ -434,7 +434,7 @@ test "ActionMap: key button の isDown / justPressed / hold edge" {
     try testing.expect(!map.justPressed(jump));
 }
 
-test "ActionMap: gamepad button の isDown / justPressed" {
+test "ActionMap: gamepad button isDown / justPressed" {
     var map = TestMap.init();
     const jump = try map.defineButton("jump");
     try map.bindGamepadButton(jump, 0, .a);
@@ -465,7 +465,7 @@ test "ActionMap: gamepad button の isDown / justPressed" {
     try testing.expect(!map.justPressed(jump));
 }
 
-test "ActionMap: key と gamepad button の複数 binding は論理 OR" {
+test "ActionMap: multiple key and gamepad button bindings are logical OR" {
     var map = TestMap.init();
     const jump = try map.defineButton("jump");
     try map.bindKey(jump, .SPACE);
@@ -504,7 +504,7 @@ test "ActionMap: key と gamepad button の複数 binding は論理 OR" {
     try testing.expect(map.justPressed(jump)); // key rising
 }
 
-test "ActionMap: key pair は -1 / 0 / +1 合成" {
+test "ActionMap: key pair synthesizes -1 / 0 / +1" {
     var map = TestMap.init();
     const move_x = try map.defineAxis("move_x");
     try map.bindKeyPair(move_x, .A, .D);
@@ -536,7 +536,7 @@ test "ActionMap: key pair は -1 / 0 / +1 合成" {
     try testing.expectEqual(@as(f32, 0), map.axisValue(move_x));
 }
 
-test "ActionMap: gamepad stick deadzone 適用と -1..1 範囲" {
+test "ActionMap: gamepad stick deadzone applied and clamped to -1..1" {
     var map = TestMap.init();
     const move_x = try map.defineAxis("move_x");
     try map.bindGamepadStick(move_x, 0, .left, .x, 0.15);
@@ -546,7 +546,7 @@ test "ActionMap: gamepad stick deadzone 適用と -1..1 範囲" {
     kb.beginFrame();
     const prev = emptyPads();
 
-    // deadzone 内
+    // Inside deadzone
     var cur = makePads(.{ .left_stick = .{ .x = 0.1, .y = 0 } });
     map.update(&kb, &prev, &cur);
     try testing.expectEqual(@as(f32, 0), map.axisValue(move_x));
@@ -556,13 +556,13 @@ test "ActionMap: gamepad stick deadzone 適用と -1..1 範囲" {
     map.update(&kb, &prev, &cur);
     try testing.expectApproxEqAbs(@as(f32, 0.4117647), map.axisValue(move_x), 1e-5);
 
-    // フル
+    // Full deflection
     cur = makePads(.{ .left_stick = .{ .x = -1, .y = 0 } });
     map.update(&kb, &prev, &cur);
     try testing.expectApproxEqAbs(@as(f32, -1), map.axisValue(move_x), 1e-5);
 }
 
-test "ActionMap: stick と key pair 同時入力は stick 優先" {
+test "ActionMap: simultaneous stick and key pair prefers stick" {
     var map = TestMap.init();
     const move_x = try map.defineAxis("move_x");
     try map.bindKeyPair(move_x, .A, .D);
@@ -577,16 +577,16 @@ test "ActionMap: stick と key pair 同時入力は stick 優先" {
     map.update(&kb, &prev, &cur);
     try testing.expectApproxEqAbs(@as(f32, 0.4117647), map.axisValue(move_x), 1e-5);
 
-    // stick を 0 にすると key にフォールバック
+    // Zeroing the stick falls back to the key
     const cur2 = makePads(.{ .left_stick = .{ .x = 0, .y = 0 } });
     map.update(&kb, &prev, &cur2);
     try testing.expectEqual(@as(f32, 1), map.axisValue(move_x));
 }
 
-test "ActionMap: 複数 stick 候補は絶対値最大、同値時は登録順" {
+test "ActionMap: multiple stick candidates take max abs; ties keep registration order" {
     var map = TestMap.init();
     const move_x = try map.defineAxis("move_x");
-    // pad0 先登録、pad1 後登録
+    // pad0 registered first, pad1 second
     try map.bindGamepadStick(move_x, 0, .left, .x, 0);
     try map.bindGamepadStick(move_x, 1, .left, .x, 0);
 
@@ -602,14 +602,14 @@ test "ActionMap: 複数 stick 候補は絶対値最大、同値時は登録順" 
     map.update(&kb, &prev, &cur);
     try testing.expectApproxEqAbs(@as(f32, -0.8), map.axisValue(move_x), 1e-5);
 
-    // 同絶対値 → 登録順（pad0 先勝ち）
+    // Same absolute value → registration order (pad0 first-wins)
     cur[0] = .{ .left_stick = .{ .x = 0.5, .y = 0 } };
     cur[1] = .{ .left_stick = .{ .x = -0.5, .y = 0 } };
     map.update(&kb, &prev, &cur);
     try testing.expectApproxEqAbs(@as(f32, 0.5), map.axisValue(move_x), 1e-5);
 }
 
-test "ActionMap: gamepad 切断時は button が落ち justPressed も false" {
+test "ActionMap: on gamepad disconnect buttons drop and justPressed is also false" {
     var map = TestMap.init();
     const jump = try map.defineButton("jump");
     try map.bindGamepadButton(jump, 0, .a);
@@ -627,7 +627,7 @@ test "ActionMap: gamepad 切断時は button が落ち justPressed も false" {
     map.update(&kb, &prev, &cur);
     try testing.expect(map.isDown(jump));
 
-    // 切断
+    // Disconnected
     prev = cur;
     cur = emptyPads();
     map.update(&kb, &prev, &cur);
@@ -635,13 +635,13 @@ test "ActionMap: gamepad 切断時は button が落ち justPressed も false" {
     try testing.expect(!map.justPressed(jump));
 }
 
-test "ActionMap: replaceBindings 成功と容量不足時の旧 binding 保持" {
+test "ActionMap: replaceBindings success and keeps old bindings on capacity failure" {
     var map = ActionMap(4, 2).init();
     const jump = try map.defineButton("jump");
     try map.bindKey(jump, .SPACE);
     try testing.expectEqual(@as(u8, 1), map.bindingCount(jump));
 
-    // 容量超過 → 旧 binding 保持
+    // Over capacity → keep old bindings
     const too_many = [_]Binding{
         .{ .key = .A },
         .{ .key = .B },
@@ -656,9 +656,9 @@ test "ActionMap: replaceBindings 成功と容量不足時の旧 binding 保持" 
     kb.beginFrame();
     kb.keyDown(.SPACE);
     map.update(&kb, &pads, &pads);
-    try testing.expect(map.isDown(jump)); // 旧 SPACE が残っている
+    try testing.expect(map.isDown(jump)); // Old SPACE remains
 
-    // 成功置換
+    // Successful replace
     const ok = [_]Binding{
         .{ .key = .ENTER },
         .{ .gamepad_button = .{ .pad = 0, .button = .b } },
@@ -678,7 +678,7 @@ test "ActionMap: replaceBindings 成功と容量不足時の旧 binding 保持" 
     try testing.expect(!map.isDown(jump));
 }
 
-test "ActionMap: update は allocator 不要（固定長 state のみ更新）" {
+test "ActionMap: update needs no allocator (updates fixed-length state only)" {
     var map = TestMap.init();
     const jump = try map.defineButton("jump");
     const move_x = try map.defineAxis("move_x");
@@ -686,14 +686,14 @@ test "ActionMap: update は allocator 不要（固定長 state のみ更新）" 
     try map.bindKeyPair(move_x, .A, .D);
     try map.bindGamepadStick(move_x, 0, .left, .x, 0.15);
 
-    // KeyboardState のイベント容量は事前確保（ActionMap 本体の評価は alloc しない）
+    // Pre-reserve KeyboardState event capacity (ActionMap evaluation itself does not alloc)
     var kb = KeyboardState.init(testing.allocator);
     defer kb.deinit();
     kb.beginFrame();
     kb.keyDown(.SPACE);
     kb.keyDown(.D);
 
-    // ActionMap は allocator を持たず固定長 state のみ更新する（読取は kb / pads のみ）。
+    // ActionMap holds no allocator and only updates fixed-length state (reads kb / pads only).
     const prev = emptyPads();
     const cur = makePads(.{ .left_stick = .{ .x = 0.5, .y = 0 } });
     map.update(&kb, &prev, &cur);

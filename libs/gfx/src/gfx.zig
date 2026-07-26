@@ -1,12 +1,12 @@
-//! libs/gfx umbrella（TASK-111.2 / TASK-111.3 / TASK-111.4 / TASK-111.5 / TASK-111.8）。
+//! libs/gfx umbrella.
 //! sprite / fixed_timestep / fps_counter / keyboard / atlas / animation / camera / action_map / tilemap
-//! を再エクスポートし、kit.gfx の公開面とする。
+//! are re-exported as the kit.gfx public surface.
 //!
-//! atlas / animation / camera / action_map / tilemap は同一 module 内の相対 import（`@import("atlas.zig")` 等）。
-//! こうすると `zig test` が gfx root 経由で test を収集し、専用 runner を
-//! 増やさずに test-gfx へ接続できる（TASK-111.3/111.4 Claude 設計レビュー付記）。
-//! named module の sprite/helpers は `@import("sprite")` 等で受け取る
-//! （同一 .zig を 2 module に属させない）。
+//! atlas / animation / camera / action_map / tilemap use relative imports inside the same module (`@import("atlas.zig")`, etc.).
+//! That lets `zig test` collect tests through the gfx root and wire them into test-gfx
+//! without adding a dedicated runner.
+//! Named-module sprite/helpers are received via `@import("sprite")`, etc.
+//! (do not put the same .zig into two modules).
 
 pub const sprite = @import("sprite");
 pub const fixed_timestep = @import("fixed_timestep");
@@ -73,9 +73,9 @@ pub const isArrowKey = keyboard.isArrowKey;
 pub const isNavigationKey = keyboard.isNavigationKey;
 pub const getCharFromKey = keyboard.getCharFromKey;
 
-// test-gfx 用: `pub const X = @import("f.zig")` だけでは f.zig の test は集まらない。
-// namespace 全体を test ブロックで参照して収集する（gui.zig と同型）。
-// keyboard（KeyboardState 含む）は dedicated run_gfx_kb_test で実行（二重収集を避ける）。
+// For test-gfx: `pub const X = @import("f.zig")` alone does not collect f.zig's tests.
+// Reference the whole namespace from a test block to collect them (same pattern as gui.zig).
+// keyboard (including KeyboardState) runs via dedicated run_gfx_kb_test (avoid double collection).
 test {
     _ = atlas;
     _ = animation;

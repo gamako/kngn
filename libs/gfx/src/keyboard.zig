@@ -1,16 +1,16 @@
 //! Keyboard utility module
 //!
-//! `platform_types.KeyCode` enum に対するヘルパー関数（キー名取得・分類・文字変換）。
-//! KeyCode 型自体は `core/platform_types.zig` が単一ソース。libs/gfx は type-only core のみ参照する
-//! （ADR-007: libs → type-only core。platform facade 実装には依存しない）。
+//! Helpers on the `platform_types.KeyCode` enum (name lookup, classification, char conversion).
+//! KeyCode itself is sourced from `core/platform_types.zig`. libs/gfx depends on type-only core only
+//! (ADR-007: libs → type-only core; no dependency on the platform facade implementation).
 
 const std = @import("std");
 const platform_types = @import("platform_types");
 
 pub const KeyCode = platform_types.KeyCode;
 
-/// キーコードを人間が読める文字列に変換します。
-/// 文字キー（A-Z）と数字キー（0-9）は実際の文字を返します。
+/// Convert a key code to a human-readable string.
+/// Letter keys (A-Z) and digit keys (0-9) return the actual character.
 pub fn getKeyName(key: KeyCode) []const u8 {
     if (isLetterKey(key)) {
         const letter_names = [_][]const u8{
@@ -114,8 +114,8 @@ pub const KeyInfo = struct {
 pub fn getKeyInfo(key: KeyCode) KeyInfo {
     const code = @intFromEnum(key);
     const name = getKeyName(key);
-    // KeyCode に列挙されている範囲では SPACE / A-Z / 0-9 のみが printable
-    // （`!"#$%`... 等の記号は KeyCode に存在しない）
+    // Within KeyCode's enumerated range, only SPACE / A-Z / 0-9 are printable
+    // (punctuation like `!"#$%`... is not present in KeyCode)
     const is_printable = key == .SPACE or isLetterKey(key) or isDigitKey(key);
 
     return KeyInfo{
@@ -167,7 +167,7 @@ pub fn isNavigationKey(key: KeyCode) bool {
     };
 }
 
-/// 文字キー (A-Z) / 数字キー (0-9) からASCII文字を取得します
+/// Get an ASCII character from a letter key (A-Z) / digit key (0-9)
 pub fn getCharFromKey(key: KeyCode) ?u8 {
     if (isLetterKey(key) or isDigitKey(key)) {
         return @intCast(@intFromEnum(key));
@@ -176,36 +176,36 @@ pub fn getCharFromKey(key: KeyCode) ?u8 {
 }
 
 // ============================================================================
-// KeyboardState — 押下集合 + 前後フレーム差分エッジ（TASK-111.7）
+// KeyboardState — pressed-key set + previous/current frame edge
 // ============================================================================
 
-/// キー押下集合を保持し、`isDown` / `justPressed` / `justReleased` を提供する。
+/// Holds the pressed-key set and provides `isDown` / `justPressed` / `justReleased`.
 ///
-/// エッジ判定は `src/gamepad.zig` の `justPressed`/`justReleased` と同型で、
-/// **前後フレームの最終押下集合の差分**のみを見る。
+/// Edge detection matches `src/gamepad.zig`'s `justPressed`/`justReleased`:
+/// it looks only at the **difference between the final pressed sets of consecutive frames**.
 ///
-/// 使い方（毎フレーム）:
+/// Usage (every frame):
 /// ```
-/// state.beginFrame(); // 前フレーム集合を保存
-/// // イベント処理中:
+/// state.beginFrame(); // save previous-frame set
+/// // During event handling:
 /// state.keyDown(key); // / keyUp(key)
-/// // 更新/描画:
+/// // Update/draw:
 /// if (state.justPressed(.SPACE)) { ... }
 /// if (state.isDown(.LEFT_SHIFT)) { ... }
 /// ```
 ///
-/// ## 同一フレーム内 down→up の transient edge 非保持
+/// ## No transient edge for same-frame down→up
 ///
-/// 同一フレームで `keyDown(A)` 直後に `keyUp(A)` した場合、フレーム終端の
-/// current / previous はどちらも A を含まないため、`justPressed(A)` も
-/// `justReleased(A)` も **false** のまま（edge を蓄積しない）。
-/// GUI の `keys_pressed` エッジ蓄積とは意味論が異なる点に注意。
+/// If `keyDown(A)` is immediately followed by `keyUp(A)` in the same frame, both
+/// current and previous at frame end exclude A, so `justPressed(A)` and
+/// `justReleased(A)` stay **false** (edges are not accumulated).
+/// Note: this differs semantically from GUI `keys_pressed` edge accumulation.
 ///
-/// 修飾キー（LEFT_SHIFT 等）も `KeyCode` として同じ集合で扱う。
-/// `KeyCode.UNKNOWN` および負値のキーは集合に入れない（`keyDown`/`keyUp` で無視）。
+/// Modifier keys (LEFT_SHIFT, etc.) are in the same set as ordinary `KeyCode`s.
+/// `KeyCode.UNKNOWN` and negative key values are never added (`keyDown`/`keyUp` ignore them).
 ///
-/// ホットパス: イベント時の線形探索 + フレーム毎 `O(押下キー数)` の集合コピー。
-/// 全画素・RT ループ無し。初回容量確保後は `clearRetainingCapacity` で再確保しない。
+/// Hot path: linear search on events + per-frame `O(pressed key count)` set copy.
+/// No full-pixel or RT loops. After the first capacity reserve, `clearRetainingCapacity` avoids realloc.
 pub const KeyboardState = struct {
     alloc: std.mem.Allocator,
     current: std.ArrayList(KeyCode) = .empty,
@@ -221,18 +221,18 @@ pub const KeyboardState = struct {
         self.* = undefined;
     }
 
-    /// フレーム冒頭で呼ぶ。現フレーム開始時点の押下集合を previous に保存する。
-    /// current はそのまま維持し、以降の keyDown/keyUp で更新する。
+    /// Call at the start of a frame. Saves the pressed set at frame start into previous.
+    /// current is kept as-is and then updated by subsequent keyDown/keyUp.
     pub fn beginFrame(self: *KeyboardState) void {
         self.previous.clearRetainingCapacity();
         self.previous.appendSlice(self.alloc, self.current.items) catch @panic("KeyboardState.beginFrame: OOM");
     }
 
-    /// キーを押下集合に追加する（重複は無視。key repeat 相当の二重登録を防ぐ）。
-    /// 負値 / UNKNOWN は無視。
-    /// previous の容量もここ（イベント時）で同時確保し、beginFrame のフレーム毎
-    /// appendSlice が再確保しないことを保証する（codex レビュー対応。無割当は
-    /// FailingAllocator テストで固定）。
+    /// Add a key to the pressed set (duplicates ignored; prevents double-insert equivalent to key repeat).
+    /// Negative / UNKNOWN are ignored.
+    /// Also reserves previous's capacity here (on the event) so beginFrame's per-frame
+    /// appendSlice does not realloc (zero-alloc after warm-up is pinned by the
+    /// FailingAllocator test).
     pub fn keyDown(self: *KeyboardState, key: KeyCode) void {
         if (!isTrackable(key)) return;
         if (listContains(self.current.items, key)) return;
@@ -240,7 +240,7 @@ pub const KeyboardState = struct {
         self.previous.ensureTotalCapacity(self.alloc, self.current.items.len) catch @panic("KeyboardState.keyDown: OOM");
     }
 
-    /// キーを押下集合から除去する。未押下・負値 / UNKNOWN は no-op。
+    /// Remove a key from the pressed set. Not-pressed / negative / UNKNOWN are no-ops.
     pub fn keyUp(self: *KeyboardState, key: KeyCode) void {
         if (!isTrackable(key)) return;
         removeFirst(&self.current, key);
@@ -250,12 +250,12 @@ pub const KeyboardState = struct {
         return listContains(self.current.items, key);
     }
 
-    /// 前フレーム非押下 → 今フレーム押下。
+    /// True only on the rising edge (not pressed previous frame → pressed this frame).
     pub fn justPressed(self: *const KeyboardState, key: KeyCode) bool {
         return listContains(self.current.items, key) and !listContains(self.previous.items, key);
     }
 
-    /// 前フレーム押下 → 今フレーム非押下。
+    /// True only on the falling edge (pressed previous frame → not pressed this frame).
     pub fn justReleased(self: *const KeyboardState, key: KeyCode) bool {
         return listContains(self.previous.items, key) and !listContains(self.current.items, key);
     }
@@ -276,11 +276,11 @@ pub const KeyboardState = struct {
 };
 
 // ============================================================================
-// tests（platform facade 不要。platform_types のみ）
+// tests (no platform facade; platform_types only)
 // ============================================================================
 const testing = std.testing;
 
-test "KeyboardState: idle は全クエリ false" {
+test "KeyboardState: idle makes every query false" {
     var state = KeyboardState.init(testing.allocator);
     defer state.deinit();
     try testing.expect(!state.isDown(.A));
@@ -288,7 +288,7 @@ test "KeyboardState: idle は全クエリ false" {
     try testing.expect(!state.justReleased(.A));
 }
 
-test "KeyboardState: 単一キー down / hold / up のエッジは 1 フレーム差分だけ" {
+test "KeyboardState: single-key down / hold / up edges are only the 1-frame difference" {
     var state = KeyboardState.init(testing.allocator);
     defer state.deinit();
 
@@ -319,7 +319,7 @@ test "KeyboardState: 単一キー down / hold / up のエッジは 1 フレー�
     try testing.expect(!state.justReleased(.A));
 }
 
-test "KeyboardState: 修飾キー（左右 Shift/Control）も KeyCode 集合で扱う" {
+test "KeyboardState: modifiers (left/right Shift/Control) are also in the KeyCode set" {
     var state = KeyboardState.init(testing.allocator);
     defer state.deinit();
 
@@ -334,7 +334,7 @@ test "KeyboardState: 修飾キー（左右 Shift/Control）も KeyCode 集合で
     try testing.expect(!state.isDown(.LEFT_CONTROL));
 }
 
-test "KeyboardState: 複数キー同時押下と一部解放" {
+test "KeyboardState: multiple keys held and partial release" {
     var state = KeyboardState.init(testing.allocator);
     defer state.deinit();
 
@@ -354,7 +354,7 @@ test "KeyboardState: 複数キー同時押下と一部解放" {
     try testing.expect(!state.justPressed(.D));
 }
 
-test "KeyboardState: 重複 keyDown（repeat 相当）で二重登録されない" {
+test "KeyboardState: duplicate keyDown (repeat-equivalent) does not double-insert" {
     var state = KeyboardState.init(testing.allocator);
     defer state.deinit();
 
@@ -373,7 +373,7 @@ test "KeyboardState: 重複 keyDown（repeat 相当）で二重登録されな�
     try testing.expect(!state.justPressed(.SPACE));
 }
 
-test "KeyboardState: UNKNOWN / 負値キーは集合に入らない" {
+test "KeyboardState: UNKNOWN / negative keys are not added to the set" {
     var state = KeyboardState.init(testing.allocator);
     defer state.deinit();
 
@@ -388,9 +388,9 @@ test "KeyboardState: UNKNOWN / 負値キーは集合に入らない" {
     try testing.expectEqual(@as(usize, 0), state.current.items.len);
 }
 
-test "KeyboardState: 同一フレーム down→up は transient edge を保持しない" {
-    // plan §7 / Claude 設計レビュー付記: 前後フレーム最終状態差分方式では
-    // 同一フレーム内の押下後即解放は justPressed/justReleased に現れない。
+test "KeyboardState: same-frame down→up does not keep a transient edge" {
+    // Same-frame press-then-release does not surface on justPressed/justReleased
+    // under the previous/current final-state diff model.
     var state = KeyboardState.init(testing.allocator);
     defer state.deinit();
 
@@ -402,23 +402,23 @@ test "KeyboardState: 同一フレーム down→up は transient edge を保持�
     try testing.expect(!state.justReleased(.ESCAPE));
 }
 
-test "KeyboardState: 容量安定後の beginFrame はゼロアロケーション（FailingAllocator で実測）" {
+test "KeyboardState: beginFrame after capacity warm-up is zero-alloc (pinned with FailingAllocator)" {
     var state = KeyboardState.init(std.testing.allocator);
     defer state.deinit();
-    // イベント時（keyDown）に current/previous の容量を確保しておく
+    // Reserve current/previous capacity on the event (keyDown)
     state.beginFrame();
     state.keyDown(.A);
     state.keyDown(.B);
     state.keyDown(.LEFT_SHIFT);
     try std.testing.expect(state.justPressed(.A)); // prev=[] / current={A,B,SHIFT}
-    // 以降のフレーム毎 beginFrame は一切割り当てないことを FailingAllocator で固定
+    // Pin with FailingAllocator that later per-frame beginFrame allocates nothing
     var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
     state.alloc = failing.allocator();
-    state.beginFrame(); // prev={A,B,SHIFT} へコピー（容量確保済み → 無割当）
+    state.beginFrame(); // Copy into prev={A,B,SHIFT} (capacity already reserved → zero alloc)
     try std.testing.expect(!state.justPressed(.A));
     try std.testing.expect(state.isDown(.B));
     state.beginFrame();
     try std.testing.expect(state.isDown(.LEFT_SHIFT));
-    // 後始末用に通常 allocator へ戻す（deinit の free は FailingAllocator でも可だが明示的に戻す）
+    // Switch back to a normal allocator for cleanup (deinit free works on FailingAllocator too, but be explicit)
     state.alloc = std.testing.allocator;
 }

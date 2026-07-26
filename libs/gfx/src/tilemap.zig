@@ -1,13 +1,13 @@
-//! タイルマップ描画 + solid AABB 衝突 / 押し戻し（TASK-111.5）。
+//! Tilemap drawing + solid AABB collision / resolution.
 //!
-//! `TileMap` は Atlas・マップ配列・フラグ配列を所有しない非所有型。
-//! タイル ID は Atlas frame index と 1:1。`EmptyTile` は空セル予約値。
+//! `TileMap` is a non-owning type; it does not own the Atlas, map array, or flag array.
+//! Tile IDs are 1:1 with Atlas frame indices. `EmptyTile` is the empty-cell sentinel.
 //!
-//! ホットパス宣言:
-//! - `draw`: フレーム毎。visibleRect 由来の候補タイルのみ走査し、各タイルは
-//!   `Atlas.drawFrame` → 既存 `drawSpriteEx`（SIMD 経路）へ委譲。全画素ループ新設なし。
-//! - `queryAabb` / `resolveAabb`: 論理更新毎。AABB 候補タイルのみ走査、allocation-free。
-//! - マップ / Atlas / フラグ確保は初期化時のみ（本モジュール外）。
+//! Hot-path declaration:
+//! - `draw`: every frame. Walks only candidate tiles from visibleRect; each tile
+//!   delegates to `Atlas.drawFrame` → existing `drawSpriteEx` (SIMD path). No new full-pixel loop.
+//! - `queryAabb` / `resolveAabb`: every logical update. Walks only AABB candidate tiles; allocation-free.
+//! - Map / Atlas / flag allocation is init-time only (outside this module).
 
 const std = @import("std");
 const atlas_mod = @import("atlas.zig");
@@ -19,35 +19,35 @@ const Atlas = atlas_mod.Atlas;
 const Camera = camera_mod.Camera;
 const SpriteDrawOptions = sprite.SpriteDrawOptions;
 
-/// 空セル用の予約タイル ID。Atlas frame index `0` は有効なタイルとして使える。
+/// Reserved tile ID for empty cells. Atlas frame index `0` remains a valid tile.
 pub const EmptyTile: u16 = std.math.maxInt(u16);
 
-/// タイル種別（Atlas frame）ごとの衝突・描画フラグ。
-/// 注: `opaque` は Zig 予約語のためフィールドは `@"opaque"`（意味はプランの opaque と同じ）。
+/// Per-tile-kind (Atlas frame) collision and draw flags.
+/// Note: `opaque` is a Zig reserved word, so the field is `@"opaque"`.
 pub const TileFlags = struct {
     solid: bool = false,
-    /// true のとき描画は `SpriteDrawOptions.@"opaque"` 経路（全画素 alpha=255 を init で検証）。
+    /// When true, drawing uses the `SpriteDrawOptions.@"opaque"` path (init verifies every pixel alpha=255).
     @"opaque": bool = false,
 };
 
 pub const TileMapError = error{
-    /// `width * height` と `tiles.len` が一致しない
+    /// `width * height` does not match `tiles.len`
     DimensionMismatch,
-    /// タイル ID が Atlas frame 範囲外
+    /// Tile ID is outside the Atlas frame range
     TileIdOutOfRange,
-    /// `flags.len` が Atlas frame 数と一致しない
+    /// `flags.len` does not match the Atlas frame count
     FlagsLengthMismatch,
-    /// tile 寸法が Atlas frame と一致しない
+    /// Tile size does not match Atlas frames
     TileSizeMismatch,
-    /// `opaque=true` な frame に alpha≠255 の画素がある
+    /// An `opaque=true` frame has a pixel with alpha≠255
     OpaqueAlphaViolation,
-    /// tile 幅/高さが 0
+    /// Tile width/height is 0
     ZeroTileSize,
-    /// width/height の乗算が overflow
+    /// width/height multiplication overflows
     DimensionOverflow,
 };
 
-/// Atlas を借用する非所有タイルマップ。
+/// Non-owning tilemap that borrows an Atlas.
 pub const TileMap = struct {
     atlas: *const Atlas,
     tiles: []const u16,
@@ -57,7 +57,7 @@ pub const TileMap = struct {
     tile_width: u32,
     tile_height: u32,
 
-    /// 検証付きで TileMap を構築する（所有権は移さない）。
+    /// Build a TileMap with validation (ownership is not transferred).
     pub fn init(
         atlas: *const Atlas,
         tiles: []const u16,
@@ -84,7 +84,7 @@ pub const TileMap = struct {
             if (@as(usize, id) >= frame_count) return error.TileIdOutOfRange;
         }
 
-        // opaque=true の frame は全画素 alpha=255 を要求（srcOverOpaque 前提）。
+        // opaque=true frames require every pixel alpha=255 (srcOverOpaque premise).
         for (flags, 0..) |f, fi| {
             if (!f.@"opaque") continue;
             const fr = atlas.frames[fi];
@@ -110,8 +110,8 @@ pub const TileMap = struct {
         };
     }
 
-    /// ワールド可視矩形内のタイルだけを描画する。
-    /// 各タイルは `Atlas.drawFrame` へ委譲（全画素ループは新設しない）。
+    /// Draw only tiles inside the world-visible rect.
+    /// Each tile delegates to `Atlas.drawFrame` (no new full-pixel loop).
     pub fn draw(
         self: *const TileMap,
         framebuffer: []u32,
@@ -126,13 +126,13 @@ pub const TileMap = struct {
         const tw: f32 = @floatFromInt(self.tile_width);
         const th: f32 = @floatFromInt(self.tile_height);
 
-        // 可視範囲をタイル index へ（@floor で負も一貫）。右下は exclusive。
+        // Visible range → tile indices (@floor is consistent for negatives). Bottom-right is exclusive.
         var tx0: i32 = @intFromFloat(@floor(vis.x / tw));
         var ty0: i32 = @intFromFloat(@floor(vis.y / th));
         var tx1: i32 = @intFromFloat(@ceil((vis.x + vis.w) / tw));
         var ty1: i32 = @intFromFloat(@ceil((vis.y + vis.h) / th));
 
-        // マップ境界へループ前 clamp
+        // Clamp to map bounds before the loop
         const map_w: i32 = @intCast(self.width);
         const map_h: i32 = @intCast(self.height);
         if (tx0 < 0) tx0 = 0;
@@ -168,7 +168,7 @@ pub const TileMap = struct {
         }
     }
 
-    /// body AABB と交差する solid タイルを row-major 順で列挙する iterator を返す。
+    /// Return an iterator that enumerates solid tiles intersecting the body AABB in row-major order.
     pub fn queryAabb(self: *const TileMap, body: gmath.Rect) QueryIterator {
         var it = QueryIterator{
             .map = self,
@@ -194,7 +194,7 @@ pub const TileMap = struct {
         return it;
     }
 
-    /// solid タイルとの最大 penetration 優先押し戻し（固定反復・決定的）。
+    /// Max-penetration-first push-out against solid tiles (fixed iterations; deterministic).
     pub fn resolveAabb(self: *const TileMap, body: *gmath.Rect) ResolveResult {
         var result = ResolveResult{};
         if (body.isEmpty()) return result;
@@ -208,7 +208,7 @@ pub const TileMap = struct {
             };
             result.iterations = i + 1;
 
-            // normal * depth で押し戻し（normal は tile→body 方向 = body が押し出される方向）
+            // Push out by normal * depth (normal is tile→body = the direction the body is pushed)
             body.x += contact.collision.normal.x * contact.collision.depth;
             body.y += contact.collision.normal.y * contact.collision.depth;
 
@@ -217,14 +217,14 @@ pub const TileMap = struct {
             if (contact.collision.normal.x < 0) result.hit_left = true;
             if (contact.collision.normal.x > 0) result.hit_right = true;
         }
-        // 最大反復到達: まだ接触が残っている可能性
+        // Hit max iterations: contact may still remain
         if (self.deepestContact(body.*) != null) {
             result.saturated = true;
         }
         return result;
     }
 
-    /// タイル (tx, ty) のワールド AABB。
+    /// World AABB of tile (tx, ty).
     pub fn tileWorldRect(self: *const TileMap, tx: u32, ty: u32) gmath.Rect {
         return .{
             .x = @as(f32, @floatFromInt(tx)) * @as(f32, @floatFromInt(self.tile_width)),
@@ -245,7 +245,7 @@ pub const TileMap = struct {
 
         var tx0_i: i32 = @intFromFloat(@floor(body.x / tw));
         var ty0_i: i32 = @intFromFloat(@floor(body.y / th));
-        // 半開区間: 右下 exclusive。境界ぴったりは次タイルを含まない。
+        // Half-open: bottom-right exclusive. A point exactly on the edge does not include the next tile.
         var tx1_i: i32 = @intFromFloat(@ceil((body.x + body.w) / tw));
         var ty1_i: i32 = @intFromFloat(@ceil((body.y + body.h) / th));
 
@@ -265,14 +265,14 @@ pub const TileMap = struct {
         };
     }
 
-    /// 正の penetration が最大の接触を 1 件返す。同深さは row-major 先頭を維持。
+    /// Return one contact with the largest positive penetration. Ties keep the row-major first.
     fn deepestContact(self: *const TileMap, body: gmath.Rect) ?TileContact {
         var best: ?TileContact = null;
         var it = self.queryAabb(body);
         while (it.next()) |c| {
             if (best) |b| {
                 if (c.collision.depth > b.collision.depth) best = c;
-                // 同深さ: query が row-major なので先勝ちを維持（更新しない）
+                // Same depth: query is row-major, so keep first-wins (do not update)
             } else {
                 best = c;
             }
@@ -281,7 +281,7 @@ pub const TileMap = struct {
     }
 };
 
-/// `queryAabb` の接触 1 件。
+/// One contact from `queryAabb`.
 pub const TileContact = struct {
     tile_x: u32,
     tile_y: u32,
@@ -290,7 +290,7 @@ pub const TileContact = struct {
     collision: gmath.Collision,
 };
 
-/// allocation-free の solid 接触 iterator（row-major）。
+/// Allocation-free solid-contact iterator (row-major).
 pub const QueryIterator = struct {
     map: *const TileMap,
     body: gmath.Rect,
@@ -317,7 +317,7 @@ pub const QueryIterator = struct {
 
                 const tile_rect = self.map.tileWorldRect(tx, ty);
                 const col = gmath.aabbVsAabb(self.body, tile_rect);
-                // エッジ接触だけの depth=0 は押し戻し対象外
+                // depth=0 edge-only contacts are not push-out targets
                 if (!col.hit or col.depth <= 0) continue;
 
                 return .{
@@ -336,7 +336,7 @@ pub const QueryIterator = struct {
     }
 };
 
-/// `resolveAabb` の結果。
+/// Result of `resolveAabb`.
 pub const ResolveResult = struct {
     grounded: bool = false,
     hit_ceiling: bool = false,
@@ -346,7 +346,7 @@ pub const ResolveResult = struct {
     saturated: bool = false,
 };
 
-/// 押し戻しの最大反復回数（固定。飽和時は `saturated=true`）。
+/// Max push-out iterations (fixed. On saturation, `saturated=true`).
 pub const ResolveMaxIterations: u8 = 8;
 
 // ============================================================
@@ -381,7 +381,7 @@ fn makeAtlasGrid(
 }
 
 fn solidFlags(n: usize) []const TileFlags {
-    // テスト用: 全 frame solid + opaque
+    // For tests: all frames solid + opaque
     const static_flags = [_]TileFlags{
         .{ .solid = true, .@"opaque" = true },
         .{ .solid = true, .@"opaque" = true },

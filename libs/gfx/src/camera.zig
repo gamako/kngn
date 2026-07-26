@@ -1,25 +1,25 @@
-//! 2D カメラ / ビューポート（TASK-111.4）。
+//! 2D camera / viewport.
 //!
-//! world↔screen 変換、ワールド境界 clamp、ターゲット追従（固定 f32 lerp）、
-//! 可視範囲 `visibleRect`（カリング・タイル描画の共通入口）。
+//! world↔screen transform, world-bounds clamp, target follow (fixed f32 lerp),
+//! and visible range `visibleRect` (shared entry for culling and tile drawing).
 //!
-//! ホットパス宣言:
+//! Hot-path declaration:
 //! - `worldToScreen` / `screenToWorld` / `visibleRect` / `clampToWorld` / `follow`
-//!   はフレーム毎・オブジェクト毎または論理更新毎の O(1)。アロケーション無し・全画素ループ無し。
+//!   are O(1) per frame / per object / or per logical update. No allocation; no full-pixel loops.
 //!
-//! 決定論の前提（follow の bit 一致）:
-//! - lerp は `a + (b - a) * alpha` のみ（@mulAdd 禁止）。
-//! - 時刻・乱数・浮動 dt は Camera 内で使用しない。
+//! Determinism premises (bit-identical follow):
+//! - lerp is only `a + (b - a) * alpha` (@mulAdd forbidden).
+//! - Camera uses no wall clock, RNG, or floating dt internally.
 
 const std = @import("std");
 
-/// 2D ベクトル（f32。drawing / シミュレーションと同じ精度）。
+/// 2D vector (f32; same precision as drawing / simulation).
 pub const Vec2 = struct {
     x: f32,
     y: f32,
 };
 
-/// 軸平行矩形。半開区間 `[x, x+w) × [y, y+h)`。
+/// Axis-aligned rect. Half-open `[x, x+w) × [y, y+h)`.
 pub const Rect = struct {
     x: f32,
     y: f32,
@@ -31,18 +31,18 @@ pub const Rect = struct {
     }
 };
 
-/// zoom の有効範囲（両端含む）。
+/// Valid zoom range (inclusive on both ends).
 pub const ZOOM_MIN: u32 = 1;
 pub const ZOOM_MAX: u32 = 8;
 
-/// 2D カメラ。
+/// 2D camera.
 ///
-/// `position` はワールド座標の**左上**（viewport 左上に対応する world 点 = pan）。
-/// center position とは混同しない。
+/// `position` is the **top-left** of the world viewport (world point mapped to viewport top-left = pan).
+/// Do not confuse with a center position.
 pub const Camera = struct {
     position: Vec2,
-    /// 1..8（ZOOM_MIN..ZOOM_MAX）。init/setZoom で clamp されるが、直接代入で不変条件を
-    /// 破っても除算前提が崩れないよう、全変換は使用時に clampZoom で正規化する（codex レビュー対応）。
+    /// 1..8 (ZOOM_MIN..ZOOM_MAX). init/setZoom clamp it; even if direct assignment breaks the invariant,
+    /// every transform still normalizes via clampZoom at use time so the division premise holds.
     zoom: u32,
 
     pub fn init(position: Vec2, zoom: u32) Camera {
@@ -56,7 +56,7 @@ pub const Camera = struct {
         self.zoom = clampZoom(zoom);
     }
 
-    /// world → screen。
+    /// world → screen.
     /// `screen = viewport.origin + (world - position) * zoom`
     pub fn worldToScreen(self: Camera, world: Vec2, viewport: Rect) Vec2 {
         const z: f32 = @floatFromInt(clampZoom(self.zoom));
@@ -66,7 +66,7 @@ pub const Camera = struct {
         };
     }
 
-    /// screen → world。
+    /// screen → world.
     /// `world = position + (screen - viewport.origin) / zoom`
     pub fn screenToWorld(self: Camera, screen: Vec2, viewport: Rect) Vec2 {
         const z: f32 = @floatFromInt(clampZoom(self.zoom));
@@ -76,8 +76,8 @@ pub const Camera = struct {
         };
     }
 
-    /// 現在の position / zoom / viewport サイズから、ワールド座標の可視矩形を返す。
-    /// タイル描画やカリングの共通入口。viewport.origin は影響しない（サイズのみ）。
+    /// From current position / zoom / viewport size, return the visible rect in world coordinates.
+    /// Shared entry for tile drawing and culling. viewport.origin does not affect it (size only).
     pub fn visibleRect(self: Camera, viewport: Rect) Rect {
         const z: f32 = @floatFromInt(clampZoom(self.zoom));
         return .{
@@ -88,17 +88,17 @@ pub const Camera = struct {
         };
     }
 
-    /// ワールド境界内に position を clamp する。
-    /// ワールドが可視より小さい軸は中央配置する。
+    /// Clamp position inside world bounds.
+    /// Axes where the world is smaller than the view are centered.
     pub fn clampToWorld(self: *Camera, viewport: Rect, world_bounds: Rect) void {
         const vis = self.visibleRect(viewport);
         self.position.x = clampAxis(self.position.x, world_bounds.x, world_bounds.w, vis.w);
         self.position.y = clampAxis(self.position.y, world_bounds.y, world_bounds.h, vis.h);
     }
 
-    /// ターゲットを viewport 中央へ置く位置へ固定 f32 `lerp_alpha` で補間し、その後 clamp。
-    /// `lerp_alpha` は呼び出し側が固定値を渡す（Camera 内で時刻・乱数は使わない）。
-    /// 式: `pos = pos + (desired - pos) * alpha`（@mulAdd 禁止）。
+    /// Lerp toward the position that centers the target in the viewport with fixed f32 `lerp_alpha`, then clamp.
+    /// Caller passes a fixed `lerp_alpha` (Camera uses no wall clock or RNG).
+    /// Formula: `pos = pos + (desired - pos) * alpha` (@mulAdd forbidden).
     pub fn follow(self: *Camera, target: Vec2, viewport: Rect, world_bounds: Rect, lerp_alpha: f32) void {
         const z: f32 = @floatFromInt(clampZoom(self.zoom));
         const half_w = (viewport.w / z) * 0.5;
@@ -107,7 +107,7 @@ pub const Camera = struct {
             .x = target.x - half_w,
             .y = target.y - half_h,
         };
-        // a + (b - a) * alpha — 縮約演算子を使わない（bit 決定論）
+        // a + (b - a) * alpha — no fused multiply-add (bit determinism)
         self.position.x = self.position.x + (desired.x - self.position.x) * lerp_alpha;
         self.position.y = self.position.y + (desired.y - self.position.y) * lerp_alpha;
         self.clampToWorld(viewport, world_bounds);
@@ -118,10 +118,10 @@ fn clampZoom(zoom: u32) u32 {
     return @min(@max(zoom, ZOOM_MIN), ZOOM_MAX);
 }
 
-/// 1 軸の clamp。world が view より狭いときは中央配置の position を返す。
+/// Clamp one axis. When world is narrower than view, return the centered position.
 fn clampAxis(pos: f32, world_origin: f32, world_size: f32, view_size: f32) f32 {
     if (world_size <= view_size) {
-        // 中央配置: position は world より view の余剰半分だけ手前
+        // Center: position sits half the view surplus ahead of world
         return world_origin - (view_size - world_size) * 0.5;
     }
     const min_pos = world_origin;
@@ -277,7 +277,7 @@ test "Camera follow same input sequence is bit-identical" {
 }
 
 test "Camera screen/world negative coords use consistent float math" {
-    // 負座標の往復（@floor は example 側。Camera 自体は f32 線形）
+    // Round-trip with negative coords (@floor is on the example side; Camera itself is f32 linear)
     const cam = Camera.init(.{ .x = -30, .y = -40 }, 2);
     const vp: Rect = .{ .x = 5, .y = 10, .w = 100, .h = 80 };
     const world: Vec2 = .{ .x = -50.75, .y = -12.25 };
@@ -285,7 +285,7 @@ test "Camera screen/world negative coords use consistent float math" {
     const back = cam.screenToWorld(screen, vp);
     try expectVec2Eq(back, world, 1e-4);
 
-    // example と同じ丸め規則: @floor で screen を i32 へ
+    // Same rounding as examples: @floor screen to i32
     const sx = @as(i32, @intFromFloat(@floor(screen.x)));
     const sy = @as(i32, @intFromFloat(@floor(screen.y)));
     // screen.x = 5 + (-50.75 - (-30))*2 = 5 + (-20.75)*2 = 5 - 41.5 = -36.5 → floor = -37

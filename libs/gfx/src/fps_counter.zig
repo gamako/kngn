@@ -1,59 +1,59 @@
 const std = @import("std");
 
-/// FPS計測ヘルパー
+/// FPS measurement helper
 ///
-/// 設計意図:
-/// - 指定した時間間隔でFPSを自動計測
-/// - update()を毎フレーム呼ぶだけでカウント
-/// - 間隔経過時にFPS値を自動更新（コンソール出力はオプション）
+/// Design intent:
+/// - Auto-measure FPS over a configured time interval
+/// - Just call update() every frame to count
+/// - When the interval elapses, update the FPS value automatically (console print is optional)
 ///
-/// 使用例:
+/// Example:
 /// ```zig
-/// var fps_counter = FpsCounter.init(1.0);  // 1秒間隔
+/// var fps_counter = FpsCounter.init(1.0);  // 1-second interval
 ///
 /// while (c.platform_poll_events(window)) {
-///     const frame_time = /* 前フレームからの経過時間 */;
+///     const frame_time = /* elapsed time since the previous frame */;
 ///
 ///     if (fps_counter.update(frame_time)) {
 ///         std.debug.print("FPS: {d}\n", .{fps_counter.getFps()});
 ///     }
 ///
-///     // ... 描画処理 ...
+///     // ... draw ...
 /// }
 /// ```
 pub const FpsCounter = struct {
-    /// 計測間隔（秒）
+    /// Measurement interval (seconds)
     interval: f64,
 
-    /// 現在の経過時間（秒）
+    /// Elapsed time in the current interval (seconds)
     timer: f64 = 0.0,
 
-    /// 現在の間隔内でのフレーム数
+    /// Frame count within the current interval
     frame_count: u32 = 0,
 
-    /// 最後に計算されたFPS値
+    /// Last computed FPS value
     last_fps: u32 = 0,
 
-    /// 初期化
-    /// - interval: FPS計測の更新間隔（秒）、通常は1.0を指定
+    /// Initialize
+    /// - interval: FPS measurement update interval (seconds); usually 1.0
     pub fn init(interval: f64) FpsCounter {
-        std.debug.assert(interval > 0.0); // ゼロ除算を防ぐ
+        std.debug.assert(interval > 0.0); // Prevent division by zero
         return .{ .interval = interval };
     }
 
-    /// フレーム時間を追加し、FPS値を更新
+    /// Add frame time and update the FPS value
     ///
-    /// 戻り値: true の場合、FPS値が更新された（間隔経過）
+    /// Returns: true when the FPS value was updated (interval elapsed)
     pub fn update(self: *FpsCounter, frame_time: f64) bool {
         self.timer += frame_time;
         self.frame_count += 1;
 
         if (self.timer >= self.interval) {
-            // FPS = フレーム数 / 経過時間
+            // FPS = frame count / elapsed time
             self.last_fps = @intFromFloat(@as(f64, @floatFromInt(self.frame_count)) / self.timer);
 
-            // リセット
-            // 注: ラグスパイク後の誤報を防ぐため、余剰時間は切り捨てる
+            // Reset
+            // Note: discard surplus time so a lag spike does not falsely report the next interval early
             self.frame_count = 0;
             self.timer = 0.0;
 
@@ -63,12 +63,12 @@ pub const FpsCounter = struct {
         return false;
     }
 
-    /// 最新のFPS値を取得
+    /// Get the latest FPS value
     pub fn getFps(self: *const FpsCounter) u32 {
         return self.last_fps;
     }
 
-    /// カウンタをリセット（シーン遷移、ポーズ解除時など）
+    /// Reset the counter (e.g. scene change, unpause)
     pub fn reset(self: *FpsCounter) void {
         self.timer = 0.0;
         self.frame_count = 0;
@@ -79,20 +79,20 @@ pub const FpsCounter = struct {
 test "FpsCounter basic" {
     var counter = FpsCounter.init(1.0);
 
-    // 60FPSのシミュレーション（1フレーム約16.67ms）
+    // Simulate 60FPS (≈16.67ms per frame)
     const dt = 1.0 / 60.0;
 
-    // 59フレーム目までは更新されない
+    // No update through frame 59
     for (0..59) |_| {
         const updated = counter.update(dt);
         try std.testing.expect(!updated);
     }
 
-    // 60フレーム目で約1秒経過 → FPS更新
+    // Frame 60 ≈ 1 second elapsed → FPS updates
     const updated = counter.update(dt);
     try std.testing.expect(updated);
 
-    // FPSは約60
+    // FPS is about 60
     const fps = counter.getFps();
     try std.testing.expect(fps >= 59 and fps <= 61);
 }
@@ -100,11 +100,11 @@ test "FpsCounter basic" {
 test "FpsCounter reset" {
     var counter = FpsCounter.init(1.0);
 
-    // いくつかのフレームを追加
+    // Add a few frames
     _ = counter.update(0.5);
     try std.testing.expect(counter.frame_count > 0);
 
-    // リセット
+    // Reset
     counter.reset();
     try std.testing.expectEqual(@as(f64, 0.0), counter.timer);
     try std.testing.expectEqual(@as(u32, 0), counter.frame_count);
@@ -114,16 +114,16 @@ test "FpsCounter reset" {
 test "FpsCounter timer reset on interval" {
     var counter = FpsCounter.init(1.0);
 
-    // 1.1秒分の時間を追加
+    // Add 1.1 seconds of time
     const updated = counter.update(1.1);
     try std.testing.expect(updated);
 
-    // タイマーは0にリセットされる（ラグスパイク後の誤報を防ぐため）
+    // Timer resets to 0 (prevents false reports after a lag spike)
     try std.testing.expectEqual(@as(f64, 0.0), counter.timer);
 }
 
 test "FpsCounter zero interval assertion" {
-    // interval=0.0 でアサーション失敗することを確認
-    // 注: このテストはデバッグビルドでのみ機能
-    // リリースビルドではassertが無効化される
+    // Confirm interval=0.0 fails the assertion
+    // Note: this test only works in debug builds
+    // In release builds assert is disabled
 }

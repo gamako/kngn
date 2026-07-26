@@ -1,41 +1,41 @@
-/// 固定タイムステップヘルパー
+/// Fixed timestep helper
 ///
-/// 論理更新（物理演算、ゲームロジック）を固定レートで実行するための時間管理。
-/// フレームレートが変動しても、論理的な動作が一定になることを保証する。
+/// Time manager that runs logical updates (physics, game logic) at a fixed rate.
+/// Guarantees stable logical behavior even when the frame rate varies.
 ///
-/// 設計意図:
-/// - 描画レートと論理更新レートを分離し、安定したシミュレーションを実現
-/// - 高速な描画では補間により滑らかな表示、処理落ち時はステップスキップで破綻を防止
-/// - max_steps（デフォルト5）により「死のスパイラル」（更新が追いつかず無限に遅延が増加する現象）を防止
+/// Design intent:
+/// - Separate render rate from logical update rate for a stable simulation
+/// - Fast rendering uses interpolation for smooth display; under load, step capping prevents collapse
+/// - max_steps (default 5) prevents the spiral of death (updates fall behind and delay grows without bound)
 ///
-/// フレーム戦略との関係:
+/// Relation to frame strategies:
 ///
-/// 1. 可変タイムステップ（delta time直接使用）
-///    - 毎フレームのdelta timeで直接計算
-///    - シンプルだがフレームレート依存の動作になる
-///    - このヘルパーは不要
+/// 1. Variable timestep (use delta time directly)
+///    - Compute with each frame's delta time
+///    - Simple, but behavior depends on frame rate
+///    - This helper is not needed
 ///
-/// 2. 固定タイムステップ（描画と同期）
-///    - 描画と論理更新が同じレート（例: 両方60Hz + VSync）
-///    - 安定した動作、alpha補間は不要
-///    - このヘルパーを使用（alpha()は不要）
+/// 2. Fixed timestep (synced with rendering)
+///    - Render and logical update share a rate (e.g. both 60Hz + VSync)
+///    - Stable behavior; alpha interpolation is unnecessary
+///    - Use this helper (alpha() is not needed)
 ///
-/// 3. 固定タイムステップ（描画と非同期）← このヘルパーの主な用途
-///    - 描画と論理更新が異なるレート、またはフレームレートが不安定
-///    - alpha補間で滑らかな描画（最大1dt分の遅延あり）
-///    - このヘルパー + alpha()を使用
+/// 3. Fixed timestep (async from rendering) ← primary use of this helper
+///    - Render and logical update differ in rate, or frame rate is unstable
+///    - Alpha interpolation for smooth drawing (up to 1 dt of latency)
+///    - Use this helper + alpha()
 ///
-/// 参考: https://gafferongames.com/post/fix_your_timestep/
+/// Reference: https://gafferongames.com/post/fix_your_timestep/
 pub const FixedTimeStep = struct {
-    accumulator: f64 = 0.0, // 公開: 呼び出し側が操作可能
-    dt: f64, // 論理更新間隔（秒）
-    max_steps: usize = 5, // スパイラル防止
+    accumulator: f64 = 0.0, // Public: callers may mutate
+    dt: f64, // Logical update interval (seconds)
+    max_steps: usize = 5, // Spiral-of-death guard
 
     pub fn init(update_rate: f64) FixedTimeStep {
         return .{ .dt = 1.0 / update_rate };
     }
 
-    /// フレーム時間を追加し、実行すべき論理更新回数を返す
+    /// Add frame time and return how many logical updates should run
     pub fn update(self: *FixedTimeStep, frame_time: f64) usize {
         self.accumulator += frame_time;
         var steps: usize = @intFromFloat(self.accumulator / self.dt);
@@ -48,31 +48,31 @@ pub const FixedTimeStep = struct {
         return steps;
     }
 
-    /// 補間係数（0.0〜1.0）を取得
+    /// Get the interpolation factor (0.0..1.0)
     ///
-    /// 目的: 描画を滑らかにする
-    /// 論理更新のタイミングと描画タイミングはずれるため、
-    /// 直前2回の論理状態（prev, current）を補間して描画位置を求める。
+    /// Purpose: smooth rendering
+    /// Logical-update timing and draw timing diverge, so
+    /// interpolate the previous two logical states (prev, current) for the draw position.
     ///
-    /// トレードオフ:
-    /// 補間により描画位置は実時間より最大1論理更新分（dt）遅れる。
-    /// 60Hzなら最大約16.7ms。通常は問題にならないが、
-    /// 低遅延が求められる場合（格ゲー等）は考慮が必要。
+    /// Trade-off:
+    /// Interpolation delays the draw position by at most one logical update (dt) behind real time.
+    /// At 60Hz that is about 16.7ms max. Usually fine, but
+    /// consider it when low latency is required (e.g. fighting games).
     ///
-    /// 補間はオプション:
-    /// 遅延を避けたい場合は補間を使わず、最新の論理位置をそのまま描画できる。
-    /// 論理更新が60Hz以上なら補間なしでも通常は十分滑らか。
+    /// Interpolation is optional:
+    /// To avoid that latency, skip interpolation and draw the latest logical position as-is.
+    /// If logical updates are 60Hz or higher, no interpolation is usually smooth enough.
     ///
-    /// 使用例:
-    ///   // prev_x: update()実行前に保存した状態
-    ///   // current_x: update()実行後の最新状態
+    /// Example:
+    ///   // prev_x: state saved before update()
+    ///   // current_x: latest state after update()
     ///   const alpha = timestep.alpha();
     ///   const draw_x = prev_x + (current_x - prev_x) * alpha;
     pub fn alpha(self: *const FixedTimeStep) f64 {
         return self.accumulator / self.dt;
     }
 
-    /// accumulatorをリセット（シーン遷移、ポーズ解除時など）
+    /// Reset the accumulator (e.g. scene change, unpause)
     pub fn reset(self: *FixedTimeStep) void {
         self.accumulator = 0.0;
     }
@@ -81,15 +81,15 @@ pub const FixedTimeStep = struct {
 test "FixedTimeStep basic" {
     var ts = FixedTimeStep.init(60.0);
 
-    // 60FPSで1フレーム分の時間を追加 → 1ステップ
+    // Add one frame at 60FPS → 1 step
     const steps1 = ts.update(1.0 / 60.0);
     try @import("std").testing.expectEqual(@as(usize, 1), steps1);
 
-    // 半分の時間を追加 → 0ステップ（accumulatorに蓄積）
+    // Add half a frame → 0 steps (accumulates)
     const steps2 = ts.update(1.0 / 120.0);
     try @import("std").testing.expectEqual(@as(usize, 0), steps2);
 
-    // もう半分追加 → 1ステップ
+    // Add the other half → 1 step
     const steps3 = ts.update(1.0 / 120.0);
     try @import("std").testing.expectEqual(@as(usize, 1), steps3);
 }
@@ -97,31 +97,31 @@ test "FixedTimeStep basic" {
 test "FixedTimeStep max_steps" {
     var ts = FixedTimeStep.init(60.0);
 
-    // 大きな時間を追加（スパイク時のシミュレーション）
-    const steps = ts.update(1.0); // 1秒 = 60ステップ分
-    try @import("std").testing.expectEqual(@as(usize, 5), steps); // max_stepsで制限
+    // Add a large time (spike simulation)
+    const steps = ts.update(1.0); // 1 second = 60 steps worth
+    try @import("std").testing.expectEqual(@as(usize, 5), steps); // Capped by max_steps
 }
 
 test "FixedTimeStep alpha" {
     var ts = FixedTimeStep.init(60.0);
     const dt = ts.dt;
 
-    // 半分の時間を追加
+    // Add half a frame
     _ = ts.update(dt * 0.5);
     const a = ts.alpha();
 
-    // alphaは0.5付近であるべき
+    // alpha should be near 0.5
     try @import("std").testing.expect(a > 0.4 and a < 0.6);
 }
 
 test "FixedTimeStep reset" {
     var ts = FixedTimeStep.init(60.0);
 
-    // 時間を蓄積
+    // Accumulate time
     _ = ts.update(1.0 / 120.0);
     try @import("std").testing.expect(ts.accumulator > 0);
 
-    // リセット
+    // Reset
     ts.reset();
     try @import("std").testing.expectEqual(@as(f64, 0.0), ts.accumulator);
 }
