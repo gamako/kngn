@@ -4,19 +4,19 @@ const pixelops = @import("pixelops");
 
 pub const PremultipliedImage = png.PremultipliedImage;
 
-/// スプライト構造体
-/// Premultiplied Alpha形式のPNG画像データと画面座標を保持
+/// Sprite struct
+/// Holds Premultiplied Alpha PNG image data and screen coordinates
 pub const Sprite = struct {
     image: PremultipliedImage,
     x: i32,
     y: i32,
 
-    /// PNGファイルからスプライトを作成
-    /// - io: I/O 実装（main では `init.io`、テストでは `std.testing.io`）
-    /// - allocator: メモリアロケータ
-    /// - path: PNGファイルのパス
-    /// - x: 初期X座標
-    /// - y: 初期Y座標
+    /// Create a sprite from a PNG file
+    /// - io: I/O implementation (`init.io` in main, `std.testing.io` in tests)
+    /// - allocator: memory allocator
+    /// - path: path to the PNG file
+    /// - x: initial X coordinate
+    /// - y: initial Y coordinate
     pub fn init(io: std.Io, allocator: std.mem.Allocator, path: []const u8, x: i32, y: i32) !Sprite {
         const image = try png.decodePNGFilePremultiplied(io, allocator, path);
         return Sprite{
@@ -26,12 +26,12 @@ pub const Sprite = struct {
         };
     }
 
-    /// 埋め込みPNGデータからスプライトを作成
-    /// @embedFile で埋め込んだバイナリデータから直接読み込む
-    /// - allocator: メモリアロケータ
-    /// - png_data: PNGバイナリデータ（@embedFileで取得）
-    /// - x: 初期X座標
-    /// - y: 初期Y座標
+    /// Create a sprite from embedded PNG data
+    /// Load directly from binary data embedded with @embedFile
+    /// - allocator: memory allocator
+    /// - png_data: PNG binary data (from @embedFile)
+    /// - x: initial X coordinate
+    /// - y: initial Y coordinate
     pub fn initFromData(allocator: std.mem.Allocator, png_data: []const u8, x: i32, y: i32) !Sprite {
         const image = try png.decodePNGPremultiplied(allocator, png_data);
         return Sprite{
@@ -41,21 +41,21 @@ pub const Sprite = struct {
         };
     }
 
-    /// スプライトを破棄してメモリを解放
+    /// Destroy the sprite and free its memory
     pub fn deinit(self: *Sprite, allocator: std.mem.Allocator) void {
         self.image.deinit(allocator);
     }
 
-    /// スプライトを移動
-    /// - dx: X方向の移動量
-    /// - dy: Y方向の移動量
+    /// Move the sprite
+    /// - dx: X displacement
+    /// - dy: Y displacement
     pub fn move(self: *Sprite, dx: i32, dy: i32) void {
         self.x += dx;
         self.y += dy;
     }
 };
 
-/// ソース矩形（半開区間 `[x, x+w) × [y, y+h)`）
+/// Source rectangle (half-open `[x, x+w) × [y, y+h)`)
 pub const SourceRect = struct {
     x: u32,
     y: u32,
@@ -63,47 +63,47 @@ pub const SourceRect = struct {
     h: u32,
 };
 
-/// RGB 乗算 tint（alpha は変更しない）。白 `{255,255,255}` は恒等。
+/// RGB multiply tint (alpha unchanged). White `{255,255,255}` is identity.
 pub const RgbTint = struct {
     r: u8 = 255,
     g: u8 = 255,
     b: u8 = 255,
 };
 
-/// drawSpriteEx の描画オプション。デフォルトは drawSprite と等価。
+/// drawSpriteEx draw options. Defaults are equivalent to drawSprite.
 pub const SpriteDrawOptions = struct {
-    /// null = 画像全体
+    /// null = whole image
     src: ?SourceRect = null,
     flip_x: bool = false,
     flip_y: bool = false,
     scale: u32 = 1,
     tint: RgbTint = .{},
-    /// true のとき `srcOverOpaque` 経路（dst 不透明前提の straight src-over）。
-    /// 既定 false = 従来の `blendPremul` 経路（既存呼び出しに bit 非影響）。
-    /// ソースが全画素 alpha=255 のとき両経路は bit 一致する（テストで固定）。
-    /// 注: `opaque` は Zig 予約語のため `@"opaque"`。
+    /// When true, use the `srcOverOpaque` path (straight src-over assuming opaque dst).
+    /// Default false = the existing `blendPremul` path (bit-identical for existing callers).
+    /// When every source pixel has alpha=255 the two paths are bit-identical (pinned by tests).
+    /// Note: `opaque` is a Zig keyword, hence `@"opaque"`.
     @"opaque": bool = false,
 };
 
-/// フレームバッファにスプライトを描画（クリッピング処理付き）
+/// Draw a sprite into the framebuffer (with clipping)
 ///
-/// Premultiplied Alpha形式のアルファブレンディング対応:
-/// - 透明ピクセル（alpha=0）は背景を透過
-/// - 半透明ピクセルは背景とブレンド
+/// Premultiplied Alpha blending:
+/// - transparent pixels (alpha=0) leave the background
+/// - translucent pixels blend with the background
 ///
-/// - framebuffer: フレームバッファ（canonical BGRA 0xAARRGGBB 形式）
-/// - fb_width: フレームバッファの幅
-/// - fb_height: フレームバッファの高さ
-/// - sprite: 描画するスプライト
-/// 毎フレーム全画素相当を走るホットパス。ブレンド/clip は libs/pixelops の
-/// 共有実装（blendPremul4 / blendPremul / clipBlit。TASK-51 で移設）を使う。
+/// - framebuffer: framebuffer (canonical BGRA 0xAARRGGBB)
+/// - fb_width: framebuffer width
+/// - fb_height: framebuffer height
+/// - sprite: sprite to draw
+/// Hot path that touches the equivalent of every pixel each frame. Blend/clip use the shared
+/// libs/pixelops implementation (blendPremul4 / blendPremul / clipBlit).
 pub fn drawSprite(
     framebuffer: []u32,
     fb_width: u32,
     fb_height: u32,
     sprite: *const Sprite,
 ) void {
-    // clip 交差はループ外で 1 回計算（clip-hoist）。完全画面外は早期リターン。
+    // Compute the clip intersection once outside the loop (clip-hoist). Early-return if fully off-screen.
     const clip = pixelops.clipBlit(
         fb_width,
         fb_height,
@@ -113,18 +113,18 @@ pub fn drawSprite(
         sprite.y,
     ) orelse return;
 
-    // ピクセルブレンド（クリップされた範囲のみ）
-    // 各行を 4 ピクセル単位の SIMD パス + 残り (0..3 px) のスカラー tail で処理する
+    // Pixel blend (clipped range only)
+    // Process each row with a 4-pixel SIMD path + a scalar tail for the remainder (0..3 px)
     var y: u32 = 0;
     while (y < clip.h) : (y += 1) {
         const src_row_base = (clip.src_y + y) * sprite.image.width + clip.src_x;
         const dst_row_base = (clip.dst_y + y) * fb_width + clip.dst_x;
 
         var x: u32 = 0;
-        // SIMD-4 パス
-        // ループ条件 x + 4 <= clip.w と clip.w <= sprite_width - clip.src_x /
-        // fb_width - clip.dst_x により、`src_row_base + x + 3 < (src_y+1)*sprite_width` と
-        // `dst_row_base + x + 3 < (dst_y+1)*fb_width` が成立し、行をまたぐアクセスは発生しない。
+        // SIMD-4 path
+        // Loop condition x + 4 <= clip.w together with clip.w <= sprite_width - clip.src_x /
+        // fb_width - clip.dst_x guarantees `src_row_base + x + 3 < (src_y+1)*sprite_width` and
+        // `dst_row_base + x + 3 < (dst_y+1)*fb_width`, so accesses never cross a row boundary.
         while (x + 4 <= clip.w) : (x += 4) {
             const src_chunk: *const [4]u32 = sprite.image.pixels[src_row_base + x ..][0..4];
             const dst_chunk: *[4]u32 = framebuffer[dst_row_base + x ..][0..4];
@@ -132,7 +132,7 @@ pub fn drawSprite(
             const dv: pixelops.Vec16u8 = @bitCast(dst_chunk.*);
             dst_chunk.* = @bitCast(pixelops.blendPremul4(dv, sv));
         }
-        // スカラー tail
+        // scalar tail
         while (x < clip.w) : (x += 1) {
             const src_idx = src_row_base + x;
             const dst_idx = dst_row_base + x;
@@ -141,13 +141,13 @@ pub fn drawSprite(
     }
 }
 
-/// ソース矩形切り出し / flip / 整数倍 scale / RGB tint 付きスプライト描画。
+/// Sprite draw with source-rect crop / flip / integer scale / RGB tint.
 ///
-/// 毎フレーム全画素相当を走るホットパス。
-/// - clip は `pixelops.clipBlit` でループ外 1 回
-/// - scale/flip の source index は行開始および source pixel group 単位で決定（per-pixel 除算禁止）
-/// - tint は `div255` / `div255Vec16`、blend は `blendPremul4` / `blendPremul`（自作禁止）
-/// - 変換後最大 4px をローカル row buffer に組み立ててから blend
+/// Hot path that touches the equivalent of every pixel each frame.
+/// - clip via `pixelops.clipBlit` once outside the loop
+/// - scale/flip source index decided at row start and per source-pixel group (per-pixel division forbidden)
+/// - tint via `div255` / `div255Vec16`, blend via `blendPremul4` / `blendPremul` (rolling your own is forbidden)
+/// - assemble up to 4 transformed px into a local row buffer, then blend
 pub fn drawSpriteEx(
     framebuffer: []u32,
     fb_width: u32,
@@ -162,7 +162,7 @@ pub fn drawSpriteEx(
     const src: SourceRect = opts.src orelse .{ .x = 0, .y = 0, .w = img_w, .h = img_h };
     if (src.w == 0 or src.h == 0) return;
 
-    // 画像外 / overflow → no-op（内側ループでは検証しない）
+    // Outside image / overflow → no-op (not re-checked in the inner loop)
     const src_x1 = std.math.add(u32, src.x, src.w) catch return;
     const src_y1 = std.math.add(u32, src.y, src.h) catch return;
     if (src_x1 > img_w or src_y1 > img_h) return;
@@ -182,7 +182,7 @@ pub fn drawSpriteEx(
     var y: u32 = 0;
     while (y < clip.h) : (y += 1) {
         const ly = clip.src_y + y;
-        const uy = ly / scale; // 行開始時に 1 回だけ
+        const uy = ly / scale; // Once at row start only
         const src_row: u32 = if (flip_y)
             src.y + (src.h - 1 - uy)
         else
@@ -190,7 +190,7 @@ pub fn drawSpriteEx(
         const src_row_base = src_row * img_w;
         const dst_row_base = (clip.dst_y + y) * fb_width + clip.dst_x;
 
-        // Fast path: scale=1 かつ非 flip_x → ソースも行連続。drawSprite と同型の SIMD 読出し。
+        // Fast path: scale=1 and not flip_x → source is also row-contiguous. Same SIMD read shape as drawSprite.
         if (scale == 1 and !flip_x) {
             const src_x0 = src.x + clip.src_x;
             var x: u32 = 0;
@@ -218,7 +218,7 @@ pub fn drawSpriteEx(
             continue;
         }
 
-        // 水平: clip.src_x から始まる scaled local x。source col と残りコピー数を初期化。
+        // Horizontal: scaled local x starting at clip.src_x. Initialise source col and remaining copy count.
         var ux = clip.src_x / scale;
         var copies_left = scale - (clip.src_x % scale);
 
@@ -269,7 +269,7 @@ pub fn drawSpriteEx(
     }
 }
 
-/// Premultiplied RGB に tint を乗算（A 不変）。scalar。
+/// Multiply tint onto premultiplied RGB (A unchanged). Scalar.
 inline fn applyTint1(pixel: u32, tint: RgbTint) u32 {
     const bytes: [4]u8 = @bitCast(pixel);
     // BGRA: [B,G,R,A]
@@ -282,11 +282,11 @@ inline fn applyTint1(pixel: u32, tint: RgbTint) u32 {
     return @bitCast(out);
 }
 
-/// 4px まとめて tint（div255Vec16）。A lane は ×255 → 恒等。
+/// Tint 4px at once (div255Vec16). A lanes ×255 → identity.
 inline fn applyTint4(pixels: *[4]u32, tint: RgbTint) void {
     const sv: pixelops.Vec16u8 = @bitCast(pixels.*);
     const wide: pixelops.Vec16u16 = sv;
-    // lane 順 BGRA×4
+    // lane order BGRA×4
     const factors: pixelops.Vec16u16 = .{
         tint.b, tint.g, tint.r, 255,
         tint.b, tint.g, tint.r, 255,
@@ -297,8 +297,8 @@ inline fn applyTint4(pixels: *[4]u32, tint: RgbTint) void {
     pixels.* = @bitCast(tinted);
 }
 
-/// drawSpriteEx のスカラー参照実装（SIMD/scale 経路との bit 一致検証用）。
-/// per-pixel の除算・bounds を含むが、テスト専用でホットパスではない。
+/// Scalar reference for drawSpriteEx (for bit-identity checks against the SIMD/scale paths).
+/// Includes per-pixel division and bounds, but is test-only and not a hot path.
 fn drawSpriteExScalarRef(
     framebuffer: []u32,
     fb_width: u32,
@@ -348,14 +348,14 @@ fn drawSpriteExScalarRef(
 // ============================================================
 const testing = std.testing;
 
-/// Premultiplied 不変条件 (R/G/B <= A) を満たす u32 ピクセルを生成する。
-/// `@intCast(Vec16u16 -> Vec16u8)` の narrow が範囲内に収まることを保証するため
-/// すべてのテストデータはこのヘルパーを通すこと。
+/// Build a u32 pixel that satisfies the premultiplied invariant (R/G/B <= A).
+/// All test data must go through this helper so the `@intCast(Vec16u16 -> Vec16u8)`
+/// narrow stays in range.
 ///
-/// 注: これは **不変条件のみ** を満たし、厳密な premultiplied 値
-/// (R' = R * A / 255) を生成するわけではない。例: R=100, A=128 →
-/// 真の premultiplied は 50 だが、本関数は min(100, 128) = 100 を返す。
-/// pixelops.blendPremul4 の `@intCast` narrow を安全に通すための簡易クランプとして使う。
+/// Note: this satisfies the **invariant only**; it does not produce a strict premultiplied value
+/// (R' = R * A / 255). Example: R=100, A=128 →
+/// true premultiplied is 50, but this returns min(100, 128) = 100.
+/// Used as a simple clamp so pixelops.blendPremul4's `@intCast` narrow is safe.
 fn makePremulPixel(r: u8, g: u8, b: u8, a: u8) u32 {
     const rr = @min(r, a);
     const gg = @min(g, a);
@@ -364,8 +364,8 @@ fn makePremulPixel(r: u8, g: u8, b: u8, a: u8) u32 {
     return @bitCast(bytes);
 }
 
-/// PremultipliedImage 風の最小データを作るテスト用ヘルパー。
-/// テストの allocator で pixels を確保し、Sprite に詰めて返す。
+/// Test helper that builds a minimal PremultipliedImage-like payload.
+/// Allocates pixels with the test allocator and packs them into a Sprite.
 fn makeTestSprite(
     allocator: std.mem.Allocator,
     width: u32,
@@ -389,8 +389,8 @@ fn fillRandomPremul(pixels: []u32, seed: u64) void {
     }
 }
 
-// drawSprite の SIMD-4 経路と scalar tail 経路が、SIMD 化前の参照実装と
-// 完全一致することを保証する。
+// Guarantee that drawSprite's SIMD-4 path and scalar-tail path are
+// bit-identical to the scalar reference.
 fn drawSpriteScalarRef(
     framebuffer: []u32,
     fb_width: u32,
@@ -533,7 +533,7 @@ test "drawSpriteEx SIMD path matches scalar reference (flip/scale/tint/clip)" {
     var s = try makeTestSprite(allocator, sw, sh, 0);
     defer allocator.free(s.image.pixels);
     fillRandomPremul(s.image.pixels, 0xABCD1234);
-    // 角に透明・半透明・不透明を明示配置
+    // Place transparent / translucent / opaque explicitly at the corners
     s.image.pixels[0] = makePremulPixel(0, 0, 0, 0);
     s.image.pixels[1] = makePremulPixel(40, 80, 120, 128);
     s.image.pixels[2] = makePremulPixel(200, 100, 50, 255);
@@ -601,7 +601,7 @@ test "drawSpriteEx invalid rect/scale are no-ops" {
 
     drawSpriteEx(fb, 16, 16, &s, .{ .scale = 0 });
     drawSpriteEx(fb, 16, 16, &s, .{ .src = .{ .x = 0, .y = 0, .w = 0, .h = 4 } });
-    drawSpriteEx(fb, 16, 16, &s, .{ .src = .{ .x = 6, .y = 0, .w = 4, .h = 4 } }); // 画像外
+    drawSpriteEx(fb, 16, 16, &s, .{ .src = .{ .x = 6, .y = 0, .w = 4, .h = 4 } }); // outside the image
     drawSpriteEx(fb, 16, 16, &s, .{ .src = .{ .x = 0, .y = 7, .w = 4, .h = 4 } });
 
     for (fb) |px| try testing.expectEqual(bg, px);
@@ -622,7 +622,7 @@ test "applyTint4 matches applyTint1 per lane" {
 }
 
 test "drawSpriteEx opaque path bit-matches blendPremul for fully opaque src" {
-    // TileFlags.opaque 前提: 全画素 alpha=255 のとき opaque=true/false は bit 一致。
+    // TileFlags.opaque assumption: when every pixel has alpha=255, opaque=true/false are bit-identical.
     const allocator = testing.allocator;
     const widths = [_]u32{ 1, 3, 4, 5, 7, 8, 11, 16 };
 
@@ -631,7 +631,7 @@ test "drawSpriteEx opaque path bit-matches blendPremul for fully opaque src" {
         const fb_h: u32 = 5;
         var s = try makeTestSprite(allocator, w, 4, 0);
         defer allocator.free(s.image.pixels);
-        // 全画素 alpha=255 の premul
+        // premul with every pixel alpha=255
         for (s.image.pixels) |*p| {
             p.* = makePremulPixel(40, 80, 120, 255);
         }
