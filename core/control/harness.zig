@@ -5225,7 +5225,6 @@ test "harness onLock/onPresent: 観測 copy は platform buffer 借用から fra
     try testing.expectEqual(@as(u32, 0xFF112233), frame_pixels[3]);
 }
 
-
 fn testSleepMs(ms: u64) void {
     const sec: i64 = @intCast(ms / 1000);
     const nsec: i64 = @intCast((ms % 1000) * 1_000_000);
