@@ -1,13 +1,13 @@
-//! Swift ランタイムリンクヘルパー
+//! Swift runtime link helper
 
 const std = @import("std");
 const macos = @import("macos.zig");
 
-/// Swift ランタイムライブラリ群を exe にリンクする。
+/// Link the Swift runtime libraries into the exe.
 ///
-/// - コアランタイム（必ずリンク）
-/// - optional ライブラリ（SDK に存在する場合のみリンク）
-/// - extra_libs（呼び出し側が指定した追加ライブラリ）
+/// - core runtime (always linked)
+/// - optional libraries (linked only when present in the SDK)
+/// - extra_libs (additional libraries requested by the caller)
 pub fn linkSwiftRuntime(
     b: *std.Build,
     exe: *std.Build.Step.Compile,
@@ -50,8 +50,8 @@ pub fn linkSwiftRuntime(
         exe.root_module.linkSystemLibrary(lib, .{});
     }
 
-    // SDK に存在する場合のみリンクする optional な Swift ランタイム
-    // (新しい macOS SDK では swiftc が暗黙的にこれらへの FORCE_LOAD を生成する)
+    // Optional Swift runtime libraries, linked only when present in the SDK
+    // (on newer macOS SDKs swiftc implicitly emits FORCE_LOAD for these)
     const optional_libs = [_][]const u8{
         "swiftSpatial",
     };
@@ -66,7 +66,7 @@ pub fn linkSwiftRuntime(
     }
 }
 
-/// SDK の usr/lib/swift/ 配下に lib<name>.tbd が存在するかを確認する。
+/// Check whether lib<name>.tbd exists under the SDK's usr/lib/swift/.
 fn swiftRuntimeLibExists(b: *std.Build, sdk_path: []const u8, lib_name: []const u8) bool {
     const tbd_path = b.fmt("{s}/usr/lib/swift/lib{s}.tbd", .{ sdk_path, lib_name });
     var exit_code: u8 = 0;

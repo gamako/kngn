@@ -1,63 +1,63 @@
-//! プラットフォーム層（ObjC / Swift / Metal）のコンパイルヘルパー
+//! Compile helpers for the platform layer (ObjC / Swift / Metal)
 //!
-//! 親 build.zig と examples/*/build.zig から共通利用される。
-//! 入力ファイルは LazyPath で受け取り、ビルドグラフに依存を載せる。
+//! Shared by the parent build.zig and examples/*/build.zig.
+//! Inputs are LazyPaths so they carry build-graph dependencies.
 
 const std = @import("std");
 const macos = @import("macos.zig");
 const swift = @import("swift.zig");
 
 pub const PlatformType = enum {
-    // macOS backends（C ABI platform.h 経由。Zig 側 facade/backend は共通で .o リンクだけ異なる）
+    // macOS backends (via C ABI platform.h. Zig facade/backend is shared; only the .o link differs)
     objc,
     swift,
     metal,
-    // Linux backends（純 Zig。x11 は TASK-28.2〜、wayland は TASK-28.5）
+    // Linux backends (pure Zig. x11 and wayland)
     x11,
     wayland,
-    // Windows backends（純 Zig。gdi=GDI software blit/best-effort（TASK-31）、d3d11=D3D11-DXGI/1級（TASK-35））
+    // Windows backends (pure Zig. gdi=GDI software blit/best-effort; d3d11=D3D11-DXGI/tier-1)
     gdi,
     d3d11,
-    // wasm32-wasi（TASK-73。JS glue + canvas。stdlib は wasi、描画/入力は env import）
+    // wasm32-wasi (JS glue + canvas. stdlib is wasi; draw/input via env import)
     wasm,
 };
 
-/// 当該 OS のデフォルト backend（`-Dplatform` 省略時に使う）。
+/// Default backend for the OS (used when `-Dplatform` is omitted).
 pub fn defaultBackend(os: std.Target.Os.Tag) PlatformType {
     return switch (os) {
         .macos => .objc,
         .linux => .x11,
-        .windows => .gdi, // 当面 GDI 既定（d3d11 は opt-in。TASK-35）
-        .wasi => .wasm, // TASK-73.1: wasm32-wasi
-        .freestanding => .wasm, // 旧 freestanding 表記の残骸；本タスクの正は wasi
-        else => .objc, // 実際には build.zig 側の OS チェックで到達しない
+        .windows => .gdi, // GDI is the default for now (d3d11 is opt-in)
+        .wasi => .wasm, // wasm32-wasi
+        .freestanding => .wasm, // Legacy freestanding alias; the canonical target is wasi
+        else => .objc, // Unreachable in practice: build.zig's OS check rejects it first
     };
 }
 
-/// 当該 OS で **このタスク時点で実装済み** の backend 一覧。
-/// （`install-all` や全 backend ビルドの対象。Linux は x11 / wayland の両方を常時ビルドして
-/// 回帰を検出するが、default は x11。wayland は TASK-28.5 で追加）
+/// Backends **implemented** for the OS.
+/// (targets of `install-all` and full-backend builds. Linux always builds both x11 and wayland for
+/// regression coverage; default is x11. wayland is also implemented)
 pub fn implementedBackends(os: std.Target.Os.Tag) []const PlatformType {
     return switch (os) {
         .macos => &.{ .objc, .swift, .metal },
         .linux => &.{ .x11, .wayland },
         .windows => &.{ .gdi, .d3d11 },
-        .wasi => &.{.wasm}, // TASK-73.1: wasm32-wasi 専用ブランチが主経路
+        .wasi => &.{.wasm}, // wasm32-wasi-only branch is the main path
         .freestanding => &.{.wasm},
         else => &.{},
     };
 }
 
-/// L1 オーディオ出力 backend が当該 OS で実装済みか（macOS=AudioToolbox / Linux=ALSA / Windows=WASAPI）。
-/// top-level build.zig と standalone の両方で audio 必須ターゲット（synth / example_15）の gate に使う
-/// （判定を 1 箇所に集約する）。
+/// Whether an L1 audio-output backend is implemented for the OS (macOS=AudioToolbox / Linux=ALSA / Windows=WASAPI).
+/// Used by both top-level build.zig and standalone as the gate for audio-required targets (synth / example_15)
+/// (one place for the decision).
 pub fn audioSupported(os: std.Target.Os.Tag) bool {
     return os == .macos or os == .linux or os == .windows;
 }
 
-/// `-Dplatform` で指定された backend が対象 OS に対して妥当か検証する。
-/// 不整合（macOS backend を Linux で等）は build エラーにする。
-/// （panic のスタックトレースを避け、1 行の明確なメッセージで停止する）
+/// Validate that the `-Dplatform` backend is valid for the target OS.
+/// Mismatches (e.g. a macOS backend on Linux) become a build error.
+/// (exit with a clear one-line message instead of a panic stack trace)
 pub fn assertBackendForOs(backend: PlatformType, os: std.Target.Os.Tag) void {
     for (implementedBackends(os)) |b| {
         if (b == backend) return;
@@ -67,36 +67,36 @@ pub fn assertBackendForOs(backend: PlatformType, os: std.Target.Os.Tag) void {
         .linux => "x11 / wayland",
         .windows => "gdi / d3d11",
         .wasi, .freestanding => "wasm",
-        else => "(なし)",
+        else => "(none)",
     };
     std.log.err(
-        "-Dplatform={s} は OS={s} では使えません。有効値: {s}",
+        "-Dplatform={s} is not valid for OS={s}. Valid values: {s}",
         .{ @tagName(backend), @tagName(os), valid },
     );
     std.process.exit(1);
 }
 
-/// exe / run-step 名のための backend サフィックス。
+/// Backend suffix for exe / run-step names.
 pub fn backendName(backend: PlatformType) []const u8 {
     return @tagName(backend);
 }
 
-/// platform モジュール (`core/platform.zig`) を作成する。
+/// Create the platform module (`core/platform.zig`).
 ///
-/// macOS backend は `@cImport` で `platform.h` を取り込むため、`link_libc = true` と
-/// platform/ include path 追加をワンセットで行う（Linux backend は platform.h を
-/// 取り込まないので include path は無害な dead path となるだけ）。
+/// macOS backends `@cImport` `platform.h`, so `link_libc = true` and the
+/// platform/ include path are applied together (Linux backends do not pull in platform.h,
+/// so the include path is a harmless dead path there).
 ///
-/// `backend` は `build_options.platform_backend`（"x11"/"wayland"/"objc"…）として
-/// platform module に渡され、`src/platform_linux.zig` 等が x11/wayland を選ぶのに使う。
-/// backend ごとに別値の module を持たせるため、本関数は backend ごとに呼ぶこと。
+/// `backend` is passed as `build_options.platform_backend` ("x11"/"wayland"/"objc"…) into the
+/// platform module; `core/platform_linux.zig` and friends use it to pick x11/wayland.
+/// Call once per backend so each gets its own module with a distinct value.
 ///
-/// path の解決方法 (`b.path` / `cwd_relative`) は callsite に委ねる。
-/// 親 build.zig からは `b.path(...)`、standalone からは
-/// `.{ .cwd_relative = PROJECT_ROOT ++ ... }` を渡すこと。
+/// Path resolution (`b.path` / `cwd_relative`) is left to the callsite.
+/// Parent build.zig uses `b.path(...)`; standalone uses
+/// `.{ .cwd_relative = PROJECT_ROOT ++ ... }`.
 ///
-/// macOS platform 層の opt-in 機能フラグ（TASK-80.2 gamepad / TASK-97.3 menu）。
-/// bool パラメータ増加に備え options struct 化した（TASK-97.3 plan 手順 2）。
+/// Opt-in feature flags for the macOS platform layer (gamepad / menu).
+/// Bundled into an options struct so more bools can be added without growing the parameter list.
 pub const PlatformFeatures = struct {
     enable_gamepad: bool = false,
     enable_menu: bool = false,
@@ -108,33 +108,33 @@ pub fn createPlatformModule(
     platform_source: std.Build.LazyPath,
     platform_include_root: std.Build.LazyPath,
     backend: PlatformType,
-    /// 共有型 module（core/platform_types.zig）。platform.zig + 各 backend が `@import("platform_types")` で使う。
-    /// harness module と **同一インスタンス** を渡すこと（Event/EventStats の型同一性のため。TASK-32.2）。
+    /// Shared types module (core/platform_types.zig). platform.zig + each backend `@import("platform_types")`.
+    /// Pass the **same instance** as the harness module (for Event/EventStats type identity).
     types_mod: *std.Build.Module,
-    /// Command/menu の type-only module（core/command_types.zig）。facade と backend の共通契約。
+    /// Command/menu type-only module (core/command_types.zig). Shared contract between facade and backend.
     command_types_mod: *std.Build.Module,
-    /// harness module（core/control/harness.zig）。platform.zig(facade) が `@import("harness")` で使う。
-    /// audio module と **同一インスタンス** を渡すことで module-level state（audio tap 等）を共有する (TASK-32.2)。
+    /// harness module (core/control/harness.zig). platform.zig (facade) `@import("harness")`.
+    /// Pass the **same instance** as the audio module so module-level state (audio tap, …) is shared.
     harness_mod: *std.Build.Module,
-    /// opt-in 機能（gamepad / menu）。`build_options.enable_gamepad` / `enable_menu` として
-    /// platform module に焼き込まれる。gamepad: facade の `Window.getGamepadState` が参照。
-    /// menu: `platform_macos.zig` の C symbol 参照 comptime gate が参照（TASK-97.3）。
-    /// false でも harness synthetic gamepad 経路はこの値に関係なく常に動く。
+    /// Opt-in features (gamepad / menu). Baked into the platform module as `build_options.enable_gamepad` / `enable_menu`.
+    /// gamepad: read by the facade's `Window.getGamepadState`.
+    /// menu: read by the comptime gate on C-symbol refs in `platform_macos.zig`.
+    /// The harness synthetic gamepad path always runs regardless of this value.
     features: PlatformFeatures,
 ) *std.Build.Module {
-    // linkSystemLibrary は target 既知の module を要求するため、明示的に target を設定する
-    // （import module は通常 importer から target を継承するが、x11 のリンク呼び出しには事前に必要）。
+    // linkSystemLibrary needs a module with a known target, so set target explicitly
+    // (import modules usually inherit from the importer, but the x11 link call needs it beforehand).
     const is_wasm = backend == .wasm;
-    // wasm shared audio（TASK-73.2）: atomics 付き target なら multi-thread（本物の atomic 命令）。
+    // wasm shared audio: multi-thread when the target has atomics (real atomic ops).
     const wasm_shared = is_wasm and target.result.cpu.has(.wasm, .atomics);
     const mod = b.createModule(.{
         .root_source_file = platform_source,
         .target = target,
-        .link_libc = !is_wasm, // wasm（wasi）は wasi preview1 + 手書き JS shim。libc 不要
+        .link_libc = !is_wasm, // wasm (wasi) uses wasi preview1 + a hand-written JS shim. No libc.
         .single_threaded = if (is_wasm) !wasm_shared else null,
     });
     if (!is_wasm) mod.addIncludePath(platform_include_root);
-    // platform.zig + backends は `@import("platform_types")`、facade は `@import("harness")` を使う。
+    // platform.zig + backends `@import("platform_types")`; the facade `@import("harness")`.
     mod.addImport("platform_types", types_mod);
     mod.addImport("command_types", command_types_mod);
     mod.addImport("harness", harness_mod);
@@ -145,52 +145,52 @@ pub fn createPlatformModule(
     opts.addOption(bool, "enable_menu", features.enable_menu);
     mod.addOptions("build_options", opts);
 
-    // Linux x11 backend は platform_linux_x11.zig が @cImport(<X11/Xlib.h>) / <X11/extensions/XShm.h> する。
-    // platform module に X11/Xext を linkSystemLibrary することで、(a) @cImport のヘッダ解決
-    // （pkg-config の Cflags 経由）と (b) exe への lib リンク伝播 を両方行う。
+    // Linux x11: platform_linux_x11.zig `@cImport(<X11/Xlib.h>)` / `<X11/extensions/XShm.h>`.
+    // linkSystemLibrary("X11"/"Xext") on the platform module both (a) resolves `@cImport` headers
+    // (via pkg-config Cflags) and (b) propagates the libs to the exe.
     if (backend == .x11) {
         mod.linkSystemLibrary("X11", .{});
         mod.linkSystemLibrary("Xext", .{});
     } else if (backend == .wayland) {
-        // Wayland backend は platform_linux_wayland.zig が
-        // @cImport(<wayland-client.h>, <xkbcommon/xkbcommon.h>, "xdg-shell-client-protocol.h") する。
-        // wayland-client/xkbcommon の link で (a) @cImport ヘッダ解決（pkg-config Cflags）と
-        // (b) exe への lib リンク伝播 を行う。xdg-shell-client-protocol.h は wayland-scanner 生成物
-        // なので、生成 header の dir を include path に追加する。
+        // Wayland backend: platform_linux_wayland.zig
+        // `@cImport(<wayland-client.h>, <xkbcommon/xkbcommon.h>, "xdg-shell-client-protocol.h")`.
+        // Linking wayland-client/xkbcommon both (a) resolves `@cImport` headers (pkg-config Cflags) and
+        // (b) propagates the libs to the exe. xdg-shell-client-protocol.h is a wayland-scanner
+        // product, so add its generated-header dir to the include path.
         mod.linkSystemLibrary("wayland-client", .{});
-        mod.linkSystemLibrary("wayland-cursor", .{}); // TASK-75.3: system cursor（wl_cursor_theme / @cInclude <wayland-cursor.h>）
+        mod.linkSystemLibrary("wayland-cursor", .{}); // system cursor (wl_cursor_theme / @cInclude <wayland-cursor.h>)
         mod.linkSystemLibrary("xkbcommon", .{});
         mod.addIncludePath(generateXdgShellClientHeaderDir(b));
-        mod.addIncludePath(generateXdgDecorationClientHeaderDir(b)); // TASK-28.5.6: SSD/CSD 装飾
+        mod.addIncludePath(generateXdgDecorationClientHeaderDir(b)); // SSD/CSD decoration
     }
 
     return mod;
 }
 
 // ============================================================================
-// xdg-shell protocol glue（TASK-28.5.1）
+// xdg-shell protocol glue
 //
-// Wayland の window 管理は xdg-shell プロトコルで行う。手書きせず標準経路の `wayland-scanner`
-// で client-header(.h) と private-code(.c) を build 時生成する。`xdg-shell.xml` は
-// `pkg-config --variable=pkgdatadir wayland-protocols` から引く（nix devShell 前提）。
+// Wayland window management uses the xdg-shell protocol. Generate client-header (.h) and
+// private-code (.c) at build time via the standard `wayland-scanner` path (no hand-writing). Pull `xdg-shell.xml` from
+// `pkg-config --variable=pkgdatadir wayland-protocols` (assumes the nix devShell).
 //
-// 生成は backend×exe ごとに走るが、macOS が setupExecutableForPlatform 内で platform_macos.m を
-// exe ごとに clang する既存スタイルと対称で、helper シグネチャを増やさずに済む（scanner は軽量）。
+// Generation runs per backend×exe, symmetric with macOS clang'ing platform_macos.m per exe
+// inside setupExecutableForPlatform, without widening the helper signature (scanner is cheap).
 // ============================================================================
 
-/// `xdg-shell-client-protocol.h` を生成し、その親ディレクトリ（include path 用）を返す。
-/// Wayland backend の `@cImport("xdg-shell-client-protocol.h")` 解決に使う。
+/// Generate `xdg-shell-client-protocol.h` and return its parent directory (for the include path).
+/// Used to resolve Wayland backend `@cImport("xdg-shell-client-protocol.h")`.
 fn generateXdgShellClientHeaderDir(b: *std.Build) std.Build.LazyPath {
     const cmd = b.addSystemCommand(&.{
         "sh",                                                                                                                            "-c",
-        // $0=sh, $1=出力パス(addOutputFileArg)。pkg-config で xdg-shell.xml の場所を引く。
+        // $0=sh, $1=output path (addOutputFileArg). Locate xdg-shell.xml via pkg-config.
         "wayland-scanner client-header \"$(pkg-config --variable=pkgdatadir wayland-protocols)/stable/xdg-shell/xdg-shell.xml\" \"$1\"", "sh",
     });
     return cmd.addOutputFileArg("xdg-shell-client-protocol.h").dirname();
 }
 
-/// `xdg-shell-protocol.c`（protocol marshalling 実体）を生成して LazyPath を返す。
-/// exe に C source として追加する（wl_proxy_* を参照するため wayland-client への link を担保する）。
+/// Generate `xdg-shell-protocol.c` (protocol marshalling body) and return a LazyPath.
+/// Add it as a C source on the exe (references wl_proxy_*, so wayland-client must be linked).
 fn generateXdgShellPrivateCode(b: *std.Build) std.Build.LazyPath {
     const cmd = b.addSystemCommand(&.{
         "sh",                                                                                                                           "-c",
@@ -199,13 +199,13 @@ fn generateXdgShellPrivateCode(b: *std.Build) std.Build.LazyPath {
     return cmd.addOutputFileArg("xdg-shell-protocol.c");
 }
 
-// xdg-decoration protocol glue（TASK-28.5.6。SSD 要求 / CSD フォールバック）
-// xdg-shell と同型。XML は wayland-protocols の unstable/xdg-decoration。2026-07 時点で本家は staging へ
-// 未移動（unstable/ のまま）。万一パスが外れたら Linux 実機で
-// `find "$(pkg-config --variable=pkgdatadir wayland-protocols)" -iname '*decoration*'` で実パス確認。
-// wl_subcompositor は wayland-client 本体の interface（wayland-client.h に宣言済み）なので scanner 生成は不要。
+// xdg-decoration protocol glue (SSD request / CSD fallback)
+// Same shape as xdg-shell. XML lives under wayland-protocols unstable/xdg-decoration. As of 2026-07 upstream has not
+// moved it to staging (still under unstable/). If the path drifts, confirm on a Linux machine with
+// `find "$(pkg-config --variable=pkgdatadir wayland-protocols)" -iname '*decoration*'`.
+// wl_subcompositor is a core wayland-client interface (declared in wayland-client.h); no scanner generation needed.
 
-/// `xdg-decoration-unstable-v1-client-protocol.h` を生成し親ディレクトリ（include path 用）を返す。
+/// Generate `xdg-decoration-unstable-v1-client-protocol.h` and return its parent directory (for the include path).
 fn generateXdgDecorationClientHeaderDir(b: *std.Build) std.Build.LazyPath {
     const cmd = b.addSystemCommand(&.{
         "sh",                                                                                                                                                    "-c",
@@ -214,7 +214,7 @@ fn generateXdgDecorationClientHeaderDir(b: *std.Build) std.Build.LazyPath {
     return cmd.addOutputFileArg("xdg-decoration-unstable-v1-client-protocol.h").dirname();
 }
 
-/// `xdg-decoration-unstable-v1-protocol.c`（marshalling 実体）を生成して LazyPath を返す。
+/// Generate `xdg-decoration-unstable-v1-protocol.c` (marshalling body) and return a LazyPath.
 fn generateXdgDecorationPrivateCode(b: *std.Build) std.Build.LazyPath {
     const cmd = b.addSystemCommand(&.{
         "sh",                                                                                                                                                   "-c",
@@ -223,16 +223,16 @@ fn generateXdgDecorationPrivateCode(b: *std.Build) std.Build.LazyPath {
     return cmd.addOutputFileArg("xdg-decoration-unstable-v1-protocol.c");
 }
 
-/// 実行ファイルにプラットフォーム層をセットアップする。
+/// Set up the platform layer on an executable.
 ///
-/// macOS backend: プラットフォーム層 (.o) のコンパイル、framework / Swift ランタイムリンク、
-/// include path 設定までを一括で行う（`sdk_paths` 必須）。
-/// Linux backend: 純 Zig なので .o コンパイルは無く、X11 等のリンクのみ（`sdk_paths` は null）。
+/// macOS backend: compile the platform layer (.o), link frameworks / Swift runtime, and
+/// set include paths in one shot (`sdk_paths` required).
+/// Linux backend: pure Zig, so no .o compile; only link X11 etc. (`sdk_paths` is null).
 ///
-/// 各 example の build.zig からはこの関数 1 つを呼ぶだけで platform 関連のセットアップが完了する。
+/// Each example's build.zig only needs this one call for all platform setup.
 ///
-/// `features`: macOS backend の opt-in（gamepad=GameController / menu=NSMenu。TASK-80.2/97.3）。
-/// true のフラグだけ .o コンパイルに `-DVP_ENABLE_*` を渡す。Linux/Windows backend では無視する。
+/// `features`: macOS-backend opt-in (gamepad=GameController / menu=NSMenu).
+/// Only true flags pass `-DVP_ENABLE_*` into the .o compile. Ignored on Linux/Windows backends.
 pub fn setupExecutableForPlatform(
     b: *std.Build,
     exe: *std.Build.Step.Compile,
@@ -244,8 +244,8 @@ pub fn setupExecutableForPlatform(
 ) void {
     switch (platform_type) {
         .objc, .swift, .metal => {
-            // macOS backend は SDK が必須
-            const sdk = sdk_paths orelse @panic("macOS backend には SDK パスが必要です（build.zig の OS 分岐を確認）");
+            // macOS backends require an SDK
+            const sdk = sdk_paths orelse @panic("macOS backend requires SDK paths (check the OS branch in build.zig)");
 
             const compiled = compilePlatformLayer(b, platform_type, optimize, platform_root, features);
             for (compiled.obj_files) |obj| {
@@ -274,115 +274,115 @@ pub fn setupExecutableForPlatform(
             }
         },
         .x11 => {
-            // X11/Xlib backend（純 Zig）。.o コンパイルや framework は不要。
-            // Xlib シンボルは createPlatformModule の linkSystemLibrary("X11"/"Xext") から
-            // exe へ伝播するため、ここでは libc のみ有効にする。
+            // X11/Xlib backend (pure Zig). No .o compile or frameworks.
+            // Xlib symbols propagate from createPlatformModule's linkSystemLibrary("X11"/"Xext")
+            // to the exe, so only enable libc here.
             exe.root_module.link_libc = true;
         },
         .wayland => {
-            // Wayland backend（純 Zig）。生成 xdg-shell-protocol.c を exe ごとにコンパイルする
-            // （macOS が platform_macos.m を addObjectFile するのと対称。helper シグネチャは増やさない）。
-            // この .c は wl_proxy_* を参照するため wayland-client への link が成立する。
-            // wayland-client は exe 側でも linkSystemLibrary して .c の compile（ヘッダ解決）と
-            // symbol 解決を確実にする（module からの伝播に依存しない）。
+            // Wayland backend (pure Zig). Compile the generated xdg-shell-protocol.c per exe
+            // (symmetric with macOS addObjectFile of platform_macos.m; do not widen the helper signature).
+            // The .c references wl_proxy_*, so linking wayland-client is required.
+            // Also linkSystemLibrary wayland-client on the exe so .c compile (header resolve) and
+            // symbol resolve are reliable (do not rely on module propagation alone).
             exe.root_module.link_libc = true;
             exe.root_module.linkSystemLibrary("wayland-client", .{});
-            exe.root_module.linkSystemLibrary("wayland-cursor", .{}); // TASK-75.3: system cursor
+            exe.root_module.linkSystemLibrary("wayland-cursor", .{}); // system cursor
             exe.root_module.addCSourceFile(.{ .file = generateXdgShellPrivateCode(b) });
-            exe.root_module.addCSourceFile(.{ .file = generateXdgDecorationPrivateCode(b) }); // TASK-28.5.6
+            exe.root_module.addCSourceFile(.{ .file = generateXdgDecorationPrivateCode(b) }); // xdg-decoration private code
         },
         .gdi, .d3d11 => {
-            // Windows backend（純 Zig）。platform_windows.zig（dispatcher）が Win32 を extern fn で叩く
-            // （@cImport しない）。SDK/xcrun は不要で、zig 同梱の MinGW import lib が link を解決する
-            // （kernel32 は zig が自動リンク）。libc は不要（std.os.windows と extern fn のみ）だが、
-            // 他 OS と挙動を揃えるため有効化する。共通の window/入力/dialog は user32 / comdlg32。
+            // Windows backend (pure Zig). platform_windows.zig (dispatcher) calls Win32 via extern fn
+            // (no @cImport). No SDK/xcrun; zig's bundled MinGW import libs resolve the link
+            // (kernel32 is auto-linked by zig). libc is not required (std.os.windows + extern fn only), but
+            // enable it to match other OS behaviour. Shared window/input/dialog uses user32 / comdlg32.
             exe.root_module.link_libc = true;
-            exe.root_module.linkSystemLibrary("user32", .{}); // CreateWindowExW / メッセージポンプ / 入力
+            exe.root_module.linkSystemLibrary("user32", .{}); // CreateWindowExW / message pump / input
             exe.root_module.linkSystemLibrary("comdlg32", .{}); // GetSaveFileNameW / GetOpenFileNameW
             switch (platform_type) {
-                // GDI: software blit（StretchDIBits / BITMAPINFO）。
+                // GDI: software blit (StretchDIBits / BITMAPINFO).
                 .gdi => exe.root_module.linkSystemLibrary("gdi32", .{}),
-                // D3D11-DXGI: GPU upload path。named export は d3d11.dll の D3D11CreateDeviceAndSwapChain
-                // のみ（swap chain / DXGI は d3d11 が生成した COM の vtbl 経由でしか触らないので dxgi.dll の
-                // import は不要）。gdi32 も不要。
+                // D3D11-DXGI: GPU upload path. The only named export is d3d11.dll's D3D11CreateDeviceAndSwapChain
+                // (swap chain / DXGI are only touched via COM vtbls from the d3d11-created objects, so no dxgi.dll
+                // import). gdi32 is also unnecessary.
                 .d3d11 => exe.root_module.linkSystemLibrary("d3d11", .{}),
                 else => unreachable,
             }
-            // GUI アプリとして Windows subsystem にする（既定の console subsystem だと起動時に
-            // コンソール窓が出る）。コンソール出力が本体のツール（例: example_06 ベンチ）は
-            // caller 側で .Console に上書きする。std.debug.print はコンソール非接続時 no-op になる。
+            // Use the Windows subsystem for GUI apps (the default console subsystem would open a
+            // console window on launch). Tools whose console output is the point (e.g. example_06 bench)
+            // override to .Console at the caller. std.debug.print is a no-op when no console is attached.
             exe.subsystem = .Windows;
         },
         .wasm => {
-            // wasm32-wasi（TASK-73.1）。native .o / system lib は不要。
-            // entry/rdynamic/single_threaded は build.zig の wasm ブランチ側で設定する。
+            // wasm32-wasi. No native .o / system lib.
+            // entry/rdynamic/single_threaded are set on build.zig's wasm branch.
         },
     }
 }
 
 // ============================================================
-// standalone build 共通ヘルパー
-// （examples/*/build.zig, apps/editor/build.zig が単独ビルドで使う）
+// standalone build shared helpers
+// (used by examples/*/build.zig and apps/editor/build.zig for standalone builds)
 // ============================================================
 
-/// exe root module に足す追加 import（OS/backend 非依存。caller が 1 度だけ作って渡す）。
+/// Extra imports for the exe root module (OS/backend-independent. Caller creates once and passes in).
 pub const Import = struct {
     name: []const u8,
     module: *std.Build.Module,
 };
 
-/// standalone（単一 exe）ビルドの指定。
+/// Spec for a standalone (single-exe) build.
 pub const StandaloneSpec = struct {
-    /// install / run 名のベース（例 "example_01_timed_window"）。
+    /// Base for install / run names (e.g. "example_01_timed_window").
     base_name: []const u8,
-    /// main ソース（build root 相対。`b.path("main.zig")` 等）。
+    /// Main source (relative to the build root; `b.path("main.zig")`, …).
     main_source: std.Build.LazyPath,
-    /// `core/platform.zig`（standalone は `.{ .cwd_relative = PROJECT_ROOT ++ "/core/platform.zig" }`）。
+    /// `core/platform.zig` (standalone: `.{ .cwd_relative = PROJECT_ROOT ++ "/core/platform.zig" }`).
     platform_source: std.Build.LazyPath,
-    /// platform module の include root（`platform.h`。`.{ .cwd_relative = PROJECT_ROOT ++ "/platform" }`）。
+    /// platform module include root (`platform.h`; `.{ .cwd_relative = PROJECT_ROOT ++ "/platform" }`).
     platform_include: std.Build.LazyPath,
-    /// setup 用の platform root（macOS backend の .o コンパイル/フレームワーク用。`b.path(PROJECT_ROOT ++ "/platform")`）。
+    /// platform root for setup (macOS backend .o compile/frameworks; `b.path(PROJECT_ROOT ++ "/platform")`).
     platform_root: std.Build.LazyPath,
-    /// libs/gfx/src/keyboard.zig（不要なら null）。platform_types（KeyCode）のみに依存するため
-    /// backend ごとに作るが platform facade は不要（TASK-111.2）。
+    /// libs/gfx/src/keyboard.zig (null if unused). Depends only on platform_types (KeyCode), so
+    /// create per backend; no platform facade needed.
     keyboard_source: ?std.Build.LazyPath = null,
-    /// src/gamepad.zig（不要なら null。TASK-80.1）。keyboard_source と対称だが platform_types のみに
-    /// 依存する（platform facade は不要）。
+    /// src/gamepad.zig (null if unused). Symmetric with keyboard_source; depends only on platform_types
+    /// (no platform facade needed).
     gamepad_source: ?std.Build.LazyPath = null,
-    /// OS/backend 非依存の追加 import（sprite / png / gui / core 等）。
+    /// OS/backend-independent extra imports (sprite / png / gui / core, …).
     extra: []const Import = &.{},
-    /// L1 オーディオ出力の system ライブラリを exe にリンクするか（audio module は `extra` で渡す）。
-    /// macOS=AudioToolbox / Linux=alsa / Windows=ole32(WASAPI/COM)。
+    /// Whether to link L1 audio-output system libraries on the exe (pass the audio module via `extra`).
+    /// macOS=AudioToolbox / Linux=alsa / Windows=ole32(WASAPI/COM).
     link_audio: bool = false,
-    /// ゲームパッド実 backend（GameController framework。macOS のみ意味を持つ）を有効にするか
-    /// （TASK-80.2 opt-in 化。`link_audio` と対称）。true なら platform module の
-    /// `build_options.enable_gamepad` が true になり、macOS backend の .o コンパイルにも
-    /// `-DVP_ENABLE_GAMEPAD` を渡して GameController framework をリンクする。既定 false
-    /// （既存 standalone exe は不変）。opt-in するのは examples/22_gamepad のみ。
+    /// Enable the real gamepad backend (GameController framework; meaningful on macOS only)
+    /// (opt-in, symmetric with `link_audio`). When true, platform module
+    /// `build_options.enable_gamepad` is true, the macOS backend .o compile also gets
+    /// `-DVP_ENABLE_GAMEPAD`, and GameController is linked. Default false
+    /// (existing standalone exes unchanged). Only examples/22_gamepad opts in.
     link_gamepad: bool = false,
-    /// native メニュー（NSMenu。macOS objc/swift/metal 共通。TASK-122）。true なら
-    /// `build_options.enable_menu` + 共有 `platform_macos_menu.m`（`-DVP_ENABLE_MENU`）。
-    /// 既定 false。opt-in は pixie のみ。
+    /// Native menu (NSMenu; shared across macOS objc/swift/metal). When true,
+    /// `build_options.enable_menu` + shared `platform_macos_menu.m` (`-DVP_ENABLE_MENU`).
+    /// Default false. Only pixie opts in.
     link_menu: bool = false,
-    /// png module（libs/png）。**呼び出し側が png を作って `extra` に png 依存モジュール（sprite/core 等）を
-    /// 渡す場合は、その同じ png をここにも渡すこと**。harness（platform→harness→png）と extra 側で png module が
-    /// 二重化すると「file exists in modules 'png' and 'png0'」になるため、同一インスタンスを共有する。
-    /// null なら buildStandalone が platform_source から導出して1つ作る (TASK-32.2)。
+    /// png module (libs/png). **If the caller builds png and passes png-dependent modules (sprite/core, …) in `extra`,
+    /// pass that same png here too.** If harness (platform→harness→png) and the extra side each get a png module,
+    /// you hit "file exists in modules 'png' and 'png0'"; share one instance.
+    /// null: buildStandalone derives one from platform_source.
     png_module: ?*std.Build.Module = null,
-    /// kit umbrella（ADR-007 R4）を配線する場合に caller が用意する安定 lib 群。
-    /// apps（pixie 等）の standalone ビルドに必須（apps のソースは `@import("kit")` を使うため）。
-    /// examples は kit を使わないので null のまま。
-    /// **png は spec.png_module と同一インスタンスを渡すこと**（file-in-two-modules 回避）。
-    /// platform / control(harness) / types / audio / gamepad は buildStandalone が内部で配線する
-    /// （gamepad は TASK-80.1。platform_types のみに依存するため caller から受け取る必要が無い）。
+    /// Stable libs the caller supplies when wiring the kit umbrella (ADR-007 R4).
+    /// Required for apps (pixie, …) standalone builds (app sources `@import("kit")`).
+    /// examples do not use kit, so leave null.
+    /// **png must be the same instance as spec.png_module** (avoid file-in-two-modules).
+    /// platform / control(harness) / types / audio / gamepad are wired inside buildStandalone
+    /// (gamepad depends only on platform_types, so the caller need not supply it).
     kit_libs: ?KitLibs = null,
 };
 
-/// standalone の kit 配線に必要な安定 lib module 群（ADR-007 kit 初期セットのうち caller 供給分）。
+/// Stable lib modules needed to wire kit for standalone (the caller-supplied slice of the ADR-007 initial kit set).
 pub const KitLibs = struct {
-    /// platform facade と command_types が共有する core type-only module。
+    /// Core type-only module shared by the platform facade and command_types.
     platform_types: *std.Build.Module,
-    /// kit.command_types と libs/gui が共有する core type-only module。
+    /// Core type-only module shared by kit.command_types and libs/gui.
     command_types: *std.Build.Module,
     gui: *std.Build.Module,
     png: *std.Build.Module,
@@ -390,33 +390,33 @@ pub const KitLibs = struct {
     dsp: *std.Build.Module,
     synth: *std.Build.Module,
     gmath: *std.Build.Module,
-    /// kit.gfx（TASK-111.2）。sprite / fixed_timestep / fps_counter / keyboard。
+    /// kit.gfx. sprite / fixed_timestep / fps_counter / keyboard.
     gfx: *std.Build.Module,
-    /// kit.sound（TASK-111.6）。WAV デコード + SE/BGM ミキサー。dsp + synth に依存。
+    /// kit.sound. WAV decode + SE/BGM mixer. Depends on dsp + synth.
     sound: *std.Build.Module,
-    /// kit.recipe（TASK-62.5.8）は serde に依存する。caller が paint 等でも serde module を
-    /// 作っている場合（例: apps/editor）、**同一インスタンス**を渡さないと同じ serde.zig が
-    /// 2 module に属し「file exists in modules」エラーになる。渡されなければ buildStandalone が
-    /// 単独生成する（recipe 以外で serde を使わない kit 消費者向けの後方互換）。
+    /// kit.recipe depends on serde. If the caller also builds a serde module for paint etc.
+    /// (e.g. apps/editor), pass the **same instance** or the same serde.zig ends up in
+    /// two modules ("file exists in modules"). If omitted, buildStandalone
+    /// creates one alone (backward compat for kit consumers that do not use serde outside recipe).
     serde: ?*std.Build.Module = null,
-    /// kit.appshell（TASK-114.1）。serde と同一 module instance を共有する。
+    /// kit.appshell. Shares the same module instance as serde.
     appshell: ?*std.Build.Module = null,
-    /// 流動中の paint は kit 非収録。example/app の root へ direct import する。
+    /// paint is still in flux and not in kit. Direct-import it into the example/app root.
     paint: ?*std.Build.Module = null,
-    /// kit.gamepad / kit.gfx(action_map) で共有する gamepad module（TASK-111.8）。
-    /// caller が gfx へ gamepad を配線する場合は**同一インスタンス**を渡すこと。
-    /// null なら buildStandalone が従来どおり自前生成する（既存 consumer 不変）。
+    /// gamepad module shared by kit.gamepad / kit.gfx(action_map).
+    /// If the caller wires gamepad into gfx, pass the **same instance**.
+    /// null: buildStandalone creates its own (existing consumers unchanged).
     gamepad: ?*std.Build.Module = null,
 };
 
-/// audio を使う standalone exe に L1 出力の system ライブラリを OS 別にリンクする
-/// （top build.zig の linkAudioBackend と同方針）。
+/// Link L1 output system libraries per OS onto a standalone exe that uses audio
+/// (same policy as top build.zig's linkAudioBackend).
 ///
-/// macOS 分岐は capture（mic AUHAL input / camera AVFoundation。TASK-49.2）の framework も
-/// 併せてリンクする（トップ階層 build.zig の `linkAudioBackend` と同じ予防的追加。codex
-/// レビュー指摘）。同じループ内で呼ばれる `setupExecutableForPlatform`（呼び出し順序は下記
-/// `buildStandalone` 参照）が -F/-L の検索パスを設定するため、ここでは framework/library 名の
-/// 追加だけで足りる（build graph 構築順序は実際のリンク時の解決に影響しない）。
+/// The macOS branch also links capture frameworks (mic AUHAL input / camera AVFoundation),
+/// matching top-level build.zig `linkAudioBackend` as a preventive add.
+/// `setupExecutableForPlatform` in the same loop (see call order in
+/// `buildStandalone` below) sets the -F/-L search paths, so only framework/library names
+/// are needed here (build-graph construction order does not affect link-time resolve).
 fn linkAudioForStandalone(exe: *std.Build.Step.Compile, target_os: std.Target.Os.Tag) void {
     switch (target_os) {
         .macos => {
@@ -429,13 +429,13 @@ fn linkAudioForStandalone(exe: *std.Build.Step.Compile, target_os: std.Target.Os
             exe.root_module.linkSystemLibrary("objc", .{});
         },
         .linux => exe.root_module.linkSystemLibrary("alsa", .{}),
-        .windows => exe.root_module.linkSystemLibrary("ole32", .{}), // WASAPI は COM 経由（CoCreateInstance 等が ole32）
-        else => {}, // それ以外: audio backend 未対応。リンクせず compile 時の facade compileError に任せる
+        .windows => exe.root_module.linkSystemLibrary("ole32", .{}), // WASAPI goes through COM (CoCreateInstance etc. in ole32)
+        else => {}, // else: no audio backend. Do not link; leave it to the facade compileError at compile time
     }
 }
 
-/// 対象 OS の実装済み backend ごとに exe を 1 つ作り、install / `run-<backend>` /
-/// `run`(default) を生成する。SDK 解決は macOS backend のときだけ行う（Linux は xcrun 不要）。
+/// Create one exe per implemented backend for the target OS, plus install / `run-<backend>` /
+/// `run` (default). Resolve the SDK only for macOS backends (Linux needs no xcrun).
 pub fn buildStandalone(
     b: *std.Build,
     target: std.Build.ResolvedTarget,
@@ -450,12 +450,12 @@ pub fn buildStandalone(
     ) orelse defaultBackend(target_os);
     assertBackendForOs(platform_option, target_os);
 
-    // audio 必須の standalone（example_15 等）は audio 非対応 OS では exe を生成しない
-    // （top-level build.zig の audio_supported gate と同じ。無いと未対応 OS で audio facade の
-    // compileError に落ちる）。-Dtarget/-Dplatform は上で受理済みなので、ここで何も step を作らず早期 return。
-    // 現状 macOS/Linux/Windows は全て audio 対応なので、この skip は将来の未対応 OS 向け。
+    // Audio-required standalones (example_15, …) skip exe creation on OSes without audio
+    // (same as top-level build.zig's audio_supported gate. Without it, unsupported OSes hit the audio facade
+    // compileError). -Dtarget/-Dplatform were already accepted above, so early-return with no steps.
+    // macOS/Linux/Windows all support audio today; this skip is for future unsupported OSes.
     if (spec.link_audio and !audioSupported(target_os)) {
-        std.log.info("standalone '{s}': audio 非対応 OS ({s}) のためスキップ", .{ spec.base_name, @tagName(target_os) });
+        std.log.info("standalone '{s}': skipping; OS ({s}) has no audio backend", .{ spec.base_name, @tagName(target_os) });
         return;
     }
 
@@ -467,28 +467,28 @@ pub fn buildStandalone(
     const default_be = defaultBackend(target_os);
     var default_exe: ?*std.Build.Step.Compile = null;
 
-    // platform module は harness(src/platform.zig→harness.zig) 経由で png codec(libs/png) に依存する。
-    // standalone の platform_source（.cwd_relative <ROOT>/src/platform.zig）から
-    // png lib（<ROOT>/libs/png/src/lib.zig）を導出し、png module を1つ作って各 backend で共有する。
+    // The platform module depends on the png codec (libs/png) via harness (core/platform.zig → core/control/harness.zig).
+    // From the standalone platform_source (.cwd_relative <ROOT>/core/platform.zig),
+    // derive the png lib (<ROOT>/libs/png/src/lib.zig) and share one png module across backends.
     const png_source: std.Build.LazyPath = switch (spec.platform_source) {
         .cwd_relative => |s| blk: {
             const root = std.fs.path.dirname(std.fs.path.dirname(s) orelse s) orelse ".";
             break :blk .{ .cwd_relative = b.fmt("{s}/libs/png/src/lib.zig", .{root}) };
         },
-        // standalone build は常に .cwd_relative の platform_source を渡す前提。
-        // それ以外だと png lib パスを導出できず @import("png") が壊れるため明示的に失敗させる。
-        else => @panic("buildStandalone: platform_source は .cwd_relative 前提です（png lib パス導出のため）"),
+        // standalone builds always pass a .cwd_relative platform_source.
+        // Anything else cannot derive the png lib path and would break `@import("png")`, so fail explicitly.
+        else => @panic("buildStandalone: platform_source must be .cwd_relative (needed to derive the png lib path)"),
     };
-    // 呼び出し側が extra 用に作った png があればそれを共有する（二重 png module 化を防ぐ）。
+    // Reuse a caller-built png for extra when present (avoid a second png module).
     const png_mod = spec.png_module orelse b.createModule(.{ .root_source_file = png_source });
 
-    // 共有型 module（platform_types）と harness module も platform_source の dirname（<ROOT>/core）から
-    // 導出して1つずつ作り、全 backend で共有する。platform.zig(facade) は `@import("platform_types")` /
-    // `@import("harness")`、harness は `@import("png")` / `@import("platform_types")` する (TASK-32.2)。
-    // harness は core/control/ 配下（ADR-007 R3: 制御＋観測プレーンへの昇格）。
+    // Also derive shared platform_types and harness modules from platform_source's dirname (<ROOT>/core)
+    // and share one of each across backends. platform.zig (facade) `@import("platform_types")` /
+    // `@import("harness")`; harness `@import("png")` / `@import("platform_types")`.
+    // harness lives under core/control/ (ADR-007 R3: promotion into the control+obs plane).
     const core_dir: []const u8 = switch (spec.platform_source) {
         .cwd_relative => |s| std.fs.path.dirname(s) orelse ".",
-        else => @panic("buildStandalone: platform_source は .cwd_relative 前提です（types/harness パス導出のため）"),
+        else => @panic("buildStandalone: platform_source must be .cwd_relative (needed to derive types/harness paths)"),
     };
     const types_mod: *std.Build.Module = if (spec.kit_libs) |kl|
         kl.platform_types
@@ -508,43 +508,43 @@ pub fn buildStandalone(
     harness_mod.addImport("png", png_mod);
     harness_mod.addImport("platform_types", types_mod);
     harness_mod.addImport("command_types", command_types_mod);
-    // harness は synthetic capture source（TASK-49.5）を `@import("capture_synthetic")` する。
-    // capture_synthetic は capture_types にのみ依存（camera/audio facade へは配線しない）。
-    // これを wire しないと harness を使う全 example の standalone build が壊れる（TASK-22.1 で判明）。
+    // harness `@import("capture_synthetic")` for the synthetic capture source.
+    // capture_synthetic depends only on capture_types (not wired to camera/audio facades).
+    // Without this wire, every standalone build that uses harness breaks.
     const capture_types_mod = b.createModule(.{ .root_source_file = .{ .cwd_relative = b.fmt("{s}/capture_types.zig", .{core_dir}) } });
     const capture_synthetic_mod = b.createModule(.{ .root_source_file = .{ .cwd_relative = b.fmt("{s}/capture_synthetic.zig", .{core_dir}) } });
     capture_synthetic_mod.addImport("capture_types", capture_types_mod);
     harness_mod.addImport("capture_synthetic", capture_synthetic_mod);
 
-    // harness は digest audio のスペクトル解析（band/centroid/onset。TASK-92）で `@import("dsp")` する
-    // （トップ階層 build.zig の `linkCoreException(harness, dsp, ...)` と同じ配線）。これが無いと
-    // harness を使う全 standalone build（例: soundalert）が壊れる（capture_synthetic と同じ理由）。
-    // caller が kit_libs.dsp を渡していればそれを共有し（同一ファイルの二重 module 化回避）、
-    // 渡していなければここで単独の dsp module を作る。
+    // harness `@import("dsp")` for digest-audio spectrum analysis (band/centroid/onset)
+    // (same wiring as top-level build.zig `linkCoreException(harness, dsp, ...)`). Without it,
+    // every harness-using standalone (e.g. soundalert) breaks (same reason as capture_synthetic).
+    // Reuse kit_libs.dsp when the caller supplies it (avoid two modules for the same file);
+    // otherwise create a standalone dsp module here.
     const harness_dsp_mod: *std.Build.Module = if (spec.kit_libs) |kl|
         kl.dsp
     else
         b.createModule(.{ .root_source_file = .{ .cwd_relative = b.fmt("{s}/../src/dsp/dsp.zig", .{core_dir}) } });
     harness_mod.addImport("dsp", harness_dsp_mod);
 
-    // link_audio のとき audio facade module を **buildStandalone が生成**し、harness を配線する（TASK-32.2）。
-    // audio.zig は `@import("harness")` するので、platform module と **同一の harness_mod** を共有しないと
-    // file-in-two-modules になり audio probe も無音になる。caller が別途 audio module を作って extra で渡すと
-    // harness が二重化するため、audio は link_audio に集約する（example_15 等）。
+    // When link_audio is set, **buildStandalone creates** the audio facade module and wires harness.
+    // audio.zig `@import("harness")`, so sharing a **single harness_mod** with the platform module is required;
+    // otherwise file-in-two-modules and a silent audio probe. If the caller also builds an audio module for extra,
+    // harness duplicates, so audio is concentrated under link_audio (example_15, …).
     const audio_mod: ?*std.Build.Module = if (spec.link_audio or spec.kit_libs != null) blk: {
         const am = b.createModule(.{ .root_source_file = .{ .cwd_relative = b.fmt("{s}/audio.zig", .{core_dir}) } });
         am.addImport("harness", harness_mod);
-        // audio.zig の capture 拡張（マイク入力。TASK-49.1）が `@import("capture_types")` する
-        // （named module。トップ階層 build.zig の `link(audio, capture_types)` と同じ配線）。
-        // これが無いと standalone で `audio.openCapture`/`requestCapturePermission` 等を実際に
-        // 使う caller（例: soundalert）がコンパイルエラーになる。
+        // audio.zig's capture extension (mic input) `@import("capture_types")`
+        // (named module; same wiring as top-level build.zig `link(audio, capture_types)`).
+        // Without it, standalones that actually call `audio.openCapture`/`requestCapturePermission`
+        // (e.g. soundalert) fail to compile.
         am.addImport("capture_types", capture_types_mod);
-        // macOS の audio_macos.zig（capture 権限確認。TASK-49.2）が `@import("objc_runtime")` する
-        // （トップ階層 build.zig の `link(audio, objc_runtime)` と同じ配線。std.c.nanosleep を使うため
-        // link_libc=true も同じ）。これが無いと macOS standalone で capture API を参照する caller が
-        // `no module named 'objc_runtime'` になる。非 macOS native では未参照のため解析されず無害だが、
-        // wasm（audio_web 経路）ではトップ階層の `if (!is_wasm) link(audio, objc_runtime)` と同じく
-        // 配線しない（意図の明示。wasi/freestanding が buildStandalone の wasm 経路）。
+        // macOS audio_macos.zig (capture permission check) `@import("objc_runtime")`
+        // (same wiring as top-level build.zig `link(audio, objc_runtime)`; also link_libc=true because
+        // it uses std.c.nanosleep). Without it, macOS standalones that touch capture APIs hit
+        // `no module named 'objc_runtime'`. Harmless on non-macOS native (unreflected), but
+        // on wasm (audio_web path) skip the wire just like top-level `if (!is_wasm) link(audio, objc_runtime)`
+        // (intent made explicit; wasi/freestanding is buildStandalone's wasm path).
         if (target_os != .wasi and target_os != .freestanding) {
             const objc_runtime_mod = b.createModule(.{
                 .root_source_file = .{ .cwd_relative = b.fmt("{s}/objc_runtime.zig", .{core_dir}) },
@@ -576,8 +576,8 @@ pub fn buildStandalone(
         root.addImport("platform", platform_mod);
         if (spec.link_audio) root.addImport("audio", audio_mod.?);
 
-        // kit umbrella（ADR-007 R4/R5）。apps の standalone は root が `@import("kit")` する。
-        // kit/kit.zig の pub import と 1:1 で揃える（platform は backend 毎なので kit も backend 毎）。
+        // kit umbrella (ADR-007 R4/R5). apps standalones have the root `@import("kit")`.
+        // Keep 1:1 with kit/kit.zig's pub imports (platform is per-backend, so kit is too).
         if (spec.kit_libs) |kl| {
             const kit_root: []const u8 = std.fs.path.dirname(core_dir) orelse ".";
             const kit_mod = b.createModule(.{
@@ -596,9 +596,9 @@ pub fn buildStandalone(
             kit_mod.addImport("gmath", kl.gmath);
             kit_mod.addImport("gfx", kl.gfx);
             kit_mod.addImport("sound", kl.sound);
-            // gamepad（TASK-80.1 / TASK-111.8）: kit.zig が無条件 import する。
-            // caller が kl.gamepad を渡していればそれを共有（gfx/action_map と同一 instance）。
-            // null なら従来どおり自前生成（apps/editor 等の既存 consumer 不変）。
+            // gamepad: kit.zig imports unconditionally.
+            // Reuse kl.gamepad when supplied (same instance as gfx/action_map).
+            // null: create locally as before (existing consumers such as apps/editor unchanged).
             const kit_gamepad_mod: *std.Build.Module = if (kl.gamepad) |gp|
                 gp
             else blk: {
@@ -609,11 +609,11 @@ pub fn buildStandalone(
                 break :blk m;
             };
             kit_mod.addImport("gamepad", kit_gamepad_mod);
-            // recipe（TASK-62.5.8）: kit.zig が無条件 import する（トップ階層 build.zig の
-            // `link(kit, common.recipe)` と同じ）。libs/recipe は serde にのみ依存する headless lib。
-            // serde module は caller（paint 等で serde を使う場合）と**同一インスタンスを共有**する
-            // 必要がある（別々に作ると同じ serde.zig が 2 module に属しコンパイルエラー）。caller が
-            // kl.serde を渡していればそれを使い、無ければ gamepad と同様ここで自前生成する。
+            // recipe: kit.zig imports unconditionally (same as top-level build.zig
+            // `link(kit, common.recipe)`). libs/recipe is a headless lib that depends only on serde.
+            // The serde module **must share one instance** with the caller (when paint etc. also use serde);
+            // separate modules put the same serde.zig in two modules and fail to compile. Use
+            // kl.serde when supplied; otherwise create locally like gamepad.
             const kit_serde_mod: *std.Build.Module = if (kl.serde) |s|
                 s
             else
@@ -629,17 +629,17 @@ pub fn buildStandalone(
                 break :blk m;
             };
             kit_mod.addImport("appshell", kit_appshell_mod);
-            // app_runtime（TASK-73）: kit.zig が無条件 import する（トップ階層 build.zig の
-            // `link(kit, app_runtime)` と同じ）。frame-driven runtime で platform に依存するため
-            // backend 毎に生成し platform_mod を配線する（KitLibs には含めない）。
+            // app_runtime: kit.zig imports unconditionally (same as top-level build.zig
+            // `link(kit, app_runtime)`). Frame-driven runtime depends on platform, so
+            // create per backend and wire platform_mod (not part of KitLibs).
             const kit_app_runtime_mod = b.createModule(.{
                 .root_source_file = .{ .cwd_relative = b.fmt("{s}/app_runtime.zig", .{core_dir}) },
             });
             kit_app_runtime_mod.addImport("platform", platform_mod);
             kit_mod.addImport("app_runtime", kit_app_runtime_mod);
-            // midi（TASK-115.1）: kit.zig が無条件 import する。core/midi.zig は platform_types と
-            // harness（synthetic FIFO）に依存し、harness が backend 毎のため midi も backend 毎に
-            // ここで自前生成する（gamepad/app_runtime と同じ理由で KitLibs には含めない）。
+            // midi: kit.zig imports unconditionally. core/midi.zig depends on platform_types and
+            // harness (synthetic FIFO); harness is per-backend, so midi is also created per backend
+            // here (same reason as gamepad/app_runtime: not in KitLibs).
             const kit_midi_mod = b.createModule(.{
                 .root_source_file = .{ .cwd_relative = b.fmt("{s}/midi.zig", .{core_dir}) },
             });
@@ -668,7 +668,7 @@ pub fn buildStandalone(
 
         const exe = b.addExecutable(.{ .name = name, .root_module = root });
 
-        // build_options: 起動時バナー用の platform 名（top build.zig と同じく全 backend に付与）
+        // build_options: platform name for the startup banner (attached to every backend, as in top build.zig)
         const opts = b.addOptions();
         opts.addOption([]const u8, "platform_name", backendName(be));
         exe.root_module.addOptions("build_options", opts);
@@ -697,20 +697,20 @@ fn addStandaloneRunStep(b: *std.Build, name: []const u8, description: []const u8
 }
 
 pub const PlatformCompileResult = struct {
-    /// backend 本体 +（enable_menu 時）共有 menu TU。1 つ以上。
+    /// Backend body + (when enable_menu) the shared menu TU. One or more.
     compile_steps: []const *std.Build.Step.Run,
-    /// compile_steps と同順の .o。
+    /// .o files in the same order as compile_steps.
     obj_files: []const std.Build.LazyPath,
 };
 
-/// プラットフォーム層を `.o` にコンパイルする。
+/// Compile the platform layer to `.o`.
 ///
-/// `platform_root` は `platform/` ディレクトリへの LazyPath。
-/// 親プロジェクトからは `b.path("platform")`、examples からは
-/// `b.path("../../platform")` を渡す。
-/// `features`: true のフラグだけ .o コンパイルに `-DVP_ENABLE_*` を渡す（TASK-80.2/97.3/122 opt-in）。
-/// enable_menu=true のとき共有 `platform_macos_menu.m` を追加コンパイルして返す。
-/// .m/.swift ソース側は `#if defined(VP_ENABLE_GAMEPAD)` / `#if defined(VP_ENABLE_MENU)` で条件コンパイルする。
+/// `platform_root` is a LazyPath to the `platform/` directory.
+/// Parent project: `b.path("platform")`; examples:
+/// `b.path("../../platform")`.
+/// `features`: only true flags pass `-DVP_ENABLE_*` into the .o compile (gamepad/menu opt-in).
+/// When enable_menu=true, also compile shared `platform_macos_menu.m` and return it.
+/// .m/.swift sources gate on `#if defined(VP_ENABLE_GAMEPAD)` / `#if defined(VP_ENABLE_MENU)`.
 pub fn compilePlatformLayer(
     b: *std.Build,
     platform_type: PlatformType,
@@ -722,8 +722,8 @@ pub fn compilePlatformLayer(
         .objc => buildObjC(b, optimize, platform_root, features),
         .swift => buildSwift(b, optimize, platform_root, features),
         .metal => buildMetal(b, optimize, platform_root, features),
-        // Linux / Windows backend は純 Zig で .o コンパイル不要。setupExecutableForPlatform の
-        // macOS 分岐からのみ呼ばれるため、ここには到達しない。
+        // Linux / Windows backends are pure Zig and need no .o compile. Only reached from
+        // setupExecutableForPlatform's macOS branch, so this arm is unreachable.
         .x11, .wayland, .gdi, .d3d11, .wasm => unreachable,
     };
 }
@@ -737,7 +737,7 @@ fn objcOptFlag(optimize: std.builtin.OptimizeMode) []const u8 {
     };
 }
 
-/// enable_menu 時だけ共有 menu TU をコンパイルする（TASK-122）。
+/// Compile the shared menu TU only when enable_menu (NSMenu).
 fn buildMenuObject(
     b: *std.Build,
     optimize: std.builtin.OptimizeMode,
@@ -798,10 +798,10 @@ fn buildObjC(
         "objective-c",
     });
     compile_cmd.addPrefixedDirectoryArg("-I", platform_root);
-    // ゲームパッド opt-in（TASK-80.2）。platform_macos.m の `#if defined(VP_ENABLE_GAMEPAD)` を有効化する。
+    // Gamepad opt-in. Enables `#if defined(VP_ENABLE_GAMEPAD)` in platform_macos.m.
     if (features.enable_gamepad) compile_cmd.addArg("-DVP_ENABLE_GAMEPAD");
-    // native メニュー opt-in（TASK-97.3/122）。bridge + poll 消費に `-DVP_ENABLE_MENU`。
-    // NSMenu 本体は共有 platform_macos_menu.m（makeCompileResult が追加）。
+    // Native menu opt-in. `-DVP_ENABLE_MENU` for bridge + poll consumption.
+    // NSMenu body lives in shared platform_macos_menu.m (added by makeCompileResult).
     if (features.enable_menu) compile_cmd.addArg("-DVP_ENABLE_MENU");
     compile_cmd.addArgs(&.{
         "-fobjc-arc",
@@ -831,24 +831,24 @@ fn buildSwift(
         "-disable-autolinking-runtime-compatibility",
         "-disable-autolinking-runtime-compatibility-concurrency",
         "-disable-autolinking-runtime-compatibility-dynamic-replacements",
-        // TASK-140: 共有+backend の 2 .swift を単一 .o にまとめる（-c -o は複数入力で複数出力になるため WMO 必須）。
+        // Pack shared+backend's two .swift files into one .o (WMO required: -c -o with multiple inputs would emit multiple outputs).
         "-whole-module-optimization",
         "-framework",
         "Cocoa",
         "-framework",
         "QuartzCore",
     });
-    // ゲームパッド opt-in（TASK-80.2）。共有 platform_macos_shared.swift の `#if VP_ENABLE_GAMEPAD` を有効化する。
-    // `-import-objc-header` は次トークンを bridging header path として必須で取るため、その前に置く
-    // （後に置くと `-import-objc-header` が `-DVP_ENABLE_GAMEPAD` を誤って path として消費してしまう）。
+    // Gamepad opt-in. Enables `#if VP_ENABLE_GAMEPAD` in shared platform_macos_shared.swift.
+    // `-import-objc-header` takes the next token as the bridging-header path, so place the define before it
+    // (otherwise `-import-objc-header` would consume `-DVP_ENABLE_GAMEPAD` as a path).
     if (features.enable_gamepad) compile_cmd.addArg("-DVP_ENABLE_GAMEPAD");
-    // native メニュー opt-in（TASK-122）。bridge + poll 消費。本体は共有 menu.m。
+    // Native menu opt-in. Bridge + poll consumption; body is shared menu.m.
     if (features.enable_menu) compile_cmd.addArg("-DVP_ENABLE_MENU");
     compile_cmd.addArg("-import-objc-header");
     compile_cmd.addFileArg(platform_root.path(b, "platform.h"));
     compile_cmd.addArgs(&.{ "-c", "-o" });
     const obj_path = compile_cmd.addOutputFileArg("platform_macos_swift.o");
-    // TASK-140: 共有 .swift と backend 固有 .swift を同一 swiftc 呼び出しでコンパイル（1 .o）。
+    // Compile shared .swift and backend-specific .swift in one swiftc invocation (one .o).
     compile_cmd.addFileArg(platform_root.path(b, "macos-shared/platform_macos_shared.swift"));
     compile_cmd.addFileArg(platform_root.path(b, "macos-swift/platform_macos_swift.swift"));
     return makeCompileResult(b, compile_cmd, obj_path, features, optimize, platform_root);
@@ -871,7 +871,7 @@ fn buildMetal(
         "-disable-autolinking-runtime-compatibility",
         "-disable-autolinking-runtime-compatibility-concurrency",
         "-disable-autolinking-runtime-compatibility-dynamic-replacements",
-        // TASK-140: 共有+backend の 2 .swift を単一 .o にまとめる（-c -o は複数入力で複数出力になるため WMO 必須）。
+        // Pack shared+backend's two .swift files into one .o (WMO required: -c -o with multiple inputs would emit multiple outputs).
         "-whole-module-optimization",
         "-framework",
         "Cocoa",
@@ -880,16 +880,16 @@ fn buildMetal(
         "-framework",
         "MetalKit",
     });
-    // ゲームパッド opt-in（TASK-80.2）。共有 platform_macos_shared.swift の `#if VP_ENABLE_GAMEPAD` を有効化する。
-    // `-import-objc-header` は次トークンを bridging header path として必須で取るため、その前に置く。
+    // Gamepad opt-in. Enables `#if VP_ENABLE_GAMEPAD` in shared platform_macos_shared.swift.
+    // `-import-objc-header` takes the next token as the bridging-header path, so place the define before it.
     if (features.enable_gamepad) compile_cmd.addArg("-DVP_ENABLE_GAMEPAD");
-    // native メニュー opt-in（TASK-122）。bridge + poll 消費。本体は共有 menu.m。
+    // Native menu opt-in. Bridge + poll consumption; body is shared menu.m.
     if (features.enable_menu) compile_cmd.addArg("-DVP_ENABLE_MENU");
     compile_cmd.addArg("-import-objc-header");
     compile_cmd.addFileArg(platform_root.path(b, "platform.h"));
     compile_cmd.addArgs(&.{ "-c", "-o" });
     const obj_path = compile_cmd.addOutputFileArg("platform_macos_metal.o");
-    // TASK-140: 共有 .swift と backend 固有 .swift を同一 swiftc 呼び出しでコンパイル（1 .o）。
+    // Compile shared .swift and backend-specific .swift in one swiftc invocation (one .o).
     compile_cmd.addFileArg(platform_root.path(b, "macos-shared/platform_macos_shared.swift"));
     compile_cmd.addFileArg(platform_root.path(b, "macos-metal/platform_macos_metal.swift"));
     return makeCompileResult(b, compile_cmd, obj_path, features, optimize, platform_root);

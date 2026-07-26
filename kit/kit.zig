@@ -1,26 +1,26 @@
-//! kit — 公開 umbrella モジュール（ADR-007 R4）
+//! kit — public umbrella module (ADR-007 R4)
 //!
-//! apps/ と外部消費者が依存してよい**唯一の公開面**。個別モジュールの直 import ではなく
-//! `@import("kit")` 経由で参照することで、内部リファクタが消費者を壊さない境界をここで引く。
+//! The **only public surface** apps/ and external consumers may depend on. Import via
+//! `@import("kit")` rather than individual modules, so internal refactors stay behind this boundary.
 //!
-//! 収録は「安定 lib のみ」（ADR-007 未決#2 の段階化方針。kit に載る＝将来 semver で守る対象）:
-//! - platform: core/platform.zig facade（window / event / 手動描画 / getTime）
-//! - control:  core/control/harness.zig（制御＋観測プレーン: probe / replay / live / 仮想クロック）
-//! - types:    core/platform_types.zig（KeyCode / Event 等の type-only 共有型）
-//! - audio:    core/audio.zig facade（L1 オーディオ出力）
-//! - gui / png / font / dsp / synth / sound / gmath / gfx / appshell: 安定 libs
-//! - gamepad: src/gamepad.zig（ゲームパッド入力ヘルパー。TASK-80.1。platform_types のみに依存する
-//!   headless lib として layer=.lib で扱う。keyboard 等の gfx ヘルパーは TASK-111.2 で libs/gfx へ
-//!   移設し kit.gfx 経由でも公開する）
-//! - recipe: libs/recipe（CommandRecord 列の save/replay。TASK-62.5.8。std + serde のみ）
-//! - sound: libs/sound（WAV デコード + SE/BGM ミキサー。TASK-111.6。dsp + synth）
-//! - gfx: libs/gfx（sprite / fixed_timestep / fps_counter / keyboard / atlas / animation。TASK-111.2/111.3）
+//! Contents are "stable libs only" (ADR-007 staging: being in kit means covered by future semver):
+//! - platform: core/platform.zig facade (window / event / manual draw / getTime)
+//! - control:  core/control/harness.zig (control+obs plane: probe / replay / live / virtual clock)
+//! - types:    core/platform_types.zig (type-only shared types: KeyCode / Event, …)
+//! - audio:    core/audio.zig facade (L1 audio output)
+//! - gui / png / font / dsp / synth / sound / gmath / gfx / appshell: stable libs
+//! - gamepad: src/gamepad.zig (gamepad input helper; platform_types-only
+//!   headless lib at layer=.lib. Keyboard and other gfx helpers live under libs/gfx and
+//!   are also exposed via kit.gfx)
+//! - recipe: libs/recipe (save/replay of CommandRecord sequences; std + serde only)
+//! - sound: libs/sound (WAV decode + SE/BGM mixer; dsp + synth)
+//! - gfx: libs/gfx (sprite / fixed_timestep / fps_counter / keyboard / atlas / animation)
 //!
-//! **流動中の lib（modular / paint / viz 等）は載せない**。apps はそれらを「内部・壊れうる」
-//! 前提の直 import で使い、API が固まったら kit へ昇格する（成熟ゲート）。
+//! **Libs still in flux (modular / paint / viz, …) stay out.** Apps import those directly as
+//! "internal / may break", and promote them into kit once the API settles (maturity gate).
 //!
-//! 注意: platform が backend 毎の module のため、kit も backend 毎に生成される
-//! （build.zig の makeKitModule）。ここに import を足す場合は build.zig 側の配線も揃えること。
+//! Note: because platform is a per-backend module, kit is also generated per backend
+//! (makeKitModule in build.zig). Adding an import here requires matching wiring in build.zig.
 
 pub const platform = @import("platform");
 pub const control = @import("harness");
@@ -43,11 +43,11 @@ pub const app_runtime = @import("app_runtime");
 pub const sound = @import("sound");
 
 // ============================================================================
-// platform.Event → gui.InputEvent アダプタ（TASK-111.7）
+// platform.Event → gui.InputEvent adapter
 // ============================================================================
 
-/// platform.MouseButton → gui.InputEvent の button index（0=left / 1=right / 2=middle）。
-/// 未知の button は `0xFF`（gui 側で無視されうる sentinel。pixie 正準）。
+/// platform.MouseButton → gui.InputEvent button index (0=left / 1=right / 2=middle).
+/// Unknown buttons map to `0xFF` (sentinel the gui side may ignore; pixie is canonical).
 fn buttonToU8(b: platform.MouseButton) u8 {
     return switch (b) {
         .left => 0,
@@ -57,23 +57,23 @@ fn buttonToU8(b: platform.MouseButton) u8 {
     };
 }
 
-/// `platform.Event` → `gui.InputEvent` の公式アダプタ（pixie 現行意味論が正準）。
+/// Canonical `platform.Event` → `gui.InputEvent` adapter (pixie's current semantics).
 ///
-/// GUI に関係しないイベントは `null`:
+/// GUI-unrelated events return `null`:
 /// - `quit`
-/// - `char_input`（IME 確定文字。GUI へ渡すかは app 側判断。examples/27・28 は自前で渡す）
+/// - `char_input` (IME-committed char; whether to forward to GUI is app-owned. examples/27 and 28 pass it themselves)
 /// - `gamepad_connected` / `gamepad_disconnected`
 /// - `composition_changed`
-/// - `menu_command`（App.dispatchCommand で消費）
+/// - `menu_command` / `file_drop` (menu: App.dispatchCommand; drop: app-owned)
 ///
-/// キーの負値（`KeyCode.UNKNOWN = -1` 等）は破棄（libs/gui は u32 code 前提）。
+/// Negative key values (`KeyCode.UNKNOWN = -1`, …) are discarded (libs/gui assumes u32 codes).
 ///
-/// 使い方:
+/// Usage:
 /// ```
 /// if (kit.toGuiEvent(ev)) |ge| ctx.pushEvent(ge);
 /// ```
 ///
-/// ホットパス: イベント到着時のみ。全画素・RT・フレーム毎 allocation 無し。
+/// Hot path: on event arrival only. No per-pixel / RT / per-frame allocation.
 pub fn toGuiEvent(ev: platform.Event) ?gui.InputEvent {
     return switch (ev) {
         .quit => null,
@@ -100,18 +100,18 @@ pub fn toGuiEvent(ev: platform.Event) ?gui.InputEvent {
 }
 
 // ============================================================================
-// tests（adapter。test-kit 経由で収集。TASK-111.7）
+// tests (adapter; collected via test-kit)
 // ============================================================================
 const std = @import("std");
 const testing = std.testing;
 
-// gui_font.zig の test ブロックを取り込む（pub const GuiFont = @import(...).GuiFont だけでは
-// Zig が sibling file の test を収集しない。libs/gui と同型の ref パターン）。
+// Pull in gui_font.zig's test block (`pub const GuiFont = @import(...).GuiFont` alone does not
+// make Zig collect sibling-file tests. Same ref pattern as libs/gui).
 test {
     _ = @import("gui_font.zig");
 }
 
-test "toGuiEvent: mouse move/down/up/scroll の値と modifier" {
+test "toGuiEvent: mouse move/down/up/scroll values and modifiers" {
     const shift = platform.ModifierFlags{ .shift = true };
     const move = toGuiEvent(.{ .mouse_move = .{
         .x = 10,
@@ -161,7 +161,7 @@ test "toGuiEvent: mouse move/down/up/scroll の値と modifier" {
     try testing.expectEqual((platform.ModifierFlags{ .alt = true }).toC(), scroll.mouse_scroll.modifiers);
 }
 
-test "toGuiEvent: left/right/middle と未知 button" {
+test "toGuiEvent: left/right/middle and unknown button" {
     const left = toGuiEvent(.{ .mouse_down = .{
         .x = 0,
         .y = 0,
@@ -199,7 +199,7 @@ test "toGuiEvent: left/right/middle と未知 button" {
     try testing.expectEqual(@as(u8, 0xFF), unknown.mouse_down.button);
 }
 
-test "toGuiEvent: key down/up と repeat、UNKNOWN 破棄" {
+test "toGuiEvent: key down/up and repeat; discard UNKNOWN" {
     const kd = toGuiEvent(.{ .key_down = .{
         .key = .A,
         .is_repeat = true,
@@ -230,7 +230,7 @@ test "toGuiEvent: key down/up と repeat、UNKNOWN 破棄" {
     } }) == null);
 }
 
-test "toGuiEvent: pixie と同じ無視対象イベントは null" {
+test "toGuiEvent: events ignored by pixie return null" {
     try testing.expect(toGuiEvent(.quit) == null);
     try testing.expect(toGuiEvent(.{ .char_input = .{ .codepoint = 'a', .modifiers = .{} } }) == null);
     try testing.expect(toGuiEvent(.{ .gamepad_connected = .{ .index = 0 } }) == null);

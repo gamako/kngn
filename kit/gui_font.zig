@@ -1,34 +1,34 @@
-//! 実アプリ向け system OutlineFont 注入ヘルパ（TASK-138）。
+//! Helper that injects a system OutlineFont for real apps.
 //!
-//! 借用チェーン bytes ← FontFace ← OutlineFont ← Font（asFont は借用 view）のため、
-//! **最終配置後に in-place load**し、ctx.font は後から再ポイントする。
-//! ホットパス: 起動時（初期化時）のみ。フレーム毎・RT の新規経路は追加しない。
+//! Borrowing chain: bytes ← FontFace ← OutlineFont ← Font (asFont is a borrowed view), so
+//! **load in place after the final placement**, then re-point ctx.font.
+//! Hot path: startup (init) only. No new per-frame or RT path.
 
 const std = @import("std");
 const builtin = @import("builtin");
 const gui = @import("gui");
 const font = @import("font");
 
-/// ノード用の小タイトルフォントの px サイズ（TASK-170）。通常 GUI の 16px より小さくし、
-/// パッチキャンバスのノードタイトルを読みやすい密度に保つ。
+/// Pixel size for the small node-title font. Smaller than the usual GUI 16px so
+/// patch-canvas node titles stay at a readable density.
 const TITLE_FONT_PX: f32 = 11;
 
-/// GUI Context へ注入する system OutlineFont の所有束。
-/// App/ローカルの最終配置先に置き、`load` は pointer receiver でその場に詰めること。
+/// Owned bundle of a system OutlineFont injected into the GUI Context.
+/// Place at the App/local final site; `load` must fill in place via a pointer receiver.
 pub const GuiFont = struct {
     gpa: std.mem.Allocator = undefined,
     bytes: ?[]u8 = null,
     face: ?font.FontFace = null,
     outline: ?font.OutlineFont = null,
-    /// ノードタイトル等、小さいサイズが要る用途向け（TASK-170）。同じ face を再利用し二重ロードしない。
+    /// For smaller sizes (node titles, etc.). Reuses the same face; does not double-load.
     outline_small: ?font.OutlineFont = null,
 
-    /// system text face を読み、self 上に bytes/face/outline(/outline_small) を構築する。
-    /// 未検出・失敗時は outline=null のまま警告を出し、`asFont`/`asTitleFont` が default_font へ落ちる（AC3）。
+    /// Load the system text face and build bytes/face/outline(/outline_small) on self.
+    /// On miss/failure, leave outline=null, warn, and let `asFont`/`asTitleFont` fall back to default_font.
     pub fn load(self: *GuiFont, io: std.Io, gpa: std.mem.Allocator) void {
         self.gpa = gpa;
-        // wasm には native システムフォントパスが無い（旧 loadSystemTextFontBytes の
-        // "pixie 用" isWasm guard を踏襲）。outline=null のまま default_font へ落ちる。
+        // wasm has no native system font path (same isWasm guard as the former
+        // loadSystemTextFontBytes "for pixie"). Leave outline=null and fall back to default_font.
         if (builtin.cpu.arch.isWasm()) return;
         const loaded = font.loadSystemTextFace(io, gpa) orelse {
             std.log.warn("GuiFont: no usable system font; falling back to gui.default_font", .{});
@@ -36,30 +36,30 @@ pub const GuiFont = struct {
         };
         self.bytes = loaded.bytes;
         self.face = loaded.face;
-        // `&self.face.?` は最終配置済み self 内の安定アドレス（move 後に取らない）。
+        // `&self.face.?` is a stable address inside the finally-placed self (do not take it after a move).
         self.outline = font.OutlineFont.init(gpa, &self.face.?, 16);
         self.outline_small = font.OutlineFont.init(gpa, &self.face.?, TITLE_FONT_PX);
     }
 
-    /// OutlineFont があればその借用 Font、無ければ `gui.default_font`。
+    /// Borrowed Font from OutlineFont when present; otherwise `gui.default_font`.
     pub fn asFont(self: *GuiFont) gui.Font {
         if (self.outline) |*o| return o.asFont();
         return gui.default_font;
     }
 
-    /// ノードタイトル用の小さい OutlineFont があればその借用 Font、無ければ `gui.default_font`
-    /// （TASK-170。asFont と同じ fallback 契約）。
+    /// Borrowed Font from the small title OutlineFont when present; otherwise `gui.default_font`
+    /// (same fallback contract as asFont).
     pub fn asTitleFont(self: *GuiFont) gui.Font {
         if (self.outline_small) |*o| return o.asFont();
         return gui.default_font;
     }
 
-    /// canvas 用に同じ bytes を参照（二重ロード回避）。所有は GuiFont。
+    /// Borrow the same bytes for canvas use (avoid double-load). Ownership stays with GuiFont.
     pub fn systemBytes(self: *const GuiFont) ?[]const u8 {
         return self.bytes;
     }
 
-    /// Context.deinit の後に呼ぶこと。順序: outline(_small).deinit → free(bytes)。
+    /// Call after Context.deinit. Order: outline(_small).deinit → free(bytes).
     pub fn deinit(self: *GuiFont) void {
         if (self.outline_small) |*o| o.deinit();
         self.outline_small = null;

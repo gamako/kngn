@@ -1,7 +1,7 @@
-//! macOS SDK / Toolchain パスの解決とフレームワークリンクヘルパー
+//! Resolve macOS SDK / toolchain paths and link frameworks
 //!
-//! nix の zig 0.16 は macOS SDK を自動検出しないため、
-//! xcode-select / xcrun で解決したパスを exe に明示的に渡す。
+//! nix's zig 0.16 does not auto-detect the macOS SDK, so
+//! resolve via `xcode-select -p` (toolchain) and `xcrun --show-sdk-path` (SDK) and pass the paths to the exe explicitly.
 
 const std = @import("std");
 
@@ -10,8 +10,8 @@ pub const MacOSSDKPaths = struct {
     toolchain_path: []const u8,
 };
 
-/// macOS SDK / Toolchain のパスを解決する。
-/// オーバーライドが渡された場合はそれを使い、なければ xcode-select / xcrun で取得する。
+/// Resolve macOS SDK / toolchain paths.
+/// Use overrides when given; otherwise toolchain=`xcode-select -p`, SDK=`xcrun --show-sdk-path`.
 pub fn resolveMacOSSDKPaths(
     b: *std.Build,
     toolchain_override: ?[]const u8,
@@ -40,12 +40,12 @@ pub fn resolveMacOSSDKPaths(
     return .{ .sdk_path = sdk_path, .toolchain_path = toolchain_path };
 }
 
-/// macOS フレームワークを exe にリンクする。
-/// 内部で SDK の framework / library 検索パスも追加する。
+/// Link macOS frameworks into the exe.
+/// Also adds the SDK framework / library search paths.
 ///
-/// `enable_gamepad`: ゲームパッド入力 (GCController/GCExtendedGamepad。TASK-80.2。ADR-009) を
-/// 使う exe だけ true にする（audio の `link_audio` と対称の opt-in。TASK-80.2 opt-in 化リファクタ）。
-/// false の exe は GameController framework をリンクしない（`otool -L` に出ない）。
+/// `enable_gamepad`: true only for exes that use gamepad input (GCController/GCExtendedGamepad; ADR-009).
+/// Opt-in, symmetric with audio's `link_audio`.
+/// When false, GameController is not linked (absent from `otool -L`).
 pub fn linkMacOSFrameworks(
     b: *std.Build,
     exe: *std.Build.Step.Compile,
@@ -57,21 +57,21 @@ pub fn linkMacOSFrameworks(
     const frameworks = [_][]const u8{
         "Cocoa",
         "QuartzCore",
-        // ファイルダイアログの UTType (allowedContentTypes) 用。objc backend は明示リンク必須。
-        // swift/metal は swiftUniformTypeIdentifiers overlay 経由でも解決できるが共通化のため一律リンク。
+        // For file-dialog UTType (allowedContentTypes). The objc backend requires an explicit link.
+        // swift/metal can resolve via the swiftUniformTypeIdentifiers overlay; link uniformly for consistency.
         "UniformTypeIdentifiers",
     };
     for (frameworks) |framework| {
         exe.root_module.linkFramework(framework, .{});
     }
     if (enable_gamepad) {
-        // ゲームパッド入力 (GCController/GCExtendedGamepad。TASK-80.2。ADR-009)。opt-in exe のみリンク。
+        // Gamepad input (GCController/GCExtendedGamepad; ADR-009). Linked only for opt-in exes.
         exe.root_module.linkFramework("GameController", .{});
     }
 }
 
-/// SDK の framework / library 検索パスを exe に追加する。
-/// linkMacOSFrameworks() の内部実装で、外部公開はしない。
+/// Add the SDK framework / library search paths to the exe.
+/// Internal to linkMacOSFrameworks(); not part of the public surface.
 fn addMacOSSDKSearchPaths(
     b: *std.Build,
     exe: *std.Build.Step.Compile,
