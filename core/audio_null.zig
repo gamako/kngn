@@ -1,22 +1,22 @@
-//! Null audio output device (L1 オーディオ出力プリミティブ・TASK-32.4 P4)
+//! Null audio output device (an L1 audio output primitive)
 //!
-//! headless harness（`VP_HEADLESS=1`）用の実デバイス無し出力。純 Zig・OS 非依存
-//! （`@cImport` しない。audio_linux/audio_windows と同じ ABI 戦略）。`start()` で再生スレッド
-//! (`std.Thread`) を spawn し、実時間ペーシング（period 分の時間だけ sleep）で render callback を
-//! pull する（audio_linux の push-thread パターン踏襲。実デバイスと同じ「別スレッドが実時間で
-//! callback を駆動する」挙動をアプリから見て変えないため。詳細はタスク plan §3.2 の「未決事項」）。
+//! The output with no real device, for the headless harness (`VP_HEADLESS=1`). Pure Zig and OS independent
+//! (no `@cImport`, the same ABI strategy as audio_linux and audio_windows). `start()` spawns a playback thread
+//! (`std.Thread`) and pulls the render callback with real-time pacing (sleeping for exactly one period's worth of
+//! time), following audio_linux's push-thread pattern. That way the behaviour an application sees — another thread
+//! driving the callback in real time — is the same as with a real device.
 //!
-//! ホットパス宣言: `renderThread` は **RT（実時間）pull ループ**。scratch は `open()` で事前確保済みで、
-//! ループ内（callback 呼び出し + sleep）に **alloc/lock/IO/panic は無い**（FailingAllocator でテスト固定）。
-//! null デバイス自身は毎サンプルの演算を持たない（サンプル生成は呼び出し側のユーザー callback）。
+//! Hot path declaration: `renderThread` is a **real-time pull loop**. The scratch buffer is allocated up front in `open()`, and
+//! within the loop (the callback call plus the sleep) there is **no alloc, lock, IO or panic** (pinned by a test using FailingAllocator).
+//! The null device itself does no per-sample arithmetic (generating samples is the caller's own callback).
 //!
-//! ## 公開型は呼び出し元（OS backend）のものをそのまま使う
+//! ## The public types are the caller's (the OS backend's), used as they are
 //!
-//! `NullBackend(comptime B: type)` は `B.{Error,Config,EffectiveConfig,RenderCallback}` を
-//! **エイリアスとして再エクスポート**する（新しい型を作らない）。`audio.zig` facade はこれを
-//! `B = backend`（実行中 OS の backend module）で 1 回だけ instantiate するため、
-//! `NullBackend(backend).Config` は `backend.Config` と文字通り同一の型になり、
-//! facade の公開 `Config`/`Error`/... は一切変更不要（型もエラーセットも増えない）。
+//! `NullBackend(comptime B: type)` **re-exports** `B.{Error,Config,EffectiveConfig,RenderCallback}`
+//! **as aliases** rather than creating new types. The `audio.zig` facade instantiates this exactly once with
+//! `B = backend` (the running OS's backend module), so
+//! `NullBackend(backend).Config` is literally the same type as `backend.Config`, and
+//! the facade's public `Config`, `Error` and the rest need no change at all (neither the types nor the error sets grow).
 
 const std = @import("std");
 
@@ -27,15 +27,15 @@ pub fn NullBackend(comptime B: type) type {
         pub const EffectiveConfig = B.EffectiveConfig;
         pub const RenderCallback = B.RenderCallback;
 
-        /// 再生スレッド / callback に安定アドレスで渡すための状態。`open()` で heap 確保し
-        /// `close()` で破棄する（backend 実装と同じ形）。
+        /// The state passed to the playback thread and the callback at a stable address. Heap-allocated by `open()`
+        /// and destroyed by `close()` (the same shape as a backend implementation).
         const State = struct {
             render_callback: RenderCallback,
             userdata: ?*anyopaque,
             effective: EffectiveConfig,
             running: std.atomic.Value(bool),
             thread: ?std.Thread,
-            scratch: []f32, // period * channels の interleaved バッファ（open 時のみ確保）
+            scratch: []f32, // the interleaved buffer of period * channels (allocated only at open)
             allocator: std.mem.Allocator,
         };
 
@@ -46,11 +46,11 @@ pub fn NullBackend(comptime B: type) type {
                 return self.state.effective;
             }
 
-            /// 再生スレッドを起動する。実デバイスの prepare に相当する処理は無いので常に成功する
-            /// （spawn 失敗のみ `error.StartFailed`）。
+            /// Starts the playback thread. There is nothing corresponding to a real device's prepare, so it always succeeds
+            /// (only a failed spawn gives `error.StartFailed`).
             pub fn start(self: @This()) Error!void {
                 const state = self.state;
-                if (state.thread != null) return; // 二重 start は無視（backend と同じ契約）
+                if (state.thread != null) return; // a double start is ignored (the same contract as a backend)
                 state.running.store(true, .release);
                 state.thread = std.Thread.spawn(.{}, renderThread, .{state}) catch {
                     state.running.store(false, .release);
@@ -58,7 +58,7 @@ pub fn NullBackend(comptime B: type) type {
                 };
             }
 
-            /// 再生スレッドを止める。`running=false` → join。
+            /// Stops the playback thread: `running=false`, then join.
             pub fn stop(self: @This()) void {
                 const state = self.state;
                 if (state.thread) |thread| {
@@ -68,7 +68,7 @@ pub fn NullBackend(comptime B: type) type {
                 }
             }
 
-            /// stop → scratch 解放 → State 破棄。
+            /// stop, then free the scratch, then destroy the State.
             pub fn close(self: @This()) void {
                 const state = self.state;
                 self.stop();
@@ -77,7 +77,7 @@ pub fn NullBackend(comptime B: type) type {
             }
         };
 
-        /// RT 契約区間: `render_callback` 呼び出し + sleep のみ。alloc/lock/IO/panic 禁止。
+        /// The real-time contract region: the `render_callback` call plus the sleep, and nothing else. No alloc, lock, IO or panic.
         fn renderThread(state: *State) void {
             const ch: usize = state.effective.channels;
             const period: usize = state.effective.max_frames_per_slice;
@@ -92,7 +92,7 @@ pub fn NullBackend(comptime B: type) type {
                     sample_rate,
                     state.userdata,
                 );
-                // 実デバイス同型の実時間ペーシング（1 period 分の再生時間だけ待つ）。
+                // Real-time pacing of the same shape as a real device (waiting for exactly one period's playback time).
                 sleepNs(period_ns);
             }
         }
@@ -126,15 +126,15 @@ pub fn NullBackend(comptime B: type) type {
     };
 }
 
-/// period（frames）と sample_rate から period の再生時間をナノ秒で求める（純ロジック・テスト可能）。
+/// Works out a period's playback time in nanoseconds from the period (in frames) and the sample_rate (pure logic, testable).
 fn periodNanos(period: usize, sample_rate: u32) u64 {
     if (sample_rate == 0) return 0;
     return @as(u64, period) * std.time.ns_per_s / sample_rate;
 }
 
 // ============================================================================
-// OS 非依存 sleep（`src/platform.zig` の `sleep()` と同じ実装。audio 層は platform に依存しない
-// レイヤー設計のため import せず同じパターンをここに複製する。POSIX=nanosleep / Windows=Sleep）。
+// An OS-independent sleep (the same implementation as `sleep()` in `src/platform.zig`. The audio layer does not depend on
+// platform by design, so rather than importing it the same pattern is duplicated here: POSIX uses nanosleep, Windows uses Sleep).
 // ============================================================================
 const builtin = @import("builtin");
 
@@ -155,11 +155,11 @@ fn sleepNs(nanoseconds: u64) void {
 }
 
 // ============================================================================
-// tests（display/実デバイス不要・OS 非依存）
+// tests (no display or real device needed, and OS independent)
 // ============================================================================
 const testing = std.testing;
 
-/// テスト専用の backend 型集合（audio_{macos,linux,windows}.zig と同一シグネチャ）。
+/// The set of backend types used by the tests alone (the same signature as audio_{macos,linux,windows}.zig).
 const TestBackend = struct {
     pub const Error = error{
         OpenFailed,
@@ -185,7 +185,7 @@ const TestBackend = struct {
 };
 const TestNull = NullBackend(TestBackend);
 
-test "periodNanos: sample_rate=0 は 0、そうでなければ period/sample_rate 秒" {
+test "periodNanos: sample_rate=0 gives 0, and otherwise period/sample_rate seconds" {
     try testing.expectEqual(@as(u64, 0), periodNanos(512, 0));
     try testing.expectEqual(@as(u64, std.time.ns_per_s), periodNanos(48000, 48000));
     try testing.expectEqual(@as(u64, std.time.ns_per_s / 2), periodNanos(24000, 48000));
@@ -204,11 +204,11 @@ fn countingCallback(buf: []f32, frames: u32, channels: u32, sample_rate: u32, us
     _ = ctx.count.fetchAdd(1, .monotonic);
 }
 
-test "open/start/stop/close: callback が実時間で複数回呼ばれ、join が安全に終わる" {
+test "open/start/stop/close: the callback is called several times in real time and the join finishes safely" {
     var ctx = CallCtx{};
     const device = try TestNull.open(testing.allocator, .{
         .sample_rate = 48000,
-        .buffer_frames = 128, // 短い period で速く複数回まわす（≈2.7ms/回）
+        .buffer_frames = 128, // go round several times quickly with a short period (about 2.7ms each)
         .channels = 2,
         .render_callback = countingCallback,
         .userdata = &ctx,
@@ -219,17 +219,17 @@ test "open/start/stop/close: callback が実時間で複数回呼ばれ、join �
     try testing.expectEqual(@as(u32, 128), device.config().max_frames_per_slice);
 
     try device.start();
-    sleepNs(30 * std.time.ns_per_ms); // 30ms あれば数回まわる
+    sleepNs(30 * std.time.ns_per_ms); // 30ms is enough for several times round
     device.stop();
 
     try testing.expect(ctx.count.load(.monotonic) >= 2);
     try testing.expectEqual(@as(u32, 128), ctx.last_frames.load(.monotonic));
 
-    // 二重 stop / start は安全（no-op）
+    // a double stop or start is safe (a no-op)
     device.stop();
 }
 
-test "RT 契約: pull ループ稼働中は open 後の追加アロケーションが無い（FailingAllocator）" {
+test "the real-time contract: no allocation happens after open while the pull loop runs (FailingAllocator)" {
     var failing = std.testing.FailingAllocator.init(testing.allocator, .{});
     const alloc = failing.allocator();
 
@@ -244,13 +244,13 @@ test "RT 契約: pull ループ稼働中は open 後の追加アロケーショ�
     defer device.close();
 
     const allocs_after_open = failing.allocations;
-    // ここから先で 1 回でも alloc されたら OOM になるよう固定する。
+    // From here on, pin it so that a single allocation would give OOM.
     failing.fail_index = allocs_after_open;
 
     try device.start();
     sleepNs(30 * std.time.ns_per_ms);
     device.stop();
 
-    try testing.expectEqual(allocs_after_open, failing.allocations); // pull ループ中に alloc 無し
-    try testing.expect(ctx.count.load(.monotonic) >= 1); // callback は実際に呼ばれている
+    try testing.expectEqual(allocs_after_open, failing.allocations); // no allocation during the pull loop
+    try testing.expect(ctx.count.load(.monotonic) >= 1); // the callback really is called
 }

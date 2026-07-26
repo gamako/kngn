@@ -1,27 +1,27 @@
 //! Audio output layer (facade)
 //!
-//! L1 オーディオ出力プリミティブの公開 interface。`builtin.os.tag` で backend 実装を選ぶ。
-//! caller は `@import("audio")` でこの API のみを使う。
-//!   - macOS   → `audio_macos.zig`（AudioUnit を extern fn で叩く）
-//!   - Linux   → `audio_linux.zig`（ALSA を extern fn で叩く）
-//!   - Windows → `audio_windows.zig`（WASAPI/COM を extern vtable で叩く）
+//! The public interface of the L1 audio output primitives. The backend implementation is chosen by `builtin.os.tag`.
+//! A caller uses this API alone, through `@import("audio")`.
+//!   - macOS   → `audio_macos.zig` (driving AudioUnit through extern fn)
+//!   - Linux   → `audio_linux.zig` (driving ALSA through extern fn)
+//!   - Windows → `audio_windows.zig` (driving WASAPI/COM through an extern vtable)
 //!
-//! audio 層は `@cImport` せず必要な C ABI を extern fn で取り込む方針で統一している
-//! （build が単純・header search path 不要。Windows WASAPI/COM も vtable を自前宣言して同方針）。
+//! The audio layer never uses `@cImport`; it pulls in the C ABI it needs through extern fn instead,
+//! which keeps the build simple and needs no header search path (Windows WASAPI/COM follows suit by declaring the vtable itself).
 //!
-//! ## ヘッドレス検証 harness（TASK-32.2）
+//! ## The headless verification harness
 //!
-//! harness **有効時のみ**、`open()` はユーザーの render callback を harness trampoline で包む。RT スレッドで
-//! ユーザー callback を実行した後、出力サンプルを `harness.onAudioSamples()` へ push する（依存方向 audio→harness）。
-//! harness は組み込み `audio` probe（WAV + RMS/peak/f0/silent digest）でこのサンプルを使う。
-//! harness **無効時** は backend をそのまま使う（trampoline も追加 alloc も無し＝既存挙動と完全一致）。
+//! **Only while harness is enabled**, `open()` wraps the user's render callback in a harness trampoline. Having run the
+//! user callback on the real-time thread, it pushes the output samples to `harness.onAudioSamples()` (so the dependency runs audio→harness).
+//! The harness uses those samples for the built-in `audio` probe (a WAV plus an rms/peak/f0/silent digest).
+//! **While harness is disabled** the backend is used as it is (no trampoline and no extra allocation, matching existing behaviour exactly).
 //!
-//! ## headless（実デバイス無し）駆動（TASK-32.4 P4）
+//! ## Driving it headless, with no real device
 //!
-//! `VP_HEADLESS=1` 時は `backend`（実 OS デバイス）の代わりに `audio_null.zig` の
-//! null デバイスを開く（実デバイス無し・純 Zig・実時間 pull スレッド）。`AudioDevice.inner` を
-//! tagged union（`native`/`null_dev`）にして分岐するだけで、公開 `Error`/`Config`/`EffectiveConfig`/
-//! `RenderCallback` は一切変えない（`NullBackend(backend)` が backend の型をエイリアスするため）。
+//! With `VP_HEADLESS=1` the null device of `audio_null.zig` is opened in place of `backend`
+//! (the real OS device): no real device, pure Zig, a real-time pull thread. `AudioDevice.inner` becomes a
+//! tagged union (`native` / `null_dev`) and the code merely branches on it; the public `Error`, `Config`, `EffectiveConfig`
+//! and `RenderCallback` do not change at all, because `NullBackend(backend)` aliases the backend's types.
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -36,7 +36,7 @@ else switch (builtin.os.tag) {
     else => @compileError("video-proto: unsupported OS for audio backend: " ++ @tagName(builtin.os.tag)),
 };
 
-/// wasm: AudioWorklet 用 export をリンクに残す（TASK-73.2）。native は no-op。
+/// wasm: keeps the AudioWorklet export in the link. A no-op on native.
 pub fn enableWebAudioExports() void {
     if (builtin.cpu.arch.isWasm()) {
         backend.enableAudioExports();
@@ -53,25 +53,25 @@ pub const Config = backend.Config;
 pub const EffectiveConfig = backend.EffectiveConfig;
 pub const RenderCallback = backend.RenderCallback;
 
-/// RT スレッド callback に渡す安定状態（ユーザー callback/userdata を保持）。open で heap 確保し close で破棄。
+/// The stable state handed to the real-time thread callback (it holds the user callback and userdata). Heap-allocated by open and destroyed by close.
 const WrappedState = struct {
     user_callback: RenderCallback,
     user_userdata: ?*anyopaque,
     allocator: std.mem.Allocator,
 };
 
-/// RT スレッドで呼ばれる trampoline。ユーザー callback 実行後に harness へサンプルを push する。
-/// **malloc/lock/IO/panic 禁止**（harness.onAudioSamples は lock-free。userdata は null 不可だが
-/// RT で panic しないよう `orelse return` で防御する）。
+/// The trampoline called on the real-time thread. Having run the user callback, it pushes the samples to the harness.
+/// **No malloc, locking, IO or panic** (harness.onAudioSamples is lock-free. userdata cannot be null, but
+/// `orelse return` guards it so that nothing panics on the real-time thread).
 fn renderTrampoline(buf: []f32, frames: u32, channels: u32, sample_rate: u32, userdata: ?*anyopaque) void {
     const wrapped: *WrappedState = @ptrCast(@alignCast(userdata orelse return));
     wrapped.user_callback(buf, frames, channels, sample_rate, wrapped.user_userdata);
     harness.onAudioSamples(buf, frames, channels, sample_rate);
 }
 
-/// facade デバイス。backend デバイス（native）か null デバイス（headless）を tagged union で内包する。
-/// harness 有効時のみ `wrapped`（trampoline 状態）を持ち、close で破棄する。
-/// harness 無効時は `wrapped=null`（backend を素通し＝既存挙動と完全一致）。
+/// The facade device. It holds either a backend device (native) or the null device (headless) in a tagged union.
+/// Only while harness is enabled does it hold `wrapped` (the trampoline state), which close destroys.
+/// While harness is disabled `wrapped=null`, passing the backend straight through and matching existing behaviour exactly.
 pub const AudioDevice = struct {
     inner: Inner,
     wrapped: ?*WrappedState,
@@ -119,17 +119,17 @@ pub const AudioDevice = struct {
     }
 };
 
-/// オーディオ出力を開く。
-/// - harness 無効時: backend をそのまま使う（trampoline も追加 alloc も無し＝既存挙動と完全一致）。
-/// - harness 有効時: ユーザーの render callback を harness trampoline で包み、出力を audio probe へ流す。
-///   - **headless 時（TASK-32.4 P4）**: 実 OS デバイスの代わりに null デバイス（`audio_null.zig`）を開く
-///     （実デバイス無し・実時間 pull スレッド）。
+/// Opens the audio output.
+/// - While harness is disabled: the backend is used as it is (no trampoline and no extra allocation, matching existing behaviour exactly).
+/// - While harness is enabled: the user's render callback is wrapped in a harness trampoline and the output feeds the audio probe.
+///   - **When headless**: the null device (`audio_null.zig`) is opened instead of the real OS device
+///     (no real device, a real-time pull thread).
 ///
-/// `isHeadlessActive()` を `isEnabled()` より先に判定するのは意図的: headless は
-/// platform が確定した `VP_HEADLESS=1`（`harness.setHeadlessActive`）で決まり、script 読込失敗等で transport が
-/// 最終的に `.disabled` になっても真になり得る（`platform.zig` の `backend.init()` 自体を
-/// スキップする判断と対）。ここで `isEnabled()` を先に見ると、その edge case で
-/// headless 指定なのに実オーディオデバイスを開いてしまう不整合が起きる。
+/// Testing `isHeadlessActive()` before `isEnabled()` is deliberate: headless is decided by the
+/// `VP_HEADLESS=1` that platform settled (`harness.setHeadlessActive`), and can hold even when the transport ends up
+/// `.disabled` because the script failed to load or the like (this pairs with the decision to skip
+/// `backend.init()` itself in `platform.zig`). Consulting `isEnabled()` first would, in that edge case,
+/// open a real audio device despite headless having been asked for.
 pub fn open(allocator: std.mem.Allocator, cfg: Config) Error!AudioDevice {
     if (!harness.isEnabled() and !harness.isHeadlessActive()) {
         const inner = try backend.open(allocator, cfg);
@@ -158,23 +158,23 @@ pub fn open(allocator: std.mem.Allocator, cfg: Config) Error!AudioDevice {
 }
 
 // ============================================================================
-// capture 拡張（マイク入力・TASK-49.1）
+// The capture extension (microphone input)
 //
-// 既存の出力経路（上記 `Error`/`Config`/`EffectiveConfig`/`AudioDevice`/`open`）とは完全に独立の
-// 追加セクション。既存出力 backend（`audio_{macos,linux,windows}.zig`）は本タスクで無変更のまま、
-// capture 側だけ `audio_capture_stub.zig`（全 OS 共通の明示 stub）を経由させる。
-// mic/camera の facade が同じ動詞概念・同じ型 shape（`CaptureError`/`PermissionState`/
-// `EffectiveConfig`）を共有することが control plane 統一の実体（設計文書
-// `docs/plans/capture-foundation-plan.md` 4章）。命名は既存出力 API との衝突を避けるため
-// `Capture` を挟む（`core/camera.zig` は新規ファイルのため bare な動詞名を使う。対比は設計文書
-// 4.1 の表）。
+// A section wholly independent of the existing output path (the `Error`, `Config`, `EffectiveConfig`, `AudioDevice` and `open` above).
+// The existing output backends (`audio_{macos,linux,windows}.zig`) are untouched, and only the
+// capture side goes through `audio_capture_stub.zig` (an explicit stub shared by every OS).
+// That the mic and camera facades share the same verb concepts and the same type shapes (`CaptureError`,
+// `PermissionState`, `EffectiveConfig`) is what the unified control plane actually consists of
+// (see `docs/capture.md`). The naming inserts `Capture` to avoid colliding with the existing output API
+// (`core/camera.zig` is a file of its own and so uses the bare verb names; the comparison is the table in
+// `docs/capture.md`).
 //
-// TASK-49.2/49.3: macOS は AUHAL、Linux は ALSA、Windows は将来実 backend を経由する。
+// macOS goes through AUHAL, Linux through ALSA, and Windows through a future real backend.
 //
-// ホットパス宣言: この拡張自体は「イベント時のみ / 初期化時のみ」（facade 骨格・backend 委譲）。
-// mic capture callback（`CaptureCallback`）は RT（毎サンプル）契約。macOS 実装
-// （`audio_macos.zig` の `inputTrampoline`）は CoreAudio の RT スレッドで呼ばれ、区間内で
-// malloc/lock/IO/panic をしない（詳細は `audio_macos.zig` 冒頭のホットパス宣言）。
+// Hot path declaration: this extension itself runs at event time or initialisation time only (a facade skeleton delegating to a backend).
+// The mic capture callback (`CaptureCallback`) is under the real-time (per-sample) contract. The macOS implementation
+// (`inputTrampoline` in `audio_macos.zig`) is called on CoreAudio's real-time thread and does no
+// malloc, locking, IO or panic within that region (see the hot path declaration at the head of `audio_macos.zig`).
 // ============================================================================
 
 const capture_types = @import("capture_types");
@@ -190,10 +190,10 @@ fn hasRealCaptureBackendOs() bool {
     return builtin.os.tag == .macos or builtin.os.tag == .linux;
 }
 
-// capture_types の型を audio module から直接使えるよう再公開する（camera.zig が DeviceInfo 等を
-// 再公開しているのと対称。外部利用者が `capture_types` を別途 import しなくても
-// `audio.AudioInFrame`/`audio.DeviceInfo`/`audio.PermissionState`/`audio.freeDeviceList` だけで
-// capture API を完結して使えるようにする）。
+// Re-publish the capture_types types so they can be used straight from the audio module (symmetrical with
+// camera.zig re-publishing DeviceInfo and friends). An external consumer can then use the capture API
+// entirely through `audio.AudioInFrame`, `audio.DeviceInfo`, `audio.PermissionState` and `audio.freeDeviceList`
+// without importing `capture_types` separately.
 pub const CaptureError = capture_types.CaptureError;
 pub const DeviceInfo = capture_types.DeviceInfo;
 pub const PermissionState = capture_types.PermissionState;
@@ -204,28 +204,28 @@ pub const CaptureConfig = capture_backend.Config;
 pub const CaptureEffectiveConfig = capture_backend.EffectiveConfig;
 pub const CaptureDevice = capture_backend.CaptureDevice;
 
-/// 接続中のマイクデバイスを列挙する。呼び出し側 `allocator` で確保した `DeviceInfo` の配列を返す
-/// （`id`/`name` も同 allocator。解放は `freeDeviceList()`。契約は設計文書 4.4）。
+/// Enumerates the connected microphone devices. It returns an array of `DeviceInfo` allocated with the caller's `allocator`
+/// (`id` and `name` too; free it with `freeDeviceList()`. The contract is in `docs/capture.md`).
 pub fn enumerateCaptureDevices(allocator: std.mem.Allocator) CaptureError![]DeviceInfo {
-    if (harness.isCaptureSyntheticActive()) return error.Unsupported; // TASK-49.5 でここに synthetic backend 呼び出しを追加
+    if (harness.isCaptureSyntheticActive()) return error.Unsupported; // the synthetic backend call goes here
     return capture_backend.enumerate(allocator);
 }
 
-/// マイク権限を要求し、確定した状態を返す（ブロッキング。詳細は設計文書 6章）。
+/// Requests microphone permission and returns the settled state (blocking; the detail is in `docs/capture.md`).
 pub fn requestCapturePermission() CaptureError!PermissionState {
-    if (harness.isCaptureSyntheticActive()) return error.Unsupported; // TASK-49.5 でここに synthetic backend 呼び出しを追加
+    if (harness.isCaptureSyntheticActive()) return error.Unsupported; // the synthetic backend call goes here
     return capture_backend.requestPermission();
 }
 
-/// マイクを開く。`cfg` の sample_rate/channels はヒント。実効値は `device.config()` で取得する
-/// （`configure()` という独立動詞は置かない。設計文書 4.2）。
+/// Opens the microphone. `cfg`'s sample_rate and channels are hints, and the effective values come from `device.config()`
+/// (there is no separate `configure()` verb; see `docs/capture.md`).
 pub fn openCapture(allocator: std.mem.Allocator, cfg: CaptureConfig) CaptureError!CaptureDevice {
-    if (harness.isCaptureSyntheticActive()) return error.Unsupported; // TASK-49.5 でここに synthetic backend 呼び出しを追加
+    if (harness.isCaptureSyntheticActive()) return error.Unsupported; // the synthetic backend call goes here
     return capture_backend.open(allocator, cfg);
 }
 
 // ============================================================================
-// capture 拡張のテスト
+// tests for the capture extension
 // ============================================================================
 const testing = std.testing;
 
@@ -234,27 +234,27 @@ fn noopCaptureCallback(frame: AudioInFrame, userdata: ?*anyopaque) void {
     _ = userdata;
 }
 
-test "audio capture 拡張: harness 無効時の stub 委譲を確認する（実 backend OS 以外）" {
-    // 実 backend（AUHAL/ALSA）は permission/open が実デバイスに触れるため自動テスト対象外。
-    // backend の compile+link は backend 専用 test（audio_macos_capture_test / audio_linux_capture_test）が
-    // 担保し、config も同 test で検証する。
-    // `comptime` 必須: ランタイム呼び出しにすると Zig が後続 body を dead-code 消去できず、macOS/Linux でも
-    // 実 backend の capture enumerate/open がこの facade test 経由でコンパイルされてしまう（macOS では
-    // audio_macos.zig の capture 経路がその一例で、facade test は stub 委譲確認が目的）。
+test "the audio capture extension: it delegates to the stub while harness is disabled (on an OS with no real backend)" {
+    // A real backend (AUHAL or ALSA) touches a real device in permission and open, so it is out of scope for an automated test.
+    // The backend's compile and link is covered by the backend's own tests (audio_macos_capture_test and audio_linux_capture_test),
+    // which check the config too.
+    // `comptime` is required: making it a runtime call stops Zig dead-code-eliminating the rest of the body, so the real
+    // backend's capture enumerate and open would be compiled through this facade test even on macOS and Linux (the capture
+    // path of audio_macos.zig is one such case, and this facade test only means to check the delegation to the stub).
     if (comptime hasRealCaptureBackendOs()) return error.SkipZigTest;
     try testing.expectError(error.Unsupported, enumerateCaptureDevices(testing.allocator));
     try testing.expectError(error.Unsupported, requestCapturePermission());
     try testing.expectError(error.Unsupported, openCapture(testing.allocator, .{ .capture_callback = noopCaptureCallback }));
 }
 
-test "audio capture 拡張: isCaptureSyntheticActive() は現状常に false（synthetic 分岐は到達しない）" {
+test "the audio capture extension: isCaptureSyntheticActive() is always false for now, so the synthetic branch is unreachable" {
     try testing.expect(!harness.isCaptureSyntheticActive());
 }
 
-test "audio capture 拡張: capture_types を re-export しているので外部利用者は audio.* だけで完結できる" {
-    // capture_types を別途 import せずとも、audio.AudioInFrame / audio.DeviceInfo /
-    // audio.PermissionState / audio.freeDeviceList だけで capture API 一式を組み立てられることを
-    // コンパイル時に固定する（camera.zig の再公開と対称）。
+test "the audio capture extension: capture_types is re-exported, so an external consumer needs only audio.*" {
+    // Pin at compile time that the whole capture API can be assembled from audio.AudioInFrame, audio.DeviceInfo,
+    // audio.PermissionState and audio.freeDeviceList alone, without importing capture_types separately
+    // (symmetrical with camera.zig's re-publication).
     const frame: AudioInFrame = .{ .samples = &.{}, .frames = 0, .channels = 1, .sample_rate = 48000, .timestamp_ns = 0 };
     noopCaptureCallback(frame, null);
 

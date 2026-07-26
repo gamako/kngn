@@ -1,25 +1,25 @@
-//! マイク capture backend の全 OS 共通明示 stub（TASK-49.1）。
+//! The explicit microphone capture backend stub shared by every OS.
 //!
-//! `core/audio.zig`（出力）の capture 拡張が経由する backend。目的・規約は `core/camera_stub.zig`
-//! と同じ（すべての動詞が `error.Unsupported`。黙って劣化させない）。設計文書
-//! `docs/plans/capture-foundation-plan.md` 参照。
+//! The backend the capture extension of `core/audio.zig` (the output side) goes through. Its purpose and rules are
+//! the same as `core/camera_stub.zig`'s: every verb returns `error.Unsupported`, so nothing degrades silently. See
+//! `docs/capture.md`.
 //!
-//! `core/audio.zig` の既存出力 backend（`audio_{macos,linux,windows}.zig`）とは**独立**に、
-//! `core/audio.zig` がこのファイルを直接 import する（出力 backend ファイルは本タスクで無変更）。
-//! TASK-49.2〜.4 がこのファイルの import を `builtin.os.tag` 分岐へ置き換える。
+//! **Independently** of the existing output backends of `core/audio.zig` (`audio_{macos,linux,windows}.zig`),
+//! `core/audio.zig` imports this file directly.
+//! A real backend replaces this import with a `builtin.os.tag` branch.
 //!
-//! ホットパス宣言: 初期化時のみ（全関数が即 `error.Unsupported`/固定値を返すだけ。ループ無し）。
-//! `CaptureCallback` は将来（TASK-49.2〜.4）capture スレッドの RT 区間で呼ばれる契約
-//! （malloc/lock/IO/panic 禁止。既存出力 `RenderCallback` と同一の RT 契約）。
+//! Hot path declaration: initialisation time only (every function merely returns `error.Unsupported` or a fixed value; there is no loop).
+//! `CaptureCallback` is contracted to be called in the real-time region of a capture thread
+//! (no malloc, locking, IO or panic — the same real-time contract as the existing output `RenderCallback`).
 
 const std = @import("std");
 const types = @import("capture_types");
 
-/// mic capture callback に渡される `AudioInFrame` を受け取る関数ポインタ型。
-/// RT スレッド（capture スレッド）で呼ばれる。**malloc / lock / IO / panic をしてはならない**。
+/// The function pointer type receiving the `AudioInFrame` handed to a mic capture callback.
+/// It is called on a real-time thread (the capture thread). **It must not malloc, lock, do IO or panic.**
 pub const CaptureCallback = *const fn (frame: types.AudioInFrame, userdata: ?*anyopaque) void;
 
-/// 要求設定（あくまでヒント。stub は常に失敗するため実際には使われない）。
+/// The requested settings (hints only; the stub always fails, so they are never actually used).
 pub const Config = struct {
     device_id: ?[]const u8 = null,
     sample_rate: u32 = 48000,
@@ -28,20 +28,20 @@ pub const Config = struct {
     userdata: ?*anyopaque = null,
 };
 
-/// `open()` が返す実効値（stub には到達しないため型のみ確定させる）。
+/// The effective values `open()` returns (unreachable in the stub, so only the type is settled).
 pub const EffectiveConfig = struct {
     sample_rate: u32,
     channels: u32,
     max_frames_per_slice: u32,
 };
 
-/// stub は実体を持たない（`open` が常に失敗するため構築されない）。
+/// The stub holds no instance (it is never constructed, `open` always failing).
 pub const CaptureDevice = struct {
     _unused: u0 = 0,
 
     pub fn config(self: CaptureDevice) EffectiveConfig {
         _ = self;
-        unreachable; // open が常に失敗するため到達しない
+        unreachable; // unreachable, open always failing
     }
 
     pub fn start(self: CaptureDevice) types.CaptureError!void {
@@ -58,18 +58,18 @@ pub const CaptureDevice = struct {
     }
 };
 
-/// マイクを列挙する。未実装 backend のため `error.Unsupported`。
+/// Enumerates microphones. This backend is not implemented, so `error.Unsupported`.
 pub fn enumerate(allocator: std.mem.Allocator) types.CaptureError![]types.DeviceInfo {
     _ = allocator;
     return error.Unsupported;
 }
 
-/// マイク権限を要求する。未実装 backend のため `error.Unsupported`。
+/// Requests microphone permission. This backend is not implemented, so `error.Unsupported`.
 pub fn requestPermission() types.CaptureError!types.PermissionState {
     return error.Unsupported;
 }
 
-/// マイクを開く。未実装 backend のため常に `error.Unsupported`。
+/// Opens a microphone. This backend is not implemented, so always `error.Unsupported`.
 pub fn open(allocator: std.mem.Allocator, cfg: Config) types.CaptureError!CaptureDevice {
     _ = allocator;
     _ = cfg;
@@ -86,7 +86,7 @@ fn noopCallback(frame: types.AudioInFrame, userdata: ?*anyopaque) void {
     _ = userdata;
 }
 
-test "audio_capture_stub: enumerate/requestPermission/open は全て error.Unsupported" {
+test "audio_capture_stub: enumerate, requestPermission and open all give error.Unsupported" {
     try testing.expectError(error.Unsupported, enumerate(testing.allocator));
     try testing.expectError(error.Unsupported, requestPermission());
     try testing.expectError(error.Unsupported, open(testing.allocator, .{ .capture_callback = noopCallback }));
