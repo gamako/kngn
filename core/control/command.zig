@@ -1,56 +1,56 @@
-//! Co-pilot（人間+AI 混在操作）の意味的コマンド実行モデル（TASK-62.5.1）。
+//! The semantic command execution model for co-piloting (a human and an AI operating together).
 //!
-//! `CommandExecutor` が `Dispatcher`（既存 action callback 相当）の手前に立ち、
-//! 誰が（`ActorId`）・何を（action name/args）・どの macro 単位で（`Transaction`）実行したかを
-//! `CommandLog`（固定リング）へ記録し、その記録から undo/redo を導出する。
-//! `CommandLog` を持たない構成（`Executor.log = null`）は **no-op recorder**（記録せず dispatch のみ通す）。
+//! `CommandExecutor` stands in front of `Dispatcher` (the equivalent of the existing action callback) and
+//! records who (`ActorId`), what (the action name and args) and within which macro unit (`Transaction`) something
+//! ran into a `CommandLog` (a fixed ring), then derives undo and redo from those records.
+//! A configuration with no `CommandLog` (`Executor.log = null`) is a **no-op recorder** (it records nothing and only passes the dispatch through).
 //!
-//! ## ホットパス宣言
-//! command 記録・transaction 管理・undo/redo 探索は**すべてイベント時のみ**（ユーザー/agent の操作時・
-//! undo/redo 要求時）に走る。フレーム毎（全画素）/ RT（毎サンプル）経路には一切乗らない。
-//! よって性能規約の SIMD 3点セット・cache_line 分離・bench 前後比較は対象外。
-//! 実行は main thread 限定（harness action/UI と同じ規約）で、本モジュールは lock/atomic を持たない。
+//! ## Hot path declaration
+//! Recording a command, managing a transaction and searching for an undo or a redo all run **at event time only** (when a
+//! user or an agent operates, or asks for undo or redo). None of it sits on a per-frame (all-pixel) or real-time (per-sample) path,
+//! so the performance rules' SIMD trio, cache line separation and before-and-after benchmarks do not apply.
+//! Execution is main-thread only (the same rule as harness actions and the UI), and this module holds no lock and no atomic.
 //!
-//! ## 依存
-//! `@import` は `std` のみ。platform / harness に非依存でグローバル状態も持たない
-//! （すべて呼び出し側がインスタンス化する struct）。
+//! ## Dependencies
+//! `@import` is `std` alone. It depends on neither platform nor harness, and holds no global state
+//! (everything is a struct the caller instantiates).
 //!
-//! ## 用語（親 TASK-62.5 plan v1.1 §3/§4/§5 が意味論の正）
-//! - `ActorId`: 誰が実行したか（local_user/local_agent/peer/system）。
-//! - `CommandRecord`: 実行済み command 1 件の記録（kind=normal/revert）。
-//! - `Transaction`: 複数 command を 1 undo 単位に束ねる macro 境界。
-//! - `UndoRef`: app 内部の逆適用データへの opaque handle。framework は中身非解釈。
+//! ## Terms
+//! - `ActorId`: who ran it (local_user, local_agent, peer, system).
+//! - `CommandRecord`: the record of one executed command (kind=normal or revert).
+//! - `Transaction`: the macro boundary bundling several commands into a single undo unit.
+//! - `UndoRef`: an opaque handle on the application's internal inverse-apply data. The framework does not interpret its contents.
 
 const std = @import("std");
 const command_types = @import("command_types");
 
-/// action name の inline 所有バイト数上限（既存 action 名は最長 20B 弱。余裕を含む）。
+/// The limit on the bytes owned inline for an action name (existing action names run to just under 20B, so there is room to spare).
 pub const MAX_CMD_NAME = 64;
-/// adapter.summarize / 履歴表示文言の上限（**bytes**。UTF-8 境界で切り詰め。TASK-62.5.5）。
+/// The limit on adapter.summarize and on the history display text (in **bytes**, truncated at a UTF-8 boundary).
 pub const MAX_SUMMARY = 64;
-/// args の inline 所有バイト数上限（UI/agent stroke の点列格納。62.3 wire の
-/// `MAX_ACTION_FRAME_BYTES` 目安 4096B と同値。TASK-62.5.3 で 1024→4096。
-/// 応答バッファの `DIGEST_BUF_LEN`=1024 とは無関係）。
+/// The limit on the bytes owned inline for args (it holds the point sequence of a UI or agent stroke). The same value as
+/// the wire's `MAX_ACTION_FRAME_BYTES` guide of 4096B, and
+/// unrelated to the response buffer's `DIGEST_BUF_LEN`=1024.
 pub const MAX_CMD_ARGS = 4096;
-/// `CommandLog` の固定リング容量（62.3 plan v6 の undo 保持数 max_history=128 と整合）。
+/// The fixed ring capacity of `CommandLog` (consistent with the netsync side's undo retention of max_history=128).
 pub const MAX_CMD_LOG = 128;
-/// 追跡できる actor（redo_epoch 表）の上限（netsync peer 規模と同水準）。
+/// The limit on trackable actors (the redo_epoch table), on the same scale as the netsync peer count.
 pub const MAX_ACTORS = 16;
-/// 同時に open できる transaction の上限（実用は actor あたり 1）。
+/// The limit on simultaneously open transactions (in practice one per actor).
 pub const MAX_OPEN_TX = 4;
-/// 1 transaction の undo/redo で扱える undoable command 数の上限（スナップショット配列の固定長）。
+/// The limit on undoable commands a single transaction's undo or redo can handle (the fixed length of the snapshot array).
 pub const MAX_TX_UNDO = 32;
-/// transaction label の inline 所有バイト数上限。
+/// The limit on the bytes owned inline for a transaction label.
 pub const MAX_TX_LABEL = 64;
 
-/// 操作の実行主体。undo/redo 探索・actor 表・transaction 照合の一致判定に使う。
+/// Who performs an operation. Used as the match test for undo and redo searches, the actor table and transaction checks.
 pub const ActorId = union(enum) {
     local_user,
     local_agent,
     peer: u32,
     system,
 
-    /// peer は id まで比較する完全一致判定（hash/modulo は使わない）。
+    /// A peer is compared right down to its id, an exact match (no hash, no modulo).
     pub fn eql(a: ActorId, b: ActorId) bool {
         if (std.meta.activeTag(a) != std.meta.activeTag(b)) return false;
         return switch (a) {
@@ -62,10 +62,10 @@ pub const ActorId = union(enum) {
 
 pub const CommandKind = enum { normal, revert };
 
-/// app 内部の逆適用データ（例: pixie `UndoStack.Op`）への opaque handle。framework は中身非解釈。
+/// An opaque handle on the application's internal inverse-apply data (pixie's `UndoStack.Op`, say). The framework does not interpret its contents.
 pub const UndoRef = u64;
 
-/// 実行済み command 1 件の記録。undo/redo 探索・履歴表示の正。
+/// The record of one executed command. The authority for undo and redo searches and for the history display.
 pub const CommandRecord = struct {
     seq: u64,
     actor: ActorId,
@@ -76,20 +76,20 @@ pub const CommandRecord = struct {
     args_buf: [MAX_CMD_ARGS]u8 = undefined,
     transaction_id: ?u64,
     undoable: bool,
-    /// normal command 側の状態（undo 済みか）。
+    /// The state on the normal command side (whether it has been undone).
     reverted: bool = false,
-    /// revert command 側の状態（redo で再適用済みか）。
+    /// The state on the revert command side (whether a redo has reapplied it).
     redo_consumed: bool = false,
-    /// kind=revert の対象 normal command の seq。
+    /// The seq of the normal command a kind=revert record targets.
     target_seq: ?u64 = null,
-    /// redo で再適用された normal command が参照する旧 target。epoch bump 除外の根拠。
+    /// The old target referred to by a normal command that a redo reapplied. The grounds for skipping an epoch bump.
     redo_of: ?u64 = null,
     undo_ref: ?UndoRef = null,
-    /// kind=revert のみ有効: 作成時点の actor redo_epoch を焼き込む。
+    /// Valid for kind=revert only: burns in the actor's redo_epoch as of creation.
     epoch: u64 = 0,
-    /// transaction 所属時のみ有効（0 = 非所属/非対象）: normal 側は tx 内 undoable member の
-    /// 1-based 序数、revert 側は revert bundle 内の 1-based 序数。undo/redo の完全性判定
-    /// （序数 1 の member が現存すること）に使う。
+    /// Valid only while it belongs to a transaction (0 = does not belong, or does not apply): on the normal side it is the
+    /// 1-based ordinal among that transaction's undoable members, and on the revert side the 1-based ordinal within the
+    /// revert bundle. Used to decide whether an undo or a redo is complete (that the member with ordinal 1 still exists).
     tx_member_index: u16 = 0,
 
     pub fn name(self: *const CommandRecord) []const u8 {
@@ -111,14 +111,14 @@ pub const CommandRecord = struct {
     }
 };
 
-/// `CommandRecord` の固定リング + 単調 `next_seq`。alloc なし。
+/// A fixed ring of `CommandRecord` plus a monotonic `next_seq`. No allocation.
 pub const CommandLog = struct {
     records: [MAX_CMD_LOG]CommandRecord = undefined,
-    /// 現在有効な record 数（上限 `MAX_CMD_LOG` に達したら以後は一定）。
+    /// How many records are currently valid (constant once it reaches the `MAX_CMD_LOG` limit).
     filled: u32 = 0,
-    /// 次に書き込むリング位置。
+    /// The ring position written to next.
     head: u32 = 0,
-    /// 次に発番する local seq。
+    /// The local seq issued next.
     next_seq: u64 = 1,
 
     pub fn append(self: *CommandLog, rec: CommandRecord) void {
@@ -127,20 +127,20 @@ pub const CommandLog = struct {
         if (self.filled < MAX_CMD_LOG) self.filled += 1;
     }
 
-    /// i: 0 = 最古 … `filled - 1` = 最新。読み取り専用（履歴 panel / probe 用。TASK-62.5.5）。
-    /// 範囲外は caller 責任（`i < filled`）。
+    /// i: 0 = the oldest … `filled - 1` = the newest. Read only (for the history panel and for probes).
+    /// Out of range is the caller's responsibility (`i < filled`).
     pub fn recordAt(self: *const CommandLog, i: u32) *const CommandRecord {
         const idx = (self.head + MAX_CMD_LOG - self.filled + i) % MAX_CMD_LOG;
         return &self.records[idx];
     }
 
-    /// 内部用（reverted マーク等）。`recordAt` と同位置の可変参照。
+    /// For internal use (marking reverted and so on). A mutable reference to the same position as `recordAt`.
     fn recordAtMut(self: *CommandLog, i: u32) *CommandRecord {
         const idx = (self.head + MAX_CMD_LOG - self.filled + i) % MAX_CMD_LOG;
         return &self.records[idx];
     }
 
-    /// 溢れて消えた record は「見つからない」だけ（サイドデータなし。stale 参照が構造的に無い）。
+    /// A record lost to overflow is simply "not found" (there is no side data, so a stale reference cannot arise by construction).
     pub fn findBySeq(self: *CommandLog, seq: u64) ?*CommandRecord {
         var i: u32 = 0;
         while (i < self.filled) : (i += 1) {
@@ -150,17 +150,17 @@ pub const CommandLog = struct {
         return null;
     }
 
-    /// 最新（直近に append された）record。空なら null（history probe 等の観測用。TASK-62.5.3）。
+    /// The newest (most recently appended) record, or null when empty (for observation by the history probe and friends).
     pub fn latest(self: *CommandLog) ?*CommandRecord {
         if (self.filled == 0) return null;
         return self.recordAtMut(self.filled - 1);
     }
 };
 
-/// redo 由来の command を記録する際に発行元が渡す付随メタ（epoch 誤 bump 防止。§5.2）。
+/// The metadata an issuer passes alongside a command that came from a redo, which stops the epoch from being bumped wrongly.
 pub const PendingMeta = struct { redo_of: ?u64 };
 
-/// executeAction の出所。`remote_commit` は netsync COMMIT 適用専用（router 再経由なし）。
+/// Where an executeAction came from. `remote_commit` is only for applying a netsync COMMIT (it does not pass through the router again).
 pub const ExecuteSource = union(enum) {
     local,
     remote_commit: struct { seq: u64, pending_local_meta: ?PendingMeta = null },
@@ -177,27 +177,27 @@ pub const ExecuteOptions = struct {
 
 pub const ExecuteResult = struct { seq: ?u64, output: []const u8 };
 
-/// open transaction の slot 参照。generation 不一致は stale handle（slot 再利用後の古い参照）として弾く。
+/// A slot reference for an open transaction. A generation mismatch is rejected as a stale handle (an old reference to a reused slot).
 pub const TransactionHandle = struct { index: u8, generation: u32 };
 
-/// 既存 action callback 相当。名前解決済みの action を実行する薄い委譲口。
+/// The equivalent of the existing action callback: a thin delegation point that runs an already name-resolved action.
 pub const Dispatcher = struct {
     ctx: *anyopaque,
     run: *const fn (ctx: *anyopaque, name: []const u8, args: []const u8, buf: []u8) anyerror![]const u8,
 };
 
-/// app 側の undo 逆適用アダプタ。
+/// The application's adapter for inverse-applying an undo.
 pub const CommandAdapter = struct {
     ctx: *anyopaque,
-    /// UndoRef が現存し逆適用可能かを確認する。
+    /// Confirms that the UndoRef still exists and can be inverse-applied.
     canUndo: *const fn (ctx: *anyopaque, rec: *const CommandRecord) bool,
-    /// 逆適用する。**失敗しない契約**: `canUndo==true` なら必ず成功する
-    /// （逆適用が失敗しうる app は `canUndo` 側で false を返す責務を負う。
-    /// これにより transaction の all-or-nothing が事前検証だけで成立する）。
+    /// Inverse-applies it. **A contract that cannot fail**: when `canUndo==true` this always succeeds
+    /// (an application whose inverse apply can fail takes on the duty of returning false from `canUndo`.
+    /// That is what makes a transaction's all-or-nothing hold on pre-validation alone).
     applyUndo: *const fn (ctx: *anyopaque, rec: *const CommandRecord) void,
-    /// record の短い表示文言を `buf`（呼び出し側が `MAX_SUMMARY` 以上）に書き、書いた slice を返す。
-    /// 失敗しない（不明なら name を写す）。alloc/副作用なし。戻りは ASCII 印刷可能（0x20..0x7E）に
-    /// 正規化済みであること。executor は呼ばない（履歴 UI / probe 用。TASK-62.5.5）。
+    /// Writes the record's short display text into `buf` (the caller provides at least `MAX_SUMMARY`) and returns the written slice.
+    /// It cannot fail (it copies the name when it knows no better). No allocation, no side effects. The return value must be
+    /// normalised to printable ASCII (0x20..0x7E). The executor never calls it (it is for the history UI and for probes).
     summarize: *const fn (ctx: *anyopaque, rec: *const CommandRecord, buf: []u8) []const u8,
 };
 
@@ -230,12 +230,12 @@ const TxSlot = struct {
     generation: u32 = 0,
     label_len: u8 = 0,
     label_buf: [MAX_TX_LABEL]u8 = undefined,
-    /// tx 内で undoable な normal command が append されるたびに増える。`tx_member_index` の発番源。
+    /// Increments each time an undoable normal command is appended within the transaction. The source of `tx_member_index`.
     undoable_member_count: u16 = 0,
 };
 
-/// tx（transaction 側 or revert bundle 側）の member を一時的に退避するスナップショット。
-/// undo/redo 中にリングが上書きされても安全に扱えるよう、対象を確定した時点で値コピーする。
+/// A snapshot that stashes a transaction's members (either the transaction side or the revert bundle side).
+/// The records are copied by value once the targets are settled, so overwriting the ring during an undo or a redo stays safe.
 const TxSnapshot = struct {
     items: [MAX_TX_UNDO]CommandRecord = undefined,
     count: u16 = 0,
@@ -247,7 +247,7 @@ fn writeMsg(buf: []u8, msg: []const u8) []const u8 {
     return buf[0..n];
 }
 
-/// AppendSpec: `executeAction` の記録 / undo の revert 記録 / redo の新規記録が共有する append 経路。
+/// AppendSpec: the append path shared by `executeAction`'s record, an undo's revert record and a redo's new record.
 const AppendSpec = struct {
     actor: ActorId,
     kind: CommandKind,
@@ -262,8 +262,8 @@ const AppendSpec = struct {
     source: ExecuteSource = .local,
 };
 
-/// 人間/agent 混在操作の意味的コマンド実行器。record 対象の `CommandLog` を持たなければ
-/// no-op recorder（記録せず dispatch のみ通す）として振る舞う。
+/// The semantic command executor for a human and an agent operating together. Without a `CommandLog` to record into it
+/// behaves as a no-op recorder (recording nothing and only passing the dispatch through).
 pub const Executor = struct {
     log: ?*CommandLog = null,
     dispatcher: Dispatcher,
@@ -273,18 +273,18 @@ pub const Executor = struct {
     actor_count: u32 = 0,
 
     tx_table: [MAX_OPEN_TX]TxSlot = undefined,
-    /// begin / undo の revert bundle / redo の新 bundle ごとに単調一意な id を発行する。
-    /// 閉じた transaction の id は再利用しない。u64 枯渇は実用上到達不能だが、到達時は
-    /// fail-stop でなく新規 transaction を reject する（`allocTransactionId`）。
+    /// Issues a monotonically unique id for each begin, each revert bundle of an undo, and each new bundle of a redo.
+    /// A closed transaction's id is never reused. Exhausting u64 is unreachable in practice, but on reaching it the
+    /// behaviour is to reject a new transaction rather than to fail-stop (`allocTransactionId`).
     next_transaction_id: u64 = 1,
 
-    /// dispatcher.run 実行区間を示す（reentrant executeAction/redo を拒否するためのフラグ）。
+    /// Marks the dispatcher.run interval (the flag by which a reentrant executeAction or redo is rejected).
     in_dispatch: bool = false,
     pending_undo_ref: ?UndoRef = null,
     pending_set: bool = false,
 
-    /// netsync session 中は true。source=.local の record を no_record に落とす（wire seq 衝突防止。TASK-62.3.5）。
-    /// **main thread のみ**設定（netsync gate open / shutdown / fail-soft）。
+    /// True during a netsync session. It drops a source=.local record to no_record, which stops a wire seq collision.
+    /// Set from the **main thread only** (the netsync gate opening, shutdown, fail-soft).
     wire_session: bool = false,
 
     pub fn init(dispatcher: Dispatcher) Executor {
@@ -297,16 +297,16 @@ pub const Executor = struct {
         self.wire_session = on;
     }
 
-    /// dispatch callback 実行中に app が呼ぶ。**dispatch 開始時に pending を clear、正常復帰時のみ
-    /// consume、dispatch エラー時は discard**（`runDispatchCapturingUndo` が管理）。
-    /// 同一 dispatch 内の 2 回目以降の呼び出しは first-wins（警告して無視）。
+    /// Called by the application while the dispatch callback runs. **pending is cleared at the start of a dispatch, consumed
+    /// only on a normal return, and discarded on a dispatch error** (`runDispatchCapturingUndo` manages it).
+    /// A second or later call within the same dispatch is first-wins (warned about and ignored).
     pub fn noteUndo(self: *Executor, ref: UndoRef) void {
         if (!self.in_dispatch) {
-            std.debug.print("[command] noteUndo: dispatch 区間外の呼び出しは無視されます\n", .{});
+            std.debug.print("[command] noteUndo: a call from outside a dispatch interval is ignored\n", .{});
             return;
         }
         if (self.pending_set) {
-            std.debug.print("[command] noteUndo: 同一 dispatch 内の2回目以降の呼び出しは無視されます(first-wins)\n", .{});
+            std.debug.print("[command] noteUndo: a second or later call within the same dispatch is ignored (first-wins)\n", .{});
             return;
         }
         self.pending_undo_ref = ref;
@@ -314,7 +314,7 @@ pub const Executor = struct {
     }
 
     // ------------------------------------------------------------------
-    // actor 表（redo_epoch）
+    // the actor table (redo_epoch)
     // ------------------------------------------------------------------
 
     fn findActorSlot(self: *Executor, actor: ActorId) ?*ActorEpochSlot {
@@ -342,11 +342,11 @@ pub const Executor = struct {
         return if (self.findActorSlot(actor)) |s| s.epoch else 0;
     }
 
-    /// 記録なしで actor の redo_epoch を +1 する（TASK-62.5.4 §2b）。app が「CommandLog に
-    /// 載らない undoable 編集」（段階移行中の未記録 UI 操作）を検出した時に呼び、その actor の
-    /// 未消費 redo 候補を失効させる（通常の失効は undoable normal command の記録時に自動で
-    /// 起きる。これはその記録外変種）。actor 表が満杯で未登録の場合は no-op（記録も undo 候補も
-    /// 無い actor に失効させる redo は存在しない）。
+    /// Increments an actor's redo_epoch by one without recording anything. An application calls it on detecting an
+    /// "undoable edit that never reaches the CommandLog" (an unrecorded UI operation during a staged migration), which
+    /// expires that actor's unconsumed redo candidates (the usual expiry happens automatically when an undoable normal
+    /// command is recorded; this is the variant outside that recording). When the actor table is full and the actor is
+    /// unregistered this is a no-op (an actor with no records and no undo candidates has no redo to expire).
     pub fn bumpEpoch(self: *Executor, actor: ActorId) void {
         const slot = self.ensureActor(actor) catch return;
         slot.epoch += 1;
@@ -371,7 +371,7 @@ pub const Executor = struct {
         return false;
     }
 
-    /// transaction id の発番。u64 枯渇時は null（fail-stop でなく新規 transaction を reject する）。
+    /// Issues a transaction id, or null once u64 is exhausted (rejecting a new transaction rather than fail-stopping).
     fn allocTransactionId(self: *Executor) ?u64 {
         if (self.next_transaction_id == std.math.maxInt(u64)) return null;
         const id = self.next_transaction_id;
@@ -408,8 +408,8 @@ pub const Executor = struct {
         slot.generation += 1;
     }
 
-    /// 以後のタグ付けを止めるのみ。実行済み command の巻き戻しは framework の責務外
-    /// （必要なら app が undo を呼ぶ）。
+    /// This only stops the tagging from here on. Rewinding already executed commands is not the framework's responsibility
+    /// (the application calls undo if it needs to).
     pub fn cancelTransaction(self: *Executor, handle: TransactionHandle, actor: ActorId) TransactionError!void {
         try self.checkTransactionHandle(handle, actor);
         const slot = &self.tx_table[handle.index];
@@ -418,7 +418,7 @@ pub const Executor = struct {
     }
 
     // ------------------------------------------------------------------
-    // append（executeAction の記録 / undo の revert 記録 / redo の新規記録が共有）
+    // append (shared by executeAction's record, an undo's revert record and a redo's new record)
     // ------------------------------------------------------------------
 
     fn appendRecord(self: *Executor, spec: AppendSpec) !u64 {
@@ -452,7 +452,7 @@ pub const Executor = struct {
         rec.setArgs(spec.args);
 
         const slot = try self.ensureActor(spec.actor);
-        // epoch を進めるのは「redo 由来でない新規 undoable normal command」の記録のみ（§5.3）。
+        // Only the record of "a new undoable normal command that did not come from a redo" advances the epoch.
         if (spec.kind == .normal and spec.undoable and spec.redo_of == null) {
             slot.epoch += 1;
         }
@@ -463,7 +463,7 @@ pub const Executor = struct {
     }
 
     // ------------------------------------------------------------------
-    // dispatch（in_dispatch 管理 + noteUndo の scoped pending）
+    // dispatch (managing in_dispatch, plus noteUndo's scoped pending)
     // ------------------------------------------------------------------
 
     const DispatchResult = struct { output: []const u8, undo_ref: ?UndoRef };
@@ -487,7 +487,7 @@ pub const Executor = struct {
     }
 
     // ------------------------------------------------------------------
-    // preflight（dispatch 前に一括検証。record_policy と log の有無によらず同一の入力制約を適用）
+    // preflight (validated in one go before the dispatch; the same input constraints apply regardless of record_policy or of whether there is a log)
     // ------------------------------------------------------------------
 
     fn preflight(self: *Executor, name: []const u8, args: []const u8, opts: ExecuteOptions) !void {
@@ -499,7 +499,7 @@ pub const Executor = struct {
         switch (opts.source) {
             .local => {},
             .remote_commit => |rc| {
-                // log が無い（no-op recorder）場合は比較対象の next_seq が無いため検査自体が成立しない。
+                // With no log (a no-op recorder) there is no next_seq to compare against, so the check cannot be made at all.
                 if (self.log) |log| {
                     if (rc.seq < log.next_seq) return error.StaleRemoteSeq;
                 }
@@ -520,7 +520,7 @@ pub const Executor = struct {
 
         const dr = try self.runDispatchCapturingUndo(name, args, buf);
 
-        // netsync session 中の local 記録は抑止（wire seq と衝突させない。TASK-62.3.5 A-2）。
+        // A local record during a netsync session is suppressed, so that it cannot collide with a wire seq.
         const effective_policy: RecordPolicy = blk: {
             if (opts.record_policy == .no_record) break :blk .no_record;
             if (self.wire_session and opts.source == .local) break :blk .no_record;
@@ -563,9 +563,9 @@ pub const Executor = struct {
         return .{ .seq = seq, .output = dr.output };
     }
 
-    /// その actor の open 中 transaction の handle を返す（MVP は actor あたり 1 個前提で
-    /// 最初の一致。無ければ null）。app の action wrapper が「copilot の begin_tx で開いた tx」へ
-    /// 自動参加するために使う（TASK-62.5.3）。
+    /// Returns the handle of that actor's open transaction (the MVP assumes one per actor and takes the first
+    /// match; null when there is none). An application's action wrapper uses it to join "the transaction copilot
+    /// opened with begin_tx" automatically.
     pub fn openTransactionFor(self: *Executor, actor: ActorId) ?TransactionHandle {
         for (self.tx_table, 0..) |slot, i| {
             if (slot.open and slot.actor.eql(actor)) {
@@ -575,17 +575,17 @@ pub const Executor = struct {
         return null;
     }
 
-    /// **既に実行済みの操作を dispatch せずに記録する**（UI 操作の記録用。TASK-62.5.3）。
-    /// preflight は `executeAction` と同一・epoch bump 規則も同一（`appendRecord` 共有）。
-    /// undoable = `undo_ref != null`。`record_policy` は `.record` のみ許容（それ以外は
-    /// `error.InvalidRecordPolicy`）。戻り値は記録された seq（log 無し = no-op recorder は null）。
-    /// redo（62.5.4）はこの record を通常どおり dispatcher で再実行する。
+    /// **Records an already performed operation without dispatching it** (for recording a UI operation).
+    /// preflight is identical to `executeAction`'s, and so is the epoch bump rule (they share `appendRecord`).
+    /// undoable = `undo_ref != null`. `record_policy` accepts `.record` only (anything else gives
+    /// `error.InvalidRecordPolicy`). The return value is the recorded seq (null for a no-op recorder with no log).
+    /// A redo re-runs this record through the dispatcher as usual.
     pub fn recordExecuted(self: *Executor, name: []const u8, args: []const u8, opts: ExecuteOptions, undo_ref: ?UndoRef, buf: []u8) anyerror!?u64 {
-        _ = buf; // executeAction と対称のシグネチャ（dispatch しないため現状未使用）
+        _ = buf; // a signature symmetrical with executeAction's (unused for now, since nothing is dispatched)
         if (opts.record_policy != .record) return error.InvalidRecordPolicy;
         try self.preflight(name, args, opts);
         if (self.log == null) return null;
-        // netsync session 中の local 記録は抑止（UI stroke 等。TASK-62.3.5 A-2）。
+        // A local record during a netsync session is suppressed (a UI stroke, say).
         if (self.wire_session and opts.source == .local) return null;
 
         var transaction_id: ?u64 = null;
@@ -622,8 +622,8 @@ pub const Executor = struct {
     // undo
     // ------------------------------------------------------------------
 
-    /// tx（または revert bundle）の member を集める。序数1が現存しない・上限超過なら null
-    /// （候補外として skip する。§6 のリング溢れ安全策）。
+    /// Collects a transaction's (or a revert bundle's) members. Returns null when ordinal 1 no longer exists, or the limit is exceeded
+    /// (skipping it as a non-candidate; this is the safeguard against a ring overflow).
     fn collectMembers(log: *CommandLog, tx_id: u64, kind: CommandKind) ?TxSnapshot {
         var out: TxSnapshot = .{};
         var has_index1 = false;
@@ -667,14 +667,14 @@ pub const Executor = struct {
                 .tx_member_index = member_index,
                 .source = .local,
             });
-            // append 後に seq で再解決してからマークする（`*CommandRecord` を append 跨ぎで保持しない）。
+            // Mark it only after re-resolving by seq following the append (a `*CommandRecord` is never held across an append).
             if (log.findBySeq(m.seq)) |live| live.reverted = true;
         }
         return .{ .happened = true, .message = writeMsg(buf, "undo ok") };
     }
 
-    /// 後方走査で単発 undo 候補 seq を返す（tx member 除外。netsync `.undo_own` 用。TASK-62.3.5）。
-    /// 条件: actor 一致・kind=normal・undoable・!reverted・transaction_id==null・canUndo。
+    /// Returns the seq of a single-command undo candidate by scanning backwards (transaction members excluded; for netsync's `.undo_own`).
+    /// The conditions: a matching actor, kind=normal, undoable, !reverted, transaction_id==null, and canUndo.
     pub fn findUndoCandidate(self: *Executor, actor: ActorId) ?u64 {
         if (actor.eql(.system)) return null;
         const log = self.log orelse return null;
@@ -688,16 +688,16 @@ pub const Executor = struct {
             if (rec.kind != .normal) continue;
             if (!rec.undoable) continue;
             if (rec.reverted) continue;
-            if (rec.transaction_id != null) continue; // wire/netsync は単発のみ
+            if (rec.transaction_id != null) continue; // wire and netsync handle single commands only
             if (!adapter.canUndo(adapter.ctx, rec)) continue;
             return rec.seq;
         }
         return null;
     }
 
-    /// wire COMMIT_REVERT 適用（TASK-62.3.5）。target を逆適用し reverted 固定 + revert record を
-    /// `source=.remote_commit{seq=new_seq}` で append。actor は target の actor を継承。
-    /// revert record は solo undoOne と同様に transaction_id 付き 1-member bundle（redoOne 探索互換）。
+    /// Applies a wire COMMIT_REVERT. It inverse-applies the target, fixes reverted, and appends a revert record with
+    /// `source=.remote_commit{seq=new_seq}`. The actor is inherited from the target's actor.
+    /// As with a solo undoOne, the revert record is a 1-member bundle carrying a transaction_id (compatible with redoOne's search).
     pub fn applyWireRevert(self: *Executor, target_seq: u64, new_seq: u64) !void {
         const log = self.log orelse return error.NoLog;
         const adapter = self.adapter orelse return error.NoAdapter;
@@ -728,8 +728,8 @@ pub const Executor = struct {
         });
     }
 
-    /// 後方走査で「actor 一致・kind=normal・undoable・!reverted・canUndo=true」の最新候補を探し、
-    /// 逆適用 + revert record 群を append する。`.system` actor は常に候補なし。
+    /// Scans backwards for the newest candidate matching "a matching actor, kind=normal, undoable, !reverted, canUndo=true",
+    /// then inverse-applies it and appends the revert records. The `.system` actor never has a candidate.
     pub fn undoOne(self: *Executor, actor: ActorId, buf: []u8) anyerror!UndoOutcome {
         if (actor.eql(.system)) return .{ .happened = false, .message = writeMsg(buf, "no candidate: system actor") };
         const log = self.log orelse return .{ .happened = false, .message = writeMsg(buf, "no candidate: no log") };
@@ -745,8 +745,8 @@ pub const Executor = struct {
             if (rec.reverted) continue;
 
             if (rec.transaction_id) |tx_id| {
-                if (self.isTransactionOpen(tx_id)) continue; // open 中の tx の member は候補外
-                const snap = collectMembers(log, tx_id, .normal) orelse continue; // 不完全/上限超過な tx は skip
+                if (self.isTransactionOpen(tx_id)) continue; // a member of an open transaction is not a candidate
+                const snap = collectMembers(log, tx_id, .normal) orelse continue; // an incomplete transaction, or one over the limit, is skipped
 
                 var all_ok = true;
                 for (snap.items[0..snap.count]) |m| {
@@ -755,11 +755,11 @@ pub const Executor = struct {
                         break;
                     }
                 }
-                if (!all_ok) continue; // all-or-nothing: 1件でも不可なら tx ごと skip
+                if (!all_ok) continue; // all-or-nothing: if even one is impossible, skip the whole transaction
 
                 return try self.performUndoBundle(log, adapter, actor, snap.items[0..snap.count], buf);
             } else {
-                // 単発: findUndoCandidate と同じ述語（canUndo）。挙動不変のためここでも直接判定。
+                // A single command: the same predicate as findUndoCandidate (canUndo). Decided directly here too, to keep the behaviour identical.
                 if (!adapter.canUndo(adapter.ctx, rec)) continue;
                 const single = [1]CommandRecord{rec.*};
                 return try self.performUndoBundle(log, adapter, actor, single[0..1], buf);
@@ -785,7 +785,7 @@ pub const Executor = struct {
     }
 
     fn performRedoBundle(self: *Executor, log: *CommandLog, actor: ActorId, members_in: []CommandRecord, buf: []u8) !RedoOutcome {
-        sortByTargetSeqAsc(members_in); // 元の実行順（target_seq 昇順）で再実行する
+        sortByTargetSeqAsc(members_in); // re-run in the original execution order (ascending target_seq)
 
         const new_tx_id = self.allocTransactionId() orelse
             return .{ .happened = false, .message = writeMsg(buf, "no candidate: transaction id exhausted") };
@@ -822,9 +822,9 @@ pub const Executor = struct {
             });
         }
 
-        // transaction redo の途中失敗規則（MVP）: bundle は試行1回で全消費する
-        // （成功/失敗を問わず revert 群全件に redo_consumed=true を立てる。適用済み分は
-        // 同一の新 transaction_id を共有するため 1 回の undoOne でまとめて取り消せる）。
+        // The rule for a mid-way failure of a transaction redo (MVP): a bundle is consumed entirely on a single attempt
+        // (redo_consumed=true is set on every revert record, whether it succeeded or failed. Whatever was applied shares
+        // the same new transaction_id, so a single undoOne takes all of it back at once).
         for (members_in) |m| {
             if (log.findBySeq(m.seq)) |live| live.redo_consumed = true;
         }
@@ -833,12 +833,12 @@ pub const Executor = struct {
         return .{ .happened = true, .message = writeMsg(buf, "redo ok") };
     }
 
-    /// redo 候補（target の name/args）。slice は CommandLog 内を指すため、呼び出し側は
-    /// mutate 前にコピーすること。netsync `.redo_own` 用（TASK-62.3.5）。
+    /// A redo candidate (the target's name and args). The slices point into the CommandLog, so the caller must copy
+    /// them before mutating. For netsync's `.redo_own`.
     ///
-    /// **既知の許容（peer 間 epoch 発散）**: redo_of は wire 非搭載のため、他 peer では redo 由来
-    /// commit が normal に見え epoch が進む。actor ごとの epoch 値は peer 間で発散しうるが、
-    /// redo 探索は発行者ローカルでしか使わないため無害（§1.5.1 v6）。
+    /// **A known and accepted consequence (epochs diverging between peers)**: redo_of is not carried on the wire, so on
+    /// another peer a commit that came from a redo looks normal and its epoch advances. Per-actor epoch values may
+    /// diverge between peers, which is harmless because a redo search is only ever used locally by the issuer.
     pub const RedoCandidate = struct {
         target_seq: u64,
         name: []const u8,
@@ -861,7 +861,7 @@ pub const Executor = struct {
             const tx_id = rec.transaction_id orelse continue;
 
             const snap = collectMembers(log, tx_id, .revert) orelse continue;
-            // netsync は単発のみ（bundle は session 中非対応）
+            // netsync handles single commands only (a bundle is unsupported during a session)
             if (snap.count != 1) continue;
 
             const m = snap.items[0];
@@ -873,8 +873,8 @@ pub const Executor = struct {
         return null;
     }
 
-    /// 後方走査で「actor 一致・kind=revert・!redo_consumed・epoch==現在値・target が現存し reverted の
-    /// まま」の最新候補を探し、target を新しい normal command として再実行する。
+    /// Scans backwards for the newest candidate matching "a matching actor, kind=revert, !redo_consumed, an epoch equal to the
+    /// current value, and a target that still exists and is still reverted", then re-runs the target as a new normal command.
     pub fn redoOne(self: *Executor, actor: ActorId, buf: []u8) anyerror!RedoOutcome {
         if (actor.eql(.system)) return .{ .happened = false, .message = writeMsg(buf, "no candidate: system actor") };
         const log = self.log orelse return .{ .happened = false, .message = writeMsg(buf, "no candidate: no log") };
@@ -889,9 +889,9 @@ pub const Executor = struct {
             if (rec.kind != .revert) continue;
             if (rec.redo_consumed) continue;
             if (rec.epoch != current_epoch) continue;
-            const tx_id = rec.transaction_id orelse continue; // 設計上 revert は必ず transaction_id を持つ
+            const tx_id = rec.transaction_id orelse continue; // by design a revert always carries a transaction_id
 
-            const snap = collectMembers(log, tx_id, .revert) orelse continue; // bundle 不完全なら候補外
+            const snap = collectMembers(log, tx_id, .revert) orelse continue; // an incomplete bundle is not a candidate
 
             var viable = true;
             for (snap.items[0..snap.count]) |m| {
@@ -918,17 +918,17 @@ pub const Executor = struct {
 };
 
 // ============================================================================
-// テスト（TASK-62.5.1 plan v1.3 §7。ケース番号はテスト名のプレフィックスで対応）
+// tests (each case number is the prefix of the test name)
 // ============================================================================
 
 const testing = std.testing;
 
-/// テスト専用の最小 app モック。undoable 判定は名前 "set_tool" のみ非 undoable、それ以外は
-/// dispatch のたびに新規 ref を発行して noteUndo する。`fail_on` に一致する名前は dispatch エラー。
+/// A minimal application mock for the tests. Only the name "set_tool" counts as non-undoable; everything else
+/// issues a fresh ref and calls noteUndo on each dispatch. A name matching `fail_on` makes the dispatch fail.
 const MockApp = struct {
     exec: *Executor = undefined,
     next_ref: u64 = 1,
-    /// dispatcher(run) が呼ばれた総回数。「dispatch 前 reject では呼ばれない」ことの観測用。
+    /// How many times dispatcher(run) was called in total. Used to observe that "a reject before the dispatch never calls it".
     run_count: u64 = 0,
     valid: [4096]bool = [_]bool{false} ** 4096,
     fail_on: []const u8 = "",
@@ -982,7 +982,7 @@ fn exec1(exec: *Executor, actor: ActorId, name: []const u8, buf: []u8) !ExecuteR
     return exec.executeAction(name, "", .{ .actor = actor }, buf);
 }
 
-test "1: actor 混在 undo/redo(親 plan §5.1 例と同値)" {
+test "1: undo and redo with mixed actors" {
     var app: MockApp = undefined;
     var log: CommandLog = undefined;
     var exec: Executor = undefined;
@@ -1000,7 +1000,7 @@ test "1: actor 混在 undo/redo(親 plan §5.1 例と同値)" {
 
     const uc2 = try exec.undoOne(.local_user, &buf);
     try testing.expect(uc2.happened);
-    try testing.expect(log.findBySeq(1).?.reverted); // B(agent) は skip され A(user) が対象
+    try testing.expect(log.findBySeq(1).?.reverted); // B(agent) is skipped and A(user) is the target
     try testing.expect(!log.findBySeq(2).?.reverted);
 
     const a1 = try exec.undoOne(.local_agent, &buf);
@@ -1008,7 +1008,7 @@ test "1: actor 混在 undo/redo(親 plan §5.1 例と同値)" {
     try testing.expect(log.findBySeq(2).?.reverted);
 }
 
-test "2: reverted skip(同一対象の二重 undo が起きない)" {
+test "2: a reverted record is skipped, so the same target is never undone twice" {
     var app: MockApp = undefined;
     var log: CommandLog = undefined;
     var exec: Executor = undefined;
@@ -1022,10 +1022,10 @@ test "2: reverted skip(同一対象の二重 undo が起きない)" {
     try testing.expect(log.findBySeq(1).?.reverted);
 
     const uc2 = try exec.undoOne(.local_user, &buf);
-    try testing.expect(!uc2.happened); // 対象が尽きて候補なし
+    try testing.expect(!uc2.happened); // the targets are exhausted, so there is no candidate
 }
 
-test "3: redo 連鎖(親 plan §5.2 例。seq/redo_of/redo_consumed まで assert)" {
+test "3: a redo chain, asserting seq, redo_of and redo_consumed" {
     var app: MockApp = undefined;
     var log: CommandLog = undefined;
     var exec: Executor = undefined;
@@ -1063,7 +1063,7 @@ test "3: redo 連鎖(親 plan §5.2 例。seq/redo_of/redo_consumed まで asser
     try testing.expect(log.findBySeq(6).?.reverted);
 }
 
-test "3b: tx redo の途中失敗(PartialRedo)は bundle を全消費し適用済み分は1回のundoで取り消せる" {
+test "3b: a mid-way failure of a transaction redo (PartialRedo) consumes the whole bundle, and a single undo takes back what was applied" {
     var app: MockApp = undefined;
     var log: CommandLog = undefined;
     var exec: Executor = undefined;
@@ -1080,11 +1080,11 @@ test "3b: tx redo の途中失敗(PartialRedo)は bundle を全消費し適用�
     try testing.expect(log.findBySeq(1).?.reverted);
     try testing.expect(log.findBySeq(2).?.reverted);
 
-    app.fail_on = "m2"; // 2件目の再実行(m2)を失敗させる
+    app.fail_on = "m2"; // make the re-run of the second one (m2) fail
     const r = exec.redoOne(.local_user, &buf);
     try testing.expectError(error.PartialRedo, r);
 
-    // bundle は全消費(2件とも redo_consumed=true)。以後 redo 候補なし。
+    // the bundle is consumed entirely (redo_consumed=true on both), so no redo candidate remains
     var count_consumed: u32 = 0;
     var i: u32 = 0;
     while (i < log.filled) : (i += 1) {
@@ -1096,7 +1096,7 @@ test "3b: tx redo の途中失敗(PartialRedo)は bundle を全消費し適用�
     }
     try testing.expectEqual(@as(u32, 2), count_consumed);
 
-    // m1 は再適用され新しい tx の1件として残っている(m2 は失敗し追加されない)
+    // m1 was reapplied and remains as the single member of a new transaction (m2 failed and was not added)
     var applied_new: u32 = 0;
     i = 0;
     while (i < log.filled) : (i += 1) {
@@ -1105,12 +1105,12 @@ test "3b: tx redo の途中失敗(PartialRedo)は bundle を全消費し適用�
     }
     try testing.expectEqual(@as(u32, 1), applied_new);
 
-    // 残った1件は undoOne 1回でまとめて取り消せる
+    // the one that remains can be taken back by a single undoOne
     const uc2 = try exec.undoOne(.local_user, &buf);
     try testing.expect(uc2.happened);
 }
 
-test "4: epoch 破棄(undo 後の新規 undoable 編集で redo 候補が失効)" {
+test "4: discarding the epoch, so a new undoable edit after an undo expires the redo candidate" {
     var app: MockApp = undefined;
     var log: CommandLog = undefined;
     var exec: Executor = undefined;
@@ -1120,13 +1120,13 @@ test "4: epoch 破棄(undo 後の新規 undoable 編集で redo 候補が失効)
     _ = try exec1(&exec, .local_user, "a", &buf); // seq1
     _ = try exec.undoOne(.local_user, &buf); // revert target=1
 
-    _ = try exec1(&exec, .local_user, "b", &buf); // 新規 undoable 編集 -> epoch bump
+    _ = try exec1(&exec, .local_user, "b", &buf); // a new undoable edit -> an epoch bump
 
     const r = try exec.redoOne(.local_user, &buf);
-    try testing.expect(!r.happened); // 失効済みの revert は候補外
+    try testing.expect(!r.happened); // an expired revert is not a candidate
 }
 
-test "5: redo 由来は epoch 不変(redo B' 直後でも redo C' が可能)" {
+test "5: a redo leaves the epoch unchanged, so redo C' is still possible right after redo B'" {
     var app: MockApp = undefined;
     var log: CommandLog = undefined;
     var exec: Executor = undefined;
@@ -1139,14 +1139,14 @@ test "5: redo 由来は epoch 不変(redo B' 直後でも redo C' が可能)" {
     _ = try exec.undoOne(.local_user, &buf); // undo b
     _ = try exec.undoOne(.local_user, &buf); // undo a
 
-    const r1 = try exec.redoOne(.local_user, &buf); // redo a (最古の未消費revertから)
+    const r1 = try exec.redoOne(.local_user, &buf); // redo a (from the oldest unconsumed revert)
     try testing.expect(r1.happened);
 
-    const r2 = try exec.redoOne(.local_user, &buf); // redo b -> bump したら自壊するケース
+    const r2 = try exec.redoOne(.local_user, &buf); // redo b -> the case that would destroy itself if it bumped
     try testing.expect(r2.happened);
 }
 
-test "6: transaction(非undoable+undoable混在)は undo 1回でstrokeのみ逆適用・revert群が同一tx id" {
+test "6: a transaction mixing non-undoable and undoable members inverse-applies only the stroke in one undo, and its revert records share one transaction id" {
     var app: MockApp = undefined;
     var log: CommandLog = undefined;
     var exec: Executor = undefined;
@@ -1154,7 +1154,7 @@ test "6: transaction(非undoable+undoable混在)は undo 1回でstrokeのみ逆�
     var buf: [256]u8 = undefined;
 
     const tx = try exec.beginTransaction(.local_user, "macro");
-    _ = try exec.executeAction("set_tool", "", .{ .actor = .local_user, .transaction = tx }, &buf); // seq1 非undoable
+    _ = try exec.executeAction("set_tool", "", .{ .actor = .local_user, .transaction = tx }, &buf); // seq1 is not undoable
     _ = try exec.executeAction("stroke", "", .{ .actor = .local_user, .transaction = tx }, &buf); // seq2 undoable
     try exec.endTransaction(tx, .local_user);
 
@@ -1163,10 +1163,10 @@ test "6: transaction(非undoable+undoable混在)は undo 1回でstrokeのみ逆�
 
     const u = try exec.undoOne(.local_user, &buf);
     try testing.expect(u.happened);
-    try testing.expect(!log.findBySeq(1).?.reverted); // 非undoableは対象外のまま
+    try testing.expect(!log.findBySeq(1).?.reverted); // the non-undoable one stays out of scope
     try testing.expect(log.findBySeq(2).?.reverted);
 
-    // revert record は1件だけ(undoable memberが1件のため)で、その transaction_id を確認
+    // there is a single revert record (there being one undoable member); check its transaction_id
     var revert_tx_id: ?u64 = null;
     var revert_count: u32 = 0;
     var i: u32 = 0;
@@ -1181,61 +1181,61 @@ test "6: transaction(非undoable+undoable混在)は undo 1回でstrokeのみ逆�
     try testing.expect(revert_tx_id != null);
 }
 
-test "7: tx all-or-nothing(canUndo=false を含む tx は skip され次候補へ)" {
+test "7: transaction all-or-nothing, so a transaction containing canUndo=false is skipped for the next candidate" {
     var app: MockApp = undefined;
     var log: CommandLog = undefined;
     var exec: Executor = undefined;
     wire(&app, &log, &exec);
     var buf: [256]u8 = undefined;
 
-    _ = try exec1(&exec, .local_user, "solo", &buf); // seq1: 単発undoable(候補予備)
+    _ = try exec1(&exec, .local_user, "solo", &buf); // seq1: a single undoable command (a spare candidate)
 
     const tx = try exec.beginTransaction(.local_user, "macro");
     _ = try exec.executeAction("m1", "", .{ .actor = .local_user, .transaction = tx }, &buf); // seq2
     _ = try exec.executeAction("m2", "", .{ .actor = .local_user, .transaction = tx }, &buf); // seq3
     try exec.endTransaction(tx, .local_user);
 
-    // tx の2件目(seq3)の undo_ref を無効化(canUndo=falseにする)
+    // invalidate the undo_ref of the transaction's second member (seq3), making canUndo false
     app.valid[log.findBySeq(3).?.undo_ref.?] = false;
 
-    const u = try exec.undoOne(.local_user, &buf); // tx は all-or-nothing で skip -> seq1(solo)が対象
+    const u = try exec.undoOne(.local_user, &buf); // the transaction is all-or-nothing and so is skipped -> seq1 (solo) is the target
     try testing.expect(u.happened);
     try testing.expect(log.findBySeq(1).?.reverted);
     try testing.expect(!log.findBySeq(2).?.reverted);
     try testing.expect(!log.findBySeq(3).?.reverted);
 }
 
-test "8: リング溢れ(最古が消えると undo/redo 候補にならない)" {
+test "8: a ring overflow, so once the oldest is gone it is no longer an undo or redo candidate" {
     var app: MockApp = undefined;
     var log: CommandLog = undefined;
     var exec: Executor = undefined;
     wire(&app, &log, &exec);
     var buf: [256]u8 = undefined;
 
-    _ = try exec1(&exec, .local_user, "first", &buf); // seq1: これが溢れて消える対象
+    _ = try exec1(&exec, .local_user, "first", &buf); // seq1: this is the one that overflows and disappears
 
     var n: usize = 0;
     while (n < MAX_CMD_LOG) : (n += 1) {
         _ = try exec1(&exec, .local_user, "filler", &buf);
     }
-    // ring は MAX_CMD_LOG 件で満杯。seq1 は既に溢れて消えている。
+    // the ring is full at MAX_CMD_LOG records, so seq1 has already overflowed and gone.
     try testing.expect(log.findBySeq(1) == null);
 
-    // seq1 を狙って undo することはできない(そもそも探索対象は最新側からなので、代わりに
-    // 「消えた対象は候補にならない」ことを redo 経路で確認する: 直接 undo/redo の一般挙動として
-    // 現存する最新の filler は普通に undo できることを確認する。
+    // seq1 cannot be undone deliberately (the search runs from the newest end anyway), so instead
+    // "a lost target never becomes a candidate" is checked through the redo path: as general undo and redo
+    // behaviour, confirm that the newest filler still present can be undone normally.
     const u = try exec.undoOne(.local_user, &buf);
     try testing.expect(u.happened);
 }
 
-test "9: リング境界の tx undo(revert append によるスロット進行があっても誤マーク・stale参照なく完了)" {
+test "9: a transaction undo at the ring boundary completes with no wrong mark and no stale reference, even as the revert appends advance the slot" {
     var app: MockApp = undefined;
     var log: CommandLog = undefined;
     var exec: Executor = undefined;
     wire(&app, &log, &exec);
     var buf: [256]u8 = undefined;
 
-    // log をほぼ満杯にする
+    // fill the log almost to capacity
     var n: usize = 0;
     while (n < MAX_CMD_LOG - 4) : (n += 1) {
         _ = try exec1(&exec, .local_user, "filler", &buf);
@@ -1258,7 +1258,7 @@ test "9: リング境界の tx undo(revert append によるスロット進行が
     try testing.expect(log.findBySeq(seq_m3).?.reverted);
 }
 
-test "10: remote_commit(seq採用/next_seq前進/重複reject/pending_local_meta.redo_ofでepoch不変)" {
+test "10: remote_commit adopts the seq, advances next_seq, rejects a duplicate, and leaves the epoch unchanged given pending_local_meta.redo_of" {
     var app: MockApp = undefined;
     var log: CommandLog = undefined;
     var exec: Executor = undefined;
@@ -1268,23 +1268,23 @@ test "10: remote_commit(seq採用/next_seq前進/重複reject/pending_local_meta
     _ = try exec1(&exec, .local_user, "local1", &buf); // seq1
     try testing.expectEqual(@as(u64, 2), log.next_seq);
 
-    // remote_commit で seq=10 を受理 -> next_seq は 11 に前進
+    // accept seq=10 as a remote_commit -> next_seq advances to 11
     const r = try exec.executeAction("remote1", "", .{ .actor = .{ .peer = 1 }, .source = .{ .remote_commit = .{ .seq = 10 } } }, &buf);
     try testing.expectEqual(@as(?u64, 10), r.seq);
     try testing.expectEqual(@as(u64, 11), log.next_seq);
 
-    // 同一 seq=10 の再配送は dispatch 前に reject（dispatcher 呼出回数が増えない）
+    // redelivering the same seq=10 is rejected before the dispatch (the dispatcher call count does not rise)
     const run_count_before_dup = app.run_count;
     const dup = exec.executeAction("remote1_dup", "", .{ .actor = .{ .peer = 1 }, .source = .{ .remote_commit = .{ .seq = 10 } } }, &buf);
     try testing.expectError(error.StaleRemoteSeq, dup);
     try testing.expectEqual(run_count_before_dup, app.run_count);
-    try testing.expect(log.findBySeq(10).?.name_len == "remote1".len); // 記録内容も不変
+    try testing.expect(log.findBySeq(10).?.name_len == "remote1".len); // the recorded content is unchanged too
 
-    // local の以降の採番は 11 から(衝突しない)
+    // local numbering carries on from 11, with no collision
     const local2 = try exec1(&exec, .local_user, "local2", &buf);
     try testing.expectEqual(@as(?u64, 11), local2.seq);
 
-    // pending_local_meta.redo_of を伴う remote_commit は epoch を bump しない
+    // a remote_commit carrying pending_local_meta.redo_of does not bump the epoch
     const before_epoch = exec.currentEpoch(.{ .peer = 1 });
     _ = try exec.executeAction("remote_redo", "", .{
         .actor = .{ .peer = 1 },
@@ -1293,7 +1293,7 @@ test "10: remote_commit(seq採用/next_seq前進/重複reject/pending_local_meta
     try testing.expectEqual(before_epoch, exec.currentEpoch(.{ .peer = 1 }));
 }
 
-test "11: record_policy(dry_run/no_record/no-op recorder)いずれも preflight の入力制約は同一に効く" {
+test "11: preflight's input constraints apply identically for every record_policy (dry_run, no_record, a no-op recorder)" {
     var app: MockApp = undefined;
     var log: CommandLog = undefined;
     var exec: Executor = undefined;
@@ -1303,30 +1303,30 @@ test "11: record_policy(dry_run/no_record/no-op recorder)いずれも preflight 
     const before_filled = log.filled;
     const dry = try exec.executeAction("dry_action", "", .{ .actor = .local_user, .record_policy = .dry_run }, &buf);
     try testing.expectEqual(@as(?u64, null), dry.seq);
-    try testing.expectEqual(before_filled, log.filled); // dispatch すらされない -> ref も発行されない
+    try testing.expectEqual(before_filled, log.filled); // not even dispatched -> so no ref is issued either
     try testing.expectEqual(@as(u64, 1), app.next_ref);
 
     const nr = try exec.executeAction("no_record_action", "", .{ .actor = .local_user, .record_policy = .no_record }, &buf);
     try testing.expectEqual(@as(?u64, null), nr.seq);
-    try testing.expectEqual(before_filled, log.filled); // dispatch はされるが記録されない
+    try testing.expectEqual(before_filled, log.filled); // dispatched, but not recorded
     try testing.expectEqual(@as(u64, 2), app.next_ref);
 
-    // preflight の入力制約(空名)は record_policy によらず同じに効く
+    // preflight's input constraint (an empty name) applies the same regardless of record_policy
     try testing.expectError(error.NameEmpty, exec.executeAction("", "", .{ .actor = .local_user, .record_policy = .dry_run }, &buf));
     try testing.expectError(error.NameEmpty, exec.executeAction("", "", .{ .actor = .local_user, .record_policy = .no_record }, &buf));
 
-    // no-op recorder(log=null)でも同じ制約が効く
+    // the same constraint applies to a no-op recorder (log=null) too
     var app2: MockApp = undefined;
     var exec2: Executor = Executor.init(.{ .ctx = &app2, .run = MockApp.run });
     app2 = .{ .exec = &exec2 };
     try testing.expect(exec2.log == null);
     try testing.expectError(error.NameEmpty, exec2.executeAction("", "", .{ .actor = .local_user }, &buf));
     const ok = try exec2.executeAction("ok_action", "", .{ .actor = .local_user }, &buf);
-    try testing.expectEqual(@as(?u64, null), ok.seq); // 記録されない(no-op recorder)
-    try testing.expectEqual(@as(u64, 2), app2.next_ref); // dispatch 自体はされる(直前の失敗した空名呼び出しは dispatch されていない)
+    try testing.expectEqual(@as(?u64, null), ok.seq); // not recorded (a no-op recorder)
+    try testing.expectEqual(@as(u64, 2), app2.next_ref); // the dispatch itself does happen (the failed empty-name call just before was not dispatched)
 }
 
-test "12: preflight失敗系(空名/name超過/args超過/staleTxHandle/MAX_ACTORS/MAX_OPEN_TX)はdispatchされない" {
+test "12: the preflight failures (an empty name, a name over the limit, args over the limit, a stale transaction handle, MAX_ACTORS, MAX_OPEN_TX) are not dispatched" {
     var app: MockApp = undefined;
     var log: CommandLog = undefined;
     var exec: Executor = undefined;
@@ -1334,7 +1334,7 @@ test "12: preflight失敗系(空名/name超過/args超過/staleTxHandle/MAX_ACTO
     var buf: [256]u8 = undefined;
 
     try testing.expectError(error.NameEmpty, exec.executeAction("", "", .{ .actor = .local_user }, &buf));
-    try testing.expectEqual(@as(u64, 0), app.run_count); // dispatch されていない
+    try testing.expectEqual(@as(u64, 0), app.run_count); // not dispatched
 
     const long_name = [_]u8{'x'} ** (MAX_CMD_NAME + 1);
     try testing.expectError(error.NameTooLong, exec.executeAction(&long_name, "", .{ .actor = .local_user }, &buf));
@@ -1345,13 +1345,13 @@ test "12: preflight失敗系(空名/name超過/args超過/staleTxHandle/MAX_ACTO
     try testing.expectError(error.ArgsTooLong, exec.executeAction("ok", &long_args_buf, .{ .actor = .local_user }, &buf));
     try testing.expectEqual(@as(u64, 0), app.run_count);
 
-    // stale transaction handle: close 後の generation 不一致
+    // a stale transaction handle: a generation mismatch after the close
     const tx = try exec.beginTransaction(.local_user, "macro");
     try exec.endTransaction(tx, .local_user);
     try testing.expectError(error.StaleTransactionHandle, exec.executeAction("m", "", .{ .actor = .local_user, .transaction = tx }, &buf));
     try testing.expectEqual(@as(u64, 0), app.run_count);
 
-    // MAX_ACTORS 溢れ（dispatch 前 reject = dispatcher 呼出回数が増えない）
+    // MAX_ACTORS overflow (a reject before the dispatch = the dispatcher call count does not rise)
     var i: u32 = 0;
     while (i < MAX_ACTORS) : (i += 1) {
         _ = try exec.executeAction("touch", "", .{ .actor = .{ .peer = i } }, &buf);
@@ -1360,7 +1360,7 @@ test "12: preflight失敗系(空名/name超過/args超過/staleTxHandle/MAX_ACTO
     try testing.expectError(error.TooManyActors, exec.executeAction("touch", "", .{ .actor = .{ .peer = 999 } }, &buf));
     try testing.expectEqual(run_count_full, app.run_count);
 
-    // MAX_OPEN_TX 溢れ
+    // MAX_OPEN_TX overflow
     var app2: MockApp = undefined;
     var log2: CommandLog = undefined;
     var exec2: Executor = undefined;
@@ -1373,32 +1373,32 @@ test "12: preflight失敗系(空名/name超過/args超過/staleTxHandle/MAX_ACTO
     try testing.expectError(error.TooManyOpenTransactions, exec2.beginTransaction(.local_user, "overflow"));
 }
 
-test "12b: next_transaction_id 枯渇時は新規 transaction を reject(fail-stop しない)" {
+test "12b: once next_transaction_id is exhausted a new transaction is rejected, without a fail-stop" {
     var app: MockApp = undefined;
     var log: CommandLog = undefined;
     var exec: Executor = undefined;
     wire(&app, &log, &exec);
     var buf: [256]u8 = undefined;
 
-    _ = try exec1(&exec, .local_user, "a", &buf); // 枯渇前に undo/redo 候補を1件用意
+    _ = try exec1(&exec, .local_user, "a", &buf); // prepare one undo and redo candidate before the exhaustion
 
-    exec.next_transaction_id = std.math.maxInt(u64); // 枯渇状態を再現
+    exec.next_transaction_id = std.math.maxInt(u64); // reproduce the exhausted state
     try testing.expectError(error.TransactionIdExhausted, exec.beginTransaction(.local_user, "macro"));
 
-    const u = try exec.undoOne(.local_user, &buf); // revert bundle 用の id が発番できない -> 候補なし扱い
+    const u = try exec.undoOne(.local_user, &buf); // no id can be issued for the revert bundle -> treated as no candidate
     try testing.expect(!u.happened);
-    try testing.expect(!log.findBySeq(1).?.reverted); // 逆適用は行われていない（id 発番は applyUndo より前）
-    try testing.expect(app.valid[log.findBySeq(1).?.undo_ref.?]); // UndoRef も消費されていない
+    try testing.expect(!log.findBySeq(1).?.reverted); // no inverse apply happened (issuing the id comes before applyUndo)
+    try testing.expect(app.valid[log.findBySeq(1).?.undo_ref.?]); // the UndoRef was not consumed either
 }
 
-test "13: noteUndo規則(reentrant拒否/エラー時discard/二重noteUndoはfirst-wins)" {
+test "13: the noteUndo rules: a reentrant call is rejected, an error discards, a doubled noteUndo is first-wins" {
     var app: MockApp = undefined;
     var log: CommandLog = undefined;
     var exec: Executor = undefined;
     wire(&app, &log, &exec);
     var buf: [256]u8 = undefined;
 
-    // reentrant dispatch: dispatcher callback 内から executeAction を呼ぶ
+    // reentrant dispatch: calling executeAction from inside the dispatcher callback
     const ReentrantApp = struct {
         fn run(ctx: *anyopaque, name: []const u8, args: []const u8, b: []u8) anyerror![]const u8 {
             _ = name;
@@ -1418,18 +1418,18 @@ test "13: noteUndo規則(reentrant拒否/エラー時discard/二重noteUndoはfi
     const res = try exec_r.executeAction("outer", "", .{ .actor = .local_user }, &buf);
     try testing.expectEqualStrings("ReentrantDispatch", res.output);
 
-    // dispatch エラー時に pending が discard され次の record を汚染しない:
-    // noteUndo で pending をセットした**後に** error を返す dispatcher で失敗させ、
-    // 直後の「noteUndo を呼ばない」成功 command が undoable=false（undo_ref=null）で記録されることを確認
+    // A pending is discarded on a dispatch error and does not contaminate the next record:
+    // fail with a dispatcher that returns an error **after** setting pending through noteUndo, and confirm
+    // that the successful command right after, which does not call noteUndo, is recorded as undoable=false (undo_ref=null)
     const NoteThenFailApp = struct {
         fn run(ctx: *anyopaque, name: []const u8, args: []const u8, b: []u8) anyerror![]const u8 {
             _ = args;
             const e: *Executor = @ptrCast(@alignCast(ctx));
             if (std.mem.eql(u8, name, "note_then_fail")) {
-                e.noteUndo(333); // pending セット後に失敗
+                e.noteUndo(333); // fail after setting pending
                 return error.Boom;
             }
-            return writeMsg(b, "ok"); // noteUndo なし
+            return writeMsg(b, "ok"); // no noteUndo
         }
     };
     var log_f: CommandLog = .{};
@@ -1439,10 +1439,10 @@ test "13: noteUndo規則(reentrant拒否/エラー時discard/二重noteUndoはfi
     try testing.expectError(error.Boom, exec_f.executeAction("note_then_fail", "", .{ .actor = .local_user }, &buf));
     const plain = try exec_f.executeAction("plain", "", .{ .actor = .local_user }, &buf);
     const plain_rec = log_f.findBySeq(plain.seq.?).?;
-    try testing.expect(!plain_rec.undoable); // discard 済み pending が漏れて undoable 化しない
+    try testing.expect(!plain_rec.undoable); // a discarded pending does not leak and turn this undoable
     try testing.expectEqual(@as(?UndoRef, null), plain_rec.undo_ref);
 
-    // 二重 noteUndo は first-wins
+    // a doubled noteUndo is first-wins
     const DoubleNoteApp = struct {
         fn run(ctx: *anyopaque, name: []const u8, args: []const u8, b: []u8) anyerror![]const u8 {
             _ = name;
@@ -1462,7 +1462,7 @@ test "13: noteUndo規則(reentrant拒否/エラー時discard/二重noteUndoはfi
     try testing.expectEqual(@as(?UndoRef, 111), log_d.findBySeq(1).?.undo_ref);
 }
 
-test "14: undo_ref消滅(canUndo=false)で候補skip(最終防衛)" {
+test "14: a vanished undo_ref (canUndo=false) skips the candidate, as the last line of defence" {
     var app: MockApp = undefined;
     var log: CommandLog = undefined;
     var exec: Executor = undefined;
@@ -1472,16 +1472,16 @@ test "14: undo_ref消滅(canUndo=false)で候補skip(最終防衛)" {
     _ = try exec1(&exec, .local_user, "a", &buf); // seq1
     _ = try exec1(&exec, .local_user, "b", &buf); // seq2
 
-    // seq2 の undo_ref を app 側で消す(canUndo=falseになる)
+    // drop seq2's undo_ref on the application side (making canUndo false)
     app.valid[log.findBySeq(2).?.undo_ref.?] = false;
 
-    const u = try exec.undoOne(.local_user, &buf); // seq2 は skip され seq1 が対象
+    const u = try exec.undoOne(.local_user, &buf); // seq2 is skipped and seq1 is the target
     try testing.expect(u.happened);
     try testing.expect(log.findBySeq(1).?.reverted);
     try testing.expect(!log.findBySeq(2).?.reverted);
 }
 
-test "15: 16actor境界(MAX_ACTORS満杯で新actorはpreflight reject・既存actorは影響なし)" {
+test "15: the 16-actor boundary: with MAX_ACTORS full a new actor is rejected in preflight and existing actors are unaffected" {
     var app: MockApp = undefined;
     var log: CommandLog = undefined;
     var exec: Executor = undefined;
@@ -1494,33 +1494,33 @@ test "15: 16actor境界(MAX_ACTORS満杯で新actorはpreflight reject・既存a
     }
     const run_count_full = app.run_count;
     try testing.expectError(error.TooManyActors, exec.executeAction("touch", "", .{ .actor = .{ .peer = 999 } }, &buf));
-    try testing.expectEqual(run_count_full, app.run_count); // dispatch 前 reject（dispatcher は呼ばれない）
+    try testing.expectEqual(run_count_full, app.run_count); // a reject before the dispatch (the dispatcher is not called)
 
-    // 既存 actor は影響なし
+    // existing actors are unaffected
     const r = try exec.executeAction("touch2", "", .{ .actor = .{ .peer = 0 } }, &buf);
     try testing.expect(r.seq != null);
     try testing.expectEqual(run_count_full + 1, app.run_count);
 }
 
-test "16: tx部分溢れ(先頭member喪失でtx全体・revert bundle全体が候補外/open中txも候補外)" {
+test "16: a partial transaction overflow: losing the first member puts the whole transaction and the whole revert bundle out of the running, as does an open transaction" {
     var app: MockApp = undefined;
     var log: CommandLog = undefined;
     var exec: Executor = undefined;
     wire(&app, &log, &exec);
     var buf: [256]u8 = undefined;
 
-    // open 中の tx: member を1件足すが close しない
+    // an open transaction: add one member but do not close it
     const open_tx = try exec.beginTransaction(.local_user, "open");
     _ = try exec.executeAction("open_m1", "", .{ .actor = .local_user, .transaction = open_tx }, &buf);
     const open_seq = log.next_seq - 1;
 
     const u_open = try exec.undoOne(.local_user, &buf);
-    try testing.expect(!u_open.happened); // open 中の member は候補にならない(他に候補もない)
+    try testing.expect(!u_open.happened); // a member of an open transaction is never a candidate (and there is no other candidate)
     try testing.expect(!log.findBySeq(open_seq).?.reverted);
 
     try exec.endTransaction(open_tx, .local_user);
 
-    // 3件 undoable の tx を作り、先頭1件だけをリング溢れで失わせる
+    // build a transaction with 3 undoable members and lose only the first to a ring overflow
     const tx = try exec.beginTransaction(.local_user, "macro3");
     _ = try exec.executeAction("m1", "", .{ .actor = .local_user, .transaction = tx }, &buf);
     const seq_m1 = log.next_seq - 1;
@@ -1529,23 +1529,23 @@ test "16: tx部分溢れ(先頭member喪失でtx全体・revert bundle全体が�
     _ = try exec.executeAction("m3", "", .{ .actor = .local_user, .transaction = tx }, &buf);
     try exec.endTransaction(tx, .local_user);
 
-    // ここまでの累計 append 数(open_m1 + m1,m2,m3) = 4。非undoable(set_tool)の filler で ring を埋め、
-    // 総 append 数が MAX_CMD_LOG+2 になった時点で evicted=2件(open_m1, m1)。m2/m3 は健在のまま。
-    // filler を非undoableにするのは「undo 候補として拾われて undo 自体が新たな append を起こし
-    // さらなる溢れを連鎖させる」ことを避けるため(non-undoable なので undoOne から常に無視される)。
+    // the cumulative appends so far (open_m1 plus m1, m2, m3) = 4. Fill the ring with non-undoable (set_tool) fillers, and
+    // once the total appends reach MAX_CMD_LOG+2, evicted=2 (open_m1 and m1). m2 and m3 are still intact.
+    // The fillers are non-undoable to avoid "being picked up as an undo candidate, so that the undo itself appends more
+    // and chains a further overflow" (being non-undoable, undoOne always ignores them).
     var n: usize = 0;
     const filler_count = MAX_CMD_LOG - 4 + 2;
     while (n < filler_count) : (n += 1) {
         _ = try exec.executeAction("set_tool", "", .{ .actor = .local_user }, &buf);
     }
-    try testing.expect(log.findBySeq(seq_m1) == null); // 先頭member(m1)は溢れて消えた
-    try testing.expect(log.findBySeq(seq_m2) != null); // m2 は健在
+    try testing.expect(log.findBySeq(seq_m1) == null); // the first member (m1) overflowed and is gone
+    try testing.expect(log.findBySeq(seq_m2) != null); // m2 is intact
 
-    const u = try exec.undoOne(.local_user, &buf); // tx3 は不完全 -> 候補外。filler は非undoableで候補外 -> no candidate
+    const u = try exec.undoOne(.local_user, &buf); // tx3 is incomplete -> not a candidate. The fillers are non-undoable -> not candidates. So: no candidate
     try testing.expect(!u.happened);
-    try testing.expect(!log.findBySeq(seq_m2).?.reverted); // 部分 undo は起きない
+    try testing.expect(!log.findBySeq(seq_m2).?.reverted); // no partial undo happens
 
-    // revert bundle 側の部分溢れ: 完全な小さい tx を undo してから、その revert 群の先頭を溢れさせる
+    // Partial overflow on the revert bundle side: undo a small complete transaction, then overflow the first of its revert records
     var app2: MockApp = undefined;
     var log2: CommandLog = undefined;
     var exec2: Executor = undefined;
@@ -1556,11 +1556,11 @@ test "16: tx部分溢れ(先頭member喪失でtx全体・revert bundle全体が�
     _ = try exec2.executeAction("a2", "", .{ .actor = .local_user, .transaction = tx2 }, &buf);
     try exec2.endTransaction(tx2, .local_user);
 
-    const uc2 = try exec2.undoOne(.local_user, &buf); // revert bundle(2件)を生成: idx1(target=a2) idx2(target=a1)
+    const uc2 = try exec2.undoOne(.local_user, &buf); // produce a revert bundle (2 records): idx1(target=a2), idx2(target=a1)
     try testing.expect(uc2.happened);
 
-    // 累計 append 数(a1,a2,revert×2) = 4。127件 filler を足すと evicted=3件(a1,a2,revert-idx1)で
-    // revert-idx2(target=a1)だけが残る。bundle の序数1(revert-idx1)が消えるので bundle は不完全。
+    // the cumulative appends (a1, a2, revert×2) = 4. Adding 127 fillers makes evicted=3 (a1, a2, revert-idx1), leaving
+    // only revert-idx2(target=a1). The bundle's ordinal 1 (revert-idx1) is gone, so the bundle is incomplete.
     var n2: usize = 0;
     const filler_count2 = MAX_CMD_LOG - 4 + 3;
     while (n2 < filler_count2) : (n2 += 1) {
@@ -1570,53 +1570,53 @@ test "16: tx部分溢れ(先頭member喪失でtx全体・revert bundle全体が�
     try testing.expect(!r2.happened);
 }
 
-test "17: recordExecuted(dispatchなし・記録あり・epoch bump・undoable=undo_ref有無・record のみ許容)" {
+test "17: recordExecuted: no dispatch, a record, an epoch bump, undoable following undo_ref, and only record accepted" {
     var app: MockApp = undefined;
     var log: CommandLog = undefined;
     var exec: Executor = undefined;
     wire(&app, &log, &exec);
     var buf: [256]u8 = undefined;
 
-    // dispatch されない + undo_ref 付きで記録される
+    // not dispatched, and recorded with an undo_ref
     const seq1 = try exec.recordExecuted("stroke", "tool=pen 1 1", .{ .actor = .local_user }, 42, &buf);
     try testing.expectEqual(@as(?u64, 1), seq1);
-    try testing.expectEqual(@as(u64, 0), app.run_count); // dispatcher は呼ばれない
+    try testing.expectEqual(@as(u64, 0), app.run_count); // the dispatcher is not called
     const rec1 = log.findBySeq(1).?;
     try testing.expect(rec1.undoable);
     try testing.expectEqual(@as(?UndoRef, 42), rec1.undo_ref);
     try testing.expectEqualStrings("stroke", rec1.name());
     try testing.expectEqualStrings("tool=pen 1 1", rec1.args());
-    try testing.expectEqual(@as(u64, 1), exec.currentEpoch(.local_user)); // undoable 記録で epoch bump
+    try testing.expectEqual(@as(u64, 1), exec.currentEpoch(.local_user)); // an undoable record bumps the epoch
 
-    // undo_ref=null は undoable=false + epoch 不変
+    // undo_ref=null means undoable=false and the epoch unchanged
     _ = try exec.recordExecuted("set_color", "FF0000", .{ .actor = .local_user }, null, &buf);
     try testing.expect(!log.findBySeq(2).?.undoable);
     try testing.expectEqual(@as(u64, 1), exec.currentEpoch(.local_user));
 
-    // preflight は executeAction と同一（空名 / args 超過は dispatch も記録もされない）
+    // preflight is identical to executeAction's (an empty name, or args over the limit, is neither dispatched nor recorded)
     try testing.expectError(error.NameEmpty, exec.recordExecuted("", "", .{ .actor = .local_user }, null, &buf));
     var big_args: [MAX_CMD_ARGS + 1]u8 = undefined;
     @memset(&big_args, 'x');
     try testing.expectError(error.ArgsTooLong, exec.recordExecuted("stroke", &big_args, .{ .actor = .local_user }, null, &buf));
     try testing.expectEqual(@as(u32, 2), log.filled);
 
-    // record 以外の record_policy は拒否
+    // a record_policy other than record is rejected
     try testing.expectError(error.InvalidRecordPolicy, exec.recordExecuted("a", "", .{ .actor = .local_user, .record_policy = .no_record }, null, &buf));
     try testing.expectError(error.InvalidRecordPolicy, exec.recordExecuted("a", "", .{ .actor = .local_user, .record_policy = .dry_run }, null, &buf));
 
-    // no-op recorder(log=null)は preflight のみで null を返す
+    // a no-op recorder (log=null) returns null after preflight alone
     var exec2: Executor = Executor.init(.{ .ctx = &app, .run = MockApp.run });
     const none = try exec2.recordExecuted("stroke", "1 1", .{ .actor = .local_user }, 7, &buf);
     try testing.expectEqual(@as(?u64, null), none);
 
-    // recordExecuted で記録した undoable record は undoOne の対象になる（記録一点主義の対応付け）
-    app.valid[42] = true; // MockApp の canUndo が参照する ref 台帳に載せる
+    // an undoable record made by recordExecuted becomes a target of undoOne (recording in one place is what ties them together)
+    app.valid[42] = true; // put it on the ref ledger MockApp's canUndo consults
     const u = try exec.undoOne(.local_user, &buf);
     try testing.expect(u.happened);
     try testing.expect(log.findBySeq(1).?.reverted);
 }
 
-test "18: openTransactionFor(open 中のみ・actor 別・close 後 null)" {
+test "18: openTransactionFor: only while open, per actor, and null after the close" {
     var app: MockApp = undefined;
     var log: CommandLog = undefined;
     var exec: Executor = undefined;
@@ -1628,18 +1628,18 @@ test "18: openTransactionFor(open 中のみ・actor 別・close 後 null)" {
     const found = exec.openTransactionFor(.local_agent).?;
     try testing.expectEqual(tx.index, found.index);
     try testing.expectEqual(tx.generation, found.generation);
-    try testing.expect(exec.openTransactionFor(.local_user) == null); // actor 別
+    try testing.expect(exec.openTransactionFor(.local_user) == null); // per actor
 
-    // 見つけた handle は executeAction の transaction 照合を通る
+    // the handle found passes executeAction's transaction check
     var buf: [256]u8 = undefined;
     const res = try exec.executeAction("m1", "", .{ .actor = .local_agent, .transaction = found }, &buf);
     try testing.expectEqual(@as(?u64, 1), log.findBySeq(res.seq.?).?.transaction_id);
 
     try exec.endTransaction(tx, .local_agent);
-    try testing.expect(exec.openTransactionFor(.local_agent) == null); // close 後 null
+    try testing.expect(exec.openTransactionFor(.local_agent) == null); // null after the close
 }
 
-test "19: MAX_CMD_ARGS=4096 境界(丁度は通り +1 は reject)" {
+test "19: the MAX_CMD_ARGS=4096 boundary: exactly the limit passes and +1 is rejected" {
     var app: MockApp = undefined;
     var log: CommandLog = undefined;
     var exec: Executor = undefined;
@@ -1657,7 +1657,7 @@ test "19: MAX_CMD_ARGS=4096 境界(丁度は通り +1 は reject)" {
     try testing.expectError(error.ArgsTooLong, exec.executeAction("big", &over, .{ .actor = .local_user }, &buf));
 }
 
-test "20: bumpEpoch(記録なしで redo 候補を失効させる。未記録 UI 編集の epoch 破棄)" {
+test "20: bumpEpoch expires a redo candidate without recording anything, discarding the epoch for an unrecorded UI edit" {
     var app: MockApp = undefined;
     var log: CommandLog = undefined;
     var exec: Executor = undefined;
@@ -1667,24 +1667,24 @@ test "20: bumpEpoch(記録なしで redo 候補を失効させる。未記録 UI
     _ = try exec1(&exec, .local_user, "a", &buf); // seq1
     _ = try exec.undoOne(.local_user, &buf); // revert target=1
 
-    // 対照: bump しなければ redo 候補がある（別 executor で確認）
-    // 本題: bumpEpoch 後は epoch 不一致で候補なし
+    // the control: without a bump there is a redo candidate (checked on a separate executor)
+    // the point: after bumpEpoch the epoch no longer matches, so there is no candidate
     exec.bumpEpoch(.local_user);
     const r = try exec.redoOne(.local_user, &buf);
     try testing.expect(!r.happened);
 
-    // 他 actor の epoch には影響しない
+    // another actor's epoch is unaffected
     _ = try exec1(&exec, .local_agent, "b", &buf);
     _ = try exec.undoOne(.local_agent, &buf);
-    const r2 = try exec.redoOne(.local_agent, &buf); // local_user の bump は無関係
+    const r2 = try exec.redoOne(.local_agent, &buf); // a bump of local_user is unrelated
     try testing.expect(r2.happened);
 
-    // 未登録 actor への bump は登録して epoch を進める（後の記録と整合）
+    // a bump of an unregistered actor registers it and advances the epoch (consistent with a later record)
     exec.bumpEpoch(.{ .peer = 9 });
     try testing.expectEqual(@as(u64, 1), exec.currentEpoch(.{ .peer = 9 }));
 }
 
-test "21: applyWireRevert（reverted 固定・revert record・epoch 焼き込み）" {
+test "21: applyWireRevert: fixing reverted, the revert record, and burning in the epoch" {
     var app: MockApp = undefined;
     var log: CommandLog = undefined;
     var exec: Executor = undefined;
@@ -1702,7 +1702,7 @@ test "21: applyWireRevert（reverted 固定・revert record・epoch 焼き込み
     try testing.expectEqualStrings("revert", rev.name());
     try testing.expectEqual(@as(u64, 1), rev.target_seq.?);
     try testing.expect(rev.actor.eql(.{ .peer = 0 }));
-    try testing.expectEqual(epoch_before, rev.epoch); // 焼き込み（normal undoable ではないので epoch 不変）
+    try testing.expectEqual(epoch_before, rev.epoch); // burned in (the epoch is unchanged, this not being a normal undoable)
     try testing.expectEqual(@as(u64, 3), log.next_seq);
 
     // findUndoCandidate / findRedoCandidate
@@ -1712,7 +1712,7 @@ test "21: applyWireRevert（reverted 固定・revert record・epoch 焼き込み
     try testing.expectEqualStrings("paint", rc.name);
 }
 
-test "22: wire_session は local 記録を抑止し remote_commit は記録する" {
+test "22: wire_session suppresses a local record and still records a remote_commit" {
     var app: MockApp = undefined;
     var log: CommandLog = undefined;
     var exec: Executor = undefined;
@@ -1722,7 +1722,7 @@ test "22: wire_session は local 記録を抑止し remote_commit は記録す�
     exec.setWireSession(true);
     const local = try exec.executeAction("save", "/tmp/x", .{ .actor = .local_user }, &buf);
     try testing.expect(local.seq == null);
-    try testing.expectEqual(@as(u64, 1), log.next_seq); // 消費しない
+    try testing.expectEqual(@as(u64, 1), log.next_seq); // not consumed
 
     const remote = try exec.executeAction("stroke", "1 2", .{
         .actor = .{ .peer = 0 },
@@ -1732,7 +1732,7 @@ test "22: wire_session は local 記録を抑止し remote_commit は記録す�
     try testing.expectEqual(@as(u64, 2), log.next_seq);
 
     _ = try exec.recordExecuted("ui", "", .{ .actor = .local_user }, 1, &buf);
-    try testing.expectEqual(@as(u32, 1), log.filled); // UI record も抑止
+    try testing.expectEqual(@as(u32, 1), log.filled); // a UI record is suppressed too
 
     exec.setWireSession(false);
     const after = try exec.executeAction("local2", "", .{ .actor = .local_user }, &buf);
@@ -1740,13 +1740,13 @@ test "22: wire_session は local 記録を抑止し remote_commit は記録す�
 }
 
 // ============================================================================
-// App.dispatchCommand adapter (TASK-97.1)
+// App.dispatchCommand adapter
 // ============================================================================
 
 pub const RouteFn = *const fn (name: []const u8, args: []const u8, buf: []u8) anyerror![]const u8;
 pub const NetsyncStateFn = *const fn (ctx: *anyopaque) bool;
 
-/// app が所有する command table 1 行。ID は stable、action name は Executor/router の lookup 名。
+/// One row of the command table an application owns. The ID is stable; the action name is the lookup name for the Executor or the router.
 pub const AppCommandBinding = struct {
     id: command_types.CommandId,
     action: []const u8,
@@ -1759,8 +1759,8 @@ pub const AppDispatchResult = struct {
     routed: bool,
 };
 
-/// app が所有する Executor を menu command の共通入口へ接続する adapter。
-/// NetworkPolicy の意味は action registry/router に委譲し、この層では解釈しない。
+/// The adapter connecting an application-owned Executor to the shared entry point for menu commands.
+/// The meaning of a NetworkPolicy is delegated to the action registry and the router; this layer does not interpret it.
 pub const App = struct {
     executor: *Executor,
     bindings: []const AppCommandBinding,
@@ -1807,7 +1807,7 @@ fn appAdapterFakeDispatch(ctx: *anyopaque, name: []const u8, _: []const u8, buf:
 }
 
 fn appAdapterFakeRoute(name: []const u8, _: []const u8, buf: []u8) anyerror![]const u8 {
-    // fake router は NetworkPolicy の結果だけを表現する。実際の解釈は router 側の責務。
+    // The fake router expresses only the outcome of a NetworkPolicy. Interpreting it for real is the router's responsibility.
     if (std.mem.eql(u8, name, "reject")) return error.RejectedWhileSynced;
     if (std.mem.eql(u8, name, "undo_own")) {
         @memcpy(buf[0..4], "undo");
@@ -1817,7 +1817,7 @@ fn appAdapterFakeRoute(name: []const u8, _: []const u8, buf: []u8) anyerror![]co
     return buf[0..5];
 }
 
-test "App.dispatchCommand: solo は app 所有 Executor を通り、記録される" {
+test "App.dispatchCommand: solo goes through the application-owned Executor and is recorded" {
     var state: AppAdapterFakeState = .{};
     var log = CommandLog{};
     var executor = Executor.init(.{ .ctx = @ptrCast(&state), .run = appAdapterFakeDispatch });
@@ -1839,7 +1839,7 @@ test "App.dispatchCommand: solo は app 所有 Executor を通り、記録され
     try testing.expectEqual(@as(u32, 1), log.filled);
 }
 
-test "App.dispatchCommand: netsync は relay/reject/undo_own を router に委譲する" {
+test "App.dispatchCommand: netsync delegates relay, reject and undo_own to the router" {
     var state: AppAdapterFakeState = .{ .netsync = true };
     var executor = Executor.init(.{ .ctx = @ptrCast(&state), .run = appAdapterFakeDispatch });
     const bindings = [_]AppCommandBinding{
@@ -1864,7 +1864,7 @@ test "App.dispatchCommand: netsync は relay/reject/undo_own を router に委�
     try testing.expectEqual(@as(u32, 0), state.dispatch_count);
 }
 
-test "App.dispatchCommand: 未登録 ID は Executor/router に届かない" {
+test "App.dispatchCommand: an unregistered ID reaches neither the Executor nor the router" {
     var state: AppAdapterFakeState = .{};
     var executor = Executor.init(.{ .ctx = @ptrCast(&state), .run = appAdapterFakeDispatch });
     const bindings = [_]AppCommandBinding{.{ .id = 1, .action = "local" }};

@@ -1,31 +1,31 @@
-//! copilot/assist transport（TASK-62.5.2）: 通常 UX と共存する第3の control-plane。
+//! The copilot/assist transport: a third control plane that coexists with the ordinary UX.
 //!
-//! `VP_COPILOT_*` opt-in で TCP loopback に listen し、agent が probe で observe / action で
-//! operate できる。harness live（検証専用・step gate でアプリを止める）と異なり **step gate を
-//! 持ち込まない**: コマンドは毎フレームの `pump()` が非ブロッキングで処理し、ユーザーの通常操作と
-//! agent 操作が同一セッションで混在する。operate は `CommandExecutor`（command.zig, TASK-62.5.1）を
-//! 通り `actor=local_agent` で CommandRecord に記録される。
+//! Opting in through `VP_COPILOT_*` makes it listen on TCP loopback, so an agent can observe through a probe and
+//! operate through an action. Unlike harness live (which is verification-only and stops the application at a step gate),
+//! it **brings no step gate with it**: commands are handled non-blockingly by `pump()` on each frame, and a user's
+//! ordinary operations mix with an agent's within one session. An operate passes through `CommandExecutor`
+//! (command.zig) and is recorded in a CommandRecord with `actor=local_agent`.
 //!
-//! ## ホットパス宣言
-//! copilot transport は**イベント時 + フレーム毎 O(1)**: `pump()` を facade の `pollEvents` から
-//! 毎フレーム呼ぶが、idle 時は非ブロッキング poll 1 回（syscall 1 発・alloc なし・全画素/毎サンプル
-//! 処理なし）で即帰る。コマンド処理（digest/snapshot/action/tx）はコマンド到着時のみ。RT 経路には
-//! 一切触れない。SIMD 3点セット・bench 対象外。**env 未設定時は pump が bool 1 個の early return**
-//! （既存挙動への回帰ゼロ）。
+//! ## Hot path declaration
+//! The copilot transport is **event time plus O(1) per frame**: `pump()` is called every frame from the facade's
+//! `pollEvents`, but while idle it returns straight away after a single non-blocking poll (one syscall, no allocation,
+//! nothing over every pixel or every sample). Handling a command (digest, snapshot, action, tx) happens only when a
+//! command arrives. It never touches a real-time path, so the SIMD trio and the benchmarks do not apply. **With the
+//! environment unset, pump is an early return on a single bool** (zero regression to existing behaviour).
 //!
-//! ## 依存方向（一方向）
-//! copilot.zig → harness.zig（registry アクセサ / capabilities）+ command.zig（executor）。
-//! harness.zig 側の copilot への参照は namespace 再エクスポート 1 行のみで、harness から copilot の
-//! 関数は呼ばない。
+//! ## The direction of dependency (one-way)
+//! copilot.zig → harness.zig (the registry accessors and capabilities) plus command.zig (the executor).
+//! harness.zig's reference to copilot is a single namespace re-export line, and harness never calls a copilot
+//! function.
 //!
-//! ## 排他（1 プロセス 1 control transport）
-//! `VP_HARNESS_*`（SCRIPT/LISTEN/VP_HEADLESS）の env が存在すれば `VP_COPILOT_*` は warn して無視
-//! （判定は env 存在ベースで `parseConfig()` 時点に確定・決定論。harness の listen 成否には依存しない）。
+//! ## Mutual exclusion (one control transport per process)
+//! If any `VP_HARNESS_*` variable exists (SCRIPT, LISTEN, VP_HEADLESS), `VP_COPILOT_*` is warned about and ignored
+//! (the decision is based on the variable existing, is settled at `parseConfig()` and is deterministic; it does not depend on whether harness's listen succeeded).
 //!
-//! ## 接続モデル（非ブロッキング state machine）
-//! harness live と同じ「1 接続 = 1 リクエスト（`;`/改行区切り・client half-close で確定）= 1 レスポンス」
-//! で `scripts/drive` がそのまま使える（wire 互換）。fd は OS レベル nonblocking。read/execute/send の
-//! 全フェーズがフレームを跨いで進行し、main loop を block しない（詳細は `ConnState` と `pump()`）。
+//! ## The connection model (a non-blocking state machine)
+//! As with harness live, "one connection = one request (separated by `;` or a newline, settled by the client's half-close) = one response",
+//! so `scripts/drive` works unchanged (the wire is compatible). The fd is nonblocking at the OS level. Every phase —
+//! read, execute and send — progresses across frames and never blocks the main loop (see `ConnState` and `pump()` for the detail).
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -36,31 +36,31 @@ const command = @import("command.zig");
 const net = std.Io.net;
 const gpa = std.heap.page_allocator;
 
-/// リクエスト / レスポンスの wire 上限（各 64 KiB）。超過リクエストは error 応答、
-/// 超過レスポンスは打ち切り + `error: response truncated` 行。
+/// The wire limit on a request and on a response (64 KiB each). A request over the limit gets an error response,
+/// and a response over the limit is truncated and gets an `error: response truncated` line.
 pub const MAX_WIRE = 64 * 1024;
-/// 1 pump（フレーム）あたりのコマンド実行 budget。64 KiB に大量のコマンドを詰められても
-/// 1 フレームを占有しない（残りは次フレームへ持ち越し）。
+/// The budget of command executions per pump (per frame). Even when a great many commands are packed into 64 KiB,
+/// no single frame is monopolised (the rest carries over to the next frame).
 pub const CMD_BUDGET = 16;
-/// 接続 deadline（フレーム数。60fps で約 30 秒）。read〜send が完了しない slow client を close して
-/// 単一接続モデルの永久占有を防ぐ（時刻 syscall は使わない）。
+/// The connection deadline (in frames, so about 30 seconds at 60fps). A slow client that does not finish read-to-send is
+/// closed, so that it cannot occupy the single-connection model forever (no clock syscall is involved).
 pub const DEADLINE_FRAMES = 1800;
-/// 1 pump あたりの read チャンク上限（高速に流し込む client でも 1 フレームを占有しない）。
+/// The limit on read chunks per pump (even a client streaming in fast does not monopolise one frame).
 const READ_CHUNKS_PER_PUMP = 16;
 const TRUNCATED_LINE = "error: response truncated\n";
 
 // ============================================================================
-// module 状態（enabled 時のみ touch。env 未設定の通常実行では一切使われない）
+// module state (touched only while enabled; with the environment unset a normal run never uses any of it)
 // ============================================================================
 
 var config_parsed = false;
 var transport_started = false;
-/// parseConfig で確定する「listen を試みる」フラグ（排他判定込み）。
+/// The "try to listen" flag settled by parseConfig (mutual exclusion included).
 var enabled_pending = false;
-/// listen 成功後に立つ有効フラグ。`pump()` の early return 判定。
+/// The enabled flag raised once the listen succeeds. What `pump()`'s early return tests.
 var enabled = false;
 var req_port: u16 = 0;
-/// netsync session 中は operate（action / tx 制御）を拒否する（observe は可。TASK-62.5 親 plan §6）。
+/// During a netsync session an operate (an action or transaction control) is rejected; an observe is still allowed.
 var netsync_active = false;
 
 var io_inited = false;
@@ -73,60 +73,60 @@ var conn_active = false;
 var conn_fd: net.Socket.Handle = undefined;
 var conn: ConnState = undefined;
 
-/// operate の記録先（TASK-62.5.1 の consumer 第1号）。BSS 固定容量で enabled 時のみ touch。
+/// Where an operate is recorded (the first consumer of command.zig). Fixed BSS capacity, touched only while enabled.
 var command_log: command.CommandLog = undefined;
 var executor: command.Executor = undefined;
-/// wire の begin_tx/end_tx/cancel_tx が管理する open transaction（同時 1 個）。
+/// The open transaction the wire's begin_tx, end_tx and cancel_tx manage (one at a time).
 var open_tx: ?command.TransactionHandle = null;
-/// app 所有の共有 executor（TASK-62.5.3）。設定時は own executor/log を使わない:
-/// - `action` は harness.findAction の run を**直接呼ぶ**（記録は app 側 wrapper が一元化。
-///   own-executor 経由だと app wrapper の executeAction と二重記録になり、同一 executor なら
-///   ReentrantDispatch になるため）。
-/// - `begin_tx`/`end_tx`/`cancel_tx` は共有 executor に対して actor=.local_agent で操作する
-///   （app wrapper が `openTransactionFor(.local_agent)` で自動参加する）。
-/// 未設定（null）時は 62.5.2 の挙動（own executor + own log）を完全維持。
+/// The application-owned shared executor. When it is set, neither the own executor nor the own log is used:
+/// - `action` **calls harness.findAction's run directly** (recording is centralised in the application's own wrapper;
+///   going through the own executor would double-record against the application wrapper's executeAction, and with the
+///   same executor it would be a ReentrantDispatch).
+/// - `begin_tx`, `end_tx` and `cancel_tx` operate on the shared executor with actor=.local_agent
+///   (the application wrapper joins automatically through `openTransactionFor(.local_agent)`).
+/// While it is unset (null), the behaviour with an own executor and own log is preserved exactly.
 var shared_executor: ?*command.Executor = null;
 
-/// 共有 executor を設定する（facade の `platform.setCommandExecutor` から委譲される。
-/// harness/copilot 無効時も呼んでよい no-op 規約 = module 変数の代入のみ）。
+/// Sets the shared executor (delegated from the facade's `platform.setCommandExecutor`.
+/// It may be called with harness and copilot disabled, per the no-op rule — it only assigns a module variable).
 pub fn setSharedExecutor(exec: ?*command.Executor) void {
     shared_executor = exec;
 }
 
-/// teardown 前に共有 executor の借用だけを破棄する（旧ポインタを deref しない）。
+/// Drops just the borrow of the shared executor before teardown (without dereferencing the old pointer).
 pub fn forgetSharedExecutor() void {
     shared_executor = null;
 }
 
-/// operate（action/tx 制御）の対象 executor（共有 executor 優先）。
+/// The executor an operate (an action or transaction control) targets, preferring the shared executor.
 fn targetExecutor() *command.Executor {
     return shared_executor orelse &executor;
 }
 
-/// capabilities JSON の組み立て先（harness の capabilities_buf と同型の再利用スクラッチ）。
+/// Where the capabilities JSON is assembled (a reusable scratch buffer, the same shape as harness's capabilities_buf).
 var caps_buf: [16 * 1024]u8 = undefined;
 
 pub fn isEnabled() bool {
     return enabled;
 }
 
-/// netsync session の operate 拒否フラグ（platform が `netsync.setSessionStateCallback` で配線。TASK-62.5.6）。
+/// The flag rejecting an operate during a netsync session (platform wires it up through `netsync.setSessionStateCallback`).
 pub fn setNetsyncSessionActive(active: bool) void {
     netsync_active = active;
 }
 
 // ============================================================================
-// lifecycle（platform.init/shutdown から呼ばれる。§3b の順序）
+// lifecycle (called from platform.init and platform.shutdown)
 // ============================================================================
 
-/// 排他の純粋判定（env I/O から分離。単体テスト用）: harness の env が 1 つでも存在すれば
-/// copilot は無効（1 プロセス 1 control transport）。
+/// The pure mutual-exclusion decision, separated from the environment IO for unit testing: if even one of harness's
+/// variables exists, copilot is disabled (one control transport per process).
 fn decideEnabled(requested: bool, harness_env_present: bool) bool {
     return requested and !harness_env_present;
 }
 
-/// platform.init() が `harness.parseConfig()` の後に 1 度だけ呼ぶ。env を読むだけで
-/// I/O 副作用（listen/alloc/thread）は起こさない（AC #2）。
+/// platform.init() calls this exactly once, after `harness.parseConfig()`. It only reads the environment and causes
+/// no IO side effect (no listen, no allocation, no thread).
 pub fn parseConfig() void {
     if (config_parsed) return;
     config_parsed = true;
@@ -138,19 +138,19 @@ pub fn parseConfig() void {
         getEnv("VP_HARNESS_LISTEN") != null or
         getEnv("VP_HEADLESS") != null;
     if (!decideEnabled(requested, harness_env_present)) {
-        std.debug.print("[copilot] VP_HARNESS_* が有効なため VP_COPILOT_* を無視します（1プロセス1 control transport）\n", .{});
+        std.debug.print("[copilot] VP_HARNESS_* is active, so VP_COPILOT_* is ignored (one control transport per process)\n", .{});
         return;
     }
     if (comptime builtin.os.tag == .windows) {
-        std.debug.print("[copilot] Windows では copilot transport は未対応です。VP_COPILOT_* を無視します\n", .{});
+        std.debug.print("[copilot] the copilot transport is unsupported on Windows; ignoring VP_COPILOT_*\n", .{});
         return;
     }
     if (getEnv("VP_COPILOT_PORT")) |pe| req_port = std.fmt.parseInt(u16, pe, 10) catch 0;
     enabled_pending = true;
 }
 
-/// platform.init() が `harness.startTransport()` の後に 1 度だけ呼ぶ。listen 成功時のみ
-/// enabled 確定 + registry OR ゲートを開く。listen 失敗は warn + disabled（起動は継続）。
+/// platform.init() calls this exactly once, after `harness.startTransport()`. Only a successful listen settles
+/// enabled and opens the registry's OR gate. A failed listen warns and leaves it disabled (start-up continues).
 pub fn startTransport() void {
     if (comptime builtin.os.tag != .windows) startTransportPosix();
 }
@@ -163,11 +163,11 @@ fn startTransportPosix() void {
     ensureIo();
     const addr = net.IpAddress{ .ip4 = net.Ip4Address.loopback(req_port) };
     server = addr.listen(io_val, .{ .reuse_address = true }) catch |err| {
-        std.debug.print("[copilot] listen 失敗: {s}（copilot 無効のまま起動継続）\n", .{@errorName(err)});
+        std.debug.print("[copilot] listen failed: {s} (start-up continues with copilot disabled)\n", .{@errorName(err)});
         return;
     };
     if (!setNonblocking(server.socket.handle)) {
-        std.debug.print("[copilot] listener の nonblocking 設定に失敗。copilot を無効化します\n", .{});
+        std.debug.print("[copilot] failed to make the listener nonblocking; disabling copilot\n", .{});
         server.deinit(io_val);
         return;
     }
@@ -175,12 +175,12 @@ fn startTransportPosix() void {
     harness.setExternalRegistryEnabled(true);
     enabled = true;
     const chosen = server.socket.address.getPort();
-    std.debug.print("[copilot] 有効: 127.0.0.1:{d}\n", .{chosen});
+    std.debug.print("[copilot] enabled: 127.0.0.1:{d}\n", .{chosen});
     writePortFile(chosen);
 }
 
-/// platform.shutdown() が呼ぶ。接続中 stream を close（送信途中の応答は破棄）→ listener close →
-/// enabled=false。
+/// Called by platform.shutdown(). It closes the connected stream (discarding a response mid-send), then the listener,
+/// then sets enabled=false.
 pub fn stopTransport() void {
     if (comptime builtin.os.tag != .windows) stopTransportPosix();
 }
@@ -208,9 +208,9 @@ fn initExecutorState() void {
     open_tx = null;
 }
 
-/// executor の Dispatcher: harness action registry の name lookup → run() 委譲
-/// （framework は args も戻り値も解釈しない）。
-/// structured error は `action_registry.dispatch` と同様、run 前に毎回クリアする（TASK-62.5.9）。
+/// The executor's Dispatcher: a name lookup in the harness action registry, then delegation to run()
+/// (the framework interprets neither the args nor the return value).
+/// As in `action_registry.dispatch`, the structured error is cleared before every run.
 fn dispatchHarnessAction(ctx: *anyopaque, name: []const u8, args: []const u8, buf: []u8) anyerror![]const u8 {
     _ = ctx;
     harness.action_registry.clearActionErrorDetail();
@@ -219,26 +219,26 @@ fn dispatchHarnessAction(ctx: *anyopaque, name: []const u8, args: []const u8, bu
 }
 
 fn writePortFile(port: u16) void {
-    const path = getEnv("VP_COPILOT_PORT_FILE") orelse return; // 省略時は stderr 表示のみ
+    const path = getEnv("VP_COPILOT_PORT_FILE") orelse return; // with it omitted, only the stderr message
     var pbuf: [16]u8 = undefined;
     const txt = std.fmt.bufPrint(&pbuf, "{d}\n", .{port}) catch return;
     std.Io.Dir.cwd().writeFile(io_val, .{ .sub_path = path, .data = txt }) catch |err| {
-        std.debug.print("[copilot] port file 書き込み失敗 {s}: {s}\n", .{ path, @errorName(err) });
+        std.debug.print("[copilot] failed to write the port file {s}: {s}\n", .{ path, @errorName(err) });
     };
 }
 
-/// 環境変数を読む（harness と同じく libc getenv。platform module は常に link_libc）。
+/// Reads an environment variable (libc getenv, as harness does; the platform module always links libc).
 fn getEnv(name: [*:0]const u8) ?[]const u8 {
     const v = std.c.getenv(name) orelse return null;
     return std.mem.span(v);
 }
 
 // ============================================================================
-// pump（毎フレーム。facade の Window.pollEvents 末尾から呼ばれる）
+// pump (every frame; called from the end of the facade's Window.pollEvents)
 // ============================================================================
 
-/// フレーム毎に 1 回呼ぶ。disabled なら bool 1 個の early return（回帰ゼロ）。
-/// 1 pump の仕事量上限: accept 1 回 + read 16 チャンク + コマンド 16 個 + 書ける分の send。
+/// Called once per frame. While disabled it is an early return on a single bool (zero regression).
+/// The work limit for one pump: one accept, 16 read chunks, 16 commands, and as much send as fits.
 pub fn pump() void {
     if (!enabled) return;
     if (comptime builtin.os.tag != .windows) pumpPosix();
@@ -249,7 +249,7 @@ fn pumpPosix() void {
         if (!fdReadable(server.socket.handle)) return;
         const fd = tryAccept() orelse return;
         if (!setNonblocking(fd)) {
-            std.debug.print("[copilot] accepted fd の nonblocking 設定に失敗。接続を破棄します\n", .{});
+            std.debug.print("[copilot] failed to make the accepted fd nonblocking; discarding the connection\n", .{});
             io_val.vtable.netClose(io_val.userdata, (&fd)[0..1]);
             return;
         }
@@ -259,7 +259,7 @@ fn pumpPosix() void {
     }
 
     if (!conn.tickFrame()) {
-        std.debug.print("[copilot] 接続 deadline 超過（{d} frames）。close します\n", .{DEADLINE_FRAMES});
+        std.debug.print("[copilot] connection deadline exceeded ({d} frames); closing\n", .{DEADLINE_FRAMES});
         closeConn();
         return;
     }
@@ -274,33 +274,33 @@ fn closeConn() void {
     conn_active = false;
 }
 
-/// listener/接続 fd の readable 判定（timeout=0 の非ブロッキング poll 1 回）。
+/// Tests whether the listener or the connection fd is readable (a single non-blocking poll with timeout=0).
 fn fdReadable(fd: net.Socket.Handle) bool {
     var pfds = [_]posix.pollfd{.{ .fd = fd, .events = posix.POLL.IN | posix.POLL.ERR | posix.POLL.HUP, .revents = 0 }};
     const n = posix.poll(&pfds, 0) catch return false;
     if (n == 0) return false;
-    // POLLHUP は half-close 後の残データ読み取りに使う（read を尽くして read==0 で確定。§4 v1.3）。
+    // POLLHUP is used to read the data left after a half-close (settled by exhausting read until read==0).
     return pfds[0].revents & (posix.POLL.IN | posix.POLL.HUP) != 0;
 }
 
-/// 非ブロッキング accept（EAGAIN/EINTR は「このフレームでは進捗なし」= null。§4: EINTR も
-/// 同一 pump 内でリトライせず次フレームへ持ち越す＝signal 連打でフレームを占有しない。
-/// listener が nonblocking なので poll→accept 間で接続が消えても block しない）。
+/// A non-blocking accept (EAGAIN and EINTR mean "no progress this frame" = null. EINTR is not retried within the
+/// same pump either but carries over to the next frame, so a burst of signals cannot monopolise a frame.
+/// The listener is nonblocking, so losing the connection between the poll and the accept does not block).
 fn tryAccept() ?net.Socket.Handle {
     const rc = std.c.accept(server.socket.handle, null, null);
     switch (posix.errno(rc)) {
         .SUCCESS => return @intCast(rc),
         .INTR, .AGAIN => return null,
         else => |e| {
-            std.debug.print("[copilot] accept 失敗: {s}\n", .{@tagName(e)});
+            std.debug.print("[copilot] accept failed: {s}\n", .{@tagName(e)});
             return null;
         },
     }
 }
 
-/// fd を OS レベル nonblocking にする。失敗（F_GETFL/F_SETFL）は false（呼び出し側が
-/// listener なら transport 無効化・accepted fd なら接続破棄する。blocking fd のまま
-/// 進めると poll(0) 判定だけに頼る形になり §4 の非ブロッキング契約が崩れるため黙殺しない）。
+/// Makes an fd nonblocking at the OS level. A failure (F_GETFL or F_SETFL) gives false, on which the caller
+/// disables the transport for a listener, or discards the connection for an accepted fd. Carrying on with a
+/// blocking fd would leave everything resting on the poll(0) decision alone and break the non-blocking contract, so it is not swallowed.
 fn setNonblocking(fd: net.Socket.Handle) bool {
     const fl = std.c.fcntl(fd, posix.F.GETFL, @as(c_int, 0));
     if (fl < 0) return false;
@@ -308,14 +308,14 @@ fn setNonblocking(fd: net.Socket.Handle) bool {
     return std.c.fcntl(fd, posix.F.SETFL, fl | nonblock) >= 0;
 }
 
-/// 読める分だけ読む（nonblocking read。EAGAIN/EINTR=このフレームは進捗なし・次フレームへ持ち越し /
-/// read==0=half-close で確定）。raw `std.c.read` を使うのは、`posix.read` が EINTR を内部で
-/// 無制限リトライするため（§4: 同一 pump 内で無制限ループしない契約に揃える）。
+/// Reads whatever is available (a nonblocking read; EAGAIN and EINTR mean no progress this frame and carry over to the
+/// next, and read==0 settles the half-close). Raw `std.c.read` is used because `posix.read` retries EINTR internally
+/// without limit (matching the contract of never looping without limit within one pump).
 ///
-/// HUP の優先順（§4 v1.3）の担保: `fdReadable` が POLLIN|POLLHUP どちらでも true を返し、close の
-/// 判定はこの関数の **read の結果のみ**（read==0 かつ `finishRead()==false`=データ無し、または
-/// read エラー）で行う。POLLHUP ビットを見て直接 close する分岐は存在しないため、half-close 直後に
-/// 未読データと HUP が同時に届いても、まず read を尽くして正常 request として実行される。
+/// Upholding the priority of HUP: `fdReadable` returns true for either POLLIN or POLLHUP, and the decision to close
+/// rests on **the result of the read in this function alone** (read==0 together with `finishRead()==false`, meaning no
+/// data, or a read error). No branch inspects the POLLHUP bit and closes directly, so when unread data and a HUP arrive
+/// together right after a half-close, the read is exhausted first and the request runs normally.
 fn pumpRead() void {
     var chunks: usize = 0;
     var rbuf: [4096]u8 = undefined;
@@ -325,61 +325,61 @@ fn pumpRead() void {
             .SUCCESS => {
                 const n: usize = @intCast(rc);
                 if (n == 0) {
-                    // half-close = リクエスト確定。データ無し HUP は応答なしで close（§4 v1.3）。
+                    // a half-close settles the request. A HUP with no data closes with no response.
                     if (!conn.finishRead()) closeConn();
                     return;
                 }
                 conn.feed(rbuf[0..n]);
             },
-            .INTR, .AGAIN => return, // 次フレームへ持ち越し
+            .INTR, .AGAIN => return, // carried over to the next frame
             else => {
-                closeConn(); // read エラーは接続 close + 状態リセット
+                closeConn(); // a read error closes the connection and resets the state
                 return;
             },
         }
     }
 }
 
-/// 書ける分だけ送る（nonblocking send。読み取らない client が main thread を止めない。
-/// EAGAIN/EINTR はともに「このフレームでは進捗なし」= 次フレームへ持ち越し。§4）。
+/// Sends whatever fits (a nonblocking send, so a client that does not read cannot stall the main thread.
+/// EAGAIN and EINTR both mean "no progress this frame" = carried over to the next frame).
 fn pumpSend() void {
     while (conn.sent < conn.resp_len) {
         const rc = std.c.send(conn_fd, conn.resp[conn.sent..].ptr, conn.resp_len - conn.sent, posix.MSG.NOSIGNAL);
         switch (posix.errno(rc)) {
             .SUCCESS => conn.sent += @intCast(rc),
-            .INTR, .AGAIN => return, // 次フレームへ持ち越し
+            .INTR, .AGAIN => return, // carried over to the next frame
             else => {
-                closeConn(); // send 中の HUP/エラーは close
+                closeConn(); // a HUP or an error mid-send closes
                 return;
             },
         }
     }
-    closeConn(); // 送り切ったら close（1 接続 = 1 レスポンス）
+    closeConn(); // once it is all sent, close (one connection = one response)
 }
 
 // ============================================================================
-// ConnState（バイト列 state machine。fd から分離して socket 非依存で単体テスト可能）
+// ConnState (a byte-sequence state machine, separated from the fd so it is unit testable without a socket)
 // ============================================================================
 
 pub const Phase = enum { reading, executing, sending };
 
-/// 1 接続分の request/response 状態。read（feed/finishRead）→ execute（executeBudget）→
-/// send（transport 側が resp[sent..resp_len] を送る）の 3 フェーズをフレームを跨いで進める。
+/// The request and response state for one connection. It advances the three phases across frames: read (feed and
+/// finishRead), execute (executeBudget), then send (the transport side sends resp[sent..resp_len]).
 pub const ConnState = struct {
     phase: Phase = .reading,
     req: [MAX_WIRE]u8 = undefined,
     req_len: usize = 0,
     req_overflow: bool = false,
-    /// コマンド実行カーソル（budget 持ち越しの再開点）。
+    /// The command execution cursor (where a carried-over budget resumes).
     cursor: usize = 0,
     resp: [MAX_WIRE]u8 = undefined,
     resp_len: usize = 0,
     resp_truncated: bool = false,
-    /// 送信済みバイト数（transport 側が進める）。
+    /// How many bytes have been sent (the transport side advances it).
     sent: usize = 0,
     frames_alive: u32 = 0,
 
-    /// 固定長配列には触れずスカラーのみ初期化する（接続ごとの 128 KiB memset を避ける）。
+    /// Initialises the scalars only and leaves the fixed-length arrays alone (avoiding a 128 KiB memset per connection).
     pub fn reset(self: *ConnState) void {
         self.phase = .reading;
         self.req_len = 0;
@@ -391,7 +391,7 @@ pub const ConnState = struct {
         self.frames_alive = 0;
     }
 
-    /// 受信バイトを蓄積する（上限 MAX_WIRE。超過は overflow フラグ + 以降の read 破棄）。
+    /// Accumulates received bytes (up to MAX_WIRE; over the limit sets the overflow flag and discards later reads).
     pub fn feed(self: *ConnState, bytes: []const u8) void {
         if (self.phase != .reading or self.req_overflow) return;
         if (self.req_len + bytes.len > MAX_WIRE) {
@@ -402,8 +402,8 @@ pub const ConnState = struct {
         self.req_len += bytes.len;
     }
 
-    /// half-close（read==0）でリクエスト確定。戻り値 false = データ無し HUP（応答なしで close してよい）。
-    /// 上限超過は実行せず error 応答のみ（send フェーズへ直行）。
+    /// A half-close (read==0) settles the request. A false return means a HUP with no data (it is fine to close with no response).
+    /// Over the limit nothing runs and only an error response is produced (going straight to the send phase).
     pub fn finishRead(self: *ConnState) bool {
         if (self.phase != .reading) return true;
         if (self.req_overflow) {
@@ -416,13 +416,13 @@ pub const ConnState = struct {
         return true;
     }
 
-    /// 接続フレームカウンタ。deadline 超過で false（呼び出し側が close する）。
+    /// The connection's frame counter. Past the deadline it is false (and the caller closes).
     pub fn tickFrame(self: *ConnState) bool {
         self.frames_alive += 1;
         return self.frames_alive <= DEADLINE_FRAMES;
     }
 
-    /// 1 pump あたり最大 CMD_BUDGET 個のコマンドを実行する。全消化で send フェーズへ。
+    /// Runs at most CMD_BUDGET commands per pump. Once they are all consumed, on to the send phase.
     pub fn executeBudget(self: *ConnState) void {
         if (self.phase != .executing) return;
         var executed: usize = 0;
@@ -436,10 +436,10 @@ pub const ConnState = struct {
             executeCommand(self, line);
             executed += 1;
         }
-        // budget 消化。残りは次フレームへ持ち越し（phase は .executing のまま）
+        // the budget is spent; the rest carries over to the next frame (the phase stays .executing)
     }
 
-    /// 次のコマンド片を返す（区切りは改行または `;`。harness のコマンド言語と同じ）。尽きたら null。
+    /// Returns the next command fragment (separated by a newline or `;`, as in harness's command language), or null once exhausted.
     fn nextLine(self: *ConnState) ?[]const u8 {
         if (self.cursor >= self.req_len) return null;
         const start = self.cursor;
@@ -449,7 +449,7 @@ pub const ConnState = struct {
         return self.req[start..end];
     }
 
-    /// レスポンス追記（上限 MAX_WIRE - truncated 行の予約。超過分は打ち切り + フラグ）。
+    /// Appends to the response (up to MAX_WIRE minus the reservation for the truncated line; the excess is cut and the flag set).
     fn appendResp(self: *ConnState, s: []const u8) void {
         if (self.resp_truncated) return;
         const limit = MAX_WIRE - TRUNCATED_LINE.len;
@@ -463,7 +463,7 @@ pub const ConnState = struct {
 
     fn beginSend(self: *ConnState) void {
         if (self.resp_truncated) {
-            // appendResp が TRUNCATED_LINE.len 分を常に予約しているので必ず入る
+            // appendResp always reserves TRUNCATED_LINE.len, so this always fits
             @memcpy(self.resp[self.resp_len..][0..TRUNCATED_LINE.len], TRUNCATED_LINE);
             self.resp_len += TRUNCATED_LINE.len;
         }
@@ -472,10 +472,10 @@ pub const ConnState = struct {
 };
 
 // ============================================================================
-// コマンド言語（harness のサブセット + transaction 制御。§5）
-//   observe: digest <probe> / snapshot <probe> <path>   … 失敗は `error: <reason>` 行
+// The command language (a subset of harness's, plus transaction control)
+//   observe: digest <probe> / snapshot <probe> <path>   … a failure is an `error: <reason>` line
 //   operate: action <name> [args...] / begin_tx [label] / end_tx / cancel_tx
-//            … 成功 `<name> <msg>` / `ok tx=<id>` / `ok`、失敗 `fail <name> <reason>` 行
+//            … success `<name> <msg>` / `ok tx=<id>` / `ok`; failure a `fail <name> <reason>` line
 // ============================================================================
 
 fn executeCommand(conn_state: *ConnState, line: []const u8) void {
@@ -494,15 +494,15 @@ fn executeCommand(conn_state: *ConnState, line: []const u8) void {
     } else if (std.mem.eql(u8, cmd, "cancel_tx")) {
         handleCancelTx(conn_state);
     } else if (std.mem.eql(u8, cmd, "quit")) {
-        // アプリ寿命の所有者は人間（harness=検証との分界）
+        // the application's lifetime is owned by the user (the dividing line against harness, which is for verification)
         failResp(conn_state, "quit", "unsupported (app lifetime is owned by the user)");
     } else {
         failResp(conn_state, cmd, "unknown command");
     }
 }
 
-/// 組み込み probe のうち copilot 非公開のもの（fb 捕捉の per-frame memcpy 等を通常 UX に足さない。
-/// 観察は custom probe + capabilities で足りる。将来 additive に拡張可）。
+/// The built-in probes copilot does not expose (so that per-frame memcpy for framebuffer capture and the like is not
+/// added to the ordinary UX. Custom probes plus capabilities are enough to observe with, and this can be widened additively).
 fn isCopilotUnavailableBuiltin(name: []const u8) bool {
     return std.mem.eql(u8, name, "fb") or std.mem.eql(u8, name, "audio") or std.mem.eql(u8, name, "stats") or
         std.mem.eql(u8, name, "capture") or std.mem.eql(u8, name, "gamepad");
@@ -518,8 +518,8 @@ fn failResp(conn_state: *ConnState, name: []const u8, reason: []const u8) void {
     failRespEx(conn_state, name, reason, false);
 }
 
-/// action run 失敗専用: app が `setActionErrorDetail` 済みなら末尾に ` code=<c> next=<n>` を追記
-/// （TASK-62.5.9。未セット時は `failResp` と同じ = 従来 bit 一致。行頭 `fail ` 不変）。
+/// For an action run failure only: when the application has called `setActionErrorDetail`, ` code=<c> next=<n>` is appended.
+/// (With none set this is identical to `failResp`, bit-for-bit as before. The leading `fail ` never changes.)
 fn failActionResp(conn_state: *ConnState, name: []const u8, reason: []const u8) void {
     failRespEx(conn_state, name, reason, true);
 }
@@ -540,7 +540,7 @@ fn failRespEx(conn_state: *ConnState, name: []const u8, reason: []const u8, with
     conn_state.appendResp("\n");
 }
 
-/// `msg` を最初の `\r`/`\n` の手前で切る（wire framing 保護。harness reportAction と同じ防御）。
+/// Cuts `msg` at the first CR or LF (protecting the wire framing, the same defence as harness's reportAction).
 fn firstLine(msg: []const u8) []const u8 {
     const nl = std.mem.indexOfScalar(u8, msg, '\n');
     const cr = std.mem.indexOfScalar(u8, msg, '\r');
@@ -548,7 +548,7 @@ fn firstLine(msg: []const u8) []const u8 {
     return msg[0..cut];
 }
 
-/// digest: custom probe + `capabilities` のみ（組み込み fb/audio/stats/capture/gamepad は対象外）。
+/// digest: custom probes plus `capabilities` only (the built-in fb, audio, stats, capture and gamepad are out of scope).
 fn handleDigestCmd(conn_state: *ConnState, it: *std.mem.TokenIterator(u8, .any)) void {
     const probe = it.next() orelse return errorResp(conn_state, "digest: missing probe name");
     if (std.mem.eql(u8, probe, "capabilities")) {
@@ -569,7 +569,7 @@ fn handleDigestCmd(conn_state: *ConnState, it: *std.mem.TokenIterator(u8, .any))
     conn_state.appendResp("\n");
 }
 
-/// snapshot: custom probe の raw bytes を明示 path（必須）へ書き、path を返す。
+/// snapshot: writes a custom probe's raw bytes to an explicit path (required) and returns the path.
 fn handleSnapshotCmd(conn_state: *ConnState, it: *std.mem.TokenIterator(u8, .any)) void {
     const probe = it.next() orelse return errorResp(conn_state, "snapshot: missing probe name");
     const path = it.next() orelse return errorResp(conn_state, "snapshot: path required");
@@ -580,29 +580,29 @@ fn handleSnapshotCmd(conn_state: *ConnState, it: *std.mem.TokenIterator(u8, .any
     const snap = p.snapshot orelse return errorResp(conn_state, "snapshot unsupported");
     ensureIo();
     const bytes = snap(p.ctx, gpa) catch |err| {
-        std.debug.print("[copilot] snapshot {s} 失敗: {s}\n", .{ probe, @errorName(err) });
+        std.debug.print("[copilot] snapshot {s} failed: {s}\n", .{ probe, @errorName(err) });
         return errorResp(conn_state, "snapshot failed");
     };
     defer gpa.free(bytes);
     std.Io.Dir.cwd().writeFile(io_val, .{ .sub_path = path, .data = bytes }) catch |err| {
-        std.debug.print("[copilot] snapshot {s} 書き込み失敗 {s}: {s}\n", .{ probe, path, @errorName(err) });
+        std.debug.print("[copilot] snapshot {s} failed to write {s}: {s}\n", .{ probe, path, @errorName(err) });
         return errorResp(conn_state, "snapshot write failed");
     };
     conn_state.appendResp(path);
     conn_state.appendResp("\n");
 }
 
-/// action: executor 経由で実行し `actor=local_agent` で記録する（open 中の tx があればタグ付け）。
+/// action: runs it through the executor and records it with `actor=local_agent` (tagging it if a transaction is open).
 fn handleActionCmd(conn_state: *ConnState, it: *std.mem.TokenIterator(u8, .any)) void {
     const name = it.next() orelse return failResp(conn_state, "?", "missing action name");
     if (netsync_active) return failResp(conn_state, name, "netsync session active (operate disabled)");
     const args = std.mem.trim(u8, it.rest(), " \t");
     var buf: [harness.DIGEST_BUF_LEN]u8 = undefined;
     if (shared_executor != null) {
-        // 共有 executor 設定時: registry の run を直接呼ぶ（app 側 wrapper が executor 経由の
-        // 記録を一元化しているため、ここで own executor を通すと二重記録/ReentrantDispatch になる）。
+        // With a shared executor set: call the registry's run directly (the application wrapper centralises recording
+        // through the executor, so passing through the own executor here would double-record or be a ReentrantDispatch).
         const act = harness.findAction(name) orelse return failResp(conn_state, name, "unknown action");
-        // direct-run は action_registry.dispatch を経由しないので structured error を手動クリア
+        // a direct run does not pass through action_registry.dispatch, so clear the structured error by hand
         harness.action_registry.clearActionErrorDetail();
         const result = act.run(act.ctx, args, &buf) catch |err| {
             return failActionResp(conn_state, name, @errorName(err));
@@ -662,13 +662,13 @@ fn handleCancelTx(conn_state: *ConnState) void {
 }
 
 // ============================================================================
-// tests（socket 非依存の直叩き中心。実 socket・並行 UX 非干渉は E2E で確認）
-// 名前は "copilot:" prefix（build.zig の test-copilot step が filter で選別する）。
+// tests (mostly calling directly, without a socket. A real socket and non-interference with a concurrent UX are checked by the E2E)
+// The names are prefixed "copilot:" (build.zig's test-copilot step selects them by filter).
 // ============================================================================
 
 const testing = std.testing;
 
-/// copilot module 状態のテスト用リセット（transport は起動しない）。
+/// A test reset of copilot's module state (it does not start the transport).
 fn resetCopilotForTest() void {
     ensureIo();
     initExecutorState();
@@ -676,11 +676,11 @@ fn resetCopilotForTest() void {
     enabled = false;
     shared_executor = null;
     harness.setExternalRegistryEnabled(false);
-    // false は action_registry に伝わらないため、無効化は resetForTest 必須（TASK-62.3.1）。
+    // false does not reach action_registry, so disabling requires resetForTest.
     harness.action_registry.resetForTest();
 }
 
-/// テスト用 convenience: 1 リクエスト分の bytes を ConnState に通し全コマンドを実行、応答 slice を返す。
+/// A test convenience: feed one request's bytes through a ConnState, run every command, and return the response slice.
 fn handleRequest(cs: *ConnState, bytes: []const u8) []const u8 {
     cs.reset();
     cs.feed(bytes);
@@ -718,20 +718,20 @@ fn testProbeSnapshot(ctx: *anyopaque, allocator: std.mem.Allocator) anyerror![]u
     return allocator.dupe(u8, "SNAPBYTES");
 }
 
-test "copilot: 1 env未設定は no-op（isEnabled=false・pump no-op・register は従来通り no-op）" {
+test "copilot: 1 with the environment unset it is a no-op (isEnabled=false, pump a no-op, register a no-op as before)" {
     resetCopilotForTest();
     try testing.expect(!isEnabled());
-    pump(); // disabled → 即 return（クラッシュしないこと）
-    // harness disabled + external gate off → registerAction は no-op
+    pump(); // disabled → return at once (and do not crash)
+    // harness disabled plus the external gate off → registerAction is a no-op
     try testing.expect(!harness.isEnabled());
     var c = TestActionCtx{};
     harness.registerAction(.{ .name = "copilot_noreg", .ctx = &c, .run = testActionPing });
     try testing.expect(harness.findAction("copilot_noreg") == null);
 }
 
-test "copilot: 2 OR ゲート（setExternalRegistryEnabled で registerProbe/registerAction が registry へ入る）" {
+test "copilot: 2 the OR gate, so setExternalRegistryEnabled lets registerProbe and registerAction reach the registry" {
     resetCopilotForTest();
-    try testing.expect(!harness.isEnabled()); // 前提: harness は disabled のまま
+    try testing.expect(!harness.isEnabled()); // the premise: harness stays disabled
     harness.setExternalRegistryEnabled(true);
     defer {
         harness.setExternalRegistryEnabled(false);
@@ -745,7 +745,7 @@ test "copilot: 2 OR ゲート（setExternalRegistryEnabled で registerProbe/reg
     try testing.expect(harness.findProbe("copilot_gate_p") != null);
 }
 
-test "copilot: 3 action 応答形式 + CommandLog に actor=local_agent kind=normal で記録" {
+test "copilot: 3 the action response format, plus a CommandLog record with actor=local_agent and kind=normal" {
     resetCopilotForTest();
     harness.setExternalRegistryEnabled(true);
     defer {
@@ -766,10 +766,10 @@ test "copilot: 3 action 応答形式 + CommandLog に actor=local_agent kind=nor
     try testing.expectEqual(command.CommandKind.normal, rec.kind);
     try testing.expectEqualStrings("ping", rec.name());
     try testing.expectEqualStrings("hello", rec.args());
-    try testing.expect(!rec.undoable); // noteUndo 呼び出し元がまだ無い（62.5.3 で pixie が対応）
+    try testing.expect(!rec.undoable); // there is no caller of noteUndo yet
 }
 
-test "copilot: 3b failActionResp に structured error（code=/next=）/ 未セット時 bit 一致 / fail 行頭" {
+test "copilot: 3b failActionResp carries the structured error (code= and next=), is bit-identical when unset, and keeps the leading fail" {
     resetCopilotForTest();
     harness.setExternalRegistryEnabled(true);
     defer {
@@ -784,16 +784,16 @@ test "copilot: 3b failActionResp に structured error（code=/next=）/ 未セ�
     try testing.expect(std.mem.startsWith(u8, resp1, "fail boom "));
     try testing.expectEqualStrings("fail boom Boom code=file_not_found next=check path or use save first\n", resp1);
 
-    // dispatch 相当のクリア: 次の失敗（detail 未セット）は従来形式と bit 一致
+    // the equivalent of dispatch's clear: the next failure, with no detail set, is bit-identical to the old format
     const resp2 = handleRequest(&cs, "action boom noset");
     try testing.expectEqualStrings("fail boom Boom\n", resp2);
 
-    // 非 action 失敗（begin_tx 等）は detail を付けない
+    // a non-action failure (begin_tx and friends) attaches no detail
     const resp3 = handleRequest(&cs, "end_tx");
     try testing.expectEqualStrings("fail end_tx no open transaction\n", resp3);
 }
 
-test "copilot: 4 begin_tx→action→end_tx で transaction_id が付く / 二重 begin・handle 不整合は fail" {
+test "copilot: 4 begin_tx then action then end_tx attaches a transaction_id, while a doubled begin or an inconsistent handle fails" {
     resetCopilotForTest();
     harness.setExternalRegistryEnabled(true);
     defer {
@@ -810,23 +810,23 @@ test "copilot: 4 begin_tx→action→end_tx で transaction_id が付く / 二�
     try testing.expectEqual(@as(?u64, 1), rec.transaction_id);
     try testing.expect(open_tx == null);
 
-    // 二重 begin は 2 回目が fail
+    // a doubled begin fails the second time
     const resp2 = handleRequest(&cs, "begin_tx a; begin_tx b");
     try testing.expectEqualStrings("ok tx=2\nfail begin_tx transaction already open\n", resp2);
     _ = handleRequest(&cs, "end_tx");
 
-    // open が無い end_tx / cancel_tx は fail（handle 不整合の wire 表現）
+    // an end_tx or cancel_tx with nothing open fails (the wire's expression of an inconsistent handle)
     const resp3 = handleRequest(&cs, "end_tx; cancel_tx");
     try testing.expectEqualStrings("fail end_tx no open transaction\nfail cancel_tx no open transaction\n", resp3);
 
-    // cancel_tx 後の action は tx タグ無し
+    // an action after cancel_tx carries no transaction tag
     const resp4 = handleRequest(&cs, "begin_tx m2; cancel_tx; action ping y");
     try testing.expect(std.mem.endsWith(u8, resp4, "ping pong y\n"));
     const rec_last = command_log.findBySeq(command_log.next_seq - 1).?;
     try testing.expectEqual(@as(?u64, null), rec_last.transaction_id);
 }
 
-test "copilot: 5 netsync session 中は operate 拒否・observe は許可（AC #3）" {
+test "copilot: 5 during a netsync session an operate is rejected and an observe is allowed" {
     resetCopilotForTest();
     harness.setExternalRegistryEnabled(true);
     defer {
@@ -850,14 +850,14 @@ test "copilot: 5 netsync session 中は operate 拒否・observe は許可（AC 
             "fail cancel_tx netsync session active (operate disabled)\n",
         resp,
     );
-    try testing.expectEqual(@as(u32, 0), ac.calls); // dispatch されていない
-    try testing.expectEqual(@as(u32, 0), command_log.filled); // 記録もされない
+    try testing.expectEqual(@as(u32, 0), ac.calls); // not dispatched
+    try testing.expectEqual(@as(u32, 0), command_log.filled); // and not recorded either
 
-    // observe（digest）は許可
+    // an observe (digest) is allowed
     const resp2 = handleRequest(&cs, "digest cp_probe; digest capabilities");
     try testing.expect(std.mem.startsWith(u8, resp2, "cp_probe value=42\ncapabilities {"));
 
-    // observe（snapshot）も許可（netsync 中に拒否されるのは operate の 4 コマンドのみ）
+    // an observe (snapshot) is allowed too (only the four operate commands are rejected during netsync)
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     var path_buf: [160]u8 = undefined;
@@ -872,7 +872,7 @@ test "copilot: 5 netsync session 中は operate 拒否・observe は許可（AC 
     try testing.expectEqualStrings("SNAPBYTES", written);
 }
 
-test "copilot: 6 digest/snapshot/未知の応答形式（capabilities/custom/明示 path/fail 形式/quit 非対応）" {
+test "copilot: 6 the response formats for digest, snapshot and the unknown (capabilities, custom, an explicit path, the fail form, quit unsupported)" {
     resetCopilotForTest();
     harness.setExternalRegistryEnabled(true);
     defer {
@@ -883,13 +883,13 @@ test "copilot: 6 digest/snapshot/未知の応答形式（capabilities/custom/明
     harness.registerProbe(.{ .name = "cp_probe", .ctx = &pc, .digest = testProbeDigest, .snapshot = testProbeSnapshot });
 
     var cs: ConnState = undefined;
-    // digest: custom / capabilities / 組み込み非公開 / 未知
+    // digest: custom, capabilities, a built-in that is not exposed, and an unknown one
     try testing.expectEqualStrings("cp_probe value=9\n", handleRequest(&cs, "digest cp_probe"));
     try testing.expect(std.mem.startsWith(u8, handleRequest(&cs, "digest capabilities"), "capabilities {\"probes\":["));
     try testing.expectEqualStrings("error: probe not available via copilot (custom probes + capabilities only)\n", handleRequest(&cs, "digest fb"));
     try testing.expectEqualStrings("error: unknown probe\n", handleRequest(&cs, "digest nosuch"));
 
-    // snapshot: 明示 path へ書き path を返す / path 省略は error
+    // snapshot: writes to an explicit path and returns it; omitting the path is an error
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     var path_buf: [160]u8 = undefined;
@@ -904,13 +904,13 @@ test "copilot: 6 digest/snapshot/未知の応答形式（capabilities/custom/明
     try testing.expectEqualStrings("SNAPBYTES", written);
     try testing.expectEqualStrings("error: snapshot: path required\n", handleRequest(&cs, "snapshot cp_probe"));
 
-    // 未知 action / 未知コマンド / quit 非対応
+    // an unknown action, an unknown command, and quit being unsupported
     try testing.expectEqualStrings("fail nosuch unknown action\n", handleRequest(&cs, "action nosuch x"));
     try testing.expectEqualStrings("fail bogus unknown command\n", handleRequest(&cs, "bogus 1 2"));
     try testing.expect(std.mem.startsWith(u8, handleRequest(&cs, "quit"), "fail quit "));
 }
 
-test "copilot: 7 リクエスト 64KiB 超過で error 応答（実行されない）" {
+test "copilot: 7 a request over 64KiB gets an error response and is not run" {
     resetCopilotForTest();
     var cs: ConnState = undefined;
     cs.reset();
@@ -920,24 +920,24 @@ test "copilot: 7 リクエスト 64KiB 超過で error 応答（実行されな�
     while (fed <= MAX_WIRE) : (fed += chunk.len) cs.feed(&chunk);
     try testing.expect(cs.req_overflow);
     try testing.expect(cs.finishRead());
-    try testing.expectEqual(Phase.sending, cs.phase); // 実行フェーズを踏まない
+    try testing.expectEqual(Phase.sending, cs.phase); // the execute phase is never entered
     try testing.expectEqualStrings("error: request too large\n", cs.resp[0..cs.resp_len]);
 }
 
-test "copilot: 8 排他（VP_HARNESS_* 併用時は copilot 無効）" {
-    try testing.expect(!decideEnabled(true, true)); // harness env があれば無効
+test "copilot: 8 mutual exclusion, so copilot is disabled alongside VP_HARNESS_*" {
+    try testing.expect(!decideEnabled(true, true)); // the presence of a harness variable disables it
     try testing.expect(decideEnabled(true, false));
     try testing.expect(!decideEnabled(false, false));
     try testing.expect(!decideEnabled(false, true));
 }
 
-// カバレッジ限界の明記: POLLIN|POLLHUP 同時到着時の実 socket タイミング（half-close 直後の
-// 未読データ + HUP）は unit test では決定的に再現できない（OS のバッファリング依存で脆いテストに
-// なるため追加しない）。コード上の担保は `pumpRead` の doc comment のとおり「close 判定は read の
-// 結果のみ・POLLHUP ビットで直接 close しない」構造で、ConnState 層の等価分岐（データ有り=実行 /
-// データ無し=close）は下のテストが直接叩く。実 socket 経路は E2E（scripts/drive。drive は
-// write→half-close→read の順で必ずこの経路を通る）で担保する。
-test "copilot: 9 ConnState transport 挙動（partial feed/一度だけ実行/truncated/deadline/budget 持ち越し）" {
+// The limit of this coverage, stated plainly: the real-socket timing of POLLIN and POLLHUP arriving together (unread
+// data plus a HUP right after a half-close) cannot be reproduced deterministically in a unit test (it depends on the
+// OS's buffering and would make a brittle test, so it is not added). What upholds it in the code is the structure
+// described in `pumpRead`'s doc comment — "the close decision rests on the read result alone, and no POLLHUP bit
+// closes directly" — and the equivalent branches at the ConnState layer (data present = run / no data = close) are
+// exercised directly by the tests below. The real socket path is upheld by the E2E (scripts/drive always takes it, going write → half-close → read).
+test "copilot: 9 ConnState transport behaviour (a partial feed, running exactly once, truncated, the deadline, the budget carrying over)" {
     resetCopilotForTest();
     harness.setExternalRegistryEnabled(true);
     defer {
@@ -947,13 +947,13 @@ test "copilot: 9 ConnState transport 挙動（partial feed/一度だけ実行/tr
     var ac = TestActionCtx{};
     harness.registerAction(.{ .name = "ping", .ctx = &ac, .run = testActionPing });
 
-    // データ無し HUP: 1 byte も受けずに half-close → finishRead()=false（transport が応答なしで close）
+    // A HUP with no data: half-close without receiving a single byte → finishRead()=false (the transport closes with no response)
     var cs: ConnState = undefined;
     cs.reset();
     try testing.expect(!cs.finishRead());
 
-    // データ有り HUP: 未読データがあれば HUP が同時でも実行フェーズへ進む（partial feed →
-    // half-close で一度だけ実行）
+    // A HUP with data: if there is unread data the execute phase is reached even with a simultaneous HUP (a partial feed,
+    // then a half-close, running exactly once)
     cs.reset();
     cs.feed("action pi");
     cs.feed("ng abc");
@@ -962,10 +962,10 @@ test "copilot: 9 ConnState transport 挙動（partial feed/一度だけ実行/tr
     try testing.expectEqual(Phase.sending, cs.phase);
     try testing.expectEqualStrings("ping pong abc\n", cs.resp[0..cs.resp_len]);
     try testing.expectEqual(@as(u32, 1), ac.calls);
-    cs.executeBudget(); // .sending 以降は no-op（再実行されない）
+    cs.executeBudget(); // from .sending on it is a no-op (nothing runs twice)
     try testing.expectEqual(@as(u32, 1), ac.calls);
 
-    // 応答 64KiB 超過で truncated 行
+    // a response over 64KiB gets a truncated line
     cs.reset();
     var big: [4096]u8 = undefined;
     @memset(&big, 'x');
@@ -975,7 +975,7 @@ test "copilot: 9 ConnState transport 挙動（partial feed/一度だけ実行/tr
     cs.beginSend();
     try testing.expect(std.mem.endsWith(u8, cs.resp[0..cs.resp_len], TRUNCATED_LINE));
 
-    // deadline: DEADLINE_FRAMES 回までは true、超過で false（close 判定）
+    // deadline: true up to DEADLINE_FRAMES times, false beyond it (the close decision)
     cs.reset();
     var i: u32 = 0;
     while (i < DEADLINE_FRAMES) : (i += 1) {
@@ -983,7 +983,7 @@ test "copilot: 9 ConnState transport 挙動（partial feed/一度だけ実行/tr
     }
     try testing.expect(!cs.tickFrame());
 
-    // budget 持ち越し: 17 コマンドは 2 pump に分割実行される
+    // budget carry-over: 17 commands are split across 2 pumps
     ac.calls = 0;
     cs.reset();
     var req: std.ArrayList(u8) = .empty;
@@ -995,14 +995,14 @@ test "copilot: 9 ConnState transport 挙動（partial feed/一度だけ実行/tr
     cs.feed(req.items);
     try testing.expect(cs.finishRead());
     cs.executeBudget();
-    try testing.expectEqual(@as(u32, CMD_BUDGET), ac.calls); // 1 pump 目は budget 分だけ
-    try testing.expectEqual(Phase.executing, cs.phase); // 持ち越し
+    try testing.expectEqual(@as(u32, CMD_BUDGET), ac.calls); // the first pump does only the budget's worth
+    try testing.expectEqual(Phase.executing, cs.phase); // carried over
     cs.executeBudget();
-    try testing.expectEqual(@as(u32, CMD_BUDGET + 1), ac.calls); // 2 pump 目で残りを消化
+    try testing.expectEqual(@as(u32, CMD_BUDGET + 1), ac.calls); // the second pump consumes the rest
     try testing.expectEqual(Phase.sending, cs.phase);
 }
 
-test "copilot: 10 setSharedExecutor（action は own-log 非記録の直 dispatch / tx は共有 executor / 未設定時は従来挙動）" {
+test "copilot: 10 setSharedExecutor (an action is a direct dispatch not recorded in the own log, a transaction goes to the shared executor, and unset restores the old behaviour)" {
     resetCopilotForTest();
     harness.setExternalRegistryEnabled(true);
     defer {
@@ -1012,39 +1012,39 @@ test "copilot: 10 setSharedExecutor（action は own-log 非記録の直 dispatc
     var ac = TestActionCtx{};
     harness.registerAction(.{ .name = "ping", .ctx = &ac, .run = testActionPing });
 
-    // 共有 executor（app 所有想定。ここではテストローカル）を設定
+    // set a shared executor (the application would own it; here it is local to the test)
     var shared_log: command.CommandLog = .{};
     var shared_exec = command.Executor.init(.{ .ctx = undefined, .run = dispatchHarnessAction });
     shared_exec.log = &shared_log;
     setSharedExecutor(&shared_exec);
     defer setSharedExecutor(null);
 
-    // action: own-log に記録されず直 dispatch される（記録は app wrapper の責務 = ここでは無記録）
+    // action: dispatched directly without reaching the own log (recording is the application wrapper's job, so here nothing is recorded)
     var cs: ConnState = undefined;
     const resp = handleRequest(&cs, "action ping hello");
     try testing.expectEqualStrings("ping pong hello\n", resp);
-    try testing.expectEqual(@as(u32, 1), ac.calls); // dispatch はされる
-    try testing.expectEqual(@as(u32, 0), command_log.filled); // own-log には記録されない
-    try testing.expectEqual(@as(u32, 0), shared_log.filled); // executor 経由でもない（app wrapper が居ないので無記録）
+    try testing.expectEqual(@as(u32, 1), ac.calls); // the dispatch does happen
+    try testing.expectEqual(@as(u32, 0), command_log.filled); // nothing lands in the own log
+    try testing.expectEqual(@as(u32, 0), shared_log.filled); // nor through the executor (with no application wrapper there is no record)
 
-    // begin_tx は共有 executor に開き、openTransactionFor(.local_agent) で見える
+    // begin_tx opens on the shared executor and is visible through openTransactionFor(.local_agent)
     const resp2 = handleRequest(&cs, "begin_tx macro");
     try testing.expectEqualStrings("ok tx=1\n", resp2);
     try testing.expect(shared_exec.openTransactionFor(.local_agent) != null);
-    try testing.expect(executor.openTransactionFor(.local_agent) == null); // own executor は無関係
+    try testing.expect(executor.openTransactionFor(.local_agent) == null); // the own executor is unrelated
     const resp3 = handleRequest(&cs, "end_tx");
     try testing.expectEqualStrings("ok\n", resp3);
     try testing.expect(shared_exec.openTransactionFor(.local_agent) == null);
 
-    // 未設定へ戻すと従来挙動（own executor 経由で own-log に記録される）
+    // putting it back to unset restores the old behaviour (recorded in the own log through the own executor)
     setSharedExecutor(null);
     const resp4 = handleRequest(&cs, "action ping x");
     try testing.expectEqualStrings("ping pong x\n", resp4);
-    try testing.expectEqual(@as(u32, 1), command_log.filled); // own-log に記録
+    try testing.expectEqual(@as(u32, 1), command_log.filled); // recorded in the own log
     try testing.expect(command_log.latest().?.actor.eql(.local_agent));
 }
 
-test "copilot: 8 netsync session callback 配線で operate 拒否・終了で復帰" {
+test "copilot: 8 wiring the netsync session callback rejects an operate, and ending it restores" {
     resetCopilotForTest();
     harness.netsync.resetForTest();
     harness.setExternalRegistryEnabled(true);
@@ -1060,7 +1060,7 @@ test "copilot: 8 netsync session callback 配線で operate 拒否・終了で�
     harness.registerAction(.{ .name = "ping", .ctx = &ac, .run = testActionPing });
     harness.registerProbe(.{ .name = "cp_probe", .ctx = &pc, .digest = testProbeDigest, .snapshot = testProbeSnapshot });
 
-    // platform.init 相当（callback は enableRouter より前）
+    // the equivalent of platform.init (the callback comes before enableRouter)
     harness.netsync.setSessionStateCallback(setNetsyncSessionActive);
     harness.netsync.initHost(0);
     try testing.expect(netsync_active);
