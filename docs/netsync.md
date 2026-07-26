@@ -1,0 +1,228 @@
+# Networked concurrent editing (netsync)
+
+Several editor processes edit the same document at once over a persistent TCP
+connection, with the host as the authority (propose/commit). The implementation is
+`core/control/netsync.zig` plus `action_registry.NetworkPolicy`. With its environment
+variables unset it passes through completely.
+
+## Environment variables
+
+| Variable | Meaning |
+|---|---|
+| `VP_NETSYNC_HOST=1` | listen as the host (`VP_NETSYNC_PORT` required) |
+| `VP_NETSYNC_PORT` | the host's listen port |
+| `VP_NETSYNC_CONNECT=ip:port` | connect as a client |
+| `VP_NETSYNC_ACTOR=human\|agent` | the actor kind in the client's HELLO (default `human`; an invalid value warns and falls back to human) |
+| `VP_NETSYNC_LABEL=<display name>` | the display label in the client's HELLO (default `client`, at most 200 bytes) |
+
+Specifying `HOST` and `CONNECT` together disables netsync. A failure to listen or
+connect is fail-soft (the application continues without netsync).
+
+**Relationship with the copilot transport**: during a netsync session, the copilot
+transport's operate commands (`action`, `begin_tx`, `end_tx`, `cancel_tx`) are
+rejected (observe — digest and snapshot — is still allowed). An agent's operations go
+through a dedicated peer connection with `VP_NETSYNC_ACTOR=agent`.
+
+**The teardown contract**: the `Executor` is a borrow owned by the caller, and
+`platform.shutdown` drops the netsync and copilot borrows before the teardown that
+follows freeing App.
+
+## The frame format
+
+```
+Frame = { kind: u8, len: u32 LE, payload: [len]u8 }
+```
+
+| kind | Value | Payload |
+|---|---|---|
+| HELLO | `0x01` | text (client→host and host→client) |
+| PROPOSE | `0x02` | `u32 LE proposal_id` ++ `"<name> <args>"` (client→host) |
+| COMMIT | `0x03` | `u64 LE seq` ++ `u32 LE origin_peer` ++ `"<name> <args>"` (host→clients; not sent to the host itself) |
+| SYNC | `0x04` | `u64 LE seq` ++ state bytes (host→client, once on join; an empty state means no snapshot) |
+| REJECT | `0x05` | `u32 LE proposal_id` ++ `"<reason>"` (host→the proposer only) |
+| PROPOSE_REVERT | `0x06` | a client proposing to revert one of its own commits (see undo below) |
+| COMMIT_REVERT | `0x07` | the host committing a revert to every client |
+| PEER_INFO | `0x08` | `u32 LE peer_id ++ u8 kind ++ label` (see peer info distribution below) |
+
+The limit for action frames is `MAX_ACTION_FRAME_BYTES` (4096). SYNC uses a big entry
+(on the heap) up to `MAX_SYNC_BYTES` (16MiB). Exceeding either closes that connection.
+
+## SYNC on join
+
+1. Host: HELLO succeeds → a ClientJoined (an internal kind carrying the peer id and
+   generation) goes onto the inbound queue → the pump exports state → a
+   SYNC(seq=`wire_seq`) is enqueued as a big entry on the outbound FIFO → `synced=true`.
+   Broadcasts go only to synced slots.
+2. If no exporter is registered, an empty SYNC with a state of zero bytes is sent and
+   `snapshot_valid=false`. A registered exporter returning zero bytes is treated as a
+   failure (the connection is closed).
+3. Client: on connecting, `awaiting_sync=true`. Until it clears, the pump does not
+   enter the inbound dequeue loop (COMMITs accumulate in the queue). A SYNC goes to the
+   heap-allocated `pending_sync` (a later one replaces it). An empty SYNC clears the
+   flag with no import. An import failure is fail-soft, leaving the pending COMMITs
+   unapplied.
+4. All four applications just call their existing serialisation
+   (the editor's `document_io`, the synth's `patch_io`, the modular engine's
+   `pattern_io`, the patch canvas's `graph_io`) through a thin `registerStateSync`.
+
+## NetworkPolicy
+
+| Value | Host | Client |
+|---|---|---|
+| `.relay` | apply locally → fan out a COMMIT | PROPOSE only (the response is `"proposed <id>"`; application follows in the COMMIT) |
+| `.local_only` | local only (no broadcast) | local only (no PROPOSE) |
+| `.reject_when_synced` | immediately `RejectedWhileSynced` | the same |
+| `.undo_own` / `.redo_own` | revert your own latest undoable / re-commit the most recent revert | PROPOSE_REVERT / a PROPOSE of the original command |
+
+The default is `.reject_when_synced`. In the editor: `stroke` is `.relay` (the
+originator's tool, colour, size, opacity and hardness plus `layer=#<id>` are made
+canonical); `set_color` and `set_tool` are `.local_only` (per-peer UI state); `save` is
+`.local_only`. The layer structure operations (add, delete, visible, opacity, move and
+so on) have been promoted to `.relay`.
+
+## The propose/commit/reject flow
+
+1. A client runs a `.relay` action → `proposed <id>` is returned immediately and a
+   PROPOSE is sent to the host (nothing is applied locally).
+2. The host re-verifies `network_policy == .relay` → applies it → sends a COMMIT to
+   every client (on failure, a REJECT to the proposer).
+3. Each client applies the COMMIT it receives (including ones it originated; this does
+   not go through the router).
+4. A REJECT warns and is stored in `last_rejected_proposal` and `last_reject_reason`
+   (the data source for the observation probe).
+
+**Applying remote commands**: every wire commit is recorded in the `CommandLog` with
+`source=.remote_commit{seq}`. Local recording during a session is suppressed by
+`wire_session`.
+
+## The two-process procedure (deterministic waiting via probes)
+
+```bash
+# Start up (sleeping is acceptable only while waiting for the port file to appear;
+# netsync is on 9110 and the port files live in the workspace's .e2e)
+mkdir -p .e2e
+VP_HEADLESS=1 VP_HARNESS_LISTEN= VP_HARNESS_PORT_FILE=./.e2e/host.port \
+  VP_NETSYNC_HOST=1 VP_NETSYNC_PORT=9110 zig build run-pixie &
+VP_HEADLESS=1 VP_HARNESS_LISTEN= VP_HARNESS_PORT_FILE=./.e2e/client.port \
+  VP_NETSYNC_CONNECT=127.0.0.1:9110 zig build run-pixie &
+
+# The client has finished joining. In free-run no step needs injecting into the host;
+# await holds one connection and waits.
+scripts/drive --port-file ./.e2e/client.port 'await netsync awaiting_sync=0 600'
+
+# Add one shared layer and have the host and client select different ones
+# (select_layer is local_only).
+scripts/drive --port-file ./.e2e/host.port 'action add_layer'
+until scripts/drive --port-file ./.e2e/host.port 'step 1; digest netsync' | grep -E 'last_seq=[1-9][0-9]*' | grep -q 'pending=0'; do sleep 0.05; done
+until scripts/drive --port-file ./.e2e/client.port 'step 1; digest netsync' | grep -q 'awaiting_sync=0'; do sleep 0.05; done
+scripts/drive --port-file ./.e2e/host.port 'action select_layer 0; action set_tool brush; action set_color FF0000'
+scripts/drive --port-file ./.e2e/client.port 'action select_layer 1; action set_tool pen; action set_color 0000FF'
+
+# Strokes from both sides. The canonical wire carries the origin's layer=#id, colour and tool.
+scripts/drive --port-file ./.e2e/host.port 'action stroke 10 10 60 10'
+scripts/drive --port-file ./.e2e/client.port 'action stroke 20 20 70 20'  # → "proposed <id>"
+
+# The relay is done: mix in a host step to advance the COMMIT, then re-check
+# last_seq>=3 && pending=0 on both sides.
+until scripts/drive --port-file ./.e2e/host.port 'step 1; digest netsync' | grep -E 'last_seq=[3-9][0-9]*' | grep -q 'pending=0'; do sleep 0.05; done
+until scripts/drive --port-file ./.e2e/client.port 'step 1; digest netsync' | grep -E 'last_seq=[3-9][0-9]*' | grep -q 'pending=0'; do sleep 0.05; done
+
+scripts/drive --port-file ./.e2e/host.port 'digest canvas'    # the crcs of l0 and l1
+scripts/drive --port-file ./.e2e/client.port 'digest canvas'  # the same l0/l1 crcs, with selected still per peer
+
+# Take the measured values and assert that the l0/l1 crcs match and that tool, colour
+# and selected are peer-local.
+# Always terminate with drive's quit (never pkill).
+scripts/drive --port-file ./.e2e/host.port 'quit'
+scripts/drive --port-file ./.e2e/client.port 'quit'
+```
+
+## The netsync observation probe
+
+`platform.init` registers a custom probe named `netsync` only when netsync is enabled
+(it is not a reserved name).
+
+| Item | Content |
+|---|---|
+| digest | one line of `k=v` (a live response is prefixed `netsync `): `role=<host\|client> peers=<n> agents=<n> peer_id=<n> last_seq=<n> pending=<n> awaiting_sync=<0\|1> last_reject=<id\|none> reject_reason=<str\|none> [log=<seq:origin:name,...>]` |
+| snapshot | one JSON object: a `peers` array `[{peer_id,kind,label}]` plus `agents` plus the whole `log` (ext=json). For a host it is every entry of `slots[]`; for a client it is every active entry of the PEER_INFO catalogue (including the host itself, itself, and other peers) |
+| last_seq | host: the wire commit counter. client: the seq of the last COMMIT applied |
+| reject_reason | ASCII whitespace and control characters become `_`, truncated to 64 bytes |
+| the log summary | the last few entries. A revert reads `seq:origin:revert->target`. **`origin` remains a number or a tag** (a peer is its numeric peer id; kind and label never appear — that is the public contract) |
+| agents | the number of connected peers with `kind=agent` (a host counts `slots[]`, a client counts the active agents in its catalogue) |
+
+## PEER_INFO distribution and peer origin
+
+- **Wire**: frame kind `0x08`, payload = `u32 LE peer_id ++ u8 kind ++ label`
+  (kind: 0=human, 1=agent, 0xFF=left). The protocol version stays 1. `0x09` is the
+  copilot presence layer (pointer, highlight and suggestion sharing) and is not part of
+  the document synchronisation described here.
+- **On join** (the host's `handleHello`): a new client receives (1) the host's fixed
+  identity (peer_id=0, kind=human, label `"host"`) and (2) a PEER_INFO for every
+  existing active peer. Existing active clients receive a PEER_INFO for the new peer.
+  All of them go onto the same outbound FIFO ahead of ClientJoined → SYNC.
+- **On leave**: the remaining clients receive `PEER_INFO_KIND_LEFT` plus the label
+  from just before. A client's catalogue does not delete the entry but keeps kind and
+  label as an `active=false` tombstone (so history keeps displaying after a peer has
+  left).
+- **The client catalogue**: fixed length `MAX_PEERS+1`. When full, only inactive
+  tombstones are reused (an active entry is never evicted). There is one
+  `peer_metadata_revision` for the whole module (no per-entry revision).
+- **The origin resolution API**: `resolvePeerOrigin` and `peerMetadataRevision`
+  (through the platform facade). **The `log=` field of `digest netsync` and
+  `log[].origin` in the snapshot stay numeric or tagged** — a label may contain `:`, so
+  the public contract is not broken. The history UI and the additive
+  `last_origin_kind` and `last_origin_label` of `digest history` are the authority for
+  displaying kind and label.
+- **The host itself**: peer_id 0 is a fixed identity (`HOST_ACTOR_KIND=.human`,
+  `HOST_LABEL="host"`). No host-side environment variable (a
+  `VP_NETSYNC_HOST_ACTOR` and the like) is provided.
+- **Compatibility with an older peer**: with no PEER_INFO received, the history display
+  falls back to `#<peer_id>` (it does not freeze).
+
+### Checking the history panel's origin display end to end (two processes)
+
+```bash
+mkdir -p .e2e
+VP_HEADLESS=1 VP_HARNESS_LISTEN= VP_HARNESS_PORT_FILE=./.e2e/host.port \
+  VP_NETSYNC_HOST=1 VP_NETSYNC_PORT=9110 zig build run-pixie &
+VP_HEADLESS=1 VP_HARNESS_LISTEN= VP_HARNESS_PORT_FILE=./.e2e/client.port \
+  VP_NETSYNC_CONNECT=127.0.0.1:9110 VP_NETSYNC_ACTOR=agent VP_NETSYNC_LABEL=bot \
+  zig build run-pixie &
+scripts/drive --port-file ./.e2e/client.port 'await netsync awaiting_sync=0 600'
+scripts/drive --port-file ./.e2e/host.port 'action stroke 10 10 60 10'
+scripts/drive --port-file ./.e2e/client.port 'action stroke 20 20 70 20'
+until scripts/drive --port-file ./.e2e/host.port 'digest history' | grep -q 'last_origin_kind=agent.*last_origin_label=bot'; do sleep 0.05; done
+# The host's history shows AI:bot, the client's shows H:host, and the client's own row is starred
+scripts/drive --port-file ./.e2e/host.port 'quit'
+scripts/drive --port-file ./.e2e/client.port 'quit'
+```
+
+## Undo and redo during a session
+
+- Only your own wire commits can be undone (`.undo_own`). The host verifies: unknown,
+  not yours, not undoable, already reverted, transaction unsupported, too old, and
+  before the peer joined.
+- An undo applies a revert going forward (`PROPOSE_REVERT` / `COMMIT_REVERT`). Pixels
+  caught in an overlapping region are accepted as a limitation.
+- A redo is an ordinary propose/commit of the original command (there is no redo_of on
+  the wire; the issuer's local pending metadata protects the epoch).
+- Undoing a transaction is not supported during a session.
+- Cmd+Z from the keyboard goes through `routeAction("undo"/"redo")` while
+  `netsyncActive()`.
+
+Wait deterministically by re-checking `drive 'digest netsync'` in an until loop (do not
+retry on a fixed sleep; sleeping is acceptable only while waiting for a process's port
+file).
+
+## Constraints and retrying during a session
+
+- Opening a PNG is not possible during a session (rejected by default). Layer structure
+  operations are `.relay` and apply the same stable `#id` to every peer.
+- Only `save` is allowed locally (during a session it is not recorded in the command
+  log, so it consumes no wire seq).
+- **Retry only when `clientSend` fails** (an error response). Once `"proposed"` or
+  `"revert proposed"` has come back, never resend; from then on, wait deterministically
+  on `digest netsync`.
+- An action before the connection is established can fail → retry after the join
+  completes (`awaiting_sync=0`), under the retry condition above.
