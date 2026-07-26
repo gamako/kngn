@@ -1,7 +1,7 @@
 //! The explicit camera backend stub shared by every OS.
 //!
-//! Its purpose: to settle the control plane's verbs and types while keeping `zig build` green until the real
-//! OS implementations (AVFoundation, V4L2, Media Foundation) arrive. **Every verb returns
+//! Its purpose: to settle the control plane's verbs and types, and to keep `zig build` green on an OS with no
+//! real implementation. **Every verb returns
 //! `error.Unsupported`** — an explicit error rather than silently degrading to doing nothing. See
 //! the shared control plane conventions in `docs/capture.md`.
 //!

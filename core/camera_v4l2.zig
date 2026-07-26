@@ -9,7 +9,7 @@
 //!   It uses the MMAP and TripleBuffer allocated up front at open, and only converts, publishes and QBUFs.
 //! - **`yuyvToBgraRow`**: a per-pixel colour conversion processing every pixel of every frame. Unlike macOS's
 //!   `copyBgraRows` (a plain row `@memcpy`) it does integer multiplication, addition and clamping.
-//!   The MVP is a fixed-point scalar implementation, and whether to make it SIMD depends on the benchmark results.
+//!   It is a fixed-point scalar implementation, not SIMD.
 //! - enumerate, open, start, stop and close run at initialisation or event time only.
 
 const std = @import("std");

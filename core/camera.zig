@@ -12,7 +12,7 @@
 //! Each capture function tests `harness.isCaptureSyntheticActive()` at its head, which holds when
 //! `VP_HARNESS_CAPTURE_SYNTHETIC` is set and harness is enabled. **This facade is not wired to the
 //! synthetic source**, so that branch returns `error.Unsupported`: the synthetic source is reached only
-//! through the harness's own `capture` command and probe. Wiring it here replaces that one line.
+//! through the harness's own `capture` command and probe. The branch point and its name are all this facade fixes.
 //!
 //! Hot path declaration: this file itself runs at event time or initialisation time only (a facade skeleton delegating to the stub).
 //! It contains no per-frame (all-pixel) loop. `pollLatestFrame()` only does an `acquire()` from the

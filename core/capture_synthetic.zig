@@ -21,7 +21,7 @@
 //!   every pixel, but the target is a synthetic image for the harness verification tool alone (a small resolution,
 //!   64x64 by default) rather than a real application's production drawing hot path, so `libs/pixelops`'s three rules (SIMD, div255, clip hoisting) are not applied. The grounds: it fires only when an AI or a script issues an
 //!   explicit command, and never runs at the frequency or over the area of a real application's per-frame all-pixel
-//!   path. Should wiring camera.zig later make it high-frequency, it needs judging afresh.
+//!   path, so it is not a production hot path at all.
 //! - `SyntheticAudioDevice`'s generating thread (`renderThread`): **real time (per sample)**. No malloc, locking, IO or
 //!   panic (the same contract as `audio_null.zig`). Calling `@sin` per sample is in literal tension with the performance
 //!   rule that transcendental functions per sample (pow, tan, exp) are forbidden, but it is the same pattern as

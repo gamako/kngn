@@ -169,7 +169,7 @@ pub fn open(allocator: std.mem.Allocator, cfg: Config) Error!AudioDevice {
 // (`core/camera.zig` is a file of its own and so uses the bare verb names; the comparison is the table in
 // `docs/capture.md`).
 //
-// macOS goes through AUHAL, Linux through ALSA, and Windows through a future real backend.
+// macOS goes through AUHAL and Linux through ALSA. Windows and everything else go through the stub.
 //
 // Hot path declaration: this extension itself runs at event time or initialisation time only (a facade skeleton delegating to a backend).
 // The mic capture callback (`CaptureCallback`) is under the real-time (per-sample) contract. The macOS implementation

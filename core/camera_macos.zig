@@ -238,7 +238,7 @@ pub const MAX_VIDEO_DIM: u32 = 4096;
 
 /// The requested settings (hints only). The effective values are read with `device.config()` after `open()`.
 pub const Config = struct {
-    device_id: ?[]const u8 = null, // unused in the MVP (the default camera is fixed; selecting a device comes later)
+    device_id: ?[]const u8 = null, // unused: the default camera is always opened, so this selects nothing
     width: u32 = 640,
     height: u32 = 480,
     frame_rate: u32 = 30,

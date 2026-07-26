@@ -7,7 +7,7 @@
 //! `MIDIEventList`), but `MIDIReceiveBlock` uses the Objective-C block ABI and so does not suit this project's
 //! approach of passing a C function pointer to an `extern fn` rather than using `@cImport`.
 //! A hand-written extern does not pick up the SDK's deprecation attribute, and an unrelated API is not adopted
-//! merely to hide a warning. The replacement point for a future MIDI 2 or block backend is isolated to this file.
+//! merely to hide a warning. The seam for a MIDI 2 or block-based backend is confined to this file.
 //!
 //! ## Hot path declaration
 //!

@@ -294,7 +294,7 @@ pub const capture = struct {
     pub const CaptureCallback = *const fn (frame: types.AudioInFrame, userdata: ?*anyopaque) void;
 
     pub const Config = struct {
-        device_id: ?[]const u8 = null, // The MVP is fixed to the default PCM. The enumerated ids are for a future selection path.
+        device_id: ?[]const u8 = null, // Unused: the default PCM is always opened, so an enumerated id selects nothing.
         sample_rate: u32 = 48000,
         channels: u32 = 1,
         capture_callback: CaptureCallback,

@@ -13,7 +13,7 @@
 //!
 //! The format: shared mode follows the engine's mix format. A modern Windows uses 32-bit float, so that is
 //! used directly (render_callback's f32 goes straight into the WASAPI buffer, with no intermediate copy).
-//! A mix format other than float gives ConfigFailed (a conversion layer is future work).
+//! A mix format other than float gives ConfigFailed: there is no conversion layer.
 
 const std = @import("std");
 const win = std.os.windows;

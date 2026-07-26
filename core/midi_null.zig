@@ -1,6 +1,6 @@
 //! The OS-independent MIDI null backend (see ADR-010).
 //!
-//! Until a real backend is added, it makes open succeed and delivers no events on every target OS.
+//! On every target OS it makes open succeed and delivers no events.
 //! It takes an allocator so that the facade contract is uniform, but the null backend never uses it.
 
 const std = @import("std");

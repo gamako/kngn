@@ -90,7 +90,7 @@ pub const AudioInFrame = struct {
 
 /// A capture frame's pixel format. Delivery is always normalised to canonical BGRA (the MVP has `bgra8` alone).
 /// Normalising it (converting a native format such as YUY2 or NV12 to BGRA) is the backend's responsibility.
-/// It stays an enum to leave room for a future extension declaring the native format for diagnostics.
+/// It is an enum rather than a bool, so declaring another format stays an additive change.
 pub const PixelFormat = enum { bgra8 };
 
 /// One camera frame. `pixels` is canonical BGRA (the same representation as the framebuffer of `core/platform.zig`:

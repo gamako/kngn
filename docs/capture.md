@@ -123,7 +123,8 @@ exactly as audio output is; see [audio-and-synth.md](audio-and-synth.md).
 representation as the framebuffer of `core/platform.zig`, so a frame can be fed straight
 to the existing sprite and canvas paths. Converting from a native format (YUY2, NV12)
 is the backend's responsibility. `PixelFormat` stays an enum with the single variant
-`bgra8` so that a future variant can declare a native format for diagnostics.
+`bgra8`, which is an enum rather than a bool so that declaring another format stays an
+additive change.
 
 Video is delivered from the capture thread to the main thread through a **triple buffer,
 latest-wins and non-blocking** — not a callback. A capture rate and a draw rate need not
@@ -156,11 +157,8 @@ harness's own `capture` command and `capture` probe** (see [harness.md](harness.
 `harness.isCaptureSyntheticActive()` at its head — which holds when
 `VP_HARNESS_CAPTURE_SYNTHETIC` is set and the harness is enabled — and that branch
 returns `error.Unsupported`. So `camera.open()` and `audio.openCapture()` never reach the
-synthetic source, and a real backend is bypassed without a substitute. Wiring it in means
-replacing that one line in each verb; the branch point and its name are all that is settled
-here. The intended shape, once wired, is to replace the backend outright rather than wrap it,
-mirroring audio output's `open()` consulting `harness.isHeadlessActive()` to substitute the
-null device.
+synthetic source, and a real backend is bypassed without a substitute. What this facade fixes
+is the branch point and its name, nothing more.
 
 Synthetic video is generated deterministically from the harness's virtual clock, so the
 same tick gives a bit-identical frame. The synthetic microphone is driven by a
@@ -177,5 +175,4 @@ calls `platform.init()` always behaves as though the harness were disabled. See
 
 Recording, encoding and writing files; opening several devices at once and watching for
 device changes (hotplug); delivering video in a non-BGRA format without conversion; and
-a unified API treating microphone and camera in one loop (permanently declined, per the
-reasoning at the top).
+a unified API treating microphone and camera in one loop.
