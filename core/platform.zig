@@ -461,6 +461,10 @@ pub const Window = struct {
         return self.inner.native.getEventStats();
     }
 
+    /// Acquire a drawable frame slot if one is available; otherwise `null`.
+    /// `null` is retryable and not fatal (e.g. a Wayland frame callback or busy buffer).
+    /// The returned `Framebuffer`'s `width`/`height` are authoritative for that frame.
+    /// Contract: docs/adr/002 (revised) and docs/adr/005.
     pub fn lockFramebuffer(self: *Window) ?Framebuffer {
         // Hot path declaration: for native and null alike this only returns a view of the backend buffer, latches the snapshot, and records onLock while the harness is enabled.
         // No per-frame allocation, no per-pixel work and no converting copy (the observation copy happens in onPresent, at present time).
@@ -504,6 +508,9 @@ pub const Window = struct {
         };
     }
 
+    /// Submit the most recently locked frame to the display queue (the frame commit point; not a vsync wait).
+    /// After present the pixels are owned by the backend; the caller must not touch them until the next lock.
+    /// Contract: docs/adr/002 (revised) and docs/adr/005.
     pub fn present(self: Window) void {
         // Hot path declaration: while the harness is enabled, onStats→onPresent (an owned observation copy) runs before the backend present.
         // A null present is a no-op. There is no per-frame allocation and no per-pixel work.

@@ -131,8 +131,11 @@ wiring.
    latency management; Metal `fifo` = display sync, drawable pacing and an inflight
    semaphore.
 5. **Resize contract**: once resize is supported, the `Framebuffer.width/height`
-   returned by a successful `lockFramebuffer()` is **authoritative for that frame**,
-   and the caller checks `fb.width/height` every frame. After a resize the old
+   returned by a successful `lockFramebuffer()` is **authoritative for that frame's
+   buffer dimensions**. The caller checks `fb.width/height` every frame for the
+   drawable size. **GUI layout uses logical size** (`fb.logical_size` or
+   `window.logicalSize()`), not `fb.width/height`, under `.physical` mode — see
+   [ADR-011](011_high-dpi-coordinates-and-fb-modes.md) R2. After a resize the old
    framebuffer pointer is invalid. The backend recreates the swap chain, `wl_buffer`
    or Metal texture at a frame boundary and never returns a stale pointer to the
    caller. (D3D11 implements this today through `resizeSwapChain` / `ResizeBuffers`, and the
@@ -374,3 +377,4 @@ following were filed as follow-up work:
 | 1.1 | 2026-06-28 | The Metal backend meets the first-class frame pacing contract (triple slot + inflight semaphore; the drawable warning removed by keeping everything inside `draw(in:)`; `displaySyncEnabled` set explicitly). The tier table and the Metal section updated to implemented. |
 | 1.2 | 2026-07-05 | Added references to [ADR-008](008_frame-pacing-api-and-fatal-state.md) from the wait/skip policy and fatal state policy sections, now that the API shape and the separation are settled. The decision itself is unchanged. |
 | 1.3 | 2026-07-27 | Status / tier table / D3D11 section / Follow-up ①–③ updated to match the implemented D3D11 backend and the documented best-effort non-guarantees. Follow-up ④ and the decision itself are unchanged. |
+| 1.4 | 2026-07-27 | Resize contract wording distinguishes buffer dimensions (`fb.width/height`) from GUI layout size (`logical_size` / `logicalSize()`), citing [ADR-011](011_high-dpi-coordinates-and-fb-modes.md). The decision itself is unchanged. |

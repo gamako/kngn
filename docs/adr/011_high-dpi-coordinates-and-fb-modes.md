@@ -47,11 +47,10 @@ environments and backends that have not implemented it.
 
 ### R2. Separate logical size from framebuffer size in the API (the key premise)
 
-Today `fb.width/height` is used directly as the GUI's logical size
-(`pixie/main.zig:6668` calls `beginFrame(fb.width, fb.height)`, and
-`patch/main.zig:2830` is the same shape). Continuing that under
-`.physical` would double layout, clipping and hit testing, and break. To make the
-chosen coordinate model work, platform gains this contract:
+Before this work, `fb.width/height` was used directly as the GUI's logical size
+(`pixie/main.zig` and `patch/main.zig` called `beginFrame(fb.width, fb.height)`).
+Continuing that under `.physical` would double layout, clipping and hit testing, and
+break. To make the chosen coordinate model work, platform gains this contract:
 
 - `window.logicalSize()` (logical points) and `window.framebufferSize()` (physical
   pixels) are **separate APIs**. `Framebuffer` returns physical pixels, and under
@@ -80,8 +79,7 @@ chosen coordinate model work, platform gains this contract:
   Derived coordinates such as `mouse_pressed_pos` are built from the
   facade-normalised values.
 - The window and `Framebuffer` types in `platform_types.zig` and `platform.zig` gain
-  the framebuffer mode and the four snapshot fields above (no such contract exists
-  today).
+  the framebuffer mode and the four snapshot fields above.
 
 ### R3. The coordinate model: applications and the GUI stay in logical coordinates, and scale is applied once at the output edge
 
@@ -93,7 +91,7 @@ the conversion to physical pixels is applied only at the drawing exit.
 
 **The per-backend input contract** (macOS alone is not enough):
 - The unit of each backend's OS event coordinates is documented (macOS already
-  converts view coordinates to logical points — `platform_macos.m:336-343`; Linux and
+  converts view coordinates to logical points in `platform_macos.m`; Linux and
   Windows may be returning client pixels and need checking).
 - **There is exactly one place that converts to logical coordinates** (as settled in
   R2: the backend passes raw coordinates plus an event epoch, and **the facade is the
@@ -107,8 +105,8 @@ Rejected: having applications and the GUI think in physical pixels and sprinkle
 ### R4. Scale injection for the UI is concentrated in `gui.render`, with the conversion rules written down
 
 A draw list holds logical coordinates, and `gui.render` (`libs/gui/src/render.zig`)
-takes a physical target plus a scale and bakes them. Rendering is currently 1:1
-(`render.zig:17-28`), so
+takes a physical target plus a scale and bakes them. At decision time rendering was
+1:1 (the `scale == 1.0` fast path in `render`), so
 the following **conversion rules are settled** (a precondition for the GUI stage, all
 pinned by unit tests in `libs/gui`):
 
@@ -121,22 +119,21 @@ pinned by unit tests in `libs/gui`):
 - **Lines**: endpoints are `floor(p*s)` and the width is
   `thickness_phys = max(1, round(t*s))`. So a **1-logical-pixel rule is 2px at s=2**
   (`round(1*2)=2`) and 1px at s=1.
-  - ⚠️ **An existing bug, older than high DPI**: `render.zig:23` does not pass the
-    line's thickness through to `drawLine` (`render.zig:123`), even though
-    `draw.zig:15` has it. That is
+  - An older bug (pre-dating high DPI) left `render` not passing line thickness
+    through to `drawLine`, even though `draw` already accepted it. That was
     **fixed first, as a precondition for this work**.
 - **Images**: nearest upscaling. For each destination pixel `(dx,dy)` (physical, local
   to the rect), the source is `sx = floor(dx * src_w / dst_w)`,
-  `sy = floor(dy * src_h / dst_h)` (integer nearest). The current 1:1 blit, which
-  assumes `rect.w == src_w` (`draw.zig:96-113`), is generalised to this.
+  `sy = floor(dy * src_h / dst_h)` (integer nearest). The previous 1:1 blit, which
+  assumed `rect.w == src_w` in `draw`, is generalised to this.
 - **Minimum test cases**: at s ∈ {1.0, 1.5, 2.0}, pin bit-exactly ① adjacent
   rectangles tiling perfectly (zero gaps, zero overlap) ② clip boundaries agreeing
   ③ the physical width of a 1px rule ④ the source-to-destination mapping of an image.
 
 ### R5. GUI fonts separate logical measurement from physical rasterisation
 
-`Font` currently has `measure()` and `drawTo()` on the same instance
-(`libs/font/src/font.zig:30-66`). The chosen model
+`Font` already had `measure()` and `drawTo()` on the same instance
+(`libs/font/src/font.zig`). The chosen model
 needs `measure()` to be logical width and `drawTo()` to rasterise at physical pixels.
 **The API adopted (settled)**:
 
@@ -150,7 +147,7 @@ needs `measure()` to be logical width and `drawTo()` to rasterise at physical pi
   renderer pass a scale separately was rejected. **The glyph cache is keyed by the
   physical pixel size** (`(codepoint, px_size)`).
 - **Bitmap fonts are not rejected under `.physical`**: `default_font` (the spleen
-  bitmap, `gui/font.zig:208-215`) still works under `.physical`, but **nearest
+  bitmap, `gui/font.zig`) still works under `.physical`, but **nearest
   upscaling will not make it crisp**. UI that
   needs crispness switches to an **outline default font** — recommended, and the real
   answer for crisp text.
@@ -168,7 +165,7 @@ does `@memset(fb.pixels)` plus `drawSpriteEx(pixels, fb_w, fb_h, …)`, with pos
 coming from `gfx.camera`). But it is not only `camera.worldToScreen()` that
 needs a scale contract: `screenToWorld()`, `visibleRect()`, `clampToWorld()`, the
 physical drawing size of tiles and sprites, and both the logical and physical size of
-the viewport all do (`camera.zig:59-88` treats the viewport as screen coordinates).
+the viewport all do (`camera.zig` treats the viewport as screen coordinates).
 
 **Mixing scale into the camera would change how much of the world is visible** once
 retina is involved. To avoid that, scale is separated out as a **drawing transform**
@@ -203,7 +200,7 @@ transform weave in the scale individually:
   `screenToCanvas` and `canvasToScreen` conversions. It **becomes crisper automatically
   just from the larger framebuffer**, and there is no re-rasterisation problem.
 - **The patch canvas's visualisation strip** (`spec.draw`, `osc.draw` and `meter.draw`
-  write straight into `fb.pixels`; `patch/main.zig:2643-2665`): simply multiplying
+  write straight into `fb.pixels` in `patch/main.zig`): simply multiplying
   `VIS_H` by the scale does **not** increase the resolution of the visualisation buffers themselves (the
   `Spectrogram(width,height)` and `Scope(width,height)` in `libs/viz` are
   comptime-sized). **The drawing order is split into two layers (settled)**:
@@ -347,3 +344,5 @@ Factual (not a decision change). Verified against the tree as of this revision:
 - 2026-07-27 Status, Context framing, Implementation status and Consequences updated
   to record that Stages 0–5 have landed. R1–R10 and the rejected alternatives are
   unchanged.
+- 2026-07-27 Line-number citations removed (symbols / contracts only); R4 thickness
+  bug note moved to past tense to match the landed implementation.

@@ -35,13 +35,13 @@ Frame = { kind: u8, len: u32 LE, payload: [len]u8 }
 
 | kind | Value | Payload |
 |---|---|---|
-| HELLO | `0x01` | text (client→host and host→client) |
+| HELLO | `0x01` | text: client→host `client {ver} {kind} {label}`; host→client `host {ver} {peer_id}` |
 | PROPOSE | `0x02` | `u32 LE proposal_id` ++ `"<name> <args>"` (client→host) |
 | COMMIT | `0x03` | `u64 LE seq` ++ `u32 LE origin_peer` ++ `"<name> <args>"` (host→clients; not sent to the host itself) |
 | SYNC | `0x04` | `u64 LE seq` ++ state bytes (host→client, once on join; an empty state means no snapshot) |
 | REJECT | `0x05` | `u32 LE proposal_id` ++ `"<reason>"` (host→the proposer only) |
-| PROPOSE_REVERT | `0x06` | a client proposing to revert one of its own commits (see undo below) |
-| COMMIT_REVERT | `0x07` | the host committing a revert to every client |
+| PROPOSE_REVERT | `0x06` | `u32 LE proposal_id` ++ `u64 LE target_seq` (client→host) |
+| COMMIT_REVERT | `0x07` | `u64 LE seq` ++ `u64 LE target_seq` (host→clients) |
 | PEER_INFO | `0x08` | `u32 LE peer_id ++ u8 kind ++ label` (see peer info distribution below) |
 
 The limit for action frames is `MAX_ACTION_FRAME_BYTES` (4096). SYNC uses a big entry
@@ -73,6 +73,7 @@ The limit for action frames is `MAX_ACTION_FRAME_BYTES` (4096). SYNC uses a big 
 | `.local_only` | local only (no broadcast) | local only (no PROPOSE) |
 | `.reject_when_synced` | immediately `RejectedWhileSynced` | the same |
 | `.undo_own` / `.redo_own` | revert your own latest undoable / re-commit the most recent revert | PROPOSE_REVERT / a PROPOSE of the original command |
+| `.ephemeral` | apply locally as presence (no COMMIT / seq) | enqueue PRESENCE only (the response is `"sent"`; no PROPOSE / seq) |
 
 The default is `.reject_when_synced`. In the editor: `stroke` is `.relay` (the
 originator's tool, colour, size, opacity and hardness plus `layer=#<id>` are made
