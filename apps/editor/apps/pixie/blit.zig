@@ -1,5 +1,5 @@
 //! Pixie canvas display blit (zoom transfer + checkerboard background). Extracted from main.zig.
-//! Pure logic importing core only (callable from unit tests and bench-blit).
+//! Pure logic over paint and pixelops only (callable from unit tests and bench-blit).
 //!
 //! These functions are a **per-frame, full canvas-area** hot path (most of the window).
 //! Clip intersection is hoisted once outside the loop; the inner path writes contiguous runs; no per-pixel division
@@ -76,7 +76,7 @@ pub inline fn blitCanvasZoomZ(
 /// 4. Logical display pixel → canvas via the existing Zoom source rule
 ///
 /// `content_scale == 1.0` delegates to existing `blitCanvasZoomZ` to keep the logical CRC.
-/// No per-pixel division in the inner loop (run writes + threshold accumulator).
+/// No per-pixel division when writing pixels (run writes + threshold accumulator).
 pub fn blitCanvasZoomPhysical(
     fb: []u32,
     fb_w: u32,
@@ -125,7 +125,7 @@ pub fn blitCanvasZoomPhysical(
     // row: physical y → logical display v = floor((fy - phys_dst.y) * log_h / phys_h)
     // Coalesce runs of the same v vertically; fill each logical row with horizontal nearest.
     // edge = floor((v+1)*phys/log) may not advance under the floor inverse, so
-    // scan until v changes (run boundaries only; inner loop has no division).
+    // scan until v changes (division only while probing run boundaries, never per written pixel).
     var fy = y0;
     while (fy < y1) {
         const ly: i32 = fy - phys_dst.y;
