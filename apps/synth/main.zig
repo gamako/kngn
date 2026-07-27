@@ -1,12 +1,12 @@
-//! apps/synth — シンセ本体 (TASK-27.5 / 27.6 / 27.8 / 27.13-27.16)。
+//! apps/synth — the synthesiser app.
 //!
-//! 入力: PC キーボード(A..K=C4..C5) と GUI 画面鍵盤(クリック)。
-//! 操作: GUI スライダ/ボタンで音色(osc/filter/env/LFO/unison/osc2/noise)とマスター FX(delay/chorus/dist/reverb)を変更。
-//! 表示: 出力タップ→mono downmix→ スペクトログラム / オシロスコープ / ピーク・RMS レベルメータ。
-//! 音は L1 audio の RT コールバックから Synth.render→MasterEffects.process（GUI⇔Audio はロックフリー）。
+//! Input: PC keyboard (A..K = C4..C5) and on-screen GUI keyboard (click).
+//! Controls: GUI sliders/buttons change timbre (osc/filter/env/LFO/unison/osc2/noise) and master FX (delay/chorus/dist/reverb).
+//! Display: output tap → mono downmix → spectrogram / oscilloscope / peak·RMS level meter.
+//! Audio runs from the L1 audio RT callback through Synth.render→MasterEffects.process (GUI⇔Audio is lock-free).
 
 const std = @import("std");
-const kit = @import("kit"); // 公開 umbrella（ADR-007 R4/R5: apps は kit-only 消費者）
+const kit = @import("kit"); // Public umbrella (ADR-007 R4/R5: apps are kit-only consumers)
 const platform = kit.platform;
 const audio = kit.audio;
 const synthlib = kit.synth;
@@ -22,15 +22,15 @@ const MAX_VOICES = 16;
 const Synth = synthlib.Synth(MAX_VOICES);
 const Tap = synthlib.SampleTap(8192);
 const Patch = synthlib.Patch;
-// マスターエフェクト: delay ~1.36s(65536@48k) / chorus ~85ms(4096@48k, 96kHz でも余裕)。いずれも 2 の冪。
+// Master effects: delay ~1.36s (65536@48k) / chorus ~85ms (4096@48k, headroom at 96kHz). Both powers of two.
 const Fx = synthlib.MasterEffects(65536, 4096);
 
 const NOTE_LOW = 60; // C4
 const NOTE_HIGH = 72; // C5
 const NOTE_COUNT = NOTE_HIGH - NOTE_LOW + 1;
 
-// レイアウト（コントロールパネルは 4 カラム。FX カラムが 11 行と高いので縦に余裕を持たせる）
-// 可視化帯(y 300〜420, h 120)を横に分割: スペクトログラム / オシロスコープ / レベルメータ。
+// Layout (control panel is 4 columns. The FX column is 11 rows tall, so leave vertical room)
+// Visualisation strip (y 300..420, h 120) split horizontally: spectrogram / oscilloscope / level meter.
 const WIN_W = 1080;
 const WIN_H = 520;
 const SPEC_X0 = 20;
@@ -41,7 +41,7 @@ const SCOPE_X0 = 710;
 const SCOPE_W = 300;
 const METER_X0 = 1018;
 const METER_W = 52;
-const VIS_Y0 = 300; // 可視化帯の上端(SPEC/SCOPE/METER 共通)
+const VIS_Y0 = 300; // Top of the visualisation strip (shared by SPEC/SCOPE/METER)
 const VIS_H = 120;
 const PIANO_Y0 = 440;
 const PIANO_H = 55;
@@ -49,9 +49,9 @@ const PIANO_H = 55;
 const Spec = spectrogram.Spectrogram(SPEC_W, SPEC_H);
 const Scope = scope.Oscilloscope(SCOPE_W, VIS_H);
 
-/// アプリ状態（TASK-73.2: app_runtime へ移行。native 挙動不変 + wasm export 駆動）。
+/// App state (driven via app_runtime: native behaviour unchanged + wasm export driven).
 const App = struct {
-    /// app_runtime が参照する初期ウィンドウ仕様
+    /// Initial window spec consulted by app_runtime
     pub const window = .{
         .w = WIN_W,
         .h = WIN_H,
@@ -59,21 +59,21 @@ const App = struct {
     };
 
     gpa: std.mem.Allocator,
-    /// `save_patch`/`load_patch` action（TASK-65 serialize）が使うファイル I/O ハンドル
-    /// （`std.process.Init.io`。イベント時のみ使用。RT 経路には一切渡さない）。
+    /// File I/O handle used by the `save_patch`/`load_patch` actions
+    /// (`std.process.Init.io`. Event-time only; never passed onto the RT path).
     io: std.Io,
     synth: Synth,
     fx: Fx,
-    /// GUI 側で最後に publish した patch のコピー（patch probe 用。TASK-56。
-    /// Mailbox の consumer 状態は RT 専有のため probe からは触らない）
+    /// GUI-side copy of the last published patch (for the patch probe.
+    /// Do not touch Mailbox consumer state from the probe — it is RT-exclusive)
     last_patch: Patch = .{},
     tap: Tap = .{},
-    /// GUI スライダ/ボタンが in-place 更新するパラメータ束（TASK-65）
+    /// Parameter bundle updated in-place by GUI sliders/buttons
     params: Params = .{},
     fxp: FxParams = .{},
     device: audio.AudioDevice,
     ctx: gui.Context,
-    /// GUI 用 system OutlineFont（TASK-138。未検出時は default_font）。
+    /// System OutlineFont for the GUI (falls back to default_font when not found).
     gui_font: kit.GuiFont = .{},
     spec: *Spec,
     osc: *Scope,
@@ -90,7 +90,7 @@ const App = struct {
         appDeinit(self);
     }
     pub fn frame(self: *App, win: *platform.Window, now: f64) !bool {
-        _ = now; // pacing は app_runtime が所有する（TASK-180）。synth は時刻を使わない。
+        _ = now; // Pacing is owned by app_runtime. synth does not use the timestamp.
         return appFrame(self, win);
     }
 };
@@ -99,7 +99,7 @@ fn audioCallback(buf: []f32, frames: u32, channels: u32, sample_rate: u32, userd
     _ = sample_rate;
     const app: *App = @ptrCast(@alignCast(userdata.?));
     app.synth.render(buf, frames, channels);
-    app.fx.process(buf, frames, channels); // マスターエフェクト(出力タップの前)
+    app.fx.process(buf, frames, channels); // Master effects (before the output tap)
     app.tap.write(buf);
 }
 
@@ -122,7 +122,7 @@ fn keyToNote(key: platform.KeyCode) ?u8 {
     };
 }
 
-/// 画面鍵盤の当たり判定。ピアノ領域内の x,y からノート番号を返す。
+/// Hit-test for the on-screen keyboard. Returns the note number from x,y inside the piano region.
 fn pianoHitTest(x: i32, y: i32) ?u8 {
     if (y < PIANO_Y0 or y >= PIANO_Y0 + PIANO_H) return null;
     if (x < 0 or x >= WIN_W) return null;
@@ -130,7 +130,7 @@ fn pianoHitTest(x: i32, y: i32) ?u8 {
     return @intCast(NOTE_LOW + idx);
 }
 
-/// framebuffer のピクセル u32 packing（gui.Color と同じ: メモリ B,G,R,A = u32 0xAARRGGBB）。
+/// framebuffer pixel u32 packing (same as gui.Color: memory B,G,R,A = u32 0xAARRGGBB).
 fn rgba(r: u8, g: u8, b: u8, a: u8) u32 {
     return @as(u32, b) | (@as(u32, g) << 8) | (@as(u32, r) << 16) | (@as(u32, a) << 24);
 }
@@ -138,9 +138,9 @@ fn rgba(r: u8, g: u8, b: u8, a: u8) u32 {
 fn drawSpectrogramBgAndPiano(fb: platform.Framebuffer, pressed: *const [128]bool) void {
     const w: usize = fb.width;
     const h: usize = fb.height;
-    @memset(fb.pixels, rgba(0x10, 0x10, 0x18, 0xFF)); // 暗い背景
+    @memset(fb.pixels, rgba(0x10, 0x10, 0x18, 0xFF)); // Dark background
 
-    // 画面鍵盤（下部）。白鍵/黒鍵を区別し、押下中はハイライト。
+    // On-screen keyboard (bottom). Distinguishes white/black keys; highlights while pressed.
     var note: usize = NOTE_LOW;
     while (note <= NOTE_HIGH) : (note += 1) {
         const idx = note - NOTE_LOW;
@@ -149,7 +149,7 @@ fn drawSpectrogramBgAndPiano(fb: platform.Framebuffer, pressed: *const [128]bool
         const semitone = note % 12;
         const is_black = (semitone == 1 or semitone == 3 or semitone == 6 or semitone == 8 or semitone == 10);
         const base: u32 = if (is_black) rgba(0x30, 0x30, 0x38, 0xFF) else rgba(0xC8, 0xC8, 0xD0, 0xFF);
-        const lit: u32 = rgba(0xFF, 0xC0, 0x40, 0xFF); // 押下中(アンバー)
+        const lit: u32 = rgba(0xFF, 0xC0, 0x40, 0xFF); // Pressed (amber)
         const col = if (pressed[note]) lit else base;
         var y: usize = PIANO_Y0;
         while (y < @min(PIANO_Y0 + PIANO_H, h)) : (y += 1) {
@@ -171,16 +171,16 @@ const FREQ_LABELS = [_]FreqLabel{
     .{ .hz = 10000, .text = "10kHz" },
 };
 
-/// スペクトログラムに対数周波数ラベル(左内側)と dB カラースケール凡例(帯の下のすき間)を重ね描き。
+/// Overlay log-frequency labels (inner left) and a dB colour-scale legend (gap under the strip) on the spectrogram.
 fn drawSpecLabels(fb: platform.Framebuffer, spec: *const Spec) void {
     const target: gui.RenderTarget = .{ .pixels = fb.pixels, .width = fb.width, .height = fb.height };
     const clip: gui.Rect = .{ .x = 0, .y = 0, .w = @intCast(fb.width), .h = @intCast(fb.height) };
     const label_col = gui.Color.rgba(0xE0, 0xE0, 0xE0, 0xFF);
     const tick_col = rgba(0xFF, 0xFF, 0xFF, 0xFF);
 
-    // 周波数ラベル(対数軸位置)。tick は実位置、テキスト y は領域内に clamp。
+    // Frequency labels (log-axis positions). tick is the true position; text y is clamped into the region.
     const ty_min: i32 = SPEC_Y0;
-    const ty_max: i32 = SPEC_Y0 + SPEC_H - 16; // font 高 16 ぶん上端を確保
+    const ty_max: i32 = SPEC_Y0 + SPEC_H - 16; // Reserve 16 px at the top for font height
     for (FREQ_LABELS) |fl| {
         const off = spec.rowOffsetForFreq(fl.hz) orelse continue;
         const tick_y = SPEC_Y0 + off;
@@ -190,9 +190,9 @@ fn drawSpecLabels(fb: platform.Framebuffer, spec: *const Spec) void {
         gui.default_bitmap_font.drawTo(target, .{ .x = SPEC_X0 + 8, .y = ty }, fl.text, label_col, clip, 1.0);
     }
 
-    // dB カラースケール凡例(帯の下 y=420..440): "-60dB" [横グラデ] "0dB"
+    // dB colour-scale legend (under the strip, y=420..440): "-60dB" [horizontal gradient] "0dB"
     const leg_y = SPEC_Y0 + SPEC_H + 2; // 422
-    const bar_x0 = SPEC_X0 + 56; // "-60dB"(5文字=40px)の右
+    const bar_x0 = SPEC_X0 + 56; // To the right of "-60dB" (5 chars = 40px)
     const bar_w: usize = 160;
     const bar_y = leg_y + 2;
     const bar_h: usize = 10;
@@ -236,14 +236,14 @@ fn toGuiEvent(ev: platform.Event) ?gui.InputEvent {
 }
 
 // ============================================================================
-// ヘッドレス検証 harness の custom probe（TASK-32.3）
+// Custom probes for the headless verification harness
 //
-// `platform.registerProbe` で opt-in 登録。framework は中身非解釈で raw+digest をルートするだけ。
-// ctx は *App。voices/patch は audio RT スレッドが更新するため main スレッドからの読み出しは torn し得る
-// best-effort スナップショット（既存 audio probe と同じ debug 方針）。RT 経路には同期/alloc/lock を足さない。
+// Opt-in via `platform.registerProbe`. The framework routes raw+digest without interpreting the payload.
+// ctx is *App. voices/patch are updated by the audio RT thread, so main-thread reads may be torn
+// best-effort snapshot (same debug policy as the existing audio probe). Do not add sync/alloc/lock on the RT path.
 // ============================================================================
 
-/// VoicePool の占有状態を JSON 1行に整形（active voice の note/stage を列挙）。
+/// Format VoicePool occupancy as one JSON line (list note/stage of active voices).
 fn formatVoices(app: *App, buf: []u8) []const u8 {
     var len: usize = 0;
     len += (std.fmt.bufPrint(buf[len..], "{{\"active\":{d},\"capacity\":{d},\"voices\":[", .{
@@ -262,9 +262,9 @@ fn formatVoices(app: *App, buf: []u8) []const u8 {
     return buf[0..len];
 }
 
-/// 公開中 patch を JSON 1行に整形。
-/// Mailbox の consumer 状態（RT 専有）に触れないよう、GUI 側コピー（last_patch）を読む（TASK-56）。
-/// probe は GUI と同一スレッド（main）なので plain read で安全。
+/// Format the published patch as one JSON line.
+/// Read the GUI-side copy (last_patch) so the Mailbox consumer state (RT-exclusive) is never touched.
+/// The probe shares the GUI thread (main), so a plain read is safe.
 fn formatPatch(app: *App, buf: []u8) []const u8 {
     const p = app.last_patch;
     return std.fmt.bufPrint(buf, "{{\"wave\":\"{s}\",\"filter\":\"{s}\",\"cutoff\":{d:.1},\"res\":{d:.2},\"gain\":{d:.3},\"attack\":{d:.3},\"release\":{d:.3},\"unison\":{d}}}", .{
@@ -294,13 +294,13 @@ fn appInit(gpa: std.mem.Allocator, io: std.Io) !*App {
     const initial_patch = makePatch(Params{});
     const spec = try gpa.create(Spec);
     errdefer gpa.destroy(spec);
-    spec.init(48000); // 仮 sr。audio.open 後に setSampleRate で対数軸を再算出
+    spec.init(48000); // Provisional sr. After audio.open, setSampleRate recalculates the log axis
 
     const osc = try gpa.create(Scope);
     errdefer gpa.destroy(osc);
     osc.* = .{};
 
-    // device は後で open。一旦 undefined を避け open 成功後に書く。
+    // device is opened later. Avoid leaving it undefined; write it after a successful open.
     app.* = .{
         .gpa = gpa,
         .io = io,
@@ -314,7 +314,7 @@ fn appInit(gpa: std.mem.Allocator, io: std.Io) !*App {
     };
     errdefer app.ctx.deinit();
 
-    // App 最終配置後に GuiFont を in-place load → ctx.font を再ポイント（TASK-138）。
+    // After App is finally placed, load GuiFont in-place and re-point ctx.font.
     app.gui_font.load(io, gpa);
     errdefer app.gui_font.deinit();
     app.ctx.font = app.gui_font.asFont();
@@ -342,7 +342,7 @@ fn appInit(gpa: std.mem.Allocator, io: std.Io) !*App {
         return err;
     };
 
-    // harness custom probe / action（無効時 no-op）
+    // harness custom probe / action (no-op when disabled)
     platform.registerProbe(.{ .name = "voices", .ctx = app, .ext = "json", .snapshot = voicesSnapshot, .digest = voicesDigest });
     platform.registerProbe(.{ .name = "patch", .ctx = app, .ext = "json", .snapshot = patchSnapshot, .digest = patchDigest });
     registerActions(app);
@@ -363,8 +363,8 @@ fn appDeinit(self: *App) void {
 
 fn appFrame(self: *App, window: *platform.Window) !bool {
     var running = true;
-    // pacing は app_runtime が所有する（TASK-180。`app.frame` から戻った後・framebuffer unlock 後に 1 回待つ）。
-    const fb = window.lockFramebuffer() orelse return true; // frame slot 無し（retry 可）
+    // Pacing is owned by app_runtime (waits once after returning from `app.frame` and unlocking the framebuffer).
+    const fb = window.lockFramebuffer() orelse return true; // No frame slot (retry allowed)
     defer fb.unlock();
 
     self.ctx.beginFrame(fb.width, fb.height);
@@ -411,7 +411,7 @@ fn appFrame(self: *App, window: *platform.Window) !bool {
         if (toGuiEvent(ev)) |ge| self.ctx.pushEvent(ge);
     }
 
-    // 出力タップを drain → mono downmix → スペクトログラム / オシロスコープ / レベルメータ
+    // Drain the output tap → mono downmix → spectrogram / oscilloscope / level meter
     while (true) {
         const n = self.tap.read(&self.stereo);
         if (n < 2) break;
@@ -422,7 +422,7 @@ fn appFrame(self: *App, window: *platform.Window) !bool {
         self.meter.feed(self.mono[0..frames]);
     }
 
-    // GUI コントロールパネル（上部）
+    // GUI control panel (top)
     self.ctx.beginBox(.{
         .direction = .column,
         .padding = .{ 10, 10, 10, 10 },
@@ -481,12 +481,12 @@ fn appFrame(self: *App, window: *platform.Window) !bool {
     self.ctx.endBox();
     self.ctx.endFrame();
 
-    // パラメータを publish（atomic/patch publish 経由で audio スレッドへ）
+    // Publish parameters (to the audio thread via atomic/patch publish)
     self.last_patch = makePatch(self.params);
     self.synth.publishPatch(self.last_patch);
     self.fx.publishParams(makeFxParams(self.fxp));
 
-    // 手動描画 → GUI
+    // Manual draw → GUI
     drawSpectrogramBgAndPiano(fb, &self.pressed);
     self.spec.draw(fb.pixels, fb.width, fb.height, SPEC_X0, SPEC_Y0);
     self.osc.draw(fb.pixels, fb.width, fb.height, SCOPE_X0, VIS_Y0);
@@ -496,7 +496,7 @@ fn appFrame(self: *App, window: *platform.Window) !bool {
     gui.render(target, &self.ctx.draw_list, self.ctx.font, 1.0);
 
     window.present();
-    // pacing は app_runtime が担う（TASK-180。wasm は rAF 律速なので pacing しない）。
+    // Pacing is owned by app_runtime (wasm is paced by rAF, so no pacing here).
     return running;
 }
 
@@ -504,7 +504,7 @@ const Rt = app_runtime.Runtime(App);
 
 pub fn enableWasmRuntime() void {
     Rt.enableWasmExports();
-    // audio_web の export（vp_audio_render / stack_top / render_buf）を DCE から守る
+    // Keep audio_web exports (vp_audio_render / stack_top / render_buf) alive against DCE
     audio.enableWebAudioExports();
 }
 
@@ -513,7 +513,7 @@ pub fn main(process_init: std.process.Init) !void {
     try Rt.runNative(process_init);
 }
 
-/// GUI スライダ/ボタンが in-place 更新するパラメータ束。
+/// Parameter bundle updated in-place by GUI sliders/buttons.
 const Params = struct {
     cutoff: f32 = 6000,
     resonance: f32 = 1.2,
@@ -523,17 +523,17 @@ const Params = struct {
     wave_idx: usize = 1, // saw
     filter_mode_idx: usize = 0, // lowpass
     keytrack: f32 = 0.0,
-    filter_env_amount: f32 = 0.0, // フィルタ env 量(オクターブ)
+    filter_env_amount: f32 = 0.0, // Filter env amount (octaves)
     filter_attack: f32 = 0.01,
     filter_decay: f32 = 0.2,
     lfo_rate: f32 = 5.0,
-    vibrato_depth: f32 = 0.0, // 半音
+    vibrato_depth: f32 = 0.0, // Semitones
     tremolo_depth: f32 = 0.0, // 0..1
-    // オシレータ拡張(27.13)。unison はスライダ用に f32 で保持し makePatch で u8 へ。
+    // Oscillator extensions. unison is kept as f32 for the slider and converted to u8 in makePatch.
     unison: f32 = 1,
     detune: f32 = 0.0, // cents
     osc2_mix: f32 = 0.0, // 0..1
-    osc2_detune: f32 = 0.0, // 半音
+    osc2_detune: f32 = 0.0, // Semitones
     osc2_wave_idx: usize = 0, // sine
     noise_amount: f32 = 0.0, // 0..1
 };
@@ -577,10 +577,10 @@ fn makePatch(p: Params) Patch {
     };
 }
 
-/// マスターエフェクト用 GUI パラメータ束(in-place 更新)。
+/// GUI parameter bundle for master effects (updated in-place).
 const FxParams = struct {
     bypass: bool = false,
-    delay_time: f32 = 0.25, // 秒
+    delay_time: f32 = 0.25, // Seconds
     delay_fb: f32 = 0.3,
     delay_mix: f32 = 0.0,
     chorus_rate: f32 = 0.8, // Hz
@@ -611,20 +611,20 @@ fn makeFxParams(p: FxParams) Fx.Params {
 }
 
 // ============================================================================
-// ヘッドレス検証 harness の custom action（TASK-65。TASK-62.1 の registerAction を synth が採用。
-// pixie(TASK-64) と同じ「probe(read) に対称な write 口。UI と同じ App.params/App.fxp field を
-// 書き換えるだけ」構図）。
+// Custom actions for the headless verification harness (synth adopts registerAction,
+// same shape as pixie: a write mouth symmetric to probe(read). Only rewrites the same
+// App.params/App.fxp fields the UI does).
 //
-// ホットパス宣言: 全 action の `run()` は「イベント時のみ」（harness `action` コマンド1回につき1回、
-// main thread の pollGate 内で実行）。フレーム毎・毎サンプルのいずれでもないため性能規約の適用対象外。
-// action が触れる状態伝播は既存の RT-safe cross-thread hand-off（`Synth.publishPatch` /
-// `MasterEffects.publishParams`。いずれも atomic/Mailbox 経由で、毎フレーム GUI が呼ぶ既存コード
-// パスと同一）をそのまま使うだけで、RT 経路（`Synth.render`/`MasterEffects.process`）へ新たな
-// 同期/alloc/lock/panic は一切追加しない。
+// Hot-path declaration: every action `run()` is event-time only (once per harness `action` command,
+// inside main-thread pollGate). Neither per-frame nor per-sample, so the performance rules do not apply.
+// State propagation uses the existing RT-safe cross-thread hand-off (`Synth.publishPatch` /
+// `MasterEffects.publishParams`; both go through atomic/Mailbox, identical to the existing code
+// path the GUI calls every frame). On the RT path (`Synth.render`/`MasterEffects.process`) no new
+// sync/alloc/lock/panic is added.
 //
-// パーサは `actions.zig`（std のみ・App/kit/dsp 非依存）に切り出し単体テストする。enum 名解決
-// （wave/filter 名 → index）は App の具象型を知るこのファイル側で行う（pixie の `ToolKind` 解決と
-// 同じ分離方針）。
+// Parsers live in `actions.zig` (std only; no App/kit/dsp) and are unit-tested there. Enum-name
+// resolution (wave/filter name → index) stays in this file, which knows App's concrete types
+// (same separation as pixie's `ToolKind` resolution).
 // ============================================================================
 
 fn actionApp(ctx: *anyopaque) *App {
@@ -640,7 +640,7 @@ fn republishFx(app: *App) void {
     app.fx.publishParams(makeFxParams(app.fxp));
 }
 
-/// `Params` の f32 field へ comptime dispatch で書き込む（`set_param` 汎用 setter）。
+/// Write a `Params` f32 field via comptime dispatch (generic `set_param` setter).
 fn setParamsF32(p: *Params, name: []const u8, value: f32) error{UnknownParam}!void {
     inline for (@typeInfo(Params).@"struct".fields) |f| {
         if (f.type == f32 and std.mem.eql(u8, f.name, name)) {
@@ -651,7 +651,7 @@ fn setParamsF32(p: *Params, name: []const u8, value: f32) error{UnknownParam}!vo
     return error.UnknownParam;
 }
 
-/// `FxParams` の f32 field へ comptime dispatch で書き込む（`set_fx_param` 汎用 setter）。
+/// Write an `FxParams` f32 field via comptime dispatch (generic `set_fx_param` setter).
 fn setFxParamsF32(p: *FxParams, name: []const u8, value: f32) error{UnknownParam}!void {
     inline for (@typeInfo(FxParams).@"struct".fields) |f| {
         if (f.type == f32 and std.mem.eql(u8, f.name, name)) {
@@ -701,7 +701,7 @@ fn actionSetFilter(ctx: *anyopaque, args: []const u8, buf: []u8) anyerror![]cons
     const app = actionApp(ctx);
     const name = try actions.parseName(args);
     const fm = std.meta.stringToEnum(dsp.FilterMode, name) orelse return error.UnknownFilter;
-    app.params.filter_mode_idx = @intFromEnum(fm); // filterModeOf の switch 順と同じ ordinal
+    app.params.filter_mode_idx = @intFromEnum(fm); // Same ordinal as the switch order in filterModeOf
     republishPatch(app);
     return "ok";
 }
@@ -724,12 +724,12 @@ fn actionSetFxBypass(ctx: *anyopaque, args: []const u8, buf: []u8) anyerror![]co
 }
 
 // ============================================================================
-// save_patch / load_patch（TASK-65 serialize。probe `patch` と対称の永続化口）。
+// save_patch / load_patch (persistence mouth symmetric to the `patch` probe).
 //
-// ホットパス宣言: save/load はイベント時のみ（action 1回につき1回。std.Io のブロッキング file I/O は
-// main thread の pollGate 内で完結する）。RT 経路（Synth.render/MasterEffects.process）には一切触れない。
-// 保存対象は App.params/App.fxp（GUI スライダと同じ値）のみ。load 後は既存の republishPatch/
-// republishFx（既存の atomic/Mailbox publish 経路）でそのまま audio スレッドへ反映する。
+// Hot-path declaration: save/load is event-time only (once per action. Blocking std.Io file I/O
+// finishes inside main-thread pollGate). Never touches the RT path (Synth.render/MasterEffects.process).
+// Persist only App.params/App.fxp (the same values as the GUI sliders). After load, republish via
+// the existing republishPatch/republishFx path (atomic/Mailbox) onto the audio thread.
 // ============================================================================
 
 fn actionSavePatch(ctx: *anyopaque, args: []const u8, buf: []u8) anyerror![]const u8 {
@@ -752,8 +752,8 @@ fn actionLoadPatch(ctx: *anyopaque, args: []const u8, buf: []u8) anyerror![]cons
     return "ok";
 }
 
-/// 8 action を一括登録する（`platform.init()` 後・main loop 前に呼ぶ。harness 無効時は
-/// `registerAction` 自体が no-op なので通常実行に影響しない）。
+/// Register all 8 actions in one go (call after `platform.init()`, before the main loop. When the harness
+/// is disabled `registerAction` itself is a no-op, so normal runs are unaffected).
 fn registerActions(app: *App) void {
     platform.registerAction(.{ .name = "set_param", .ctx = app, .run = actionSetParam });
     platform.registerAction(.{ .name = "set_wave", .ctx = app, .run = actionSetWave });

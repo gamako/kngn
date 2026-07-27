@@ -1,17 +1,17 @@
-//! apps/synth の harness action（TASK-65）向け純パーサ。
+//! Pure parsers for apps/synth harness actions.
 //!
-//! ホットパス宣言: ここでパースした結果は「イベント時のみ」（harness の `action <name> [args]`
-//! コマンド1回につき1回）dispatch される。毎フレーム全画素ループ・毎サンプル RT 経路のいずれでもない
-//! ため、性能規約（SIMD 3点セット等）の適用対象外。
+//! Hot-path declaration: parse results are **event-time only** (once per harness
+//! `action <name> [args]` command) and then dispatch. Neither a per-frame full-pixel loop nor a per-sample RT path,
+//! so the performance rules (SIMD triad and the rest) do not apply.
 //!
-//! このファイルは **std のみに依存**し、App / kit / platform / dsp を一切 import しない
-//! （pixie の `actions.zig` と同型。main.zig との circular import を避け、単体テスト可能にする）。
-//! パラメータ名・enum 名（wave/filter 等）の解決は App の具象型を知る main.zig 側が行う
-//! （pixie の `ToolKind` 解決と同じ分離方針。このファイルは name を素通しする）。
+//! This file depends on **std only** and imports none of App / kit / platform / dsp
+//! (same shape as pixie's `actions.zig`. Avoids a circular import with main.zig and stays unit-testable).
+//! Resolving parameter names and enum names (wave/filter and the like) is done on the main.zig side,
+//! which knows App's concrete types (same separation as pixie's `ToolKind` resolution; this file passes names through).
 //!
-//! 各パーサは `action <name>` の後の残り行 raw テキスト（trim 済み・main.zig 側で `;`/改行は
-//! 既に取り除かれている）を受け取り、typed な値かエラーを返す。空白区切りのトークンを読み、
-//! **余剰トークンがあれば `error.TooManyTokens` で拒否**する（fail-fast。typo を握りつぶさない）。
+//! Each parser takes the raw remainder of the line after `action <name>` (already trimmed; main.zig
+//! has already stripped `;` / LF) and returns a typed value or an error. Tokens are whitespace-split;
+//! **surplus tokens are rejected with `error.TooManyTokens`** (fail-fast; do not swallow typos).
 
 const std = @import("std");
 
@@ -27,16 +27,16 @@ fn tokenize(args: []const u8) std.mem.TokenIterator(u8, .any) {
     return std.mem.tokenizeAny(u8, args, " \t");
 }
 
-/// トークン反復子に余剰トークンが残っていないか検査する（fail-fast の共通ヘルパー）。
+/// Check that the token iterator has no leftover tokens (shared fail-fast helper).
 fn expectExhausted(it: *std.mem.TokenIterator(u8, .any)) ParseError!void {
     if (it.next() != null) return error.TooManyTokens;
 }
 
 pub const NameF32 = struct { name: []const u8, value: f32 };
 
-/// "<name> <value>" の2トークン（`set_param`/`set_fx_param` 用の汎用 f32 setter パーサ）。
-/// NaN/Inf は `error.NonFinite` で拒否する（fail-fast。非有限値を RT 側 Patch へ渡すと
-/// `makePatch` の `@intFromFloat(clamp(round(unison)))` 等で illegal behavior を招くため）。
+/// Two tokens "<name> <value>" (generic f32 setter parser for `set_param`/`set_fx_param`).
+/// Reject NaN/Inf with `error.NonFinite` (fail-fast. Feeding a non-finite value into the RT-side Patch
+/// invites illegal behaviour in `makePatch` via `@intFromFloat(clamp(round(unison)))` and the like).
 pub fn parseNameF32(args: []const u8) ParseError!NameF32 {
     var it = tokenize(args);
     const name = it.next() orelse return error.Empty;
@@ -47,7 +47,7 @@ pub fn parseNameF32(args: []const u8) ParseError!NameF32 {
     return .{ .name = name, .value = value };
 }
 
-/// "<name>" の1トークン（`set_wave`/`set_osc2_wave`/`set_filter` 用）。
+/// One token "<name>" (for `set_wave`/`set_osc2_wave`/`set_filter`).
 pub fn parseName(args: []const u8) ParseError![]const u8 {
     var it = tokenize(args);
     const name = it.next() orelse return error.Empty;
@@ -55,7 +55,7 @@ pub fn parseName(args: []const u8) ParseError![]const u8 {
     return name;
 }
 
-/// "<0|1>" の1トークン（`set_fx_bypass` 用）。
+/// One token "<0|1>" (for `set_fx_bypass`).
 pub fn parseBool01(args: []const u8) ParseError!bool {
     var it = tokenize(args);
     const tok = it.next() orelse return error.Empty;
@@ -69,9 +69,9 @@ pub fn parseBool01(args: []const u8) ParseError!bool {
     return on;
 }
 
-/// `save_patch`/`load_patch` 用: 前後の空白のみ trim し、内部の空白はそのまま保持する（path は
-/// 空白を含みうる1本の文字列として扱う。数値系パーサのようにトークナイズしない。pixie の
-/// `parsePath` と同型）。
+/// For `save_patch`/`load_patch`: trim only leading/trailing whitespace; keep internal spaces (path is
+/// treated as one string that may contain spaces. Do not tokenise like the numeric parsers. Same as pixie's
+/// `parsePath`).
 pub fn parsePath(args: []const u8) ParseError![]const u8 {
     const trimmed = std.mem.trim(u8, args, " \t");
     if (trimmed.len == 0) return error.Empty;
@@ -84,7 +84,7 @@ pub fn parsePath(args: []const u8) ParseError![]const u8 {
 
 const testing = std.testing;
 
-test "parseNameF32: 有効値 / 空 / 不正数値 / 非有限 / 余剰トークン" {
+test "parseNameF32: valid / empty / bad number / non-finite / surplus tokens" {
     const r = try parseNameF32("cutoff 8000");
     try testing.expectEqualStrings("cutoff", r.name);
     try testing.expectEqual(@as(f32, 8000), r.value);
@@ -102,14 +102,14 @@ test "parseNameF32: 有効値 / 空 / 不正数値 / 非有限 / 余剰トーク
     try testing.expectError(error.TooManyTokens, parseNameF32("cutoff 8000 extra"));
 }
 
-test "parseName: 前後 trim / 余剰トークン拒否 / 空拒否" {
+test "parseName: trim ends / reject surplus tokens / reject empty" {
     try testing.expectEqualStrings("saw", try parseName("  saw  "));
     try testing.expectError(error.Empty, parseName(""));
     try testing.expectError(error.Empty, parseName("   "));
     try testing.expectError(error.TooManyTokens, parseName("saw extra"));
 }
 
-test "parseBool01: 0/1 のみ許容" {
+test "parseBool01: only 0/1 accepted" {
     try testing.expectEqual(true, try parseBool01("1"));
     try testing.expectEqual(false, try parseBool01("0"));
     try testing.expectError(error.UnknownBool, parseBool01("true"));
@@ -117,7 +117,7 @@ test "parseBool01: 0/1 のみ許容" {
     try testing.expectError(error.TooManyTokens, parseBool01("1 0"));
 }
 
-test "parsePath: 前後 trim / 内部空白保持 / 空は拒否" {
+test "parsePath: trim ends / keep internal spaces / reject empty" {
     try testing.expectEqualStrings("/tmp/out.synp", try parsePath("  /tmp/out.synp  "));
     try testing.expectEqualStrings("/tmp/my patch.synp", try parsePath("/tmp/my patch.synp"));
     try testing.expectError(error.Empty, parsePath(""));

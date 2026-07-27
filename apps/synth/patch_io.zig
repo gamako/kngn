@@ -1,32 +1,32 @@
-//! apps/synth の音色パラメータ直列化（TASK-65 serialize）。
+//! Timbre-parameter serialisation for apps/synth.
 //!
-//! libs/serde の versioned container（TASK-62.2）に main.zig の `Params`（音色）/ `FxParams`
-//! （マスター FX）を chunk として載せる。`libs/paint` の `document_io.zig`（DOCH/FRAM/LAYR の固定
-//! layout・schema_version 明示）と同じ流儀だが、対象が「f32/bool/usize のみを持つフラット構造体」
-//! という限定形なので comptime で汎用化している。
+//! Packs main.zig's `Params` (timbre) / `FxParams`
+//! (master FX) as chunks into a libs/serde versioned container. Same style as `libs/paint`'s `document_io.zig` (fixed DOCH/FRAM/LAYR
+//! layout with an explicit schema_version), but specialised for the restricted shape "flat structs whose fields are only f32/bool/usize"
+//! so it is generalised at comptime.
 //!
-//! **循環 import 回避**: `Params`/`FxParams` の具体型は main.zig にあるが、この file は main.zig を
-//! 一切 import しない（main.zig ⇄ patch_io.zig の循環を避け、std + serde のみで単体テストできる
-//! ようにするため。`actions.zig` が App 型を持たず name を素通しするのと同じ分離方針）。
-//! 呼び出し側（main.zig）が具体型 `comptime P/F: type` を渡す。
+//! **Avoiding a circular import**: the concrete `Params`/`FxParams` types live in main.zig, but this file never imports main.zig
+//! (breaks the main.zig ⇄ patch_io.zig cycle so it can be unit-tested with only std + serde;
+//! same separation as `actions.zig` passing names through without holding the App type).
+//! The caller (main.zig) supplies the concrete `comptime P/F: type`.
 //!
-//! **対応 field 型は f32 / bool / usize のみ**（各 4B/1B/4B の little-endian 固定幅、宣言順）。
-//! 未対応の field 型は comptime error になる（構造体に新しい型の field を足したとき即座に気づける
-//! フェイルセーフ）。usize は 32bit 範囲の小さい index 値（wave_idx 等）にのみ使う前提で u32 truncate。
+//! **Supported field types are f32 / bool / usize only** (fixed little-endian widths 4B/1B/4B, declaration order).
+//! Unsupported field types are a comptime error (fail-safe so adding a new field type is noticed
+//! immediately). usize is u32-truncated under the assumption it only holds small 32-bit-range index values (wave_idx and the like).
 //!
-//! ホットパス宣言: encode/decode/save/load は **イベント時のみ**（`save_patch`/`load_patch` action
-//! 1回につき1回）。RT 経路（`Synth.render`/`MasterEffects.process`）には一切触れない。
+//! Hot-path declaration: encode/decode/save/load are **event-time only** (once per `save_patch`/`load_patch` action).
+//! Never touches the RT path (`Synth.render`/`MasterEffects.process`).
 
 const std = @import("std");
 const serde = @import("serde");
 
-/// 'SYNP'（synth patch）の little-endian u32。serde の expected_magic に渡す。
+/// Little-endian u32 of 'SYNP' (synth patch). Passed to serde as expected_magic.
 pub const magic: u32 = @as(u32, 'S') | (@as(u32, 'Y') << 8) | (@as(u32, 'N') << 16) | (@as(u32, 'P') << 24);
-/// このファイルの schema バージョン（serde の container_version とは別。app 管理）。
+/// Schema version for this file (separate from serde's container_version; owned by the app).
 pub const schema_version: u16 = 1;
 
-const TAG_PARM: [4]u8 = "PARM".*; // Params（音色）
-const TAG_FXPM: [4]u8 = "FXPM".*; // FxParams（マスター FX）
+const TAG_PARM: [4]u8 = "PARM".*; // Params (timbre)
+const TAG_FXPM: [4]u8 = "FXPM".*; // FxParams (master FX)
 
 pub const DecodeError = error{
     MissingParm,
@@ -37,21 +37,21 @@ pub const DecodeError = error{
     NonFiniteField,
 };
 
-/// field 1 個あたりの直列化バイト数（f32/usize=4B, bool=1B）。未対応型は compile error。
+/// Serialized byte count per field (f32/usize=4B, bool=1B). Unsupported types are a compile error.
 fn fieldSize(comptime T: type) usize {
     if (T == f32 or T == usize) return 4;
     if (T == bool) return 1;
     @compileError("patch_io: unsupported field type " ++ @typeName(T));
 }
 
-/// フラット struct の直列化サイズ（宣言順に fieldSize を積算）。
+/// Serialized size of a flat struct (sum of fieldSize in declaration order).
 fn packedSize(comptime T: type) usize {
     comptime var total: usize = 0;
     inline for (@typeInfo(T).@"struct".fields) |f| total += comptime fieldSize(f.type);
     return total;
 }
 
-/// `value` の全 field を宣言順に `out`（ちょうど `packedSize(T)` バイト）へ書く。
+/// Write every field of `value` in declaration order into `out` (exactly `packedSize(T)` bytes).
 fn packInto(comptime T: type, value: T, out: []u8) void {
     comptime var off: usize = 0;
     inline for (@typeInfo(T).@"struct".fields) |f| {
@@ -69,11 +69,11 @@ fn packInto(comptime T: type, value: T, out: []u8) void {
     }
 }
 
-/// `bytes`（ちょうど `packedSize(T)` バイト。呼び出し側が検証済み）から `T` を宣言順に復元する。
-/// **f32 field は non-finite（NaN/Inf）を `error.NonFiniteField` で拒否する**（fail-fast。ファイル
-/// 由来の非有限値をそのまま `app.params`/`app.fxp` へ代入すると、後段の `makePatch` 内
-/// `@intFromFloat(clamp(round(unison)))` 等で safety-checked illegal behavior を招くため。
-/// `actions.zig` の `parseNameF32` が action 経路で行っている検査と同じものを file load 経路にも課す）。
+/// Restore `T` in declaration order from `bytes` (exactly `packedSize(T)` bytes; caller-validated).
+/// **f32 fields reject non-finite (NaN/Inf) with `error.NonFiniteField`** (fail-fast. Assigning a
+/// file-sourced non-finite value straight into `app.params`/`app.fxp` invites safety-checked illegal
+/// behaviour later inside `makePatch` via `@intFromFloat(clamp(round(unison)))` and the like.
+/// Same check `actions.zig`'s `parseNameF32` already applies on the action path, also on file load).
 fn unpackFrom(comptime T: type, bytes: []const u8) error{NonFiniteField}!T {
     var value: T = .{};
     comptime var off: usize = 0;
@@ -98,8 +98,8 @@ pub fn Decoded(comptime P: type, comptime F: type) type {
     return struct { params: P, fxp: F };
 }
 
-/// `P`（Params）/ `F`（FxParams）を 2 chunk（PARM/FXPM）にして versioned container を組み立てる
-/// （caller が free する）。
+/// Build a versioned container with `P` (Params) / `F` (FxParams) as two chunks (PARM/FXPM)
+/// (caller frees).
 pub fn encode(comptime P: type, comptime F: type, gpa: std.mem.Allocator, p: P, f: F) ![]u8 {
     var w = try serde.Writer.init(gpa, magic, schema_version);
     errdefer w.deinit();
@@ -115,7 +115,7 @@ pub fn encode(comptime P: type, comptime F: type, gpa: std.mem.Allocator, p: P, 
     return w.finish();
 }
 
-/// バイト列から `P`/`F` を復元する。v1 は固定長 chunk（`packedSize` と厳密一致しない payload は破損扱い）。
+/// Restore `P`/`F` from a byte slice. v1 uses fixed-length chunks (payloads that do not exactly match `packedSize` are corrupt).
 pub fn decode(comptime P: type, comptime F: type, bytes: []const u8) !Decoded(P, F) {
     const container = try serde.Container.parse(bytes, magic);
     if (container.schemaVersion() > schema_version) return error.UnsupportedSchemaVersion;
@@ -128,14 +128,14 @@ pub fn decode(comptime P: type, comptime F: type, bytes: []const u8) !Decoded(P,
     return .{ .params = try unpackFrom(P, parm), .fxp = try unpackFrom(F, fxpm) };
 }
 
-/// `P`/`F` を path へ保存する（encode → writeFile）。
+/// Save `P`/`F` to path (encode → writeFile).
 pub fn save(io: std.Io, path: []const u8, comptime P: type, comptime F: type, p: P, f: F, gpa: std.mem.Allocator) !void {
     const bytes = try encode(P, F, gpa, p, f);
     defer gpa.free(bytes);
     try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = bytes });
 }
 
-/// path から `P`/`F` を読む。
+/// Read `P`/`F` from path.
 pub fn load(io: std.Io, gpa: std.mem.Allocator, path: []const u8, comptime P: type, comptime F: type) !Decoded(P, F) {
     const bytes = try std.Io.Dir.cwd().readFileAlloc(io, path, gpa, .unlimited);
     defer gpa.free(bytes);
@@ -172,10 +172,10 @@ test "encode/decode: round-trip flat f32/bool/usize struct pair" {
     try testing.expectEqual(f, got.fxp);
 }
 
-test "decode: 破損検出 (BadMagic/UnsupportedSchemaVersion/MissingParm/MissingFxpm/CorruptParm)" {
+test "decode: corruption detection (BadMagic/UnsupportedSchemaVersion/MissingParm/MissingFxpm/CorruptParm)" {
     const gpa = testing.allocator;
 
-    // BadMagic（serde が検出）
+    // BadMagic (detected by serde)
     {
         var w = try serde.Writer.init(gpa, 0xDEADBEEF, schema_version);
         defer w.deinit();
@@ -203,7 +203,7 @@ test "decode: 破損検出 (BadMagic/UnsupportedSchemaVersion/MissingParm/Missin
         defer gpa.free(bytes);
         try testing.expectError(error.UnsupportedSchemaVersion, decode(TestParams, TestFx, bytes));
     }
-    // MissingParm（PARM 無し）
+    // MissingParm (no PARM)
     {
         var w = try serde.Writer.init(gpa, magic, schema_version);
         defer w.deinit();
@@ -214,7 +214,7 @@ test "decode: 破損検出 (BadMagic/UnsupportedSchemaVersion/MissingParm/Missin
         defer gpa.free(bytes);
         try testing.expectError(error.MissingParm, decode(TestParams, TestFx, bytes));
     }
-    // MissingFxpm（FXPM 無し）
+    // MissingFxpm (no FXPM)
     {
         var w = try serde.Writer.init(gpa, magic, schema_version);
         defer w.deinit();
@@ -225,7 +225,7 @@ test "decode: 破損検出 (BadMagic/UnsupportedSchemaVersion/MissingParm/Missin
         defer gpa.free(bytes);
         try testing.expectError(error.MissingFxpm, decode(TestParams, TestFx, bytes));
     }
-    // CorruptParm（PARM の長さ不一致）
+    // CorruptParm (PARM length mismatch)
     {
         var w = try serde.Writer.init(gpa, magic, schema_version);
         defer w.deinit();
@@ -237,7 +237,7 @@ test "decode: 破損検出 (BadMagic/UnsupportedSchemaVersion/MissingParm/Missin
         defer gpa.free(bytes);
         try testing.expectError(error.CorruptParm, decode(TestParams, TestFx, bytes));
     }
-    // NonFiniteField（PARM 内の f32 field が NaN/Inf。CRC 的には正当だが復元を拒否する）
+    // NonFiniteField (f32 field inside PARM is NaN/Inf. CRC-valid but restore is rejected)
     {
         var w = try serde.Writer.init(gpa, magic, schema_version);
         defer w.deinit();
@@ -251,7 +251,7 @@ test "decode: 破損検出 (BadMagic/UnsupportedSchemaVersion/MissingParm/Missin
         defer gpa.free(bytes);
         try testing.expectError(error.NonFiniteField, decode(TestParams, TestFx, bytes));
     }
-    // NonFiniteField（FXPM 側の f32 field が +Inf）
+    // NonFiniteField (f32 field on the FXPM side is +Inf)
     {
         var w = try serde.Writer.init(gpa, magic, schema_version);
         defer w.deinit();
@@ -267,7 +267,7 @@ test "decode: 破損検出 (BadMagic/UnsupportedSchemaVersion/MissingParm/Missin
     }
 }
 
-test "前方互換: 未知 chunk tag を挟んでも PARM/FXPM を読める" {
+test "forward compat: still reads PARM/FXPM with an unknown chunk tag in between" {
     const gpa = testing.allocator;
     var w = try serde.Writer.init(gpa, magic, schema_version);
     defer w.deinit();

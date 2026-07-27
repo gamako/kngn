@@ -1,7 +1,7 @@
-//! synth wasm root（TASK-73.2: wasm32-wasi + shared memory audio）
+//! synth wasm root (wasm32-wasi + shared memory audio)
 //!
-//! root に `main` が無いこと。wasi command `_start` / reactor `_initialize` の
-//! std.start 配線を避け、export（vp_init/vp_frame/vp_audio_*）駆動の reactor 相当にする。
+//! No `main` at the root. Avoid std.start wiring of wasi command `_start` / reactor `_initialize`,
+//! and behave as a reactor driven by the exports (vp_init/vp_frame/vp_audio_*).
 
 const synth = @import("synth_app");
 
