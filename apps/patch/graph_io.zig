@@ -442,8 +442,11 @@ test "corruption detection: UnsupportedSchemaVersion / CorruptNode / CorruptEdge
 test "file I/O: save→load round-trip" {
     const gpa = testing.allocator;
     const io = testing.io;
-    const path = ".task65_patch_graph_io_test.ptcg";
-    defer std.Io.Dir.cwd().deleteFile(io, path) catch {};
+    // Fixed cwd names race across parallel test binaries, so isolate with tmpDir.
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buf: [64]u8 = undefined;
+    const path = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}/graph_io_test.ptcg", .{&tmp.sub_path});
 
     const nodes = [_]NodeEntry{
         .{ .handle = 3, .kind = .lfo, .x = 5, .y = 6 },

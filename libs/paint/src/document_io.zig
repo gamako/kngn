@@ -1174,7 +1174,7 @@ test "reset + direct layerPixels write + commitActiveLayerToCel → save/load pi
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     var path_buf: [64]u8 = undefined;
-    const pix_path = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}/task95_open_commit.pix", .{&tmp.sub_path});
+    const pix_path = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}/open_commit.pix", .{&tmp.sub_path});
     try saveDocument(io, pix_path, &doc, gpa);
 
     var loaded = try loadDocument(io, gpa, pix_path, 4, 4);
@@ -1325,8 +1325,11 @@ test "file I/O: saveDocument→loadDocument round-trip + size reject + exportPng
         .{ .idx = 0, .before = 0, .after = 0x80FF00FF },
     }));
 
-    const pix_path = ".task45_doc_test.pix";
-    defer std.Io.Dir.cwd().deleteFile(io, pix_path) catch {};
+    // Fixed cwd names race across parallel test binaries, so isolate with tmpDir.
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buf: [64]u8 = undefined;
+    const pix_path = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}/doc_test.pix", .{&tmp.sub_path});
     try saveDocument(io, pix_path, &doc, gpa);
 
     // Size reject (expect 256 → 4x4 rejected; error before layer restore)
@@ -1340,9 +1343,10 @@ test "file I/O: saveDocument→loadDocument round-trip + size reject + exportPng
     try testing.expectEqualSlices(u32, c.layers.items[1].pixels, loaded.activeCanvas().layers.items[1].pixels);
 
     // exportPngSequence (1 frame → <stem>_0001.png; matches compositeStraight)
-    const stem = ".task45_seq_test";
-    const seq_path = ".task45_seq_test_0001.png";
-    defer std.Io.Dir.cwd().deleteFile(io, seq_path) catch {};
+    var stem_buf: [64]u8 = undefined;
+    const stem = try std.fmt.bufPrint(&stem_buf, ".zig-cache/tmp/{s}/seq_test", .{&tmp.sub_path});
+    var seq_buf: [80]u8 = undefined;
+    const seq_path = try std.fmt.bufPrint(&seq_buf, "{s}_0001.png", .{stem});
     try exportPngSequence(io, stem, &doc, gpa);
     const png_img = try png.decodePNGFile(io, gpa, seq_path);
     defer {
@@ -1367,18 +1371,22 @@ test "exportSpriteSheet: 2x2 layout / 1-frame identity / margin / columns / fram
     const gpa = testing.allocator;
     const io = std.testing.io;
     const png = @import("png");
+    // Fixed cwd names race across parallel test binaries, so isolate with tmpDir.
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buf: [64]u8 = undefined;
 
     // Reject frame count 0
     var empty = try Document.initEmpty(gpa, 2, 2);
     defer empty.deinit();
-    try testing.expectError(error.NoFrames, exportSpriteSheet(io, ".task45_sheet_empty.png", &empty, gpa, .{}));
+    const empty_path = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}/sheet_empty.png", .{&tmp.sub_path});
+    try testing.expectError(error.NoFrames, exportSpriteSheet(io, empty_path, &empty, gpa, .{}));
 
     // 1-frame identity (auto columns = 1)
     var one = try Document.init(gpa, 2, 2);
     defer one.deinit();
     try paintFramePixel(&one, gpa, 0, 0xFFFF0000);
-    const one_path = ".task45_sheet_one.png";
-    defer std.Io.Dir.cwd().deleteFile(io, one_path) catch {};
+    const one_path = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}/sheet_one.png", .{&tmp.sub_path});
     try exportSpriteSheet(io, one_path, &one, gpa, .{});
     const one_img = try png.decodePNGFile(io, gpa, one_path);
     defer {
@@ -1398,8 +1406,7 @@ test "exportSpriteSheet: 2x2 layout / 1-frame identity / margin / columns / fram
         try doc.addFrame(gpa, @intCast(fi));
         try paintFramePixel(&doc, gpa, @intCast(fi), colors[fi]);
     }
-    const sheet_path = ".task45_sheet_2x2.png";
-    defer std.Io.Dir.cwd().deleteFile(io, sheet_path) catch {};
+    const sheet_path = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}/sheet_2x2.png", .{&tmp.sub_path});
     try exportSpriteSheet(io, sheet_path, &doc, gpa, .{ .columns = 2 });
     const sheet = try png.decodePNGFile(io, gpa, sheet_path);
     defer {
@@ -1420,8 +1427,7 @@ test "exportSpriteSheet: 2x2 layout / 1-frame identity / margin / columns / fram
     try paintFramePixel(&margin_doc, gpa, 0, 0xFFFF0000);
     try margin_doc.addFrame(gpa, 1);
     try paintFramePixel(&margin_doc, gpa, 1, 0xFF00FF00);
-    const margin_path = ".task45_sheet_margin.png";
-    defer std.Io.Dir.cwd().deleteFile(io, margin_path) catch {};
+    const margin_path = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}/sheet_margin.png", .{&tmp.sub_path});
     try exportSpriteSheet(io, margin_path, &margin_doc, gpa, .{ .columns = 2, .margin = 1 });
     const margin_img = try png.decodePNGFile(io, gpa, margin_path);
     defer {
@@ -1440,7 +1446,12 @@ test "exportSpriteSheet: huge columns/margin → SheetTooLarge (checked arithmet
     const io = std.testing.io;
     var doc = try Document.init(gpa, 2, 2);
     defer doc.deinit();
-    try testing.expectError(error.SheetTooLarge, exportSpriteSheet(io, ".task45_sheet_huge.png", &doc, gpa, .{
+    // Fixed cwd names race across parallel test binaries, so isolate with tmpDir.
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buf: [64]u8 = undefined;
+    const huge_path = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}/sheet_huge.png", .{&tmp.sub_path});
+    try testing.expectError(error.SheetTooLarge, exportSpriteSheet(io, huge_path, &doc, gpa, .{
         .columns = std.math.maxInt(u32),
         .margin = std.math.maxInt(u32),
     }));

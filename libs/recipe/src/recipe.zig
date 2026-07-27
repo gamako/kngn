@@ -331,8 +331,11 @@ test "checkAppName / checkNotReplaying" {
 test "file I/O: save→load round-trip" {
     const gpa = testing.allocator;
     const io = std.testing.io;
-    const path = ".task6258_recipe_test.recipe";
-    defer std.Io.Dir.cwd().deleteFile(io, path) catch {};
+    // Fixed cwd names race across parallel test binaries, so isolate with tmpDir.
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buf: [64]u8 = undefined;
+    const path = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}/recipe_io_test.recipe", .{&tmp.sub_path});
 
     const entries = [_]Entry{
         .{ .name = "seed", .args = "42" },
@@ -445,8 +448,11 @@ test "Byte-count oversize → RecipeTooLarge (decode / load)" {
     // load: file over the cap
     {
         const io = std.testing.io;
-        const path = ".task6258_recipe_too_large.recipe";
-        defer std.Io.Dir.cwd().deleteFile(io, path) catch {};
+        // Fixed cwd names race across parallel test binaries, so isolate with tmpDir.
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        var path_buf: [64]u8 = undefined;
+        const path = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}/recipe_too_large.recipe", .{&tmp.sub_path});
         const big = try gpa.alloc(u8, MAX_RECIPE_BYTES + 1);
         defer gpa.free(big);
         @memset(big, 0xab);

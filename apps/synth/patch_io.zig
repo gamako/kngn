@@ -289,8 +289,11 @@ test "forward compat: still reads PARM/FXPM with an unknown chunk tag in between
 test "file I/O: save→load round-trip" {
     const gpa = testing.allocator;
     const io = testing.io;
-    const path = ".task65_synth_patch_io_test.synp";
-    defer std.Io.Dir.cwd().deleteFile(io, path) catch {};
+    // Fixed cwd names race across parallel test binaries, so isolate with tmpDir.
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buf: [64]u8 = undefined;
+    const path = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}/patch_io_test.synp", .{&tmp.sub_path});
 
     const p = TestParams{ .a = 42, .b = -1, .idx = 3, .flag = true, .c = 0.5 };
     const f = TestFx{ .bypass = false, .x = 1.5, .y = -2.5 };
