@@ -35,7 +35,8 @@ devShell includes zig 0.16, zls, the X11 dev libraries (`libX11`, `libXext`), Xv
 
 > **Transferring sources**: the script that sends sources to Linux or Windows hardware
 > to build natively there contains the machine names, so it lives in the private
-> meta repository. Its procedure is documented there.
+> meta repository. Nothing in it is required to build: clone this repository on the
+> target machine and build natively there (the script only saves a round trip).
 
 Input (keys, mouse, scroll, modifiers) is translated from `XEvent`s by
 `core/platform_linux_x11.zig`. Physical keys become a `KeyCode` through the evdev X

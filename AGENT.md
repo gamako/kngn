@@ -442,6 +442,13 @@ cost, so **always also measure the application's real frame rate**. The procedur
 
 ## Common commands
 
+> **Changing a public API also means checking the external consumer.**
+> [tictactoe](https://github.com/gamako/tictactoe) depends on this repository through a
+> `.path` dependency and is the worked example of consuming `kit` and the build helpers from
+> outside. It is not built by any step here, so a signature change can break it silently —
+> which is what happened when `gui.render` gained its `scale` argument. Build it against your
+> branch when you change anything `kit` re-exports.
+
 ```bash
 # Build every platform variant (also used as a build regression check for examples and platform)
 zig build -Dinstall-all=true

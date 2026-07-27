@@ -213,6 +213,12 @@ swap means tearing does not occur.
 
 **Responsibility**: the caller.
 
+> **Historical examples.** The two loops below are how this was written when the decision
+> was taken, and they are kept as the record of it. **Do not copy them into new code**: the
+> current API is `platform.framePaceUntil(deadline)`, which waits out the remainder of a frame
+> deadline and learns the OS timer overshoot instead of adding a fixed period. See
+> `docs/adr/008` and [docs/performance-measurement.md](../performance-measurement.md).
+
 **How**:
 
 ```zig
