@@ -422,7 +422,13 @@ const App = struct {
             .size = .{ .width = WINDOW_W, .height = WINDOW_H },
             .fb_mode = .physical,
         };
-        const override_path = if (std.c.getenv("VP_APPSHELL_DIR")) |value| std.mem.span(value) else null;
+        // VP_APPSHELL_DIR is a native-only development override; wasm has no process env to read.
+        const override_path = if (comptime builtin.os.tag == .wasi or builtin.os.tag == .freestanding)
+            null
+        else if (std.c.getenv("VP_APPSHELL_DIR")) |value|
+            std.mem.span(value)
+        else
+            null;
         var data_dir = appshell.paths.openAppDataDir(io, gpa, "pixie", override_path) catch |err| {
             std.log.err("pixie: window_state data dir open failed: {s}", .{@errorName(err)});
             return fallback_opts;
@@ -6612,7 +6618,13 @@ fn appInit(gpa: std.mem.Allocator, io: std.Io) !*App {
     const onion_scratch = try gpa.alloc(u32, canvas_pixel_count);
     errdefer gpa.free(onion_scratch);
 
-    const override_path = if (std.c.getenv("VP_APPSHELL_DIR")) |value| std.mem.span(value) else null;
+    // VP_APPSHELL_DIR is a native-only development override; wasm has no process env to read.
+    const override_path = if (comptime builtin.os.tag == .wasi or builtin.os.tag == .freestanding)
+        null
+    else if (std.c.getenv("VP_APPSHELL_DIR")) |value|
+        std.mem.span(value)
+    else
+        null;
     var data_dir = try appshell.paths.openAppDataDir(io, gpa, "pixie", override_path);
     errdefer data_dir.close(io);
     var autosave_dir = try appshell.paths.openAutosaveDir(io, data_dir);

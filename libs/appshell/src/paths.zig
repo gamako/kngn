@@ -67,6 +67,8 @@ pub fn normalizePath(io: std.Io, allocator: std.mem.Allocator, path: []const u8)
 }
 
 fn env(name: [*:0]const u8) ?[]const u8 {
+    // Wasm has no process env; env-based path overrides are a native-only development aid.
+    if (comptime builtin.os.tag == .wasi or builtin.os.tag == .freestanding) return null;
     const value = std.c.getenv(name) orelse return null;
     return std.mem.span(value);
 }
