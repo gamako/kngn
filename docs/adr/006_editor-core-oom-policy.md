@@ -1,12 +1,17 @@
-# ADR-006: OOM policy for `apps/editor/core` (keep `@panic`)
+# ADR-006: OOM policy for `libs/paint` (keep `@panic`)
 
 **Status:** Accepted
 **Date:** 2026-07-03
 **Category:** Editor, error handling, API design
 
+> **Path note (factual, not a decision change):** when this ADR was accepted the
+> reusable editor core lived at `apps/editor/core/`. [ADR-007](007_project-layers-and-module-boundaries.md)
+> R6 promoted it to `libs/paint/src/`. The OOM policy itself is unchanged and still
+> applies to that library.
+
 ## Summary
 
-Allocation failure (OOM) in `apps/editor/core` — `Canvas`, `UndoStack`,
+Allocation failure (OOM) in `libs/paint` — `Canvas`, `UndoStack`,
 `StrokeRecorder`, `Selection`, `Path` — **keeps the existing policy of stopping
 immediately via `catch @panic("…: OOM")`**.
 
@@ -46,13 +51,26 @@ immediately via `catch @panic("…: OOM")`**.
 
 ## Consequences
 
-- The `catch @panic("…: OOM")` sites in `undo.zig`, `path.zig`, `bezier.zig`,
-  `selection.zig` and `canvas.zig` (`moveLayer`) are intentional and are not
-  review findings.
+- The `catch @panic("…: OOM")` sites in `libs/paint` are intentional and are not
+  review findings. In the current layout:
+  - `libs/paint/src/document.zig` owns `Op` / `UndoStack` (and many Document OOM paths).
+  - `libs/paint/src/undo.zig` owns `StrokeRecorder` / `PaintDiff` / `PixelDiff` /
+    `NameSnapshot` (stroke recording only; it does not import `document.zig`).
+  - Other sites include `libs/paint/src/path.zig`, `bezier.zig`, `selection.zig` and
+    `canvas.zig` (`moveLayer`).
 - If error propagation is ever needed — for use as an external library, say — a
   new ADR superseding this one comes first.
 
 ## Related
 
-- The policy comment at the top of `apps/editor/core/undo.zig` refers to this ADR
-- `apps/editor/core/README.md` carries a summary of the policy
+- The policy comment at the top of `libs/paint/src/undo.zig` refers to this ADR
+- `libs/paint/README.md` carries a summary of the policy
+- [ADR-007](007_project-layers-and-module-boundaries.md) R6 (promotion into
+  `libs/paint`)
+
+## Revision history
+
+- 2026-07-03 First version. Keeps `@panic` for OOM in the editor core; init/construction keep `!T`.
+- 2026-07-27 Path and file-layout facts updated for the ADR-007 R6 promotion to
+  `libs/paint` (`Op`/`UndoStack` in `document.zig`; stroke recording in `undo.zig`).
+  The decision itself is unchanged.

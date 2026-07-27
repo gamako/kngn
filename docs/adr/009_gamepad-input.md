@@ -1,15 +1,17 @@
 # ADR-009: Gamepad input (types, API shape, harness alignment)
 
-**Status:** Accepted (the design is settled; backend implementations are follow-up work)
+**Status:** Accepted (the design is settled; the macOS GameController backend is implemented; Linux and Windows hardware backends remain follow-up)
 **Date:** 2026-07-05
 **Category:** Platform API, input
 
 ## Summary
 
-Settles the design of gamepad (controller) input. This stage implements only the
-backend-independent skeleton — types, a facade stub, harness injection and a probe,
-helpers, and an example scaffold — and leaves the actual HID/IOKit/XInput
-implementations to the backend work that follows.
+Settles the design of gamepad (controller) input. The backend-independent
+skeleton — types, the facade, harness injection and a probe, helpers, and an
+example — is in place. **macOS** now implements hardware polling through the
+GameController framework (opt-in per executable via `build_options.enable_gamepad`).
+**Linux and Windows** hardware backends remain follow-up; without the harness they
+still return `null` from `Window.getGamepadState`.
 
 **The decision, in short:**
 
@@ -140,16 +142,20 @@ pub fn getGamepadState(self: Window, index: u8) ?GamepadState;
 
 - **The polling function is a `Window` method**, matching the shape of the existing
   `lockFramebuffer` and `present`.
-- **Every backend returns `null` for now** (the backends implement it later), and
-  **the facade holds the stub itself**: it delegates to the harness when
-  `harness.isEnabled() or harness.isHeadlessActive()`, and otherwise returns `null`
-  unconditionally. The
-  backend files are **untouched** at this stage; once
-  `backend.Window.getGamepadState` exists, the facade is changed to dispatch there.
-- **Connect and disconnect go through `Event`.** Where `Window.nextEvent()` has a
-  native path, each backend enqueues `Event.gamepad_connected` and
-  `gamepad_disconnected` later; at this stage the only source is the harness's
-  `inject gamepad_connect/disconnect`.
+- **Facade dispatch (current behaviour)**: when the harness is enabled it returns
+  injected state; otherwise on **macOS with `build_options.enable_gamepad`** it
+  dispatches to `platform_macos.Window.getGamepadState` (GameController via the C
+  ABI); on Linux, Windows, wasm, or macOS without the opt-in it returns `null`.
+  > **Supersedes the skeleton-era note**: when this ADR was accepted every backend
+  > returned `null` and the backend files were untouched. That is no longer true on
+  > macOS (`platform/macos/platform_macos.m`,
+  > `platform/macos-shared/platform_macos_shared.swift`, and
+  > `core/platform_macos.zig`). Linux / Windows / DirectInput / XInput /
+  > evdev hardware backends remain follow-up.
+- **Connect and disconnect go through `Event`.** On macOS the GameController
+  connect/disconnect observers enqueue `Event.gamepad_connected` and
+  `gamepad_disconnected`. The harness's `inject gamepad_connect/disconnect` remains
+  the synthetic path for every OS.
 
 ### 3. The C ABI (for the macOS backend; consumed by the backend work)
 
@@ -189,9 +195,9 @@ bool platform_get_gamepad_state(PlatformWindow* window, int index, PlatformGamep
 - `PLATFORM_EVENT_GAMEPAD_CONNECTED` and `PLATFORM_EVENT_GAMEPAD_DISCONNECTED` are
   appended to `PlatformEventType`, and `gamepad{ int32_t index; char name[33]; }` is
   added to `PlatformEvent.payload` (`name` is empty for the disconnect event).
-- **This stage declares only.** Nothing calls `platform_get_gamepad_state`, so the
-  macOS `.m` and `.swift` implementation files need no change (an unused extern
-  declaration creates no link requirement).
+- **macOS implements `platform_get_gamepad_state`** (objc and the shared Swift path)
+  when gamepad support is linked. Linux and Windows still have no native
+  implementation; the Zig facade returns `null` there (see §2).
 
 ### 4. Effect on the harness
 
@@ -258,9 +264,9 @@ use it directly.
   (the `toGuiEvent` family in the examples, `apps/patch`, and parts of
   `apps/editor/apps/pixie`) each gain a one-line no-op branch — the same scope of change as when
   `char_input` was added.
-- **The backends can implement this**: because every backend goes through the
-  facade's null-returning stub, no backend implementation file changes at this stage,
-  and each can be tackled separately later.
+- **Backends implement independently**: macOS has done so (GameController). Linux and
+  Windows can still land later without changing the settled layout or harness
+  contract.
 - **Harness determinism**: `gamepad_states` is updated only while handling an
   injection (on events only, so not a hot path). The per-frame `getGamepadState` call
   itself just reads existing state, with no allocation and no locking.
@@ -271,17 +277,18 @@ use it directly.
   `Stick`, `GamepadState`, `GamepadInfo` and `GamepadDisconnect`, plus two variants on
   the `Event` union.
 - `platform/platform.h`: backward-compatible appends of the C ABI types, the event
-  kinds and the function prototype (declarations only).
-- `core/platform.zig`: the `Window.getGamepadState` stub plus type re-exports.
+  kinds and the function prototype.
+- `core/platform.zig`: `Window.getGamepadState` (harness choke point; macOS opt-in
+  dispatch; otherwise `null`).
+- `core/platform_macos.zig` plus the macOS C ABI
+  (`platform/macos/platform_macos.m`,
+  `platform/macos-shared/platform_macos_shared.swift`): GameController polling and
+  connect/disconnect events (**implemented** after this ADR was accepted).
 - `core/control/harness.zig`: the `gamepad_states` state, four injection commands and
   the built-in `gamepad` probe.
-- `src/gamepad.zig`: new helpers (re-exported from `kit/kit.zig`).
-- `examples/22_gamepad`: the example scaffold (`run-example_22`; the number initially
-  assumed, `examples/20_gamepad`, was re-read as 22 because `20_capture_demo` already
-  exists).
-- The backend implementation files (`platform_macos.zig`, `platform_linux*.zig`,
-  `platform_windows*.zig`, and the macOS `.m` and `.swift` files) are **unchanged**
-  here.
+- `src/gamepad.zig`: helpers (re-exported from `kit/kit.zig`).
+- `examples/22_gamepad`: the example (`run-example_22`).
+- Linux and Windows hardware backends remain follow-up (facade returns `null`).
 
 ## Hot-path declaration
 
@@ -298,3 +305,4 @@ command) and are not hot paths.
 | Version | Date | Changes |
 |---------|------|---------|
 | 1.0 | 2026-07-05 | First version. Settles the standard layout, polling first plus connection events, triggers as axes only, raw values plus a deadzone helper, the harness state model, appending to `Event`, and the C ABI types. |
+| 1.1 | 2026-07-27 | Status / §2 / C ABI / Consequences updated for the implemented macOS GameController backend. The decision (layout, polling-first, triggers-as-axes, harness model) is unchanged. Linux/Windows hardware backends remain follow-up. |

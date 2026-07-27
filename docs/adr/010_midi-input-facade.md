@@ -1,15 +1,19 @@
 # ADR-010: MIDI input facade
 
-- Status: Accepted
+- Status: Accepted (the OS-independent skeleton stands; the macOS CoreMIDI backend is implemented; Linux/Windows hardware backends remain follow-up)
 - Date: 2026-07-17
-- Scope: the OS-independent skeleton, ahead of any hardware backend
+- Scope: the OS-independent contracts (types, polling facade, null backend, harness, monitor example), plus the later macOS CoreMIDI backend that realises them
 
 ## Goal and non-goals
 
-Ahead of a real MIDI backend, this fixes the contracts for the OS-independent
-types, the polling facade, the null backend, harness synthetic input, and the MIDI
-monitor example. Out of scope here: MIDI output, sysex, clock, wiring into the
-modular engine, and the CoreMIDI and ALSA implementations.
+This ADR fixes the contracts for the OS-independent types, the polling facade, the
+null backend, harness synthetic input, and the MIDI monitor example. Out of scope
+here when accepted: MIDI output, sysex, clock, wiring into the modular engine, and
+the ALSA / Windows hardware implementations.
+
+> **Supersedes the skeleton-era "Out of scope: CoreMIDI" note**: macOS now selects
+> `core/midi_macos.zig` (CoreMIDI). Linux and Windows still select
+> `core/midi_null.zig`. The contracts below still govern those backends.
 
 ## Public types and facade
 
@@ -23,8 +27,12 @@ modular engine, and the CoreMIDI and ALSA implementations.
 
 `core/midi.zig` re-exports the types, and `midi.open(allocator)` returns a
 `midi.Device`. `Device.pollMidi()` returns one event at a time and `null` when
-empty; `Device.close()` tears down. At this stage every target OS selects
-`core/midi_null.zig`: open succeeds, poll always returns `null`, close is a no-op.
+empty; `Device.close()` tears down. Backend selection (`core/midi.zig`):
+
+- **macOS** → `core/midi_macos.zig` (CoreMIDI)
+- **Linux / Windows / wasm / other** → `core/midi_null.zig` (open succeeds, poll
+  always returns `null`, close is a no-op)
+
 When the harness is enabled, no native backend is opened and the harness FIFO is
 read from the main thread.
 
@@ -39,13 +47,15 @@ the existing union stays as it is.
 
 `midi.Device` and `pollMidi()` are owned by the main thread. A `MidiEvent` is
 passed to the consumer by value. The null backend and harness injection are
-single-threaded, so no atomics and no ring buffer are added.
+single-threaded, so no atomics and no ring buffer are required there.
 
-The hardware backends that follow will place an SPSC queue in the backend, with
-the OS callback as the single producer and `pollMidi()` as the single consumer. No
-alloc, lock, IO or panic inside the callback. The existing
-`libs/synth/src/ring.zig` is a reuse candidate for that work, and no new
-core-to-libs dependency exception is added at this stage.
+Hardware backends place an SPSC queue in the backend, with the OS callback as the
+single producer and `pollMidi()` as the single consumer. No alloc, lock, IO or
+panic inside the callback. The macOS CoreMIDI backend follows that shape (a
+fixed-length SPSC ring local to `midi_macos.zig`; it does not import
+`libs/synth`'s ring and adds no core-to-libs exception). Linux / Windows hardware
+backends remain follow-up under the same contract. `libs/synth/src/ring.zig`
+remains a reuse candidate for those later backends.
 
 ## Harness contract
 
@@ -78,15 +88,30 @@ application has drained it.
 
 ## Handover to the hardware backends
 
-The backend work adds real OS callbacks, device enumeration and open, and the
+A hardware backend adds real OS callbacks, device enumeration and open, and the
 callback → SPSC → main-thread poll drain. It preserves the value ranges, the
 ownership model, the FIFO ordering and the callback's no-alloc/no-lock/no-IO
-contract defined here, and it does not extend `platform.Event`.
+contract defined here, and it does not extend `platform.Event`. **macOS CoreMIDI
+has landed under this handover**; ALSA and Windows remain to do.
 
 ## Hot-path declaration
 
-MIDI reception here runs on events only. The null backend and harness queue/state
-updates and the digest run only while handling a command or event; there is no
-thread, no atomic, no SPSC and no per-sample real-time path. The monitor draws
-every frame, but only fixed-size rectangles into the existing framebuffer, which
-is not a real-time path.
+- **Null backend and harness**: MIDI reception runs on events only. Queue/state
+  updates and the digest run only while handling a command or event; there is no
+  thread, no atomic, no SPSC and no per-sample real-time path.
+- **macOS CoreMIDI backend**: the receive callback (`midiReadProc`) runs on
+  CoreMIDI's high-priority thread and is near-real-time: it only pushes into a
+  fixed-length SPSC ring (no alloc, lock, IO, panic, CF, or logging). Cache-line
+  separation of head/tail applies. Enumeration and connection changes are deferred
+  to the main thread's `pollMidi()` (when dirty), or to `open`/`close`.
+- The monitor draws every frame, but only fixed-size rectangles into the existing
+  framebuffer, which is not a real-time path.
+
+## Revision history
+
+- 2026-07-17 First version. Settles the types, polling facade, null backend,
+  harness contract, and ownership model ahead of hardware backends.
+- 2026-07-27 Status / facade selection / ownership / hot-path updated for the
+  implemented macOS CoreMIDI backend (`core/midi_macos.zig`). The decision
+  (types, polling-not-Event, ownership, harness wire format) is unchanged.
+  Linux/Windows hardware backends remain follow-up.

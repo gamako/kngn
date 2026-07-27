@@ -1,6 +1,6 @@
 # ADR-005: Platform support tiers and the frame pacing contract
 
-**Status:** Accepted (the decision is accepted; the frame pacing API, the D3D11 backend and promoting Metal are follow-up work)
+**Status:** Accepted (the decision is accepted; the D3D11-DXGI backend and Metal first-class pacing are implemented; `beginFrame` / `waitFrame` and fatal-state separation remain follow-up — see Follow-up ④)
 **Date:** 2026-06-27
 **Category:** Platform strategy, rendering, frame control
 
@@ -33,10 +33,13 @@ contract** shared by first-class backends.
   of excluding X11).
 
 > **Scope of this ADR**: the **definitions** of the contract, the policy and the
-> tiers. Implementing `beginFrame`/`waitFrame` and the fatal-separation API in Zig,
-> implementing the D3D11-DXGI backend, and promoting Metal to first class are
-> **follow-up work** (see "Follow-up"). The signature and behaviour of the current
-> `lockFramebuffer() ?Framebuffer` and `present()` are unchanged here.
+> tiers. The D3D11-DXGI backend and Metal first-class pacing have since been
+> **implemented** (see Follow-up ①–② and the per-backend sections). Implementing
+> `beginFrame`/`waitFrame` and the fatal-separation API in Zig remains
+> **follow-up** (Follow-up ④; the API shape is settled in
+> [ADR-008](008_frame-pacing-api-and-fatal-state.md)). The signature and behaviour
+> of the current `lockFramebuffer() ?Framebuffer` and `present()` are unchanged
+> here.
 
 ## Context
 
@@ -80,7 +83,7 @@ contract** shared by first-class backends.
 | Tier | Backend | Tearing avoided | Frame pacing (fifo) | Low jitter / frame latency control | Notes |
 |---|---|---|---|---|---|
 | **first-class** | macOS Metal | guaranteed | guaranteed | goal | promoted (triple slot + inflight semaphore) |
-| **first-class** | Windows D3D11-DXGI | guaranteed | guaranteed | goal | not implemented yet; migration target from GDI |
+| **first-class** | Windows D3D11-DXGI | guaranteed | guaranteed | goal | implemented (`core/platform_windows_d3d11.zig`; `-Dplatform=d3d11`; GDI remains the Windows default) |
 | **first-class** | Linux Wayland | guaranteed by the compositor | already achieved, paced by the frame callback | compositor dependent | frame availability already implemented |
 | **best-effort** | macOS CALayer (objc/swift) | left to the window server (effectively absent) | not guaranteed | not guaranteed | CADisplayLink runs underneath, but there is no explicit contract |
 | **best-effort** | Linux X11 | **not guaranteed** (can occur) | not guaranteed | not guaranteed | best-effort reduction planned |
@@ -193,7 +196,7 @@ later.
 
 ### Wayland — null from the frame callback and busy buffers
 
-The existing Wayland backend (`src/platform_linux_wayland.zig`) already returns `null`
+The existing Wayland backend (`core/platform_linux_wayland.zig`) already returns `null`
 from `lockFramebuffer()` when: not yet
 configured, closing, or already locked; `frame_pending` and before the deadline (the
 `wl_surface.frame` callback has not arrived); or both buffers are busy
@@ -235,12 +238,19 @@ this contract:
   `null`, `beginFrame`/`waitFrame`, and separating fatal state were out of scope for
   that work and are left to the follow-up policy in the two sections above.
 
-### D3D11-DXGI — the migration target from GDI
+### D3D11-DXGI — implemented as Windows' first-class backend
 
-Windows currently has GDI (software blit) only. D3D11-DXGI is added as Windows'
-**first-class backend**, aligning fifo (DXGI `Present(1,0)` plus frame latency
-management), buffer ownership (swap chain / upload) and present semantics with this
-contract. Details in the next section.
+Windows keeps GDI as a best-effort software blit and selects D3D11-DXGI with
+`-Dplatform=d3d11` (`core/platform_windows_d3d11.zig`; the Windows default remains
+GDI). The D3D11 backend meets this contract via an **upload path**:
+`UpdateSubresource` (CPU backing → a DEFAULT texture) → `CopyResource` (→ the swap
+chain backbuffer) → `IDXGISwapChain.Present(1, 0)` (fifo submit). Canonical BGRA
+needs no conversion (`DXGI_FORMAT_B8G8R8A8_UNORM`). Window, input, dialogs,
+`getTime`, the event queue and the CPU backing are shared with GDI through
+`core/platform_windows_common.zig`. Remaining gaps called out in that source (lost-device
+recovery, a waitable swap chain / frame-latency waitable object, and
+`beginFrame`/`waitFrame`) are still follow-up; they do not change the tier
+assignment.
 
 ### GDI / X11 / CALayer — what is not guaranteed
 
@@ -256,31 +266,31 @@ For best-effort backends the following are explicitly **not guaranteed**:
   currently always return non-null, so the caller must pace itself with `sleep` or a
   fixed timestep)
 
-These non-guarantees are also written into the README and docs by follow-up work so
-that they reach users.
+These non-guarantees are documented for users in `AGENT.md` (the platform backends
+table and the support-tier summary) and in
+[docs/platform-verification.md](../platform-verification.md).
 
 ## Migrating Windows from GDI to D3D11-DXGI, and coexistence
 
 - **GDI stays as a best-effort backend** (it is not removed). It is useful as a
   software framebuffer, for portability, and as a stepping stone for headless
-  verification.
-- **D3D11-DXGI is added as Windows' first-class backend.** A `d3d11` value is added
-  to `-Dplatform` on Windows, and which one is the default is decided in follow-up
-  (GDI as default with d3d11 opt-in is the safe starting point).
+  verification. It remains the **Windows default** (`-Dplatform=gdi`).
+- **D3D11-DXGI is Windows' first-class backend** and is selected with
+  `-Dplatform=d3d11` (opt-in; implemented in `core/platform_windows_d3d11.zig`).
 - The canonical pixel format is already BGRA on every OS, so uploading a CPU
   framebuffer into a D3D11 texture needs no conversion.
 - The public API shape (`lockFramebuffer`, `present`, events, `getTime`) is
-  unchanged, and the D3D11 backend is added as one implementation behind the facade
+  unchanged, and the D3D11 backend sits as one implementation behind the facade
   dispatcher — the same pattern as the Linux x11/wayland dispatcher.
-- Suggested breakdown for follow-up work: ① device, swap chain, render target or
-  upload path ② displaying a BGRA framebuffer (present = submit) ③ fifo present and
-  frame latency management ④ resize and device lost (including stating what is
-  best-effort).
+- The original implementation breakdown (device / swap chain / upload path;
+  BGRA present = submit; fifo present; resize and device-lost handling) is largely
+  done. Remaining gaps (lost-device recovery, a waitable swap chain) are noted in
+  the D3D11 source header and do not reopen the tier decision.
 
 ## Alignment with the verification harness
 
-> **Premise**: the harness (`src/harness.zig`, plus wrapping the facade) is merged.
-> `src/platform.zig` is no longer a pass-through re-export but a thin wrapper that
+> **Premise**: the harness (`core/control/harness.zig`, plus wrapping the facade) is merged.
+> `core/platform.zig` is no longer a pass-through re-export but a thin wrapper that
 > interposes on
 > `pollEvents`, `nextEvent`, `lockFramebuffer`, `present` and `getTime`, passing
 > straight through only when its environment variables are unset. This section
@@ -305,10 +315,10 @@ whether the synchronisation point for frame progress (the step gate) stays on
 "present = the frame commit point and the condition for advancing the frame index"
 unchanged, or define separately how to migrate without breaking replay determinism.
 
-> **A constraint on real code**: the harness is now a real hook in `src/platform.zig`,
+> **A constraint on real code**: the harness is now a real hook in `core/platform.zig`,
 > not a design. If backend work changes the behaviour, the signatures, or the condition
 > for advancing the frame index of `present` or `lockFramebuffer`, then **the hooks in
-> `src/harness.zig` (`onLock`, `onLockMiss`, `onPresent`, `pollGate`, the virtual clock)
+> `core/control/harness.zig` (`onLock`, `onLockMiss`, `onPresent`, `pollGate`, the virtual clock)
 > must follow in the same change**. Pass-through when the environment is unset, and replay
 > determinism (bit-identical framebuffers), must not regress.
 
@@ -327,14 +337,18 @@ This ADR goes as far as defining the contract, the policy and the tiers. The
 following were filed as follow-up work:
 
 1. **The D3D11-DXGI first-class backend** (coexisting with GDI; making Windows first
-   class).
+   class). **Done** — `core/platform_windows_d3d11.zig`, selected with
+   `-Dplatform=d3d11` (GDI remains the Windows default).
 2. **Bringing the Metal backend in line with the first-class frame pacing contract**
    (removing the CAMetalLayerDrawable warning; drawable and inflight ownership; fifo
-   pacing).
+   pacing). **Done** — see the Metal section above (revision 1.1).
 3. **Documenting the non-guarantees of best-effort backends** for users (README,
-   AGENT.md, docs).
+   AGENT.md, docs). **Done** — `AGENT.md` (platform backends table and tier
+   summary) and [docs/platform-verification.md](../platform-verification.md).
 4. **Designing `beginFrame` / `waitFrame` and the fatal-state separation API** (the
-   home for the two policies above).
+   home for the two policies above). **Still open for implementation** — the API
+   shape is settled in [ADR-008](008_frame-pacing-api-and-fatal-state.md); backends
+   have not yet grown `beginFrame` / `waitFrame`.
 
 ## Consequences
 
@@ -346,9 +360,10 @@ following were filed as follow-up work:
 - Comments brought into line with this contract: `platform/platform.h` (the present
   and lockFramebuffer comments), `AGENT.md` (the manual drawing section),
   `examples/01_timed_window/README.md`.
-- Implementation code (the behaviour and signatures of present and lockFramebuffer,
-  `build.zig`, the facade) is unchanged here. The frame pacing API, the D3D11
-  backend and promoting Metal are the follow-up work above.
+- The public signatures of `present` and `lockFramebuffer` stay as they were when
+  this ADR was accepted. First-class pacing for Metal and D3D11, and the
+  best-effort documentation, are now in place (Follow-up ①–③). Implementing
+  `beginFrame` / `waitFrame` remains Follow-up ④.
 
 ## Revision history
 
@@ -357,3 +372,4 @@ following were filed as follow-up work:
 | 1.0 | 2026-06-27 | First version. Defines the support tiers and the frame pacing contract. Supersedes ADR-004, revises ADR-002. |
 | 1.1 | 2026-06-28 | The Metal backend meets the first-class frame pacing contract (triple slot + inflight semaphore; the drawable warning removed by keeping everything inside `draw(in:)`; `displaySyncEnabled` set explicitly). The tier table and the Metal section updated to implemented. |
 | 1.2 | 2026-07-05 | Added references to [ADR-008](008_frame-pacing-api-and-fatal-state.md) from the wait/skip policy and fatal state policy sections, now that the API shape and the separation are settled. The decision itself is unchanged. |
+| 1.3 | 2026-07-27 | Status / tier table / D3D11 section / Follow-up ①–③ updated to match the implemented D3D11 backend and the documented best-effort non-guarantees. Follow-up ④ and the decision itself are unchanged. |

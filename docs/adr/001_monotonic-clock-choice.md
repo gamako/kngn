@@ -214,61 +214,34 @@ const GameState = struct {
 double platform_get_time(void);
 ```
 
-### Examples
+### Where it lives today
+
+The decision (double + RAW monotonic) is unchanged. The implementation files have
+moved with the platform backends:
 
 #### macOS (Objective-C)
-```objective-c
-// platform/macos/platform_macos.m
-#include <time.h>
 
-// Read a high-resolution monotonic time (unadjusted)
-double platform_get_time(void) {
-    uint64_t ns = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
-    return (double)ns / 1e9;
-}
-```
+`platform/macos/platform_macos.m` — `platform_get_time` via
+`clock_gettime_nsec_np(CLOCK_UPTIME_RAW)`.
 
-#### macOS (Swift)
-```swift
-// platform/macos-swift/platform_macos.swift
-@_cdecl("platform_get_time")
-func platform_get_time() -> Double {
-    let ns = clock_gettime_nsec_np(CLOCK_UPTIME_RAW)
-    return Double(ns) / 1e9
-}
-```
+#### macOS (Swift / Metal)
 
-#### Windows (C)
-```c
-// platform/windows/platform_windows.c
-#include <windows.h>
+`platform_get_time` is defined once in the shared Swift layer
+`platform/macos-shared/platform_macos_shared.swift` (same `CLOCK_UPTIME_RAW`). The
+Swift and Metal backends (`platform/macos-swift/platform_macos_swift.swift`,
+`platform/macos-metal/platform_macos_metal.swift`) do not redefine it.
 
-double platform_get_time(void) {
-    static LARGE_INTEGER frequency;
-    static BOOL initialized = FALSE;
+#### Windows (pure Zig)
 
-    if (!initialized) {
-        QueryPerformanceFrequency(&frequency);
-        initialized = TRUE;
-    }
+`core/platform_windows_common.zig` — `getTime()` via `QueryPerformanceCounter` /
+`QueryPerformanceFrequency` (no `platform/windows/platform_windows.c`; Windows is
+pure Zig).
 
-    LARGE_INTEGER counter;
-    QueryPerformanceCounter(&counter);
-    return (double)counter.QuadPart / (double)frequency.QuadPart;
-}
-```
+#### Linux (pure Zig)
 
-#### Linux (C)
-```c
-// platform/linux/platform_linux.c
-#include <time.h>
-
-double platform_get_time(void) {
-    struct timespec ts;
-    clock_gettime(CLOCK_MONOTONIC_RAW, &ts);
-    return (double)ts.tv_sec + (double)ts.tv_nsec / 1e9;
-}
-```
+`core/platform_linux_common.zig` — `getTime()` via
+`clock_gettime(CLOCK_MONOTONIC_RAW, …)` with a `CLOCK_MONOTONIC` fallback (no
+`platform/linux/platform_linux.c`; Linux is pure Zig).
 
 ## Reference
 
@@ -306,11 +279,13 @@ double platform_get_time(void) {
 | Version | Date | Changes |
 |---------|------|---------|
 | 1.0 | 2025-10-25 | First recorded, implementation complete |
+| 1.1 | 2026-07-27 | Implementation / Related paths corrected to the current tree (macOS shared Swift; Windows/Linux pure Zig under `core/`). The decision itself is unchanged. |
 
 ## Related
 
-- `platform/platform.h` — the API
+- `platform/platform.h` — the C ABI declaration of `platform_get_time`
 - `platform/macos/platform_macos.m` — macOS Objective-C implementation
-- `platform/macos-swift/platform_macos.swift` — macOS Swift implementation
-- `platform/macos-metal/platform_macos_metal.swift` — macOS Metal implementation
+- `platform/macos-shared/platform_macos_shared.swift` — macOS Swift/Metal shared `platform_get_time`
+- `core/platform_windows_common.zig` — Windows `getTime` (QueryPerformanceCounter)
+- `core/platform_linux_common.zig` — Linux `getTime` (CLOCK_MONOTONIC_RAW)
 - `examples/01_timed_window/` — sample usage

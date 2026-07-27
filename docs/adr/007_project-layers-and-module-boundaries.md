@@ -195,15 +195,20 @@ shells alone**, which makes the judgement simple (R6, R8).
   build configuration**. Physically, each layer also has its module root in its own
   directory, so a relative `@import` into an unwired layer becomes a "file outside
   module path" compile error — two lines of defence.
-- **Only two kinds of exception**, both localised behind an explicit API:
-  ① `linkCoreException` — `harness(core/control) → png(libs/png)` (for encoding
+- **Only localised exceptions**, each behind an explicit API. The authoritative
+  list is the `linkCoreException` / `linkAppException` call sites in `build.zig`
+  (also summarised in `AGENT.md`). The current set is seven edges:
+  ① `linkCoreException` — `harness(core/control) → png(libs/png)` (encoding
   snapshots and crc32; png is a dependency-free pure Zig leaf lib, so headlessness is
-  preserved), and `harness(core/control) → dsp` (for the spectrum analysis behind the
-  audio digest: band, centroid, onset. `src/dsp/fft.zig` is reused rather than
-  duplicated, and analysis runs only when a digest is requested, never touching the
-  real-time path). ② `linkAppException` — a named direct import where a file inside an
-  app doubles as a pure-test root (`apps/modular/patch.zig` importing synth and dsp);
-  kit and the direct import are the same module instance, so type identity holds.
+  preserved); ② `harness(core/control) → dsp` (spectrum analysis behind the audio
+  digest: band, centroid, onset; analysis runs only when a digest is requested, never
+  touching the real-time path); ③ `platform(core) → pixelops(libs/pixelops)`
+  (BGRA→RGBA SIMD swizzle for wasm present). ④–⑦ `linkAppException` —
+  `apps/editor/apps/pixie → pixelops` (downscale blit SIMD); `example_26 → paint`
+  (demo direct import); `apps/patch/lofi.zig → synth` and `→ dsp` (generative-layer
+  types such as `SampleTap` / `AtomicF32` and FFT band-energy checks, keeping a
+  pure-test root platform-free). Kit and a direct import of the same lib are the
+  same module instance, so type identity holds.
 - **The allow-list for direct imports by apps** (libs not in kit because they are
   still in flux): modular, paint, viz (spectrogram/scope). It is managed by
   `TaggedModule.app_direct_ok=true`, and wiring an app directly to a lib that *is*
@@ -253,3 +258,8 @@ shells alone**, which makes the judgement simple (R6, R8).
 - 2026-07-11 Added harness→dsp to `linkCoreException` (the FFT behind the audio
   digest's band, centroid and onset keys). The existing rms/peak/f0/silent/frames
   keys stayed bit-stable; the extension is additive and creates no new probe name.
+- 2026-07-27 Exception inventory refreshed to the current seven
+  `linkCoreException` / `linkAppException` edges in `build.zig` (platform→pixelops;
+  pixie→pixelops; example_26→paint; `apps/patch/lofi.zig`→synth/dsp). Replaced the
+  stale `apps/modular/patch.zig` path with `apps/patch/lofi.zig`. The R1–R8
+  decisions themselves are unchanged.

@@ -1,21 +1,22 @@
 # ADR-011: The high-DPI (retina) coordinate model and framebuffer modes
 
-**Status:** Accepted
+**Status:** Accepted (R1–R10 stand; the staged implementation has landed — see Implementation status)
 **Date:** 2026-07-20
 **Category:** platform / gui / gfx, coordinate systems, the drawing pipeline
 
 ## Context and problem
 
-Every macOS backend (objc/swift/metal) currently allocates the framebuffer at
-**logical resolution (points)** and, on retina (`backingScaleFactor=2`), **scales it
-up 2x at display time**. No backend draws at true physical resolution. The only
-difference between "blurry" and "crisp" is how that scaling happens:
+When this ADR was written, every macOS backend (objc/swift/metal) allocated the
+framebuffer at **logical resolution (points)** and, on retina
+(`backingScaleFactor=2`), **scaled it up 2x at display time**. No backend drew at
+true physical resolution. The only difference between "blurry" and "crisp" was how
+that scaling happened:
 
-| Backend | Scaling | Appearance |
+| Backend | Scaling (pre-ADR-011) | Appearance |
 |---|---|---|
 | objc | A logical-size CGImage in `CALayer.contents`, with no `contentsScale` or filter set → the default **linear** upscale | blurry |
 | swift | Almost identical to objc (no filter, no contentsScale) | should be blurry like objc (needs re-checking on hardware) |
-| metal | The shader sampler uses `filter::nearest` (`platform_macos_metal.swift:82-84`) | crisp (but blocky nearest upscaling, not true 2x drawing) |
+| metal | The shader sampler uses `filter::nearest` (`platform_macos_metal.swift`) | crisp (but blocky nearest upscaling, not true 2x drawing) |
 
 Hence the feedback from real hardware: "UI parts look coarse, as if 2x", "the font is
 too small and soft", "the objc screenshots from the OS are blurry". **Crisp text can
@@ -272,6 +273,10 @@ optimisation and cutting scope.
 
 ## Staged plan
 
+The stages below were the original delivery order. **They have since been
+implemented** (see Implementation status); the list is kept as the historical plan
+tied to R1–R10.
+
 - **Stage 0**: the objc nearest filter, as an independent stopgap (R8).
 - **Stage 1**: the platform contract — `logicalSize()`, `framebufferSize()`,
   `contentScale()`, **runtime scale changes**, the framebuffer mode (default
@@ -286,6 +291,22 @@ optimisation and cutting scope.
   physical target conversion, R6) move to `.physical`.
 - **Stage 5**: rolling out swift and metal, then Linux (x11/wayland) and Windows
   (gdi/d3d11), plus the performance regression (R10).
+
+## Implementation status
+
+Factual (not a decision change). Verified against the tree as of this revision:
+
+| Stage / rule | Status | Where |
+|---|---|---|
+| R8 / Stage 0 nearest filter | **Done** | objc `contentLayer` uses `kCAFilterNearest` (`platform/macos/platform_macos.m`) |
+| R1–R3 / Stage 1 platform contract | **Done** | `FramebufferMode` / snapshot fields in `core/platform_types.zig`; facade latch + input normalisation in `core/platform.zig`; macOS objc/swift/metal and Linux/Windows backends expose `logicalSize` / `contentScale` / scale epoch |
+| R4 / Stage 2 `gui.render` scale | **Done** | `libs/gui/src/render.zig` (floor-tiling rects, thickness, images; scale≠1.0 path) |
+| R5 / Stage 3 fonts | **Done** | `Font.drawTo(..., scale)` and related paths in `libs/gui` / `libs/font` |
+| R6 / Stage 4 drawing transform | **Done** | `libs/gfx/src/screen_transform.zig` (`ScreenTransform`) |
+| R7 / Stage 4 app seams | **Done** | pixie and patch create windows with `.fb_mode = .physical` |
+| Stage 5 non-macOS backends | **Done** for the contract surface | Linux/Windows HiDPI paths live under `core/platform_*_common.zig` (scale 1.0 backends still accept `.physical` per R1) |
+| R9 crc regression | **In place** as conditional guarantee | harness / backend coverage continues; default `.logical` keeps the layout/API/crc contract |
+| R10 performance matrix | **Partially measured** | spot measurements in `docs/performance-measurement.md` (e.g. editor objc retina `.physical` 2x); the full 1x/1.5x/2x × subsystem matrix remains ongoing measurement work, not a reopened decision |
 
 ## Alternatives and why they were rejected
 
@@ -310,11 +331,19 @@ optimisation and cutting scope.
 - Existing applications, examples and the harness: **unchanged, with a bit-identical
   framebuffer crc** under the default `.logical` (under R9's conditions, pinned by
   regression tests).
-- The editor and the patch canvas: crisp UI by opting into `.physical` (stage 4). The
-  patch visualisation's resolution policy is settled by R7 (draw logical, nearest
-  upscale, then draw labels as outlines after the upscale).
+- The editor and the patch canvas **opt into `.physical`** for crisp UI (R7 seams
+  applied). The patch visualisation's resolution policy remains R7 (draw logical,
+  nearest upscale, then draw labels as outlines after the upscale).
 - Game authors: `.logical` behaves as before (retro work naturally keeps
   nearest-upscaling its own back buffer), and `.physical` plus `contentScale()` plus
   the drawing transform is available for high-resolution crispness.
-- The existing bug where `gui.render` does not pass line thickness through is fixed
-  first, as a precondition for stage 2.
+- The `gui.render` line-thickness pass-through (R4 precondition) is fixed.
+- Ongoing work is measurement and tuning under R10, not reopening R1–R9.
+
+## Revision history
+
+- 2026-07-20 First version. Settles R1–R10 (opt-in framebuffer mode, logical
+  coordinates, facade input normalisation, GUI/font/gfx scale rules, staged plan).
+- 2026-07-27 Status, Context framing, Implementation status and Consequences updated
+  to record that Stages 0–5 have landed. R1–R10 and the rejected alternatives are
+  unchanged.
