@@ -25,12 +25,12 @@ pub const AtomicF32 = struct {
     }
 };
 
-/// Triple-buffer mailbox (successor to the former DoubleBuffer). For patches that swap multiple values coherently.
+/// Triple-buffer mailbox. For patches that swap multiple values coherently.
 /// Single producer (GUI) / single consumer (Audio RT).
 ///
 /// With only two slots, if the producer publishes twice while the consumer is still copying there is a
 /// theoretical torn-read window — so this is three slots (same semantics as the Mailbox in libs/modular dyn.zig;
-/// API/names aligned so they stay easy to share).
+/// API/names aligned so they stay easy to share). See docs/adr/015 for why the third buffer is spent.
 /// Invariant: {write_idx, read_idx, shared&IDX} is always a permutation of {0,1,2} = **the producer
 /// never writes the slot the consumer currently holds**.
 pub fn Mailbox(comptime T: type) type {
