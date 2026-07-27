@@ -182,9 +182,17 @@ video-proto-main/
 │   ├── platform_linux*.zig     # the Linux backend (a dispatcher plus x11/wayland plus input translation; pure Zig)
 │   ├── platform_windows*.zig   # the Windows backend (a dispatcher plus gdi/d3d11 plus input translation; pure Zig)
 │   ├── platform_native_stub.zig # a stub for publishing the native .o archive
-│   ├── audio.zig / audio_*.zig # the audio output facade plus per-OS backends (macOS/Linux/Windows/null)
+│   ├── audio.zig / audio_*.zig # the audio output facade plus per-OS backends (macOS/Linux/Windows/web/null)
+│   ├── midi.zig / midi_*.zig   # the MIDI input facade plus per-OS backends (CoreMIDI/null)
+│   ├── camera.zig / capture_*.zig # the camera input facade, symmetric with audio (AVFoundation/V4L2/synthetic/stub)
+│   ├── app_runtime.zig # the frame-driven application runtime (absorbing the push/pull difference of frame driving)
+│   ├── frame_pacing.zig # the frame pacing helper (see docs/performance-measurement.md)
 │   └── control/       # the control and observation plane (ADR-007 R3)
-│       └── harness.zig # the headless verification harness (input injection, frame capture, a virtual clock)
+│       ├── harness.zig # the headless verification harness (input injection, frame capture, a virtual clock)
+│       ├── action_registry.zig # the action registry (the write and operate counterpart to a probe)
+│       ├── command.zig # the semantic command execution model for co-piloting (a human and an AI together)
+│       ├── copilot.zig # the copilot transport: a third control plane coexisting with the ordinary UX (VP_COPILOT_*)
+│       └── netsync.zig # networked concurrent editing (see docs/netsync.md)
 ├── src/               # Zig not yet moved (R8 is opportunistic: moved into libs by whichever task next touches it)
 │   ├── main.zig       # the main program (an HSV rainbow gradient)
 │   ├── dsp/           # DSP helpers (Oscillator, Envelope, Filter, Mixer) → a future libs/audio
@@ -196,12 +204,16 @@ video-proto-main/
 ├── libs/              # L2–L3, portable reusable libraries (platform-independent as a rule, unit testable headless)
 │   ├── png/           # a PNG codec (decode and encode)
 │   ├── pixelops/      # shared pixel blending primitives (premultiplied and straight blends, div255, clip hoisting)
-│   ├── gfx/           # sprite drawing plus helpers (sprite, fixed_timestep, fps_counter, keyboard). In kit
+│   ├── gfx/           # 2D drawing and game helpers (sprite, animation, atlas, tilemap, camera, action_map,
+│   │                  #   screen_transform, fixed_timestep, fps_counter, keyboard). In kit
+│   ├── gmath/         # f32 game mathematics and collision tests (vec2, rect, scalar, collision). Inline, allocation-free. In kit
 │   ├── serde/         # the versioned container serialisation base (a RIFF/IFF lineage plus version and CRC). std only, not in kit
 │   ├── recipe/        # saving and replaying a sequence of command records (std plus serde). In kit
 │   ├── gui/           # the immediate-mode GUI (input, an ID stack, flex layout, drawing, widgets)
 │   ├── font/          # fonts (TrueType/OpenType outlines via sfnt/glyf/cff, plus bmfont; BDF lives in src/text.zig)
 │   ├── synth/         # the synth (Voice, VoicePool, Patch, the lock-free handover)
+│   ├── sound/         # in-memory playback (WAV decode plus an SE one-shot and BGM loop mixer). In kit
+│   ├── appshell/      # headless application state persistence (Preferences, WindowState, RecentFiles, DocumentHost). In kit
 │   ├── modular/       # the modular graph engine (not in kit — still in flux)
 │   ├── paint/         # the editor family's shared core (promoted from apps/editor/core by ADR-007 R6; not in kit)
 │   └── viz/           # visualisation (spectrogram and scope; shared by synth, modular and patch; not in kit)
@@ -287,17 +299,20 @@ are implemented:
 - **Examples**: basic drawing, input, sprites, a fixed timestep, text, benchmarks, the
   mouse, the GUI widgets, outline fonts, audio, cursor shapes, colour emoji, capture,
   gamepads, fullscreen, tilemaps, a GUI gallery and a torture suite, and more.
-- **Helpers**: sprite, fixed_timestep, fps_counter and keyboard (`libs/gfx`), plus text
-  (`src/`).
-- **Libraries**: `libs/png`, `libs/gui`, `libs/font`, `libs/synth`, `libs/pixelops`,
-  `libs/gfx`, `libs/modular`, `libs/paint`, `libs/viz`.
+- **Helpers**: sprite, animation, atlas, tilemap, camera, action_map, screen_transform,
+  fixed_timestep, fps_counter and keyboard (`libs/gfx`), plus text (`src/`).
+- **Libraries**: `libs/png`, `libs/gui`, `libs/font`, `libs/synth`, `libs/sound`,
+  `libs/pixelops`, `libs/gfx`, `libs/gmath`, `libs/serde`, `libs/recipe`,
+  `libs/appshell`, `libs/modular`, `libs/paint`, `libs/viz`.
 - **Applications**: the pixel editor, the synth, and the patch canvas.
 - **The audio and synthesis layers**: see
   [docs/audio-and-synth.md](docs/audio-and-synth.md).
 - **The headless verification harness**: see [docs/harness.md](docs/harness.md).
 
-> The template group
-> (DoubleBuffer, SimpleApp, GameLoop, SnapshotRenderer) has not been started.
+> The application template lives in `core/app_runtime.zig`: `Runtime(App)` takes an App
+> supplying init, frame and deinit and drives it with frame pacing, unifying the native
+> pull loop and the wasm rAF push. A double-buffer helper and a snapshot renderer do not
+> exist.
 
 ## The platform backends
 

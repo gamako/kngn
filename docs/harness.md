@@ -14,8 +14,9 @@ Phases, all implemented:
 - **Live control** (TCP loopback plus the `scripts/drive` CLI), the built-in
   `audio` and `stats` probes, and record → replay.
 - **A custom probe registry**: an application opts in with
-  `platform.registerProbe(...)` (the editor registers `canvas`, `undo`, `tool`; the
-  synth registers `voices`, `patch`). See "Adding a custom probe".
+  `platform.registerProbe(...)` (the editor registers twelve, `canvas` and `undo` and
+  `tool` among them; the synth registers `voices` and `patch`). See "Adding a custom
+  probe".
 - **Fully display-less** operation: `VP_HEADLESS=1` makes `platform.init()` skip
   the native `backend.init()` entirely and select `platform_null` at runtime. A
   script or a listener is optional, so a display-less run needs neither. See
@@ -125,10 +126,12 @@ built-in. Currently:
   `WxH layers=N selected=.. comp=XXXXXXXX lN{v=..,op=..,crc=..,nz=..,name=..}`),
   `undo` (`{"depth":N,"redo":M}`), `tool` (`tool=Pen color=#RRGGBB`), `cursor`,
   `history`, `diff` (`changed=N bbox=x0,y0,x1,y1 from=#RRGGBB to=#RRGGBB`; the
-  baseline comes from `action diff_mark` or is initialised on the first digest; when
-  `changed=0` it reads `bbox=none from=none to=none`), and `palette`
+  baseline comes from `action diff_mark` or is initialised on the first digest — so
+  the first `digest diff` writes as well as reads; when `changed=0` it reads
+  `bbox=none from=none to=none`), `palette`
   (`colors=N used=M top=[#RRGGBB:NN%,...]` — the palette size, the number of unique
-  colours in the composite, and the top four).
+  colours in the composite, and the top four), plus `timeline`, `panels`, `menu`,
+  `appshell` and `presence`. Twelve in total.
 - The synth: `voices`
   (`{"active":N,"capacity":16,"voices":[{"note":..,"stage":".."}]}`) and `patch`
   (the current patch as JSON).
