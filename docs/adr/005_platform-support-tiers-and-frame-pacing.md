@@ -135,7 +135,8 @@ wiring.
    and the caller checks `fb.width/height` every frame. After a resize the old
    framebuffer pointer is invalid. The backend recreates the swap chain, `wl_buffer`
    or Metal texture at a frame boundary and never returns a stale pointer to the
-   caller. (Every backend currently runs at a fixed size; resize is follow-up work.)
+   caller. (D3D11 implements this today through `resizeSwapChain` / `ResizeBuffers`, and the
+   X11 and Wayland backends track size changes; device-lost recovery remains follow-up work.)
 
 ## Wait/skip policy, and beginFrame / waitFrame
 

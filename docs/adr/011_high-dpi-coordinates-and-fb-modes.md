@@ -155,11 +155,11 @@ needs `measure()` to be logical width and `drawTo()` to rasterise at physical pi
   needs crispness switches to an **outline default font** — recommended, and the real
   answer for crisp text.
 
-The vertical-centring work is already done and covers only centring within a line. The
-**physical-pixel font work here (the logical-measure / physical-raster `Font` API, the
-glyph cache, the outline default font) is separate, new work** (adding a 2x bitmap
-font was rejected because it copes badly with arbitrary scales). It builds on the
-existing font foundation (outline fonts, AA coverage, the font interface).
+The vertical-centring work covers only centring within a line. The physical-pixel font
+work stated here (the logical-measure / physical-raster `Font` API, the glyph cache, the
+outline default font) was scoped as separate work at decision time and **has since been
+implemented** (see Implementation status); adding a 2x bitmap font was rejected because it
+copes badly with arbitrary scales.
 
 ### R6. For games, scale is kept out of the camera; "logical viewport → physical target" is a separate contract
 
@@ -273,9 +273,9 @@ optimisation and cutting scope.
 
 ## Staged plan
 
-The stages below were the original delivery order. **They have since been
-implemented** (see Implementation status); the list is kept as the historical plan
-tied to R1–R10.
+The stages below were the original delivery order. **The contract surface of every stage
+is implemented** (see Implementation status); R10's full performance matrix remains
+ongoing measurement work. The list is kept as the historical plan tied to R1–R10.
 
 - **Stage 0**: the objc nearest filter, as an independent stopgap (R8).
 - **Stage 1**: the platform contract — `logicalSize()`, `framebufferSize()`,
