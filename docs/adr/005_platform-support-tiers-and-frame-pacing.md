@@ -345,7 +345,7 @@ following were filed as follow-up work:
   strategy is the reverse of the implementation).
 - Comments brought into line with this contract: `platform/platform.h` (the present
   and lockFramebuffer comments), `AGENT.md` (the manual drawing section),
-  `docs/PLAN.md`, `examples/01_timed_window/README.md`.
+  `examples/01_timed_window/README.md`.
 - Implementation code (the behaviour and signatures of present and lockFramebuffer,
   `build.zig`, the facade) is unchanged here. The frame pacing API, the D3D11
   backend and promoting Metal are the follow-up work above.

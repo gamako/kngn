@@ -87,7 +87,7 @@ Windows MSG ───┘   · minimal FFI          · translation (shared)
    - Roughly 540 duplicated lines is acceptable at that scale
 
 4. **Consistent with the project's principles**
-   - Matches the "simplicity first" principle in `docs/PLAN.md`
+   - Matches the project's "simplicity first" principle
    - Keeps each layer's responsibility separate, in the Unix tradition
 
 ## Implementation
@@ -123,4 +123,3 @@ API.
 
 ## Related
 
-- `docs/PLAN_example_02.md` — the implementation plan this decision was made for

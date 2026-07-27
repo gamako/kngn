@@ -152,4 +152,3 @@ Revisit X11 support if all of these hold:
 
 ## Related
 
-- `docs/PLAN_example_02.md` — the implementation plan this decision was made for

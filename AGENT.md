@@ -294,7 +294,7 @@ are implemented:
   [docs/audio-and-synth.md](docs/audio-and-synth.md).
 - **The headless verification harness**: see [docs/harness.md](docs/harness.md).
 
-> The original phase breakdown is recorded in `docs/PLAN.md`. The template group
+> The template group
 > (DoubleBuffer, SimpleApp, GameLoop, SnapshotRenderer) has not been started.
 
 ## The platform backends
@@ -522,7 +522,7 @@ zig build run-example_31        # 31_sprite_ex (a drawSpriteEx demo, using kit.g
 
 ## Project management
 
-The implementation plan is in `docs/PLAN.md`.
+Design decisions live in `docs/adr/`; the subsystem documents are indexed above.
 
 Version control uses jj, whose model differs from git's. Consult the maintainer before
 anything beyond the everyday commands.

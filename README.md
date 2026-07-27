@@ -27,7 +27,7 @@ support tier（1級 = Metal / D3D11-DXGI / Wayland、best-effort = CALayer / X11
 ├── examples/     # サンプル 01〜17（run-example_NN で実行）+ image/（共有アセット）
 ├── libs/         # 再利用ライブラリ（png / gui / font / synth）
 ├── apps/         # アプリ（editor/pixie: ドット絵エディタ、synth: PC キーボード演奏）
-└── docs/         # 設計ドキュメント（PLAN.md / PLAN_*.md / adr/）
+└── docs/         # 設計ドキュメント（サブシステム別ドキュメント / adr/）
 ```
 
 ## 前提環境

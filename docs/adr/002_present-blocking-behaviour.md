@@ -429,7 +429,7 @@ The definitions this discussion settled:
 3. **platform/macos/platform_macos.m**
    - A duplicated comment removed
 
-4. **docs/PLAN.md**
+4. **The project plan document** (since removed; superseded by this ADR)
    - The vsync design decision recorded
    - "Decision pending" changed to "decided"
 
@@ -440,7 +440,6 @@ The definitions this discussion settled:
 - `platform/macos-swift/platform_macos.swift` — macOS Swift implementation
 - `platform/macos-metal/platform_macos_metal.swift` — macOS Metal implementation
 - `examples/01_timed_window/main.zig` — sample usage (an example of frame rate control)
-- `docs/PLAN.md` — the project plan and the record of design decisions
 - [ADR-001](001_monotonic-clock-choice.md) — the related timer API decision
 
 ## Reference
