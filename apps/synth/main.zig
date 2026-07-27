@@ -509,7 +509,7 @@ pub fn enableWasmRuntime() void {
 }
 
 pub fn main(process_init: std.process.Init) !void {
-    std.debug.print("apps/synth: A..K=C4..C5 / 画面鍵盤クリック / スライダで音色変更 / ESC 終了\n", .{});
+    std.debug.print("apps/synth: A..K=C4..C5 / click the on-screen keys / sliders change the timbre / ESC quits\n", .{});
     try Rt.runNative(process_init);
 }
 
