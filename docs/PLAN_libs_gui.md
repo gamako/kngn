@@ -117,6 +117,9 @@ layout runs in `endFrame`. Dear ImGui–style synchronous hit-test reconciles th
 - `clicked` uses this frame's input + previous-frame rect, so it **returns immediately** (no click delay).
 - Only frames where layout changes see a one-frame hit-test lag; invisible for static layouts.
 - The first frame has no rects yet → treated as miss (one-frame warm-up).
+- The manual interaction example (`examples/09_gui_interaction`) has no layout tree: it passes
+  hard-coded rectangles straight to `buttonBehavior`, so it neither uses the rect cache nor
+  needs the warm-up frame.
 
 ---
 
