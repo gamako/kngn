@@ -56,7 +56,11 @@ place is prepared in advance so that incoming code (the state-model `framework/`
   core but become independent modules, so only the applications that link them pay
   for them. **Core not growing is what "thin" actually means.** The existing rule
   that the audio backend is linked only into executables that use audio is extended
-  to every heavy lib.
+  to every heavy lib. **One exception is on record**: netsync is networking that lives
+  in `core/control` rather than in a module of its own, granted because it adds no
+  framework or library link dependency and carries the control plane's own commands. ADR-014 states the
+  exception, its grounds, and the conditions that would end it. The per-executable
+  linking mechanism that R7 relies on is recorded in ADR-013.
 - **R8 decide now, migrate later**: the skeleton — creating `core/`, defining
   `kit`, enforcing dependencies in build.zig, and the R6 reclassification — is
   **built now in one deliberate refactor**. Physically moving existing files is
@@ -263,3 +267,7 @@ shells alone**, which makes the judgement simple (R6, R8).
   pixie→pixelops; example_26→paint; `apps/patch/lofi.zig`→synth/dsp). Replaced the
   stale `apps/modular/patch.zig` path with `apps/patch/lofi.zig`. The R1–R8
   decisions themselves are unchanged.
+- 2026-07-27 R7 gained a pointer to its one recorded exception (netsync in
+  `core/control`, stated in ADR-014) and to the linking mechanism it relies on
+  (ADR-013). R7 itself is unchanged: the exception is narrow, its grounds are
+  written down, and the conditions that would end it are too.
