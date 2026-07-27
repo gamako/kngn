@@ -1,8 +1,8 @@
-//! PerIdStateStore capacity / LRU trim measurement (TASK-127).
-//! 100 unique IDs/frame × 300 frames = 30,000 unique IDs を生成しても
-//! 既定上限（max_entries=4096, trim_to=3072）により entry 数が収束することを assert する。
+//! PerIdStateStore capacity / LRU trim measurement.
+//! Even when generating 100 unique IDs/frame × 300 frames = 30,000 unique IDs,
+//! assert entry count converges under the default caps (max_entries=4096, trim_to=3072).
 //!
-//! ホットパス宣言: 300 フレームの計測専用ループ。RT / 通常 GUI 経路には影響しない。
+//! Hot-path note: a 300-frame measurement-only loop. Does not affect RT / normal GUI paths.
 
 const std = @import("std");
 const gui = @import("gui");
@@ -15,7 +15,7 @@ const FRAMES: usize = 300;
 const MAX_ENTRIES: usize = gui.PerIdStateStore.default_max_entries; // 4096
 const TRIM_TO: usize = gui.PerIdStateStore.default_trim_to; // 3072
 
-/// Zig 0.16 には CountingAllocator が無いため、live/peak/alloc 回数を数える薄い wrapper。
+/// Zig 0.16 has no CountingAllocator, so this is a thin wrapper that counts live/peak/alloc.
 const CountingAllocator = struct {
     parent: std.mem.Allocator,
     live_bytes: usize = 0,
@@ -156,14 +156,14 @@ test "gui leak: 100 unique IDs/frame x 300 frames stays within PerIdStateStore c
 
     const r = try runLeakScenario(&counter);
 
-    // TASK-127: 30,000 unique ID を生成しても endFrame 後の entry は max_entries 以下。
-    // trim は count > max_entries のときだけ発火し trim_to まで減らすため、
-    // final は常に 3072 固定ではなく [trim_to, max_entries] 付近に収まる。
+    // 30,000 unique IDs still leave endFrame entry count <= max_entries.
+    // trim fires only when count > max_entries and reduces to trim_to, so
+    // final is not fixed at 3072; it settles near [trim_to, max_entries].
     try testing.expectEqual(@as(usize, IDS_PER_FRAME), r.entries_frame_1);
     try testing.expect(r.entries_frame_300 <= MAX_ENTRIES);
     try testing.expect(r.entries_final <= MAX_ENTRIES);
     try testing.expect(r.max_observed <= MAX_ENTRIES);
-    // 上限なし旧仕様（30000）へ退行していないこと
+    // Must not regress to the old uncapped behaviour (30000).
     try testing.expect(r.entries_final <= TRIM_TO + IDS_PER_FRAME * 12);
     try testing.expect(r.entries_final < IDS_PER_FRAME * FRAMES / 2);
 

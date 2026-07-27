@@ -1,6 +1,6 @@
-# TASK-121.1 gallery replay
-# 1024x640 / Debug / gui.default_font / section=overview 初期
-# expect 値は 2026-07-17 headless replay の実測（digest gallery）を焼き込み。
+# gallery replay
+# 1024x640 / Debug / gui.default_font / section=overview initially
+# expect values baked from a 2026-07-17 headless replay (digest gallery).
 step 2
 digest gallery
 expect gallery section=overview
@@ -82,7 +82,7 @@ digest gallery
 expect gallery section=layout
 expect gallery widgets=5
 snapshot fb
-# layout: iconButton hover 500ms → tooltip（beginFrame は frame_index/60 → step 32 ≈ 0.53s）
+# layout: iconButton hover 500ms → tooltip (beginFrame is frame_index/60 → step 32 ≈ 0.53s)
 # pen center ≈ (144,124): outer pad16 + header64 + gap16 + content pad16 + icon pad4
 #   x: 16+16 + "iconButton:"(11*8=88) + gap8 + half icon_w(16) = 144
 inject mouse_move 144 124
@@ -90,19 +90,19 @@ step 32
 digest gallery
 expect gallery hot=iconButton
 snapshot fb
-# brush center ≈ (184,124) 長文 tip の表示確認（画面端クランプは context.zig 単体テストで担保）
+# brush center ≈ (184,124) long tip visibility (edge clamp covered by context.zig unit tests)
 inject mouse_move 184 124
 step 32
 digest gallery
 expect gallery hot=iconButton
 snapshot fb
-# leave → tooltip 消灯
+# leave → tooltip off
 inject mouse_move 1000 620
 step 2
 digest gallery
 expect gallery hot=none
 snapshot fb
-# collapsible header（icon row の下 ≈ y=160, x=120）: hover / click で body 出現 / 再 click で消灯
+# collapsible header (below icon row ≈ y=160, x=120): hover / click shows body / click again hides
 inject mouse_move 120 160
 step 2
 digest gallery
@@ -115,9 +115,9 @@ expect gallery active=collapsible
 snapshot fb
 inject mouse_up left
 step 1
-# open 後 body（Apply option）が見える
+# after open, body (Apply option) is visible
 snapshot fb
-# 再 click で close
+# click again to close
 inject mouse_down left
 step 1
 inject mouse_up left

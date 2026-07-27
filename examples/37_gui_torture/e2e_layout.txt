@@ -1,5 +1,5 @@
-# TASK-121.2 layout torture (1024x768)
-# expect 値は 2026-07-18 headless replay の実測を焼き込み（TASK-126 内側優先）
+# layout torture (1024x768)
+# expect values baked from a 2026-07-18 headless replay (inner-priority scroll)
 step 3
 digest layout
 expect layout case=layout
@@ -31,7 +31,7 @@ expect layout draw_ok=1
 snapshot fb
 
 # nested scroll: mouse over inner (outer_vp y~248, inner y~272)
-# TASK-126: 内側優先。旧観測 outer=96/inner=96 → 新仕様 outer=0/inner=96（意図的差分）
+# Inner priority: previous observation outer=96/inner=96 → contract outer=0/inner=96 (intentional)
 inject mouse_move 150 320
 step 2
 inject scroll 0 -3
@@ -41,7 +41,7 @@ expect scroll outer_scroll_y=0
 expect scroll inner_scroll_y=96
 snapshot fb
 
-# second wheel: outer は動かず inner のみ（旧は outer/inner とも >0）
+# second wheel: outer stays put; only inner moves (previously both outer/inner >0)
 inject mouse_move 120 300
 step 1
 inject scroll 0 -2
@@ -54,7 +54,7 @@ expect layout overflow=1
 expect layout draw_ok=1
 snapshot fb
 
-# inner 端到達 + 残量の outer 伝播（inner max=264、余剰が outer へ）
+# inner hits the end + remainder propagates to outer (inner max=264; surplus goes outer)
 inject mouse_move 150 320
 step 1
 inject scroll 0 -10
@@ -62,7 +62,7 @@ step 2
 digest scroll
 expect scroll inner_scroll_y=264
 expect scroll outer_scroll_y=216
-# 同方向の追加 wheel: inner は max のまま、outer だけが増える
+# further wheel same direction: inner stays at max; only outer grows
 inject scroll 0 -1
 step 2
 digest scroll

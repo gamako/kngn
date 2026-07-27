@@ -1,15 +1,15 @@
 #!/usr/bin/env bash
-# drive: ヘッドレス検証 harness の live driver の薄い入口（TASK-32.2）。
-# ビルド済み zig-out/bin/drive を直接 exec する（毎回 zig build しない＝応答 stdout を汚さない）。
+# drive: thin entry for the headless harness live driver.
+# exec the built zig-out/bin/drive directly (no per-call zig build = keep response stdout clean).
 #
 #   scripts/drive --port-file /tmp/vp.port 'inject key_down A; step 3; digest fb'
 #
-# 先に `zig build drive`（または `zig build`）で zig-out/bin/drive を生成しておくこと。
+# Build zig-out/bin/drive first with `zig build drive` (or `zig build`).
 set -euo pipefail
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 bin="$here/zig-out/bin/drive"
 if [[ ! -x "$bin" ]]; then
-  echo "drive: $bin が見つかりません。先に 'zig build drive'（または zig build）でビルドしてください。" >&2
+  echo "drive: $bin not found. Build first with 'zig build drive' (or zig build)." >&2
   exit 1
 fi
 exec "$bin" "$@"

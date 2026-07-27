@@ -1,12 +1,12 @@
 #!/usr/bin/env bash
-# TASK-162: netsync relay で 300 点 UI ドラッグが消失しないこと（host/client crc 一致・nz>0）。
-# direnv が壊れる workspace では VP_MAIN_DIR で本体 flake を借用する。
+# A 300-point UI drag over netsync relay must not vanish (host/client crc match, nz>0).
+# When direnv is broken in a workspace, borrow the main flake via VP_MAIN_DIR.
 set -euo pipefail
 
 ROOT=$(cd "$(dirname "$0")/../.." && pwd)
 MAIN="${VP_MAIN_DIR:-$ROOT}"
 DRIVE="$ROOT/scripts/drive"
-E2E="$ROOT/.e2e/task-162"
+E2E="$ROOT/.e2e/netsync-long-stroke"
 NETSYNC_PORT=9210
 HOST_PORT="$E2E/host.port"
 CLIENT_PORT="$E2E/client.port"
@@ -62,7 +62,7 @@ trap cleanup EXIT
 drive_h() { "$DRIVE" --port-file "$HOST_PORT" "$1"; }
 drive_c() { "$DRIVE" --port-file "$CLIENT_PORT" "$1"; }
 
-# host+client を交互に step しつつ条件待ち
+# Alternate host+client steps while waiting on the condition
 wait_until() {
   local who=$1 # host|client|both
   local pattern=$2
@@ -101,7 +101,7 @@ parse_kv() {
   printf '%s' "$text" | grep -oE "${key}=[^ ]+" | head -1 | cut -d= -f2-
 }
 
-# canvas cell → screen（digest の origin/zoom_num, zoom_den）
+# canvas cell → screen (digest origin/zoom_num, zoom_den)
 cell_to_screen() {
   local ox=$1 oy=$2 num=$3 den=$4 cx=$5 cy=$6
   if [[ "$den" == "1" ]]; then
@@ -113,7 +113,7 @@ cell_to_screen() {
   fi
 }
 
-log "=== TASK-162 netsync 300-point stroke E2E ==="
+log "=== netsync 300-point stroke E2E ==="
 host_pid=$(start_pixie "$HOST_PORT" "$HOST_OUT" VP_NETSYNC_HOST=1 VP_NETSYNC_PORT="$NETSYNC_PORT")
 wait_port "$HOST_PORT" "$host_pid"
 client_pid=$(start_pixie "$CLIENT_PORT" "$CLIENT_OUT" VP_NETSYNC_CONNECT=127.0.0.1:"$NETSYNC_PORT")
@@ -141,8 +141,8 @@ ox=${ox:-0}; oy=${oy:-0}; znum=${znum:-1}; zden=${zden:-1}
 log "canvas origin=($ox,$oy) zoom=$znum/$zden"
 
 # 300 distinct canvas points: (i%50, 10+i/50) for i=0..299
-# 重要: canvas_input はフレーム毎に mouse_pos を1回だけ読むため、
-# 各点は「inject mouse_move + step 1」で1フレームずつ進める（同一 step 内の連続 move は最終座標のみ）。
+# Important: canvas_input reads mouse_pos once per frame, so
+# each point is `inject mouse_move + step 1` (one frame each; consecutive moves in one step keep only the last coord).
 read -r sx0 sy0 < <(cell_to_screen "$ox" "$oy" "$znum" "$zden" 0 10)
 drive_c "inject mouse_move $sx0 $sy0; inject mouse_down left; step 1" >/dev/null
 drive_h 'step 1' >/dev/null
@@ -152,7 +152,7 @@ for i in $(seq 0 299); do
   cy=$((10 + i / 50))
   read -r sx sy < <(cell_to_screen "$ox" "$oy" "$znum" "$zden" "$cx" "$cy")
   drive_c "inject mouse_move $sx $sy; step 1" >/dev/null
-  # host も定期的に pump（accept/COMMIT）
+  # Also pump the host regularly (accept/COMMIT)
   if (( i % 5 == 0 )); then
     drive_h 'step 1' >/dev/null
   fi
@@ -162,7 +162,7 @@ read -r sx sy < <(cell_to_screen "$ox" "$oy" "$znum" "$zden" $((299 % 50)) $((10
 drive_c "inject mouse_move $sx $sy; inject mouse_up left; step 1" >/dev/null
 drive_h 'step 1' >/dev/null
 
-# pending 解消 + last_seq 前進（chunk 数 >= 3 を期待）を先に待つ
+# Wait first for pending clear + last_seq advance (expect chunk count >= 3)
 expect_seq=$((baseline_seq + 3))
 log "waiting netsync drain (expect last_seq>=$expect_seq, pending=0)..."
 local_ok=0
@@ -193,7 +193,7 @@ if [[ "$local_ok" != "1" ]]; then
   exit 1
 fi
 
-# pending 解消後に初めて canvas 判定
+# Only then judge the canvas, after pending has cleared
 host_canvas=$(drive_h 'digest canvas' 2>/dev/null || true)
 client_canvas=$(drive_c 'digest canvas' 2>/dev/null || true)
 log "host canvas: $host_canvas"

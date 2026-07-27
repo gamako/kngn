@@ -1,17 +1,17 @@
-# TASK-111.9 / TASK-137 E2E: 統合ミニゲーム capstone（登坂プレイアビリティ）
-# 前提: 640×360 / FixedTimeStep 60Hz / harness 仮想クロック / objc
-# CRC の正は aarch64-darwin 採取値。他 platform で divergence 時は再採取。
-# snapshot fb は path 省略 → $VP_HARNESS_OUT/frame_<n>.png
-# audio: silent=0 のみ（onsets は live smoke で検証）
-# 足場（TASK-137）: 床 top=336(y=322) / P1 top=272(y=258) / P2 top=208(y=194) / P3 top=144(y=130)。
-# JUMP_V=-8.0。左→右の階段状足場を弧ジャンプで1段ずつ登る（step 数は着地に十分な余裕を持たせる）。
+# E2E: integrated minigame capstone (climb playability)
+# Preconditions: 640×360 / FixedTimeStep 60Hz / harness virtual clock / objc
+# CRC oracle is the aarch64-darwin capture. Re-capture on other platforms if it diverges.
+# snapshot fb with path omitted → $VP_HARNESS_OUT/frame_<n>.png
+# audio: silent=0 only (onsets checked in live smoke)
+# Platforms: floor top=336(y=322) / P1 top=272(y=258) / P2 top=208(y=194) / P3 top=144(y=130).
+# JUMP_V=-8.0. Climb the left-to-right stepped platforms one arc-jump at a time (give steps enough margin to land).
 
-# 初期状態: 空中から落下
+# Initial state: falling from air
 step 1
 assert game grounded=0
 expect game state=falling
 
-# 床へ着地
+# Land on the floor
 step 40
 assert game grounded=1
 expect game y=322.000
@@ -19,13 +19,13 @@ snapshot fb
 digest fb
 expect fb crc=BF6186EB
 
-# 右移動 → 床コイン取得（score>0）
+# Move right → collect floor coin (score>0)
 inject key_down RIGHT
 step 66
 assert game grounded=1
 expect game score>0
 
-# jump1 → 第1足場 P1 に着地（足場到達 AC）
+# jump1 → land on platform P1 (platform-reach AC)
 inject key_down SPACE
 step 1
 inject key_up SPACE
@@ -39,7 +39,7 @@ snapshot fb
 digest fb
 expect fb crc=633CAEB5
 
-# P1 上を右へ → jump2 → 第2足場 P2 に着地
+# Right on P1 → jump2 → land on platform P2
 step 26
 inject key_down SPACE
 step 1
@@ -48,7 +48,7 @@ step 34
 assert game grounded=1
 expect game y=194.000
 
-# P2 上を右へ → jump3 → 第3足場 P3（上段）に着地
+# Right on P2 → jump3 → land on platform P3 (top)
 step 42
 inject key_down SPACE
 step 1
@@ -58,7 +58,7 @@ assert game grounded=1
 expect game y=130.000
 expect game cam_x>0.0
 
-# P3 上を右へ → 頂上コイン取得（score が 300 まで伸びる = 全コイン回収で登坂完遂）
+# Right on P3 → collect summit coin (score reaches 300 = all coins; climb complete)
 step 18
 assert game grounded=1
 expect game score>200

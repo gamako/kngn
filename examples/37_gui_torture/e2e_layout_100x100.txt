@@ -1,6 +1,6 @@
-# TASK-121.2 layout torture at 100x100
-# 起動: VP_GUI_WIDTH=100 VP_GUI_HEIGHT=100 VP_GUI_TORTURE_CASE=layout
-# expect 値は 2026-07-17 headless replay の実測を焼き込み
+# layout torture at 100x100
+# Launch: VP_GUI_WIDTH=100 VP_GUI_HEIGHT=100 VP_GUI_TORTURE_CASE=layout
+# expect values baked from a 2026-07-17 headless replay
 step 3
 digest layout
 expect layout case=layout

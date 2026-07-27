@@ -1,24 +1,24 @@
-// video-proto wasm JS glue（TASK-73.1 + TASK-73.2 audio + TASK-73.3 file/clipboard）
+// video-proto wasm JS glue (audio + file/clipboard)
 // import table:
 //   env: vp_now / vp_present / vp_log / vp_set_cursor
-//        + vp_audio_open / vp_audio_start / vp_audio_stop / vp_audio_close（audio app）
-//        + vp_request_open / vp_clipboard_write / vp_request_paste（file dialog / clipboard）
-//   wasi_snapshot_preview1: 手書き shim + in-memory FS（path_open/fd_read/write/seek/close）
+//        + vp_audio_open / vp_audio_start / vp_audio_stop / vp_audio_close (audio app)
+//        + vp_request_open / vp_clipboard_write / vp_request_paste (file dialog / clipboard)
+//   wasi_snapshot_preview1: hand-written shim + in-memory FS (path_open/fd_read/write/seek/close)
 //
-// boot オプション（script type=module から、または data-*）:
-//   wasm: "pixie.wasm" | "synth.wasm"（既定 pixie.wasm）
-//   sharedMemory: true のとき import shared memory（synth audio 必須）
-//   audio: true のとき AudioWorklet 経路を有効化（sharedMemory 必須）
+// boot options (from a script type=module import, or data-*):
+//   wasm: "pixie.wasm" | "synth.wasm" (default pixie.wasm)
+//   sharedMemory: true imports shared memory (required for synth audio)
+//   audio: true enables the AudioWorklet path (requires sharedMemory)
 //
-// 時刻契約（M2）:
-//   - アプリのフレーム時刻は常に env.vp_now（performance.now 基準・秒）
-//   - WASI clock_time_get は stdlib 内部専用。monotonic も performance.now 基準で揃える
-// DOM → vp_push_*（KeyCode 変換は Zig 側 table。JS は code 文字列の識別と export 呼び出しのみ）
+// Time contract:
+//   - App frame time is always env.vp_now (performance.now based, seconds)
+//   - WASI clock_time_get is for stdlib internals only. monotonic is also performance.now based
+// DOM → vp_push_* (KeyCode conversion is a Zig-side table. JS only identifies code strings and calls exports)
 //
-// ファイル I/O（TASK-73.3）:
-//   - open: <input type=file> → 仮想 path `pick/<name>` にバイト登録 → vp_file_picked
-//   - save: Zig が path を書き WASI write → fd_close で Blob download
-//   - OPFS は不採用（download/pick 往復で .pix round-trip 可）
+// File I/O:
+//   - open: <input type=file> → register bytes at virtual path `pick/<name>` → vp_file_picked
+//   - save: Zig writes a path via WASI write → Blob download on fd_close
+//   - OPFS is not used (download/pick round-trip is enough for .pix)
 
 const canvas = document.getElementById("vp-canvas");
 const ctx2d = canvas.getContext("2d", { alpha: false });
@@ -30,31 +30,31 @@ let instance;
 /** @type {WebAssembly.Module | null} */
 let wasmModule = null;
 
-// ImageData は再利用（サイズ変化・memory growth 時のみ再生成。codex Medium#3）
+// ImageData is reused (recreated only on size change or memory growth)
 let imageData = null;
 let imageW = 0;
 let imageH = 0;
 
 const CURSOR_CSS = ["default", "crosshair", "none"];
 
-// ---- audio state（TASK-73.2）----
+// ---- audio state ----
 /** @type {AudioContext | null} */
 let audioCtx = null;
 /** @type {AudioWorkletNode | null} */
 let audioNode = null;
 let audioChannels = 2;
-/** start 意図フラグ。stop 後の gesture で意図せず resume しない（修正4） */
+/** Intent-to-start flag. After stop, a later gesture must not resume unintentionally. */
 let audioWantRunning = false;
 let audioGestureBound = false;
 /**
- * boot で worklet Node 構築 + 2nd Instance + sentinel 検証が成功したとき true。
- * envAudioOpen はこれが false なら 0 を返す → Zig open が error.OpenFailed（修正2）。
+ * true when boot built the worklet Node, 2nd Instance, and sentinel checks successfully.
+ * When false, envAudioOpen returns 0 so Zig open fails with error.OpenFailed.
  */
 let audioReady = false;
 const WORKLET_READY_TIMEOUT_MS = 5000;
 const SENTINEL_MAGIC = 0x56504153;
 
-// ---- WASI preview1 errno / clockid（実測 import 用最小面）----
+// ---- WASI preview1 errno / clockid (minimal surface for the measured imports) ----
 const WASI_ESUCCESS = 0;
 const WASI_EBADF = 8;
 const WASI_EEXIST = 20;
@@ -63,16 +63,16 @@ const WASI_EINVAL = 28;
 const WASI_ENOENT = 44;
 const WASI_ENOSYS = 52;
 const WASI_ENOTCAPABLE = 76;
-/** memFS の size/offset/成長上限（64 MiB）。超過は EFBIG/EINVAL。 */
+/** memFS size/offset/growth cap (64 MiB). Over that: EFBIG/EINVAL. */
 const MEMFS_MAX_BYTES = 64 * 1024 * 1024;
 const WASI_CLOCK_REALTIME = 0;
 const WASI_CLOCK_MONOTONIC = 1;
 const WASI_FILETYPE_CHARACTER_DEVICE = 2;
 const WASI_FILETYPE_DIRECTORY = 3;
 const WASI_FILETYPE_REGULAR_FILE = 4;
-/** Zig wasi cwd = fd 3（最初の preopen） */
+/** Zig wasi cwd = fd 3 (first preopen) */
 const WASI_PREOPEN_FD = 3;
-/** oflags bits（wasi oflags_t packed） */
+/** oflags bits (wasi oflags_t packed) */
 const WASI_O_CREAT = 1;
 const WASI_O_DIRECTORY = 2;
 const WASI_O_EXCL = 4;
@@ -92,7 +92,7 @@ function setU32(ptr, v) {
   new DataView(memory.buffer).setUint32(ptr, v >>> 0, true);
 }
 function setU64(ptr, v) {
-  // BigInt で little-endian u64 を書く（Timestamp = ns）
+  // Write a little-endian u64 via BigInt (Timestamp = ns)
   const dv = new DataView(memory.buffer);
   const bi = typeof v === "bigint" ? v : BigInt(Math.trunc(v));
   dv.setBigUint64(ptr, bi, true);
@@ -124,7 +124,7 @@ function appendFd(fd, text) {
   }
 }
 
-/** ciovec[] を連結して文字列化。戻り値は書込バイト数。 */
+/** Concatenate ciovec[] into a string. Returns bytes written. */
 function concatIovecs(iovsPtr, iovsLen) {
   const parts = [];
   let total = 0;
@@ -157,7 +157,7 @@ function writeFdstat(statPtr, filetype) {
   dv.setBigUint64(statPtr + 16, 0n, true); // rights_inheriting
 }
 
-/** filestat_t（64B）: dev/ino u64, filetype u8 + pad, nlink u64, size u64, atim/mtim/ctim u64 */
+/** filestat_t (64B): dev/ino u64, filetype u8 + pad, nlink u64, size u64, atim/mtim/ctim u64 */
 function writeFilestat(statPtr, filetype, size) {
   const dv = new DataView(memory.buffer);
   dv.setBigUint64(statPtr + 0, 0n, true); // dev
@@ -173,7 +173,7 @@ function writeFilestat(statPtr, filetype, size) {
   dv.setBigUint64(statPtr + 56, nowNs, true); // ctim
 }
 
-// ---- in-memory FS（TASK-73.3）----
+// ---- in-memory FS ----
 /** @type {Map<string, Uint8Array>} path → file bytes */
 const memFiles = new Map();
 /**
@@ -183,7 +183,7 @@ const memFiles = new Map();
 const memFds = new Map();
 let nextMemFd = 4;
 
-/** open picker 進行中（二重発火防止） */
+/** open picker in progress (prevent double-fire) */
 let openPickerBusy = false;
 /** @type {HTMLInputElement | null} */
 let hiddenFileInput = null;
@@ -208,15 +208,15 @@ function pathBasename(p) {
 
 function makePickPath(filename) {
   let base = pathBasename(filename);
-  // path traversal 除去（basename 済みだが念のため）
+  // Strip path traversal (basename already applied; belt-and-suspenders)
   base = base.replace(/[\\/]/g, "_");
   if (!base || base === "." || base === "..") base = "file";
   return "pick/" + base;
 }
 
 /**
- * UTF-8 バイト長が maxBytes 以下になるよう code point 単位で末尾を落とす。
- * 単純な byte 切断による UTF-8 破壊と、memFS key / wasm 配送 path の不一致を防ぐ（TASK-73.3 修正2）。
+ * Truncate by code point so the UTF-8 byte length stays <= maxBytes.
+ * Avoids breaking UTF-8 with a raw byte cut, and keeps the memFS key and wasm delivery path identical.
  * @param {string} s
  * @param {number} maxBytes
  * @returns {string}
@@ -230,7 +230,7 @@ function clampUtf8(s, maxBytes) {
 }
 
 /**
- * BigInt/number → 非負の SafeInteger。不正なら null。
+ * BigInt/number → non-negative SafeInteger. Returns null if invalid.
  * @param {number|bigint} v
  * @returns {number|null}
  */
@@ -251,7 +251,7 @@ function asSafeNonNegInt(v) {
 }
 
 /**
- * BigInt/number → 符号付き SafeInteger（fd_seek の delta 用）。不正なら null。
+ * BigInt/number → signed SafeInteger (for fd_seek delta). Returns null if invalid.
  * @param {number|bigint} v
  * @returns {number|null}
  */
@@ -288,7 +288,7 @@ function triggerDownload(filename, data) {
     document.body.appendChild(a);
     a.click();
     a.remove();
-    // revoke を遅延（一部 browser が即 revoke で download 失敗）
+    // Delay revoke (some browsers fail download if revoke is immediate)
     setTimeout(() => URL.revokeObjectURL(url), 2000);
   } catch (e) {
     console.error("download failed:", e);
@@ -302,7 +302,7 @@ function ensureFileInput() {
   input.style.display = "none";
   input.addEventListener("change", () => {
     const file = input.files && input.files[0];
-    input.value = ""; // 同一ファイル再選択を許可
+    input.value = ""; // Allow re-selecting the same file
     if (!file) {
       openPickerBusy = false;
       if (instance && typeof instance.exports.vp_file_cancelled === "function") {
@@ -315,7 +315,7 @@ function ensureFileInput() {
       openPickerBusy = false;
       try {
         const buf = new Uint8Array(reader.result);
-        // 登録 key と wasm 配送 path を同一文字列に（UTF-8 安全クランプ。scratch 256B 契約）
+        // Keep the registered key and the wasm delivery path as the same string (UTF-8-safe clamp; scratch 256B contract)
         const vpath = clampUtf8(makePickPath(file.name), 256);
         registerMemFile(vpath, buf);
         deliverPickedPath(vpath);
@@ -335,7 +335,7 @@ function ensureFileInput() {
     };
     reader.readAsArrayBuffer(file);
   });
-  // cancel: 一部 browser は cancel イベントを持つ
+  // cancel: some browsers expose a cancel event
   input.addEventListener("cancel", () => {
     openPickerBusy = false;
     if (instance && typeof instance.exports.vp_file_cancelled === "function") {
@@ -348,7 +348,7 @@ function ensureFileInput() {
 }
 
 function deliverPickedPath(vpath) {
-  // vpath は呼び出し側で clampUtf8(..., 256) 済み。ここでの再切断はしない（key 不一致防止）。
+  // Caller already clampUtf8(..., 256) on vpath. Do not re-truncate here (avoids key mismatch).
   if (!instance || typeof instance.exports.vp_file_path_scratch !== "function") return;
   const enc = new TextEncoder();
   const bytes = enc.encode(vpath);
@@ -359,19 +359,19 @@ function deliverPickedPath(vpath) {
 }
 
 /**
- * Zig `vp_request_open` — <input type=file> を発火。
+ * Zig `vp_request_open` — fire <input type=file>.
  * @param {number} extPtr
  * @param {number} extLen
  */
 function envRequestOpen(extPtr, extLen) {
-  if (openPickerBusy) return; // 二重発火防止
+  if (openPickerBusy) return; // Prevent double-fire
   openPickerBusy = true;
   const input = ensureFileInput();
   let accept = "";
   if (extLen > 0) {
     try {
       const ext = new TextDecoder().decode(bytesAt(extPtr, extLen));
-      // "png" → ".png,image/png" 程度のヒント
+      // Hint like "png" → ".png,image/png"
       if (ext && !ext.includes("/") && !ext.startsWith(".")) {
         accept = "." + ext;
       } else {
@@ -382,7 +382,7 @@ function envRequestOpen(extPtr, extLen) {
     }
   }
   input.accept = accept;
-  // user gesture 外でも click は多くの browser で動く（button 由来 frame 経由）
+  // click often works even outside a user gesture (via a button-origin frame)
   try {
     input.click();
   } catch (e) {
@@ -435,21 +435,21 @@ function envRequestPaste() {
 }
 
 /**
- * wasi_snapshot_preview1 — 手書き shim + in-memory FS（TASK-73.3）。
- * 標準入出力は console。通常ファイルは memFiles/memFds。cwd preopen = fd 3。
+ * wasi_snapshot_preview1 — hand-written shim + in-memory FS.
+ * stdin/stdout/stderr go to console. Regular files use memFiles/memFds. cwd preopen = fd 3.
  */
 const wasi = {
   clock_res_get(clockId, resolutionPtr) {
     if (clockId !== WASI_CLOCK_REALTIME && clockId !== WASI_CLOCK_MONOTONIC) {
       return WASI_EINVAL;
     }
-    // 1ms 相当（ブラウザ timer 精度の目安）
+    // About 1ms (rough browser timer resolution)
     setU64(resolutionPtr, 1_000_000n);
     return WASI_ESUCCESS;
   },
   clock_time_get(clockId, _precision, timePtr) {
-    // M2: monotonic = performance.now 基準。realtime は Date.now。
-    // アプリ時刻は vp_now を使う（本関数は stdlib 内部専用）。
+    // monotonic = performance.now based. realtime = Date.now.
+    // App time uses vp_now (this function is stdlib-internal only).
     let ns;
     if (clockId === WASI_CLOCK_MONOTONIC) {
       ns = BigInt(Math.trunc(performance.now() * 1e6));
@@ -474,12 +474,12 @@ const wasi = {
     const ent = memFds.get(fd);
     if (!ent) return WASI_EBADF;
     memFds.delete(fd);
-    // write 済みなら memFiles に確定 + download 発火
+    // If written, commit into memFiles and fire download
     if (ent.writable && ent.dirty) {
       memFiles.set(ent.path, ent.data);
       triggerDownload(pathBasename(ent.path), ent.data);
     } else if (ent.writable) {
-      // 空書きでも path は登録（create のみ）
+      // Even an empty write registers the path (create-only)
       memFiles.set(ent.path, ent.data);
     }
     return WASI_ESUCCESS;
@@ -598,7 +598,7 @@ const wasi = {
     if (memFds.has(fd)) return WASI_ESUCCESS;
     return WASI_EBADF;
   },
-  // M3: per-fd 行バッファ → newline で console.log/error。複数 iovec 連結。
+  // per-fd line buffer → console.log/error on newline. Concatenate multiple iovec.
   fd_write(fd, iovsPtr, iovsLen, nwrittenPtr) {
     if (fd === 1 || fd === 2) {
       const { text, total } = concatIovecs(iovsPtr, iovsLen);
@@ -615,7 +615,7 @@ const wasi = {
   },
   path_filestat_get(dirfd, _flags, pathPtr, pathLen, statPtr) {
     if (dirfd !== WASI_PREOPEN_FD && dirfd !== 3) {
-      // 相対 open は cwd のみサポート
+      // Relative open supports cwd only
       if (!memFds.has(dirfd)) return WASI_EBADF;
     }
     const path = normalizePath(new TextDecoder().decode(bytesAt(pathPtr, pathLen)));
@@ -628,7 +628,7 @@ const wasi = {
     return WASI_ENOTCAPABLE;
   },
   path_open(dirfd, _dirflags, pathPtr, pathLen, oflags, _fsRightsBase, _fsRightsInheriting, _fsFlags, fdPtr) {
-    // cwd preopen のみ（Zig Dir.cwd handle=3）
+    // cwd preopen only (Zig Dir.cwd handle=3)
     if (dirfd !== WASI_PREOPEN_FD) return WASI_EBADF;
     if ((oflags & WASI_O_DIRECTORY) !== 0) return WASI_ENOTCAPABLE;
     const path = normalizePath(new TextDecoder().decode(bytesAt(pathPtr, pathLen)));
@@ -645,7 +645,7 @@ const wasi = {
       if (!creat) return WASI_ENOENT;
       data = new Uint8Array(0);
     }
-    // rights は無視。writeFile は CREAT|TRUNC、read は oflags=0。
+    // rights are ignored. writeFile uses CREAT|TRUNC; read uses oflags=0.
     const writable = creat || trunc;
     const fd = nextMemFd++;
     memFds.set(fd, {
@@ -728,7 +728,7 @@ function memFdReadAt(ent, iovsPtr, iovsLen, offset, nreadPtr, advancePos) {
 function memFdWriteAt(ent, iovsPtr, iovsLen, offset, nwrittenPtr, advancePos) {
   if (!Number.isSafeInteger(offset) || offset < 0) return WASI_EINVAL;
   if (offset > MEMFS_MAX_BYTES) return WASI_EFBIG;
-  // まず総バイト数
+  // First the total byte count
   let need = 0;
   for (let i = 0; i < iovsLen; i++) {
     need += u32(iovsPtr + i * 8 + 4);
@@ -777,16 +777,16 @@ function buttonsFromEvent(e) {
 }
 
 function buttonIndex(e) {
-  // DOM MouseEvent.button をそのまま渡す（0=left, 1=middle, 2=right）。
-  // Zig 側 buttonFromDom が MouseButton（left=0,right=1,middle=2）へ変換する。
-  // ※ 共有 enum の discriminant とは middle/right が入れ替わる点に注意。
+  // Pass DOM MouseEvent.button through as-is (0=left, 1=middle, 2=right).
+  // Zig-side buttonFromDom maps to MouseButton (left=0,right=1,middle=2).
+  // Note: middle/right swap relative to the shared enum discriminant.
   if (e.button === 0) return 0;
   if (e.button === 1) return 1;
   if (e.button === 2) return 2;
   return -1;
 }
 
-/** clientX/Y → canvas logical px（HiDPI / CSS scale 対応） */
+/** clientX/Y → canvas logical px (HiDPI / CSS scale) */
 function canvasLogicalXY(e) {
   const rect = canvas.getBoundingClientRect();
   const scaleX = canvas.width / rect.width;
@@ -812,7 +812,7 @@ function pushKey(e, down) {
 }
 
 function shouldPreventKey(e) {
-  // pixie / synth が使うキーのページデフォルトを抑止
+  // Suppress page defaults for keys used by pixie / synth
   const c = e.code;
   return (
     c === "Space" ||
@@ -822,12 +822,12 @@ function shouldPreventKey(e) {
     c === "Delete" ||
     ((e.metaKey || e.ctrlKey) &&
       (c === "KeyZ" || c === "KeyS" || c === "KeyO" || c === "KeyQ" || c === "KeyC" || c === "KeyV" || c === "KeyX")) ||
-    // synth 鍵盤 A..K 周辺
+    // Around the synth keyboard A..K
     (c.startsWith("Key") && c.length === 4)
   );
 }
 
-/** コンテナの論理 px（DPR 非適用）を wasm へ通知。pending 方式でフレーム境界適用。 */
+/** Notify wasm of the container's logical px (no DPR). Applied at the frame boundary via pending. */
 function reportCanvasSize() {
   if (!instance) return;
   const w = Math.round(canvas.clientWidth);
@@ -859,7 +859,7 @@ function ensureAudioGestureResume() {
   audioGestureBound = true;
   const hint = document.getElementById("vp-audio-hint");
   const tryResume = async () => {
-    // stop 後の gesture で意図せず再開しない（修正4）
+    // After stop, a later gesture must not resume unintentionally
     if (!audioWantRunning) return;
     if (!audioCtx) return;
     if (audioCtx.state === "suspended") {
@@ -873,7 +873,7 @@ function ensureAudioGestureResume() {
       hint.style.display = "none";
     }
   };
-  // クリック / キーで resume（autoplay policy）
+  // Resume on click / key (autoplay policy)
   const onGesture = () => {
     void tryResume();
   };
@@ -886,9 +886,9 @@ function ensureAudioGestureResume() {
 }
 
 /**
- * boot: main Instance 生成後・vp_init 前に AudioWorkletNode を構築し、
- * worklet 側 2nd Instance + sentinel 検証の ready を await する（修正1/2）。
- * g_state は未設定だが worklet は running ゲート内でしか読まないので安全。
+ * boot: after the main Instance is created and before vp_init, build AudioWorkletNode
+ * and await worklet-side 2nd Instance + sentinel ready.
+ * g_state is unset yet, but the worklet only reads it inside the running gate, so this is safe.
  * @param {number} channels
  * @returns {Promise<void>}
  */
@@ -902,7 +902,7 @@ function prepareAudioWorkletNode(channels) {
       reject(new Error("prepareAudioWorkletNode: missing vp_audio_set_sentinel"));
       return;
     }
-    // main が shared memory 上に magic を書く（worklet instantiate 前）
+    // main writes the magic on shared memory (before worklet instantiate)
     instance.exports.vp_audio_set_sentinel();
 
     const stackTop =
@@ -979,8 +979,8 @@ function prepareAudioWorkletNode(channels) {
 }
 
 /**
- * Zig `vp_audio_open` → boot 済み worklet を確認して実 sample rate を返す。
- * Node 生成は boot に前倒し済み。audioReady でなければ 0（修正2）。
+ * Zig `vp_audio_open` → confirm the boot-time worklet and return the real sample rate.
+ * Node creation already ran at boot. Returns 0 unless audioReady.
  * @returns {number} actual sample rate, or 0 on failure
  */
 function envAudioOpen(sampleRate, channels, bufferFrames) {
@@ -1044,12 +1044,12 @@ function envAudioClose() {
 function makeImportObject() {
   return {
     env: {
-      // アプリ時刻の正（フレーム・getTime）。WASI clock は使わない。
+      // Canonical app time (frame / getTime). Do not use the WASI clock.
       vp_now() {
         return performance.now() / 1000;
       },
       vp_present(ptr, w, h) {
-        // memory growth で旧 ArrayBuffer が detach するため、毎回 buffer から view を作り直す
+        // memory growth detaches the old ArrayBuffer, so rebuild the view from buffer every time
         const nbytes = (w * h * 4) >>> 0;
         const wasmView = new Uint8ClampedArray(memory.buffer, ptr, nbytes);
         if (!imageData || imageW !== w || imageH !== h || imageData.data.length !== nbytes) {
@@ -1075,7 +1075,7 @@ function makeImportObject() {
       vp_audio_start: envAudioStart,
       vp_audio_stop: envAudioStop,
       vp_audio_close: envAudioClose,
-      // TASK-73.3 file dialog / clipboard
+      // file dialog / clipboard
       vp_request_open: envRequestOpen,
       vp_clipboard_write: envClipboardWrite,
       vp_request_paste: envRequestPaste,
@@ -1093,7 +1093,7 @@ function bindInput() {
     if (shouldPreventKey(e)) e.preventDefault();
     pushKey(e, false);
   });
-  // 確定文字（char_input）。制御キーは Zig 側でも弾く
+  // Committed characters (char_input). Control keys are also filtered on the Zig side
   canvas.addEventListener("keypress", (e) => {
     if (e.charCode && e.charCode >= 0x20) {
       instance.exports.vp_push_char(e.charCode, modsFromEvent(e));
@@ -1116,9 +1116,9 @@ function bindInput() {
   canvas.addEventListener(
     "wheel",
     (e) => {
-      e.preventDefault(); // ページスクロール抑止
+      e.preventDefault(); // Suppress page scroll
       const { x, y } = canvasLogicalXY(e);
-      // DOM wheel は下方向が正 → pixie/gui 慣習に合わせ dy を反転
+      // DOM wheel is positive downward → flip dy to match the pixie/gui convention
       instance.exports.vp_push_scroll(x, y, -e.deltaX, -e.deltaY, modsFromEvent(e));
     },
     { passive: false },
@@ -1146,7 +1146,7 @@ export async function boot(opts = {}) {
   audioReady = false;
 
   if (useAudio) {
-    // addModule は「node を作る同一 AudioContext」に対して必須。
+    // addModule must target the same AudioContext that creates the node.
     const AC = window.AudioContext || window.webkitAudioContext;
     if (!AC) throw new Error("AudioContext not available");
     if (typeof SharedArrayBuffer === "undefined" || !globalThis.crossOriginIsolated) {
@@ -1182,7 +1182,7 @@ export async function boot(opts = {}) {
     memory = /** @type {WebAssembly.Memory} */ (instance.exports.memory);
   }
 
-  // audio: vp_init 前に 2nd Instance + sentinel 検証を完了（失敗 → open も失敗）（修正2）
+  // audio: finish 2nd Instance + sentinel checks before vp_init (failure → open also fails)
   if (useAudio) {
     try {
       await prepareAudioWorkletNode(2);
@@ -1191,7 +1191,7 @@ export async function boot(opts = {}) {
     } catch (e) {
       audioReady = false;
       showAudioError(e && e.message ? e.message : e);
-      // グラフィックスは続行。audio.open は OpenFailed になる。
+      // Graphics continue. audio.open returns OpenFailed.
       console.warn("audio disabled:", e);
     }
   }
@@ -1201,13 +1201,13 @@ export async function boot(opts = {}) {
   instance.exports.vp_init();
 
   function loop(ts) {
-    instance.exports.vp_frame(ts); // rAF ms。Zig 側で /1000
+    instance.exports.vp_frame(ts); // rAF ms. Zig divides by 1000
     requestAnimationFrame(loop);
   }
   requestAnimationFrame(loop);
 }
 
-// 既定: index.html は data 属性 or クエリ無しで pixie
+// Default: index.html with no data attribute or query loads pixie
 function defaultOptsFromPage() {
   const params = new URLSearchParams(location.search);
   const body = document.body;
@@ -1224,7 +1224,7 @@ function defaultOptsFromPage() {
   return { wasm, audio, sharedMemory };
 }
 
-// type=module のトップレベル自動起動（import { boot } でも可）
+// Auto-start at the top level of a type=module script (import { boot } also works)
 if (!globalThis.__vpManualBoot) {
   boot(defaultOptsFromPage()).catch((err) => {
     console.error(err);

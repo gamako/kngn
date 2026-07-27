@@ -1,19 +1,19 @@
-# TASK-111.4 E2E: camera pan + follow（決定論 CRC 焼き込み）
-# 前提: 640×360 / 固定背景 / 固定 world / FixedTimeStep 60Hz / harness 仮想クロック
-# CRC の正は aarch64-darwin 採取値。他 platform で divergence 時は再採取（M7）。
-# 実行例:
+# E2E: camera pan + follow (deterministic CRC baked in)
+# Preconditions: 640×360 / fixed background / fixed world / FixedTimeStep 60Hz / harness virtual clock
+# CRC oracle is the aarch64-darwin capture. Re-capture on other platforms if it diverges.
+# Example run:
 #   TMPD=$(mktemp -d)
 #   VP_HEADLESS=1 VP_HARNESS_SCRIPT=examples/33_camera/e2e.txt \
 #     VP_HARNESS_OUT=$TMPD zig build run-example_33
-# snapshot は path 省略 → $VP_HARNESS_OUT/frame_<n>.png（repo に PNG を残さない）
+# snapshot with path omitted → $VP_HARNESS_OUT/frame_<n>.png (do not leave PNGs in the repo)
 
-# --- 1. 初期表示（市松 + 目印スプライト） ---
+# --- 1. Initial view (checkerboard + marker sprite) ---
 step 1
 snapshot fb
 digest fb
 expect fb crc=11D17951
 
-# --- 2. 手動スクロール（RIGHT 長押し相当） ---
+# --- 2. Manual scroll (RIGHT held) ---
 inject key_down RIGHT
 step 40
 inject key_up RIGHT
@@ -21,7 +21,7 @@ snapshot fb
 digest fb
 expect fb crc=47CA82D8
 
-# --- 3. 境界付近まで移動（RIGHT+DOWN） ---
+# --- 3. Move near the boundary (RIGHT+DOWN) ---
 inject key_down RIGHT
 inject key_down DOWN
 step 100
@@ -31,7 +31,7 @@ snapshot fb
 digest fb
 expect fb crc=B81EB721
 
-# --- 4. 追従有効化後（lerp 進行・スプライトが視野に入る） ---
+# --- 4. After follow enables (lerp in progress; sprite enters view) ---
 inject key_down F
 step 1
 inject key_up F
@@ -40,7 +40,7 @@ snapshot fb
 digest fb
 expect fb crc=EE378351
 
-# --- 5. 追従後の安定状態（ターゲットが viewport 中央付近） ---
+# --- 5. Stable after follow (target near viewport center) ---
 step 80
 snapshot fb
 digest fb

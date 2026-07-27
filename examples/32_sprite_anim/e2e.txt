@@ -1,6 +1,6 @@
-# TASK-111.3 E2E: 歩行アニメ + 左右往復（決定論 CRC 焼き込み）
-# 前提: 640×360 / 固定背景 / 固定 seed 無しの決定的描画 / harness 仮想クロック
-# 実行例:
+# E2E: walk animation + left/right patrol (deterministic CRC baked in)
+# Preconditions: 640×360 / fixed background / deterministic draw without a fixed seed / harness virtual clock
+# Example run:
 #   TMPD=$(mktemp -d)
 #   VP_HEADLESS=1 VP_HARNESS_SCRIPT=examples/32_sprite_anim/e2e.txt \
 #     VP_HARNESS_OUT=$TMPD zig build run-example_32

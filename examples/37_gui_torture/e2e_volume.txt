@@ -1,5 +1,5 @@
-# TASK-121.2 volume E2E (500 then 1000 via PAGE_DOWN)
-# 起動: VP_GUI_TORTURE_CASE=volume
+# volume E2E (500 then 1000 via PAGE_DOWN)
+# Launch: VP_GUI_TORTURE_CASE=volume
 step 4
 digest state
 digest layout

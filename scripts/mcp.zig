@@ -1,14 +1,14 @@
-//! vp-mcp: harness listen TCP ↔ stdio MCP server（TASK-88.2）。
+//! vp-mcp: harness listen TCP ↔ stdio MCP server.
 //!
-//! 起動済みアプリ（`VP_HARNESS_LISTEN`）へ attach し、capabilities から MCP tools を動的生成する。
-//! 純 std + `std.Io.net` のみ（platform/audio 非依存・module import なし）。
+//! Attach to a running app (`VP_HARNESS_LISTEN`) and build MCP tools dynamically from capabilities.
+//! Pure std + `std.Io.net` only (no platform/audio dependency, no module import).
 //!
-//! 使い方:
+//! Usage:
 //!   vp-mcp --port-file /tmp/vp.port
 //!   vp-mcp --port 54321 --out /tmp/vp-mcp-out
 //!
-//! MCP protocol は stdio JSON-RPC 最小サブセット（initialize / notifications/initialized /
-//! tools/list / tools/call / ping）。正は TASK-88 umbrella plan v3 + TASK-88.2 plan。
+//! MCP protocol is a minimal stdio JSON-RPC subset (initialize / notifications/initialized /
+//! tools/list / tools/call / ping). See docs/harness.md.
 
 const std = @import("std");
 const net = std.Io.net;
@@ -19,8 +19,8 @@ const PROTOCOL_VERSION = "2025-06-18";
 const SERVER_NAME = "vp-mcp";
 const SERVER_VERSION = "0.1.0";
 const MESSAGE_MAX = 64 * 1024;
-// CONNECT_TIMEOUT_S=2 は umbrella §5 の契約値。Zig 0.16 Threaded の netConnectIpPosix は
-// timeout≠.none で TODO panic のため未適用（drive と同じ .none）。std 実装後に接続へ載せる。
+// CONNECT_TIMEOUT_S=2 is the intended connect budget. Zig 0.16 Threaded netConnectIpPosix
+// panics on timeout≠.none (TODO), so it is unused (same `.none` as drive). Apply it once std supports it.
 const RESPONSE_TIMEOUT_S: i64 = 30;
 const RESPONSE_LIMIT = 1 << 20;
 
@@ -42,14 +42,14 @@ pub fn main(init: std.process.Init) !void {
 
     while (it.next()) |arg| {
         if (std.mem.eql(u8, arg, "--port")) {
-            const v = it.next() orelse return die("--port は値が必要です\n");
-            port_opt = std.fmt.parseInt(u16, v, 10) catch return die("--port の値が不正です\n");
+            const v = it.next() orelse return die("--port requires a value\n");
+            port_opt = std.fmt.parseInt(u16, v, 10) catch return die("--port value is invalid\n");
         } else if (std.mem.eql(u8, arg, "--port-file")) {
-            port_file = it.next() orelse return die("--port-file は値が必要です\n");
+            port_file = it.next() orelse return die("--port-file requires a value\n");
         } else if (std.mem.eql(u8, arg, "--out")) {
-            out_opt = it.next() orelse return die("--out は値が必要です\n");
+            out_opt = it.next() orelse return die("--out requires a value\n");
         } else {
-            return die2("未知の引数です: {s}\n", .{arg});
+            return die2("unknown argument: {s}\n", .{arg});
         }
     }
 
@@ -58,11 +58,11 @@ pub fn main(init: std.process.Init) !void {
         if (init.environ_map.get("VP_HARNESS_LISTEN")) |pe| {
             const trimmed = std.mem.trim(u8, pe, " \t");
             if (trimmed.len > 0 and !std.mem.eql(u8, trimmed, "0")) {
-                break :blk std.fmt.parseInt(u16, trimmed, 10) catch return die("VP_HARNESS_LISTEN の値が不正です\n");
+                break :blk std.fmt.parseInt(u16, trimmed, 10) catch return die("VP_HARNESS_LISTEN value is invalid\n");
             }
         }
         if (init.environ_map.get("VP_HARNESS_PORT_FILE")) |pf| break :blk try readPortFile(io, gpa, pf);
-        return die("port が不明です（--port / --port-file / VP_HARNESS_LISTEN / VP_HARNESS_PORT_FILE のいずれかを指定）\n");
+        return die("port is unknown (set one of --port / --port-file / VP_HARNESS_LISTEN / VP_HARNESS_PORT_FILE)\n");
     };
 
     const out_arg = out_opt orelse blk: {
@@ -73,19 +73,19 @@ pub fn main(init: std.process.Init) !void {
     const out_abs = try absolutizeOutDir(io, gpa, out_arg);
 
     const caps_resp = sendRequest(io, gpa, port, "digest capabilities") catch |err| {
-        return die2("起動時の digest capabilities に失敗しました: {s}\n", .{@errorName(err)});
+        return die2("startup digest capabilities failed: {s}\n", .{@errorName(err)});
     };
     const caps_json = try extractCapabilitiesJson(caps_resp) orelse {
-        return die("digest capabilities の応答形式が不正です\n");
+        return die("digest capabilities response format is invalid\n");
     };
 
     const caps_val = json.parseFromSliceLeaky(json.Value, gpa, caps_json, .{}) catch {
-        return die("capabilities JSON のパースに失敗しました\n");
+        return die("failed to parse capabilities JSON\n");
     };
-    if (caps_val != .object) return die("capabilities JSON が object ではありません\n");
+    if (caps_val != .object) return die("capabilities JSON is not an object\n");
     if (caps_val.object.get("truncated")) |t| {
         if (t == .bool and t.bool) {
-            return die("capabilities が truncated=true です（不完全な tool list を出せません）。アプリ側の登録を減らすか buffer を見直してください\n");
+            return die("capabilities has truncated=true (cannot emit an incomplete tool list). Reduce app-side registrations or revisit the buffer\n");
         }
     }
 
@@ -106,28 +106,28 @@ pub fn main(init: std.process.Init) !void {
 
 fn readPortFile(io: std.Io, gpa: std.mem.Allocator, path: []const u8) !u16 {
     const data = std.Io.Dir.cwd().readFileAlloc(io, path, gpa, std.Io.Limit.limited(64)) catch |err| {
-        return die2("port file の読み込みに失敗しました {s}: {s}\n", .{ path, @errorName(err) });
+        return die2("failed to read port file {s}: {s}\n", .{ path, @errorName(err) });
     };
     const trimmed = std.mem.trim(u8, data, " \t\r\n");
-    return std.fmt.parseInt(u16, trimmed, 10) catch return die("port file の内容が不正です\n");
+    return std.fmt.parseInt(u16, trimmed, 10) catch return die("port file contents are invalid\n");
 }
 
 fn absolutizeOutDir(io: std.Io, gpa: std.mem.Allocator, out_arg: []const u8) ![]const u8 {
     std.Io.Dir.cwd().createDirPath(io, out_arg) catch |err| {
-        return die2("--out ディレクトリの作成に失敗しました {s}: {s}\n", .{ out_arg, @errorName(err) });
+        return die2("failed to create --out directory {s}: {s}\n", .{ out_arg, @errorName(err) });
     };
     var dir = std.Io.Dir.cwd().openDir(io, out_arg, .{}) catch |err| {
-        return die2("--out ディレクトリを開けません {s}: {s}\n", .{ out_arg, @errorName(err) });
+        return die2("cannot open --out directory {s}: {s}\n", .{ out_arg, @errorName(err) });
     };
     defer dir.close(io);
     var buf: [std.fs.max_path_bytes]u8 = undefined;
     const n = dir.realPath(io, &buf) catch |err| {
-        return die2("--out の絶対 path 解決に失敗しました: {s}\n", .{@errorName(err)});
+        return die2("failed to resolve absolute --out path: {s}\n", .{@errorName(err)});
     };
     return try gpa.dupe(u8, buf[0..n]);
 }
 
-/// harness wire は空白トークン分割するため、--out に空白は不可。
+/// harness wire splits on whitespace tokens, so --out must not contain spaces.
 fn validateOutArg(out_arg: []const u8) error{McpFailed}!void {
     if (std.mem.indexOfAny(u8, out_arg, " \t") != null) {
         return die("--out path must not contain whitespace (harness wire splits on spaces)\n");
@@ -149,7 +149,7 @@ fn warn(comptime fmt: []const u8, args: anytype) void {
 }
 
 // ---------------------------------------------------------------------------
-// TCP (drive と同型 + timeout)
+// TCP (same shape as drive, plus timeout)
 // ---------------------------------------------------------------------------
 
 const SendError = error{
@@ -163,8 +163,8 @@ const SendError = error{
 
 fn sendRequest(io: std.Io, gpa: std.mem.Allocator, port: u16, cmd: []const u8) SendError![]u8 {
     const addr = net.IpAddress{ .ip4 = net.Ip4Address.loopback(port) };
-    // Zig 0.16 Threaded: netConnectIpPosix は timeout≠.none で TODO panic。drive と同様 .none。
-    // 応答側は receiveTimeout で RESPONSE_TIMEOUT_S を課す（umbrella §5）。
+    // Zig 0.16 Threaded: netConnectIpPosix panics on timeout≠.none (TODO). Same `.none` as drive.
+    // The receive side applies RESPONSE_TIMEOUT_S via receiveTimeout.
     var stream = addr.connect(io, .{ .mode = .stream }) catch {
         return error.ConnectFailed;
     };
@@ -225,7 +225,7 @@ const ArgSpecInfo = struct {
     max: ?f64,
 };
 
-/// args_mode: .fallback = capabilities に args 無し / .typed = args 配列（空含む）
+/// args_mode: .fallback = no args in capabilities / .typed = args array (including empty)
 const ArgsMode = enum { fallback, typed };
 
 const Tool = struct {
@@ -297,7 +297,7 @@ fn buildToolTable(gpa: std.mem.Allocator, root: json.ObjectMap) !std.ArrayList(T
         const aname = name.string;
         const desc_raw = if (obj.get("desc")) |d| (if (d == .string) d.string else "") else "";
 
-        // args 3 態: フィールド無し / .null → fallback / .array → typed（他は skip）
+        // args three forms: field absent / .null → fallback / .array → typed (anything else: skip)
         const args_present = obj.get("args");
         if (args_present) |args_v| {
             if (args_v == .null) {
@@ -340,9 +340,9 @@ fn addFallbackAction(
     desc_raw: []const u8,
 ) !void {
     const schema = try fallbackInputSchema(gpa);
-    const legacy_note = "legacy raw argument syntax。書式は app のドキュメント参照";
+    const legacy_note = "legacy raw argument syntax; see the app docs for the format";
     const d = if (desc_raw.len > 0)
-        try std.fmt.allocPrint(gpa, "{s}（{s}）", .{ desc_raw, legacy_note })
+        try std.fmt.allocPrint(gpa, "{s} ({s})", .{ desc_raw, legacy_note })
     else
         legacy_note;
     try tryAddTool(gpa, tools, name_set, .{
@@ -393,7 +393,7 @@ fn tryAddTool(
     });
 }
 
-/// 衝突解決: 本命 → `p_`/`a_` 退避 → skip。不適合名も skip。
+/// Collision resolution: preferred name → `p_`/`a_` fallback → skip. Invalid names also skip.
 fn resolveToolName(
     gpa: std.mem.Allocator,
     name_set: *const std.StringArrayHashMapUnmanaged(void),
@@ -401,7 +401,7 @@ fn resolveToolName(
     probe_prefix: bool,
 ) error{ Skipped, OutOfMemory }![]const u8 {
     if (!isValidToolName(base)) {
-        warn("tool 名が MCP 規則に不適合のため skip: {s}\n", .{base});
+        warn("skipping tool name; does not match MCP rules: {s}\n", .{base});
         return error.Skipped;
     }
     if (name_set.get(base) == null) return try gpa.dupe(u8, base);
@@ -410,7 +410,7 @@ fn resolveToolName(
     else
         try std.fmt.allocPrint(gpa, "a_{s}", .{base});
     if (isValidToolName(alt) and name_set.get(alt) == null) return alt;
-    warn("tool 名衝突を解決できないため skip: {s}\n", .{base});
+    warn("skipping tool name; collision unresolved: {s}\n", .{base});
     return error.Skipped;
 }
 
@@ -533,7 +533,7 @@ fn kindToJsonSchema(gpa: std.mem.Allocator, s: ArgSpecInfo) !json.Value {
         for (s.values) |v| try vals.append(.{ .string = v });
         try obj.put(gpa, "enum", .{ .array = vals });
     } else {
-        // string | path | 未知 kind
+        // string | path | unknown kind
         try obj.put(gpa, "type", .{ .string = "string" });
         if (s.pattern.len > 0) try obj.put(gpa, "pattern", .{ .string = s.pattern });
     }
@@ -556,7 +556,7 @@ fn findTool(tools: []const Tool, name: []const u8) ?*const Tool {
 }
 
 // ---------------------------------------------------------------------------
-// Args → raw 直列化（umbrella v3 追補）
+// Args → raw serialization
 // ---------------------------------------------------------------------------
 
 const SerializeError = error{
@@ -582,17 +582,17 @@ fn serializeArguments(gpa: std.mem.Allocator, tool: *const Tool, arguments: json
 }
 
 fn serializeTypedArgs(gpa: std.mem.Allocator, specs: []const ArgSpecInfo, arguments: json.ObjectMap) SerializeError![]const u8 {
-    // optional は末尾からのみ省略可: 末尾連続 optional の省略境界を決める
+    // optional may be omitted only from the tail: find the omit boundary of trailing optionals
     var end: usize = specs.len;
     while (end > 0 and specs[end - 1].optional and arguments.get(specs[end - 1].name) == null) {
         end -= 1;
     }
-    // 歯抜け禁止: 残区間に無い required/optional が欠けるのは NG
+    // No holes: missing a required/optional that is still in the kept range is NG
     var i: usize = 0;
     while (i < end) : (i += 1) {
         if (arguments.get(specs[i].name) == null) return error.InvalidParams;
     }
-    // end 以降に値が来ていたら歯抜け（末尾以外の省略）
+    // A value after end means a hole (omission not at the tail)
     i = end;
     while (i < specs.len) : (i += 1) {
         if (arguments.get(specs[i].name) != null) return error.InvalidParams;
@@ -671,7 +671,7 @@ fn appendSerializedToken(
         try out.appendSlice(gpa, val.string);
         return;
     }
-    // string / path / 未知 kind
+    // string / path / unknown kind
     if (val != .string) return error.InvalidParams;
     const str = val.string;
     if (allow_spaces_in_path) {
@@ -691,7 +691,7 @@ fn floatToI64Checked(f: f64) SerializeError!i64 {
 }
 
 // ---------------------------------------------------------------------------
-// fail 行抽出（右端から code=/next=）
+// Extract the fail line (code=/next= from the right end)
 // ---------------------------------------------------------------------------
 
 const FailInfo = struct {
@@ -701,7 +701,7 @@ const FailInfo = struct {
     next: ?[]const u8,
 };
 
-/// `fail <name> <msg> [code=<c> next=<n>]` を右端限定で分解。行頭 `fail ` 前提。
+/// Parse `fail <name> <msg> [code=<c> next=<n>]` with right-end-only fields. Requires a leading `fail `.
 fn parseFailLine(line: []const u8) ?FailInfo {
     const prefix = "fail ";
     if (!std.mem.startsWith(u8, line, prefix)) return null;
@@ -715,7 +715,7 @@ fn parseFailLine(line: []const u8) ?FailInfo {
 
     var code: ?[]const u8 = null;
     var next: ?[]const u8 = null;
-    // 右から " code=" を探す
+    // Search from the right for " code="
     if (std.mem.lastIndexOf(u8, msg_part, " code=")) |code_at| {
         const after_code = msg_part[code_at + " code=".len ..];
         if (std.mem.indexOf(u8, after_code, " next=")) |next_at| {
@@ -723,7 +723,7 @@ fn parseFailLine(line: []const u8) ?FailInfo {
             next = after_code[next_at + " next=".len ..];
             msg_part = msg_part[0..code_at];
         }
-        // next= が無ければ code= も採用しない（全体を msg 透過）
+        // If next= is absent, do not take code= either (pass the whole remainder as msg)
     }
     return .{ .name = name, .message = msg_part, .code = code, .next = next };
 }
@@ -792,7 +792,7 @@ fn runStdioLoop(session: *Session) !void {
         const trimmed = std.mem.trimEnd(u8, line, "\r");
         if (trimmed.len == 0) continue;
 
-        // メッセージ毎 arena: parse / 応答 JSON / TCP 一時バッファはここで解放
+        // Per-message arena: parse / response JSON / TCP scratch freed here
         var msg_arena = std.heap.ArenaAllocator.init(session.gpa);
         defer msg_arena.deinit();
         const msg_gpa = msg_arena.allocator();
@@ -979,7 +979,7 @@ fn handleToolsCall(session: *Session, msg_gpa: std.mem.Allocator, id: json.Value
     return try toolResultResponse(msg_gpa, id, trimmed, false);
 }
 
-/// trim 後が空なら EmptyResponse。
+/// EmptyResponse when trim yields empty.
 fn nonemptyTrimmed(resp: []const u8) error{EmptyResponse}![]const u8 {
     const t = std.mem.trim(u8, resp, " \t\r\n");
     if (t.len == 0) return error.EmptyResponse;
@@ -1046,16 +1046,16 @@ fn errorResponse(gpa: std.mem.Allocator, id: json.Value, code: i64, message: []c
 
 fn stringifyMinified(gpa: std.mem.Allocator, value: json.Value) ![]const u8 {
     const bytes = try json.Stringify.valueAlloc(gpa, value, .{ .whitespace = .minified });
-    // minified は改行を出さない（contract テストで応答側も検証）
+    // minified emits no newlines (contract tests also check the response side)
     std.debug.assert(std.mem.indexOfScalar(u8, bytes, '\n') == null);
     return bytes;
 }
 
 // ---------------------------------------------------------------------------
-// Tests（純関数）
+// Tests (pure functions)
 // ---------------------------------------------------------------------------
 
-test "tool name: MCP 規則" {
+test "tool name: MCP rules" {
     try testing.expect(isValidToolName("digest_canvas"));
     try testing.expect(isValidToolName("a_digest_canvas"));
     try testing.expect(isValidToolName("A-z_09"));
@@ -1068,7 +1068,7 @@ test "tool name: MCP 規則" {
     try testing.expect(isValidToolName(&ok64));
 }
 
-test "衝突解決: action が probe 由来名と衝突 → a_ 退避" {
+test "collision: action colliding with probe-derived name → a_ fallback" {
     var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena_state.deinit();
     const gpa = arena_state.allocator();
@@ -1090,7 +1090,7 @@ test "衝突解決: action が probe 由来名と衝突 → a_ 退避" {
     try testing.expect(findTool(tools.items, "digest_canvas").?.kind == .digest);
 }
 
-test "schema 変換: int/float/bool/enum/string/variadic/optional" {
+test "schema convert: int/float/bool/enum/string/variadic/optional" {
     var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena_state.deinit();
     const gpa = arena_state.allocator();
@@ -1110,11 +1110,11 @@ test "schema 変換: int/float/bool/enum/string/variadic/optional" {
     try testing.expectEqualStrings("number", props.get("x").?.object.get("type").?.string);
     try testing.expectEqualStrings("#?RRGGBB", props.get("color").?.object.get("pattern").?.string);
     const req = schema.object.get("required").?.array.items;
-    // tool は optional → required に無い
+    // tool treats optional as absent from required
     for (req) |r| try testing.expect(!std.mem.eql(u8, r.string, "tool"));
 }
 
-test "schema 変換: args 無し → fallback / args:null → fallback / args:[] → empty properties" {
+test "schema convert: no args → fallback / args:null → fallback / args:[] → empty properties" {
     var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena_state.deinit();
     const gpa = arena_state.allocator();
@@ -1147,7 +1147,7 @@ test "schema 変換: args 無し → fallback / args:null → fallback / args:[]
     try testing.expectEqual(@as(usize, 0), tools2.items[0].input_schema.object.get("properties").?.object.count());
 }
 
-test "直列化: 宣言順・variadic flatten・bool 0/1・optional 末尾のみ" {
+test "serialize: declaration order, variadic flatten, bool 0/1, optional tail-only" {
     var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena_state.deinit();
     const gpa = arena_state.allocator();
@@ -1158,7 +1158,7 @@ test "直列化: 宣言順・variadic flatten・bool 0/1・optional 末尾のみ
         .{ .name = "label", .kind = "string", .optional = true, .variadic = false, .values = &.{}, .pattern = "", .desc = "", .min = null, .max = null },
     };
     var args: json.ObjectMap = .empty;
-    // キー順をわざと逆に挿入
+    // Insert keys in reverse order on purpose
     try args.put(gpa, "visible", .{ .bool = true });
     var pts = json.Array.init(gpa);
     try pts.append(.{ .integer = 30 });
@@ -1180,14 +1180,14 @@ test "直列化: 宣言順・variadic flatten・bool 0/1・optional 末尾のみ
     const raw = try serializeArguments(gpa, &tool, args);
     try testing.expectEqualStrings("30 40 50 60 1", raw);
 
-    // label 省略 OK
-    // 歯抜け: visible 無し・label 有り → NG
+    // label may be omitted
+    // hole: no visible, but label present → NG
     var bad: json.ObjectMap = .empty;
     try bad.put(gpa, "points", .{ .array = pts });
     try bad.put(gpa, "label", .{ .string = "x" });
     try testing.expectError(error.InvalidParams, serializeArguments(gpa, &tool, bad));
 
-    // string に空白 → NG
+    // whitespace in string → NG
     var sp: json.ObjectMap = .empty;
     try sp.put(gpa, "points", .{ .array = pts });
     try sp.put(gpa, "visible", .{ .bool = false });
@@ -1195,7 +1195,7 @@ test "直列化: 宣言順・variadic flatten・bool 0/1・optional 末尾のみ
     try testing.expectError(error.InvalidParams, serializeArguments(gpa, &tool, sp));
 }
 
-test "直列化: path 最終引数は空白可・; 改行は reject / fallback args" {
+test "serialize: final path arg may contain spaces; ; and newline rejected / fallback args" {
     var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena_state.deinit();
     const gpa = arena_state.allocator();
@@ -1239,7 +1239,7 @@ test "直列化: path 最終引数は空白可・; 改行は reject / fallback a
     try testing.expectError(error.InvalidParams, serializeArguments(gpa, &fb, fa2));
 }
 
-test "fail 行: 右端 code=/next= 抽出 / 無ければ透過" {
+test "fail line: extract right-end code=/next= / else pass through" {
     const a = parseFailLine("fail boom Boom code=file_not_found next=check path or use save first").?;
     try testing.expectEqualStrings("boom", a.name);
     try testing.expectEqualStrings("Boom", a.message);
@@ -1252,19 +1252,19 @@ test "fail 行: 右端 code=/next= 抽出 / 無ければ透過" {
     try testing.expect(b.code == null);
     try testing.expect(b.next == null);
 
-    // code= のみ（next= 無し）→ 全体を msg 透過
+    // code= only (no next=) → pass the whole remainder as msg
     const c = parseFailLine("fail x msg code=only").?;
     try testing.expectEqualStrings("msg code=only", c.message);
     try testing.expect(c.code == null);
 
-    // message 内に code= っぽい文字があっても右端の " code=" + " next=" ペアのみ
+    // Even if the message looks like it contains code=, only the right-end " code=" + " next=" pair counts
     const d = parseFailLine("fail x see code=fake stuff code=real next=go").?;
     try testing.expectEqualStrings("see code=fake stuff", d.message);
     try testing.expectEqualStrings("real", d.code.?);
     try testing.expectEqualStrings("go", d.next.?);
 }
 
-test "fail text 固定複数行形式" {
+test "fail text fixed multi-line form" {
     var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena_state.deinit();
     const gpa = arena_state.allocator();
@@ -1296,7 +1296,7 @@ test "contract: initialize / version / gate / unknown / parse / minified" {
     const gpa = arena_state.allocator();
 
     var session: Session = .{
-        .io = undefined, // tools/call しない
+        .io = undefined, // do not tools/call
         .gpa = gpa,
         .port = 0,
         .out_abs = "/tmp",
@@ -1305,7 +1305,7 @@ test "contract: initialize / version / gate / unknown / parse / minified" {
         .phase = .need_initialize,
     };
 
-    // initialize 前の tools/list → error
+    // tools/list before initialize → error
     {
         const r = (try handleLine(&session, gpa, "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/list\"}")).?;
         try testing.expect(std.mem.indexOf(u8, r, "-32602") != null);
@@ -1329,20 +1329,20 @@ test "contract: initialize / version / gate / unknown / parse / minified" {
         try testing.expect(std.mem.indexOf(u8, r, "\n") == null);
     }
 
-    // initialized 前の tools/list
+    // tools/list before initialized
     {
         const r = (try handleLine(&session, gpa, "{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"tools/list\"}")).?;
         try testing.expect(std.mem.indexOf(u8, r, "-32602") != null);
     }
 
-    // notification: 無応答
+    // notification: no response
     {
         const r = try handleLine(&session, gpa, "{\"jsonrpc\":\"2.0\",\"method\":\"notifications/initialized\"}");
         try testing.expect(r == null);
         try testing.expect(session.phase == .ready);
     }
 
-    // 二重 initialize
+    // double initialize
     {
         const r = (try handleLine(&session, gpa, "{\"jsonrpc\":\"2.0\",\"id\":3,\"method\":\"initialize\",\"params\":{\"protocolVersion\":\"2025-06-18\"}}")).?;
         try testing.expect(std.mem.indexOf(u8, r, "-32602") != null);
@@ -1361,14 +1361,14 @@ test "contract: initialize / version / gate / unknown / parse / minified" {
         try testing.expect(std.mem.indexOf(u8, r, "-32700") != null);
     }
 
-    // id が文字列でも echo
+    // echo string ids too
     {
         const r = (try handleLine(&session, gpa, "{\"jsonrpc\":\"2.0\",\"id\":\"abc\",\"method\":\"ping\"}")).?;
         try testing.expect(std.mem.indexOf(u8, r, "\"id\":\"abc\"") != null);
     }
 }
 
-test "contract: initialize params 欠落・null・非 object・version 必須" {
+test "contract: initialize params missing/null/non-object/version required" {
     var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena_state.deinit();
     const gpa = arena_state.allocator();
@@ -1383,7 +1383,7 @@ test "contract: initialize params 欠落・null・非 object・version 必須" {
         .phase = .need_initialize,
     };
 
-    // params 欠落
+    // missing params
     {
         const r = (try handleLine(&session, gpa, "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\"}")).?;
         try testing.expect(std.mem.indexOf(u8, r, "-32602") != null);
@@ -1394,25 +1394,25 @@ test "contract: initialize params 欠落・null・非 object・version 必須" {
         const r = (try handleLine(&session, gpa, "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":null}")).?;
         try testing.expect(std.mem.indexOf(u8, r, "-32602") != null);
     }
-    // params: 非 object
+    // params: not an object
     {
         const r = (try handleLine(&session, gpa, "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":[]}")).?;
         try testing.expect(std.mem.indexOf(u8, r, "-32602") != null);
     }
-    // protocolVersion 欠落
+    // missing protocolVersion
     {
         const r = (try handleLine(&session, gpa, "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{\"capabilities\":{}}}")).?;
         try testing.expect(std.mem.indexOf(u8, r, "-32602") != null);
         try testing.expect(std.mem.indexOf(u8, r, "protocolVersion") != null);
     }
-    // protocolVersion が非 string
+    // protocolVersion is not a string
     {
         const r = (try handleLine(&session, gpa, "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{\"protocolVersion\":1}}")).?;
         try testing.expect(std.mem.indexOf(u8, r, "-32602") != null);
     }
 }
 
-test "空 TCP 応答 → EmptyResponse / firstLineOf" {
+test "empty TCP response → EmptyResponse / firstLineOf" {
     try testing.expectError(error.EmptyResponse, nonemptyTrimmed(""));
     try testing.expectError(error.EmptyResponse, nonemptyTrimmed("   \n\r\t  "));
     const t = try nonemptyTrimmed("  hello\nworld  ");
@@ -1421,7 +1421,7 @@ test "空 TCP 応答 → EmptyResponse / firstLineOf" {
     try testing.expectEqualStrings("/tmp/a.png", firstLineOf("/tmp/a.png\nextra"));
 }
 
-test "直列化: 範囲外 float→int / enum 外値 → InvalidParams" {
+test "serialize: out-of-range float→int / enum out of set → InvalidParams" {
     var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena_state.deinit();
     const gpa = arena_state.allocator();
@@ -1469,13 +1469,13 @@ test "直列化: 範囲外 float→int / enum 外値 → InvalidParams" {
     try testing.expectError(error.InvalidParams, serializeArguments(gpa, &itool, huge));
 }
 
-test "--out 空白 path は起動エラー" {
+test "--out path with whitespace is a startup error" {
     try testing.expectError(error.McpFailed, validateOutArg("/tmp/has space"));
     try testing.expectError(error.McpFailed, validateOutArg("/tmp/has\ttab"));
     try validateOutArg("/tmp/vp-mcp-ok");
 }
 
-test "min/max JSON .integer/.float 両対応" {
+test "min/max JSON accepts both .integer and .float" {
     var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena_state.deinit();
     const gpa = arena_state.allocator();
@@ -1494,7 +1494,7 @@ test "min/max JSON .integer/.float 両対応" {
     try testing.expectEqual(@as(f64, 1.5), specs2[0].max.?);
 }
 
-test "truncated capabilities 検出（起動失敗用の判定）" {
+test "truncated capabilities detection (startup-failure guard)" {
     var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena_state.deinit();
     const gpa = arena_state.allocator();
@@ -1504,7 +1504,7 @@ test "truncated capabilities 検出（起動失敗用の判定）" {
     try testing.expect(v.object.get("truncated").?.bool);
 }
 
-test "probe 両 flag false → tool 生成しない / digest+snapshot 両方" {
+test "probe both flags false → no tool / both digest+snapshot" {
     var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena_state.deinit();
     const gpa = arena_state.allocator();

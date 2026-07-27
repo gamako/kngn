@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# TASK-121.4 live harness E2E: 7 scenarios + expect.
-# 座標は digest layout から導出（固定座標禁止）。port は 9230〜9239 のみ。
+# live harness E2E: 7 scenarios + expect.
+# Derive coordinates from digest layout (no hard-coded coords). Ports 9230–9239 only.
 set -euo pipefail
 
 SCRIPT_DIR=$(cd "$(dirname "$0")" && pwd)
@@ -10,7 +10,7 @@ E2E_PORT="${E2E_PORT:-9230}"
 E2E_WIDTH="${E2E_WIDTH:-1024}"
 E2E_HEIGHT="${E2E_HEIGHT:-768}"
 E2E_TIMEOUT_SEC="${E2E_TIMEOUT_SEC:-60}"
-VP_HARNESS_OUT="${VP_HARNESS_OUT:-$(mktemp -d /tmp/vp-task-121.4.XXXXXX)}"
+VP_HARNESS_OUT="${VP_HARNESS_OUT:-$(mktemp -d /tmp/vp-list-menu.XXXXXX)}"
 PORT_FILE="$VP_HARNESS_OUT/harness.port"
 LOG="$VP_HARNESS_OUT/e2e.log"
 DRIVE="$ROOT/scripts/drive"
@@ -336,8 +336,8 @@ right_click_xy "$cx" "$cy"
 drive "step 1" >>"$LOG" 2>&1
 STATE1=$(digest_state)
 log "[e2e] scenario7 after right-click: $STATE1"
-# 観測値を固定（2026-07-18）: menuBar が open_title=File の間 popup を再確保するため
-# 右クリック後も popup=menu / menu=File / popup_count=1。context は同時保持されない。
+# Baked observation (2026-07-18): while menuBar keeps open_title=File it re-acquires the popup, so
+# after right-click still popup=menu / menu=File / popup_count=1. context is not held at the same time.
 expect_state "popup_count=1"
 expect_state "menu=File"
 expect_state "popup=menu"

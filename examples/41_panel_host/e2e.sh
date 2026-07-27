@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# TASK-147 PanelHost E2E: replay + live（splitter drag 含む）
+# PanelHost E2E: replay + live (includes splitter drag)
 set -euo pipefail
 
 SCRIPT_DIR=$(cd "$(dirname "$0")" && pwd)
@@ -152,7 +152,7 @@ cp -f "$(ls -1t "$LIVE_OUT"/*.png | head -1)" /tmp/t147-live-right-hidden.png
 log "[e2e] scenario 2 PASS → /tmp/t147-live-right-hidden.png"
 
 log "[e2e] === scenario 3: toggle_panel inspector ==="
-# right を戻してから inspector を隠す
+# Restore right, then hide inspector
 drive "action toggle_slot right; step 2; action toggle_panel Inspector; step 2" >>"$LOG" 2>&1
 expect_state "inspector_visible=0"
 drive "snapshot fb" >>"$LOG" 2>&1
@@ -180,7 +180,7 @@ read -r sx sy sw sh <<<"$(layout_rect split_right "$LAYOUT")"
 read -r cx cy <<<"$(rect_center "$sx" "$sy" "$sw" "$sh")"
 BEFORE=$(parse_kv right_extent "$(drive "digest state" | tee -a "$LOG" | tail -n 1)")
 log "[e2e] splitter at $cx,$cy extent_before=$BEFORE"
-# drag left 60px → right extent が増える（invert）
+# drag left 60px → right extent grows (invert)
 drive "inject mouse_move $cx $cy; step 1; inject mouse_down left; step 1; inject mouse_move $((cx - 60)) $cy; step 2; inject mouse_up left; step 2" >>"$LOG" 2>&1
 AFTER=$(parse_kv right_extent "$(drive "digest state" | tee -a "$LOG" | tail -n 1)")
 log "[e2e] extent_after=$AFTER"

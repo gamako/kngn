@@ -1,29 +1,29 @@
-//! drive: ヘッドレス検証 harness の listen トランスポート（TCP loopback）driver CLI（TASK-32.2 / TASK-164）。
+//! drive: CLI driver for the headless harness listen transport (TCP loopback).
 //!
-//! 背景起動したアプリ（`VP_HARNESS_LISTEN[=port]` で listen 中）へ、1接続=1リクエスト
-//! =1レスポンスでコマンドを投げる。状態はアプリプロセス側に残る（接続は使い捨て）。
+//! Send one request and get one response against a background app listening on
+//! `VP_HARNESS_LISTEN[=port]`. State lives in the app process (connections are disposable).
 //!
-//! 使い方:
+//! Usage:
 //!   drive --port 54321 'inject key_down A; step 3; digest fb'
 //!   drive --port-file /tmp/vp.port 'step 1; digest fb'
-//!   （--port / --port-file 省略時は env VP_HARNESS_LISTEN（正の port）/ VP_HARNESS_PORT_FILE を参照）
+//!   (when --port / --port-file are omitted, read env VP_HARNESS_LISTEN (positive port) / VP_HARNESS_PORT_FILE)
 //!
-//! コマンド文字列は残り引数を空白連結したもの。harness 側は `;` / 改行で複数コマンドに分割する。
-//! 送信後に write 側を half-close し、レスポンス（digest テキスト / snapshot パス）を stdout に出して終了する。
+//! The command string is the remaining args joined with spaces. The harness splits on `;` / newlines into multiple commands.
+//! After send, half-close the write side and print the response (digest text / snapshot path) to stdout, then exit.
 //!
-//! 純 std + `std.Io.net` のみ（platform/audio 非依存）。mac/Linux/Windows で同一コード。
+//! Pure std + `std.Io.net` only (no platform/audio dependency). Same code on mac/Linux/Windows.
 
 const std = @import("std");
 const net = std.Io.net;
 
 pub fn main(init: std.process.Init) !void {
     const io = init.io;
-    // 短命 CLI なので arena を使う（全 alloc はプロセス終了時に一括解放。手動 free / leak 報告なし）。
+    // Short-lived CLI: use an arena (all allocs freed at process exit; no manual free / leak report).
     const gpa = init.arena.allocator();
 
     var it = try std.process.Args.Iterator.initAllocator(init.minimal.args, gpa);
     defer it.deinit();
-    _ = it.next(); // program 名
+    _ = it.next(); // program name
 
     var port_opt: ?u16 = null;
     var port_file: ?[]const u8 = null;
@@ -31,34 +31,34 @@ pub fn main(init: std.process.Init) !void {
 
     while (it.next()) |arg| {
         if (std.mem.eql(u8, arg, "--port")) {
-            const v = it.next() orelse return die("--port は値が必要です\n");
-            port_opt = std.fmt.parseInt(u16, v, 10) catch return die("--port の値が不正です\n");
+            const v = it.next() orelse return die("--port requires a value\n");
+            port_opt = std.fmt.parseInt(u16, v, 10) catch return die("--port value is invalid\n");
         } else if (std.mem.eql(u8, arg, "--port-file")) {
-            port_file = it.next() orelse return die("--port-file は値が必要です\n");
+            port_file = it.next() orelse return die("--port-file requires a value\n");
         } else {
             if (cmd.items.len > 0) try cmd.append(gpa, ' ');
             try cmd.appendSlice(gpa, arg);
         }
     }
-    if (cmd.items.len == 0) return die("コマンド文字列がありません（例: drive --port-file /tmp/vp.port 'step 1; digest fb'）\n");
+    if (cmd.items.len == 0) return die("missing command string (example: drive --port-file /tmp/vp.port 'step 1; digest fb')\n");
 
-    // port 解決: --port > --port-file > env VP_HARNESS_LISTEN（正の値）> env VP_HARNESS_PORT_FILE
+    // port resolution: --port > --port-file > env VP_HARNESS_LISTEN (positive) > env VP_HARNESS_PORT_FILE
     const port: u16 = port_opt orelse blk: {
         if (port_file) |pf| break :blk try readPortFile(io, gpa, pf);
         if (init.environ_map.get("VP_HARNESS_LISTEN")) |pe| {
             const trimmed = std.mem.trim(u8, pe, " \t");
             if (trimmed.len > 0 and !std.mem.eql(u8, trimmed, "0")) {
-                break :blk std.fmt.parseInt(u16, trimmed, 10) catch return die("VP_HARNESS_LISTEN の値が不正です\n");
+                break :blk std.fmt.parseInt(u16, trimmed, 10) catch return die("VP_HARNESS_LISTEN value is invalid\n");
             }
         }
         if (init.environ_map.get("VP_HARNESS_PORT_FILE")) |pf| break :blk try readPortFile(io, gpa, pf);
-        return die("port が不明です（--port / --port-file / VP_HARNESS_LISTEN / VP_HARNESS_PORT_FILE のいずれかを指定）\n");
+        return die("port is unknown (set one of --port / --port-file / VP_HARNESS_LISTEN / VP_HARNESS_PORT_FILE)\n");
     };
 
-    // 接続 → 送信 → write half-close → レスポンス受信 → stdout
+    // connect → send → write half-close → receive response → stdout
     const addr = net.IpAddress{ .ip4 = net.Ip4Address.loopback(port) };
     var stream = addr.connect(io, .{ .mode = .stream }) catch |err| {
-        return die2("127.0.0.1 への接続に失敗しました: {s}\n", .{@errorName(err)});
+        return die2("failed to connect to 127.0.0.1: {s}\n", .{@errorName(err)});
     };
     defer stream.close(io);
 
@@ -68,12 +68,12 @@ pub fn main(init: std.process.Init) !void {
         try writer.interface.writeAll(cmd.items);
         try writer.interface.flush();
     }
-    stream.shutdown(io, .send) catch {}; // EOF を相手に伝える（harness はここまで読む）
+    stream.shutdown(io, .send) catch {}; // Tell the peer EOF (the harness reads until here)
 
     var rbuf: [4096]u8 = undefined;
     var reader = stream.reader(io, &rbuf);
     const resp = reader.interface.allocRemaining(gpa, std.Io.Limit.limited(1 << 20)) catch |err| {
-        return die2("レスポンス受信に失敗しました: {s}\n", .{@errorName(err)});
+        return die2("failed to receive response: {s}\n", .{@errorName(err)});
     };
 
     var obuf: [4096]u8 = undefined;
@@ -81,16 +81,16 @@ pub fn main(init: std.process.Init) !void {
     try stdout.interface.writeAll(resp);
     try stdout.interface.flush();
 
-    // expect/assert の合否伝播（TASK-78）: レスポンス**各行**を走査し、いずれかが `fail ` で始まれば
-    // drive 自身も非0 exit する（agent の自律反復に有効）。stdout への透過は上で完了済み。
-    // 検知は `fail ` 行頭のみ（harness の warnLine 由来 `error:` 等の benign warning は非0化しない=誤検知回避）。
-    // 複数コマンドを1リクエストに入れた場合の 2 行目以降の `fail ` も拾う（全体 startsWith ではなく line scan）。
-    // アサーション失敗は drive のバグではないので、`return error`（Zig のスタックトレースが出る）ではなく
-    // 簡潔な stderr 1行 + `exit(1)` にする（stdout は透過済み・後続は無いので defer close 省略は許容）。
+    // expect/assert outcome propagation: scan **each line** of the response; if any starts with `fail `,
+    // drive itself exits non-zero (useful for agent self-loops). stdout passthrough already finished above.
+    // Detect only a leading `fail ` (do not treat harness warnLine `error:` and other benign warnings as failure).
+    // Also catch `fail ` on line 2+ when multiple commands share one request (line scan, not whole-buffer startsWith).
+    // Assertion failure is not a drive bug, so prefer a single stderr line + `exit(1)` over `return error`
+    // (which would print a Zig stack trace). stdout is already passed through; omitting defer close is fine with no further work.
     var lines = std.mem.splitScalar(u8, resp, '\n');
     while (lines.next()) |ln| {
         if (std.mem.startsWith(u8, ln, "fail ")) {
-            std.debug.print("drive: expect/assert に失敗があります（非0 exit）\n", .{});
+            std.debug.print("drive: expect/assert failed (non-zero exit)\n", .{});
             std.process.exit(1);
         }
     }
@@ -98,10 +98,10 @@ pub fn main(init: std.process.Init) !void {
 
 fn readPortFile(io: std.Io, gpa: std.mem.Allocator, path: []const u8) !u16 {
     const data = std.Io.Dir.cwd().readFileAlloc(io, path, gpa, std.Io.Limit.limited(64)) catch |err| {
-        return die2("port file の読み込みに失敗しました {s}: {s}\n", .{ path, @errorName(err) });
+        return die2("failed to read port file {s}: {s}\n", .{ path, @errorName(err) });
     };
     const trimmed = std.mem.trim(u8, data, " \t\r\n");
-    return std.fmt.parseInt(u16, trimmed, 10) catch return die("port file の内容が不正です\n");
+    return std.fmt.parseInt(u16, trimmed, 10) catch return die("port file contents are invalid\n");
 }
 
 fn die(msg: []const u8) error{DriveFailed} {

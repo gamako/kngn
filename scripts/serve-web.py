@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Static file server with COOP/COEP for SharedArrayBuffer (TASK-73.2).
+"""Static file server with COOP/COEP for SharedArrayBuffer.
 
 Usage:
   python3 scripts/serve-web.py [dir] [port]

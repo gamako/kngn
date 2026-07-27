@@ -1,15 +1,15 @@
-// video-proto AudioWorkletProcessor（TASK-73.2）
-// main と同じ WebAssembly.Module + SharedArrayBuffer Memory で 2 つ目の Instance を同期生成し、
-// process() から vp_audio_render を push 駆動する。
+// video-proto AudioWorkletProcessor
+// Synchronously create a 2nd Instance from the same WebAssembly.Module + SharedArrayBuffer Memory as main,
+// and push-drive vp_audio_render from process().
 //
-// stack: main が shared memory 内に確保した worklet 専用 stack の top を
-//        exports.__stack_pointer にセット（PoC a で確認済み）。
-// data: shared memory ビルドは passive data segment + DataCount（バイナリ解析確認済み）。
-//       2nd instantiate は data を能動再適用しない。加えて sentinel 実行時検証。
+// stack: take the top of the worklet-only stack that main reserved in shared memory
+//        and set it on exports.__stack_pointer.
+// data: shared-memory builds use passive data segments + DataCount (confirmed by binary analysis).
+//       2nd instantiate does not actively re-apply data. Plus a runtime sentinel check.
 //
-// boot 時（g_state 未設定）の instantiate は安全: process は running ゲート内でしか g_state を読まない。
+// instantiate at boot (g_state unset) is safe: process only reads g_state inside the running gate.
 
-const SENTINEL_MAGIC = 0x56504153; // 'VPAS' — audio_web.zig と一致
+const SENTINEL_MAGIC = 0x56504153; // 'VPAS' — must match audio_web.zig
 
 class VpAudioProcessor extends AudioWorkletProcessor {
   /**
@@ -31,7 +31,7 @@ class VpAudioProcessor extends AudioWorkletProcessor {
     this._render = null;
     this._outPtr = 0;
     this._errLogged = false;
-    // RT GC 圧回避: Float32Array view をキャッシュ（buffer identity / ptr / len 変化時のみ再生成）
+    // Avoid RT GC pressure: cache the Float32Array view (rebuild only when buffer identity / ptr / len change)
     this._f32View = null;
     this._f32Buf = null;
     this._f32Ptr = 0;
@@ -41,8 +41,8 @@ class VpAudioProcessor extends AudioWorkletProcessor {
       if (!opts.module || !opts.memory) {
         throw new Error("vp-worklet: missing module/memory");
       }
-      // worklet 側は audio 経路の env だけあればよい（present/log は呼ばない）。
-      // wasi は stdlib が触る可能性があるので no-op 相当の最小面を渡す。
+      // The worklet only needs the audio-path env (it never calls present/log).
+      // wasi may be touched by stdlib, so pass a minimal no-op surface.
       const imports = {
         env: {
           memory: opts.memory,
@@ -61,13 +61,13 @@ class VpAudioProcessor extends AudioWorkletProcessor {
       const instance = new WebAssembly.Instance(opts.module, imports);
       const exp = instance.exports;
 
-      // (a) stack pointer を main が確保した専用領域の top へ
+      // (a) point the stack pointer at the top of the region main reserved
       const stackTop = opts.stackTop | 0;
       if (stackTop > 0 && exp.__stack_pointer) {
         exp.__stack_pointer.value = stackTop;
       }
 
-      // 実行時 sentinel: main が set した magic が 2nd Instance 後も共有 memory 上に残っているか
+      // Runtime sentinel: confirm the magic main set is still on shared memory after the 2nd Instance
       if (typeof exp.vp_audio_check_sentinel !== "function") {
         throw new Error("vp-worklet: missing vp_audio_check_sentinel");
       }
@@ -93,7 +93,7 @@ class VpAudioProcessor extends AudioWorkletProcessor {
       this._ready = true;
       this.port.postMessage({ type: "ready", sentinel: got });
     } catch (e) {
-      // process では throw しない（audio グラフ切断を避ける）。boot 側が await する。
+      // Do not throw from process (avoids tearing down the audio graph). boot awaits the result.
       this.port.postMessage({
         type: "error",
         message: String(e && e.message ? e.message : e),
@@ -140,7 +140,7 @@ class VpAudioProcessor extends AudioWorkletProcessor {
 
     const channels = Math.min(this._channels, output.length, 2);
     try {
-      // 戻り値 0 = skipped（start 前 / frames 過大等）→ 古い scratch を出さず無音
+      // Return 0 = skipped (before start / frames too large, etc.) → silence, do not emit stale scratch
       const ok = this._render(this._outPtr, frames, channels, this._sampleRate | 0);
       if (!ok) {
         for (let c = 0; c < output.length; c++) output[c].fill(0);

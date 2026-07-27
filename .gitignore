@@ -15,5 +15,5 @@ zig-out/
 libs/png/test-data/
 .claude/.tmp/
 
-# wrangler local auth/deploy cache (TASK-73.4)
+# wrangler local auth/deploy cache
 .wrangler/

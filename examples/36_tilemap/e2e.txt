@@ -1,19 +1,19 @@
-# TASK-111.5 E2E: tilemap draw + solid resolve（決定論 CRC 焼き込み）
-# 前提: 640×360 / 固定マップ / FixedTimeStep 60Hz / harness 仮想クロック
-# CRC の正は aarch64-darwin 採取値。他 platform で divergence 時は再採取。
-# 実行例:
+# E2E: tilemap draw + solid resolve (deterministic CRC baked in)
+# Preconditions: 640×360 / fixed map / FixedTimeStep 60Hz / harness virtual clock
+# CRC oracle is the aarch64-darwin capture. Re-capture on other platforms if it diverges.
+# Example run:
 #   TMPD=$(mktemp -d)
 #   VP_HEADLESS=1 VP_HARNESS_SCRIPT=examples/36_tilemap/e2e.txt \
 #     VP_HARNESS_OUT=$TMPD zig build run-example_36
-# snapshot は path 省略 → $VP_HARNESS_OUT/frame_<n>.png（repo に PNG を残さない）
+# snapshot with path omitted → $VP_HARNESS_OUT/frame_<n>.png (do not leave PNGs in the repo)
 
-# --- 1. 初期状態（空中から落下開始） ---
+# --- 1. Initial state (falling from air) ---
 step 1
 snapshot fb
 digest fb
 expect fb crc=190FDDC2
 
-# --- 2. RIGHT で横移動 ---
+# --- 2. Move sideways with RIGHT ---
 inject key_down RIGHT
 step 40
 inject key_up RIGHT
@@ -21,13 +21,13 @@ snapshot fb
 digest fb
 expect fb crc=038E6ED4
 
-# --- 3. キー離して重力落下・着地 ---
+# --- 3. Release key: gravity fall and land ---
 step 50
 snapshot fb
 digest fb
 expect fb crc=DACCE791
 
-# --- 4. LEFT で反対方向へ移動 ---
+# --- 4. Move the other way with LEFT ---
 inject key_down LEFT
 step 50
 inject key_up LEFT
@@ -35,7 +35,7 @@ snapshot fb
 digest fb
 expect fb crc=0B01C9D9
 
-# --- 5. 段差方向へ移動して着地安定 ---
+# --- 5. Move toward the ledge and settle on land ---
 inject key_down RIGHT
 step 80
 inject key_up RIGHT

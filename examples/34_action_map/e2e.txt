@@ -1,10 +1,10 @@
-# TASK-111.8 E2E: ActionMap keyboard + gamepad + rebind
-# float 値は probe 実装後に実測焼き込み（手計算と一致確認済み）。
-# 実行例:
+# E2E: ActionMap keyboard + gamepad + rebind
+# Float values are measured and baked after the probe landed (matches hand calculation).
+# Example run:
 #   TMPD=$(mktemp -d)
 #   VP_HEADLESS=1 VP_HARNESS_SCRIPT=examples/34_action_map/e2e.txt \
 #     VP_HARNESS_OUT=$TMPD zig build run-example_34
-# snapshot は path 省略 → $VP_HARNESS_OUT/frame_<n>.png
+# snapshot with path omitted → $VP_HARNESS_OUT/frame_<n>.png
 
 step 1
 snapshot fb

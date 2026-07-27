@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
-# TASK-163: netsync 中の history サムネイル（self/peer 双方 thumb=true, bbox!=null）+ solo 回帰。
+# History thumbnails during netsync (self/peer both thumb=true, bbox!=null) + solo regression.
 set -euo pipefail
 
 ROOT=$(cd "$(dirname "$0")/../.." && pwd)
 MAIN="${VP_MAIN_DIR:-$ROOT}"
 DRIVE="$ROOT/scripts/drive"
-E2E="$ROOT/.e2e/task-163"
+E2E="$ROOT/.e2e/netsync-history-thumb"
 NETSYNC_PORT=9211
 HOST_PORT="$E2E/host.port"
 CLIENT_PORT="$E2E/client.port"
@@ -124,7 +124,7 @@ assert_stroke_thumb() {
 }
 
 # ---------------------------------------------------------------------------
-log "=== TASK-163 solo regression ==="
+log "=== solo regression ==="
 solo_pid=$(start_pixie "$SOLO_PORT" "$SOLO_OUT")
 wait_port "$SOLO_PORT" "$solo_pid"
 drive_s 'step 2; action set_tool pen; action set_color 00FF00; action stroke 5 5 40 5; step 2' >/dev/null
@@ -171,7 +171,7 @@ quit_pid "$SOLO_PORT" "$solo_pid"
 solo_pid=""
 
 # ---------------------------------------------------------------------------
-log "=== TASK-163 netsync history thumb E2E ==="
+log "=== netsync history thumb E2E ==="
 host_pid=$(start_pixie "$HOST_PORT" "$HOST_OUT" VP_NETSYNC_HOST=1 VP_NETSYNC_PORT="$NETSYNC_PORT")
 wait_port "$HOST_PORT" "$host_pid"
 client_pid=$(start_pixie "$CLIENT_PORT" "$CLIENT_OUT" VP_NETSYNC_CONNECT=127.0.0.1:"$NETSYNC_PORT")
@@ -215,4 +215,4 @@ assert_stroke_thumb "$client_json" 1 "client-view self(client)"
   echo "peer_thumb=yes"
 } >"$E2E/result.txt"
 
-log "PASS: TASK-163 history thumbs self+peer on host and client"
+log "PASS: history thumbs self+peer on host and client"

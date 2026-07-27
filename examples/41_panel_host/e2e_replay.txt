@@ -1,4 +1,4 @@
-# TASK-147 PanelHost replay E2E
+# PanelHost replay E2E
 step 3
 digest state
 expect state left_visible=1
@@ -21,7 +21,7 @@ digest state
 expect state inspector_visible=0
 snapshot fb
 
-# restore right slot so set_extent / persistence が効く
+# restore right slot so set_extent / persistence take effect
 action toggle_slot right
 action toggle_panel Inspector
 step 2

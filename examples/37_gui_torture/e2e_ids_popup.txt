@@ -1,6 +1,6 @@
-# TASK-121.2 ids/popup torture
-# 起動: VP_GUI_TORTURE_CASE=ids_popup
-# expect 値は 2026-07-17 headless replay の実測を焼き込み
+# ids/popup torture
+# Launch: VP_GUI_TORTURE_CASE=ids_popup
+# expect values baked from a 2026-07-17 headless replay
 step 4
 digest state
 expect state case=ids_popup

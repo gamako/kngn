@@ -1,6 +1,6 @@
-# TASK-121.2 input/state torture
-# 起動: VP_GUI_TORTURE_CASE=input_state
-# 座標は unshifted pad_top=12 時の実測（slider knob @ value0）
+# input/state torture
+# Launch: VP_GUI_TORTURE_CASE=input_state
+# Coords measured with unshifted pad_top=12 (slider knob @ value0)
 step 4
 digest layout
 expect layout case=input_state
@@ -29,7 +29,7 @@ step 2
 digest state
 expect state active_is_zero=1
 
-# F1 を戻して unshifted 座標へ
+# Release F1 back to unshifted coords
 inject key_down F1
 step 1
 inject key_up F1

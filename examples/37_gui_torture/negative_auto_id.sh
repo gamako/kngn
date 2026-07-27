@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# TASK-121.2 負系 runner: 自動 ID 衝突が Debug assert で非ゼロ終了することを検証する。
-# 成功終了 (0) や純粋な build failure は不合格。期待は「実行時に非ゼロ」。
+# Negative runner: verify a duplicate auto-id hits a Debug assert and exits non-zero.
+# Clean exit (0) or a pure build failure is a fail. Expect non-zero at runtime.
 set -u
 
 SCRIPT_DIR=$(cd "$(dirname "$0")" && pwd)
@@ -29,7 +29,7 @@ if [[ "$status" -eq 0 ]]; then
   exit 1
 fi
 
-# build/step 欠落だけの失敗は除外（assert/panic 痕跡が無い場合）
+# Ignore failures that are only missing build/step (no assert/panic trace)
 if grep -Eiq 'error: (no step named|unable to find)' "$OUT/stderr.txt" 2>/dev/null; then
   if ! grep -Eiq 'assert|panic|reached unreachable|thread [0-9]+ panic' "$OUT/stderr.txt" 2>/dev/null; then
     echo "[negative_auto_id] FAIL: non-zero exit looks like build/step failure, not assert"
@@ -43,7 +43,7 @@ if grep -Eiq 'assert|panic|reached unreachable|thread [0-9]+ panic|segmentation'
   exit 0
 fi
 
-# harness が起動してから落ちた場合も合格（assert が stderr に出ない環境向け）
+# Also pass if the harness starts and then dies (for environments where assert is absent from stderr)
 if grep -Eiq 'harness|GUI Torture|negative' "$OUT/stdout.txt" "$OUT/stderr.txt" 2>/dev/null; then
   echo "[negative_auto_id] PASS: non-zero exit ($status) after process start"
   exit 0

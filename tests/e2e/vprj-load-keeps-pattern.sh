@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# TASK-151: VPRJ load が保存 pattern を seed リセットで潰さないこと（solo bit 一致 + netsync SYNC）。
-# direnv が要る場合のみ VP_MAIN_DIR で video-proto-main 本体パスを外部指定する（workspace 外の flake 借用）。
+# VPRJ load must not wipe a saved pattern via seed reset (solo bit-identical + netsync SYNC).
+# When direnv is required, set VP_MAIN_DIR to the video-proto-main path (borrow the flake outside the workspace).
 set -euo pipefail
 
 ROOT=$(cd "$(dirname "$0")/../.." && pwd)
@@ -69,7 +69,7 @@ quit_pid() {
 }
 
 # ---------------------------------------------------------------------------
-# solo: save → load → bar 跨ぎ → save → cmp bit 一致
+# solo: save → load → cross a bar → save → cmp bit-identical
 # ---------------------------------------------------------------------------
 log "=== solo E2E ==="
 SOLO_PORT=/tmp/t151-solo.port
@@ -104,7 +104,7 @@ quit_pid "$SOLO_PORT" "$solo_pid"
 rm -f "$SOLO_PORT"
 
 # ---------------------------------------------------------------------------
-# netsync: host 編集済み pattern → client SYNC → digest modular 一致
+# netsync: host-edited pattern → client SYNC → digest modular match
 # ---------------------------------------------------------------------------
 log "=== netsync E2E ==="
 HOST_PORT=/tmp/t151-host.port
@@ -170,7 +170,7 @@ quit_pid "$CLIENT_PORT" "$client_pid"
 rm -f "$HOST_PORT" "$CLIENT_PORT"
 
 log "netsync PASS: host/client pattern masks match"
-log "ALL TASK-151 E2E PASSED"
+log "ALL VPRJ load pattern E2E PASSED"
 log "solo_before_patterns=$(printf '%s' "$before_digest" | grep -oE '"patterns":\{[^}]+\}')"
 log "solo_after_load_patterns=$(printf '%s' "$after_load_digest" | grep -oE '"patterns":\{[^}]+\}')"
 log "netsync_host_patterns=$(printf '%s' "$host_digest" | grep -oE '"patterns":\{[^}]+\}')"

@@ -1,13 +1,13 @@
 #!/usr/bin/env bash
-# TASK-162 review fix: 300点ストロークの pending 解消前に別ストロークを release しても
-# 前ストローク後半 chunk が消失しないこと（sonnet Critical1 repro）。
-# 方針: release 時に全 chunk を同期 PROPOSE → 跨 stroke の send queue 破棄経路を持たない。
+# Releasing another stroke before a 300-point stroke's pending clears must not
+# drop the first stroke's later chunks.
+# Approach: on release, synchronously PROPOSE every chunk → no cross-stroke send-queue discard path.
 set -euo pipefail
 
 ROOT=$(cd "$(dirname "$0")/../.." && pwd)
 MAIN="${VP_MAIN_DIR:-$ROOT}"
 DRIVE="$ROOT/scripts/drive"
-E2E="$ROOT/.e2e/task-162-consec"
+E2E="$ROOT/.e2e/consecutive-stroke"
 NETSYNC_PORT=9212
 HOST_PORT="$E2E/host.port"
 CLIENT_PORT="$E2E/client.port"
@@ -78,7 +78,7 @@ cell_to_screen() {
   fi
 }
 
-# host_step=0: COMMIT が local capture を中断しないよう host を凍らせる
+# host_step=0: freeze the host so COMMIT cannot interrupt local capture
 drag_points() {
   local ox=$1 oy=$2 znum=$3 zden=$4 start=$5 end=$6 mode=$7 host_step=$8
   local i cx cy sx sy
@@ -107,7 +107,7 @@ drag_points() {
   drive_c "inject mouse_move $sx $sy; inject mouse_up left; step 1" >/dev/null
 }
 
-log "=== TASK-162 consecutive stroke (Critical1 repro) ==="
+log "=== consecutive stroke (pending-clear race) ==="
 host_pid=$(start_pixie "$HOST_PORT" "$HOST_OUT" VP_NETSYNC_HOST=1 VP_NETSYNC_PORT="$NETSYNC_PORT")
 wait_port "$HOST_PORT" "$host_pid"
 client_pid=$(start_pixie "$CLIENT_PORT" "$CLIENT_OUT" VP_NETSYNC_CONNECT=127.0.0.1:"$NETSYNC_PORT")
@@ -131,20 +131,20 @@ log "origin=($ox,$oy) zoom=$znum/$zden"
 baseline=$(drive_c 'digest netsync' 2>/dev/null || true)
 baseline_seq=$(parse_kv "$baseline" last_seq); baseline_seq=${baseline_seq:-0}
 
-# Stroke A: host はほとんど進めない（release 後 pending を残す）
+# Stroke A: barely advance the host (leave pending after release)
 log "stroke A: 300 points (host mostly frozen)"
 drag_points "$ox" "$oy" "$znum" "$zden" 0 300 long 0
-# client 側で PROPOSE を outbound へ出すため client step のみ
+# client-only steps so PROPOSE reaches outbound on the client
 drive_c 'step 2' >/dev/null
 mid=$(drive_c 'digest netsync' 2>/dev/null || true)
 log "mid after A: $mid"
 mp=$(parse_kv "$mid" pending); mp=${mp:-0}
 if [[ "$mp" -lt 3 ]]; then
-  # host が偶発的に進んだ場合でも、少なくとも A の PROPOSE 痕跡を期待
+  # Even if the host advances accidentally, expect at least Stroke A's PROPOSE trace
   log "WARN: pending after A is $mp (expected ~3 if host frozen)"
 fi
 
-# Stroke B: host 凍結のまま → A の COMMIT で capture 中断されない
+# Stroke B: keep the host frozen → A's COMMIT must not interrupt capture
 log "stroke B: 21 points while A still pending"
 drag_points "$ox" "$oy" "$znum" "$zden" 0 21 short 0
 drive_c 'step 2' >/dev/null
@@ -189,7 +189,7 @@ client_crc=$(printf '%s' "$client_canvas" | grep -oE 'crc=[0-9A-Fa-f]+' | head -
 log "host nz=$host_nz crc=$host_crc"
 log "client nz=$client_nz crc=$client_crc"
 
-# 旧バグ: nz≈149。期待: A(300)+B(21) ≈ 321（非重なり）
+# Old bug: nz≈149. Expect: A(300)+B(21) ≈ 321 (non-overlapping)
 if [[ "${host_nz:-0}" -lt 300 ]]; then
   log "FAIL: host nz=$host_nz < 300 (stroke A chunks dropped)"
   exit 1

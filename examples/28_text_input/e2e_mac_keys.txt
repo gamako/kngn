@@ -1,6 +1,6 @@
-# TASK-118/119 E2E: macOS 標準テキスト操作 + 縦位置 snapshot
-# フォーカス座標: snapshot 実測 first TextInput x=24..343 y=72..96（padding 72,24 / width 320）
-# クリックは枠内左寄り (40, 84) = content 付近。決め打ち禁止のため実測後に確定。
+# E2E: macOS standard text editing + vertical-position snapshot
+# Focus coords: measured firstTextInput x=24..343 y=72..96 (padding 72,24 / width 320)
+# Click left-inside the box at (40, 84) ≈ content. Fixed after measurement; no hard-coding beforehand.
 
 step 2
 
@@ -17,7 +17,7 @@ step 1
 assert input len=11
 assert input caret=11
 
-# --- Cmd+A 全選択 ---
+# --- Cmd+A select all ---
 inject key_down A cmd
 step 1
 assert input selection=0:11
@@ -28,7 +28,7 @@ step 1
 assert input caret=0
 assert input selection=0:0
 
-# --- Cmd+Shift+RIGHT = 行末まで選択 ---
+# --- Cmd+Shift+RIGHT = select to end of line ---
 inject key_down RIGHT cmd shift
 step 1
 assert input selection=0:11
@@ -38,17 +38,17 @@ inject key_down RIGHT
 step 1
 assert input caret=11
 
-# --- Cmd+LEFT = 行頭 ---
+# --- Cmd+LEFT = start of line ---
 inject key_down LEFT cmd
 step 1
 assert input caret=0
 
-# --- Option+RIGHT = "hello" 末尾 ---
+# --- Option+RIGHT = end of "hello" ---
 inject key_down RIGHT alt
 step 1
 assert input caret=5
 
-# --- Option+Shift+RIGHT = " world" まで拡張 ---
+# --- Option+Shift+RIGHT = extend through " world" ---
 inject key_down RIGHT alt shift
 step 1
 assert input selection=5:11
@@ -59,10 +59,10 @@ step 1
 assert input selection=11:11
 assert input caret=11
 
-# 本文入力後 snapshot（縦位置・caret 目視用。パスは呼び出し側が out 配下を指定）
+# Snapshot after body text (vertical position / caret eyeball; caller sets path under out)
 snapshot fb
 
-# --- composition 中: 移動系・Cmd+A 抑止、状態不変 ---
+# --- during composition: suppress movement / Cmd+A; state unchanged ---
 inject composition update 0 あ
 step 1
 assert input preedit_active=1
@@ -77,7 +77,7 @@ assert input selection=11:11
 
 snapshot fb
 
-# --- composition cancel 後に Cmd+A 全選択 ---
+# --- after composition cancel, Cmd+A select all ---
 inject composition cancel
 step 1
 assert input preedit_active=0
@@ -86,26 +86,26 @@ inject key_down A cmd
 step 1
 assert input selection=0:11
 
-# --- Cmd+C（選択あり）---
+# --- Cmd+C (with selection) ---
 inject key_down C cmd
 step 1
 assert copy count=1
 
-# --- Cmd+X → 空、clipboard 残る ---
+# --- Cmd+X → empty, clipboard kept ---
 inject key_down X cmd
 step 1
 assert input len=0
 assert input caret=0
 assert copy count=2
 
-# --- Cmd+V → headless fallback round-trip で復元 ---
+# --- Cmd+V → restore via headless fallback round-trip ---
 inject key_down V cmd
 step 1
 assert input len=11
 assert input caret=11
 assert copy count=2
 
-# --- composition 中の C/X/V 抑止（buffer / clipboard request 不変）---
+# --- during composition, suppress C/X/V (buffer / clipboard request unchanged) ---
 inject key_down A cmd
 step 1
 assert input selection=0:11

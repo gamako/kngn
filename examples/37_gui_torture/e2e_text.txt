@@ -1,6 +1,6 @@
-# TASK-121.2 text torture
-# 起動: VP_GUI_TORTURE_CASE=text
-# expect 値は 2026-07-17 headless replay の実測を焼き込み
+# text torture
+# Launch: VP_GUI_TORTURE_CASE=text
+# expect values baked from a 2026-07-17 headless replay
 step 3
 digest state
 expect state case=text
@@ -53,7 +53,7 @@ step 1
 inject key_up LEFT
 step 1
 digest state
-# 現行観測: caret=499, selection [499,500]
+# Current observation: caret=499, selection [499,500]
 expect state caret=499
 expect state selection_start=499
 expect state selection_end=500
@@ -73,7 +73,7 @@ expect state caret=1
 expect state utf8_boundary=1
 snapshot fb
 
-# open text popup with 500-codepoint item (down/up をフレーム分離)
+# open text popup with 500-codepoint item (separate frames for down/up)
 inject mouse_move 80 230
 step 2
 inject mouse_down left

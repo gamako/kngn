@@ -77,8 +77,8 @@
         "platform",
         "libs",
         "build_helpers",
-        // build() が examples の artifact と apps/editor 系のテストを常に構成するため、
-        // package として自己完結させるには含める必要がある（TASK-29.1 codex レビュー指摘）。
+        // build() always wires example artifacts and apps/editor tests,
+        // so they must be included for the package to be self-contained.
         "apps",
         "examples",
         "LICENSE",
