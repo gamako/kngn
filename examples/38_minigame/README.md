@@ -1,59 +1,65 @@
-# 38_minigame — 統合ミニゲーム capstone
+# Example 38: Integrated minigame capstone
 
-TASK-111 ファミリー（`libs/gfx` / `libs/sound` / `kit.font`）の利用例を、外部消費者がコピーして開始できる最小限のミニゲームとして統合する。
+A minimal minigame that external consumers can copy as a starting point, combining `libs/gfx`,
+`libs/sound`, and `kit.font`.
 
-ゲームロジックは本 example 内に閉じ込め、ECS・Scene・GameLoop などの新しい共通層は追加しない。
+Game logic stays inside this example; no new shared ECS / Scene / GameLoop layer is added.
 
-## 責務
+## Responsibilities
 
-| 単位 | 役割 |
+| Unit | Role |
 |------|------|
-| `Game` | プレイヤー AABB / 速度 / 接地 / facing / スコア / コイン状態 |
-| `updateGame` | 固定 60Hz 論理更新（移動・重力・AABB・コイン・アニメ・カメラ） |
-| `drawGame` | フレーム描画（背景・タイル・コイン・プレイヤー・HUD） |
+| `Game` | Player AABB / velocity / grounded / facing / score / coins |
+| `updateGame` | Fixed 60 Hz logic (move / gravity / AABB / coins / anim / camera) |
+| `drawGame` | Frame draw (background / tiles / coins / player / HUD) |
 
-## 操作
+## Controls
 
-| キー | 動作 |
+| Key | Action |
 |------|------|
-| A / D / ← / → | 水平移動（`ActionMap` 軸 `move_x`） |
-| Space / Z | ジャンプ（接地時のみ） |
-| Esc / Q | 終了 |
+| A / D / ← / → | Horizontal move (`ActionMap` axis `move_x`) |
+| Space / Z | Jump (grounded only) |
+| Esc / Q | Quit |
 
-## 仕様値
+## Spec values
 
-- ウィンドウ 640×360、タイル 16×16、マップ 80×23（1280×368 world px）
-- プレイヤー AABB 12×14、初期位置 `(64, 160)`、固定更新 60 Hz
-- 水平速度 2.5 / 重力 0.35 / 最大落下 6.0 / ジャンプ -8.0（いずれも px / update。TASK-137）
-- カメラ zoom=1、追従 alpha=0.2、マップ境界 clamp
-- 歩行 Atlas 64×64×4、clip `[0,1,2,3,2,1]`、8 fps loop
-- 浮遊足場は左→右へ登る階段状（TASK-137）: P1 `top=272` (world 256..416) / P2 `top=208` (448..592)
-  / P3 `top=144` (640..784)。真上重なりを避け横ギャップ ≈2〜3 タイルで、弧ジャンプで1段ずつ登れる
-- コイン 3 個（取得 +100）。床 `(220,328)`、P1 上 `(330,264)`、P3 上（頂上）`(700,136)`
-  （コイン bottom = 足場 top、x は足場 world 範囲内）
-- BGM 110 Hz ループ、ジャンプ SE 660 Hz、着地 SE 220 Hz（いずれもコード生成 PCM16 WAV）
-- HUD: `kit.font.default_font_bytes` + `OutlineFont` で SCORE / FPS / 操作ヒント
+- Window 640×360, tiles 16×16, map 80×23 (1280×368 world px)
+- Player AABB 12×14, start `(64, 160)`, fixed update 60 Hz
+- Horizontal speed 2.5 / gravity 0.35 / max fall 6.0 / jump −8.0 (px per update)
+- Camera zoom=1, follow alpha=0.2, clamped to map bounds
+- Walk Atlas 64×64×4, clip `[0,1,2,3,2,1]`, 8 fps loop
+- Floating platforms ascend left→right like stairs: P1 `top=272` (world 256..416) / P2 `top=208`
+  (448..592) / P3 `top=144` (640..784). Horizontal gaps ≈2–3 tiles (no direct vertical stack) so
+  arc jumps climb one step at a time
+- Three coins (+100 each): floor `(220,328)`, on P1 `(330,264)`, on P3 (summit) `(700,136)`
+  (coin bottom = platform top; x inside platform world range)
+- BGM 110 Hz loop, jump SE 660 Hz, land SE 220 Hz (code-generated PCM16 WAV)
+- HUD: `kit.font.default_font_bytes` + `OutlineFont` for SCORE / FPS / control hints
 
-## アセット
+## Assets
 
-- プレイヤー画像は既存 `examples/image/usako.png` への symlink（`image/usako.png`）。**新規 PNG は追加しない**。
-- Windows checkout では symlink がテキスト化される既知制約あり（`build_helpers` と同種）。ルート `zig build` は symlink を経由しないため動作する。standalone 単体ビルドが必要な場合は開発者モード + `core.symlinks=true` で再 checkout するか、ルートビルドを使う。
+- Player art is a symlink to existing `examples/image/usako.png` (`image/usako.png`). **Do not add
+  a new PNG.**
+- On Windows checkouts, symlinks may materialise as text files (same class of issue as
+  `build_helpers`). The root `zig build` does not rely on the symlink, so it works. For a
+  standalone-only build, re-checkout with developer mode + `core.symlinks=true`, or use the root
+  build.
 
-## 実行
+## Run
 
-ルートから:
+From the repository root:
 
 ```bash
 zig build run-example_38 -Dplatform=objc
 ```
 
-standalone:
+Standalone:
 
 ```bash
 cd examples/38_minigame && zig build run -Dplatform=objc
 ```
 
-## E2E（headless replay）
+## E2E (headless replay)
 
 ```bash
 TMPD=$(mktemp -d)
@@ -63,11 +69,13 @@ VP_HARNESS_OUT=$TMPD \
 zig build run-example_38 -Dplatform=objc
 ```
 
-- `snapshot fb` は path 省略 → `$VP_HARNESS_OUT/frame_<n>.png`
-- `expect fb crc=...` は macOS objc 実測値を焼き込み
-- `game` probe で接地・ジャンプ・カメラ・スコアを assert
+- `snapshot fb` path omitted → `$VP_HARNESS_OUT/frame_<n>.png`
+- `expect fb crc=...` baked from macOS objc measurements
+- `game` probe asserts grounded / jump / camera / score
 
-### CRC fresh 2 回一致
+See [`docs/harness.md`](../../docs/harness.md).
+
+### CRC freshness (two runs must match)
 
 ```bash
 RUN1=$(mktemp -d); RUN2=$(mktemp -d)
@@ -78,29 +86,29 @@ VP_HEADLESS=1 VP_HARNESS_SCRIPT=examples/38_minigame/e2e.txt \
 diff <(rg '\[harness\] digest fb' $RUN1/replay.log) <(rg '\[harness\] digest fb' $RUN2/replay.log)
 ```
 
-### snapshot 目視
+### Snapshot visual check
 
 ```bash
 find "$RUN1" -name 'frame_*.png' -print
-# 各 PNG を開き、地形・プレイヤー・HUD・flip・見切れを確認
+# Open each PNG; confirm terrain, player, HUD, flip, no clipping
 ```
 
 ## `game` custom probe
 
-digest は 1 行 `k=v`（改行なし、1024B 未満）:
+Digest is one `k=v` line (no newlines, under 1024 B):
 
 ```text
 x=64.000 y=322.000 vy=0.000 grounded=1 state=grounded facing=right frame=0 cam_x=0.000 cam_y=4.000 score=0 fps=60 jump_count=0 landing_count=1 se_count=0 bgm=1
 ```
 
-| キー | 意味 |
+| Key | Meaning |
 |------|------|
-| `x` `y` `vy` | プレイヤー AABB / 垂直速度 |
-| `grounded` | 接地 0/1 |
+| `x` `y` `vy` | Player AABB / vertical velocity |
+| `grounded` | Grounded 0/1 |
 | `state` | `grounded` / `jumping` / `falling` |
 | `facing` | `left` / `right` |
-| `frame` | 現在の Atlas フレーム番号 |
-| `cam_x` `cam_y` | カメラ位置 |
-| `score` `fps` | スコア / 表示 FPS |
-| `jump_count` `landing_count` `se_count` | ジャンプ・着地・SE 投入回数 |
-| `bgm` | BGM 管理状態（常時 1） |
+| `frame` | Current Atlas frame index |
+| `cam_x` `cam_y` | Camera position |
+| `score` `fps` | Score / displayed FPS |
+| `jump_count` `landing_count` `se_count` | Jump / land / SE play counts |
+| `bgm` | BGM management flag (always 1) |

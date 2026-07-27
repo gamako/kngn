@@ -1,5 +1,19 @@
-# 25_collision_demo
+# Example 25: Collision demo
 
-`kit.gmath` の AABB / 円衝突判定を使い、固定 60 Hz でボールを四辺の壁と左右の AABB パドルへ反射させるデモです。衝突した tick はボールが赤くなります。
+Uses `kit.gmath` AABB / circle tests to bounce a ball off the four walls and two side AABB
+paddles at a fixed 60 Hz. On a collision tick the ball turns red.
 
-ホットパス宣言: simulation はイベント毎の `pollEvents()` 1 回につき 1 tick、描画はフレーム毎の framebuffer 全画素ループ。gmath は inline・allocation-free・O(1) です。
+**Hot-path declaration**: simulation advances one tick per `pollEvents()` iteration; drawing is a
+per-frame full-framebuffer loop. gmath is inline, allocation-free, and O(1).
+
+## Controls
+
+- **ESC**: quit
+
+(Paddles are fixed; there is no player input beyond quit.)
+
+## Run
+
+```bash
+zig build run-example_25
+```

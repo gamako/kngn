@@ -1,61 +1,62 @@
 # libs/gui
 
-video-proto 用の immediate-mode GUI ライブラリ。platform 非依存の standalone で、
-`cd libs/gui && zig build test` で単体テストが回る。
+Immediate-mode GUI library for video-proto. Standalone and platform-independent;
+`cd libs/gui && zig build test` runs the unit tests on their own.
 
-## 構成
+## Layout
 
-| ファイル | 内容 |
+| File | Contents |
 |---|---|
-| `src/gui.zig` | 公開 API root |
+| `src/gui.zig` | Public API root |
 | `src/geom.zig` | Rect / Vec2 / RenderTarget |
-| `src/color.zig` | Color（straight alpha、canonical BGRA 0xAARRGGBB） |
-| `src/draw.zig` | DrawList（clip 焼き込み式 draw cmd） |
-| `src/font.zig` | BitmapFont（ASCII 固定幅、comptime BDF パーサ） |
-| `src/render.zig` | DrawList → ピクセルバッファのソフトウェアレンダラ |
-| `src/input.zig` | 入力集約（platform 非依存の InputEvent） |
-| `src/id.zig` | widget ID（FNV-1a）+ IdStack |
+| `src/color.zig` | Color (straight alpha, canonical BGRA 0xAARRGGBB) |
+| `src/draw.zig` | DrawList (draw cmds with clip baked in) |
+| `src/font.zig` | BitmapFont (fixed-width ASCII, comptime BDF parser) |
+| `src/render.zig` | Software renderer: DrawList → pixel buffer |
+| `src/input.zig` | Input aggregation (platform-independent InputEvent) |
+| `src/id.zig` | Widget ID (FNV-1a) + IdStack |
 | `src/state.zig` | hot / active / focused |
-| `src/context.zig` | Context（フレームライフサイクル + ツリー構築 + hit-test） |
-| `src/layout.zig` | Flex レイアウトエンジン（measure / place） |
-| `src/style.zig` | ウィジェット共通スタイル定義（色 / 寸法 / パディング等） |
-| `src/widgets.zig` | 基本ウィジェット実装（Button / Label / ColorSwatch / Slider / HSV ピッカー / ScrollArea / checkbox / toggle / radio） |
+| `src/context.zig` | Context (frame lifecycle + tree build + hit-test) |
+| `src/layout.zig` | Flex layout engine (measure / place) |
+| `src/style.zig` | Shared widget style (colours / sizes / padding, …) |
+| `src/widgets.zig` | Basic widgets (Button / Label / ColorSwatch / Slider / HSV picker / ScrollArea / checkbox / toggle / radio) |
 
-## フレームの流れ
+## Frame flow
 
 ```zig
 ctx.beginFrame(fb.width, fb.height);
-// pushEvent → widget（前フレーム rect で同期 hit-test）→ beginBox/label/endBox でツリー構築
-ctx.endFrame(); // layout 確定 + draw cmd 発行 + rect キャッシュ更新
+// pushEvent → widgets (sync hit-test against previous-frame rects) → beginBox/label/endBox builds the tree
+ctx.endFrame(); // finalize layout + emit draw cmds + update rect cache
 gui.render(target, &ctx.draw_list, ctx.font);
 ```
 
-## ウィジェット（`src/widgets.zig`。`ctx.<name>(...)` で呼ぶ）
+## Widgets (`src/widgets.zig`; call as `ctx.<name>(...)`)
 
-Button / Label / ColorSwatch / Slider(i32,f32) / HSV ピッカー(svSquare,hueBar) / imageBox /
-Splitter / ScrollArea に加え、bool トグル系（TASK-48）:
+Button / Label / ColorSwatch / Slider(i32,f32) / HSV picker (svSquare, hueBar) / imageBox /
+Splitter / ScrollArea, plus bool toggles:
 
-- `ctx.checkbox(label, *bool) bool` — □/■。クリックで反転し、変化したら true。
-- `ctx.toggle(label, *bool) bool` — トグルスイッチ（ノブが左右に動く）。戻り値は checkbox と同じ。
-- `ctx.radio(label, selected: bool) bool` — ○/◉。`selected` は表示専用、クリックされたら true（activated）。
+- `ctx.checkbox(label, *bool) bool` — □/■. Click flips; returns true on change.
+- `ctx.toggle(label, *bool) bool` — toggle switch (knob moves left/right). Same return as checkbox.
+- `ctx.radio(label, selected: bool) bool` — ○/◉. `selected` is display-only; returns true when clicked (activated).
 
-いずれも自動 ID（label hash + id_stack）。glyph + label の**箱全体がクリック域**（button と同じ）。
-radio group は選択状態を caller が管理する（IM 流。gui はグループ状態を持たない）:
+All use automatic IDs (label hash + id_stack). The **whole box** (glyph + label) is the click
+target (same as button). Radio groups are owned by the caller (IM style; gui holds no group state):
 
 ```zig
 if (ctx.radio("Pen", tool == .pen)) tool = .pen;
 if (ctx.radio("Eraser", tool == .eraser)) tool = .eraser;
 ```
 
-同一スコープに同ラベルを並べると ID が衝突するので、`~Id` 版か `id_stack.push(i)` スコープで回避する。
+Identical labels in the same scope collide on ID; use the `~Id` variants or an `id_stack.push(i)`
+scope to avoid that.
 
-## レイアウトエンジンの制限事項
+## Layout engine limits
 
-- wrap 非対応
-- absolute positioning 非対応
-- 主軸の整列（justify_content）は start のみ。右寄せ等は grow の箱を挟んで表現する
-- shrink 非対応。子の合計が親を超える場合は overflow する（見た目は `clip_children` で抑制）
-- fit の親の中の grow / percent 子は measure 段階で 0 扱い（fit 親はその分縮む）
-- percent は親の content box（padding 控除後、gap 控除前）基準。floor で切り捨て、
-  切り捨てで浮いた px は grow 子が吸収する
-- `clip_children` は描画時のみ有効で、レイアウト計算には影響しない
+- No wrap
+- No absolute positioning
+- Main-axis alignment (`justify_content`) is start only. Right-align with a grow spacer box
+- No shrink. When children exceed the parent, they overflow (visual clipping via `clip_children`)
+- grow / percent children inside a fit parent measure as 0 (the fit parent shrinks accordingly)
+- percent is relative to the parent's content box (padding deducted, gap not). Floor truncation;
+  leftover pixels are absorbed by grow children
+- `clip_children` affects drawing only, not layout

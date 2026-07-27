@@ -1,31 +1,32 @@
-# 36_tilemap — TileMap 描画 + solid 衝突
+# Example 36: TileMap draw + solid collision
 
-`kit.gfx.TileMap` で固定地形を描画し、AABB 押し戻しで左右移動・重力・着地をデモする（TASK-111.5）。
+Draws fixed terrain with `kit.gfx.TileMap` and demos left/right move, gravity, and landing via
+AABB push-out.
 
-## 操作
+## Controls
 
-| キー | 動作 |
+| Key | Action |
 |------|------|
-| ← / A | 左移動 |
-| → / D | 右移動 |
-| ↑ / W / Space / Z | ジャンプ（接地時） |
-| Esc / Q | 終了 |
+| ← / A | Move left |
+| → / D | Move right |
+| ↑ / W / Space / Z | Jump (when grounded) |
+| Esc / Q | Quit |
 
-## 実行
+## Run
 
-ルートから:
+From the repository root:
 
 ```bash
 zig build run-example_36
 ```
 
-standalone:
+Standalone:
 
 ```bash
 cd examples/36_tilemap && zig build run
 ```
 
-## E2E（headless replay）
+## E2E (headless replay)
 
 ```bash
 TMPD=$(mktemp -d)
@@ -35,11 +36,13 @@ VP_HARNESS_OUT=$TMPD \
 zig build run-example_36
 ```
 
-- snapshot path は省略 → `$VP_HARNESS_OUT/frame_<n>.png`
-- 各 `digest fb` の直後に `expect fb crc=...`（実測値を焼き込み）
-- CRC が green であること、`open $TMPD/frame_*.png` で地形とキャラクターを目視確認
+- Snapshot path omitted → `$VP_HARNESS_OUT/frame_<n>.png`
+- Each `digest fb` is followed by `expect fb crc=...` (measured values baked in)
+- Confirm CRC is green and open `$TMPD/frame_*.png` to inspect terrain and character
 
-### CRC 再採取
+See [`docs/harness.md`](../../docs/harness.md).
+
+### Re-capture CRC
 
 ```bash
 TMPD=$(mktemp -d)

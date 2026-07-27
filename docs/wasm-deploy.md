@@ -1,53 +1,54 @@
-# wasm デプロイ手順（TASK-73.4）
+# wasm deploy
 
-ブラウザ向け wasm 成果物を `zig-out/web/` に集約し、静的ホスティングへ配置する手順。
+How to gather the browser wasm artefacts into `zig-out/web/` and publish them to static hosting.
 
-## 成果物
+## Artefacts
 
-`zig build package-web` の出力（`zig-out/web/`）:
+Output of `zig build package-web` (`zig-out/web/`):
 
-| ファイル | 用途 | COOP/COEP |
+| File | Role | COOP/COEP |
 |----------|------|-----------|
-| `index.html` | Pixie エントリ | 不要 |
-| `pixie.wasm` | Pixie wasm | 不要 |
-| `synth.html` | Synth エントリ | **必須** |
-| `synth.wasm` | Synth wasm（shared memory） | **必須** |
-| `vp.js` | 共通 JS glue | synth 利用時は隔離ページから読み込み |
-| `vp-worklet.js` | AudioWorklet | synth 利用時は隔離ページから読み込み |
-| `_headers` | Cloudflare Pages 用 | synth 向けヘッダ定義 |
-| `netlify.toml` | Netlify 用（リポジトリ root にコピー可） | synth 向けヘッダ定義 |
-| `serve-coop-coep.py` | ローカル COOP/COEP 検証用 | 開発用 |
+| `index.html` | Pixie entry | not required |
+| `pixie.wasm` | Pixie wasm | not required |
+| `synth.html` | Synth entry | **required** |
+| `synth.wasm` | Synth wasm (shared memory) | **required** |
+| `vp.js` | Shared JS glue | load from an isolated page when using synth |
+| `vp-worklet.js` | AudioWorklet | load from an isolated page when using synth |
+| `_headers` | Cloudflare Pages | synth header rules |
+| `netlify.toml` | Netlify (may be copied to the repo root) | synth header rules |
+| `serve-coop-coep.py` | Local COOP/COEP check | development |
 
-### HTML / JS の fetch パス
+### HTML / JS fetch paths
 
-開発時（`web/`）も配布時（`zig-out/web/`）も**同一ディレクトリ相対パス**:
+Dev (`web/`) and packaged (`zig-out/web/`) use the **same directory-relative paths**:
 
-- `index.html` → `./vp.js` → 既定 `./pixie.wasm`
-- `synth.html`（`data-wasm="synth.wasm"`）→ `./vp.js` → `./synth.wasm` + `./vp-worklet.js`
+- `index.html` → `./vp.js` → default `./pixie.wasm`
+- `synth.html` (`data-wasm="synth.wasm"`) → `./vp.js` → `./synth.wasm` + `./vp-worklet.js`
 
-`vp.js` は `new URL("./<wasm>", import.meta.url)` で wasm を取得するため、上記ファイルはすべて同じディレクトリに置く。
+`vp.js` fetches wasm with `new URL("./<wasm>", import.meta.url)`, so every file above must sit in
+the same directory.
 
-## ビルド
+## Build
 
-リポジトリ root で:
+From the repository root:
 
 ```bash
-# 配布一式（推奨。native ターゲットから wasm を cross-compile）
+# Full package (recommended; cross-compiles wasm from a native target)
 zig build package-web
 
-# 個別（native ターゲット時）
+# Individual (native target)
 zig build build-pixie-wasm
 zig build build-synth-wasm
 
-# wasm ターゲット指定時（-Dtarget=wasm32-wasi）
+# When targeting wasm (-Dtarget=wasm32-wasi)
 zig build -Dtarget=wasm32-wasi package-web
 zig build -Dtarget=wasm32-wasi build-pixie
 zig build -Dtarget=wasm32-wasi build-synth-wasm
 ```
 
-## ローカル検証
+## Local verification
 
-### Pixie（COOP/COEP 不要）
+### Pixie (COOP/COEP not required)
 
 ```bash
 zig build package-web
@@ -56,7 +57,7 @@ python3 -m http.server 8080
 # http://127.0.0.1:8080/index.html
 ```
 
-fetch パス smoke（別ターミナル）:
+Fetch-path smoke (another terminal):
 
 ```bash
 curl -sf -o /dev/null -w "%{http_code}\n" http://127.0.0.1:8080/index.html
@@ -64,79 +65,82 @@ curl -sf -o /dev/null -w "%{http_code}\n" http://127.0.0.1:8080/vp.js
 curl -sf -o /dev/null -w "%{http_code}\n" http://127.0.0.1:8080/pixie.wasm
 ```
 
-いずれも `200` であること。
+Every response must be `200`.
 
-### Synth（COOP/COEP 必須）
+### Synth (COOP/COEP required)
 
-SharedArrayBuffer + AudioWorklet のため **cross-origin isolation** が必要。
+SharedArrayBuffer + AudioWorklet need **cross-origin isolation**.
 
 ```bash
 python3 zig-out/web/serve-coop-coep.py 8080
 # http://127.0.0.1:8080/synth.html
 ```
 
-リポジトリ内の `scripts/serve-web.py` も同様（引数で root を指定可）。
+`scripts/serve-web.py` in the repository does the same (optional root argument).
 
-> 注: `serve-coop-coep.py` は**全レスポンス**（`index.html` 含む）に COOP/COEP/CORP を付与する。
-> pixie も cross-origin isolated で配信されるが単独動作に支障はない。pixie を本番同等
-> （ヘッダ無し）で検証したい場合は `python3 -m http.server` を使う。
+> Note: `serve-coop-coep.py` attaches COOP/COEP/CORP to **every** response (including
+> `index.html`). Pixie still runs under cross-origin isolation; that does not hurt standalone
+> use. To verify pixie the way production serves it (no headers), use `python3 -m http.server`.
 
-### COOP/COEP の確認（DevTools）
+### Checking COOP/COEP (DevTools)
 
-1. ブラウザでページを開く
-2. DevTools → Console で `crossOriginIsolated` を実行
-3. **synth**: `true` であること
-4. **pixie**: `false` でも動作する（隔離不要）
+1. Open the page in a browser
+2. In DevTools → Console, evaluate `crossOriginIsolated`
+3. **synth**: must be `true`
+4. **pixie**: may be `false` (isolation not required)
 
-## 静的ホスティングへの配置
+## Publishing to static hosting
 
-`zig-out/web/` の**中身**を publish directory としてアップロードする。
+Upload the **contents** of `zig-out/web/` as the publish directory.
 
 ### Cloudflare Pages
 
 1. `zig build package-web`
-2. `zig-out/web/` を deploy root にする（または CI で `zig build package-web`）
-3. `zig-out/web/_headers` が自動適用される（synth.html のみ COOP/COEP）
+2. Use `zig-out/web/` as the deploy root (or run `zig build package-web` in CI)
+3. `zig-out/web/_headers` is applied automatically (COOP/COEP only for synth)
 
-> **注意（実配置で踏んだ罠）**: Cloudflare Pages は `/synth.html` へのリクエストを自動で
-> `308 /synth`（拡張子なし clean URL）へリダイレクトする。`_headers` のルールは**実際に
-> 配信されるパス**に一致しないと適用されないため、`/synth.html` だけでなく **`/synth` にも
-> 同じ COOP/COEP ルールを書く**必要がある（`web/deploy/_headers` は両方定義済み）。
-> 片方だけだとブラウザが読むページ（`/synth`）にヘッダが付かず
-> `crossOriginIsolated === false` になり synth が発音しない。デプロイ後は
-> `curl -sI https://<project>.pages.dev/synth | grep -i cross-origin` で**リダイレクト後の
-> パス**にヘッダが付くことを確認すること（`/synth.html` への curl だけでは見抜けない）。
+> **Caveat seen in a real deploy**: Cloudflare Pages redirects `/synth.html` to `308 /synth`
+> (extensionless clean URL). `_headers` rules must match the **path that is actually served**,
+> so write the same COOP/COEP rules for **`/synth` as well as `/synth.html`**
+> (`web/deploy/_headers` already defines both). With only one of them, the page the browser
+> reads (`/synth`) has no headers, `crossOriginIsolated === false`, and synth makes no sound.
+> After deploy, confirm headers on the **post-redirect** path:
+> `curl -sI https://<project>.pages.dev/synth | grep -i cross-origin`
+> (curling `/synth.html` alone will not catch this).
 
 ### Netlify
 
-1. リポジトリ root に `web/deploy/netlify.toml` をコピーするか、内容を既存設定にマージ
-2. `publish = "zig-out/web"`、`command = "zig build package-web"` を設定
-3. synth 向けヘッダは `[[headers]]` で付与
+1. Copy `web/deploy/netlify.toml` to the repository root, or merge its contents into an existing config
+2. Set `publish = "zig-out/web"` and `command = "zig build package-web"`
+3. Synth headers come from `[[headers]]`
 
 ### GitHub Pages
 
-- **Pixie のみ可**（`index.html` + `pixie.wasm` + `vp.js`）。カスタムレスポンスヘッダを設定できないため COOP/COEP 不可。
-- **Synth は不可**（SharedArrayBuffer が必要）。代替として [coi-serviceworker](https://github.com/gzuidhof/coi-serviceworker) によるクライアント側の擬似隔離があるが、初回リロードが入る既知のハックであり、本リポジトリでは未同梱。
-- 第一候補は Cloudflare Pages / Netlify 等、**レスポンスヘッダを設定できる**静的ホスト。
+- **Pixie only** (`index.html` + `pixie.wasm` + `vp.js`). Custom response headers cannot be set, so COOP/COEP is unavailable.
+- **Synth is not possible** (SharedArrayBuffer required). A client-side fake isolation via
+  [coi-serviceworker](https://github.com/gzuidhof/coi-serviceworker) exists but needs a first-load
+  reload and is **not** bundled here.
+- Prefer Cloudflare Pages / Netlify or any static host that **can set response headers**.
 
-## .wasm の MIME タイプ
+## `.wasm` MIME type
 
-`WebAssembly.instantiateStreaming` は `Content-Type: application/wasm` を期待する。
+`WebAssembly.instantiateStreaming` expects `Content-Type: application/wasm`.
 
-| ホスト | 既定 |
+| Host | Default |
 |--------|------|
-| `python3 -m http.server` | `.wasm` は `application/wasm`（3.7+） |
-| Cloudflare Pages / Netlify | `_headers` / `netlify.toml` で明示 |
-| GitHub Pages | 多くの場合 `application/wasm`（要確認。問題時は `instantiate` フォールバック） |
+| `python3 -m http.server` | `.wasm` → `application/wasm` (3.7+) |
+| Cloudflare Pages / Netlify | set explicitly in `_headers` / `netlify.toml` |
+| GitHub Pages | often `application/wasm` (verify; fall back to `instantiate` if needed) |
 
-`vp.js` は streaming 失敗時に `compile` + `instantiate` へフォールバックするが、本番でも `application/wasm` を設定すること。
+`vp.js` falls back to `compile` + `instantiate` when streaming fails, but production should still
+serve `application/wasm`.
 
-## 公開 URL での動作確認（AC#2）
+## Public-URL smoke check
 
-アカウント作成・実 deploy は作業者のホスト選定後に実施。手順:
+After choosing a host and deploying:
 
-1. 上記ビルド → `zig-out/web/` をホストへ配置
-2. Pixie 公開 URL で pen 描画・キー入力を目視確認
-3. Synth 公開 URL で COOP/COEP 下の発音を確認（`crossOriginIsolated === true`）
+1. Build as above and upload `zig-out/web/`
+2. On the Pixie URL, visually confirm pen drawing and key input
+3. On the Synth URL, confirm sound under COOP/COEP (`crossOriginIsolated === true`)
 
-ローカル検証までを本タスクの完了とし、実配置は申し送り。
+Local verification is enough to validate the package; real hosting is a separate hand-off.

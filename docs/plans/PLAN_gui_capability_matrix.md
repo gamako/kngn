@@ -1,87 +1,87 @@
 # GUI capability matrix v0
 
-## 1. 目的・スコープ
+## 1. Purpose and scope
 
-この文書は、WAI-ARIA APG、Dear ImGui demo、libs/gui の現有 API を同じ表に置く能力マトリクス v0 である。examples/35_gui_gallery は現有 widget の normal / endpoint 表示と、未対応 widget の空セクションを提供する。異常系・境界系は TASK-121.2、実画面 shell は TASK-121.3 / 121.4 のスコープとする。
+This document is capability matrix v0: WAI-ARIA APG, the Dear ImGui demo, and the current libs/gui APIs placed in the same tables. `examples/35_gui_gallery` shows normal / endpoint states for existing widgets and empty sections for unsupported widgets. Abnormal / boundary cases belong to the torture suite; real-screen shells belong to the settings shell and list+menu shell scopes.
 
-状態軸は次の 9 列で固定する。
+The state axes are fixed to these nine columns:
 
 normal / hover / active / focused / disabled / empty / min / max / none
 
-N/A は非適用を意味する明示セルであり、空欄にはしない。demo は代表 widget の実状態を入力注入するセル、partial は API の一部状態だけを表す。
+N/A is an explicit cell meaning not applicable; leave no blank cells. `demo` means a cell whose representative widget state is driven by input injection. `partial` means only some of the API's states are represented.
 
-### ホットパス宣言
+### Hot-path declaration
 
-ギャラリの widget 構築と DrawList 追加はフレーム毎に走る。表示項目数に対する O(N) で、全画素ループ・framebuffer 全面コピー・独自 rasterizer・RT thread は追加しない。svSquare / hueBar / stepgrid の描画は libs/gui に委譲するため、新しい全画素経路はない。状態 metadata・画像・Command/PopupItem は固定配列、widget の一時データは既存 Context frame arena を使う。
+Gallery widget construction and DrawList appends run every frame. Cost is O(N) in the number of displayed items. No full-framebuffer pixel loops, full framebuffer copies, custom rasterizers, or RT-thread work are added. svSquare / hueBar / stepgrid drawing is delegated to libs/gui, so there is no new per-pixel path. State metadata, images, and Command/PopupItem data use fixed arrays; widget temporaries use the existing Context frame arena.
 
-## 2. 参照元
+## 2. Sources
 
-本マトリクスの参照元一覧は、オーケストレータが 2026-07-17 に WebFetch で取得した一次資料に基づく。
+The matrix sources below are the primary documents fetched by the orchestrator via WebFetch on 2026-07-17.
 
-| 資料 | URL | 対象版・取得日 |
+| Source | URL | Version / fetch date |
 |---|---|---|
-| WAI-ARIA APG Patterns | https://www.w3.org/WAI/ARIA/apg/patterns/ | living document、版表記なし、2026-07-17 |
-| Dear ImGui | https://github.com/ocornut/imgui | v1.92.6、2026-07-17 |
-| video-proto libs/gui | libs/gui/src/widgets.zig / popup.zig / menu.zig / stepgrid.zig | workspace 実物、2026-07-17 |
+| WAI-ARIA APG Patterns | https://www.w3.org/WAI/ARIA/apg/patterns/ | living document, no version label, 2026-07-17 |
+| Dear ImGui | https://github.com/ocornut/imgui | v1.92.6, 2026-07-17 |
+| video-proto libs/gui | libs/gui/src/widgets.zig / popup.zig / menu.zig / stepgrid.zig | workspace tree, 2026-07-17 |
 
-## 3. APG 30 パターン一覧
+## 3. APG 30 patterns
 
-Accordion、Alert、Alert and Message Dialogs、Breadcrumb、Button、Carousel、Checkbox、Combobox、Dialog (Modal)、Disclosure、Feed、Grid、Landmarks、Link、Listbox、Menu and Menubar、Menu Button、Meter、Radio Group、Slider、Slider (Multi-Thumb)、Spinbutton、Switch、Table、Tabs、Toolbar、Tooltip、Tree View、Treegrid、Window Splitter。
+Accordion, Alert, Alert and Message Dialogs, Breadcrumb, Button, Carousel, Checkbox, Combobox, Dialog (Modal), Disclosure, Feed, Grid, Landmarks, Link, Listbox, Menu and Menubar, Menu Button, Meter, Radio Group, Slider, Slider (Multi-Thumb), Spinbutton, Switch, Table, Tabs, Toolbar, Tooltip, Tree View, Treegrid, Window Splitter.
 
-## 4. ImGui demo セクション一覧
+## 4. ImGui demo sections
 
-Basic、Trees、Collapsing Headers、Text、Images、Combo、List boxes、Selectables、Text Input、Tabs、Plotting、Color/Picker widgets、Drag/Slider widgets、Range widgets、Multi-component widgets、Vertical sliders、Drag and Drop、Querying item status、Layout & Scrolling、Popups & Modal windows、Tables、Menus。
+Basic, Trees, Collapsing Headers, Text, Images, Combo, List boxes, Selectables, Text Input, Tabs, Plotting, Color/Picker widgets, Drag/Slider widgets, Range widgets, Multi-component widgets, Vertical sliders, Drag and Drop, Querying item status, Layout & Scrolling, Popups & Modal windows, Tables, Menus.
 
 ## 5. APG × ImGui × libs/gui
 
-| APG | ImGui | 現有 API / ギャラリ分類 | 引き継ぎ先 |
+| APG | ImGui | Current API / gallery category | Follow-up category |
 |---|---|---|---|
-| Accordion / Disclosure | Collapsing Headers | 未対応・空セクション | 121.3 |
-| Alert | Querying / message UI | 正常系対象外・参照のみ | 121.2 |
-| Alert and Message Dialogs | Popups & Modal windows | 未対応 | 121.2 / 121.3 |
-| Breadcrumb / Landmarks | Layout | semantic shell 層で未対応 | 121.3 |
-| Button | Basic / Selectables | button / buttonEx / buttonId | 121.3 / 121.4 |
-| Carousel / Feed | — | 未対応 | Phase 2 |
-| Checkbox | Basic | checkbox / checkboxId | 121.3 / 121.4 |
-| Combobox / Menu Button | Combo / Menus | 組み合わせのみ、専用 API なし | 121.3 / 121.4 |
-| Dialog (Modal) | Popups & Modal windows | popup のモーダル吸収とは別物 | 121.3 |
-| Grid | Tables / Selectables | stepgrid は APG Grid の代替ではない | 121.4 / Phase 2 |
-| Link | Basic | 専用 API なし。button 代用は禁止 | 121.3 |
-| Listbox | List boxes | 未対応 | 121.4 |
-| Menu and Menubar | Menus | menuBar / menuBarPopup / popup | 121.4 |
-| Meter | Plotting / Range | 未対応 | 121.3 |
-| Radio Group | Selectables | radio、排他状態は caller 管理 | 121.3 / 121.4 |
-| Slider / Spinbutton | Drag/Slider widgets | sliderI32 / sliderF32、Spinbutton 未対応 | 121.3 |
-| Slider (Multi-Thumb) | Range widgets | 未対応 | Phase 2 |
-| Switch | Basic | toggle | 121.3 |
-| Table | Tables | 列付き table は未対応 | 121.4 |
-| Tabs | Tabs | 未対応 | 121.3 |
-| Toolbar | Basic / Layout | row + button、専用 API なし | 121.3 / 121.4 |
-| Tooltip | — | 未対応 | 121.3 / Phase 2 |
-| Tree View / Treegrid | Trees / Tables | 未対応 | 121.4 / Phase 2 |
-| Window Splitter | Layout & Scrolling | splitter | 121.3 |
+| Accordion / Disclosure | Collapsing Headers | Unsupported; empty section | settings shell |
+| Alert | Querying / message UI | Out of normal-path scope; reference only | torture suite |
+| Alert and Message Dialogs | Popups & Modal windows | Unsupported | torture suite / settings shell |
+| Breadcrumb / Landmarks | Layout | Unsupported at the semantic shell layer | settings shell |
+| Button | Basic / Selectables | button / buttonEx / buttonId | settings shell / list+menu shell |
+| Carousel / Feed | — | Unsupported | deferred |
+| Checkbox | Basic | checkbox / checkboxId | settings shell / list+menu shell |
+| Combobox / Menu Button | Combo / Menus | Composition only; no dedicated API | settings shell / list+menu shell |
+| Dialog (Modal) | Popups & Modal windows | Distinct from popup modal absorption | settings shell |
+| Grid | Tables / Selectables | stepgrid is not a substitute for APG Grid | list+menu shell / deferred |
+| Link | Basic | No dedicated API. Do not substitute button | settings shell |
+| Listbox | List boxes | Unsupported | list+menu shell |
+| Menu and Menubar | Menus | menuBar / menuBarPopup / popup | list+menu shell |
+| Meter | Plotting / Range | Unsupported | settings shell |
+| Radio Group | Selectables | radio; exclusive state owned by the caller | settings shell / list+menu shell |
+| Slider / Spinbutton | Drag/Slider widgets | sliderI32 / sliderF32; Spinbutton unsupported | settings shell |
+| Slider (Multi-Thumb) | Range widgets | Unsupported | deferred |
+| Switch | Basic | toggle | settings shell |
+| Table | Tables | Column table unsupported | list+menu shell |
+| Tabs | Tabs | Unsupported | settings shell |
+| Toolbar | Basic / Layout | row + button; no dedicated API | settings shell / list+menu shell |
+| Tooltip | — | Unsupported | settings shell / deferred |
+| Tree View / Treegrid | Trees / Tables | Unsupported | list+menu shell / deferred |
+| Window Splitter | Layout & Scrolling | splitter | settings shell |
 
-## 6. libs/gui 現有 API 一覧
+## 6. Current libs/gui API inventory
 
-| 分類 | 実物 API |
+| Category | Concrete API |
 |---|---|
-| Basic | Context.buttonId、Context.label |
-| Text | gui.selectableLabelId、Context.textInputId |
-| Values | Context.sliderI32Id、Context.sliderF32Id、Context.checkboxId、Context.toggleId、Context.radioId |
-| Color / Image | Context.colorSwatchId、Context.svSquareId、Context.hueBarId、Context.imageBox |
-| Layout | gui.splitter、Context.beginScrollArea/endScrollArea |
-| Popup / Menu | Context.popupMenu、gui.menuBar、gui.menuBarPopup |
+| Basic | Context.buttonId, Context.label |
+| Text | gui.selectableLabelId, Context.textInputId |
+| Values | Context.sliderI32Id, Context.sliderF32Id, Context.checkboxId, Context.toggleId, Context.radioId |
+| Color / Image | Context.colorSwatchId, Context.svSquareId, Context.hueBarId, Context.imageBox |
+| Layout | gui.splitter, Context.beginScrollArea/endScrollArea |
+| Popup / Menu | Context.popupMenu, gui.menuBar, gui.menuBarPopup |
 | Step grid | gui.stepgrid.widgetRow |
 
-ID 付き variant は libs/gui に実在するものだけを使用し、同一セクション内の衝突を避ける。libs/gui 本体は本タスクで変更しない。
+Use only Id-bearing variants that actually exist in libs/gui, and avoid collisions within a section. Do not change libs/gui itself for this matrix work.
 
-## 7. 状態規則
+## 7. State rules
 
-normal は caller 所有値の初期表示、hover と active は前フレーム rect cache と Context.state.hot_id / active_id による実状態、focused は TextInput の focus、disabled は PopupItem.enabled / Command.enabled の個別対応を示す。
+`normal` is the caller's owned initial value. `hover` and `active` are live states from the previous-frame rect cache and `Context.state.hot_id` / `active_id`. `focused` is TextInput focus. `disabled` is covered only where `PopupItem.enabled` / `Command.enabled` apply individually.
 
-empty は空 label / empty text、min / max は slider・picker・layout の endpoint、none は radio など「値なし」の表示を示す。共通 disabled property、semantic role、ARIA 属性、専用 focus-visible API は現有 API にない。
+`empty` is an empty label / empty text. `min` / `max` are slider, picker, and layout endpoints. `none` is a "no value" display such as radio. There is no shared disabled property, semantic role, ARIA attribute, or dedicated focus-visible API in the current surface.
 
-## 8. 現有 widget 状態マトリクス
+## 8. Current widget state matrix
 
 | widget | normal | hover | active | focused | disabled | empty | min | max | none |
 |---|---|---|---|---|---|---|---|---|---|
@@ -102,37 +102,37 @@ empty は空 label / empty text、min / max は slider・picker・layout の end
 | menuBar | ✓ | demo | demo | N/A | ✓ command | N/A | N/A | N/A | ✓ |
 | stepgrid | ✓ | demo | demo | N/A | partial (editable=false) | ✓ | N/A | N/A | ✓ |
 
-## 9. 未対応 widget 空セクション
+## 9. Unsupported-widget empty sections
 
-missing section は Accordion、Alert / Message Dialog、Breadcrumb、Carousel、Combobox、Dialog (Modal)、Disclosure、Listbox、Meter、Spinbutton、Table、Tabs、Tooltip、Tree View、Treegrid の 15 項目を表示する。各項目は矩形、NOT IMPLEMENTED、対象タスク（121.2 / 121.3 / 121.4 / Phase 2）だけを持ち、widget 実装を含まない。
+The missing section shows these 15 items: Accordion, Alert / Message Dialog, Breadcrumb, Carousel, Combobox, Dialog (Modal), Disclosure, Listbox, Meter, Spinbutton, Table, Tabs, Tooltip, Tree View, Treegrid. Each item is only a rectangle, NOT IMPLEMENTED, and a follow-up category (torture suite / settings shell / list+menu shell / deferred). No widget implementation is included.
 
-## 10. 横断的な穴
+## 10. Cross-cutting gaps
 
-### AC#1: 参照元・欠落セクション・横断穴
+### AC#1: Sources, missing sections, cross-cutting holes
 
-- 参照元は §2、APG 30 パターンは §3、ImGui セクションは §4、突き合わせは §5 に固定する。
-- 欠落 15 項目と対象タスクは §9 と gallery の missing section に一致させる。
-- disabled / focused / semantic role / common query API の穴は本 §10 と §7 に記録する。
+- Sources stay in §2, APG 30 patterns in §3, ImGui sections in §4, and the crosswalk in §5.
+- The 15 missing items and follow-up categories must match §9 and the gallery missing section.
+- Gaps for disabled / focused / semantic role / common query API are recorded in this §10 and §7.
 
 ### Disabled
 
-共通 disabled property はない。gallery は PopupItem.enabled と Command.enabled を個別に表示し、一般 widget の disabled は N/A とする。stepgrid の editable=false だけは部分対応である。
+There is no shared disabled property. The gallery shows `PopupItem.enabled` and `Command.enabled` individually; general widget disabled is N/A. Only stepgrid `editable=false` is a partial case.
 
 ### Focused / semantic
 
-Context.state.focused_id と textInputId の focus は観測できるが、ARIA role、name、description、keyboard interaction policy を widget 共通に宣言する API はない。landmark、toolbar、link、tabs の semantic 層も未対応で、121.3 の shell で再評価する。
+`Context.state.focused_id` and textInputId focus are observable, but there is no widget-wide API to declare ARIA role, name, description, or keyboard interaction policy. Landmark, toolbar, link, and tabs semantics are also unsupported; re-evaluate in the settings shell.
 
 ### Querying item status
 
-専用 query API はない。gallery は ButtonResult と custom gallery probe により、代表 widget の hot / active / focused category を観測する。probe digest は次の形式で固定する。
+There is no dedicated query API. The gallery observes representative widget hot / active / focused categories via `ButtonResult` and a custom gallery probe. The probe digest format is fixed as:
 
 section=<name> index=<i> widgets=<n> missing=<n> schema=v0 hot=<name|none> active=<name|none> focused=<name|none>
 
-## 11. Gallery section と E2E snapshot
+## 11. Gallery sections and E2E snapshot
 
-| index | section | widgets | missing | 主な実演 |
+| index | section | widgets | missing | Main demos |
 |---:|---|---:|---:|---|
-| 0 | overview | 0 | 15 | 3 軸・参照元・全体件数 |
+| 0 | overview | 0 | 15 | Three axes, sources, overall counts |
 | 1 | basic | 2 | 0 | button / label |
 | 2 | text | 2 | 0 | textInputId / selectableLabelId |
 | 3 | values | 4 | 0 | i32/f32 slider / checkbox / toggle / radio |
@@ -142,302 +142,301 @@ section=<name> index=<i> widgets=<n> missing=<n> schema=v0 hot=<name|none> activ
 | 7 | stepgrid | 1 | 0 | 16 step row |
 | 8 | missing | 15 | 15 | 15 placeholders |
 
-examples/35_gui_gallery/e2e.txt は各 section で digest gallery と path 省略の snapshot fb を行う。PNG は repository に追加せず、VP_HARNESS_OUT の実行時生成物を目視する。固定窓は 1024×640、初期 section は overview、font は gui.default_font。
+`examples/35_gui_gallery/e2e.txt` runs `digest gallery` and path-omitted `snapshot fb` for each section. Do not add PNGs to the repository; visually inspect runtime artifacts under `VP_HARNESS_OUT`. Fixed window is 1024×640, initial section is overview, font is `gui.default_font`.
 
-## 12. 更新ルールと引き継ぎ
+## 12. Update rules
 
-1. APG / ImGui の参照版と取得日を更新し、§3〜§5 の対応を先に修正する。
-2. libs/gui に API が追加されたら §6、§8、gallery section、E2E probe を同じ変更で更新する。
-3. N/A を実装済みへ変更するときは、入力注入か単体テストで状態根拠を残す。
-4. disabled / semantic / query の共通 API 追加は、横断穴を閉じる変更として記録する。
-5. TASK-121.2 は異常系、TASK-121.3 / 121.4 は shell・設定・リスト画面を引き継ぐ。
+1. When APG / ImGui source versions or fetch dates change, update the §3–§5 mapping first.
+2. When libs/gui gains an API, update §6, §8, gallery sections, and the E2E probe in the same change.
+3. When changing N/A to implemented, leave state evidence via input injection or a unit test.
+4. Adding a shared disabled / semantic / query API closes a cross-cutting gap and must be recorded as such.
+5. Abnormal / boundary coverage lives in the torture suite; shell, settings, and list screens live in the settings shell and list+menu shell examples.
 
-## 13. TASK-121.2 異常系カタログへの参照
+## 13. Torture suite reference
 
-正常系（本マトリクス + `examples/35_gui_gallery`）の対となる異常系・境界系スイートは次を参照する。
+The abnormal / boundary suite that pairs with the normal path (this matrix + `examples/35_gui_gallery`) is:
 
-- 計画: `docs/plans/PLAN_gui_torture.md`
-- 実行記録・起票候補: `docs/notes/TASK-121.2_gui_torture.md`
-- example: `examples/37_gui_torture`（probe: `state` / `layout` / `scroll`）
-- bench: `zig build bench-gui-frame`（full Context frame 500/1000 行）
-- leak: `zig build test-gui-leak`（PerIdStateStore 上限 assert: final=3072, max≤4096）
+- Plan: `docs/plans/PLAN_gui_torture.md`
+- Example: `examples/37_gui_torture` (probes: `state` / `layout` / `scroll`)
+- Bench: `zig build bench-gui-frame` (full Context frame, 500/1000 rows)
+- Leak: `zig build test-gui-leak` (PerIdStateStore cap assert: final=3072, max≤4096)
 
-### 121.2 で発見された Missing（起票候補・概要）
+### Gaps found in the torture suite (summary)
 
-詳細・file:line・再現 script は notes を正とする。
+Detail, file:line, and reproduction scripts live with the torture suite plan and example.
 
-1. Nested ScrollArea の wheel が内側優先にならず outer/inner 同時変化
-2. PerIdStateStore に trim/TTL/上限がなく ID 長期変化で単調増加 → **TASK-127 で LRU 上限を導入済み**（§18）
-3. TextBuffer / textInputId に最大長 API がない
-4. 改行・CJK・emoji の measure / coverage は §17 で default font の観測契約を明文化済み
-5. popup 長文 item の小画面 outer はみ出し仕様が未明文化
-6. zero-size / overflow container の hit-test・clip・child rect 仕様未定義
-7. drag 中 layout 変更時の rect cache 同期遅延は §16 で現行契約を明文化済み
-8. 自動 ID 同一ラベル衝突は §17 で現行契約と `Id` 版利用規約を明文化済み
+1. Nested ScrollArea wheel does not prefer the inner area; outer/inner change together
+2. PerIdStateStore had no trim/TTL/cap, so long-lived ID churn grew monotonically → **LRU cap introduced** (see §18)
+3. TextBuffer / textInputId has no max-length API
+4. Newline / CJK / emoji measure / coverage: default-font observation contract is spelled out in §17
+5. Small-screen outer overflow for long popup item text is not yet documented as a contract
+6. Hit-test / clip / child rect behavior for zero-size / overflow containers is undefined
+7. Rect-cache sync lag when layout changes during drag: current contract is spelled out in §16
+8. Auto-ID same-label collisions: current contract and `Id` variant usage rules are spelled out in §17
 
-## AC#5 / AC#6 セルフチェック
+## AC#5 / AC#6 self-check
 
-- AC#5: §2 に APG URL・living document・版表記なし・30 パターン・取得日、ImGui URL・v1.92.6・取得日を記載。
-- AC#6: §7 と §10 に disabled API 不足、PopupItem.enabled / Command.enabled の個別対応、stepgrid editable、focus と semantic role の不足、専用 query API 不足を記載。
+- AC#5: §2 records APG URL, living document, no version label, 30 patterns, fetch date; ImGui URL, v1.92.6, fetch date.
+- AC#6: §7 and §10 record missing disabled API, individual PopupItem.enabled / Command.enabled handling, stepgrid editable, missing focus and semantic role, and missing dedicated query API.
 
-## 14. TASK-121.3 観測（設定画面シェル / examples/39_settings_shell）
+## 14. Settings shell observations
 
-`examples/39_settings_shell` で左ナビ + 3 フォーム（General / Editor / Audio、合計 36 コントロール）を現有 API のみで構築した結果。`libs/gui` 本体は変更していない。
+Results from building a left nav + three forms (General / Editor / Audio, 36 controls total) with current APIs only in `examples/39_settings_shell`. libs/gui itself was not changed.
 
-### 14.1 既存 Missing への証拠追記（重複行は作らない）
+### 14.1 Evidence against existing Missing rows (do not duplicate rows)
 
-| 項目 | 121.3 での観測 |
+| Item | Observation in the settings shell |
 |---|---|
-| Tabs | 専用 API なし。左ナビ section 切替を `selectableLabelId` + app 側 section enum で代用。 |
-| Accordion / Disclosure | 専用 widget なし。フォームは常時展開の `ScrollArea` 内フラットリストで代替。 |
-| Combobox / dropdown / select | 専用 widget なし。theme / indent / font / output / buffer は `radioId` 群で代替。 |
-| Meter | 未使用・未実装のまま（Audio の show_meter は checkbox フラグのみ）。 |
-| Spinbutton | 数値は `sliderI32Id` / `sliderF32Id` で代替。 |
-| Tooltip | form description は `labelEx` の固定文で代替。専用 hover tooltip API なし。 |
-| Dialog (Modal) | 本シェルでは不要。モーダル確認 UI は未検証。 |
+| Tabs | No dedicated API. Left-nav section switching uses `selectableLabelId` + an app-side section enum. |
+| Accordion / Disclosure | No dedicated widget. Forms use a flat always-expanded list inside `ScrollArea`. |
+| Combobox / dropdown / select | No dedicated widget. theme / indent / font / output / buffer use groups of `radioId`. |
+| Meter | Unused and still unimplemented (Audio `show_meter` is a checkbox flag only). |
+| Spinbutton | Numbers use `sliderI32Id` / `sliderF32Id` instead. |
+| Tooltip | Form description uses fixed `labelEx` text. No dedicated hover tooltip API. |
+| Dialog (Modal) | Not needed in this shell. Modal confirm UI was not exercised. |
 
-### 14.2 121.3 で新規に観測したギャップ
+### 14.2 New gaps observed in the settings shell
 
-1. **`selectableLabelId` に clicked 結果がなく、nav activation に focus 依存の app 側 glue が必要**  
-   `claimFocus` は click 時に走るが「section 選択」セマンティクスではない。app が `focused_id` を section enum に写す。focus が効かない場合は `hot_id` + `mouse_pressed` の click glue が必要（hack）。
-2. **Tabs 相当の selected section semantics が専用 API として存在しない**  
-   選択中背景は外側 `beginBox` の bg で app が描画。`selectableLabel` の selection background はテキスト選択用に残した。
-3. **共通 form row / label-for / field description の composable API が存在しない**  
-   各コントロールは label 付き widget と補助 `labelEx` を手で縦に積む。field と説明の紐付け API はない。
-4. **一般 widget 共通の disabled state API が存在しない**  
-   設定項目の無効化（例: audio off 時に volume を disable）を表現できない。PopupItem/Command の個別 enabled のみ。
-5. **非 text widget の keyboard focus traversal / tab order API が存在しない**  
-   checkbox / toggle / radio / slider は focus を claim しない。E2E の `focused=` 期待のため app が `claimFocus` glue を足す必要がある（hack）。
-6. **focus-visible の共通描画状態 API が存在しない**  
-   keyboard 操作中のフォーカスリング描画を widget 横断で宣言できない。
-7. **3 フォーム 36 コントロールの明示 ID 管理が必要**  
-   自動 ID は使わず section ごとに ID レンジを分離。probe / harness 座標導出が同一 ID 表に依存。
-8. **ScrollArea 長フォームの hit-test は可能だが、scroll 後 rect の再取得が caller 責務**  
-   layout probe を scroll 後に取り直し、座標を再計算する運用が必須（harness に座標変数機能はない）。
+1. **`selectableLabelId` has no clicked result; nav activation needs focus-dependent app glue**  
+   `claimFocus` runs on click but is not "section select" semantics. The app maps `focused_id` to a section enum. When focus does not apply, `hot_id` + `mouse_pressed` click glue is required (hack).
+2. **No dedicated API for Tabs-equivalent selected section semantics**  
+   Selected background is drawn by the app via an outer `beginBox` bg. `selectableLabel` selection background remains for text selection.
+3. **No composable API for shared form row / label-for / field description**  
+   Each control is a hand-stacked labeled widget plus helper `labelEx`. There is no field-to-description binding API.
+4. **No shared disabled-state API for general widgets**  
+   Cannot express disabling a setting (e.g. volume when audio is off). Only PopupItem/Command per-item enabled exists.
+5. **No keyboard focus traversal / tab-order API for non-text widgets**  
+   checkbox / toggle / radio / slider do not claim focus. For E2E `focused=` expectations the app must add `claimFocus` glue (hack).
+6. **No shared focus-visible drawing-state API**  
+   Cannot declare a focus ring for keyboard interaction across widgets.
+7. **Explicit ID management is required for 3 forms / 36 controls**  
+   Auto IDs are avoided; ID ranges are split per section. Probe / harness coordinate derivation depends on that same ID table.
+8. **ScrollArea long-form hit-test works, but post-scroll rect re-fetch is caller duty**  
+   Re-take the layout probe after scroll and recompute coordinates (the harness has no coordinate variables).
 
-### 14.3 121.2 既記録との関係
+### 14.3 Relation to torture-suite records
 
-- Nested ScrollArea wheel・PerIdStateStore 上限・TextBuffer 最大長などは本シェルでは再起票しない。
-- 設定画面は section ごとに独立 ScrollArea 1 本で、nested wheel 問題は再現経路に含めなかった。
+- Nested ScrollArea wheel, PerIdStateStore caps, TextBuffer max length, and similar items are not re-filed from this shell.
+- The settings screen uses one independent ScrollArea per section and did not include a nested-wheel reproduction path.
 
-## 15. TASK-121.4 観測（リスト + メニュー shell）
+## 15. List+menu shell observations
 
-証拠 example: `examples/40_list_menu`（probe: `state` / `layout`、E2E: `e2e.sh` 7 シナリオ、port 9230–9239）。
-bench: `zig build bench-gui-list-menu`（500 行 full Context frame、ReleaseFast、1024×768）。
-libs/gui 本体は変更していない。不足は example 側 custom/hack または Missing として記録する。
+Evidence example: `examples/40_list_menu` (probes: `state` / `layout`; E2E: `e2e.sh` 7 scenarios; ports 9230–9239).
+Bench: `zig build bench-gui-list-menu` (500-row full Context frame, ReleaseFast, 1024×768).
+libs/gui itself was not changed. Gaps are recorded as example-side custom/hack or Missing.
 
-### 15.1 観測結果（Missing 完全リスト）
+### 15.1 Observations (complete Missing list)
 
-1. **500 行 full Context frame 時間** — 毎フレーム全行を `selectableLabelId` 付きで構築する。`bench-gui-list-menu` で avg/min/p95 を計測（既存 `bench-gui-frame` の 500 行値と対比）。virtualization なし。
-2. **Listbox 専用 semantics なし** — `selectableLabelId` はテキスト選択用であり、単一行 listbox の選択モデルではない。行選択・ハイライトは app 側 state（`selected_row` / `active_row`）で管理。
-3. **List keyboard navigation API なし** — 上下キーによる active row 移動は app が `key_down UP/DOWN` を処理する custom 実装。popup 表示中は list ナビを抑制。
-4. **Checkbox 付き persistent multi-select popup なし** — `PopupItem` に checked 状態がない。filter は `[on]/[off]` ラベル生成 + 項目選択で閉じる API 挙動を app が再オープンして複数選択を再現（`filter_reopen_count`）。
-5. **popup 同時表示数 1 件** — `PopupState` は同時 1 つのみ。menuBar と context/filter は同時保持できない。E2E シナリオ 7 で File menu 表示中に row 右クリックしても `popup_count=1` のまま（観測値: 右クリック後も menu が popup を保持／context は置換しきれない、または次フレームで menu が再確保）。menu と context の重ね合わせは不可。
-6. **Ellipsis 標準 API なし** — 長い filename の省略は app が `font.measure` で幅を見て `...` を付与。独自 rasterizer / `DrawList` 直接操作は行わない。
-7. **Virtualization API なし** — 500 行を毎フレーム全構築・全 layout。スクロールは `beginScrollArea` のみ。
-8. **複数行選択・ドラッグ選択なし** — 本画面は単一選択のみ。probe で `multi_select=0` / `drag_select=0` を明示。
-9. **Toolbar 専用 API なし** — Back / New / Refresh は `buttonId` 列として構築。
-10. **Table / column / tree view なし** — リストは row box + kind label + selectableLabel + detail の手組み。列レイアウト・ツリーは提供されない。
+1. **500-row full Context frame time** — Every frame builds all rows with `selectableLabelId`. Measure avg/min/p95 with `bench-gui-list-menu` (compare against the 500-row values from existing `bench-gui-frame`). No virtualization.
+2. **No dedicated Listbox semantics** — `selectableLabelId` is for text selection, not a single-line listbox selection model. Row select / highlight is app state (`selected_row` / `active_row`).
+3. **No list keyboard navigation API** — Up/down active-row movement is a custom app handler for `key_down UP/DOWN`. List nav is suppressed while a popup is open.
+4. **No checkbox-backed persistent multi-select popup** — `PopupItem` has no checked state. Filters rebuild `[on]`/`[off]` labels and, after item selection closes the popup, the app reopens to simulate multi-select (`filter_reopen_count`).
+5. **At most one popup at a time** — `PopupState` holds only one. menuBar and context/filter cannot be held together. E2E scenario 7: right-clicking a row while the File menu is open still yields `popup_count=1` (observed: after right-click the menu keeps the popup / context does not fully replace it, or the menu reclaims on the next frame). Overlaying menu and context is impossible.
+6. **No standard ellipsis API** — Long filenames are truncated by the app with `font.measure` then `...`. No custom rasterizer / direct `DrawList` use.
+7. **No virtualization API** — All 500 rows are built and laid out every frame. Scrolling is `beginScrollArea` only.
+8. **No multi-row select / drag select** — This screen is single-select only. The probe explicitly reports `multi_select=0` / `drag_select=0`.
+9. **No dedicated Toolbar API** — Back / New / Refresh are a `buttonId` row.
+10. **No Table / column / tree view** — The list is hand-built from row box + kind label + selectableLabel + detail. No column layout or tree.
 
-### 15.2 custom / hack 計数（example 側）
+### 15.2 custom / hack counts (example side)
 
-| 種別 | 件数 | 内容 |
+| Kind | Count | Detail |
 |---|---:|---|
-| row hit-test + 単一選択 glue | 1 | 右/左クリックで `getNodeCachedRect` により行選択 |
-| filter popup 再オープン | 1 | 選択後 `filter_open_request` で次フレーム再 open |
-| keyboard 上下ナビ | 1 | `UP`/`DOWN` → `navigateRows` |
-| ellipsis 文字列生成 | 1 | `ellipsize` + frame arena |
-| menu/context 切替制御 | 1 | context 開要求を menuBarPopup 後に適用、right-press を gui へ渡さない |
-| custom draw | 0 | `ctx.custom` / DrawList 直操作 / 独自 rasterizer なし |
+| row hit-test + single-select glue | 1 | Left/right click selects a row via `getNodeCachedRect` |
+| filter popup reopen | 1 | After selection, `filter_open_request` reopens next frame |
+| keyboard up/down nav | 1 | `UP`/`DOWN` → `navigateRows` |
+| ellipsis string build | 1 | `ellipsize` + frame arena |
+| menu/context switch control | 1 | Apply context-open request after menuBarPopup; do not forward right-press to gui |
+| custom draw | 0 | No `ctx.custom` / direct DrawList / custom rasterizer |
 
-### 15.3 サイズ別確認
+### 15.3 Size checks
 
-640×360 / 1024×768 / 1440×900 を別プロセスで起動し `snapshot fb`（path 省略）で目視。padding/gap は幅に応じて調整、固定絶対配置は使わない。
+Launch 640×360 / 1024×768 / 1440×900 as separate processes and visually inspect path-omitted `snapshot fb`. Adjust padding/gap by width; do not use fixed absolute placement.
 
-## 16. TASK-131 レイアウトと入力の時間契約
+## 16. Layout and input timing contract
 
-> **本タスク時点の観測（2026-07-18）**: 以下は libs/gui の現行実装に基づく契約である。
-> TASK-130 等の並行変更で clip / hit-test 境界が変わる場合は、当該タスクの節と本節を併読すること。
+> **Observation as of 2026-07-18**: The following is the contract of the current libs/gui implementation.
+> If concurrent work changes clip / hit-test boundaries, read that section together with this one.
 
-### 16.1 フレーム順序
+### 16.1 Frame order
 
-| 段階 | 処理 | 根拠 |
+| Stage | Work | Evidence |
 |---|---|---|
-| `beginFrame` | arena reset、input/id_stack/state 初期化、draw_list reset、layout root 生成（未 measure/place） | `libs/gui/src/context.zig:220-243` |
-| widget 呼び出し | 前フレーム `rect_cache` で同期 hit-test、当フレーム layout tree を構築 | `libs/gui/src/widgets.zig:203-206` |
+| `beginFrame` | arena reset; input/id_stack/state init; draw_list reset; layout root created (not yet measured/placed) | `libs/gui/src/context.zig:220-243` |
+| widget calls | synchronous hit-test against previous-frame `rect_cache`; build this frame's layout tree | `libs/gui/src/widgets.zig:203-206` |
 | `endFrame` | `layout.measure` → `layout.place` → `rect_cache.clearRetainingCapacity` → `updateRectCache` → `emitNode` → `frame_active=false` | `libs/gui/src/context.zig:245-260` |
 
-`endFrame` は hit-test を行わない。focus 解除・active 張り付き防止は `endFrame` 末尾の state 更新のみ（`context.zig:261-270`）。
+`endFrame` does not hit-test. Focus clear and active stuck prevention are only the state updates at the end of `endFrame` (`context.zig:261-270`).
 
-### 16.2 rect cache の可視時点
+### 16.2 When the rect cache is visible
 
-- `updateRectCache` は `endFrame` の measure/place 完了後にのみ走る（`context.zig:256-257`）。
-- 登録対象は `beginBox` で `cfg.id != 0` の明示 ID ノードのみ。`{rect, clip, measured_w, measured_h}` を保存（`context.zig:420-429`）。
-- `getNodeRect` / `getNodeCachedRect` / `getNodeMeasured` は前フレーム確定値を返す。`beginFrame` 直後も更新されない（`context.zig:377-404`）。
-- 初回フレーム・未知 ID・自動採番ノード（`beginBox` の `cfg.id==0`）は null。
-- 同一フレーム内の明示 ID 重複は Debug assert で契約違反（`context.zig:424-425`）。
+- `updateRectCache` runs only after measure/place in `endFrame` (`context.zig:256-257`).
+- Registration covers only `beginBox` nodes with `cfg.id != 0`. Stores `{rect, clip, measured_w, measured_h}` (`context.zig:420-429`).
+- `getNodeRect` / `getNodeCachedRect` / `getNodeMeasured` return previous-frame settled values. They are not updated right after `beginFrame` either (`context.zig:377-404`).
+- First frame, unknown IDs, and auto-numbered nodes (`beginBox` with `cfg.id==0`) return null.
+- Duplicate explicit IDs in the same frame are a Debug assert contract violation (`context.zig:424-425`).
 
-### 16.3 drag 中の layout 変更
+### 16.3 Layout changes during drag
 
-layout 変更を伴う drag では次の 1 フレーム遅延が観測される（現行契約。修正は採用しない）。
+Drags that change layout show a one-frame lag (current contract; not adopted as a fix target):
 
 ```text
-フレーム N:
-  前フレーム rect を読む
-  → buttonBehavior が前フレーム rect で active / held を判定
-  → widget 構築中に layout 変更
-  → endFrame で新 rect を cache に保存・新 layout を描画
+Frame N:
+  read previous-frame rect
+  → buttonBehavior decides active / held from previous-frame rect
+  → layout changes while widgets are built
+  → endFrame stores new rect in cache and draws the new layout
 
-フレーム N+1:
-  新 rect cache を読んで hit-test
+Frame N+1:
+  hit-test against the new rect cache
 ```
 
-フレーム N の描画は新 layout、hit-test は旧 layout。通常の static layout・slider drag・scroll では観測しにくい。
+Frame N draws the new layout and hit-tests the old layout. Hard to observe under ordinary static layout, slider drag, or scroll.
 
-### 16.4 採用理由と非採用案
+### 16.4 Adopted approach and rejected alternatives
 
-**採用**: 前フレーム rect cache による同期 hit-test を現行契約として維持。
+**Adopted**: Keep synchronous hit-test against the previous-frame rect cache as the current contract.
 
-**非採用案**（同一フレーム rect 反映）:
+**Rejected** (same-frame rect reflection):
 
-| 案 | 理由 |
+| Option | Why rejected |
 |---|---|
-| A: widget 構築前に layout 確定 | 兄弟 measure・親 sizing に依存し、全 widget 構築前に最終 rect を得られない |
-| B: endFrame 後に hit-test 再実行 | 同期返却 API（`ButtonResult` / `changed`）と衝突。イベント保存・再評価・順序定義が必要 |
-| C: widget ごとに予測 rect | flex/scroll/popup/動的ラベル幅を含む一般 widget に適用不可。layout と hit-test の二重経路 |
+| A: Finalize layout before widget construction | Sibling measure and parent sizing mean final rects cannot be known before all widgets are built |
+| B: Re-run hit-test after endFrame | Collides with synchronous return APIs (`ButtonResult` / `changed`). Needs event retention, re-evaluation, and ordering rules |
+| C: Predicted rect per widget | Not applicable to general widgets with flex/scroll/popup/dynamic label width. Would duplicate layout and hit-test paths |
 
-実害は限定ケース（drag 中の親 layout 変更、表示切替、release 位置が新旧 rect で不一致）に留まる。
+Real harm is limited to cases such as parent layout change during drag, display switching, and release position mismatch between old and new rects.
 
-### 16.5 TASK-121.2 E2E 根拠
+### 16.5 Torture-suite E2E evidence
 
-`examples/37_gui_torture/e2e_input_state.txt` が現行契約の観測値を固定している。
+`examples/37_gui_torture/e2e_input_state.txt` pins the observed values for the current contract.
 
-- F1 による layout shift 中も `active=slider`、`dragging=1`、`layout_generation=1` を維持（`e2e_input_state.txt:17-25`）
-- mouse up 後 `active_is_zero=1`（`e2e_input_state.txt:27-30`）
+- During F1 layout shift, `active=slider`, `dragging=1`, and `layout_generation=1` are held (`e2e_input_state.txt:17-25`)
+- After mouse up, `active_is_zero=1` (`e2e_input_state.txt:27-30`)
 
-### 16.6 TASK-126 wheel 契約との境界
+### 16.6 Boundary with the wheel contract
 
-TASK-126 の scroll wheel は `endScrollArea` 同フレーム反映（内側優先消費・viewport node への scroll offset 適用）という scroll 固有の入力配送契約である（`context.zig:64-66` の `ScrollState` コメント参照）。
+Scroll wheel input is a scroll-specific delivery contract: same-frame reflection in `endScrollArea` (inner-first consumption; scroll offset applied to the viewport node). See the `ScrollState` comment at `context.zig:64-66`.
 
-任意の layout 変更を同一フレーム hit-test に反映する一般契約とは分離して扱う。wheel と rect cache 遅延は矛盾しない。
+Treat that separately from any general contract that would reflect arbitrary layout changes into same-frame hit-test. Wheel behavior and rect-cache lag are not in conflict.
 
-## 17. TASK-132 テキスト計測・描画契約
+## 17. Text measure/draw contract
 
-> **本タスク時点の観測（2026-07-18）**: 以下は `gui.default_font`（spleen 8×16 bitmap）を前提とした観測契約である。
-> 別の `Font` 実装を渡した場合の glyph coverage と advance はその実装の契約に依存する。
+> **Observation as of 2026-07-18**: The following observation contract assumes `gui.default_font` (spleen 8×16 bitmap).
+> Glyph coverage and advance for a different `Font` implementation follow that implementation's contract.
 
-### 17.1 適用範囲と Font 依存
+### 17.1 Scope and Font dependence
 
-- 対象: `Font.measure` / `Font.drawTo` / `TextLayout` / label 系 widget / `textInputId`
-- default font: ASCII `32..127` の 8×16 bitmap（`libs/gui/src/font.zig:13-19`, `font.zig:208-215`）
-- font chain / emoji font / glyph fallback は `libs/gui` に存在しない
+- Targets: `Font.measure` / `Font.drawTo` / `TextLayout` / label-family widgets / `textInputId`
+- Default font: ASCII `32..127` 8×16 bitmap (`libs/gui/src/font.zig:13-19`, `font.zig:208-215`)
+- No font chain / emoji font / glyph fallback in `libs/gui`
 
-### 17.2 改行
+### 17.2 Newlines
 
-| 経路 | 挙動 | 根拠 |
+| Path | Behavior | Evidence |
 |---|---|---|
-| label / selectableLabel 等（表示） | `\n` は strip されない。1 codepoint として measure 8px。描画は glyph 範囲外のためスキップ、advance は 8px 進む（行送りなし） | `font.zig:18-19`, `font.zig:81-85` |
-| TextInput（編集） | typed char / paste / selection replacement は改行・ASCII 制御文字を挿入しない | `widgets.zig:500`, `widgets.zig:619-621`, `text_edit.zig:377`, `text_edit.zig:418` |
+| label / selectableLabel etc. (display) | `\n` is not stripped. Measured as 1 codepoint at 8px. Draw skips (out of glyph range); advance still moves 8px (no line advance) | `font.zig:18-19`, `font.zig:81-85` |
+| TextInput (edit) | Typed char / paste / selection replacement do not insert newlines or ASCII controls | `widgets.zig:500`, `widgets.zig:619-621`, `text_edit.zig:377`, `text_edit.zig:418` |
 
-default font は 1 行描画契約（改行による高さ増加なし）。
+Default font is a single-line draw contract (no height growth from newlines).
 
 ### 17.3 CJK
 
-valid UTF-8 の CJK は 1 codepoint として処理。
+Valid UTF-8 CJK is handled as one codepoint.
 
-| 項目 | default font | 根拠 |
+| Item | default font | Evidence |
 |---|---|---|
-| measure | 1 文字 8px | `font.zig:57-61` |
-| TextLayout | 1 codepoint 分の byte offset / prefix_width | `text_edit.zig:54-79` |
-| 描画 | glyph なし（スキップ） | `font.zig:81-85` |
-| advance | glyph なくても 8px | `font.zig:64-71` |
-| fallback | なし | — |
+| measure | 8px per character | `font.zig:57-61` |
+| TextLayout | byte offset / prefix_width for one codepoint | `text_edit.zig:54-79` |
+| draw | no glyph (skipped) | `font.zig:81-85` |
+| advance | 8px even without a glyph | `font.zig:64-71` |
+| fallback | none | — |
 
-`wordRange` は非 ASCII 連続列を 1 word とする。grapheme cluster / 言語別分割は未実装（`text_edit.zig:112-128`）。
+`wordRange` treats a contiguous non-ASCII run as one word. Grapheme clusters / language-specific segmentation are unimplemented (`text_edit.zig:112-128`).
 
 ### 17.4 emoji
 
-emoji も valid UTF-8 なら codepoint 単位。default font では CJK と同様に glyph 未描画・advance 8px。
+Emoji that is valid UTF-8 is also per codepoint. Under the default font, like CJK: no glyph drawn, advance 8px.
 
-ZWJ sequence / variation selector / skin tone 等は grapheme 単位では処理せず、構成 codepoint ごとに処理する。表示上の 1 emoji と logical width の一致は保証されない。
+ZWJ sequences / variation selectors / skin tones are not handled as graphemes; each constituent codepoint is processed. Visual one-emoji units are not guaranteed to match logical width.
 
-### 17.5 default font の coverage と fallback
+### 17.5 Default font coverage and fallback
 
-- coverage: ASCII `32..127` の bitmap 立ちビット（`font.zig:101-120`）
-- 非 ASCII: `.notdef` や代替 glyph に置換されず描画スキップ（`font.zig:81-85`）
-- fallback font / font chain: なし
+- Coverage: set bits for ASCII `32..127` bitmaps (`font.zig:101-120`)
+- Non-ASCII: not replaced with `.notdef` or a substitute glyph; draw is skipped (`font.zig:81-85`)
+- Fallback font / font chain: none
 
-### 17.6 measure / draw advance / ink 幅
+### 17.6 measure / draw advance / ink width
 
-default font の `measure`:
+Default font `measure`:
 
-- valid UTF-8: codepoint 数 × 8
-- invalid UTF-8: byte 数 × 8
-- missing glyph / newline / CJK / emoji: いずれも advance 8px
+- valid UTF-8: codepoint count × 8
+- invalid UTF-8: byte count × 8
+- missing glyph / newline / CJK / emoji: all advance 8px
 
-`drawTo` も codepoint ごとに 8px 進むため logical measure と描画カーソル幅は一致する。glyph 未描画時があるため **logical width は ink pixel 幅を意味しない**。
+`drawTo` also advances 8px per codepoint, so logical measure and draw-cursor width match. Because glyphs may be skipped, **logical width is not ink pixel width**.
 
-layout text leaf: 幅 = `Font.measure`、高さ = `Font.metrics().line_height`（`libs/gui/src/layout.zig:166-169`）。
+Layout text leaf: width = `Font.measure`, height = `Font.metrics().line_height` (`libs/gui/src/layout.zig:166-169`).
 
 ### 17.7 TextLayout / caret / selection / hit-test
 
-`buildTextLayout` は codepoint ごとに UTF-8 byte offset・logical advance・累積 `prefix_widths` を生成（`text_edit.zig:54-79`）。
+`buildTextLayout` builds per-codepoint UTF-8 byte offsets, logical advance, and cumulative `prefix_widths` (`text_edit.zig:54-79`).
 
-- `selectableLabel`: 幅 = `prefix_widths[count]`、高さ = line_height（`widgets.zig:294-298`）
-- `textInputId`: selection / caret / scroll / hit-test は `prefix_widths` 基準（`widgets.zig:351-378`）
-- `.fit` 幅 = `Font.measure` + padding（`widgets.zig:596-600`）
-- ink height = `ascent + descent`（line_height ではない。`widgets.zig:531-533`）
+- `selectableLabel`: width = `prefix_widths[count]`, height = line_height (`widgets.zig:294-298`)
+- `textInputId`: selection / caret / scroll / hit-test use `prefix_widths` (`widgets.zig:351-378`)
+- `.fit` width = `Font.measure` + padding (`widgets.zig:596-600`)
+- ink height = `ascent + descent` (not line_height; `widgets.zig:531-533`)
 
-`hitTest` は advance 中点を境界として **codepoint index** を返す（byte offset ではない）（`text_edit.zig:91-100`）。
+`hitTest` returns a **codepoint index** (not a byte offset), using advance midpoints as boundaries (`text_edit.zig:91-100`).
 
-### 17.8 自動 ID と同一ラベル衝突
+### 17.8 Auto ID and same-label collisions
 
-label 系自動 ID は `IdStack.make(label)` = 現在 seed + label の hash（`libs/gui/src/id.zig:83-85`）。
+Label-family auto IDs are `IdStack.make(label)` = current seed + label hash (`libs/gui/src/id.zig:83-85`).
 
-該当 API: `button` / `buttonEx` / `selectableLabel` / `sliderI32` / `sliderF32` / `svSquare` / `hueBar` / `checkbox` / `toggle` / `radio`（各 `id_stack.make` 呼び出しは `widgets.zig` 参照）。`colorSwatch` は `makeInt(色値)`。`textInputId` は自動 ID 版なし。
+Covered APIs: `button` / `buttonEx` / `selectableLabel` / `sliderI32` / `sliderF32` / `svSquare` / `hueBar` / `checkbox` / `toggle` / `radio` (each `id_stack.make` call is in `widgets.zig`). `colorSwatch` uses `makeInt(color value)`. `textInputId` has no auto-ID variant.
 
-同一 `IdStack` scope 内で同一 label → 同一 ID → `endFrame` の `updateRectCache` で Debug assert（`context.zig:424-425`）。
+Same label in the same `IdStack` scope → same ID → Debug assert in `endFrame`'s `updateRectCache` (`context.zig:424-425`).
 
-負系 E2E: `examples/37_gui_torture/negative_auto_id.sh`（非ゼロ終了 + assert/panic 痕跡を期待）。
+Negative E2E: `examples/37_gui_torture/negative_auto_id.sh` (expects non-zero exit plus assert/panic traces).
 
-**利用規約**: 同一ラベル並置は `buttonId` / `selectableLabelId` 等の明示 ID 版、または `id_stack.push(i)` で scope を分ける。
+**Usage rule**: For adjacent same labels, use explicit-ID variants such as `buttonId` / `selectableLabelId`, or split scope with `id_stack.push(i)`.
 
-Release build での最後勝ち上書きは契約上の許容動作ではなく、重複 ID を使わないことを前提とする。
+Last-wins overwrite in Release builds is not a contracted allowed behavior; the premise is "do not use duplicate IDs".
 
-### 17.9 利用規約と非対応範囲
+### 17.9 Usage rules and non-goals
 
-| 項目 | 状態 |
+| Item | Status |
 |---|---|
-| 複数行 layout / 折返し | 未対応（1 行契約） |
-| grapheme cluster 処理 | 未対応（codepoint 単位） |
-| glyph fallback / emoji font | 未追加 |
-| 改行の行送り（label 表示） | 未対応（advance のみ） |
-| 自動 ID 同一ラベル | Debug assert で検出（`endFrame` cache 更新時） |
+| Multi-line layout / wrapping | Unsupported (single-line contract) |
+| Grapheme cluster handling | Unsupported (codepoint unit) |
+| Glyph fallback / emoji font | Not added |
+| Newline line advance (label display) | Unsupported (advance only) |
+| Auto-ID same label | Detected by Debug assert (at `endFrame` cache update) |
 
-観測 E2E: `examples/37_gui_torture/e2e_text.txt`（ASCII/CJK/emoji/改行入り label、500 codepoints measure、TextInput caret/selection の codepoint 境界）。
+Observation E2E: `examples/37_gui_torture/e2e_text.txt` (ASCII/CJK/emoji/newline labels, 500-codepoint measure, TextInput caret/selection at codepoint boundaries).
 
-## 18. PerIdStateStore lifetime / LRU 上限（TASK-127）
+## 18. PerIdStateStore lifetime / LRU cap
 
-`PerIdStateStore`（`libs/gui/src/state.zig`）は ID ごとの selection / caret / double-click / TextInput 横スクロールを保持する。
+`PerIdStateStore` (`libs/gui/src/state.zig`) holds per-ID selection / caret / double-click / TextInput horizontal scroll.
 
-| 項目 | 契約 |
+| Item | Contract |
 |---|---|
-| 方式 | frame generation touch + ID リンク LRU |
-| 既定上限 | `max_entries=4096`、`trim_to=3072` |
-| touch | `getOrPut`（`Context.perIdState`）が current-frame を記録し LRU 末尾へ。`get` は touch しない |
-| trim 発火 | `Context.endFrame` 末尾の frame boundary のみ（`count > max_entries` 時） |
-| 保護 | current-frame touch / `active_id` / `focused_id` / `hot_id` / `next_hot_id` |
-| 非表示 | 上限超過時に LRU 古い entry から破棄され得る。再表示時は `PerIdState` 初期値 |
-| caller 所有 | `TextBuffer` と ScrollArea の `*Vec2f` は store 外（trim の影響なし） |
+| Method | frame-generation touch + ID-linked LRU |
+| Default caps | `max_entries=4096`, `trim_to=3072` |
+| touch | `getOrPut` (`Context.perIdState`) records the current frame and moves to LRU tail. `get` does not touch |
+| trim trigger | Only at the frame boundary at the end of `Context.endFrame` (when `count > max_entries`) |
+| Protected | current-frame touch / `active_id` / `focused_id` / `hot_id` / `next_hot_id` |
+| Hidden | When over cap, oldest LRU entries may be discarded. On re-show, `PerIdState` returns to defaults |
+| Caller-owned | `TextBuffer` and ScrollArea `*Vec2f` live outside the store (unaffected by trim) |
 
-| widget | store state | trim 後の挙動 |
+| widget | store state | Behavior after trim |
 |---|---|---|
-| `selectableLabelId` | selection / dragging / double-click | 再生成時に初期 selection |
-| `textInputId` | selection / caret / `scroll_x` / blink | TextBuffer は保持、編集 state は初期化 |
-| `beginScrollArea` | caller 所有 `Vec2f` | store trim の影響なし |
+| `selectableLabelId` | selection / dragging / double-click | Initial selection on recreate |
+| `textInputId` | selection / caret / `scroll_x` / blink | TextBuffer kept; edit state reset |
+| `beginScrollArea` | caller-owned `Vec2f` | Unaffected by store trim |
 
-検証入口:
+Verification entry points:
 
-- unit: `zig build test-gui`（`state.zig` / `context.zig` の LRU・保護・再初期化テスト）
-- leak: `zig build test-gui-leak`（30,000 unique ID 生成でも final=3072、max_observed≤4096）
-- E2E: `examples/39_settings_shell/e2e.sh` scenario 5（他 section 表示中も `editor_scroll_y` が app 側で保持。再表示直後の rect_cache miss clamp は ScrollArea 契約）
+- unit: `zig build test-gui` (LRU / protect / re-init tests in `state.zig` / `context.zig`)
+- leak: `zig build test-gui-leak` (even with 30,000 unique IDs: final=3072, max_observed≤4096)
+- E2E: `examples/39_settings_shell/e2e.sh` scenario 5 (`editor_scroll_y` kept by the app while another section is shown; rect_cache miss clamp right after re-show is ScrollArea contract)

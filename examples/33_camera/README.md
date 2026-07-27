@@ -1,23 +1,23 @@
-# 33: Camera（2D ビューポート / 追従スクロール）
+# Example 33: Camera (2D viewport / follow scroll)
 
-`kit.gfx` の 2D カメラ / ビューポート デモ（TASK-111.4）。
+2D camera / viewport demo in `kit.gfx`.
 
-- 画面より広いワールド（1280×720）に市松模様 + 目印 `usako.png`
-- 矢印キー / WASD で手動 pan（ワールド境界 clamp）
-- **F** でターゲット追従 ON/OFF（固定 f32 lerp + clamp）
-- 60Hz `FixedTimeStep` で target / Camera を更新
+- World larger than the window (1280×720) with a checkerboard + landmark `usako.png`
+- Arrow keys / WASD for manual pan (clamped to world bounds)
+- **F** toggles target follow (fixed f32 lerp + clamp)
+- Target / Camera update on a 60 Hz `FixedTimeStep`
 
-## 実行
+## Run
 
 ```bash
-# リポジトリ root から
+# From the repository root
 zig build run-example_33
 
-# standalone
+# Standalone
 cd examples/33_camera && zig build run
 ```
 
-## ヘッドレス E2E（CRC 固定）
+## Headless E2E (fixed CRC)
 
 ```bash
 TMPD=$(mktemp -d)
@@ -27,25 +27,25 @@ VP_HEADLESS=1 \
   zig build run-example_33
 ```
 
-固定 CRC（640×360・固定背景 / world / lerp / 仮想クロック）:
+Fixed CRC (640×360, fixed background / world / lerp / virtual clock):
 
-| シーン | crc |
+| Scene | crc |
 |--------|-----|
-| 初期 | `11D17951` |
-| 手動スクロール後 | `47CA82D8` |
-| 境界付近 | `B81EB721` |
-| 追従有効化後（lerp 進行） | `EE378351` |
-| 追従安定後 | `A775CEB8` |
+| Initial | `11D17951` |
+| After manual pan | `47CA82D8` |
+| Near boundary | `B81EB721` |
+| After enabling follow (lerp in progress) | `EE378351` |
+| After follow settles | `A775CEB8` |
 
-script 本体は `e2e.txt`（expect 焼き込み済み）。
-CRC の正は本開発機（aarch64-darwin）での採取値。他 platform で divergence が出た場合は再採取。
+Script: `e2e.txt`. CRC values were captured on aarch64-darwin; re-capture if another platform diverges.
+See [`docs/harness.md`](../../docs/harness.md).
 
-## 操作
+## Controls
 
-- **矢印 / WASD**: 手動 pan
-- **F**: ターゲット追従の有効 / 無効
-- **ESC / Q**: 終了
+- **Arrows / WASD**: manual pan
+- **F**: toggle target follow
+- **ESC / Q**: quit
 
-## 依存
+## Dependencies
 
-`@import("kit").gfx`（Camera / FixedTimeStep / drawSpriteEx / Sprite）。
+`@import("kit").gfx` (Camera / FixedTimeStep / drawSpriteEx / Sprite).

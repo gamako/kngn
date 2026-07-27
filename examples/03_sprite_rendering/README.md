@@ -1,91 +1,68 @@
-# 03: Sprite Rendering
+# Example 03: Sprite Rendering
 
-スプライトシステムのデモンストレーション。PNG画像を読み込んで画面に表示し、キーボードで操作します。
+Sprite demo: load a PNG, draw it with clipping, move it with the keyboard.
 
-## 機能
+## Features
 
-- PNG画像の読み込み（`libs/png-decoder/`を使用）
-- クリッピング処理（画面外への描画を安全に処理）
-- キーボードによるインタラクティブな操作
+- PNG load via `libs/png` (`@embedFile` + `sprite.Sprite.initFromData`)
+- Clipping (safe draw when the sprite leaves the window)
+- Keyboard movement
 
-## 操作方法
+## Controls
 
-- **矢印キー**: スプライトを移動（5px/フレーム）
-- **ESC**: 終了
+- **Arrow keys**: move the sprite (5 px per key event)
+- **ESC**: quit
 
-## ビルド・実行
+## Build / run
 
-### ルートディレクトリから
+From the repository root:
 
 ```bash
-# デフォルト（Objective-C版）
 zig build run-example_03
-
-# プラットフォームを指定
-zig build run-example_03-swift    # Swift版
-zig build run-example_03-metal    # Metal版
+zig build run-example_03 -Dplatform=swift
+zig build run-example_03 -Dplatform=metal
 ```
 
-### 独立ビルド
+Standalone:
 
 ```bash
 cd examples/03_sprite_rendering
-
-# デフォルト（Objective-C版）
 zig build run
-
-# プラットフォームを指定
-zig build run -Dplatform=swift    # Swift版
-zig build run -Dplatform=metal    # Metal版
+zig build run -Dplatform=swift
+zig build run -Dplatform=metal
 ```
 
-## 使用技術
+## Stack
 
-- **Zig 高レベル API** (`@import("platform")`):
-  - `window.lockFramebuffer()` / `fb.unlock()` - フレームバッファアクセス
-  - `window.present()` - 画面更新
-  - `window.pollEvents()` / `window.nextEvent()` - イベント処理（tagged union）
+- **Platform API** (`@import("platform")`):
+  - `lockFramebuffer` / `unlock` / `present`
+  - `pollEvents` / `nextEvent`
+- **Sprite helper** (`@import("sprite")` — `libs/gfx` sprite path wired by the build):
+  - `Sprite` / `drawSprite` (premultiplied alpha blend via `libs/pixelops`)
+- **PNG**: `libs/png`
 
-- **ヘルパーモジュール**:
-  - `keyboard.zig` - KeyCode utility（任意、本例では未使用）
-  - `sprite.zig` - スプライト描画システム（Phase 2ヘルパー）
+## Technical notes
 
-- **サブプロジェクト**:
-  - `libs/png-decoder/` - PNG画像デコード
+### Current behaviour
 
-## 技術的な詳細
+- Clipping when the sprite is partially off-screen
+- Free position updates
+- PNG → canonical BGRA `0xAARRGGBB` (memory `[B,G,R,A]`), matching the framebuffer
+- `drawSprite` uses premultiplied alpha blending (transparent pixels leave the background)
 
-### スプライトシステム（Phase 1実装）
+### Limits of this sample
 
-現在の実装には以下の機能が含まれます：
+- Single sprite only
+- No rotate / scale (position only; see `examples/31_sprite_ex` for `drawSpriteEx`)
+- Still image (see `examples/32_sprite_anim` for atlas animation)
 
-- ✅ **クリッピング処理**: スプライトが画面外にはみ出しても安全に描画
-- ✅ **座標管理**: スプライトの位置を自由に変更可能
-- ✅ **PNG読み込み**: RGBA形式の画像を読み込み
+## Sprite asset
 
-### Phase 1の制限事項
+- File: `examples/image/usako.png`
+- Size: 64×64
+- Format: RGBA PNG
 
-以下の機能は将来のPhaseで実装予定です：
+## Related
 
-- ❌ **アルファブレンディング**: 透明部分は現在上書きされます
-- ❌ **複数スプライト管理**: 現在は単一スプライトのみ
-- ❌ **回転・スケーリング**: 位置のみ変更可能
-- ❌ **アニメーション**: 静止画のみ
-
-### フレームバッファ形式
-
-- **フォーマット**: canonical BGRA8888（32bit）
-- **バイトオーダー**: メモリ `[B, G, R, A]` / u32 `0xAARRGGBB`
-- PNG decoderの出力形式と完全互換
-
-## スプライト画像
-
-- **ファイル**: `examples/image/usako.png`
-- **サイズ**: 64x64
-- **フォーマット**: RGBA
-
-## 関連ドキュメント
-
-- [実装計画](../../docs/PLAN_example_03.md) - 詳細な設計書
-- [AGENT.md](../../AGENT.md) - プロジェクト全体の構造
-- [PLAN.md](../../docs/PLAN.md) - プラットフォーム層の設計
+- [`AGENT.md`](../../AGENT.md) — project layout and contracts
+- [`docs/adr/005`](../../docs/adr/005_platform-support-tiers-and-frame-pacing.md) — backends / present

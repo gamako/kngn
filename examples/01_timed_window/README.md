@@ -1,68 +1,78 @@
 # Example 01: Timed Window
 
-時間経過で色が変わるウィンドウを2秒間表示し、自動終了するサンプルです。
+Shows a window whose colour changes over two seconds, then exits.
 
-## 説明
+## What it demonstrates
 
-このサンプルは、手動描画APIの基本的な使用方法を示しています：
+Basic manual-drawing API usage:
 
-- `platform.Window.create()` - ウィンドウ作成
-- `window.pollEvents()` - イベントポーリング（ノンブロッキング）
-- `platform.getTime()` - 高精度時刻取得
-- `window.lockFramebuffer()` - フレームバッファへのアクセス開始
-- `fb.unlock()` - フレームバッファへのアクセス終了
-- `window.present()` - 画面更新
+- `platform.Window.create()` — create a window
+- `window.pollEvents()` — non-blocking event poll
+- `platform.getTime()` — high-resolution time
+- `window.lockFramebuffer()` — begin framebuffer access
+- `fb.unlock()` — end framebuffer access
+- `window.present()` — submit the frame
+- `platform.frameDelay(...)` — pace the loop (~60 FPS here)
 
-## 動作
+## Behaviour
 
-- ウィンドウサイズ: 800x600
-- 表示時間: 2秒間
-- 色の変化: 緑 → 黄 → 赤
+- Window size: 800×600
+- Duration: 2 seconds
+- Colour transition: green → yellow → red
 
-## ビルド方法
+## Build
 
-`-Dplatform` の既定は OS 依存（macOS=objc / Linux=x11 / Windows=gdi）。以下の run-objc/swift/metal は
-macOS 向け。Linux/Windows では `zig build run`（既定 backend）や `-Dplatform=x11|wayland|gdi|d3d11` を使う。
+Default `-Dplatform` depends on the OS (macOS=objc / Linux=x11 / Windows=gdi). The
+`run-objc` / `run-swift` / `run-metal` steps below are for macOS. On Linux/Windows use
+`zig build run` (default backend) or `-Dplatform=x11|wayland|gdi|d3d11`.
 
-### Objective-C版（macOS 既定）
+### Objective-C (macOS default)
+
 ```bash
 cd examples/01_timed_window
 zig build
-# または
+# or
 zig build run-objc
 ```
 
-### Swift版
+### Swift
+
 ```bash
 zig build -Dplatform=swift
-# または
+# or
 zig build run-swift
 ```
 
-### Metal版
+### Metal
+
 ```bash
 zig build -Dplatform=metal
-# または
+# or
 zig build run-metal
 ```
 
-## 実行
-
-ビルド後、以下のコマンドで実行できます：
+From the repository root:
 
 ```bash
-# 既定 backend（macOS=objc / Linux=x11 / Windows=gdi）
-zig build run
-
-# 個別実行（macOS。無印 binary = 既定 backend）
-./zig-out/bin/example_01_timed_window        # 既定 backend（macOS=Objective-C版）
-./zig-out/bin/example_01_timed_window_swift  # Swift版
-./zig-out/bin/example_01_timed_window_metal  # Metal版
+zig build run-example_01
+zig build run-example_01 -Dplatform=metal
 ```
 
-## 学習ポイント
+## Run (standalone binaries)
 
-### 1. 手動描画のフロー
+```bash
+# Default backend (macOS=objc / Linux=x11 / Windows=gdi)
+zig build run
+
+# Installed binaries (macOS; bare name = default backend)
+./zig-out/bin/example_01_timed_window        # default (Objective-C on macOS)
+./zig-out/bin/example_01_timed_window_swift  # Swift
+./zig-out/bin/example_01_timed_window_metal  # Metal
+```
+
+## Learning points
+
+### 1. Manual draw flow
 
 ```zig
 const platform = @import("platform");
@@ -74,42 +84,41 @@ var window = try platform.Window.create(800, 600, "title");
 defer window.destroy();
 
 while (window.pollEvents()) {
-    // 1. フレームバッファをロック
     if (window.lockFramebuffer()) |fb| {
         defer fb.unlock();
-
-        // 2. ピクセルデータを書き込み
         @memset(fb.pixels, color);
-
-        // 3. 画面を更新
         window.present();
     }
 }
 ```
 
-### 2. 時刻の取得とタイミング制御
+### 2. Timing
 
 ```zig
 const start_time = platform.getTime();
 const elapsed = platform.getTime() - start_time;
 
 if (elapsed >= duration) {
-    break; // 終了
+    break;
 }
 ```
 
-### 3. 色の補間
+### 3. Colour interpolation
 
-線形補間を使用して、2つの色の間を滑らかに遷移させています。
+Linear interpolation between two colours for a smooth transition.
 
-## 次のステップ
+## Next steps
 
-- `02_keyboard_input` - キーボード入力の処理
-- `03_sprite_rendering` - スプライト表示
-- `04_fixed_timestep` - 固定タイムステップ + 物理シミュレーション
-- `07_mouse_input` - マウス入力の処理
+- `02_keyboard_input` — keyboard handling
+- `03_sprite_rendering` — sprite display
+- `04_fixed_timestep` — fixed timestep + physics
+- `07_mouse_input` — mouse handling
 
-## 注意事項
+## Notes
 
-- このサンプルでは `std.time.sleep()` を使用してフレームレートを制御していますが、本格的なアプリケーションでは 1級 backend の frame pacing（fifo）や将来の `beginFrame`/`waitFrame` によるタイミング制御が推奨されます（`present` は vsync 待ち関数ではない点に注意）。
-- `window.present()` は非ブロックの submit（frame 確定点）です。1級 backend（Metal / D3D11-DXGI / Wayland）は fifo で tearing 回避を保証対象としますが、best-effort backend（CALayer objc/swift / X11 / GDI）では tearing や jitter が発生し得ます。詳細は `docs/adr/005` を参照。
+- This sample paces with `platform.frameDelay(16_666_666)` (~60 FPS). Serious applications
+  should prefer tier-1 backend frame pacing (fifo) or the frame-pacing APIs; `present` is not a
+  vsync wait.
+- `window.present()` is a non-blocking submit (frame commit point). Tier-1 backends
+  (Metal / D3D11-DXGI / Wayland) target tear-free fifo; best-effort backends
+  (CALayer objc/swift / X11 / GDI) may tear or jitter. See `docs/adr/005`.

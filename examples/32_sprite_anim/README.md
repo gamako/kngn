@@ -1,23 +1,23 @@
-# 32: Sprite Anim（Atlas + AnimationPlayer）
+# Example 32: Sprite Anim (Atlas + AnimationPlayer)
 
-`kit.gfx` のスプライトシート / アトラスとアニメーション再生制御のデモ（TASK-111.3）。
+Demo of sprite-sheet / atlas playback in `kit.gfx`.
 
-- 既存 `examples/image/usako.png` から 4 セルの歩行 Atlas をコード生成（bobbing offset + 向きマーカー）
-- `AnimationClip` フレーム列 `[0,1,2,3,2,1]` / fps=8 / loop
-- 60Hz `FixedTimeStep` で `AnimationPlayer.update`
-- 左右往復。左向きは `flip_x = true`
+- Builds a 4-cell walk Atlas from `examples/image/usako.png` in code (bobbing offset + facing marker)
+- `AnimationClip` frames `[0,1,2,3,2,1]` / fps=8 / loop
+- `AnimationPlayer.update` on a 60 Hz `FixedTimeStep`
+- Walks left/right; left facing uses `flip_x = true`
 
-## 実行
+## Run
 
 ```bash
-# リポジトリ root から
+# From the repository root
 zig build run-example_32
 
-# standalone
+# Standalone
 cd examples/32_sprite_anim && zig build run
 ```
 
-## ヘッドレス E2E（CRC 固定）
+## Headless E2E (fixed CRC)
 
 ```bash
 TMPD=$(mktemp -d)
@@ -27,21 +27,21 @@ VP_HEADLESS=1 \
   zig build run-example_32
 ```
 
-固定 CRC（640×360・固定背景 `0xFF203040`・仮想クロック・決定的 Atlas 生成）:
+Fixed CRC (640×360, background `0xFF203040`, virtual clock, deterministic Atlas):
 
-| step 累計 | crc |
+| Cumulative step | crc |
 |-----------|-----|
 | 1 | `BA8FA900` |
 | 60 | `0D5C6C01` |
 | 120 | `D357AA75` |
 | 180 | `6A31348B` |
 
-script 本体は `e2e.txt`（expect 焼き込み済み）。
+Script: `e2e.txt` (expects baked in). See [`docs/harness.md`](../../docs/harness.md).
 
-## 操作
+## Controls
 
-- **ESC / Q**: 終了
+- **ESC / Q**: quit
 
-## 依存
+## Dependencies
 
-`@import("kit").gfx`（Atlas / AnimationClip / AnimationPlayer / FixedTimeStep / drawSpriteEx）。
+`@import("kit").gfx` (Atlas / AnimationClip / AnimationPlayer / FixedTimeStep / drawSpriteEx).

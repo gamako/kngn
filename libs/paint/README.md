@@ -1,175 +1,202 @@
-# libs/paint（エディタ族の共有コア）
+# libs/paint (shared core for the editor family)
 
-グラフィックエディタ群（pixie / paintly / tilex / animix …）が共有する再利用可能な抽象。
-アプリ非依存の headless lib（platform / GUI を import しない。ADR-007 R2）。`@import("paint")` で
-`paint.zig`（root。旧 `apps/editor/core/core.zig`。ADR-007 R6 で libs へ格上げ）の re-export を使う。
-「エディタ族の共有 lib」なので汎用 `kit` には載せず、該当 app（pixie 等）だけが直 import する。
+Reusable abstractions shared by the graphics editors (pixie / paintly / tilex / animix …).
+An application-independent headless library (it does not import platform or GUI; ADR-007 R2).
+Import via `@import("paint")`, which re-exports `paint.zig` (the root; formerly
+`apps/editor/core/core.zig`, promoted into `libs/` by ADR-007 R6). As the shared library of
+the editor family it is not on the general-purpose kit; only the apps that need it
+(pixie and so on) import it directly.
 
-## 構成
+## Layout
 
-| ファイル | 役割 |
+| File | Role |
 |---|---|
-| `canvas.zig` | `Canvas`（多レイヤ配列・合成・座標変換・レイヤ操作）、`Layer` / `Vec2` / `Rect` |
-| `undo.zig` | `StrokeRecorder`（stroke 記録機械）、`UndoStack` / `UndoCmd` / `PixelDiff` |
-| `tool.zig` | `Tool`（vtable 抽象）、`ToolEvent` / `ToolPoint`、`Pen` / `Eraser` / `Brush` |
-| `blend.zig` | ピクセル合成（`srcOver` 等）。canvas / selection / brush が利用。実装は `libs/pixelops` への facade（TASK-51） |
-| `io_png.zig` | `encodePNG` / `savePNG`（PNG 出力） |
-| `bezier.zig` | 3次ベジェ `Cubic` の評価・適応平坦化、`Vec2f`（TASK-21.13） |
-| `path.zig` | `Path`（アンカー + in/out ハンドル）・`hitTest`・`rasterize`（TASK-21.13） |
-| `path_editor.zig` | `PathEditor`（ベジェ編集状態機械。pixie が駆動）（TASK-21.13） |
-| `selection.zig` | 矩形選択の操作（clipboard `PixelBlock` / cut・paste・move のピクセル編集）（TASK-44） |
+| `paint.zig` | Public API root (re-exports) |
+| `canvas.zig` | `Canvas` (multi-layer array, composite, coordinate transforms, layer ops), `Layer` / `Vec2` / `Rect`, text-layer kinds |
+| `document.zig` | `Document` (layers × frames × cel grid), `Op`, `UndoStack`, `pushPaintOp` / `pushClear` / `undoOne` / `redoOne` |
+| `document_io.zig` | `.pix` serde (`saveDocument` / `loadDocument`), `exportPngSequence` |
+| `undo.zig` | `StrokeRecorder` (stroke recording machine), `PaintDiff` / `PixelDiff` / `Dab` / `NameSnapshot` |
+| `tool.zig` | `Tool` (vtable), `ToolEvent` / `ToolPoint`, `Pen` / `Eraser` / `Brush` |
+| `fill.zig` | Bucket fill (`floodFillCmd`, `Fill` tool) |
+| `blend.zig` | Pixel compositing (`srcOver` and friends). Used by canvas / selection / brush. Facade over `libs/pixelops` |
+| `io_png.zig` | `encodePNG` / `savePNG` (PNG output) |
+| `bezier.zig` | Cubic Bézier `Cubic` evaluation and adaptive flattening, `Vec2f` |
+| `path.zig` | `Path` (anchors + in/out handles), `hitTest`, `rasterize` |
+| `path_editor.zig` | `PathEditor` (Bézier edit state machine; driven by pixie) |
+| `selection.zig` | Rectangular selection (clipboard `PixelBlock`, cut / paste / move pixel edits) |
+| `shape.zig` | Shape raster helpers (`plotLine` / `plotRect` / `plotEllipse`) |
+| `text_render.zig` | Text-layer rasterization (`rasterizeTextLayer`) |
+| `onion_skin.zig` | Onion-skin helpers over `Document` |
 
-## 不変条件：表示=composite / 保存は用途で使い分け
+## Invariant: display = composite; choose save pixels by purpose
 
-`Canvas.composite()` は **表示専用**（白背景に不透明ピクセルを重ねた合成）。
-**白背景の `composite()` を保存に使ってはいけない**（透明ピクセルが白に潰れ、round-trip 一致が壊れる。TASK-21.6 の学び）。
+`Canvas.composite()` is **display-only** (opaque pixels composited onto a white background).
+**Do not save the white-background `composite()`** (transparent pixels collapse to white and
+round-trip equality breaks).
 
-core の `savePNG` は **渡された pixels をそのまま PNG 化するだけ**。何を渡すかは呼び出し側の用途で決める:
+`savePNG` in paint only encodes the pixels you pass. What you pass is a caller decision:
 
-- **単一 raw layer の round-trip**（透明保持）: `Canvas.layerPixels(idx)` を渡す。
-- **全 visible layer の合成フラット透明 PNG**（TASK-43 以降の pixie 通常保存）: `Canvas.compositeStraight()`
-  を渡す。透明背景に visible layer を opacity 込みで src-over するので透明が保持され、単層・opacity=255 では
-  raw と恒等になる（既存 round-trip も保たれる）。
-- **PNG は交換用フラット画像**: pixie の PNG open はフラット画像を layer0 へ読み込み他 layer を破棄する
-  （PNG では layer 構造を保持しない）。
-- **レイヤー保持は `.pix`（Document + document_io。TASK-63）**: `document_io.saveDocument`/`loadDocument` が
-  serde container 上に width/height/frame/layer(visible/opacity/pixels/name) を直列化し、round-trip で layer 構造を
-  bit 復元する。layer payload は **raw layerPixels**（透明保持）を格納し、PNG/連番書き出し（`exportPngSequence`）は
-  従来どおり `compositeStraight`（フラット透明）を使う（保存規約は不変）。undo 履歴は保存しない（load でリセット）。
-  レイヤー名（TASK-79.3）は `LAYR` とは別の任意 chunk `LNAM`（対応する `LAYR` の直後）に UTF-8 で持ち、
-  旧ファイル（`LNAM` 無し）は既定名（"Layer N"）のまま読める・旧 reader は未知 tag として無視できる
-  （schema_version は bump しない。前方/後方互換とも成立）。
+- **Single raw layer round-trip** (keep transparency): pass `Canvas.layerPixels(idx)`.
+- **Flat transparent PNG of every visible layer** (pixie's ordinary save): pass
+  `Canvas.compositeStraight()`. Visible layers are src-over'd onto a transparent background with
+  opacity applied, so transparency is preserved; with a single layer at opacity 255 this is
+  identical to raw (existing round-trips stay valid).
+- **PNG is an interchange flat image**: opening a PNG in pixie loads the flat image into layer 0
+  and discards other layers (PNG does not keep layer structure).
+- **Layer structure lives in `.pix`** (`Document` + `document_io`): `document_io.saveDocument` /
+  `loadDocument` serialise width / height / frames / layers (visible / opacity / pixels / name)
+  on a serde container and bit-restore the layer structure on round-trip. Layer payloads store
+  **raw `layerPixels`** (transparency kept). PNG / numbered export (`exportPngSequence`) still
+  uses `compositeStraight` (flat transparent). Undo history is not saved (load resets it).
+  Layer names live in an optional chunk `LNAM` (UTF-8, immediately after the matching `LAYR`).
+  Older files without `LNAM` keep the default name (`"Layer N"`); older readers ignore unknown
+  tags (schema_version is not bumped; both forward and backward compatibility hold).
 
 ```zig
-// 表示（白背景）
+// Display (white background)
 blit(canvas.composite());
-// 単一 raw layer の保存（透明保持）
-try core.savePNG(io, "out.png", canvas.layerPixels(0), w, h, gpa);
-// 全 visible layer の合成フラット透明 PNG 保存（pixie 通常保存）
-try core.savePNG(io, "out.png", canvas.compositeStraight(), w, h, gpa);
+// Save a single raw layer (keep transparency)
+try paint.savePNG(io, "out.png", canvas.layerPixels(0), w, h, gpa);
+// Save a flat transparent PNG of every visible layer (pixie's ordinary save)
+try paint.savePNG(io, "out.png", canvas.compositeStraight(), w, h, gpa);
 ```
 
-## Tool / StrokeRecorder / UndoStack の協調
+## How Tool / StrokeRecorder / Document undo cooperate
 
-責務分担:
+Responsibility split:
 
-- **StrokeRecorder**: stroke 記録機械。dedup（同一 stroke 内の再塗りは最初の before のみ）・
-  before 観測・Bresenham 線補間を担う。tool 非依存。
-- **Tool**: 入力イベント → recorder 駆動のポリシー（どの色で塗るか）。`Pen` / `Eraser` は塗り色が
-  違うだけ。vtable は将来 Fill / Picker が挿さる拡張点。
-- **UndoStack**: `UndoCmd`（before/after 両持ち）を保持。undo/redo はスタック間移動 + 値適用で可逆。
+- **StrokeRecorder**: stroke recording machine. Dedup (re-paints in the same stroke keep the first
+  `before` only), before observation, and Bresenham line interpolation. Tool-agnostic.
+- **Tool**: input event → recorder policy (which colour to paint). `Pen` / `Eraser` differ only in
+  paint colour. The vtable is the extension point for Fill / Picker and similar.
+- **`PaintDiff`**: intermediate raw edit (`layer_idx` + owned `diffs`) that does not yet know the
+  document's cel id. Produced by tools, selection, path rasterize, and fill.
+- **`Document.pushPaintOp`**: sole commit site for raster pixel edits. Builds an `Op.paint`, binds
+  the cel, and pushes onto `Document.undo` (`UndoStack`).
+- **`Op` / `UndoStack`**: live in `document.zig` (not `undo.zig`). Undo/redo move ops between stacks
+  and apply before/after values.
 
-データフロー（1 stroke）:
+Data flow (one stroke):
 
 ```
-入力(down) ─▶ tool.onEvent(.down) ─▶ recorder.begin + point
-入力(move) ─▶ tool.onEvent(.move) ─▶ recorder.lineTo
-入力(up)   ─▶ tool.onEvent(.up)   ─▶ recorder.lineTo + finish ─▶ ?UndoCmd
-                                                                  │ 非 null なら
-                                                                  ▼
-                                                          undoStack.push(cmd)
+input(down) ─▶ tool.onEvent(.down) ─▶ recorder.begin + point
+input(move) ─▶ tool.onEvent(.move) ─▶ recorder.lineTo
+input(up)   ─▶ tool.onEvent(.up)   ─▶ recorder.lineTo + finish ─▶ ?PaintDiff
+                                                                    │ if non-null
+                                                                    ▼
+                                                          try doc.pushPaintOp(gpa, pd.layer_idx, pd.diffs)
 
-Undo/Redo ─▶ undoStack.undoOne(canvas) / redoOne(canvas)   // canvas に before/after 適用
-全消去    ─▶ undoStack.pushClear(canvas, layer_idx)        // 1 コマンドとして原子的に積む
+Undo/Redo ─▶ doc.undoOne(gpa) / doc.redoOne(gpa)   // apply before/after to the active view + cels
+Clear all ─▶ try doc.pushClear(gpa, layer_idx)     // one atomic Op
 ```
 
-最小の使い方:
+Minimal usage:
 
 ```zig
-var canvas = try core.Canvas.init(gpa, w, h);
-defer canvas.deinit();
-var recorder = try core.StrokeRecorder.init(gpa, w, h);
+var doc = try paint.Document.init(gpa, w, h);
+defer doc.deinit();
+const canvas = &doc.active_view;
+var recorder = try paint.StrokeRecorder.init(gpa, w, h);
 defer recorder.deinit(gpa);
-var undo: core.UndoStack = .{};
-defer undo.deinit(gpa);
 
-var pen: core.Pen = .{ .color = 0xFFFF0000 }; // canonical BGRA 0xAARRGGBB（赤）
+var pen: paint.Pen = .{ .color = 0xFFFF0000 }; // canonical BGRA 0xAARRGGBB (red)
 const tool = pen.tool();
 
-_ = tool.onEvent(&canvas, &recorder, gpa, .{ .down = .{ .x = 0, .y = 0 } });
-_ = tool.onEvent(&canvas, &recorder, gpa, .{ .move = .{ .x = 9, .y = 4 } });
-if (tool.onEvent(&canvas, &recorder, gpa, .{ .up = .{ .x = 9, .y = 4 } })) |cmd| {
-    undo.push(gpa, cmd);
+_ = tool.onEvent(canvas, &recorder, gpa, .{ .down = .{ .x = 0, .y = 0 } });
+_ = tool.onEvent(canvas, &recorder, gpa, .{ .move = .{ .x = 9, .y = 4 } });
+if (tool.onEvent(canvas, &recorder, gpa, .{ .up = .{ .x = 9, .y = 4 } })) |pd| {
+    try doc.pushPaintOp(gpa, pd.layer_idx, pd.diffs);
 }
-undo.undoOne(gpa, &canvas); // 取り消し
+doc.undoOne(gpa); // undo
 ```
 
-## 新しいツールの足し方
+## Adding a new tool
 
-`Tool.VTable`（`onEvent` / `reset`）を実装した struct を作り、`tool()` で `Tool` を返す。
-`onEvent` 内で `StrokeRecorder` を駆動し、`.up` で `finish` の戻り値（`?UndoCmd`）を返す。
-`Pen` / `Eraser` が最小の実装例（`tool.zig`）。OOM は `@panic`（error union を返さない契約。core 全体のポリシー = [ADR-006](../../../docs/adr/006_editor-core-oom-policy.md)。新規コードもこれに従う）。
+Implement a struct with `Tool.VTable` (`onEvent` / `reset`) and return a `Tool` from `tool()`.
+Drive `StrokeRecorder` inside `onEvent`, and on `.up` return the `?PaintDiff` from `finish`.
+`Pen` / `Eraser` / `Brush` / `Fill` are the reference implementations (`tool.zig`, `fill.zig`).
+OOM is `@panic` (no error union; core-wide policy = [ADR-006](../../docs/adr/006_editor-core-oom-policy.md).
+New code follows the same rule).
 
-## ベジェ/ベクターパス（TASK-21.13）
+## Bézier / vector paths
 
-`Path` は **ブラシ非依存の独立値**（アンカー + in/out ハンドルの列）。`PathEditor` が編集状態機械
-（配置 / ハンドルドラッグ / 後編集 / 点削除 / cancel）を担い、確定（`rasterizeCommit`）で flatten 点列を
-`StrokeRecorder` の **brush 経路**（21.11/21.12 の Dab スタンプ）へ流して AA ラスタライズする。
-描画色・ブラシ形状（footprint）・不透明度は呼び出し側が渡す（`Path`/`PathEditor` は Brush ツールに依存しない）。
+`Path` is a **brush-independent value** (a sequence of anchors + in/out handles). `PathEditor`
+owns the edit state machine (place / handle drag / re-edit / delete point / cancel). On commit
+(`rasterizeCommit`) the flattened point list feeds the **brush path** of `StrokeRecorder`
+(dab stamps) for AA rasterization. Draw colour, brush footprint, and opacity are supplied by the
+caller (`Path` / `PathEditor` do not depend on the Brush tool).
 
-- 出力は破壊的ラスタライズで、確定後 `Path` は破棄する（MVP）。
-- **将来の拡張点**: `Path` がブラシ非依存の独立値なので、レイヤ機能導入時に
-  `VectorLayer { paths: []Path }` として保持でき、**再描画・ブラシ後切替・確定後の再編集**へ拡張できる。
-- pixie 側のプレビュー描画（`bezier_overlay.zig`）と入力アダプタ（`bezier_input.zig`）は GUI/platform 依存
-  のため core には置かない（core は数学・データ・状態機械・rasterize のみ）。
+- Output is destructive rasterization; after commit the `Path` is discarded (MVP).
+- **Future extension**: because `Path` is brush-independent, a later `VectorLayer { paths: []Path }`
+  can hold paths for re-draw, brush re-binding, and post-commit re-edit.
+- Pixie's preview (`bezier_overlay.zig`) and input adapter (`bezier_input.zig`) depend on
+  GUI/platform, so they stay out of paint (paint owns maths, data, the state machine, and rasterize).
 
-## テキストレイヤー（TASK-79.5）
+## Text layers
 
-`Layer` は `kind: LayerKind`（`.raster` / `.text`）で分岐する（TASK-72 の raster|vector 分岐と
-同じ器。vector 追加時も composite/merge/duplicate は `pixels` のみを見る kind-agnostic 設計の
-ため無改造で済む）。`kind==.text` の Layer は `text_params: TextParams`（文字列/font_px/色/位置。
-固定長 POD）をサイドカーとして持ち、`pixels` は**その TextParams を再ラスタライズした結果の
-キャッシュ**として保持する。
+`Layer` branches on `kind: LayerKind` (`.raster` / `.text`). The same container is kind-agnostic for
+composite / merge / duplicate (those paths look only at `pixels`). A `.text` layer carries
+`text_params: TextParams` (string / font_px / colour / position; fixed-length POD) as a side-car;
+`pixels` is a **cache** of the latest rasterization of those params.
 
-- **不変条件**: `kind==.text` の Layer の `pixels` は常に「直近の `text_params` を
-  `text_render.rasterizeTextLayer` で再ラスタライズした結果と bit 一致する」。これは Undo の
-  `layer_text_params`/`layer_rasterize`（pixels を保持せず再ラスタライズで復元する軽量 Op）の
-  可逆性の前提であり、**text レイヤーへの直接 raster 編集（Pen/Eraser/Fill/選択操作等）は
-  pixie（App 層）が全経路で禁止する**ことで維持される（`libs/paint` 自体はこの禁止を強制しない
-  ＝既存 `editingBlocked()` と同じ「App が振る舞いを決め、Canvas は素直に従う」役割分担）。
-- **API**: `Canvas.addTextLayer` / `setLayerTextParams`（再ラスタライズあり）/
-  `rasterizeLayer`（bake。kind=raster化のみで pixels 不変）/
-  `setLayerKindText`（bake の Undo/Redo 専用の低レベル setter）。
-- **.pix 互換**: `document_io.zig` は text kind でも LAYR チャンクは常に raster として pixels を
-  保存し、text 固有メタは新規 `LTXT` チャンク（`LNAM` の直後）に持つ（方式(b)。旧 reader は
-  `LTXT` を無視して raster として正しく開ける）。
+- **Invariant**: for `kind==.text`, `pixels` always bit-matches the result of re-rasterizing the
+  current `text_params` via `text_render.rasterizeTextLayer`. That is the premise for the
+  lightweight undo ops `layer_text_params` / `layer_rasterize` (they restore by re-rasterizing
+  rather than storing pixels). **Direct raster edits on a text layer** (Pen / Eraser / Fill /
+  selection, and so on) are **forbidden on every path by the app** (pixie). `libs/paint` does not
+  enforce the ban itself — the same role split as pixie's `editingBlocked()`: the app decides
+  behaviour; Canvas / Document follow.
+- **API**: `Canvas.addTextLayer` / `setLayerTextParams` (re-rasterize) /
+  `rasterizeLayer` (bake; kind becomes raster, pixels unchanged) /
+  `setLayerKindText` (low-level setter for undo/redo of bake). `Document.addTextLayer` and related
+  document ops wrap the same idea for the cel grid.
+- **`.pix` compatibility**: `document_io.zig` always stores LAYR chunks as raster pixels even for
+  text kind; text-specific metadata lives in an optional `LTXT` chunk (immediately after `LNAM`).
+  Older readers ignore `LTXT` and open the layer as raster.
 
-## 範囲選択（TASK-44）
+## Rectangular selection
 
-矩形選択の MVP。selection は `Canvas.selection: ?Rect`（矩形のみ。投げ縄/ワンドは非スコープ）。
-`selection.zig` が矩形ユーティリティ（`rectFromPoints` / `clipRect`）・clipboard（`PixelBlock`）・
-cut/paste のピクセル編集・フロート移動用の純描画ヘルパ（`renderBlockOverBase` / `layerMatchesRender` /
-`diffCmd` / `clearRectInBuf`）を担う。
+MVP rectangular selection. Selection is `Canvas.selection: ?Rect` (rectangle only; lasso / wand
+are out of scope). `selection.zig` owns rectangle utilities (`rectFromPoints` / `clipRect`), the
+clipboard (`PixelBlock`), cut/paste pixel edits, and pure drawing helpers for floating moves
+(`renderBlockOverBase` / `layerMatchesRender` / `diffCmd` / `clearRectInBuf`).
 
-- **描画制約**: `Canvas.selection` が非 null のとき、`StrokeRecorder.point` / `applyCoverage`（＝実描画
-  ホットパス）と `Canvas.drawPixel` は選択範囲外のピクセルを描かない。`selection == null` は 1 分岐で
-  素通り（オーバーヘッドゼロ・追加バッファ無し）。
-- **cut/paste は `canvas.layerPixels` へ直接書き込み**、selection ゲート付きの `StrokeRecorder` は
-  通さない（さもないと貼付先が選択範囲外だとゲートに握り潰される）。適用と同時に既存
-  `UndoCmd.paint`（before/after の PixelDiff 列）を生成して返すので可逆（`pushClear` と同じ形）。
-- **paste のブロック配置は `Blend{replace, over}` で切替**（`pasteCmd` 引数）: `replace`=そのまま上書き
-  （透明部も配置先を消す）、`over`=`blend.srcOver` 合成（透明部は配置先を残す）。pixie の既定は `over`
-  （透明を保持）で右ペインのトグルで切替。cut の元領域は透明（0）へ。
-- **move はフローティング（遅延確定）**: pixie 側 `selection_input` が **Float キャッシュ**（`base`=移動元を
-  0 クリアしたレイヤー / `block`=持ち上げた内容 / `rect` / `layer_idx` / `render_mode`）を持つ。canvas の
-  レイヤーは常に最終形（`base + block@rect`）に保たれるので、表示/保存/copy/probe/undo は普通にレイヤーを
-  読むだけでよく **確定トリガーは不要**。ドラッグ中は実レイヤーを変えず `preview_canvas` へ
-  `renderBlockOverBase` で表示し、release 時だけ実レイヤーへ焼いて `diffCmd` で 1 ドラッグ分の `UndoCmd.paint`
-  を作る。**release で確定せず Float を保持**するので、選択を作り直すまで何度でも再配置できる（再ドラッグは
-  Float を再利用＝再キャプチャしない）。移動開始時に「同一レイヤー / フロート矩形=現選択 / レイヤー内容=
-  `base+block@rect`」が崩れていれば（外部編集・選択変更等）`layerMatchesRender` 判定で re-lift する（単一地点
-  での無効化。copy/cut/paste/undo 等に破棄を散在させない）。
-- **selection 矩形そのものは undo 対象外**（編集アプリの慣習）。undo されるのはピクセル変更（cut/paste/move）
-  のみ。マーキー作成/解除/移動後の選択枠更新は undo に積まない（move を undo するとピクセルは戻るが選択枠は
-  移動先に残り得る＝既知の軽微な癖）。
-- pixie 側の入力（`selection_input.zig`）と overlay（`selection_overlay.zig`。マーチングアンツ）は
-  GUI/platform 依存のため core には置かない（bezier と同じ独立経路）。
+- **Draw constraint**: while `Canvas.selection` is non-null, `StrokeRecorder.point` /
+  `applyCoverage` (the real draw hot path) and `Canvas.drawPixel` skip pixels outside the
+  selection. `selection == null` is a single branch that falls through (zero overhead, no extra
+  buffer).
+- **cut/paste write `canvas.layerPixels` directly** and do not go through the selection-gated
+  `StrokeRecorder` (otherwise a paste whose destination lies outside the selection would be
+  swallowed by the gate). They return a `?PaintDiff` that the caller commits with
+  `Document.pushPaintOp` (same shape as `pushClear`).
+- **paste placement switches on `Blend{replace, over}`** (`pasteCmd` argument): `replace` overwrites
+  (including clearing destination under transparent source pixels); `over` uses `blend.srcOver`
+  (transparent source keeps destination). Pixie's default is `over` (keep transparency), toggled
+  in the right pane. The cut source region becomes transparent (0).
+- **move is floating (deferred commit)**: pixie's `selection_input` keeps a **Float cache**
+  (`base` = layer with the lift region cleared / `block` = lifted content / `rect` / `layer_idx` /
+  `render_mode`). The canvas layer always holds the final form (`base + block@rect`), so
+  display / save / copy / probe / undo simply read the layer — **no separate commit trigger**.
+  During drag the real layer is left alone and `preview_canvas` is drawn with
+  `renderBlockOverBase`; on release only, the real layer is baked and `diffCmd` builds one
+  `PaintDiff` for the drag. **Release keeps the Float**, so the block can be re-placed until the
+  selection is remade (re-drag reuses the Float; no re-capture). If at move start the invariants
+  "same layer / float rect equals current selection / layer equals `base+block@rect`" are broken
+  (external edit, selection change, …), `layerMatchesRender` triggers a re-lift (invalidation at
+  one site; no scattered discard on copy/cut/paste/undo).
+- **The selection rect itself is not undoable** (editor convention). Only pixel changes
+  (cut/paste/move) are. Creating / clearing the marquee, or updating the frame after a move, is
+  not pushed; undoing a move can restore pixels while leaving the marquee at the destination
+  (a known mild quirk).
+- Pixie input (`selection_input.zig`) and overlay (`selection_overlay.zig`, marching ants) depend
+  on GUI/platform and stay out of paint (same independent path as Bézier).
 
-## 注意・メモリ所有
+## Ownership notes
 
-- `UndoCmd.paint.diffs` は gpa 所有の owned slice。`UndoStack` が pop / `deinit` で free する。
-  自分で `onEvent` の戻り値を push せず捨てる場合は `gpa.free(cmd.paint.diffs)` すること。
-- `StrokeRecorder` / `Canvas` の幅・高さは一致させる（recorder の dedup ビットマップは w*h）。
-- 多レイヤは実装済み（TASK-43。`Canvas` の `layers` / `selected_layer` + `addLayer` / `insertLayer` /
-  `deleteLayer` / `moveLayer` / `selectLayer`、レイヤ opacity / visibility。描画は選択レイヤ対象）。
-  Fill / Picker / レイヤーブレンドモードは後続タスク。
+- `PaintDiff.diffs` is a gpa-owned slice. Ownership moves into `Document` when you call
+  `pushPaintOp`. If you discard an `onEvent` / helper result without pushing, free
+  `pd.diffs` yourself.
+- `StrokeRecorder` and `Canvas` width/height must match (the recorder's dedup bitmap is `w*h`).
+- Multi-layer and multi-frame are implemented (`Document` layers / frames / cel grid;
+  `active_view` is the editable view of the selected frame). Drawing targets the selected layer.
+  Layer blend modes beyond opacity/visibility remain future work.

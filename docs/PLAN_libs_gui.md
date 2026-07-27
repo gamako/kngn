@@ -1,32 +1,33 @@
-# libs/gui - 全体設計
+# libs/gui — overall design
 
-video-proto-main で開発するグラフィックエディタ群 (pixie / paintly / tilex / animix) の共通 UI 基盤として、汎用の immediate-mode GUI ライブラリ `libs/gui` を構築する。
+A general-purpose immediate-mode GUI library `libs/gui` that serves as the shared UI foundation
+for the graphics editors developed in this repository (pixie / paintly / tilex / animix).
 
-本ドキュメントは **libs/gui 全体のメンタルモデル** を提供する設計資料。各層の詳細設計は backlog の TASK-21.x シリーズに分割されており、本書はそれらを横断する見取り図として機能する。
+This document is the **mental model for libs/gui as a whole**: a cross-cutting map of the layers.
+Per-layer detail lives with the implementation and in `libs/gui/README.md`.
 
 ---
 
-## 目的・位置づけ
+## Purpose and placement
 
-| 観点 | 内容 |
+| Aspect | Content |
 |---|---|
-| 何を作るか | Dear ImGui 風の immediate-mode GUI ライブラリ |
-| 何のために | エディタ群 (pixie 等) のツールバー / パネル / ボタン / カラースワッチ等の UI を組むため |
-| 配置 | `video-proto-main/libs/gui/` (既存 `libs/png-decoder/` と並ぶ standalone library) |
-| 依存方針 | **video-proto-main の src 配下に依存しない**。`cd libs/gui && zig build` で単体ビルド可能 |
-| 公開モジュール名 | `gui` (`@import("gui")`) |
-| 関連親タスク | TASK-21 (editor 立ち上げ + libs/gui 構築) |
+| What | Dear ImGui–style immediate-mode GUI library |
+| Why | Toolbars / panels / buttons / colour swatches and similar UI for the editor family (pixie, …) |
+| Location | `libs/gui/` (standalone library alongside other `libs/*`) |
+| Dependencies | **Does not depend on `src/`**. `cd libs/gui && zig build` builds it alone |
+| Public module | `gui` (`@import("gui")`) |
 
 ---
 
-## 全体構成 (積層図)
+## Layering
 
 ```
-┌─────────────────── Application 層 (例: pixie) ───────────────────┐
+┌─────────────────── Application (e.g. pixie) ───────────────────┐
 │                                                                  │
-│   毎フレーム:                                                      │
+│   every frame:                                                   │
 │     ctx.beginFrame()                                             │
-│     if (ctx.button("Save")) saveFile();    ← 宣言と応答が同時      │
+│     if (ctx.button("Save")) saveFile();    ← declare + respond   │
 │     ctx.label("FPS: 60");                                        │
 │     ctx.endFrame()                                               │
 │     renderer.render(target, ctx.draw_list)                       │
@@ -35,265 +36,244 @@ video-proto-main で開発するグラフィックエディタ群 (pixie / paint
                               │ public API: @import("gui")
 ┌─────────────────── libs/gui ─┴───────────────────────────────────┐
 │                                                                  │
-│  ┌─ Widget 層 (TASK-21.5 / 21.9) ──────────────────────────────┐  │
+│  ┌─ Widget layer ─────────────────────────────────────────────┐  │
 │  │   Button / Label / ColorSwatch / Slider                    │  │
-│  │   内部で Layout 層にノードを追加 + buttonBehavior + DrawList   │  │
+│  │   adds Layout nodes + buttonBehavior + DrawList            │  │
 │  └────────────────────────────────────────────────────────────┘  │
 │                              ▲                                   │
-│  ┌─ Layout 層 (TASK-21.4) ────┴────────────────────────────────┐  │
-│  │   Flex layout (measure + layout 2 パス)                     │  │
-│  │   親-子ノードのリンクトリスト + grow/fit/fixed/percent 配分     │  │
+│  ┌─ Layout layer ────────────┴────────────────────────────────┐  │
+│  │   Flex layout (measure + layout, two passes)               │  │
+│  │   parent–child linked list + grow/fit/fixed/percent        │  │
 │  └────────────────────────────────────────────────────────────┘  │
 │                              ▲                                   │
-│  ┌─ Context / 入力 / ID 層 (TASK-21.2) ─────────────────────────┐  │
-│  │   Input  (mouse / keyboard を edge 化)                       │  │
-│  │   IdStack (widget 安定 ID; FNV-1a 64bit)                     │  │
-│  │   InteractionState (hot / active / focused 管理)             │  │
-│  │   Context (上記 + DrawList + arena を束ね、ライフサイクル契約) │  │
+│  ┌─ Context / input / ID layer ───────────────────────────────┐  │
+│  │   Input  (mouse / keyboard edged)                          │  │
+│  │   IdStack (stable widget IDs; FNV-1a 64-bit)               │  │
+│  │   InteractionState (hot / active / focused)                │  │
+│  │   Context (above + DrawList + arena; lifecycle contract)   │  │
 │  └────────────────────────────────────────────────────────────┘  │
 │                              ▲                                   │
-│  ┌─ 描画プリミティブ層 (TASK-21.3) ─┴───────────────────────────┐  │
-│  │   DrawList (rect/line/text/image の cmd を蓄積、clip 焼き込み) │  │
-│  │   Renderer (DrawList → RenderTarget pixel に焼く)             │  │
-│  │   Color / BitmapFont / Rect / Vec2                          │  │
+│  ┌─ Drawing primitives ──────┴────────────────────────────────┐  │
+│  │   DrawList (rect/line/text/image cmds; clip baked in)      │  │
+│  │   Renderer (DrawList → RenderTarget pixels)                │  │
+│  │   Color / BitmapFont / Rect / Vec2                         │  │
 │  └────────────────────────────────────────────────────────────┘  │
 └──────────────────────────────────────────────────────────────────┘
                               ▲
-                              │ (platform 層には依存しない。caller が変換)
-┌─────────────────── video-proto-main / platform 層 ──────────────┐
-│   platform.Event (key/mouse) → caller が gui.InputEvent に変換   │
-│   platform.Framebuffer → caller が gui.RenderTarget に変換       │
+                              │ (no platform dependency; caller converts)
+┌─────────────────── platform layer ──────────────────────────────┐
+│   platform.Event (key/mouse) → caller converts to gui.InputEvent │
+│   platform.Framebuffer → caller converts to gui.RenderTarget     │
 └──────────────────────────────────────────────────────────────────┘
 ```
 
-下から積み上がる純粋な積層構造。**上位層は下位層のみに依存し、逆は無い。** libs/gui は platform / src 配下に依存しないため、他プロジェクトへ持ち出し可能。
+A pure stack: **upper layers depend only on lower ones, never the reverse.** Because libs/gui
+does not depend on platform or `src/`, it can be taken into another project.
 
 ---
 
-## immediate-mode GUI の急所 (なぜこの設計か)
+## Immediate-mode essentials (why this design)
 
-immediate-mode GUI の特徴は「**widget オブジェクトを保持しない**」こと。毎フレーム関数呼び出しだけで GUI を組む:
+Immediate-mode GUI **does not retain widget objects**. You build UI with function calls every frame:
 
 ```zig
 if (ctx.button("Save")) { saveFile(); }
 ```
 
-この一行で「ボタンが存在することの宣言」と「クリックされたかの応答」を同時に行う。これを成立させるために、**フレームをまたいで保持すべき最小限の状態**が要る。それが libs/gui (特に TASK-21.2 = Context 層) の責任。
+That one line both declares that a button exists and answers whether it was clicked. To make that
+work, a **minimal set of state must survive across frames**. That is libs/gui's job (especially the
+Context layer).
 
-### フレーム間で保持すべき状態と理由
+### Cross-frame state and why it exists
 
-| 状態 | なぜ必要か | 提供する層 |
+| State | Why | Layer |
 |---|---|---|
-| **Widget の ID** | 関数呼び出ししか無い世界で「これは前フレームの『Save』ボタンと同じ widget だ」と紐付けるキー | `IdStack` (21.2) |
-| **hot_id** (hover 中) | hover 表示を 1 フレーム遅延で安定化させる。重なり widget での同フレーム入れ替わりによるフリッカ防止 | `InteractionState` (21.2) |
-| **active_id** (押下中ロック) | 「ボタン上で press → ドラッグして外へ → 戻って release」を click として扱う。押下開始時の widget を記録する必要がある | `InteractionState` (21.2) |
-| **mouse_pressed/released** (edge) | 「今フレームに down した」と「ずっと押されている」を区別しないと毎フレーム click が連発になる | `Input` (21.2) |
-| **wantsMouse** | 「GUI がマウスを消費中か」の per-frame シグナル (カーソル変更や非ドラッグツール判定に使う)。ドラッグの canvas/GUI 振り分け自体は press 起点ベースの capture で行う (下記「hit-test 契約」/ 手順 6) | `Context` (21.2) |
-| **mouse_pressed_pos** | press した瞬間の座標 (Dear ImGui の MouseClickedPos 相当)。canvas-side capture の開始判定や drag 閾値に使う。集約 mouse_pos は最終位置なので起点を取りこぼす | `Input` (21.2) |
-| **前フレームの widget rect** | immediate-mode の同期 hit-test に使う (下記「hit-test 契約」)。`id → Rect` を 1 フレーム保持 | `Layout` (21.4) |
-| **DrawList** | widget の描画指示を蓄積し、フレーム末にまとめてピクセル化する | 描画プリミティブ (21.3) |
+| **Widget ID** | In a world of function calls only, the key that says "this is the same 'Save' button as last frame" | `IdStack` |
+| **hot_id** (hovered) | Stabilize hover display with a one-frame delay; avoid flicker when overlapping widgets swap in the same frame | `InteractionState` |
+| **active_id** (press lock) | Treat "press on button → drag out → return → release" as a click; record which widget started the press | `InteractionState` |
+| **mouse_pressed/released** (edge) | Distinguish "went down this frame" from "held"; otherwise every frame fires a click | `Input` |
+| **wantsMouse** | Per-frame signal that GUI is consuming the mouse (cursor changes, non-drag tool decisions). Canvas/GUI routing of drags uses press-origin capture (see hit-test contract / step 6) | `Context` |
+| **mouse_pressed_pos** | Coordinates at the press instant (Dear ImGui MouseClickedPos). Used for canvas-side capture start and drag thresholds. Aggregated `mouse_pos` is the final position and would miss the origin | `Input` |
+| **Previous-frame widget rect** | Synchronous immediate-mode hit-test (see below). Keep `id → Rect` for one frame | `Layout` |
+| **DrawList** | Accumulate draw instructions; rasterize at end of frame | Drawing primitives |
 
-これらが揃って初めて、widget 関数 (21.5) を上に積める。
+Only with these in place can widget functions sit on top.
 
 ---
 
-## immediate-mode の hit-test 契約 (重要)
+## Immediate-mode hit-test contract (important)
 
-`if (ctx.button("Save")) { ... }` のように **widget 呼び出しが clicked を同期返却**するのが immediate-mode の肝。一方 Flex layout (21.4) は全子確定後でないと rect が決まらず、layout は `endFrame` で行う。この 2 つを **Dear ImGui 流の同期 hit-test** で両立する:
+`if (ctx.button("Save")) { ... }` **returns clicked synchronously** from the widget call — that is
+the immediate-mode heart. Flex layout, however, cannot know rects until every child is known, and
+layout runs in `endFrame`. Dear ImGui–style synchronous hit-test reconciles the two:
 
-| 処理 | いつ | 使う rect |
+| Step | When | Rect used |
 |---|---|---|
-| **hit-test** (hover/active 判定、`clicked` 返却) | widget 呼び出し時 | **前フレーム**の rect (`id` 別キャッシュ) |
-| **layout 計算** | `endFrame` | — (当フレームを算出) |
-| **draw コマンド発行** | `endFrame` (layout 後) | **当フレーム**の rect |
-| **hover 色** | `endFrame` の draw 時 | `hot_id` (前フレーム確定、安定) |
+| **hit-test** (hover/active, return `clicked`) | widget call | **previous-frame** rect (per-id cache) |
+| **layout** | `endFrame` | — (computes this frame) |
+| **draw cmds** | `endFrame` (after layout) | **this-frame** rect |
+| **hover colour** | draw in `endFrame` | `hot_id` (settled previous frame; stable) |
 
-- `clicked` は当フレームの入力 + 前フレーム rect で判定するので **当フレームに即返る** (click 応答の遅延なし)。
-- layout が変化したフレームのみ hit-test に 1 フレーム遅延が生じるが、静的レイアウトでは不可視。
-- 初回フレームは rect 未確定なので非ヒット扱い (1 フレームのウォームアップ)。
-- layout を持たない 21.2 の sample 09 では rect が hardcode のため、その rect をそのまま hit-test / draw に使う (キャッシュ不要の特殊ケース)。
+- `clicked` uses this frame's input + previous-frame rect, so it **returns immediately** (no click delay).
+- Only frames where layout changes see a one-frame hit-test lag; invisible for static layouts.
+- The first frame has no rects yet → treated as miss (one-frame warm-up).
 
 ---
 
-## フレームライフサイクル (1 フレームのデータの流れ)
+## Frame lifecycle (data flow for one frame)
 
 ```
-  1. platform からイベント受信 → caller が gui.InputEvent に変換
+  1. Receive platform events → caller converts to gui.InputEvent
        (Swift/Metal → C → Zig platform.Event → gui.InputEvent)
-       ・この時点では canvas に流さず、いったん溜めておく
-         (ルーティング判定は hit-test 後の手順 6 で行う)
+       · Do not send to the canvas yet; buffer first
+         (routing is decided after hit-test, in step 6)
               │
               ▼
   2. ctx.beginFrame()
-       ・arena.reset                    (前フレームの payload をここで解放)
-       ・input.beginFrame               (edge クリア、prev pos 保存)
-       ・id_stack.clear
-       ・state.beginFrame               (hot_id ← next_hot_id, next_hot_id=0,
+       · arena.reset                    (free previous-frame payloads here)
+       · input.beginFrame               (clear edges, save prev pos)
+       · id_stack.clear
+       · state.beginFrame               (hot_id ← next_hot_id, next_hot_id=0,
                                          this_frame_hovered_any=false)
-       ・draw_list.reset / layout_tree.reset
+       · draw_list.reset / layout_tree.reset
               │
               ▼
-  3. ctx.pushEvent(ev) を溜まったイベント分くり返す
-       ・Input が現在状態を更新 + edge (pressed/released) を計算
+  3. ctx.pushEvent(ev) for each buffered event
+       · Input updates current state + edges (pressed/released)
               │
               ▼
-  4. アプリが widget を呼ぶ (UI 組み立て + 同期 hit-test)
+  4. App calls widgets (UI build + sync hit-test)
        if (ctx.button("Save")) { ... }
          └→ id = id_stack.make("Save")
-         └→ レイアウトツリーにノード追加 (21.4)
-         └→ 前フレーム rect で buttonBehavior
-            → hot/active 更新、clicked を同期返却
+         └→ add a node to the layout tree
+         └→ buttonBehavior on previous-frame rect
+            → update hot/active, return clicked synchronously
               │
               ▼
   5. ctx.endFrame()
-       ・layout(root, screen_rect)       (measure + place)
-       ・ツリーを DFS して draw cmd 発行  (当フレーム rect, hover 色は hot_id)
-       ・各ノードの rect を id 別キャッシュに保存 (次フレームの hit-test 用)
-       ・※ hit-test はしない / arena reset もしない
+       · layout(root, screen_rect)       (measure + place)
+       · DFS the tree, emit draw cmds    (this-frame rect; hover colour from hot_id)
+       · store each node's rect in the per-id cache (for next-frame hit-test)
+       · ※ no hit-test / no arena reset
               │
               ▼
-  6. canvas へのルーティング (press 起点ベースの capture で行う)
-       ・canvas-side capture: press 起点 mouse_pressed_pos が canvas 領域内なら stroke 開始、
-         release まで hover に関わらず canvas が捕捉する (GUI の active_id と対称)。
-         - 判定に最終位置 mouse_pos / per-frame wantsMouse は使わない。これらはフレーム
-           最終位置依存で、「canvas で down → 同フレームで panel へ move」した press 起点を
-           取りこぼすため。down 起点を保持する mouse_pressed_pos で判定する。
-         - canvas 領域は GUI widget と重ならない前提 (pixie の canvas_area box は中身空)。
-           重なる widget を将来置く場合は press 時の GUI hit-test で別途除外する。
-       ・捕捉中は集約フレーム状態 (mouse_pos / pressed / released) をツールに渡す
-         (個々の move イベント再生は不要)。stroke の隙間は mouse_prev → mouse_pos の
-         線補間で埋める (フレーム内の中間 move を落としても繋がる)。
-       ・wantsMouse は「GUI がマウスを消費中か」の per-frame シグナルとして残る
-         (カーソル変更や非ドラッグのクリックツール判定などに使う)。
-       → 具体的な caller パターンは TASK-21.8 参照
+  6. Route to the canvas (press-origin capture)
+       · canvas-side capture: if press-origin mouse_pressed_pos is inside the canvas,
+         start a stroke and keep canvas capture until release regardless of hover
+         (symmetric with GUI active_id).
+         - Do not use final mouse_pos / per-frame wantsMouse for this decision; they
+           depend on the end-of-frame position and miss "down on canvas → move onto panel
+           in the same frame". Use mouse_pressed_pos, which keeps the down origin.
+         - Canvas region is assumed not to overlap GUI widgets (pixie's canvas_area box
+           is empty). Future overlapping widgets need a separate press-time GUI hit-test exclude.
+       · While capturing, pass aggregated frame state (mouse_pos / pressed / released) to the tool
+         (no need to replay individual moves). Fill stroke gaps by interpolating
+         mouse_prev → mouse_pos (survives dropped mid-frame moves).
+       · wantsMouse remains the per-frame "GUI is consuming the mouse" signal
+         (cursor changes, click tools that are not drags, …).
               │
               ▼
   7. canvas.render(target) → Renderer.render(target, ctx.draw_list)
-       (canvas を下地に焼き、その上に GUI の DrawCmd を焼く。clip 適用)
+       (bake canvas as the base, then GUI DrawCmds on top; apply clip)
               │
               ▼
-  8. window.present()                          (画面更新)
+  8. window.present()                          (update the screen)
 ```
 
-### ライフサイクル契約 (重要)
+### Lifecycle contract (important)
 
-- **`arena` reset は次フレームの `beginFrame` 冒頭** に行う。`endFrame` 直後ではない。
-  - 理由: `endFrame` 後でも caller が `getNodeRect(id)` 等で layout 結果を参照しうる。同じフレーム内に reset すると dangling になる。
-- **hit-test は widget 呼び出し時** (前フレーム rect 使用)。`endFrame` は layout + draw + rect キャッシュ更新のみで、hit-test はしない。
-- **ArrayList (cmds / clip_stack / id_stack / layout_tree) は gpa で持つ**。フレームごとに `clearRetainingCapacity()`。
-  - arena は cmd の payload (text / image slice 等) のみ。
-- `endFrame` 後でも `draw_list` / `id_stack` / `state` / `layout_tree` / rect キャッシュの参照は次フレーム `beginFrame` まで valid。
+- **`arena` resets at the start of the next frame's `beginFrame`**, not right after `endFrame`.
+  - Reason: after `endFrame` the caller may still read layout results via `getNodeRect(id)`.
+    Resetting in the same frame would dangle.
+- **Hit-test happens at widget call time** (previous-frame rect). `endFrame` only does layout +
+  draw + rect-cache update.
+- **ArrayLists** (cmds / clip_stack / id_stack / layout_tree) live on the gpa and
+  `clearRetainingCapacity()` each frame.
+  - The arena holds only cmd payloads (text / image slices, …).
+- After `endFrame`, references to `draw_list` / `id_stack` / `state` / `layout_tree` / the rect
+  cache stay valid until the next `beginFrame`.
 
 ---
 
-## 用語集
+## Glossary
 
-| 用語 | 意味 |
+| Term | Meaning |
 |---|---|
-| **immediate-mode** | widget オブジェクトを保持せず、毎フレーム関数呼び出しで UI を組む方式。Dear ImGui が代表。retained-mode (DOM/Qt 等) の対義 |
-| **Id** | widget を一意識別する u64。FNV-1a で id_stack + label から生成 |
-| **id_stack** | 親 widget の Id を積むスタック。同じラベル ("Save") でも親が違えば異なる Id になる |
-| **hot_id** | 前フレーム確定の hover ID。描画用 (色変えなど)。フリッカ防止のため 1 フレーム遅延 |
-| **next_hot_id** | 今フレーム計算中の hover 候補。描画順で最後勝ち。次フレーム beginFrame で hot_id に昇格 |
-| **active_id** | 押下中ロック対象の widget ID。press 開始から release までの間、入力をこの widget が独占 |
-| **focused_id** | キーボード入力フォーカス対象 (text field 用、本フェーズでは設定しない) |
-| **edge** | このフレームに状態変化があったことを示すフラグ。`mouse_pressed.left` は down した瞬間のフレームのみ true |
-| **wantsMouse** | GUI がマウスイベントを消費中か。`(this_frame_hovered_any) or (active_id != 0)`。caller は hit-test 後 (endFrame 後) に参照するので当フレームの hover を反映する (遅延なし) |
-| **同期 hit-test** | widget 呼び出し時に前フレーム rect で当たり判定し、clicked を即返す方式 (Dear ImGui 流)。draw は endFrame に後送り |
-| **clip 焼き込み** | 各 DrawCmd に clip rect を含める方式。stateful な push/pop replay 不要 |
-| **standalone** | libs/gui が video-proto-main の src 配下や platform に依存しない性質 |
+| **immediate-mode** | Build UI with function calls every frame; no retained widget objects. Dear ImGui is the archetype; opposite of retained-mode (DOM/Qt, …) |
+| **Id** | Unique u64 for a widget. FNV-1a over id_stack + label |
+| **id_stack** | Stack of parent widget Ids. Same label ("Save") under different parents → different Ids |
+| **hot_id** | Previous-frame settled hover ID. For drawing (colour changes). One-frame delay prevents flicker |
+| **next_hot_id** | Hover candidate computed this frame. Last draw wins. Promoted to hot_id in the next beginFrame |
+| **active_id** | Widget ID locked while pressed. Owns input from press until release |
+| **focused_id** | Keyboard focus target (text fields) |
+| **edge** | Flag that state changed this frame. `mouse_pressed.left` is true only on the down frame |
+| **wantsMouse** | Whether GUI is consuming mouse events: `(this_frame_hovered_any) or (active_id != 0)`. Callers read it after hit-test (after endFrame), so it reflects this frame's hover (no delay) |
+| **sync hit-test** | Hit-test at widget call time against previous-frame rect; return clicked immediately (Dear ImGui style). Draw is deferred to endFrame |
+| **baked clip** | Each DrawCmd carries its clip rect. No stateful push/pop replay |
+| **standalone** | libs/gui does not depend on this repository's `src/` or platform |
 
 ---
 
-## サブタスク分割と進捗
+## Keeping standalone status
 
-### libs/gui 内の依存順 (本ドキュメントが扱う範囲)
+1. **Do not `@import` anything under `src/`**
+   - No text / sprite / platform; define `BitmapFont` / `RenderTarget` inside libs/gui
+   - Default 8×16 ASCII font is embedded (`@embedFile`)
+2. **Independent event type**: `gui.InputEvent`. No dependency on `platform.Event`
+   - Callers (pixie, …) write a thin `platform.Event → gui.InputEvent` adapter
+3. **`cd libs/gui && zig build` / `zig build test` succeed alone**
+4. **The root `build.zig` exposes the module as `gui`** (`@import("gui")`)
 
-```
-TASK-21.3 (描画プリミティブ: DrawList / Renderer / Color / BitmapFont)
-   ▼
-TASK-21.2 (Input + ID + InteractionState + Context、フレームライフサイクル契約)
-   ▼
-TASK-21.4 (Flex layout: measure + layout 2 パス、rect キャッシュ / getNodeRect)
-   ▼
-TASK-21.5 (Button / Label / ColorSwatch)
-   ▼
-TASK-21.9 (Slider; 21.5 完了後、必要になった時点で)
-```
-
-各サブタスクは独立した backlog タスクとして `backlog/tasks/task-21.x - *.md` に詳細設計が記述されている (GPT レビュー反映済み)。本ドキュメントを起点に各タスクへドリルダウンする。
-
-### TASK-21 全体ロードマップ (親タスク基準)
-
-libs/gui の構築と editor 側 (pixie) の立ち上げは **並行する 2 本のクリティカルパス**。tracer-bullet (21.6) は libs/gui の完成を待たず、21.1 完了後に着手できる:
-
-```
-TASK-21.1 (mouse input, platform 層) ── Done
-   ├──→ TASK-21.6 (editor skeleton + tracer-bullet 最小 pixie。UI ハードコード)
-   │       └──→ TASK-21.8 (pixie UI 置換 + Pen/Eraser/Undo)
-   │               └──→ TASK-21.7 (core 抽象化整理)
-   └ (並行)
-TASK-21.3 → 21.2 → 21.4 → 21.5 ──→ TASK-21.8 (libs/gui で UI 置換)
-```
-
-→ 21.8 が libs/gui (21.5 まで) と tracer-bullet pixie (21.6) の合流点。
+That keeps libs/gui portable if the editor is later split into a sibling repository.
 
 ---
 
-## standalone 性の維持
+## External references (`getNodeRect`)
 
-libs/gui の独立性を保つため、以下を遵守する:
+When a caller needs a widget rect from outside GUI ("canvas area", "status bar", …), use
+`getNodeRect(id)`. Constraints:
 
-1. **`@import("...")` で video-proto-main の src/ を参照しない**
-   - text / sprite / platform は使わず、libs/gui 内で `BitmapFont` / `RenderTarget` を独自定義
-   - デフォルト 8x16 ASCII フォントは libs/gui に同梱 (@embedFile)
-2. **イベント型を独立定義**: `gui.InputEvent` を持つ。`platform.Event` には依存しない
-   - caller (pixie 等) が `platform.Event → gui.InputEvent` の薄いアダプタを書く
-3. **`cd libs/gui && zig build` / `zig build test` が単体で通る**
-4. **video-proto-main の build.zig からはモジュール `gui` として公開** (`@import("gui")`)
-
-これにより、将来 editor を sibling repo として切り出す際に libs/gui ごと持ち出せる。
+- **Only nodes given an explicit ID are reachable**. Auto-ID nodes (label hash + id_stack /
+  `@src()`-based) make `getNodeRect` return `null`.
+- External targets (canvas_area, …) must use APIs that **require an explicit ID**
+  (e.g. `buttonId(0xCANVAS_AREA, ..)`).
+- Obtained rects are valid from after `endFrame` until the next `beginFrame` (lifecycle contract).
 
 ---
 
-## 外部参照 (getNodeRect) の制約
+## Limits
 
-caller が「キャンバス領域」「ステータスバー」等の widget rect を GUI 外から参照したい場合は `getNodeRect(id)` を使う。ただし:
+> Starting point was the MVP limits; items resolved by later work are reflected below
+> (last updated 2026-07-18).
 
-- **明示 ID を与えたノードのみ参照可能**。自動 ID (label hash + id_stack / @src() ベース) のノードは `getNodeRect` が `null` を返す (21.4 仕様)。
-- 外部参照対象 (canvas_area 等) は `buttonId(0xCANVAS_AREA, ..)` のように **明示 ID を要求する API** を使う (21.2 指摘 3-7)。
-- 取得した rect は `endFrame` 後〜次フレーム `beginFrame` まで valid (ライフサイクル契約)。
+### Resolved (unsupported at MVP; implemented since)
+
+- **text field**: `textInputId` (`widgets.zig`) + `text_edit.zig` (selection / caret / word move /
+  copy / IME preedit). See `examples/28_text_input`.
+- **scroll view**: `beginScrollArea` / `endScrollArea` (vertical and horizontal scroll + scrollbar;
+  wheel end-of-range propagation). See `examples/16_gui_scroll`.
+- **CJK fonts (partial)**: injecting `libs/font`'s `OutlineFont.asFont()` into `gui.Context.init`
+  draws Japanese (established in the font-injection work; demonstrated by examples 21 / 28).
+  **`gui.default_font` is still the ASCII bitmap (spleen)**; callers that do not inject
+  (pixie / synth / patch apps) omit non-ASCII glyphs → rolling that into real apps is separate work.
+
+### Still unsupported
+
+- **Flex layout extensions**: wrap / absolute positioning / `justify_content` beyond `start`
+  (`center` / `end` / `space-between`, … → right-align with an empty grow box)
+- **Line drawing**: anti-aliased strokes thicker than 1
+- **CJK as the default font**: `gui.default_font` remains ASCII bitmap (see "Resolved · partial")
+- **Style push/pop scopes**: Dear ImGui–style `PushStyleColor` / `PopStyleColor`. Today only direct
+  writes to `Context.style`
+- **Dedicated dropdown / combo box**: `popup.zig` + `menu.zig` (`menuBar` / `menuBarPopup`) cover
+  dropdown-style popup menus, but there is no value-select combo widget (it can be composed on that base)
+
+Take these up when a concrete need appears.
 
 ---
 
-## 制限事項
+## Related
 
-> この節は libs/gui MVP (TASK-21) 当時の制限一覧を出発点に、その後の実装で解消した項目を反映して更新している (2026-07-18)。
-
-### 解消済み (MVP 当時は非対応だったが実装された)
-
-- **text field**: `textInputId` (`widgets.zig`) + `text_edit.zig` (選択 / caret / word 移動 / コピー / IME preedit)。example 28_text_input。TASK-113 ファミリー。
-- **scroll view**: `beginScrollArea` / `endScrollArea` (縦横スクロール + スクロールバー、wheel 端到達伝播)。example 16_gui_scroll。TASK-46 / 126。
-- **CJK フォント (部分的)**: `gui.Context.init` に `libs/font` の `OutlineFont.asFont()` を注入すれば日本語を描画できる (TASK-116 で機構を確立、example_21 / 28 で実証)。**ただし `gui.default_font` は今も ASCII bitmap (spleen)** で、注入しない caller (pixie / synth / patch の各アプリ) では非 ASCII が欠落表示になる → 実アプリへの展開は別タスク。
-
-### 未対応 (現在も非対応)
-
-- **Flex layout の拡張**: wrap (折り返し) / absolute positioning (フロー外の座標指定配置) / justify_content (`start` のみ。`center` / `end` / `space-between` 等は非対応 → 右寄せは `grow` の空箱を挟んで表現)
-- **線描画**: 太さ > 1 のアンチエイリアス
-- **CJK フォントの既定化**: `gui.default_font` 自体は ASCII bitmap のまま (上記「解消済み・部分的」参照)
-- **スタイルの push/pop スコープ管理**: Dear ImGui の `PushStyleColor` / `PopStyleColor` 相当の「局所的にスタイルを一時上書きして抜けると復帰する」スタック機構。現状は `Context.style` の直接書き換えのみ
-- **dropdown / combo box (専用 widget)**: `popup.zig` + `menu.zig` (menuBar / menuBarPopup) でドロップダウン型ポップアップメニューは実装済みだが、値選択用の combo box widget は未提供 (この基盤で組める)
-
-これらは別タスクとして必要になった時点で着手する。
-
----
-
-## 関連資料
-
-- TASK-21 (親、ディレクトリ配置と全体実装順序): `backlog/tasks/task-21 - editor-プロジェクト立ち上げ-libs-gui-構築...md`
-- TASK-21.2 (Context / 入力 / ID 層): `backlog/tasks/task-21.2 - libs-gui-入力管理-ID-stack-hot-active.md`
-- TASK-21.3 (描画プリミティブ): `backlog/tasks/task-21.3 - libs-gui-骨組み-描画プリミティブ.md`
-- TASK-21.4 (Flex レイアウト): `backlog/tasks/task-21.4 - libs-gui-Flex-レイアウトエンジン.md`
-- TASK-21.5 (基本ウィジェット): `backlog/tasks/task-21.5 - libs-gui-基本ウィジェット（Button-Label-ColorSwatch-Slider）.md`
-- TASK-21.9 (Slider): `backlog/tasks/task-21.9 - libs-gui-Slider-ウィジェット（i32-f32）.md`
-- ADR 003 (イベント処理層の配置): `video-proto-main/docs/adr/003_event-translation-layer.md`
+- ADR 003 (event translation layer): [`docs/adr/003_event-translation-layer.md`](adr/003_event-translation-layer.md)
+- Current API surface: [`libs/gui/README.md`](../libs/gui/README.md)
+- Capability matrix: [`docs/plans/PLAN_gui_capability_matrix.md`](plans/PLAN_gui_capability_matrix.md)

@@ -1,14 +1,15 @@
-# 31: SpriteEx（kit.gfx）
+# Example 31: SpriteEx (`kit.gfx`)
 
-`drawSpriteEx` のデモ。同一 `usako.png` に対して plain / flip / 整数倍 scale / RGB tint / source rect 切り出しを固定配置で並べる。
+Demo of `drawSpriteEx`. The same `usako.png` is drawn in fixed placements: plain / flip /
+integer scale / RGB tint / source-rect crop.
 
-## 実行
+## Run
 
 ```bash
 zig build run-example_31
 ```
 
-ヘッドレス検証:
+Headless check:
 
 ```bash
 cat > /tmp/ex31.txt <<'EOF'
@@ -21,12 +22,14 @@ EOF
 VP_HEADLESS=1 VP_HARNESS_SCRIPT=/tmp/ex31.txt VP_HARNESS_OUT=/tmp zig build run-example_31
 ```
 
-固定 CRC（640×360・Release 既定・決定的配置）: `DF9AE909`
+Fixed CRC (640×360, Release default, deterministic layout): `DF9AE909`
 
-## 操作
+Harness command language: [`docs/harness.md`](../../docs/harness.md).
 
-- **ESC / Q**: 終了
+## Controls
 
-## 依存
+- **ESC / Q**: quit
 
-`@import("kit").gfx`（TASK-111.2）。named module `sprite` ではなく kit 公開面を直接検証する。
+## Dependencies
+
+`@import("kit").gfx` (not the named `sprite` module — exercises the kit public surface directly).
