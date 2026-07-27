@@ -30,6 +30,12 @@ the same directory.
 
 ## Build
 
+> **The wasm targets are not covered by `zig build -Dinstall-all=true` or by `zig build test`.**
+> A change can therefore break the wasm build without any of the usual gates noticing — which is
+> exactly what happened to `build-pixie-wasm` (the harness stub drifted behind the platform facade,
+> and `std.c.getenv` is unavailable without libc). **Run the two steps below whenever you touch
+> `core/control/`, the platform facade, `libs/appshell`, or anything a wasm root imports.**
+
 From the repository root:
 
 ```bash
