@@ -27,9 +27,11 @@ subsystems have their own documents, so read the one you need.
 | [docs/platform-verification.md](docs/platform-verification.md) | Building and verifying on Linux and Windows: Xvfb, a headless Wayland compositor, synthesising input, and the Windows symlink limitation |
 | [docs/performance-measurement.md](docs/performance-measurement.md) | How to measure a real frame rate, frame pacing, and the measured `.physical` 2x frame budget |
 | [docs/adr/](docs/adr/) | Architecture decision records. The layer structure is 007; the blocking behaviour of present is 002; support tiers and frame pacing are 005; frame pacing and fatal state are 008; the comment policy is 012 |
+| [docs/wasm-deploy.md](docs/wasm-deploy.md) | Building and serving the wasm targets (COOP/COEP, the AudioWorklet, and what the usual build gates do not cover) |
+| [docs/variable-font.md](docs/variable-font.md) | Variable-font axes and how the font layer applies them |
 
-Per-task plans live in the task tracker; design documents that span tasks live in
-`docs/plans/` at the top level. Neither is under this directory.
+Per-task plans live in a private task tracker, which is not part of this repository.
+Design documents that span several tasks live in [docs/plans/](docs/plans/).
 
 ## Comment and documentation policy
 
@@ -369,9 +371,8 @@ behind these rules are in
 
 Before writing the code, decide how often the loop runs, and **if it is per frame (over
 every pixel) or real-time (per sample), state so in the doc comment** of the file or
-function (for example `/// Runs over every pixel, every frame`). The implementation plan
-carries the same declaration. Getting the frequency wrong means getting the rest of
-these rules wrong.
+function (for example `/// Runs over every pixel, every frame`). Getting the frequency
+wrong means getting the rest of these rules wrong.
 
 ### The three rules for an all-pixel loop
 

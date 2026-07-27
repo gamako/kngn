@@ -34,4 +34,3 @@ a shared foundation of `libs/paint` plus `libs/gui`.
   only paint is imported directly (the kit-only consumer rule plus the exception for a
   lib still in flux).
 
-> Zig 0.16 idioms are in the `zig-best-practices` skill.

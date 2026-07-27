@@ -18,15 +18,17 @@ headless verification harness.
 | **Windows** | `gdi` (default) / `d3d11` | Pure Zig (Win32/GDI direct / hand-written D3D11-DXGI COM) |
 
 Valid `-Dplatform` values are OS-specific (asking for `x11` on macOS is a build error). Frame-pacing
-support tiers (tier 1 = Metal / D3D11-DXGI / Wayland; best-effort = CALayer / X11 / GDI) are in
+support tiers (first-class = Metal / D3D11-DXGI / Wayland; best-effort = CALayer / X11 / GDI) are in
 `docs/adr/005`.
 
 ## Layout
 
 ```
 .
-├── src/          # Zig (main / platform facade + backends / audio / dsp / harness / helpers)
-├── platform/     # macOS native (C ABI: macos / macos-swift / macos-metal)
+├── core/         # Platform facade + per-OS backends, audio, MIDI, the control plane (harness)
+├── kit/          # The public umbrella module that applications and external consumers import
+├── src/          # Zig not yet moved into libs (main, dsp, BDF text, gamepad helpers)
+├── platform/     # macOS native (C ABI: macos / macos-shared / macos-swift / macos-metal)
 ├── examples/     # Samples 01–41 (`run-example_NN`) + image/ (shared assets)
 ├── libs/         # Reusable libraries (png / gui / font / synth / paint / …)
 ├── apps/         # Applications (editor/pixie: pixel editor; synth: PC-keyboard play)

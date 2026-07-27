@@ -117,7 +117,7 @@ Linear interpolation between two colours for a smooth transition.
 ## Notes
 
 - This sample paces with `platform.frameDelay(16_666_666)` (~60 FPS). Serious applications
-  should prefer tier-1 backend frame pacing (fifo) or the frame-pacing APIs; `present` is not a
+  should prefer first-class backend frame pacing (fifo) or the frame-pacing APIs; `present` is not a
   vsync wait.
 - `window.present()` is a non-blocking submit (frame commit point). Tier-1 backends
   (Metal / D3D11-DXGI / Wayland) target tear-free fifo; best-effort backends

@@ -437,7 +437,7 @@ The definitions this discussion settled:
 
 - `platform/platform.h` — the API
 - `platform/macos/platform_macos.m` — macOS Objective-C implementation
-- `platform/macos-swift/platform_macos.swift` — macOS Swift implementation
+- `platform/macos-swift/platform_macos_swift.swift` — macOS Swift implementation
 - `platform/macos-metal/platform_macos_metal.swift` — macOS Metal implementation
 - `examples/01_timed_window/main.zig` — sample usage (an example of frame rate control)
 - [ADR-001](001_monotonic-clock-choice.md) — the related timer API decision
