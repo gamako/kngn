@@ -24,7 +24,7 @@
 //!
 //! ## The connection model (a non-blocking state machine)
 //! As with harness live, "one connection = one request (separated by `;` or a newline, settled by the client's half-close) = one response",
-//! so `scripts/drive` works unchanged (the wire is compatible). The fd is nonblocking at the OS level. Every phase —
+//! so `kngn ctl` works unchanged (the wire is compatible). The fd is nonblocking at the OS level. Every phase —
 //! read, execute and send — progresses across frames and never blocks the main loop (see `ConnState` and `pump()` for the detail).
 
 const std = @import("std");
@@ -936,7 +936,7 @@ test "copilot: 8 mutual exclusion, so copilot is disabled alongside KNGN_HARNESS
 // OS's buffering and would make a brittle test, so it is not added). What upholds it in the code is the structure
 // described in `pumpRead`'s doc comment — "the close decision rests on the read result alone, and no POLLHUP bit
 // closes directly" — and the equivalent branches at the ConnState layer (data present = run / no data = close) are
-// exercised directly by the tests below. The real socket path is upheld by the E2E (scripts/drive always takes it, going write → half-close → read).
+// exercised directly by the tests below. The real socket path is upheld by the E2E (`kngn ctl` always takes it, going write → half-close → read).
 test "copilot: 9 ConnState transport behaviour (a partial feed, running exactly once, truncated, the deadline, the budget carrying over)" {
     resetCopilotForTest();
     harness.setExternalRegistryEnabled(true);

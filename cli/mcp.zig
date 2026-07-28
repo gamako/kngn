@@ -1,11 +1,11 @@
-//! vp-mcp: harness listen TCP ↔ stdio MCP server.
+//! `kngn mcp`: harness listen TCP ↔ stdio MCP server.
 //!
 //! Attach to a running app (`KNGN_HARNESS_LISTEN`) and build MCP tools dynamically from capabilities.
 //! Pure std + `std.Io.net` only (no platform/audio dependency, no module import).
 //!
 //! Usage:
-//!   vp-mcp --port-file /tmp/vp.port
-//!   vp-mcp --port 54321 --out /tmp/vp-mcp-out
+//!   kngn mcp --port-file /tmp/kngn.port
+//!   kngn mcp --port 54321 --out /tmp/kngn-mcp-out
 //!
 //! MCP protocol is a minimal stdio JSON-RPC subset (initialize / notifications/initialized /
 //! tools/list / tools/call / ping). See docs/harness.md.
@@ -16,7 +16,7 @@ const json = std.json;
 const testing = std.testing;
 
 const PROTOCOL_VERSION = "2025-06-18";
-const SERVER_NAME = "vp-mcp";
+const SERVER_NAME = "kngn-mcp";
 const SERVER_VERSION = "0.1.0";
 const MESSAGE_MAX = 64 * 1024;
 // CONNECT_TIMEOUT_S=2 is the intended connect budget. Zig 0.16 Threaded netConnectIpPosix
@@ -28,13 +28,11 @@ const RESPONSE_LIMIT = 1 << 20;
 // CLI / process entry
 // ---------------------------------------------------------------------------
 
-pub fn main(init: std.process.Init) !void {
+/// `it` has already had the program name and the subcommand consumed by the dispatcher, and is
+/// read from here on. Do not reinitialise it.
+pub fn run(init: std.process.Init, it: *std.process.Args.Iterator) !void {
     const io = init.io;
     const gpa = init.arena.allocator();
-
-    var it = try std.process.Args.Iterator.initAllocator(init.minimal.args, gpa);
-    defer it.deinit();
-    _ = it.next();
 
     var port_opt: ?u16 = null;
     var port_file: ?[]const u8 = null;
@@ -67,7 +65,7 @@ pub fn main(init: std.process.Init) !void {
 
     const out_arg = out_opt orelse blk: {
         const tmp = init.environ_map.get("TMPDIR") orelse "/tmp";
-        break :blk try std.fmt.allocPrint(gpa, "{s}/vp-mcp-{d}", .{ tmp, port });
+        break :blk try std.fmt.allocPrint(gpa, "{s}/kngn-mcp-{d}", .{ tmp, port });
     };
     try validateOutArg(out_arg);
     const out_abs = try absolutizeOutDir(io, gpa, out_arg);
@@ -135,17 +133,17 @@ fn validateOutArg(out_arg: []const u8) error{McpFailed}!void {
 }
 
 fn die(msg: []const u8) error{McpFailed} {
-    std.debug.print("vp-mcp: {s}", .{msg});
+    std.debug.print("kngn mcp: {s}", .{msg});
     return error.McpFailed;
 }
 
 fn die2(comptime fmt: []const u8, args: anytype) error{McpFailed} {
-    std.debug.print("vp-mcp: " ++ fmt, args);
+    std.debug.print("kngn mcp: " ++ fmt, args);
     return error.McpFailed;
 }
 
 fn warn(comptime fmt: []const u8, args: anytype) void {
-    std.debug.print("vp-mcp: " ++ fmt, args);
+    std.debug.print("kngn mcp: " ++ fmt, args);
 }
 
 // ---------------------------------------------------------------------------
@@ -949,9 +947,9 @@ fn handleToolsCall(session: *Session, msg_gpa: std.mem.Allocator, id: json.Value
     const cmd = try buildHarnessCommand(session, msg_gpa, tool, raw);
     const resp = sendRequest(session.io, msg_gpa, session.port, cmd) catch |err| {
         const msg = switch (err) {
-            error.ConnectFailed => "TCP connect failed; restart vp-mcp after the app is running",
-            error.ResponseTimeout => "TCP response timeout; restart vp-mcp if the app exited",
-            error.WriteFailed, error.ReadFailed => "TCP I/O failed; restart vp-mcp after the app is running",
+            error.ConnectFailed => "TCP connect failed; restart kngn mcp after the app is running",
+            error.ResponseTimeout => "TCP response timeout; restart kngn mcp if the app exited",
+            error.WriteFailed, error.ReadFailed => "TCP I/O failed; restart kngn mcp after the app is running",
             error.ResponseTooLarge => "TCP response too large",
             error.OutOfMemory => "out of memory",
         };
@@ -971,7 +969,7 @@ fn handleToolsCall(session: *Session, msg_gpa: std.mem.Allocator, id: json.Value
     if (tool.kind == .snapshot) {
         const first = firstLineOf(trimmed);
         if (!std.fs.path.isAbsolute(first)) {
-            return try errorResponse(msg_gpa, id, -32000, "snapshot path is not absolute; set KNGN_HARNESS_OUT / --out correctly and restart vp-mcp");
+            return try errorResponse(msg_gpa, id, -32000, "snapshot path is not absolute; set KNGN_HARNESS_OUT / --out correctly and restart kngn mcp");
         }
         return try toolResultResponse(msg_gpa, id, first, false);
     }
@@ -1324,7 +1322,7 @@ test "contract: initialize / version / gate / unknown / parse / minified" {
         const r = (try handleLine(&session, gpa, "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{\"protocolVersion\":\"2025-06-18\",\"capabilities\":{},\"clientInfo\":{\"name\":\"t\",\"version\":\"0\"}}}")).?;
         try testing.expect(std.mem.indexOf(u8, r, "\"protocolVersion\":\"2025-06-18\"") != null);
         try testing.expect(std.mem.indexOf(u8, r, "\"listChanged\":false") != null);
-        try testing.expect(std.mem.indexOf(u8, r, "\"name\":\"vp-mcp\"") != null);
+        try testing.expect(std.mem.indexOf(u8, r, "\"name\":\"kngn-mcp\"") != null);
         try testing.expect(session.phase == .need_initialized);
         try testing.expect(std.mem.indexOf(u8, r, "\n") == null);
     }
@@ -1472,7 +1470,7 @@ test "serialize: out-of-range float→int / enum out of set → InvalidParams" {
 test "--out path with whitespace is a startup error" {
     try testing.expectError(error.McpFailed, validateOutArg("/tmp/has space"));
     try testing.expectError(error.McpFailed, validateOutArg("/tmp/has\ttab"));
-    try validateOutArg("/tmp/vp-mcp-ok");
+    try validateOutArg("/tmp/kngn-mcp-ok");
 }
 
 test "min/max JSON accepts both .integer and .float" {

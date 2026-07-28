@@ -5,7 +5,7 @@ set -euo pipefail
 
 ROOT=$(cd "$(dirname "$0")/../.." && pwd)
 MAIN="${KNGN_MAIN_DIR:-$ROOT}"
-DRIVE="$ROOT/scripts/drive"
+KNGN="$ROOT/scripts/kngn"
 E2E="$ROOT/.e2e/netsync-long-stroke"
 NETSYNC_PORT=9210
 HOST_PORT="$E2E/host.port"
@@ -43,7 +43,7 @@ wait_port() {
 
 quit_pid() {
   local port_file=$1 pid=$2
-  "$DRIVE" --port-file "$port_file" 'quit' >/dev/null 2>&1 || true
+  "$KNGN" ctl --port-file "$port_file" 'quit' >/dev/null 2>&1 || true
   local i
   for i in $(seq 1 100); do
     kill -0 "$pid" 2>/dev/null || return 0
@@ -59,8 +59,8 @@ cleanup() {
 }
 trap cleanup EXIT
 
-drive_h() { "$DRIVE" --port-file "$HOST_PORT" "$1"; }
-drive_c() { "$DRIVE" --port-file "$CLIENT_PORT" "$1"; }
+drive_h() { "$KNGN" ctl --port-file "$HOST_PORT" "$1"; }
+drive_c() { "$KNGN" ctl --port-file "$CLIENT_PORT" "$1"; }
 
 # Alternate host+client steps while waiting on the condition
 wait_until() {

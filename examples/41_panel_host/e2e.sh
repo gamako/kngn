@@ -8,7 +8,7 @@ KNGN_ROOT="${KNGN_ROOT:-/Users/gamako/gamako/project/zig/video-proto/video-proto
 E2E_WIDTH="${E2E_WIDTH:-1024}"
 E2E_HEIGHT="${E2E_HEIGHT:-768}"
 E2E_TIMEOUT_SEC="${E2E_TIMEOUT_SEC:-60}"
-DRIVE="$ROOT/scripts/drive"
+KNGN="$ROOT/scripts/kngn"
 
 log() { echo "$@"; }
 
@@ -38,16 +38,16 @@ LOG="$LIVE_OUT/e2e.log"
 : >"$LOG"
 log "[e2e] === live === out=$LIVE_OUT"
 
-if [[ ! -x "$ROOT/zig-out/bin/drive" ]]; then
-  log "[e2e] building drive..."
-  direnv exec "$KNGN_ROOT" zig build drive >>"$LOG" 2>&1
+if [[ ! -x "$ROOT/zig-out/bin/kngn" ]]; then
+  log "[e2e] building kngn..."
+  direnv exec "$KNGN_ROOT" zig build kngn >>"$LOG" 2>&1
 fi
 
 APP_PID=""
 cleanup() {
   if [[ -n "${APP_PID}" ]] && kill -0 "$APP_PID" 2>/dev/null; then
     if [[ -f "$PORT_FILE" ]]; then
-      "$DRIVE" --port-file "$PORT_FILE" 'quit' >>"$LOG" 2>&1 || true
+      "$KNGN" ctl --port-file "$PORT_FILE" 'quit' >>"$LOG" 2>&1 || true
       sleep 0.3
     fi
     if kill -0 "$APP_PID" 2>/dev/null; then
@@ -88,7 +88,7 @@ done
 log "[e2e] port file ready: $(cat "$PORT_FILE")"
 
 drive() {
-  "$DRIVE" --port-file "$PORT_FILE" "$1"
+  "$KNGN" ctl --port-file "$PORT_FILE" "$1"
 }
 
 parse_kv() {

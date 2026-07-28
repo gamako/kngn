@@ -1,0 +1,16 @@
+#!/usr/bin/env bash
+# kngn: thin entry for the command line tool.
+# exec the built zig-out/bin/kngn directly (no per-call zig build = keep the response on stdout clean).
+#
+#   scripts/kngn ctl --port-file /tmp/kngn.port 'inject key_down A; step 3; digest fb'
+#   scripts/kngn mcp --port-file /tmp/kngn.port
+#
+# Build zig-out/bin/kngn first with `zig build kngn` (or `zig build`).
+set -euo pipefail
+here="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+bin="$here/zig-out/bin/kngn"
+if [[ ! -x "$bin" ]]; then
+  echo "kngn: $bin not found. Build first with 'zig build kngn' (or zig build)." >&2
+  exit 1
+fi
+exec "$bin" "$@"

@@ -12,7 +12,7 @@ E2E_HEIGHT="${E2E_HEIGHT:-768}"
 KNGN_HARNESS_OUT="${KNGN_HARNESS_OUT:-$(mktemp -d /tmp/kngn-settings-shell.XXXXXX)}"
 PORT_FILE="$KNGN_HARNESS_OUT/harness.port"
 LOG="$KNGN_HARNESS_OUT/e2e.log"
-DRIVE="$ROOT/scripts/drive"
+KNGN="$ROOT/scripts/kngn"
 
 mkdir -p "$KNGN_HARNESS_OUT"
 : >"$LOG"
@@ -23,7 +23,7 @@ APP_PID=""
 cleanup() {
   if [[ -n "${APP_PID}" ]] && kill -0 "$APP_PID" 2>/dev/null; then
     if [[ -f "$PORT_FILE" ]]; then
-      "$DRIVE" --port-file "$PORT_FILE" 'quit' >>"$LOG" 2>&1 || true
+      "$KNGN" ctl --port-file "$PORT_FILE" 'quit' >>"$LOG" 2>&1 || true
       sleep 0.3
     fi
     if kill -0 "$APP_PID" 2>/dev/null; then
@@ -36,10 +36,10 @@ trap cleanup EXIT
 
 cd "$ROOT"
 
-# ensure drive binary
-if [[ ! -x "$ROOT/zig-out/bin/drive" ]]; then
-  log "[e2e] building drive..."
-  direnv exec "$KNGN_ROOT" zig build drive >>"$LOG" 2>&1
+# ensure kngn binary
+if [[ ! -x "$ROOT/zig-out/bin/kngn" ]]; then
+  log "[e2e] building kngn..."
+  direnv exec "$KNGN_ROOT" zig build kngn >>"$LOG" 2>&1
 fi
 
 log "[e2e] out=$KNGN_HARNESS_OUT port=$E2E_PORT size=${E2E_WIDTH}x${E2E_HEIGHT}"
@@ -74,10 +74,10 @@ done
 log "[e2e] port file ready after ~$((WAIT / 2))s: $(cat "$PORT_FILE")"
 
 # warm frames
-"$DRIVE" --port-file "$PORT_FILE" 'step 3' >>"$LOG" 2>&1
+"$KNGN" ctl --port-file "$PORT_FILE" 'step 3' >>"$LOG" 2>&1
 
 drive() {
-  "$DRIVE" --port-file "$PORT_FILE" "$1"
+  "$KNGN" ctl --port-file "$PORT_FILE" "$1"
 }
 
 # parse key=value from digest line (first matching key)

@@ -155,9 +155,9 @@ Checking acceptance headlessly (sound comes out on macOS hardware; the audio dig
 taken live):
 
 ```bash
-KNGN_HARNESS_LISTEN= KNGN_HARNESS_PORT_FILE=/tmp/vp.port zig build run-patch &     # start in the background
-scripts/drive --port-file /tmp/vp.port 'digest audio'                        # → check silent=0 and rms>0
-scripts/drive --port-file /tmp/vp.port 'quit'
+KNGN_HARNESS_LISTEN= KNGN_HARNESS_PORT_FILE=/tmp/kngn.port zig build run-patch &     # start in the background
+scripts/kngn ctl --port-file /tmp/kngn.port 'digest audio'                        # → check silent=0 and rms>0
+scripts/kngn ctl --port-file /tmp/kngn.port 'quit'
 ```
 
 > Determinism is guaranteed by "two renders produce the same crc" in

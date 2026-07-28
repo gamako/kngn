@@ -11,7 +11,7 @@ Phases, all implemented:
 
 - **File replay** plus the built-in `fb` probe (framebuffer → PNG, or a one-line
   digest) and the virtual clock.
-- **Live control** (TCP loopback plus the `scripts/drive` CLI), the built-in
+- **Live control** (TCP loopback plus the `kngn ctl` CLI), the built-in
   `audio` and `stats` probes, and record → replay.
 - **A custom probe registry**: an application opts in with
   `platform.registerProbe(...)` (the editor registers twelve, `canvas` and `undo` and
@@ -183,7 +183,7 @@ agent iterate without looking at anything.
   failure **exits non-zero immediately** (a fail-fast abort — `exit(1)` skips cleanup,
   which is debug behaviour). In live, a response line of `ok` or
   `fail <probe> <expr> [actual=..]` is returned and **the process does not terminate**
-  (so in live, expect and assert behave identically). `scripts/drive` scans **every
+  (so in live, expect and assert behave identically). `kngn ctl` scans **every
   response line** and exits non-zero itself if any starts with `fail ` (warnings such
   as `error:` do not make it non-zero).
 - **Fail-fast, so a typo is never swallowed**: an unknown probe name, malformed syntax
@@ -222,7 +222,7 @@ for a shared command unit across undo and networking.
   `[harness] action <name> FAILED <msg>` on failure. A live response is
   `<name> <msg>` on success (**bare, in the same style as a digest's
   `<probe> <payload>`**) and `fail <name> <msg>` on failure (**with the `fail `
-  prefix, so `scripts/drive`'s line scan makes it exit non-zero**). If a callback
+  prefix, so `kngn ctl`'s line scan makes it exit non-zero**). If a callback
   mistakenly returns several lines, `msg` is cut at the first `\r` or `\n` before
   emitting (wire framing protection, not interpretation).
 - **Structured errors (`code` + `suggested_next_action`, opt-in)**: a wire extension
@@ -240,7 +240,7 @@ for a shared command unit across undo and networking.
   - **Wire (appended to the failure line only)**: live is
     `fail <name> <msg> code=<c> next=<n>` and replay is
     `[harness] action <name> FAILED <msg> code=<c> next=<n>`. **The leading `fail ` is
-    unchanged**, so `scripts/drive`'s prefix scan and non-zero exit keep working
+    unchanged**, so `kngn ctl`'s prefix scan and non-zero exit keep working
     untouched. The netsync REJECT reason and the capabilities JSON are outside this
     extension.
   - **Worked examples in the editor**: a failed `open` (`ReadFailed` or `FileNotFound`)
@@ -300,19 +300,19 @@ zig build test-harness   # unit tests (parser, execution model, virtual clock, a
 
 ## Using it: live (TCP loopback plus the driver CLI)
 
-Start the application in the background and use `scripts/drive` for one connection
+Start the application in the background and use `kngn ctl` for one connection
 per request per response. State stays in the process.
 
 ```bash
-zig build drive                                   # build zig-out/bin/drive once (a plain zig build includes it)
-KNGN_HARNESS_LISTEN= KNGN_HARNESS_PORT_FILE=/tmp/vp.port KNGN_HARNESS_OUT=/tmp \
-  KNGN_HARNESS_RECORD=/tmp/live.txt zig build run-synth &        # background (the ephemeral port is written to /tmp/vp.port)
+zig build kngn                                   # build zig-out/bin/kngn once (a plain zig build includes it)
+KNGN_HARNESS_LISTEN= KNGN_HARNESS_PORT_FILE=/tmp/kngn.port KNGN_HARNESS_OUT=/tmp \
+  KNGN_HARNESS_RECORD=/tmp/live.txt zig build run-synth &        # background (the ephemeral port is written to /tmp/kngn.port)
 # For a fixed port use KNGN_HARNESS_LISTEN=<n>. The port also appears on stderr.
 # For the old step-driven behaviour, add KNGN_HARNESS_MANUAL_CLOCK=1.
-scripts/drive --port-file /tmp/vp.port 'inject key_down A; step 5; digest fb'   # → returns fb ... on stdout
-scripts/drive --port-file /tmp/vp.port 'digest audio'                          # → audio rms=.. f0=.. ..
-scripts/drive --port-file /tmp/vp.port 'snapshot fb /tmp/out.png'              # → /tmp/out.png
-scripts/drive --port-file /tmp/vp.port 'quit'                                  # terminate the application
+scripts/kngn ctl --port-file /tmp/kngn.port 'inject key_down A; step 5; digest fb'   # → returns fb ... on stdout
+scripts/kngn ctl --port-file /tmp/kngn.port 'digest audio'                          # → audio rms=.. f0=.. ..
+scripts/kngn ctl --port-file /tmp/kngn.port 'snapshot fb /tmp/out.png'              # → /tmp/out.png
+scripts/kngn ctl --port-file /tmp/kngn.port 'quit'                                  # terminate the application
 # Record → replay symmetry: replaying the log above reproduces the same command sequence
 KNGN_HARNESS_SCRIPT=/tmp/live.txt KNGN_HARNESS_OUT=/tmp zig build run-synth
 ```
@@ -335,7 +335,7 @@ KNGN_HARNESS_SCRIPT=/tmp/live.txt KNGN_HARNESS_OUT=/tmp zig build run-synth
 > non-blocking accept of free-run currently exists only as a POSIX `poll(0)`
 > implementation, and the Windows branch always reports `not_ready` (a silent no-op
 > that never accepts a connection — the port file and the listen log appear, but
-> `drive` cannot connect). **On Windows, add `KNGN_HARNESS_MANUAL_CLOCK=1`** to use the
+> `kngn ctl` cannot connect). **On Windows, add `KNGN_HARNESS_MANUAL_CLOCK=1`** to use the
 > old step-driven path (a blocking accept). macOS and Linux are fine with the free-run
 > default.
 
@@ -522,27 +522,27 @@ Rules and limits:
   crc of objc and metal was measured bit-identical). Reading back Metal's GPU drawable
   is out of scope (see above).
 - **The driver is a single `std.Io.net` implementation** shared by macOS, Linux and
-  Windows (`drive` is installed unconditionally, with no OS gate; running it on Windows
-  is untested). `scripts/drive` is a thin wrapper that execs `zig-out/bin/drive`
+  Windows (`kngn` is installed unconditionally, with no OS gate; running it on Windows
+  is untested). `scripts/kngn` is a thin wrapper that execs `zig-out/bin/kngn`
   directly, so it does not pollute the response on stdout.
 
-## vp-mcp (the MCP server)
+## kngn mcp (the MCP server)
 
 A stdio JSON-RPC adapter that attaches as one client of the harness's live TCP and
 generates MCP tools dynamically from capabilities (the application is unmodified).
 
 ```bash
-zig build mcp                    # → zig-out/bin/vp-mcp
+zig build kngn                    # → zig-out/bin/kngn
 # with the application started headless and listening:
-KNGN_HEADLESS=1 KNGN_HARNESS_LISTEN= KNGN_HARNESS_PORT_FILE=/tmp/vp.port zig build run-pixie &
-zig-out/bin/vp-mcp --port-file /tmp/vp.port
-# or scripts/mcp --port-file /tmp/vp.port
+KNGN_HEADLESS=1 KNGN_HARNESS_LISTEN= KNGN_HARNESS_PORT_FILE=/tmp/kngn.port zig build run-pixie &
+zig-out/bin/kngn mcp --port-file /tmp/kngn.port
+# or scripts/kngn mcp --port-file /tmp/kngn.port
 ```
 
-- **Arguments**: `--port` and `--port-file` (the same precedence as `drive`, plus the
+- **Arguments**: `--port` and `--port-file` (the same precedence as `kngn ctl`, plus the
   environment variables `KNGN_HARNESS_LISTEN` for a positive value and
   `KNGN_HARNESS_PORT_FILE`), plus `--out <dir>` for where snapshots go (default
-  `$TMPDIR/vp-mcp-<port>`; made absolute and created at startup).
+  `$TMPDIR/kngn-mcp-<port>`; made absolute and created at startup).
 - **At startup** it takes `digest capabilities` once and fails to start if
   `"truncated":true`. The tool table is fixed from then on (it does not follow an
   application restart).
@@ -550,6 +550,6 @@ zig-out/bin/vp-mcp --port-file /tmp/vp.port
   gate; tools/list, tools/call and ping; stdout carries JSON-RPC only (logs go to
   stderr).
 - **Tools**: a probe becomes `digest_<name>` and `snapshot_<name>` (with no path
-  argument — vp-mcp injects an absolute path under `--out`); an action becomes
+  argument — kngn mcp injects an absolute path under `--out`); an action becomes
   `<name>` (or `a_<name>` on a collision).
 - **Verification**: `zig build test-mcp` (unit tests of the pure functions).

@@ -60,12 +60,12 @@ KNGN_APPSHELL_DIR=/tmp/kngn-demo KNGN_HEADLESS=1 KNGN_HARNESS_SCRIPT=/tmp/script
 同じアプリを MCP サーバーとして立てれば、エージェントの道具になります。
 
 ```bash
-zig build mcp                                   # → zig-out/bin/vp-mcp
-KNGN_HEADLESS=1 KNGN_HARNESS_LISTEN= KNGN_HARNESS_PORT_FILE=/tmp/vp.port zig build run-pixie &
-zig-out/bin/vp-mcp --port-file /tmp/vp.port     # stdio JSON-RPC
+zig build kngn                                   # → zig-out/bin/kngn
+KNGN_HEADLESS=1 KNGN_HARNESS_LISTEN= KNGN_HARNESS_PORT_FILE=/tmp/kngn.port zig build run-pixie &
+zig-out/bin/kngn mcp --port-file /tmp/kngn.port # stdio JSON-RPC
 ```
 
-`vp-mcp` はアプリに `digest capabilities` を一度問い合わせ、**登録されている probe と action から
+`kngn mcp` はアプリに `digest capabilities` を一度問い合わせ、**登録されている probe と action から
 MCP ツール表を自動生成します**。アプリ側に MCP の知識は一切要りません。
 `registerProbe` / `registerAction` を呼んだ時点で、そのアプリはエージェントから操作できます。
 `snapshot_*` ツールが返すのは**成果物ファイルの絶対パス**です（形式は probe 次第で、`fb` や

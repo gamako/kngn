@@ -109,33 +109,33 @@ KNGN_HEADLESS=1 KNGN_HARNESS_LISTEN= KNGN_HARNESS_PORT_FILE=./.e2e/client.port \
 
 # The client has finished joining. In free-run no step needs injecting into the host;
 # await holds one connection and waits.
-scripts/drive --port-file ./.e2e/client.port 'await netsync awaiting_sync=0 600'
+scripts/kngn ctl --port-file ./.e2e/client.port 'await netsync awaiting_sync=0 600'
 
 # Add one shared layer and have the host and client select different ones
 # (select_layer is local_only).
-scripts/drive --port-file ./.e2e/host.port 'action add_layer'
-until scripts/drive --port-file ./.e2e/host.port 'step 1; digest netsync' | grep -E 'last_seq=[1-9][0-9]*' | grep -q 'pending=0'; do sleep 0.05; done
-until scripts/drive --port-file ./.e2e/client.port 'step 1; digest netsync' | grep -q 'awaiting_sync=0'; do sleep 0.05; done
-scripts/drive --port-file ./.e2e/host.port 'action select_layer 0; action set_tool brush; action set_color FF0000'
-scripts/drive --port-file ./.e2e/client.port 'action select_layer 1; action set_tool pen; action set_color 0000FF'
+scripts/kngn ctl --port-file ./.e2e/host.port 'action add_layer'
+until scripts/kngn ctl --port-file ./.e2e/host.port 'step 1; digest netsync' | grep -E 'last_seq=[1-9][0-9]*' | grep -q 'pending=0'; do sleep 0.05; done
+until scripts/kngn ctl --port-file ./.e2e/client.port 'step 1; digest netsync' | grep -q 'awaiting_sync=0'; do sleep 0.05; done
+scripts/kngn ctl --port-file ./.e2e/host.port 'action select_layer 0; action set_tool brush; action set_color FF0000'
+scripts/kngn ctl --port-file ./.e2e/client.port 'action select_layer 1; action set_tool pen; action set_color 0000FF'
 
 # Strokes from both sides. The canonical wire carries the origin's layer=#id, colour and tool.
-scripts/drive --port-file ./.e2e/host.port 'action stroke 10 10 60 10'
-scripts/drive --port-file ./.e2e/client.port 'action stroke 20 20 70 20'  # → "proposed <id>"
+scripts/kngn ctl --port-file ./.e2e/host.port 'action stroke 10 10 60 10'
+scripts/kngn ctl --port-file ./.e2e/client.port 'action stroke 20 20 70 20'  # → "proposed <id>"
 
 # The relay is done: mix in a host step to advance the COMMIT, then re-check
 # last_seq>=3 && pending=0 on both sides.
-until scripts/drive --port-file ./.e2e/host.port 'step 1; digest netsync' | grep -E 'last_seq=[3-9][0-9]*' | grep -q 'pending=0'; do sleep 0.05; done
-until scripts/drive --port-file ./.e2e/client.port 'step 1; digest netsync' | grep -E 'last_seq=[3-9][0-9]*' | grep -q 'pending=0'; do sleep 0.05; done
+until scripts/kngn ctl --port-file ./.e2e/host.port 'step 1; digest netsync' | grep -E 'last_seq=[3-9][0-9]*' | grep -q 'pending=0'; do sleep 0.05; done
+until scripts/kngn ctl --port-file ./.e2e/client.port 'step 1; digest netsync' | grep -E 'last_seq=[3-9][0-9]*' | grep -q 'pending=0'; do sleep 0.05; done
 
-scripts/drive --port-file ./.e2e/host.port 'digest canvas'    # the crcs of l0 and l1
-scripts/drive --port-file ./.e2e/client.port 'digest canvas'  # the same l0/l1 crcs, with selected still per peer
+scripts/kngn ctl --port-file ./.e2e/host.port 'digest canvas'    # the crcs of l0 and l1
+scripts/kngn ctl --port-file ./.e2e/client.port 'digest canvas'  # the same l0/l1 crcs, with selected still per peer
 
 # Take the measured values and assert that the l0/l1 crcs match and that tool, colour
 # and selected are peer-local.
-# Always terminate with drive's quit (never pkill).
-scripts/drive --port-file ./.e2e/host.port 'quit'
-scripts/drive --port-file ./.e2e/client.port 'quit'
+# Always terminate with `kngn ctl`'s quit (never pkill).
+scripts/kngn ctl --port-file ./.e2e/host.port 'quit'
+scripts/kngn ctl --port-file ./.e2e/client.port 'quit'
 ```
 
 ## The netsync observation probe
@@ -190,13 +190,13 @@ KNGN_HEADLESS=1 KNGN_HARNESS_LISTEN= KNGN_HARNESS_PORT_FILE=./.e2e/host.port \
 KNGN_HEADLESS=1 KNGN_HARNESS_LISTEN= KNGN_HARNESS_PORT_FILE=./.e2e/client.port \
   KNGN_NETSYNC_CONNECT=127.0.0.1:9110 KNGN_NETSYNC_ACTOR=agent KNGN_NETSYNC_LABEL=bot \
   zig build run-pixie &
-scripts/drive --port-file ./.e2e/client.port 'await netsync awaiting_sync=0 600'
-scripts/drive --port-file ./.e2e/host.port 'action stroke 10 10 60 10'
-scripts/drive --port-file ./.e2e/client.port 'action stroke 20 20 70 20'
-until scripts/drive --port-file ./.e2e/host.port 'digest history' | grep -q 'last_origin_kind=agent.*last_origin_label=bot'; do sleep 0.05; done
+scripts/kngn ctl --port-file ./.e2e/client.port 'await netsync awaiting_sync=0 600'
+scripts/kngn ctl --port-file ./.e2e/host.port 'action stroke 10 10 60 10'
+scripts/kngn ctl --port-file ./.e2e/client.port 'action stroke 20 20 70 20'
+until scripts/kngn ctl --port-file ./.e2e/host.port 'digest history' | grep -q 'last_origin_kind=agent.*last_origin_label=bot'; do sleep 0.05; done
 # The host's history shows AI:bot, the client's shows H:host, and the client's own row is starred
-scripts/drive --port-file ./.e2e/host.port 'quit'
-scripts/drive --port-file ./.e2e/client.port 'quit'
+scripts/kngn ctl --port-file ./.e2e/host.port 'quit'
+scripts/kngn ctl --port-file ./.e2e/client.port 'quit'
 ```
 
 ## Undo and redo during a session
@@ -212,7 +212,7 @@ scripts/drive --port-file ./.e2e/client.port 'quit'
 - Cmd+Z from the keyboard goes through `routeAction("undo"/"redo")` while
   `netsyncActive()`.
 
-Wait deterministically by re-checking `drive 'digest netsync'` in an until loop (do not
+Wait deterministically by re-checking `kngn ctl 'digest netsync'` in an until loop (do not
 retry on a fixed sleep; sleeping is acceptable only while waiting for a process's port
 file).
 

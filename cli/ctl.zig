@@ -1,11 +1,11 @@
-//! drive: CLI driver for the headless harness listen transport (TCP loopback).
+//! `kngn ctl`: drives the headless harness listen transport (TCP loopback).
 //!
 //! Send one request and get one response against a background app listening on
 //! `KNGN_HARNESS_LISTEN[=port]`. State lives in the app process (connections are disposable).
 //!
 //! Usage:
-//!   drive --port 54321 'inject key_down A; step 3; digest fb'
-//!   drive --port-file /tmp/vp.port 'step 1; digest fb'
+//!   kngn ctl --port 54321 'inject key_down A; step 3; digest fb'
+//!   kngn ctl --port-file /tmp/kngn.port 'step 1; digest fb'
 //!   (when --port / --port-file are omitted, read env KNGN_HARNESS_LISTEN (positive port) / KNGN_HARNESS_PORT_FILE)
 //!
 //! The command string is the remaining args joined with spaces. The harness splits on `;` / newlines into multiple commands.
@@ -16,14 +16,13 @@
 const std = @import("std");
 const net = std.Io.net;
 
-pub fn main(init: std.process.Init) !void {
+/// `it` has already had the program name and the subcommand consumed by the dispatcher, and is
+/// read from here on. Do not reinitialise it: the trailing arguments are joined into the command
+/// string, so losing the iterator position would lose the command.
+pub fn run(init: std.process.Init, it: *std.process.Args.Iterator) !void {
     const io = init.io;
     // Short-lived CLI: use an arena (all allocs freed at process exit; no manual free / leak report).
     const gpa = init.arena.allocator();
-
-    var it = try std.process.Args.Iterator.initAllocator(init.minimal.args, gpa);
-    defer it.deinit();
-    _ = it.next(); // program name
 
     var port_opt: ?u16 = null;
     var port_file: ?[]const u8 = null;
@@ -40,7 +39,7 @@ pub fn main(init: std.process.Init) !void {
             try cmd.appendSlice(gpa, arg);
         }
     }
-    if (cmd.items.len == 0) return die("missing command string (example: drive --port-file /tmp/vp.port 'step 1; digest fb')\n");
+    if (cmd.items.len == 0) return die("missing command string (example: kngn ctl --port-file /tmp/kngn.port 'step 1; digest fb')\n");
 
     // port resolution: --port > --port-file > env KNGN_HARNESS_LISTEN (positive) > env KNGN_HARNESS_PORT_FILE
     const port: u16 = port_opt orelse blk: {
@@ -82,15 +81,15 @@ pub fn main(init: std.process.Init) !void {
     try stdout.interface.flush();
 
     // expect/assert outcome propagation: scan **each line** of the response; if any starts with `fail `,
-    // drive itself exits non-zero (useful for agent self-loops). stdout passthrough already finished above.
+    // kngn ctl itself exits non-zero (useful for agent self-loops). stdout passthrough already finished above.
     // Detect only a leading `fail ` (do not treat harness warnLine `error:` and other benign warnings as failure).
     // Also catch `fail ` on line 2+ when multiple commands share one request (line scan, not whole-buffer startsWith).
-    // Assertion failure is not a drive bug, so prefer a single stderr line + `exit(1)` over `return error`
+    // Assertion failure is not a ctl bug, so prefer a single stderr line + `exit(1)` over `return error`
     // (which would print a Zig stack trace). stdout is already passed through; omitting defer close is fine with no further work.
     var lines = std.mem.splitScalar(u8, resp, '\n');
     while (lines.next()) |ln| {
         if (std.mem.startsWith(u8, ln, "fail ")) {
-            std.debug.print("drive: expect/assert failed (non-zero exit)\n", .{});
+            std.debug.print("kngn ctl: expect/assert failed (non-zero exit)\n", .{});
             std.process.exit(1);
         }
     }
@@ -104,12 +103,12 @@ fn readPortFile(io: std.Io, gpa: std.mem.Allocator, path: []const u8) !u16 {
     return std.fmt.parseInt(u16, trimmed, 10) catch return die("port file contents are invalid\n");
 }
 
-fn die(msg: []const u8) error{DriveFailed} {
-    std.debug.print("drive: {s}", .{msg});
-    return error.DriveFailed;
+fn die(msg: []const u8) error{CtlFailed} {
+    std.debug.print("kngn ctl: {s}", .{msg});
+    return error.CtlFailed;
 }
 
-fn die2(comptime fmt: []const u8, args: anytype) error{DriveFailed} {
-    std.debug.print("drive: " ++ fmt, args);
-    return error.DriveFailed;
+fn die2(comptime fmt: []const u8, args: anytype) error{CtlFailed} {
+    std.debug.print("kngn ctl: " ++ fmt, args);
+    return error.CtlFailed;
 }

@@ -1982,7 +1982,7 @@ fn actionErrorDetailSuffix(buf: []u8) []const u8 {
 /// - live success  : `<name> <msg>` (bare, in the same style as a digest) / failure: `fail <name> <msg>` (the prefix
 ///   that puts it on drive's leading-token scan)
 /// - On a failure, when the application has called `setActionErrorDetail`, ` code=<c> next=<n>` is appended
-///   (with none set it is bit-identical to the old format. The leading `fail ` never changes, so scripts/drive's leading-token scan needs no change)
+///   (with none set it is bit-identical to the old format. The leading `fail ` never changes, so `kngn ctl`'s leading-token scan needs no change)
 /// - Only on a failure, and only when `mode == .replay`, `expect_failures` is incremented (there is no immediate abort as with assert).
 fn reportAction(pass: bool, name: []const u8, msg: []const u8) void {
     const line = firstLine(msg);
@@ -4179,7 +4179,7 @@ test "an action's structured error: code= and next= are appended to a live failu
         var it = std.mem.tokenizeAny(u8, "boom", " \t");
         handleAction(&it);
     }
-    // the leading `fail ` never changes → a regression check on scripts/drive's leading-`fail ` scan
+    // the leading `fail ` never changes → a regression check on `kngn ctl`'s leading-`fail ` scan
     try testing.expect(std.mem.startsWith(u8, resp_buf.items, "fail boom "));
     try testing.expectEqualStrings("fail boom Boom code=file_not_found next=check path or use save first\n", resp_buf.items);
     resp_buf.clearRetainingCapacity();

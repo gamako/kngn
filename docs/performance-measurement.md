@@ -17,10 +17,10 @@ KNGN_HARNESS_LISTEN= KNGN_HARNESS_PORT_FILE=/tmp/x.port KNGN_HARNESS_SKIP_FRAME_
   zig build run-pixie -Doptimize=ReleaseFast &
 until [ -s /tmp/x.port ]; do sleep 0.1; done         # wait for the port file to appear
 sleep 5                                              # warm up
-scripts/drive --port-file /tmp/x.port 'digest stats'  # first reading
+scripts/kngn ctl --port-file /tmp/x.port 'digest stats'  # first reading
 sleep 10
-scripts/drive --port-file /tmp/x.port 'digest stats'  # second reading; (frame difference) / (elapsed seconds) = fps
-scripts/drive --port-file /tmp/x.port 'quit'          # always quit (never pkill)
+scripts/kngn ctl --port-file /tmp/x.port 'digest stats'  # second reading; (frame difference) / (elapsed seconds) = fps
+scripts/kngn ctl --port-file /tmp/x.port 'quit'          # always quit (never pkill)
 ```
 
 - `frame` is **the number of `present()` calls** (present is a non-blocking submit, per

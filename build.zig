@@ -573,33 +573,21 @@ pub fn build(b: *std.Build) void {
         addBuildStep(b, "build-patch", "Build patch canvas only (uses -Dplatform option)", dp);
     }
 
-    // ----- Live harness driver CLI -----
-    // Standalone exe of pure std + std.Io.net (no platform/audio). Always install so it doubles as compile regression.
-    // The `scripts/drive` wrapper execs `zig-out/bin/drive` directly.
-    const drive_exe = b.addExecutable(.{
-        .name = "drive",
+    // ----- The command line tool -----
+    // One binary with a subcommand per line of work: `kngn ctl` drives a running app's harness,
+    // `kngn mcp` serves that harness to an MCP client. Standalone exe of pure std + std.Io.net
+    // (no platform/audio). Always install so it doubles as compile regression.
+    // The `scripts/kngn` wrapper execs `zig-out/bin/kngn` directly.
+    const kngn_exe = b.addExecutable(.{
+        .name = "kngn",
         .root_module = b.createModule(.{
-            .root_source_file = b.path("scripts/drive.zig"),
+            .root_source_file = b.path("cli/kngn.zig"),
             .target = target,
             .optimize = optimize,
         }),
     });
-    b.installArtifact(drive_exe);
-    addBuildStep(b, "drive", "Build the live harness driver CLI (zig-out/bin/drive)", drive_exe);
-
-    // ----- MCP server CLI -----
-    // Standalone exe of pure std + std.Io.net (no platform/audio). Same shape as drive.
-    // The `scripts/mcp` wrapper execs `zig-out/bin/vp-mcp` directly.
-    const mcp_exe = b.addExecutable(.{
-        .name = "vp-mcp",
-        .root_module = b.createModule(.{
-            .root_source_file = b.path("scripts/mcp.zig"),
-            .target = target,
-            .optimize = optimize,
-        }),
-    });
-    b.installArtifact(mcp_exe);
-    addBuildStep(b, "mcp", "Build the MCP server CLI (zig-out/bin/vp-mcp)", mcp_exe);
+    b.installArtifact(kngn_exe);
+    addBuildStep(b, "kngn", "Build the command line tool (zig-out/bin/kngn; ctl and mcp subcommands)", kngn_exe);
 
     // ----- wasm web distribution package -----
     // Cross-compile from the native target into zig-out/web/. The web/ layout used in development is unchanged.
@@ -670,15 +658,15 @@ pub fn build(b: *std.Build) void {
     const test_harness_step = b.step("test-harness", "Run harness unit tests (parser / execution model / virtual clock)");
     test_harness_step.dependOn(&run_harness_test.step);
 
-    // vp-mcp unit tests (schema convert / serialize / fail extract / collision resolve / contract; std only)
+    // `kngn mcp` unit tests (schema convert / serialize / fail extract / collision resolve / contract; std only)
     const mcp_test_mod = b.createModule(.{
-        .root_source_file = b.path("scripts/mcp.zig"),
+        .root_source_file = b.path("cli/mcp.zig"),
         .target = target,
         .optimize = optimize,
     });
     const mcp_test = b.addTest(.{ .root_module = mcp_test_mod });
     const run_mcp_test = b.addRunArtifact(mcp_test);
-    const test_mcp_step = b.step("test-mcp", "Run vp-mcp unit tests (schema / serialize / fail / contract)");
+    const test_mcp_step = b.step("test-mcp", "Run the kngn mcp unit tests (schema / serialize / fail / contract)");
     test_mcp_step.dependOn(&run_mcp_test.step);
 
     // command model unit tests (types + executor + no-op recorder; std only; no platform/harness)

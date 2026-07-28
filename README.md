@@ -63,12 +63,12 @@ picture depends on whatever state your own pixie happens to hold.
 Stand the same application up as an MCP server and it becomes a tool for an agent.
 
 ```bash
-zig build mcp                                   # → zig-out/bin/vp-mcp
-KNGN_HEADLESS=1 KNGN_HARNESS_LISTEN= KNGN_HARNESS_PORT_FILE=/tmp/vp.port zig build run-pixie &
-zig-out/bin/vp-mcp --port-file /tmp/vp.port     # stdio JSON-RPC
+zig build kngn                                   # → zig-out/bin/kngn
+KNGN_HEADLESS=1 KNGN_HARNESS_LISTEN= KNGN_HARNESS_PORT_FILE=/tmp/kngn.port zig build run-pixie &
+zig-out/bin/kngn mcp --port-file /tmp/kngn.port # stdio JSON-RPC
 ```
 
-`vp-mcp` asks the application for `digest capabilities` once and **generates the MCP tool
+`kngn mcp` asks the application for `digest capabilities` once and **generates the MCP tool
 table from the registered probes and actions**. The application needs to know nothing
 about MCP: the moment it calls `registerProbe` and `registerAction`, an agent can drive
 it. What a `snapshot_*` tool returns is **the absolute path of an artefact file** (the

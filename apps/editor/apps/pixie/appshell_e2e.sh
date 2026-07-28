@@ -133,11 +133,11 @@ make_script "$discard_script" 'expect appshell recovery=pending' 'action discard
 run_case recovery-discard "$recovery_app" "$discard_script"
 test -z "$(find "$recovery_app/autosave" -name '*.autosave' -print -quit 2>/dev/null || true)"
 
-# Netsync: bind failure is an allowed sandbox skip; successful runs use drive quit.
+# Netsync: bind failure is an allowed sandbox skip; successful runs use kngn ctl quit.
 netsync_status=skipped
 if test "${KNGN_E2E_NETSYNC:-1}" = 1; then
-    "$ZIG_BIN" build drive >/dev/null 2>&1 || true
-    drive="$ROOT/zig-out/bin/drive"
+    "$ZIG_BIN" build kngn >/dev/null 2>&1 || true
+    kngn="$ROOT/zig-out/bin/kngn"
     host_port="$E2E/host.port"
     client_port="$E2E/client.port"
     KNGN_APPSHELL_DIR="$APPS/netsync-host" KNGN_HEADLESS=1 KNGN_HARNESS_LISTEN= KNGN_HARNESS_PORT_FILE="$host_port" KNGN_NETSYNC_HOST=1 KNGN_NETSYNC_PORT=9130 "$APP" >"$OUT/netsync-host.log" 2>&1 &
@@ -148,15 +148,15 @@ if test "${KNGN_E2E_NETSYNC:-1}" = 1; then
         test -f "$host_port" && test -f "$client_port" && break
         sleep 0.05
     done
-    if test -x "$drive" && test -f "$host_port" && test -f "$client_port"; then
+    if test -x "$kngn" && test -f "$host_port" && test -f "$client_port"; then
         # free-run LISTEN: the host runs on its own, so no step inject. await holds one connection and waits for join to finish.
-        "$drive" --port-file "$client_port" 'await netsync awaiting_sync=0 600' >/dev/null
-        "$drive" --port-file "$host_port" 'action stroke 10 10 20 10' >/dev/null
+        "$kngn" ctl --port-file "$client_port" 'await netsync awaiting_sync=0 600' >/dev/null
+        "$kngn" ctl --port-file "$host_port" 'action stroke 10 10 20 10' >/dev/null
         # In free-run, step is a frame barrier (wait N presents). Wait 120 frames, matching the autosave threshold.
-        "$drive" --port-file "$host_port" 'step 120' >/dev/null
-        "$drive" --port-file "$host_port" 'digest appshell' | grep -q 'autosave=0'
-        "$drive" --port-file "$host_port" quit >/dev/null
-        "$drive" --port-file "$client_port" quit >/dev/null
+        "$kngn" ctl --port-file "$host_port" 'step 120' >/dev/null
+        "$kngn" ctl --port-file "$host_port" 'digest appshell' | grep -q 'autosave=0'
+        "$kngn" ctl --port-file "$host_port" quit >/dev/null
+        "$kngn" ctl --port-file "$client_port" quit >/dev/null
         wait "$host_pid" "$client_pid"
         netsync_status=ok
     else
