@@ -5,6 +5,7 @@ set -euo pipefail
 ROOT=$(cd "$(dirname "$0")/../.." && pwd)
 MAIN="${KNGN_MAIN_DIR:-$ROOT}"
 KNGN="$ROOT/scripts/kngn"
+PIXIE="$ROOT/zig-out/bin/pixie"
 E2E="$ROOT/.e2e/netsync-history-thumb"
 NETSYNC_PORT=9211
 HOST_PORT="$E2E/host.port"
@@ -20,13 +21,27 @@ rm -f "$HOST_PORT" "$CLIENT_PORT" "$SOLO_PORT"
 
 log() { printf '%s\n' "$*" >&2; }
 
+# Build once up front and start the peers as plain processes: with a `zig build run-pixie`
+# wrapper the recorded pid is the wrapper's, so a peer that ignores quit cannot be reaped
+# and keeps the netsync port. Two concurrent `zig build` runs would also contend for the
+# build cache.
+direnv exec "$MAIN" zig build build-pixie kngn
+
 start_pixie() {
   local port_file=$1 out_dir=$2
   shift 2
   mkdir -p "$out_dir"
   rm -f "$port_file"
-  env KNGN_HARNESS_PORT_FILE="$port_file" KNGN_HARNESS_OUT="$out_dir" "$@" \
-    direnv exec "$MAIN" zig build run-pixie >"$out_dir/app.log" 2>&1 &
+  # A fresh application-data directory per peer and per run. Sharing the developer's real
+  # one lets a leftover autosave open the modal recovery prompt at startup, and while that
+  # prompt is up every injected event goes to it instead of the canvas.
+  rm -rf "$out_dir/appdata"
+  mkdir -p "$out_dir/appdata"
+  # Manual clock: this script drives the frames itself (one injected point per frame, and it
+  # freezes a peer by not stepping it), which free-run LISTEN cannot express.
+  env KNGN_APPSHELL_DIR="$out_dir/appdata" KNGN_HEADLESS=1 KNGN_HARNESS_LISTEN= \
+    KNGN_HARNESS_MANUAL_CLOCK=1 KNGN_HARNESS_PORT_FILE="$port_file" \
+    KNGN_HARNESS_OUT="$out_dir" "$@" "$PIXIE" >"$out_dir/app.log" 2>&1 &
   echo $!
 }
 
@@ -50,7 +65,10 @@ quit_pid() {
     kill -0 "$pid" 2>/dev/null || return 0
     sleep 0.05
   done
+  # Last resort: kill this pid only. A survivor keeps holding the netsync port and
+  # poisons the next run.
   log "WARN: pid $pid still alive after quit"
+  kill -KILL "$pid" 2>/dev/null || true
 }
 
 host_pid=""; client_pid=""; solo_pid=""

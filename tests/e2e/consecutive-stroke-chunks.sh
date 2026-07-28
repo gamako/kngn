@@ -7,6 +7,7 @@ set -euo pipefail
 ROOT=$(cd "$(dirname "$0")/../.." && pwd)
 MAIN="${KNGN_MAIN_DIR:-$ROOT}"
 KNGN="$ROOT/scripts/kngn"
+PIXIE="$ROOT/zig-out/bin/pixie"
 E2E="$ROOT/.e2e/consecutive-stroke"
 NETSYNC_PORT=9212
 HOST_PORT="$E2E/host.port"
@@ -20,13 +21,27 @@ rm -f "$HOST_PORT" "$CLIENT_PORT"
 
 log() { printf '%s\n' "$*" >&2; }
 
+# Build once up front and start the peers as plain processes: with a `zig build run-pixie`
+# wrapper the recorded pid is the wrapper's, so a peer that ignores quit cannot be reaped
+# and keeps the netsync port. Two concurrent `zig build` runs would also contend for the
+# build cache.
+direnv exec "$MAIN" zig build build-pixie kngn
+
 start_pixie() {
   local port_file=$1 out_dir=$2
   shift 2
   mkdir -p "$out_dir"
   rm -f "$port_file"
-  env KNGN_HARNESS_PORT_FILE="$port_file" KNGN_HARNESS_OUT="$out_dir" "$@" \
-    direnv exec "$MAIN" zig build run-pixie >"$out_dir/app.log" 2>&1 &
+  # A fresh application-data directory per peer and per run. Sharing the developer's real
+  # one lets a leftover autosave open the modal recovery prompt at startup, and while that
+  # prompt is up every injected event goes to it instead of the canvas.
+  rm -rf "$out_dir/appdata"
+  mkdir -p "$out_dir/appdata"
+  # Manual clock: this script drives the frames itself (one injected point per frame, and it
+  # freezes a peer by not stepping it), which free-run LISTEN cannot express.
+  env KNGN_APPSHELL_DIR="$out_dir/appdata" KNGN_HEADLESS=1 KNGN_HARNESS_LISTEN= \
+    KNGN_HARNESS_MANUAL_CLOCK=1 KNGN_HARNESS_PORT_FILE="$port_file" \
+    KNGN_HARNESS_OUT="$out_dir" "$@" "$PIXIE" >"$out_dir/app.log" 2>&1 &
   echo $!
 }
 
@@ -50,7 +65,10 @@ quit_pid() {
     kill -0 "$pid" 2>/dev/null || return 0
     sleep 0.05
   done
+  # Last resort: kill this pid only. A survivor keeps holding the netsync port and
+  # poisons the next run.
   log "WARN: pid $pid still alive after quit"
+  kill -KILL "$pid" 2>/dev/null || true
 }
 
 host_pid=""; client_pid=""
@@ -78,31 +96,36 @@ cell_to_screen() {
   fi
 }
 
+# Cell coordinates are anchored on VX/VY, the origin of visible_rect: at the startup zoom the
+# canvas can be wider than its area, and a press outside the area does not start a stroke
+# (the new-stroke gate needs the press inside the canvas area).
+# Stroke A takes rows VY+10..VY+15 and stroke B row VY+20, so the two never overlap and the
+# non-zero pixel count is the sum of both.
 # host_step=0: freeze the host so COMMIT cannot interrupt local capture
 drag_points() {
   local ox=$1 oy=$2 znum=$3 zden=$4 start=$5 end=$6 mode=$7 host_step=$8
   local i cx cy sx sy
   if [[ "$mode" == "long" ]]; then
-    read -r sx sy < <(cell_to_screen "$ox" "$oy" "$znum" "$zden" $((start % 50)) $((10 + start / 50)))
+    read -r sx sy < <(cell_to_screen "$ox" "$oy" "$znum" "$zden" $((VX + start % 50)) $((VY + 10 + start / 50)))
   else
-    read -r sx sy < <(cell_to_screen "$ox" "$oy" "$znum" "$zden" "$start" 100)
+    read -r sx sy < <(cell_to_screen "$ox" "$oy" "$znum" "$zden" $((VX + start)) $((VY + 20)))
   fi
   drive_c "inject mouse_move $sx $sy; inject mouse_down left; step 1" >/dev/null
   if [[ "$host_step" == "1" ]]; then drive_h 'step 1' >/dev/null; fi
   for i in $(seq "$start" $((end - 1))); do
     if [[ "$mode" == "long" ]]; then
-      cx=$((i % 50)); cy=$((10 + i / 50))
+      cx=$((VX + i % 50)); cy=$((VY + 10 + i / 50))
     else
-      cx=$i; cy=100
+      cx=$((VX + i)); cy=$((VY + 20))
     fi
     read -r sx sy < <(cell_to_screen "$ox" "$oy" "$znum" "$zden" "$cx" "$cy")
     drive_c "inject mouse_move $sx $sy; step 1" >/dev/null
     if [[ "$host_step" == "1" ]] && (( i % 10 == 0 )); then drive_h 'step 1' >/dev/null; fi
   done
   if [[ "$mode" == "long" ]]; then
-    read -r sx sy < <(cell_to_screen "$ox" "$oy" "$znum" "$zden" $(((end - 1) % 50)) $((10 + (end - 1) / 50)))
+    read -r sx sy < <(cell_to_screen "$ox" "$oy" "$znum" "$zden" $((VX + (end - 1) % 50)) $((VY + 10 + (end - 1) / 50)))
   else
-    read -r sx sy < <(cell_to_screen "$ox" "$oy" "$znum" "$zden" $((end - 1)) 100)
+    read -r sx sy < <(cell_to_screen "$ox" "$oy" "$znum" "$zden" $((VX + end - 1)) $((VY + 20)))
   fi
   drive_c "inject mouse_move $sx $sy; inject mouse_up left; step 1" >/dev/null
 }
@@ -126,34 +149,38 @@ canvas=$(drive_c 'step 1; digest canvas' 2>/dev/null || true)
 ox=$(parse_kv "$canvas" origin_x); oy=$(parse_kv "$canvas" origin_y)
 znum=$(parse_kv "$canvas" zoom_num); zden=$(parse_kv "$canvas" zoom_den)
 ox=${ox:-0}; oy=${oy:-0}; znum=${znum:-1}; zden=${zden:-1}
-log "origin=($ox,$oy) zoom=$znum/$zden"
+vis=$(parse_kv "$canvas" visible_rect)
+IFS=, read -r VX VY VW VH <<<"${vis:-0,0,0,0}"
+VX=${VX:-0}; VY=${VY:-0}; VW=${VW:-0}; VH=${VH:-0}
+log "origin=($ox,$oy) zoom=$znum/$zden visible cells=($VX,$VY)+${VW}x${VH}"
+if [[ "$VW" -lt 52 || "$VH" -lt 23 ]]; then
+  log "FAIL: visible canvas ${VW}x${VH} cells is too small for the inset stroke grid"
+  exit 1
+fi
+# visible_rect is the flooring of a continuous region, so its first and last cell can be
+# partly outside the area; inset by one cell so every injected point maps to a fully
+# visible cell.
+VX=$((VX + 1)); VY=$((VY + 1))
 
 baseline=$(drive_c 'digest netsync' 2>/dev/null || true)
 baseline_seq=$(parse_kv "$baseline" last_seq); baseline_seq=${baseline_seq:-0}
 
-# Stroke A: barely advance the host (leave pending after release)
-log "stroke A: 300 points (host mostly frozen)"
+# The host stays unstepped until both strokes are captured, so its COMMIT for stroke A cannot
+# arrive while stroke B is being captured. The final pixel count and crc checks then verify
+# that no chunk was lost and that both peers agree.
+# The digests below are a trace only: netsync's `pending` is the inbound queue length, not a
+# count of the client's proposals awaiting a COMMIT.
+log "stroke A: 300 points (host frozen)"
 drag_points "$ox" "$oy" "$znum" "$zden" 0 300 long 0
 # client-only steps so PROPOSE reaches outbound on the client
 drive_c 'step 2' >/dev/null
-mid=$(drive_c 'digest netsync' 2>/dev/null || true)
-log "mid after A: $mid"
-mp=$(parse_kv "$mid" pending); mp=${mp:-0}
-if [[ "$mp" -lt 3 ]]; then
-  # Even if the host advances accidentally, expect at least Stroke A's PROPOSE trace
-  log "WARN: pending after A is $mp (expected ~3 if host frozen)"
-fi
+log "mid after A: $(drive_c 'digest netsync' 2>/dev/null || true)"
 
 # Stroke B: keep the host frozen → A's COMMIT must not interrupt capture
-log "stroke B: 21 points while A still pending"
+log "stroke B: 21 points before A is committed"
 drag_points "$ox" "$oy" "$znum" "$zden" 0 21 short 0
 drive_c 'step 2' >/dev/null
-mid2=$(drive_c 'digest netsync' 2>/dev/null || true)
-log "mid after B: $mid2"
-mp2=$(parse_kv "$mid2" pending); mp2=${mp2:-0}
-if [[ "$mp2" -lt 4 ]]; then
-  log "WARN: pending after B is $mp2 (expected >=4 if both proposed)"
-fi
+log "mid after B: $(drive_c 'digest netsync' 2>/dev/null || true)"
 
 expect_seq=$((baseline_seq + 4))
 log "waiting full drain expect last_seq>=$expect_seq"

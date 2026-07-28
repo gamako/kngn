@@ -6,6 +6,7 @@ set -euo pipefail
 ROOT=$(cd "$(dirname "$0")/../.." && pwd)
 MAIN="${KNGN_MAIN_DIR:-$ROOT}"
 KNGN="$ROOT/scripts/kngn"
+PIXIE="$ROOT/zig-out/bin/pixie"
 E2E="$ROOT/.e2e/netsync-long-stroke"
 NETSYNC_PORT=9210
 HOST_PORT="$E2E/host.port"
@@ -19,13 +20,27 @@ rm -f "$HOST_PORT" "$CLIENT_PORT"
 
 log() { printf '%s\n' "$*" >&2; }
 
+# Build once up front and start the peers as plain processes: with a `zig build run-pixie`
+# wrapper the recorded pid is the wrapper's, so a peer that ignores quit cannot be reaped
+# and keeps the netsync port. Two concurrent `zig build` runs would also contend for the
+# build cache.
+direnv exec "$MAIN" zig build build-pixie kngn
+
 start_pixie() {
   local port_file=$1 out_dir=$2
   shift 2
   mkdir -p "$out_dir"
   rm -f "$port_file"
-  env KNGN_HARNESS_PORT_FILE="$port_file" KNGN_HARNESS_OUT="$out_dir" "$@" \
-    direnv exec "$MAIN" zig build run-pixie >"$out_dir/app.log" 2>&1 &
+  # A fresh application-data directory per peer and per run. Sharing the developer's real
+  # one lets a leftover autosave open the modal recovery prompt at startup, and while that
+  # prompt is up every injected event goes to it instead of the canvas.
+  rm -rf "$out_dir/appdata"
+  mkdir -p "$out_dir/appdata"
+  # Manual clock: this script drives the frames itself (one injected point per frame, and it
+  # freezes a peer by not stepping it), which free-run LISTEN cannot express.
+  env KNGN_APPSHELL_DIR="$out_dir/appdata" KNGN_HEADLESS=1 KNGN_HARNESS_LISTEN= \
+    KNGN_HARNESS_MANUAL_CLOCK=1 KNGN_HARNESS_PORT_FILE="$port_file" \
+    KNGN_HARNESS_OUT="$out_dir" "$@" "$PIXIE" >"$out_dir/app.log" 2>&1 &
   echo $!
 }
 
@@ -49,8 +64,10 @@ quit_pid() {
     kill -0 "$pid" 2>/dev/null || return 0
     sleep 0.05
   done
-  # last resort (should not reach): leave for trap note — no pkill
+  # Last resort: kill this pid only. A survivor keeps holding the netsync port and
+  # poisons the next run.
   log "WARN: pid $pid still alive after quit"
+  kill -KILL "$pid" 2>/dev/null || true
 }
 
 cleanup() {
@@ -140,16 +157,32 @@ zden=$(parse_kv "$canvas" zoom_den)
 ox=${ox:-0}; oy=${oy:-0}; znum=${znum:-1}; zden=${zden:-1}
 log "canvas origin=($ox,$oy) zoom=$znum/$zden"
 
-# 300 distinct canvas points: (i%50, 10+i/50) for i=0..299
+# The grid is anchored on visible_rect: at the startup zoom the canvas can be wider than its
+# area, and a press outside the area does not start a stroke (the new-stroke gate needs the
+# press inside the canvas area), so cell 0 is not necessarily reachable.
+# visible_rect is the flooring of a continuous region, so its first and last cell can be
+# partly outside the area; inset by one cell and keep one cell of margin at the far edge, so
+# every injected point maps to a fully visible cell.
+vis=$(parse_kv "$canvas" visible_rect)
+IFS=, read -r vx vy vw vh <<<"${vis:-0,0,0,0}"
+vx=${vx:-0}; vy=${vy:-0}; vw=${vw:-0}; vh=${vh:-0}
+log "visible cells=($vx,$vy)+${vw}x${vh}"
+if [[ "$vw" -lt 52 || "$vh" -lt 18 ]]; then
+  log "FAIL: visible canvas ${vw}x${vh} cells is too small for an inset 50x6 grid"
+  exit 1
+fi
+vx=$((vx + 1)); vy=$((vy + 1))
+
+# 300 distinct canvas points: (vx + i%50, vy + 10 + i/50) for i=0..299
 # Important: canvas_input reads mouse_pos once per frame, so
 # each point is `inject mouse_move + step 1` (one frame each; consecutive moves in one step keep only the last coord).
-read -r sx0 sy0 < <(cell_to_screen "$ox" "$oy" "$znum" "$zden" 0 10)
+read -r sx0 sy0 < <(cell_to_screen "$ox" "$oy" "$znum" "$zden" "$vx" $((vy + 10)))
 drive_c "inject mouse_move $sx0 $sy0; inject mouse_down left; step 1" >/dev/null
 drive_h 'step 1' >/dev/null
 
 for i in $(seq 0 299); do
-  cx=$((i % 50))
-  cy=$((10 + i / 50))
+  cx=$((vx + i % 50))
+  cy=$((vy + 10 + i / 50))
   read -r sx sy < <(cell_to_screen "$ox" "$oy" "$znum" "$zden" "$cx" "$cy")
   drive_c "inject mouse_move $sx $sy; step 1" >/dev/null
   # Also pump the host regularly (accept/COMMIT)
@@ -158,7 +191,7 @@ for i in $(seq 0 299); do
   fi
 done
 
-read -r sx sy < <(cell_to_screen "$ox" "$oy" "$znum" "$zden" $((299 % 50)) $((10 + 299 / 50)))
+read -r sx sy < <(cell_to_screen "$ox" "$oy" "$znum" "$zden" $((vx + 299 % 50)) $((vy + 10 + 299 / 50)))
 drive_c "inject mouse_move $sx $sy; inject mouse_up left; step 1" >/dev/null
 drive_h 'step 1' >/dev/null
 

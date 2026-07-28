@@ -138,6 +138,25 @@ scripts/kngn ctl --port-file ./.e2e/host.port 'quit'
 scripts/kngn ctl --port-file ./.e2e/client.port 'quit'
 ```
 
+### When a peer needs a manual clock
+
+The procedure above is free-run: each process advances frames on its own, and `step N`
+is a barrier that waits for N presents. That is enough whenever the assertion is about a
+state that netsync reaches on its own.
+
+Add `KNGN_HARNESS_MANUAL_CLOCK=1` to **both** processes when the property under test is
+per-frame rather than eventual:
+
+- one injected point per frame — the editor's canvas input reads the mouse position once
+  a frame, so several `inject mouse_move` inside one step collapse to the last
+  coordinate;
+- freezing one peer — leaving a peer unstepped keeps a COMMIT from reaching it while the
+  other peer keeps working, which free-run cannot express.
+
+Under a manual clock a peer advances only through `step`, so every wait loop must step
+**both** peers; stepping only the one being asserted on deadlocks the relay. The three
+netsync scripts in `tests/e2e/` are the worked examples.
+
 ## The netsync observation probe
 
 `platform.init` registers a custom probe named `netsync` only when netsync is enabled
