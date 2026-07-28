@@ -2,6 +2,8 @@ const std = @import("std");
 const platform = @import("platform");
 const sprite = @import("sprite");
 
+const FRAME_PERIOD_S: f64 = 1.0 / 60.0;
+
 // Embed the PNG file at compile time
 const usako_png = @embedFile("image/usako.png");
 
@@ -35,6 +37,9 @@ pub fn main() !void {
     usako.y = 300 - @as(i32, @intCast(usako.image.height / 2));
 
     main_loop: while (window.pollEvents()) {
+        const frame_t0 = platform.getTime();
+        defer platform.framePaceUntil(frame_t0 + FRAME_PERIOD_S);
+
         while (window.nextEvent()) |ev| switch (ev) {
             .quit => break :main_loop,
             .key_down => |k| switch (k.key) {
@@ -55,7 +60,5 @@ pub fn main() !void {
             sprite.drawSprite(fb.pixels, fb.width, fb.height, &usako);
             window.present();
         }
-
-        platform.frameDelay(16_666_666);
     }
 }

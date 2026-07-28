@@ -12,7 +12,7 @@ Basic manual-drawing API usage:
 - `window.lockFramebuffer()` — begin framebuffer access
 - `fb.unlock()` — end framebuffer access
 - `window.present()` — submit the frame
-- `platform.frameDelay(...)` — pace the loop (~60 FPS here)
+- `platform.framePaceUntil(...)` — pace the loop to a deadline (~60 FPS here)
 
 ## Behaviour
 
@@ -116,9 +116,10 @@ Linear interpolation between two colours for a smooth transition.
 
 ## Notes
 
-- This sample paces with `platform.frameDelay(16_666_666)` (~60 FPS). Serious applications
-  should prefer first-class backend frame pacing (fifo) or the frame-pacing APIs; `present` is not a
-  vsync wait.
+- This sample paces with `platform.framePaceUntil(frame_t0 + FRAME_PERIOD_S)` (~60 FPS):
+  it takes a frame origin at the top of the loop and waits until that deadline, subtracting
+  time spent on work. `present` is not a vsync wait; first-class backend frame pacing (fifo)
+  remains available on Tier-1 backends.
 - `window.present()` is a non-blocking submit (frame commit point). Tier-1 backends
   (Metal / D3D11-DXGI / Wayland) target tear-free fifo; best-effort backends
   (CALayer objc/swift / X11 / GDI) may tear or jitter. See `docs/adr/005`.

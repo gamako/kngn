@@ -183,8 +183,8 @@ hue — see the controls note above.)
 
 ### Frame pacing
 
-Uses `platform.frameDelay(16_666_666)` (~60 FPS). Prefer vsync / frame-pacing APIs for
-production apps.
+Uses `platform.framePaceUntil(frame_t0 + FRAME_PERIOD_S)` (~60 FPS): a deadline from a
+frame origin at the top of the loop, so work time is subtracted from the wait.
 
 ## Caveats
 

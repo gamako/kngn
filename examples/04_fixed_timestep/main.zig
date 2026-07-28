@@ -13,6 +13,8 @@ const platform = @import("platform");
 const FixedTimeStep = @import("fixed_timestep").FixedTimeStep;
 const FpsCounter = @import("fps_counter").FpsCounter;
 
+const FRAME_PERIOD_S: f64 = 1.0 / 60.0;
+
 // Ball physics state
 const Ball = struct {
     x: f64,
@@ -119,9 +121,6 @@ pub fn main() !void {
     // Logical update: fixed 60Hz (for physics)
     var timestep = FixedTimeStep.init(60.0);
 
-    // Drawing: target 60FPS (defined as a separate value)
-    const target_frame_time: f64 = 1.0 / 60.0;
-
     // Initialise the ball
     var ball = Ball.init(400.0, 100.0, 200.0, 0.0, 20.0);
 
@@ -130,6 +129,9 @@ pub fn main() !void {
     var update_count: u32 = 0;
 
     main_loop: while (window.pollEvents()) {
+        const frame_t0 = platform.getTime();
+        defer platform.framePaceUntil(frame_t0 + FRAME_PERIOD_S);
+
         while (window.nextEvent()) |ev| switch (ev) {
             .quit => break :main_loop,
             .key_down => |k| if (k.key == .ESCAPE) break :main_loop,
@@ -169,14 +171,6 @@ pub fn main() !void {
             drawCircle(fb.pixels, w, h, draw_x, draw_y, 20, 0xFFFF6B6B); // canonical BGRA: coral (r=FF,g=6B,b=6B)
 
             window.present();
-        }
-
-        // Frame-rate control (sleep accounting for processing time)
-        const process_time = platform.getTime() - current_time;
-        const sleep_time = target_frame_time - process_time;
-        if (sleep_time > 0) {
-            const sleep_ns = @as(u64, @intFromFloat(sleep_time * 1_000_000_000.0));
-            platform.frameDelay(sleep_ns);
         }
     }
 

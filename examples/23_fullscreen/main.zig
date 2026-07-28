@@ -1,6 +1,8 @@
 const std = @import("std");
 const platform = @import("platform");
 
+const FRAME_PERIOD_S: f64 = 1.0 / 60.0;
+
 /// 23_fullscreen: real caller and demo of `platform.Window.createFullscreen`.
 ///
 /// Fills the whole screen with an animated vertical gradient; exit with ESC / Q or quit.
@@ -29,6 +31,9 @@ pub fn main() !void {
     var reported = false;
 
     main_loop: while (window.pollEvents()) {
+        const frame_t0 = platform.getTime();
+        defer platform.framePaceUntil(frame_t0 + FRAME_PERIOD_S);
+
         while (window.nextEvent()) |ev| switch (ev) {
             .quit => break :main_loop,
             .key_down => |k| {
@@ -67,7 +72,6 @@ pub fn main() !void {
         }
 
         frame +%= 1;
-        platform.frameDelay(16_666_666);
     }
 
     std.debug.print("Fullscreen demo terminated.\n", .{});

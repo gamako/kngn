@@ -2,6 +2,8 @@ const std = @import("std");
 const platform = @import("platform");
 const png = @import("png");
 
+const FRAME_PERIOD_S: f64 = 1.0 / 60.0;
+
 /// 24_desktop_mascot: transparent / borderless window demo.
 ///
 /// Shows usako (usako.png, 64x64 RGBA) on the desktop as a "borderless, transparent, always-on-top"
@@ -58,6 +60,9 @@ pub fn main() !void {
     std.debug.print("usako mascot running. Drag body to move / right-click or ESC to quit.\n", .{});
 
     main_loop: while (window.pollEvents()) {
+        const frame_t0 = platform.getTime();
+        defer platform.framePaceUntil(frame_t0 + FRAME_PERIOD_S);
+
         while (window.nextEvent()) |ev| switch (ev) {
             .quit => break :main_loop,
             .key_down => |k| {
@@ -95,8 +100,6 @@ pub fn main() !void {
             }
             window.present();
         }
-
-        platform.frameDelay(16_666_666);
     }
 
     std.debug.print("usako mascot terminated.\n", .{});

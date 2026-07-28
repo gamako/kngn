@@ -52,6 +52,8 @@ const spectrogram = @import("spectrogram");
 const scope = @import("scope");
 const synthlib = @import("synth");
 
+const FRAME_PERIOD_S: f64 = 0.016;
+
 // ============================================================================
 // Layout
 // ============================================================================
@@ -394,6 +396,9 @@ pub fn main() !void {
     var running = true;
 
     main_loop: while (running and window.pollEvents()) {
+        const frame_t0 = platform.getTime();
+        defer platform.framePaceUntil(frame_t0 + FRAME_PERIOD_S);
+
         const fb = window.lockFramebuffer() orelse continue :main_loop;
         defer fb.unlock();
 
@@ -432,7 +437,5 @@ pub fn main() !void {
         app.meter.draw(fb.pixels, fb.width, fb.height, METER_X0, METER_Y0, METER_W, METER_H);
 
         window.present();
-
-        platform.frameDelay(16_000_000); // ~16ms (~60fps)
     }
 }

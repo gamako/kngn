@@ -1,6 +1,8 @@
 const gmath = @import("gmath");
 const platform = @import("platform");
 
+const FRAME_PERIOD_S: f64 = 1.0 / 60.0;
+
 const WIDTH: u32 = 800;
 const HEIGHT: u32 = 600;
 const DT: f32 = 1.0 / 60.0;
@@ -102,6 +104,9 @@ pub fn main() !void {
     };
 
     main_loop: while (window.pollEvents()) {
+        const frame_t0 = platform.getTime();
+        defer platform.framePaceUntil(frame_t0 + FRAME_PERIOD_S);
+
         while (window.nextEvent()) |event| switch (event) {
             .quit => break :main_loop,
             .key_down => |key| if (key.key == .ESCAPE) break :main_loop,
@@ -123,6 +128,5 @@ pub fn main() !void {
         }
 
         // Harness maps one pollEvents call to one deterministic simulation tick.
-        platform.frameDelay(16_666_666);
     }
 }

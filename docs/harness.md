@@ -355,13 +355,14 @@ optional, so a display-less run with no transport at all is possible.
   OS-independent) drives the render callback with the same push-thread pattern as the
   Linux and Windows backends (a real-time pull thread) and feeds
   `harness.onAudioSamples()`, so the `audio` probe works with no real sink.
-- **Replay is no longer rate-limited by sleeping**: `platform.frameDelay(nanoseconds)`
-  (a no-op under a manual clock; the same as `platform.sleep()` in free-run or with the
-  harness disabled) is used for the frame wait in a main loop. Under a manual clock the
-  virtual clock and `pollGate` decide frame progress, so a real-time sleep is wasted.
-  `src/main.zig`, `apps/synth/main.zig` and examples 01, 02, 03, 04, 05 and 12 have
-  been converted (the three-second sleep in `examples/15_audio_tone` is the
-  application's lifetime itself and is out of scope).
+- **Replay is no longer rate-limited by sleeping**: `platform.framePaceUntil(deadline)`
+  is the frame wait in a main loop. Under a manual clock it is a complete no-op (it
+  reads no OS clock and touches no learning state); the virtual clock and `pollGate`
+  decide frame progress. Two audio examples deliberately use bare `platform.sleep`
+  instead, because audio pull is driven by the real clock and a no-op wait would leave
+  `digest audio` reading a silent window: `examples/30_sound_demo` and
+  `examples/38_minigame`. The three-second sleep in `examples/15_audio_tone` is the
+  application's lifetime itself and is out of scope.
 - **The framebuffer crc is bit-identical to a non-headless run** (measured; headless
   changes nothing about what is drawn).
 - A known limit: an audio-only application that never calls `platform.init()` (such as

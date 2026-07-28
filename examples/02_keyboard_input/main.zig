@@ -2,6 +2,8 @@ const std = @import("std");
 const platform = @import("platform");
 const keyboard = @import("keyboard");
 
+const FRAME_PERIOD_S: f64 = 1.0 / 60.0;
+
 const KeyCode = platform.KeyCode;
 
 // Convert HSV to RGB
@@ -102,6 +104,9 @@ pub fn main() !void {
     var prng = std.Random.DefaultPrng.init(seed);
 
     main_loop: while (window.pollEvents()) {
+        const frame_t0 = platform.getTime();
+        defer platform.framePaceUntil(frame_t0 + FRAME_PERIOD_S);
+
         while (window.nextEvent()) |ev| switch (ev) {
             .quit => {
                 std.debug.print("Quit event received\n", .{});
@@ -188,8 +193,6 @@ pub fn main() !void {
             @memset(fb.pixels, current_color);
             window.present();
         }
-
-        platform.frameDelay(16_666_666);
     }
 
     std.debug.print("Application terminated.\n", .{});

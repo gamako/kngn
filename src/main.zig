@@ -1,6 +1,8 @@
 const std = @import("std");
 const platform = @import("platform");
 
+const FRAME_PERIOD_S: f64 = 1.0 / 60.0;
+
 extern fn sin(x: f64) f64;
 
 // Fast HSV→RGB conversion (integer arithmetic)
@@ -76,6 +78,9 @@ pub fn main() !void {
 
     var time: f64 = 0.0;
     main_loop: while (window.pollEvents()) {
+        const frame_t0 = platform.getTime();
+        defer platform.framePaceUntil(frame_t0 + FRAME_PERIOD_S);
+
         while (window.nextEvent()) |ev| switch (ev) {
             .quit => {
                 std.debug.print("Quit event received\n", .{});
@@ -91,8 +96,6 @@ pub fn main() !void {
         }
 
         time += 1.0 / 60.0;
-
-        platform.frameDelay(16_666_666);
     }
 
     std.debug.print("Application terminated.\n", .{});

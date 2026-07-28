@@ -21,6 +21,8 @@ const std = @import("std");
 const platform = @import("platform");
 const fontmod = @import("font");
 
+const FRAME_PERIOD_S: f64 = 1.0 / 60.0;
+
 const Color = fontmod.Color;
 const RenderTarget = fontmod.RenderTarget;
 const Rect = fontmod.Rect;
@@ -136,6 +138,9 @@ pub fn main(init: std.process.Init) !void {
     std.debug.print("Controls: ESC to quit.\n", .{});
 
     main_loop: while (window.pollEvents()) {
+        const frame_t0 = platform.getTime();
+        defer platform.framePaceUntil(frame_t0 + FRAME_PERIOD_S);
+
         while (window.nextEvent()) |ev| switch (ev) {
             .quit => break :main_loop,
             .key_down => |k| if (k.key == .ESCAPE) break :main_loop,
@@ -219,7 +224,5 @@ pub fn main(init: std.process.Init) !void {
 
             window.present();
         }
-
-        platform.frameDelay(16_666_666);
     }
 }

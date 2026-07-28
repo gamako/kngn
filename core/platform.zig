@@ -1125,13 +1125,10 @@ fn sleepPrecise(nanoseconds: u64) void {
     }
 }
 
-/// The per-frame main loop wait.
-/// Under a manual clock (replay, or LISTEN+MANUAL_CLOCK) it is a **no-op**, because the virtual clock
-/// plus pollGate decide frame progress and a real-time sleep would be wasted. In free-run, and with the harness disabled, it equals `sleep()`.
-///
-/// **Note**: this is a fixed sleep that does not subtract the frame's work time, so passing the target
-/// period still gives a real frame rate of `1/(work + nanoseconds + the OS timer slack)` (measured:
-/// 41.8fps against a 60fps target in apps/patch). New code uses `framePaceUntil` instead.
+/// Deprecated: new frame loops use `framePaceUntil` with a deadline.
+/// This function waits for the requested fixed duration and does not subtract time spent doing frame work.
+/// Under a manual clock (replay, or LISTEN+MANUAL_CLOCK), it is a no-op.
+/// It remains available for callers that require a fixed relative wait.
 pub fn frameDelay(nanoseconds: u64) void {
     if (harness.isManualClock()) return;
     sleep(nanoseconds);

@@ -18,6 +18,8 @@ const kit = @import("kit");
 const platform = kit.platform;
 const gfx = kit.gfx;
 
+const FRAME_PERIOD_S: f64 = 1.0 / 60.0;
+
 // Symlink to existing examples/image/usako.png (no new binaries; avoid embeds outside the root)
 const usako_png = @embedFile("image/usako.png");
 
@@ -76,6 +78,9 @@ pub fn main() !void {
     var last_time = platform.getTime();
 
     main_loop: while (window.pollEvents()) {
+        const frame_t0 = platform.getTime();
+        defer platform.framePaceUntil(frame_t0 + FRAME_PERIOD_S);
+
         while (window.nextEvent()) |ev| switch (ev) {
             .quit => break :main_loop,
             .key_down => |k| switch (k.key) {
@@ -128,8 +133,6 @@ pub fn main() !void {
 
             window.present();
         }
-
-        platform.frameDelay(16_666_666);
     }
 }
 

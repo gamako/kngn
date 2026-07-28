@@ -10,6 +10,8 @@ const platform = @import("platform");
 const midi = @import("midi");
 const std = @import("std");
 
+const FRAME_PERIOD_S: f64 = 1.0 / 60.0;
+
 const WINDOW_W = 640;
 const WINDOW_H = 420;
 const NOTE_COLS = 16;
@@ -95,6 +97,9 @@ pub fn main() !void {
 
     var state: MonitorState = .{};
     main_loop: while (window.pollEvents()) {
+        const frame_t0 = platform.getTime();
+        defer platform.framePaceUntil(frame_t0 + FRAME_PERIOD_S);
+
         while (window.nextEvent()) |ev| switch (ev) {
             .quit => break :main_loop,
             .key_down => |key| if (key.key == .ESCAPE) break :main_loop,
@@ -112,6 +117,5 @@ pub fn main() !void {
             drawMonitor(state, fb.pixels, @intCast(fb.width), @intCast(fb.height));
             window.present();
         }
-        platform.frameDelay(16_666_666);
     }
 }

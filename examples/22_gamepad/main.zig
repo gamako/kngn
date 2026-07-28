@@ -21,6 +21,8 @@ const std = @import("std");
 const platform = @import("platform");
 const gamepad = @import("gamepad");
 
+const FRAME_PERIOD_S: f64 = 1.0 / 60.0;
+
 const WINDOW_W = 480;
 const WINDOW_H = 320;
 
@@ -64,6 +66,9 @@ pub fn main() !void {
     var prev_buttons: platform.GamepadButtons = .{};
 
     main_loop: while (window.pollEvents()) {
+        const frame_t0 = platform.getTime();
+        defer platform.framePaceUntil(frame_t0 + FRAME_PERIOD_S);
+
         while (window.nextEvent()) |ev| switch (ev) {
             .quit => break :main_loop,
             .key_down => |k| if (k.key == .ESCAPE) break :main_loop,
@@ -111,7 +116,5 @@ pub fn main() !void {
             fillRect(fb.pixels, w_i32, h_i32, @intFromFloat(point_x), @intFromFloat(point_y), POINT_SIZE, PALETTE[color_idx]);
             window.present();
         }
-
-        platform.frameDelay(16_666_666);
     }
 }

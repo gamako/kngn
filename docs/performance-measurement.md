@@ -80,12 +80,13 @@ the synth 44.2 → 58.7fps.
   block and the caller waited 9.6ms on average to produce 60.4fps (the real OS wait was
   11.0ms at p95, with one sleep call per frame).
 - `frameDelay` (a fixed sleep) remains for compatibility but **is not used in new code**.
-  The fixed calls in the examples are still to be migrated.
+  The examples use deadline pacing (`framePaceUntil`), except `examples/30_sound_demo` and
+  `examples/38_minigame`, which budget a real-time frame with bare `platform.sleep` so the
+  audio pull still advances under a manual clock, and `examples/15_audio_tone`, whose sleep
+  is the program's own lifetime.
 - Worked examples of pacing: **an own loop** is `apps/patch/main.zig` (the defer at the
   top of the loop body); **through the runtime** is `core/app_runtime.zig` (its consumers,
-  the editor and the synth, never call it themselves). `examples/04_fixed_timestep`
-  computes the deadline itself in the old style and is still to be moved onto
-  `framePaceUntil`.
+  the editor and the synth, never call it themselves).
 
 The breakdown within a frame is more reliably obtained by **timing sections** (inserting
 `getTime()` at each stage of the frame body) than by sampling — with sampling, things

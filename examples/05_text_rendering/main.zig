@@ -12,6 +12,8 @@ const text = @import("text");
 const fontmod = @import("font");
 const FpsCounter = @import("fps_counter").FpsCounter;
 
+const FRAME_PERIOD_S: f64 = 1.0 / 60.0;
+
 const font_bdf = @embedFile("assets/font.bdf");
 
 pub fn main() !void {
@@ -36,6 +38,9 @@ pub fn main() !void {
     var input_len: usize = 0;
 
     main_loop: while (window.pollEvents()) {
+        const frame_t0 = platform.getTime();
+        defer platform.framePaceUntil(frame_t0 + FRAME_PERIOD_S);
+
         const now = platform.getTime();
         const dt = now - last_time;
         last_time = now;
@@ -112,7 +117,5 @@ pub fn main() !void {
 
             window.present();
         }
-
-        platform.frameDelay(16_666_666);
     }
 }

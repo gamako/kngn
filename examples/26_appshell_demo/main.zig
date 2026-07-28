@@ -12,6 +12,8 @@ const paint = @import("paint");
 const platform = kit.platform;
 const appshell = kit.appshell;
 
+const FRAME_PERIOD_S: f64 = 1.0 / 60.0;
+
 const PREF_BACKGROUND = "background";
 const PREF_DEFAULT_BACKGROUND: i64 = 0x224466;
 const DOODLE_WIDTH: u32 = 256;
@@ -107,6 +109,9 @@ pub fn main() !void {
     defer draw_list.deinit();
 
     main_loop: while (!app.should_quit and window.pollEvents()) {
+        const frame_t0 = platform.getTime();
+        defer platform.framePaceUntil(frame_t0 + FRAME_PERIOD_S);
+
         while (window.nextEvent()) |event| {
             switch (event) {
                 .quit => {
@@ -169,7 +174,6 @@ pub fn main() !void {
         }
         gui.render(target, &draw_list, gui.default_font, 1.0);
         window.present();
-        platform.frameDelay(16_666_666);
     }
 
     try saveAll(&app);

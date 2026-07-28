@@ -1,6 +1,8 @@
 const std = @import("std");
 const platform = @import("platform");
 
+const FRAME_PERIOD_S: f64 = 1.0 / 60.0;
+
 // Colour interpolation (linear)
 fn interpolateColor(color1: u32, color2: u32, t: f64) u32 {
     const t_clamped = @min(@max(t, 0.0), 1.0);
@@ -48,6 +50,9 @@ pub fn main() !void {
     const duration: f64 = 2.0;
 
     main_loop: while (window.pollEvents()) {
+        const frame_t0 = platform.getTime();
+        defer platform.framePaceUntil(frame_t0 + FRAME_PERIOD_S);
+
         // Drain pending events (so we still react on close)
         while (window.nextEvent()) |ev| switch (ev) {
             .quit => break :main_loop,
@@ -78,8 +83,6 @@ pub fn main() !void {
             @memset(fb.pixels, color);
             window.present();
         }
-
-        platform.frameDelay(16_666_666);
     }
 
     std.debug.print("Application terminated.\n", .{});
