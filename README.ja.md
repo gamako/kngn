@@ -180,7 +180,7 @@ pub fn main() !void {
 読ませること**。層構造・API 契約・ビルドコマンド・ハーネスの使い方は全部そこにあります。
 
 ```
-KNGN (https://github.com/gamako/video-proto-main) を使ってデスクトップアプリを作って。
+KNGN (https://github.com/gamako/kngn) を使ってデスクトップアプリを作って。
 まず AGENT.md と docs/harness.md を読んで、kit だけを import すること。
 実装したら KNGN_HEADLESS=1 + KNGN_HARNESS_SCRIPT でヘッドレス実行して、
 snapshot fb で PNG を撮って、自分で見て確認してから報告して。
@@ -197,7 +197,7 @@ snapshot fb で PNG を撮って、自分で見て確認してから報告して
 ```zig
 // build.zig.zon
 .dependencies = .{
-    .kngn = .{ .path = "../video-proto-main" },   // または zig fetch --save <url>
+    .kngn = .{ .path = "../kngn" },   // または zig fetch --save <url>
 },
 ```
 
@@ -274,7 +274,6 @@ Windows ターゲットだけはどのホストからでもクロスビルドで
 semver の保証はありません。プリミティブ API・ハーネス・各バックエンドは実装済みで実機検証も
 済んでいますが、上物のライブラリ（特に `modular` / `paint` / `viz`）はまだ形が変わります。
 
-> リポジトリ名は `video-proto-main` のままです（KNGN はプロジェクト名）。
 > 開発者向けの技術詳細は [`AGENT.md`](AGENT.md)、サブシステム別の文書は [`docs/`](docs/) に。
 
 ## この先（顕現）

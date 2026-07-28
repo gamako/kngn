@@ -7,7 +7,7 @@
 ## Summary
 
 To grow this project as "a thin, fast multi-platform foundation plus the
-applications that use it", `video-proto-main/` is **strictly layered by dependency
+applications that use it", `kngn/` is **strictly layered by dependency
 direction**, and those boundaries are **enforced by the module graph in
 build.zig**. The existing `src/` — a catch-all holding the platform facade, every
 backend, audio, the harness, and sprite/text/dsp together — is dismantled, and a
@@ -72,7 +72,7 @@ place is prepared in advance so that incoming code (the state-model `framework/`
 **Target layout** (grouped by family, since there will be more than eight libs):
 
 ```
-video-proto-main/
+kngn/
 ├── platform/            # L0 native (unchanged)
 ├── core/                # L1 thin base (depends on platform, never on libs)
 │   ├── platform*.zig    #   facade + x11/wayland/gdi/d3d11/wasm backends

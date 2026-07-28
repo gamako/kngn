@@ -1,4 +1,4 @@
-// video-proto AudioWorkletProcessor
+// KNGN AudioWorkletProcessor
 // Synchronously create a 2nd Instance from the same WebAssembly.Module + SharedArrayBuffer Memory as main,
 // and push-drive kngn_audio_render from process().
 //

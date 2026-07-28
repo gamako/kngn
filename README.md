@@ -195,7 +195,7 @@ Two things: **have Zig 0.16.0 available**, and **have the agent read
 how to use the harness are all in there.
 
 ```
-Build me a desktop app using KNGN (https://github.com/gamako/video-proto-main).
+Build me a desktop app using KNGN (https://github.com/gamako/kngn).
 Read AGENT.md and docs/harness.md first, and import only kit.
 Once it is implemented, run it headlessly with KNGN_HEADLESS=1 and KNGN_HARNESS_SCRIPT,
 take a PNG with snapshot fb, look at it yourself, and report only after you have checked.
@@ -212,7 +212,7 @@ An external project imports only `kit`. The working example is
 ```zig
 // build.zig.zon
 .dependencies = .{
-    .kngn = .{ .path = "../video-proto-main" },   // or zig fetch --save <url>
+    .kngn = .{ .path = "../kngn" },   // or zig fetch --save <url>
 },
 ```
 
@@ -297,7 +297,6 @@ flux with no semver guarantee. The primitive API, the harness and the backends a
 implemented and verified on real hardware, but the libraries above them — `modular`,
 `paint` and `viz` especially — are still changing shape.
 
-> The repository is still named `video-proto-main` (KNGN is the project name).
 > Technical detail for developers is in [`AGENT.md`](AGENT.md), and the per-subsystem
 > documents are in [`docs/`](docs/).
 

@@ -5,7 +5,7 @@
 
 ## Context
 
-`video-proto-main` is public. The rest of the project is not: the task tracker,
+`kngn` is public. The rest of the project is not: the task tracker,
 the meta repository (operating procedures, machine names), and development notes
 are all private. Comments and documentation in this repository were written in
 Japanese for an audience of one, and they refer freely to private task ids.

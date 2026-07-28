@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # KNGN load must not wipe a saved pattern via seed reset (solo bit-identical + netsync SYNC).
-# When direnv is required, set KNGN_MAIN_DIR to the video-proto-main path (borrow the flake outside the workspace).
+# When direnv is required, set KNGN_MAIN_DIR to the kngn repository path (borrow the flake outside the workspace).
 set -euo pipefail
 
 ROOT=$(cd "$(dirname "$0")/../.." && pwd)

@@ -1,4 +1,4 @@
-// video-proto wasm JS glue (audio + file/clipboard)
+// KNGN wasm JS glue (audio + file/clipboard)
 // import table:
 //   env: kngn_now / kngn_present / kngn_log / kngn_set_cursor
 //        + kngn_audio_open / kngn_audio_start / kngn_audio_stop / kngn_audio_close (audio app)

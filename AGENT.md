@@ -173,7 +173,7 @@ is out of scope entirely.
 ## Directory structure
 
 ```
-video-proto-main/
+kngn/
 ├── platform/           # macOS native implementations (a C ABI: platform.h plus each implementation)
 │   ├── platform.h     # the primitive API (C ABI, for internal use)
 │   ├── macos/         # Objective-C (CALayer)
