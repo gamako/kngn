@@ -2309,7 +2309,7 @@ pub fn build(b: *std.Build) void {
 
 // ============================================================
 // exe / run-step names: default backend has no suffix; others get "_<backend>"
-// (macOS: objc=bare / swift / metal, Linux: x11=bare, Windows: gdi=bare / d3d11)
+// (macOS: metal=bare / swift / objc, Linux: x11=bare, Windows: gdi=bare / d3d11)
 // ============================================================
 fn artifactName(b: *std.Build, base: []const u8, be: platform.PlatformType, default_be: platform.PlatformType) []const u8 {
     return if (be == default_be) base else b.fmt("{s}_{s}", .{ base, platform.backendName(be) });

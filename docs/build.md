@@ -34,7 +34,13 @@ nix is not required. Install [zig 0.16.0](https://ziglang.org/download/) and add
 the per-OS prerequisites below.
 
 **macOS** — Xcode, or the Command Line Tools. That is all: `xcrun` resolves the
-SDK and the `swiftc` path.
+SDK and the `swiftc` path. All three macOS backends, the default `metal` included,
+build the editor (`zig build build-pixie`) with the Command Line Tools alone, as
+measured: the Metal backend compiles its shaders at
+run time from source, so the offline `metal` shader compiler that only Xcode ships
+is not needed. Under the Command Line Tools the Swift runtime resolves from the SDK
+and the build prints a warning about a Swift library directory it cannot open —
+that directory only exists in an Xcode toolchain, and linking succeeds without it.
 
 **Windows** — zig alone. Nothing else.
 
@@ -63,7 +69,7 @@ build error.
 
 | OS | `-Dplatform` | Implementation |
 |----|--------------|----------------|
-| macOS | `objc` (default) / `swift` / `metal` | Objective-C (CALayer) / Swift (CADisplayLink) / Metal (GPU) |
+| macOS | `metal` (default) / `swift` / `objc` | Metal (GPU) / Swift (CADisplayLink) / Objective-C (CALayer) |
 | Linux | `x11` (default) / `wayland` | Pure Zig (Xlib directly / wl_shm plus xdg-shell directly) |
 | Windows | `gdi` (default) / `d3d11` | Pure Zig (Win32/GDI directly / hand-written D3D11-DXGI COM) |
 
@@ -117,7 +123,9 @@ commands". None of them needs a display.
 
 Both paths are detected through `xcrun` and `xcode-select`, so updating Xcode
 needs no edit to `build.zig`. To pin them — in CI, for instance — pass
-`-Dswift-toolchain-path=` and `-Dswift-sdk-path=`.
+`-Dswift-toolchain-path=` and `-Dswift-sdk-path=`. Setting `DEVELOPER_DIR` to
+`/Library/Developer/CommandLineTools` reproduces a machine that has the Command
+Line Tools but no Xcode.
 
 ## Cross-compilation
 

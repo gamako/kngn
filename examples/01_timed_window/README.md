@@ -22,17 +22,17 @@ Basic manual-drawing API usage:
 
 ## Build
 
-Default `-Dplatform` depends on the OS (macOS=objc / Linux=x11 / Windows=gdi). The
+Default `-Dplatform` depends on the OS (macOS=metal / Linux=x11 / Windows=gdi). The
 `run-objc` / `run-swift` / `run-metal` steps below are for macOS. On Linux/Windows use
 `zig build run` (default backend) or `-Dplatform=x11|wayland|gdi|d3d11`.
 
-### Objective-C (macOS default)
+### Metal (macOS default)
 
 ```bash
 cd examples/01_timed_window
 zig build
 # or
-zig build run-objc
+zig build run-metal
 ```
 
 ### Swift
@@ -43,31 +43,31 @@ zig build -Dplatform=swift
 zig build run-swift
 ```
 
-### Metal
+### Objective-C
 
 ```bash
-zig build -Dplatform=metal
+zig build -Dplatform=objc
 # or
-zig build run-metal
+zig build run-objc
 ```
 
 From the repository root:
 
 ```bash
 zig build run-example_01
-zig build run-example_01 -Dplatform=metal
+zig build run-example_01 -Dplatform=objc
 ```
 
 ## Run (standalone binaries)
 
 ```bash
-# Default backend (macOS=objc / Linux=x11 / Windows=gdi)
+# Default backend (macOS=metal / Linux=x11 / Windows=gdi)
 zig build run
 
 # Installed binaries (macOS; bare name = default backend)
-./zig-out/bin/example_01_timed_window        # default (Objective-C on macOS)
+./zig-out/bin/example_01_timed_window        # default (Metal on macOS)
 ./zig-out/bin/example_01_timed_window_swift  # Swift
-./zig-out/bin/example_01_timed_window_metal  # Metal
+./zig-out/bin/example_01_timed_window_objc   # Objective-C
 ```
 
 ## Learning points

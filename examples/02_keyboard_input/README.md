@@ -44,32 +44,32 @@ they do not change the colour action).
 
 ## Build
 
-### Objective-C (default on macOS)
+### Metal (default on macOS)
 
 ```bash
 cd examples/02_keyboard_input
 zig build
 # or
-zig build run-objc
+zig build run-metal
 ```
 
-### Swift / Metal
+### Swift / Objective-C
 
 ```bash
 zig build -Dplatform=swift
 # or
 zig build run-swift
 
-zig build -Dplatform=metal
+zig build -Dplatform=objc
 # or
-zig build run-metal
+zig build run-objc
 ```
 
 From the repository root:
 
 ```bash
 zig build run-example_02
-zig build run-example_02 -Dplatform=metal
+zig build run-example_02 -Dplatform=objc
 ```
 
 ## Run (standalone binaries)
@@ -77,9 +77,9 @@ zig build run-example_02 -Dplatform=metal
 ```bash
 zig build run
 
-./zig-out/bin/example_02_keyboard_input
+./zig-out/bin/example_02_keyboard_input        # default (Metal on macOS)
 ./zig-out/bin/example_02_keyboard_input_swift
-./zig-out/bin/example_02_keyboard_input_metal
+./zig-out/bin/example_02_keyboard_input_objc
 ```
 
 ## Learning points

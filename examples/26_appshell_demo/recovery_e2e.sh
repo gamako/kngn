@@ -54,8 +54,11 @@ quit
 EOF
 
 (cd "$SCRIPT_DIR" && ZIG_GLOBAL_CACHE_DIR="$ROOT/.zig-global-cache" "$ZIG_BIN" build -Dplatform=objc install --prefix "$PREFIX")
-APP_BIN="$PREFIX/bin/example_26_appshell_demo"
+# This suite pins the objc backend, so the artifact carries the _objc suffix (only the
+# default backend gets a bare name).
+APP_BIN="$PREFIX/bin/example_26_appshell_demo_objc"
 test -x "$APP_BIN"
+echo "recovery e2e: running $APP_BIN"
 
 VP_APPSHELL_DIR="$APP_DIR" \
 VP_HEADLESS=1 \

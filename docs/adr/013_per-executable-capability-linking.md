@@ -115,21 +115,24 @@ harness path keeps working.
 
 ## Measured effect
 
-Built with the default `objc` backend and inspected with `otool -L` (recorded load
-dependencies) and `nm` (defined and referenced symbols). To reproduce:
+Built with the `objc` backend and inspected with `otool -L` (recorded load
+dependencies) and `nm` (defined and referenced symbols). The executables below carry the
+`_objc` suffix because only the default backend gets a bare name, and the default is
+`metal`. Which capability each executable links is a property of the executable, not of
+the backend, so the table holds for the other backends too. To reproduce:
 `zig build -Dinstall-all=true`, then
 `otool -L zig-out/bin/<exe> | grep <framework>` and
 `nm zig-out/bin/<exe> | grep platform_register_menu`.
 
 | Executable | GameController | AudioToolbox | CoreMIDI | `platform_register_menu` |
 |---|---|---|---|---|
-| `example_01` (a window only) | — | — | — | — |
-| `example_22` (gamepad) | linked | — | — | — |
-| `example_15` (audio tone) | — | linked | — | — |
-| `example_29` (MIDI monitor) | — | — | linked | — |
-| `pixie` (editor, menus) | — | — | — | present |
-| `synth` | — | linked | — | — |
-| `patch` | — | linked | linked | present |
+| `example_01_objc` (a window only) | — | — | — | — |
+| `example_22_objc` (gamepad) | linked | — | — | — |
+| `example_15_objc` (audio tone) | — | linked | — | — |
+| `example_29_objc` (MIDI monitor) | — | — | linked | — |
+| `pixie_objc` (editor, menus) | — | — | — | present |
+| `synth_objc` | — | linked | — | — |
+| `patch_objc` | — | linked | linked | present |
 
 **The observable differs per capability, and that is informative rather than an
 inconsistency.** Gamepad, audio and MIDI each omit a system framework, so

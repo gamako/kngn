@@ -265,11 +265,11 @@ The examples below are macOS. The valid values of `-Dplatform` depend on the OS
 [docs/platform-verification.md](docs/platform-verification.md) for the other systems.
 
 ```bash
-zig build                        # Objective-C (the macOS default)
+zig build                        # Metal (the macOS default)
 zig build -Dplatform=swift       # Swift
-zig build -Dplatform=metal       # Metal
+zig build -Dplatform=objc        # Objective-C
 
-zig build run                    # the default backend (macOS objc / Linux x11 / Windows gdi)
+zig build run                    # the default backend (macOS metal / Linux x11 / Windows gdi)
 zig build run-objc               # Objective-C (run-swift and run-metal likewise)
 ```
 

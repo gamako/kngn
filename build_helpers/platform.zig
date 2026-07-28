@@ -25,7 +25,7 @@ pub const PlatformType = enum {
 /// Default backend for the OS (used when `-Dplatform` is omitted).
 pub fn defaultBackend(os: std.Target.Os.Tag) PlatformType {
     return switch (os) {
-        .macos => .objc,
+        .macos => .metal, // Metal meets the first-class frame pacing contract of ADR-005 (vsync gating); objc and swift are best-effort
         .linux => .x11,
         .windows => .gdi, // GDI is the default for now (d3d11 is opt-in)
         .wasi => .wasm, // wasm32-wasi

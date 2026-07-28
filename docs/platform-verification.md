@@ -16,7 +16,7 @@ shared `getTime` and dialogs in `platform_linux_common.zig`). Windows has the sa
 input, dialogs, `getTime` and CPU backing in `platform_windows_common.zig`). The valid
 values of `-Dplatform` change by OS:
 
-- **macOS**: `objc` (default), `swift`, `metal`
+- **macOS**: `metal` (default), `swift`, `objc`
 - **Linux**: `x11` (default), `wayland`. Wayland has display, input and the editor
   implemented and has been verified on Linux hardware (a busy loop's flood of presents
   is handled by pacing on the frame callback, which is effectively vsync).
