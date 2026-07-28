@@ -76,8 +76,13 @@ The limit for action frames is `MAX_ACTION_FRAME_BYTES` (4096). SYNC uses a big 
 | `.ephemeral` | apply locally as presence (no COMMIT / seq) | enqueue PRESENCE only (the response is `"sent"`; no PROPOSE / seq) |
 
 The default is `.reject_when_synced`. In the editor: `stroke` is `.relay` (the
-originator's tool, colour, size, opacity and hardness plus `layer=#<id>` are made
-canonical); `set_color` and `set_tool` are `.local_only` (per-peer UI state); `save` is
+originator's tool, colour, size, opacity, hardness and fill tolerance plus
+`layer=#<id>` are made canonical). Every accepted stroke on the wire carries
+`tool=` — pen, eraser and brush keep their existing field sets; fill is
+`layer=#<id> tool=fill color=RRGGBB tolerance=N`. A stroke COMMIT or PROPOSE
+without `tool=` is rejected (`ToolRequired`); local callers may still omit it
+and the origin peer resolves against its own active tool before the router.
+`set_color` and `set_tool` are `.local_only` (per-peer UI state); `save` is
 `.local_only`. The layer structure operations (add, delete, visible, opacity, move and
 so on) have been promoted to `.relay`.
 

@@ -331,7 +331,7 @@ pub fn parseStrokePoints(args: []const u8, buf: []Point) ParseError![]Point {
 // as inject modifiers).
 
 /// Tools that stroke can latch (independent-path tools like bezier/select are out of scope).
-pub const StrokeTool = enum { pen, eraser, brush };
+pub const StrokeTool = enum { pen, eraser, brush, fill };
 
 /// Relay-chunk boundary meta. Omitted / `first` = normal stroke (stamp the origin).
 /// `continuation` starts from the previous chunk's end carry and does not stamp the origin.
@@ -349,6 +349,7 @@ pub const StrokeParams = struct {
     size: ?u32 = null, // 1..MAX_BRUSH_SIZE
     opacity: ?u8 = null, // 0..255
     hardness: ?u8 = null, // 0..255 (same scale as Brush.hardness_q)
+    tolerance: ?u8 = null, // 0..255 (fill only)
     segment: ?StrokeSegment = null, // null/first = normal. continuation = no-stamp origin
 };
 
@@ -385,6 +386,9 @@ pub fn parseStroke(args: []const u8, buf: []Point) ParseError!StrokeArgs {
             } else if (std.mem.eql(u8, key, "hardness")) {
                 if (params.hardness != null) return error.DuplicateKey;
                 params.hardness = std.fmt.parseUnsigned(u8, val, 10) catch return error.InvalidNumber;
+            } else if (std.mem.eql(u8, key, "tolerance")) {
+                if (params.tolerance != null) return error.DuplicateKey;
+                params.tolerance = std.fmt.parseUnsigned(u8, val, 10) catch return error.InvalidNumber;
             } else if (std.mem.eql(u8, key, "segment")) {
                 if (params.segment != null) return error.DuplicateKey;
                 params.segment = std.meta.stringToEnum(StrokeSegment, val) orelse return error.UnknownKey;
@@ -420,14 +424,17 @@ pub const EffectiveStroke = struct {
     size: u32,
     opacity: u8,
     hardness: u8,
+    /// Fill color distance (0 = exact match). Unused for pen/eraser/brush.
+    tolerance: u8 = 0,
     /// `first` is not written on the wire (backward compatible). Only `continuation` is explicit.
     segment: StrokeSegment = .first,
 };
 
 /// Build canonical self-contained stroke args (shared by UI recording and the agent path).
 /// Includes each tool-relevant key **exactly once**: pen=tool,color / eraser=tool /
-/// brush=tool,color,size,opacity,hardness. Round-trips through `parseStroke` (every recorded
-/// stroke record re-runs without depending on App state). `error.TooLong` if it does not fit buf.
+/// brush=tool,color,size,opacity,hardness / fill=tool,color,tolerance. Round-trips through
+/// `parseStroke` (every recorded stroke record re-runs without depending on App state).
+/// `error.TooLong` if it does not fit buf.
 /// `segment=continuation` is appended only for continuation chunks (`first`/omit same as before).
 pub fn formatCanonicalStroke(buf: []u8, eff: EffectiveStroke, points: []const Point) error{TooLong}![]const u8 {
     var len: usize = 0;
@@ -436,6 +443,11 @@ pub fn formatCanonicalStroke(buf: []u8, eff: EffectiveStroke, points: []const Po
         .eraser => std.fmt.bufPrint(buf, "layer=#{d} tool=eraser", .{eff.layer_id}) catch return error.TooLong,
         .brush => std.fmt.bufPrint(buf, "layer=#{d} tool=brush color={X:0>6} size={d} opacity={d} hardness={d}", .{
             eff.layer_id, eff.color & 0xFFFFFF, eff.size, eff.opacity, eff.hardness,
+        }) catch return error.TooLong,
+        .fill => std.fmt.bufPrint(buf, "layer=#{d} tool=fill color={X:0>6} tolerance={d}", .{
+            eff.layer_id,
+            eff.color & 0xFFFFFF,
+            eff.tolerance,
         }) catch return error.TooLong,
     };
     len += head.len;
@@ -1083,18 +1095,66 @@ test "parseStroke: fail-fast (duplicate key / unknown key / bad value / out of r
     var buf: [MAX_STROKE_POINTS]Point = undefined;
     try testing.expectError(error.DuplicateKey, parseStroke("tool=pen tool=brush 1 1", &buf));
     try testing.expectError(error.UnknownKey, parseStroke("thickness=3 1 1", &buf));
-    try testing.expectError(error.UnknownTool, parseStroke("tool=fill 1 1", &buf));
+    try testing.expectError(error.UnknownTool, parseStroke("tool=wand 1 1", &buf));
     try testing.expectError(error.InvalidNumber, parseStroke("color=GGGGGG 1 1", &buf));
     try testing.expectError(error.InvalidNumber, parseStroke("color=FF00 1 1", &buf));
     try testing.expectError(error.ValueOutOfRange, parseStroke("size=0 1 1", &buf));
     try testing.expectError(error.ValueOutOfRange, parseStroke("size=65 1 1", &buf));
     try testing.expectError(error.InvalidNumber, parseStroke("opacity=256 1 1", &buf));
     try testing.expectError(error.InvalidNumber, parseStroke("hardness=999 1 1", &buf));
+    try testing.expectError(error.InvalidNumber, parseStroke("tolerance=256 1 1", &buf));
+    try testing.expectError(error.DuplicateKey, parseStroke("tolerance=0 tolerance=1 1 1", &buf));
     try testing.expectError(error.OddPointCount, parseStroke("tool=pen 1 1 2", &buf));
     try testing.expectError(error.Empty, parseStroke("tool=pen", &buf));
     try testing.expectError(error.Empty, parseStroke("", &buf));
     // k=v after the coordinate list starts is invalid as a coordinate (fail-fast)
     try testing.expectError(error.InvalidNumber, parseStroke("1 1 tool=pen 2", &buf));
+}
+
+test "parseStroke: tool=fill color and tolerance" {
+    var buf: [MAX_STROKE_POINTS]Point = undefined;
+    const r = try parseStroke("layer=#7 tool=fill color=FF0000 tolerance=12 10 10", &buf);
+    try testing.expectEqual(StrokeTool.fill, r.params.tool.?);
+    try testing.expectEqual(@as(u32, 0xFFFF0000), r.params.color.?);
+    try testing.expectEqual(@as(u8, 12), r.params.tolerance.?);
+    try testing.expectEqual(LayerRef{ .id = 7 }, r.params.layer.?);
+    try testing.expectEqual(@as(usize, 1), r.points.len);
+    try testing.expectEqual(Point{ .x = 10, .y = 10 }, r.points[0]);
+}
+
+test "formatCanonicalStroke: fill form is fixed by origin EffectiveStroke (not ambient tool)" {
+    var out_pen: [512]u8 = undefined;
+    var out_brush: [512]u8 = undefined;
+    const pts = [_]Point{.{ .x = 10, .y = 10 }};
+    // Receiver tool selection never enters formatCanonicalStroke; the same origin
+    // effective values must always produce the same wire form.
+    const origin: EffectiveStroke = .{
+        .layer_id = 7,
+        .tool = .fill,
+        .color = 0xFFFF0000,
+        .size = 1,
+        .opacity = 255,
+        .hardness = 255,
+        .tolerance = 12,
+    };
+    const wire_as_if_receiver_pen = try formatCanonicalStroke(&out_pen, origin, &pts);
+    const wire_as_if_receiver_brush = try formatCanonicalStroke(&out_brush, origin, &pts);
+    try testing.expectEqualStrings("layer=#7 tool=fill color=FF0000 tolerance=12 10 10", wire_as_if_receiver_pen);
+    try testing.expectEqualStrings(wire_as_if_receiver_pen, wire_as_if_receiver_brush);
+    try testing.expectEqual(@as(usize, 1), std.mem.count(u8, wire_as_if_receiver_pen, "tool=fill"));
+
+    var buf: [MAX_STROKE_POINTS]Point = undefined;
+    const rt = try parseStroke(wire_as_if_receiver_pen, &buf);
+    try testing.expectEqual(StrokeTool.fill, rt.params.tool.?);
+    try testing.expectEqual(@as(u32, 0xFFFF0000), rt.params.color.?);
+    try testing.expectEqual(@as(u8, 12), rt.params.tolerance.?);
+}
+
+test "parseStroke: legacy bare points keep tool null (canonicalize is the caller's job)" {
+    var buf: [MAX_STROKE_POINTS]Point = undefined;
+    const r = try parseStroke("10 10", &buf);
+    try testing.expectEqual(@as(?StrokeTool, null), r.params.tool);
+    try testing.expectEqual(@as(?u8, null), r.params.tolerance);
 }
 
 test "parseStroke: cap shares MAX_STROKE_POINTS constant (over buf.len → TooManyPoints)" {

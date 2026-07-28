@@ -485,6 +485,40 @@ test "action_registry: a relay's canonicalize is applied before the router" {
     try testing.expectEqualStrings("routed:stroke:canonical:1 2", out);
 }
 
+fn testCanonicalizeFail(ctx: *anyopaque, args: []const u8, scratch: []u8) anyerror![]const u8 {
+    _ = ctx;
+    _ = args;
+    _ = scratch;
+    return error.ToolRequired;
+}
+
+fn testRouterCountCalls(name: []const u8, args: []const u8, buf: []u8) anyerror![]const u8 {
+    // Shared counter via a fixed TestCtx pointer would need globals; use a static instead.
+    router_call_count += 1;
+    return std.fmt.bufPrint(buf, "routed:{s}:{s}", .{ name, args }) catch "routed";
+}
+
+var router_call_count: u32 = 0;
+
+test "action_registry: relay canonicalize error propagates without calling the router" {
+    resetForTest();
+    setEnabled(true);
+    router_call_count = 0;
+    var c = TestCtx{};
+    registerAction(.{
+        .name = "stroke",
+        .ctx = &c,
+        .run = testRun,
+        .network_policy = .relay,
+        .canonicalize = testCanonicalizeFail,
+    });
+    setRouter(testRouterCountCalls);
+    var buf: [128]u8 = undefined;
+    try testing.expectError(error.ToolRequired, routeLocalAction("stroke", "10 10", &buf));
+    try testing.expectEqual(@as(u32, 0), router_call_count);
+    try testing.expectEqual(@as(u32, 0), c.calls);
+}
+
 fn testRunSetDetail(ctx: *anyopaque, args: []const u8, buf: []u8) anyerror![]const u8 {
     _ = ctx;
     _ = args;

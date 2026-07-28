@@ -1380,22 +1380,24 @@ const App = struct {
     }
 
     /// Resolve effective stroke parameters (explicit k=v overrides current App state). If tool is omitted and
-    /// the current tool is not pen/eraser/brush, return `error.UnsupportedTool` (fill is handled by the caller
-    /// on the legacy path; bezier/select/eyedropper stay rejected as before).
+    /// the current tool is not pen/eraser/brush/fill, return `error.UnsupportedTool`
+    /// (bezier/select/eyedropper stay rejected as before).
     fn resolveEffectiveStroke(self: *App, p: actions.StrokeParams) error{UnsupportedTool}!actions.EffectiveStroke {
         const tool: actions.StrokeTool = p.tool orelse switch (self.active_kind) {
             .pen => .pen,
             .eraser => .eraser,
             .brush => .brush,
+            .fill => .fill,
             else => return error.UnsupportedTool,
         };
         return .{
             .layer_id = 0,
             .tool = tool,
-            .color = p.color orelse self.palette.current(),
+            .color = p.color orelse if (tool == .fill) self.fill.color else self.palette.current(),
             .size = p.size orelse self.brush.size,
             .opacity = p.opacity orelse self.brush.opacity,
             .hardness = p.hardness orelse self.brush.hardness_q,
+            .tolerance = p.tolerance orelse if (tool == .fill) self.fill.tolerance else 0,
         };
     }
 
@@ -1420,16 +1422,26 @@ const App = struct {
         };
     }
 
-    /// At the `.relay` route entry, bake the source tool/color/brush settings and layer id.
-    /// Only fill's old legacy path keeps raw args as before.
+    /// At the `.relay` route entry, bake the source tool/color/brush/fill settings and layer id.
+    /// Legacy input without `tool=` is resolved against this peer's active tool and emitted as a
+    /// total wire form (every accepted stroke carries `tool=`).
     fn canonicalizeStroke(ctx: *anyopaque, args: []const u8, scratch: []u8) anyerror![]const u8 {
         const app: *App = @ptrCast(@alignCast(ctx));
         var pts_buf: [actions.MAX_STROKE_POINTS]actions.Point = undefined;
         const parsed = try actions.parseStroke(args, &pts_buf);
-        const eff = app.resolveEffectiveStroke(parsed.params) catch |err| {
-            if (app.active_kind == .fill and parsed.params.tool == null) return args;
-            return err;
-        };
+        const eff = try app.resolveEffectiveStroke(parsed.params);
+
+        if (platform.netsyncActive() and
+            eff.tool == .fill and
+            app.canvas.selection != null)
+        {
+            platform.setActionErrorDetail(
+                "selection_not_supported",
+                "clear the selection before relaying a fill stroke",
+            );
+            return error.SelectionNotSupported;
+        }
+
         var canonical = eff;
         canonical.layer_id = try app.resolveStrokeLayerId(parsed.params.layer);
         canonical.segment = parsed.params.segment orelse .first;
@@ -4161,10 +4173,10 @@ fn actionSetPixelPerfect(ctx: *anyopaque, args: []const u8, buf: []u8) anyerror!
 }
 
 /// Drive a canvas-coordinate point list as down→move×N→up (same Tool path as existing canvas_input).
-/// Accepts a leading `[tool=|color=|size=|opacity=|hardness=]` k=v prefix; latches the explicit
-/// parameters **temporarily and restores App state after** (so redo cannot clobber the current user
-/// settings). With no parameters, use current state as before (backward-compatible with the action grammar;
-/// fill stays a legacy path that cannot be spelled as tool= and runs with the current tool).
+/// Accepts a leading `[tool=|color=|size=|opacity=|hardness=|tolerance=]` k=v prefix; latches the
+/// explicit parameters **temporarily and restores App state after** (so redo cannot clobber the
+/// current user settings). Local callers may omit `tool=` (resolved against the active tool at
+/// canonicalize). A synced wire stroke without `tool=` is rejected (`error.ToolRequired`).
 /// bezier/select/eyedropper stay explicitly rejected (avoids unintended Pen draws via
 /// `activeTool()`'s unreachable fallbacks).
 fn actionStroke(ctx: *anyopaque, args: []const u8, buf: []u8) anyerror![]const u8 {
@@ -4173,6 +4185,15 @@ fn actionStroke(ctx: *anyopaque, args: []const u8, buf: []u8) anyerror![]const u
     try app.checkEditingAllowed();
     var pts_buf: [actions.MAX_STROKE_POINTS]actions.Point = undefined;
     const parsed = try actions.parseStroke(args, &pts_buf);
+
+    if (platform.netsyncActive() and parsed.params.tool == null) {
+        platform.setActionErrorDetail(
+            "tool_required",
+            "include tool=pen|eraser|brush|fill",
+        );
+        return error.ToolRequired;
+    }
+
     const pts = parsed.points;
     const target_layer = if (parsed.params.layer) |ref|
         try app.resolveStrokeLayerIndex(ref)
@@ -4189,7 +4210,7 @@ fn actionStroke(ctx: *anyopaque, args: []const u8, buf: []u8) anyerror![]const u
     app.doc.selected_layer = target_layer;
     app.canvas.selected_layer = target_layer;
 
-    // Resolve and latch effective parameters. Only fill (no tool= + active_kind==.fill) takes the legacy path.
+    // Resolve and latch effective parameters (including fill color/tolerance).
     var tool: core.Tool = undefined;
     var stroke_tool: ?actions.StrokeTool = null;
     const saved_pen_color = app.pen.color;
@@ -4197,40 +4218,47 @@ fn actionStroke(ctx: *anyopaque, args: []const u8, buf: []u8) anyerror![]const u
     const saved_brush_size = app.brush.size;
     const saved_brush_opacity = app.brush.opacity;
     const saved_brush_hardness = app.brush.hardness_q;
+    const saved_fill_color = app.fill.color;
+    const saved_fill_tolerance = app.fill.tolerance;
+    const saved_selection = app.canvas.selection;
     defer {
         app.pen.color = saved_pen_color;
         app.brush.color = saved_brush_color;
         app.brush.size = saved_brush_size;
         app.brush.opacity = saved_brush_opacity;
         app.brush.hardness_q = saved_brush_hardness;
+        app.fill.color = saved_fill_color;
+        app.fill.tolerance = saved_fill_tolerance;
+        app.canvas.setSelection(saved_selection);
     }
-    if (app.resolveEffectiveStroke(parsed.params)) |eff| {
-        stroke_tool = eff.tool;
-        switch (eff.tool) {
-            .pen => {
-                app.pen.color = eff.color;
-                tool = app.pen.tool();
-            },
-            .eraser => tool = app.eraser.tool(),
-            .brush => {
-                app.brush.color = eff.color;
-                app.brush.size = eff.size;
-                app.brush.opacity = eff.opacity;
-                app.brush.hardness_q = eff.hardness;
-                tool = app.brush.tool();
-            },
-        }
-    } else |err| {
-        // No tool= and current tool is fill → run with current state as before (backward compatible).
-        // bezier/select/eyedropper stay UnsupportedTool as before.
-        if (app.active_kind != .fill or parsed.params.tool != null) return err;
-        tool = app.activeTool();
+    const eff = try app.resolveEffectiveStroke(parsed.params);
+    stroke_tool = eff.tool;
+    switch (eff.tool) {
+        .pen => {
+            app.pen.color = eff.color;
+            tool = app.pen.tool();
+        },
+        .eraser => tool = app.eraser.tool(),
+        .brush => {
+            app.brush.color = eff.color;
+            app.brush.size = eff.size;
+            app.brush.opacity = eff.opacity;
+            app.brush.hardness_q = eff.hardness;
+            tool = app.brush.tool();
+        },
+        .fill => {
+            app.fill.color = eff.color;
+            app.fill.tolerance = eff.tolerance;
+            // A relayed fill is defined without receiver-local selection.
+            if (platform.netsyncActive()) app.canvas.clearSelection();
+            tool = app.fill.tool();
+        },
     }
 
     const is_continuation = (parsed.params.segment orelse .first) == .continuation;
     var cmd: ?core.PaintDiff = null;
     if (is_continuation) {
-        // Start-point no-stamp. Fill legacy assumes no segment is attached.
+        // Start-point no-stamp. Fill has no multi-chunk continuation form.
         const st = stroke_tool orelse return error.UnsupportedTool;
         switch (st) {
             .pen => app.recorder.beginAt(target_layer, app.pen.color, pts[0].x, pts[0].y),
@@ -4251,6 +4279,7 @@ fn actionStroke(ctx: *anyopaque, args: []const u8, buf: []u8) anyerror![]const u
                 if (cmd) |pd| try app.doc.pushPaintOp(app.gpa, pd.layer_idx, pd.diffs);
                 return "ok";
             },
+            .fill => return error.UnsupportedTool,
         }
         if (pts.len >= 2) {
             for (pts[1..], 0..) |p, i| {
@@ -4747,17 +4776,12 @@ fn layerRefToId(app: *App, ref: actions.LayerRef, forbid_index: bool) !u64 {
 /// `stroke`-only recording wrapper: parse input args → resolve effective parameters (explicit k=v
 /// overrides current state) → build **canonical args with each key exactly once** → executeAction with
 /// those canonical args (dispatch runs the same meaning as the input; every stroke record on CommandLog
-/// becomes state-independent and re-runnable). Only fill's legacy path (cannot be spelled as tool=)
-/// is recorded with raw args (keep classic behaviour; canonicalization targets pen/eraser/brush).
+/// becomes state-independent and re-runnable). Legacy fill input is canonicalised to
+/// `tool=fill color=… tolerance=…` before execute (no raw fallback).
 fn recordedStroke(ctx: *anyopaque, args: []const u8, buf: []u8) anyerror![]const u8 {
     const app: *App = @ptrCast(@alignCast(ctx));
     var canon_buf: [platform.command.MAX_CMD_ARGS]u8 = undefined;
-    const exec_args = App.canonicalizeStroke(app, args, &canon_buf) catch |err| blk: {
-        var pts_buf: [actions.MAX_STROKE_POINTS]actions.Point = undefined;
-        const parsed = actions.parseStroke(args, &pts_buf) catch return err;
-        if (app.active_kind != .fill or parsed.params.tool != null) return err;
-        break :blk args; // fill legacy (actionStroke takes the same branch into the legacy path)
-    };
+    const exec_args = try App.canonicalizeStroke(app, args, &canon_buf);
 
     const seq_before = app.cmd_log.next_seq;
     const res = try app.cmd_exec.executeAction("stroke", exec_args, .{
@@ -4819,7 +4843,7 @@ const pixie_args_set_pixel_perfect: @FieldType(platform.Action, "args") = &.{
 };
 const pixie_args_stroke: @FieldType(platform.Action, "args") = &.{
     .{ .name = "layer", .kind = "string", .pattern = "#<id>|<index>", .optional = true, .desc = "defaults to selected; canonical wire uses #<id>" },
-    .{ .name = "params", .kind = "string", .optional = true, .desc = "k=v for tool/color/size/opacity/hardness" },
+    .{ .name = "params", .kind = "string", .optional = true, .desc = "k=v for tool/color/size/opacity/hardness/tolerance (tool=pen|eraser|brush|fill)" },
     .{ .name = "xy", .kind = "int", .variadic = true, .desc = "canvas x y pairs (even count; at least one pair)" },
 };
 const pixie_args_path: @FieldType(platform.Action, "args") = &.{

@@ -133,6 +133,10 @@ fn summarizeStroke(args: []const u8, buf: []u8) ?[]const u8 {
             const color = parsed.params.color orelse return null;
             break :blk std.fmt.bufPrint(buf, "stroke brush #{X:0>6}", .{color & 0xFFFFFF}) catch null;
         },
+        .fill => blk: {
+            const color = parsed.params.color orelse return null;
+            break :blk std.fmt.bufPrint(buf, "stroke fill #{X:0>6}", .{color & 0xFFFFFF}) catch null;
+        },
     };
 }
 

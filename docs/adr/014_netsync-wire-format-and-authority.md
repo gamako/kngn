@@ -47,24 +47,34 @@ layer by ±1 relative to an id, or adding a layer with no arguments, both relay
 correctly. What it may not depend on is **peer-local state**. Each peer has its own
 selected layer, tool and colour, so an operation that reads them has two options,
 both of which are used: bake the originator's context into the wire form at the relay
-entry point — a canonicalised pen, eraser or brush stroke carries its tool, colour,
-size, opacity, hardness and target layer id — or be classified as local, which is
-what `set_tool` and `set_color` are. That fork is what forces the classification in
-Decision 3.
+entry point — a canonicalised stroke carries its tool, paint parameters and target
+layer id (pen, eraser, brush and fill each with their field set) — or be classified
+as local, which is what `set_tool` and `set_color` are. That fork is what forces the
+classification in Decision 3.
 
-**The canonicalisation is not total, and the exception is a known violation of the
-rule this section just stated.** The fill tool has a legacy argument form that cannot
-name its tool, so canonicalisation passes it through unchanged and the *receiving*
-peer executes it with whatever tool that peer currently has selected. The editor's UI
-never relays fill, but `stroke` is registered `.relay` for every caller, so the path
-is reachable by anything that can invoke an action — an agent peer or a harness
-script. It is a latent protocol hole, not merely dormant UI behaviour.
+Canonicalisation is total for stroke operations at the relay boundary. A local
+caller may still use the legacy form without `tool=`; the origin peer resolves
+that form against its own active tool and emits a canonical wire form before the
+router sees it. Therefore the legacy form is a local input syntax, not a wire
+syntax.
 
-It is recorded as an accepted gap rather than silently blessed. Closing it means one
-of three things, in increasing cost: refuse a fill-form stroke while a session is
-active; give fill an explicit tool spelling so it canonicalises like the others; or
-carry the originator's tool for every stroke form without exception. The last is the
-only one that removes the class of bug rather than this instance of it.
+Every accepted stroke wire form carries `tool=` and a stable `layer=#<id>`.
+Pen, eraser and brush retain their existing canonical fields. Fill is encoded as
+`layer=#<id> tool=fill color=RRGGBB tolerance=N`, so its paint parameters do not
+come from the receiving peer's selected tool or colour. A fill operation with a
+local selection active is rejected while synced because Canvas.selection is a
+peer-local runtime field and is not part of the wire command. When applying a
+relayed fill, the receiver's local selection is ignored.
+
+A receiver rejects a stroke COMMIT without `tool=` before drawing. A host rejects
+a PROPOSE that reaches the application in that form, and a client fails soft if
+an older host sends such a COMMIT. This is deliberately fail-closed: an older
+peer may reject the new `tool=fill` spelling or send the old no-tool spelling,
+but no peer executes a missing tool from its own local state.
+
+This closes the accepted gap for stroke commands. It does not make unrelated
+relay actions safe if they later introduce their own peer-local implicit state;
+each such action must still canonicalise or be refused under Decision 1.
 
 ## Decision 2: the host is the authority, over PROPOSE/COMMIT
 
@@ -227,6 +237,11 @@ that stays small is skipped by an older peer, while one exceeding that ceiling i
 treated as a protocol error and costs the connection. Additive frames must therefore
 stay small. Keeping the protocol version at `1` is likewise a judgement that each
 addition met that bar — not an automatic consequence of adding a kind.
+
+Action arguments have the same fail-closed compatibility rule: existing
+pen/eraser/brush canonical forms remain readable by older peers, while the new
+fill spelling is not backwards-compatible with a peer whose stroke parser does
+not know `tool=fill`.
 
 Consistent with that, a redo currently travels as an ordinary propose-and-commit of
 the original command. There is no `redo_of` on the wire, so in another peer's
