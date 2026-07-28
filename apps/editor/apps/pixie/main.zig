@@ -20,6 +20,7 @@ const recipe = kit.recipe;
 const app_runtime = kit.app_runtime;
 const appshell = kit.appshell;
 const core = @import("paint");
+const pixelops = @import("pixelops"); // app → lib exception (see build.zig linkAppException)
 const png = kit.png;
 const canvas_input = @import("canvas_input.zig");
 const actions = @import("actions.zig");
@@ -7226,7 +7227,9 @@ fn appFrameInner(self: *App, win: *platform.Window) !void {
 
         // ── Draw: bg → checker → canvas blit (α src-over) → GUI (on top) ──
         // Clear the physical fb. canvas is logical Zoom rect → physical nearest.
-        @memset(fb.pixels, COLOR_WINDOW_BG);
+        // `fill32`, not `@memset`: the four bytes of COLOR_WINDOW_BG differ, and this is the
+        // largest single write of the frame at a HiDPI physical size.
+        pixelops.fill32(fb.pixels, COLOR_WINDOW_BG);
         if (canvas_rect) |rect| {
             if (self.last_area) |area| {
                 const zoom = self.view_zoom;

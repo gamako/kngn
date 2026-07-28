@@ -226,7 +226,7 @@ apps  →  kit  →  libs  →  core  →  platform      （一方向依存。bu
 |---|---|
 | `platform/` | macOS ネイティブ実装（C ABI: objc / swift / metal）。Linux と Windows のバックエンドは pure Zig で `core/` にあります |
 | `core/` | platform ファサードと OS 別バックエンド、オーディオ、MIDI、制御プレーン（ハーネス） |
-| `libs/` | 任意で使う部品 — `gui`（イミディエイトモード） `font`（TrueType/CFF/bmfont） `png` `synth` `sound` `pixelops`（SIMD ブレンド） `gfx` `gmath` `appshell` `paint` `modular` `viz` `serde` `recipe` |
+| `libs/` | 任意で使う部品 — `gui`（イミディエイトモード） `font`（TrueType/CFF/bmfont） `png` `synth` `sound` `pixelops`（SIMD ブレンド・塗り） `gfx` `gmath` `appshell` `paint` `modular` `viz` `serde` `recipe` |
 | `kit/` | アプリと外部利用者が import する公開アンブレラモジュール |
 | `apps/` | `pixie`（ピクセルエディタ） `synth`（PC キーボード演奏） `patch`（モジュラーパッチキャンバス） |
 | `examples/` | 41 本のサンプル（`zig build run-example_NN`） |

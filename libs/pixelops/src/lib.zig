@@ -291,6 +291,113 @@ pub inline fn srcOverStraight4(dst: Vec16u8, src: Vec16u8, opacity: u8) Vec16u8 
 }
 
 // ============================================================
+// u32 fill (whole-framebuffer clear, opaque rectangle fill)
+// ============================================================
+//
+// Hot-path declaration: **runs over every pixel, every frame** (the per-frame framebuffer
+// clear is the largest single term of the frame budget at a HiDPI `.physical` size).
+//
+// `@memset` on a `[]u32` becomes the target's bulk fill (libc `memset`, wasm `memory.fill`)
+// only when the compiler can see that the four bytes of the value are equal. Any other
+// pattern — a background colour such as `0xFF12161B`, or *any* value that is not a
+// compile-time constant — becomes a scalar four-byte store loop, which runs at a fraction
+// of the achievable store bandwidth (`zig build bench-fill` reports both). `fill32`
+// therefore picks its lowering itself: a byte-wide `@memset` when the bytes repeat,
+// otherwise one seeded block replicated by `@memcpy`, which is the target's bulk copy and
+// reads a source block small enough to stay in cache, so only the writes reach memory.
+// `fillRect32` is the strided form and replicates the first row.
+//
+// **Which call sites to convert.** `@memset(dst, <constant whose four bytes are equal>)`
+// — `0`, `0xFFFFFFFF` — is already the fastest form there is; leave those alone. Every
+// other large u32 write is worth converting: a framebuffer clear, a full-width strip
+// background, a wide opaque rectangle. Small regions lose nothing by going through
+// `fill32` (below one block it *is* a single `@memset`), so a caller that cannot know its
+// value or size up front can always call it.
+
+/// Size of the source block `fill32` replicates: small enough to stay in the nearest cache,
+/// large enough to amortise a bulk-copy call. A run shorter than this is filled by the
+/// seeding `@memset` alone. It is a tuned default, not a proven optimum — the measurements
+/// behind the number are in docs/performance-measurement.md.
+const fill_block_px: usize = 1024;
+
+/// True when the four bytes of `value` are equal, so the region can be filled by a
+/// byte-wide `@memset` — the fastest fill measured, and the only one that does not care
+/// whether the value is a compile-time constant.
+pub inline fn isByteRepeated(value: u32) bool {
+    const b: [4]u8 = @bitCast(value);
+    return b[0] == b[1] and b[1] == b[2] and b[2] == b[3];
+}
+
+/// Scalar reference for `fill32` (one store per pixel). The bit-identity of `fill32`
+/// against this is pinned by tests; it is not meant to be called from a hot path.
+pub fn fill32Scalar(dst: []u32, value: u32) void {
+    for (dst) |*p| p.* = value;
+}
+
+/// Fill a contiguous pixel run with `value`. Bit-identical to `fill32Scalar`.
+/// No arithmetic per pixel and no bounds test inside the loop (the slice is the bound).
+pub fn fill32(dst: []u32, value: u32) void {
+    if (dst.len == 0) return;
+    if (isByteRepeated(value)) {
+        // A byte-wide fill reaches the target's bulk fill even with a run-time value.
+        const b: [4]u8 = @bitCast(value);
+        @memset(std.mem.sliceAsBytes(dst), b[0]);
+        return;
+    }
+    // Seed one block, then replicate it with bulk copies.
+    const seed: usize = @min(dst.len, fill_block_px);
+    @memset(dst[0..seed], value);
+    var i: usize = seed;
+    while (i < dst.len) {
+        const n: usize = @min(seed, dst.len - i);
+        // Non-overlapping: i >= seed >= n, so [i, i+n) never meets [0, n).
+        @memcpy(dst[i..][0..n], dst[0..n]);
+        i += n;
+    }
+}
+
+/// Fill the `w`x`h` rectangle at (`x`, `y`) of a `stride`-wide buffer with `value`.
+/// Bit-identical to a scalar row loop, and writes nothing outside the rectangle.
+///
+/// PRECONDITION: the rectangle is already clipped to the target — `x + w <= stride`, and
+/// the last row of the rectangle lies inside `dst` (a `dst` whose length is not a whole
+/// number of rows is accepted as long as the rectangle itself fits). Clipping belongs
+/// outside this call (per the all-pixel-loop rule that the clip intersection is computed
+/// once, outside the loop); both conditions are asserted.
+pub fn fillRect32(dst: []u32, stride: u32, x: u32, y: u32, w: u32, h: u32, value: u32) void {
+    if (w == 0 or h == 0) return;
+    std.debug.assert(stride > 0);
+    // Both checks are in subtraction form so that they cannot overflow before being
+    // evaluated. `x + w <= stride`:
+    std.debug.assert(x <= stride and w <= stride - x);
+    // "the last row fits": (y + h - 1) * stride + x + w <= dst.len, which for stride > 0 is
+    // exactly `last_row <= (dst.len - (x + w)) / stride`.
+    const span: usize = @as(usize, x) + w;
+    const last_row: usize = @as(usize, y) + h - 1;
+    std.debug.assert(dst.len >= span and last_row <= (dst.len - span) / stride);
+
+    const first = @as(usize, y) * stride + x;
+
+    // A full-width rectangle is one contiguous run.
+    if (w == stride) {
+        fill32(dst[first..][0 .. @as(usize, w) * h], value);
+        return;
+    }
+
+    // For a value whose bytes differ — which is every opaque GUI colour in practice —
+    // replicating the first row is never slower than filling each row independently, down to
+    // w=1 (measured by bench-fill), so there is no width threshold here. A byte-repeating
+    // value is the one case where a per-row byte `@memset` measures faster (by about a fifth
+    // at full width), and both forms are then above 90 GB/s, so it does not earn a branch.
+    const row0 = dst[first..][0..w];
+    fill32(row0, value);
+    var row: usize = 1;
+    while (row < h) : (row += 1) {
+        @memcpy(dst[first + row * stride ..][0..w], row0);
+    }
+}
+
+// ============================================================
 // clip-hoist: compute the blit clip intersection once outside the loop
 // ============================================================
 
@@ -690,6 +797,104 @@ test "clipBlit: table-driven boundaries" {
             return err;
         };
     }
+}
+
+// ---- fill32 / fillRect32 ----
+
+test "isByteRepeated: true only when all four bytes are equal" {
+    try testing.expect(isByteRepeated(0x00000000));
+    try testing.expect(isByteRepeated(0xFFFFFFFF));
+    try testing.expect(isByteRepeated(0xABABABAB));
+    try testing.expect(!isByteRepeated(0xFF12161B));
+    try testing.expect(!isByteRepeated(0xFFFFFFFE));
+    try testing.expect(!isByteRepeated(0xFEFFFFFF));
+    try testing.expect(!isByteRepeated(0xABABABAC));
+}
+
+test "fill32 matches fill32Scalar (block boundary lengths + random, both value kinds)" {
+    // Lengths straddle every internal branch: shorter than one block, exactly the block
+    // size (fill_block_px), whole multiples of it, and a partial last block.
+    const forced = [_]usize{
+        0,                     1,    2,    3,
+        4,                     15,   16,   17,
+        255,                   256,  257,  1023,
+        1024,                  1025, 2047, 2048,
+        2049,                  3071, 3072, fill_block_px * 4,
+        fill_block_px * 4 + 1,
+    };
+    const values = [_]u32{ 0xFF12161B, 0x00000000, 0xFFFFFFFF, 0x01020304, 0x7F7F7F7F };
+    var prng = std.Random.DefaultPrng.init(0xF111);
+    const rng = prng.random();
+
+    for (values) |value| {
+        var trial: usize = 0;
+        while (trial < forced.len + 60) : (trial += 1) {
+            const n: usize = if (trial < forced.len) forced[trial] else rng.uintLessThan(usize, 5000);
+            const got = try testing.allocator.alloc(u32, n);
+            defer testing.allocator.free(got);
+            const want = try testing.allocator.alloc(u32, n);
+            defer testing.allocator.free(want);
+            // Pre-poison so a short fill is detected rather than matching leftover zeroes.
+            @memset(got, 0xDEADBEEF);
+            @memset(want, 0xDEADBEEF);
+            fill32(got, value);
+            fill32Scalar(want, value);
+            try testing.expectEqualSlices(u32, want, got);
+        }
+    }
+}
+
+test "fillRect32: matches a scalar row loop and never writes outside the rectangle" {
+    const Case = struct { stride: u32, x: u32, y: u32, w: u32, h: u32 };
+    const cases = [_]Case{
+        .{ .stride = 64, .x = 0, .y = 0, .w = 64, .h = 8 }, // full width (contiguous path)
+        .{ .stride = 64, .x = 3, .y = 2, .w = 1, .h = 1 }, // single pixel
+        .{ .stride = 64, .x = 3, .y = 2, .w = 17, .h = 5 }, // narrow (memset rows)
+        .{ .stride = 64, .x = 0, .y = 0, .w = 64, .h = 1 }, // single full row
+        .{ .stride = 64, .x = 63, .y = 7, .w = 1, .h = 1 }, // last pixel
+        .{ .stride = 900, .x = 5, .y = 1, .w = 300, .h = 4 }, // wide (memcpy rows)
+        .{ .stride = 900, .x = 0, .y = 0, .w = 900, .h = 3 }, // wide, full width
+        .{ .stride = 900, .x = 100, .y = 0, .w = 800, .h = 6 }, // right-aligned
+        .{ .stride = 900, .x = 0, .y = 0, .w = 0, .h = 6 }, // zero width (no-op)
+        .{ .stride = 900, .x = 0, .y = 0, .w = 10, .h = 0 }, // zero height (no-op)
+    };
+    const values = [_]u32{ 0xFF12161B, 0x00000000 };
+    for (values) |value| {
+        for (cases) |c| {
+            const rows: u32 = 10;
+            const len = @as(usize, c.stride) * rows;
+            const got = try testing.allocator.alloc(u32, len);
+            defer testing.allocator.free(got);
+            const want = try testing.allocator.alloc(u32, len);
+            defer testing.allocator.free(want);
+            // Fill both with a distinguishable background: outside the rectangle it must survive.
+            for (got, want, 0..) |*g, *e, i| {
+                const bg: u32 = @truncate(0xA5000000 +% i);
+                g.* = bg;
+                e.* = bg;
+            }
+            fillRect32(got, c.stride, c.x, c.y, c.w, c.h, value);
+            var row: u32 = 0;
+            while (row < c.h) : (row += 1) {
+                const off = (@as(usize, c.y) + row) * c.stride + c.x;
+                fill32Scalar(want[off..][0..c.w], value);
+            }
+            try testing.expectEqualSlices(u32, want, got);
+        }
+    }
+}
+
+test "fillRect32: a buffer whose length is not a whole number of rows" {
+    // The last row of the rectangle is what has to fit, not a whole row of the buffer:
+    // 10 pixels at stride 6 hold rows [0,6) and a partial [6,10), and a 4-wide rectangle
+    // on the second row lives entirely inside that partial row.
+    var buf = [_]u32{0xDEADBEEF} ** 10;
+    fillRect32(&buf, 6, 0, 1, 4, 1, 0xFF12161B);
+    const want = [_]u32{
+        0xDEADBEEF, 0xDEADBEEF, 0xDEADBEEF, 0xDEADBEEF, 0xDEADBEEF, 0xDEADBEEF,
+        0xFF12161B, 0xFF12161B, 0xFF12161B, 0xFF12161B,
+    };
+    try testing.expectEqualSlices(u32, &want, &buf);
 }
 
 test "swizzleBgraToRgba matches scalar (boundary lengths + random)" {

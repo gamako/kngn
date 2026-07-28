@@ -27,6 +27,7 @@ const gui = kit.gui;
 const appshell = kit.appshell;
 const stepgrid = gui.stepgrid;
 const modular = @import("modular");
+const pixelops = @import("pixelops"); // app → lib exception (see build.zig linkAppException)
 const audio = kit.audio;
 const synth = kit.synth; // SampleTap (Audio→GUI output tap; C master visualisation)
 const midi = kit.midi;
@@ -3076,8 +3077,9 @@ fn drawVizBitmap(
     meter: *const scope.LevelMeter,
 ) void {
     std.debug.assert(viz_pixels.len >= VIZ_BITMAP_W * VIS_H);
-    // Strip background: row-contiguous @memset (do not write a per-pixel loop).
-    @memset(viz_pixels[0 .. VIZ_BITMAP_W * VIS_H], VIS_BG);
+    // Strip background: one contiguous bulk write (do not write a per-pixel loop).
+    // `fill32` rather than `@memset` because the four bytes of VIS_BG differ.
+    pixelops.fill32(viz_pixels[0 .. VIZ_BITMAP_W * VIS_H], VIS_BG);
     const draw_y: usize = VIS_LABEL_H;
     // y=0..VIS_LABEL_H is background only. Draw area is y=VIS_LABEL_H..VIS_H.
     spec.draw(viz_pixels, VIZ_BITMAP_W, VIS_H, SPEC_X0, draw_y);
@@ -3406,7 +3408,8 @@ pub fn main(init: std.process.Init) !void {
             app.syncInspectorTarget();
             app.beginParamFrame();
 
-            @memset(fb.pixels, BG);
+            // Whole-framebuffer clear: `fill32` rather than `@memset` (the four bytes of BG differ).
+            pixelops.fill32(fb.pixels, BG);
             dl.reset(logical_w, logical_h);
             drawFrame(&app, &dl);
 

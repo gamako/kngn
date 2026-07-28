@@ -138,8 +138,8 @@ fn clipRect(rect: Rect, clip: Rect, target: RenderTarget) Rect {
 // ── draw primitives ───────────────────────────────────────────────────────────
 
 /// Hot path that runs every frame (full GUI redraw). Clip intersection is outside the loop (clipRect).
-/// Opaque colors (most GUI fills) write a whole row with @memset
-/// (Color.blend(dst, a=255 src) == src, so bit-identical to the blend path).
+/// Opaque colors (most GUI fills) go through `pixelops.fillRect32`, which fills the first row
+/// and replicates it (`Color.blend(dst, a=255 src) == src`, so bit-identical to the blend path).
 fn drawRectFilled(target: RenderTarget, rect: Rect, col: Color, clip: Rect) void {
     const bounds = clipRect(rect, clip, target);
     if (bounds.isEmpty()) return;
@@ -148,11 +148,7 @@ fn drawRectFilled(target: RenderTarget, rect: Rect, col: Color, clip: Rect) void
     const x1: u32 = x0 + bounds.w;
     const y1: u32 = y0 + bounds.h;
     if (col.a == 255) {
-        const value: u32 = @bitCast(col);
-        var y = y0;
-        while (y < y1) : (y += 1) {
-            @memset(target.pixels[y * target.width + x0 .. y * target.width + x1], value);
-        }
+        pixelops.fillRect32(target.pixels, target.width, x0, y0, bounds.w, bounds.h, @bitCast(col));
         return;
     }
     var y = y0;

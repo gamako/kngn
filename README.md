@@ -242,7 +242,7 @@ apps  →  kit  →  libs  →  core  →  platform    (one-way; build.zig enfor
 |---|---|
 | `platform/` | The macOS native implementations (a C ABI: objc / swift / metal). The Linux and Windows backends are pure Zig and live in `core/` |
 | `core/` | The platform facade and the per-OS backends, audio, MIDI, and the control plane (the harness) |
-| `libs/` | Optional parts — `gui` (immediate mode), `font` (TrueType/CFF/bmfont), `png`, `synth`, `sound`, `pixelops` (SIMD blending), `gfx`, `gmath`, `appshell`, `paint`, `modular`, `viz`, `serde`, `recipe` |
+| `libs/` | Optional parts — `gui` (immediate mode), `font` (TrueType/CFF/bmfont), `png`, `synth`, `sound`, `pixelops` (SIMD blending and fills), `gfx`, `gmath`, `appshell`, `paint`, `modular`, `viz`, `serde`, `recipe` |
 | `kit/` | The public umbrella module that applications and external consumers import |
 | `apps/` | `pixie` (the pixel editor), `synth` (played from the PC keyboard), `patch` (the modular patch canvas) |
 | `examples/` | 41 samples (`zig build run-example_NN`) |

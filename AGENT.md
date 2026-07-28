@@ -208,7 +208,7 @@ kngn/
 ├── examples/          # samples 01..41, run from the root with run-example_NN, plus image/ (the shared usako.png asset)
 ├── libs/              # L2–L3, portable reusable libraries (platform-independent as a rule, unit testable headless)
 │   ├── png/           # a PNG codec (decode and encode)
-│   ├── pixelops/      # shared pixel blending primitives (premultiplied and straight blends, div255, clip hoisting)
+│   ├── pixelops/      # shared pixel primitives (premultiplied and straight blends, div255, clip hoisting, u32 fill)
 │   ├── gfx/           # 2D drawing and game helpers (sprite, animation, atlas, tilemap, camera, action_map,
 │   │                  #   screen_transform, fixed_timestep, fps_counter, keyboard). In kit
 │   ├── gmath/         # f32 game mathematics and collision tests (vec2, rect, scalar, collision). Inline, allocation-free. In kit
@@ -238,7 +238,9 @@ kngn/
 > `harness(core/control) → png(libs/png)` (encoding a framebuffer snapshot as PNG, and
 > crc32), `harness → dsp` (the spectrum analysis behind the audio digest),
 > `platform → pixelops` (the BGRA→RGBA SIMD swizzle for a wasm present),
-> `pixie(apps) → pixelops` (sharing the SIMD blend of a downscaling blit),
+> `pixie(apps) → pixelops` (sharing the SIMD blend of a downscaling blit and the u32 fill
+> of the frame clear), `patch(apps) → pixelops` (the same u32 fill for its framebuffer and
+> viz-strip clears),
 > `example_26 → paint` (a direct paint import in the demo), and
 > `apps/patch/lofi.zig → synth` / `→ dsp` (using the generative layer directly).
 > Migration follows R8's deferred policy, and files not yet moved stay in `src/`.
@@ -411,9 +413,26 @@ consumer. A loop that runs over every pixel each frame (or a comparable area):
    **outside** the loop, and make the inner loop an unchecked row-contiguous access.
    Per-pixel clip comparisons and bounds re-checks are forbidden.
 
-Also: give an opaque path (`a==255`) that fills a whole area a fast path using `@memset`
-or a bulk write. Keep accesses row-major and contiguous, and compute the row offset
-outside the loop.
+Also: give an opaque path (`a==255`) that fills a whole area a fast path using a bulk
+write. Keep accesses row-major and contiguous, and compute the row offset outside the
+loop.
+
+**Filling a large area with one u32: use `pixelops.fill32` / `fillRect32`, not `@memset`.**
+`@memset` on a `[]u32` becomes the target's bulk fill (libc `memset`, wasm `memory.fill`)
+only when the compiler can see that the four bytes of the value are equal; a background
+colour such as `0xFF12161B`, or any value that is not a compile-time constant, becomes a
+scalar four-byte store loop instead. Measured
+with `zig build bench-fill` on aarch64-macos at 21.1MB: `@memset` 1.79ms (11.8 GB/s)
+against `fill32` 0.35ms (60 GB/s). The decision rule:
+
+| The write | Use |
+|---|---|
+| A compile-time constant whose four bytes are equal (`0`, `0xFFFFFFFF`) | `@memset` — already the fastest form (109 GB/s measured, against 62 for a vector store loop) |
+| Anything else over a large area (a framebuffer clear, a strip background, a wide opaque rectangle) | `pixelops.fill32` / `fillRect32` |
+| A run of a few dozen pixels | either; below one block `fill32` *is* a single `@memset` |
+
+`fill32` takes the byte-repeating case to a byte-wide `memset` itself, so a caller that
+cannot know its value up front never loses by calling it.
 
 ### Extra rules for real-time and cross-thread sharing
 
@@ -488,7 +507,7 @@ zig build test-png-format       # PNG format conversion
 zig build test-text             # the BDF parser plus text drawing
 zig build test-font             # libs/font (bmfont and so on)
 zig build test-sprite           # sprite blending and drawing
-zig build test-pixelops         # libs/pixelops (SIMD versus scalar, div255 identities, clipBlit boundaries)
+zig build test-pixelops         # libs/pixelops (SIMD versus scalar, div255 identities, clipBlit boundaries, fill32/fillRect32)
 zig build test-serde            # libs/serde (a container round trip, corruption detection, forward compatibility, fixed fixtures)
 zig build test-recipe           # libs/recipe (saving and loading a command record sequence, collect, app_name)
 zig build test-dsp              # src/dsp (Oscillator, ADSR, Filter, Mixer)
@@ -510,6 +529,7 @@ zig build test-gui-leak         # measuring state leaks in PerIdStateStore (100 
 
 # Microbenchmarks (before-and-after for a performance change; fixed to ReleaseFast, no display or audio device, OS independent)
 zig build bench-canvas          # Canvas.composite and compositeStraight: ns/frame and Mpx/s
+zig build bench-fill            # u32 fill strategies: @memset vs a @Vector store loop vs a replicated block (ns and GB/s)
 zig build bench-synth           # Synth(16 voices).render and MasterEffects.process: ns/block and × realtime
 zig build bench-gui-frame       # a full gui Context frame (beginFrame → build → endFrame → render; 500/1000 rows, avg/min/p95)
 

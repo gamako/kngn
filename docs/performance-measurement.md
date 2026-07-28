@@ -100,15 +100,27 @@ timing sections inside the frame body, averaged over 300 frames: clearing every 
 ending the frame 0.12. The sections sum to 9.80ms; the whole frame body under the same
 conditions is 10.43ms, so the 0.63ms difference is present and other unmeasured work.
 (The real fps was 101 under the different condition of `SKIP_FRAME_COPY=1`.)
-**The largest term is clearing every pixel, not the blit.**
+**The largest term is clearing every pixel, not the blit.** Those section figures predate
+`pixelops.fill32`; at the same framebuffer size the clear now measures 3.7-4.0ms paced and
+4.8ms free-run with objc, and 0.44ms with metal, and unpaced throughput went 94.8 to
+116.6fps.
 
-- **Suspect `@memset` when writing a whole-framebuffer u32 fill**: measured on
-  aarch64-macos with zig 0.16 and ReleaseFast, a `@memset` of a u32 pattern that does not
-  repeat per byte (`COLOR_WINDOW_BG` and the like) does not lower to libc memset but to
-  a scalar four-byte store loop (1.66ms for 21.1MB, or 12.7GB/s; clang's u32 loop does
-  0.64ms and `memset_pattern4` 0.42ms). An experiment replacing it with one `@memset` of
-  a row plus `@memcpy` for the remaining rows took **metal's clear section from 1.87ms to
-  0.40ms**.
+- **A whole-framebuffer u32 fill goes through `pixelops.fill32`, not `@memset`**: measured
+  on aarch64-macos with zig 0.16 and ReleaseFast, a `@memset` of a u32 pattern that does
+  not repeat per byte (`COLOR_WINDOW_BG` and the like) does not lower to libc memset but
+  to a scalar four-byte store loop (1.66ms for 21.1MB, or 12.7GB/s; clang's u32 loop does
+  0.64ms and `memset_pattern4` 0.42ms). `fill32` seeds one 4 KiB block and replicates it
+  with `@memcpy`, which measures 0.35ms (60GB/s) for the same 21.1MB, and it takes
+  **metal's clear section from 1.78ms to 0.44ms** in the editor at 3024x1744. The
+  strategy comparison behind that choice — `@memset`, a `@Vector(16, u32)` store loop, a
+  replicated block at several block sizes, and a byte-wide `memset` for a byte-repeating
+  value — is `zig build bench-fill`, and the decision rule is in AGENT.md's performance
+  rules. On the replicated block size, that bench measures 256, 1024, 4096 and 16384 pixels
+  as indistinguishable (61-63GB/s) and 65536 as slower (55-58GB/s), so `fill32` uses 1024
+  (4 KiB); no other target has been measured, which is why the number is a tuned default
+  rather than a proven optimum. A `@Vector(16, u32)` store loop measures the same 60-62GB/s
+  as the replicated block, and the block was chosen because the same shape also fills the
+  rows of `fillRect32` and because it delegates to a bulk copy the target tunes itself.
 - **On objc and swift (a CALayer plus a CGImage per present), the first write to every
   page of the framebuffer costs about 4.3ms per frame extra** (metal does not have this).
   The 4.3ms comes from the clear section in the row-`@memcpy` experiment: objc 4.72ms

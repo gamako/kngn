@@ -181,7 +181,7 @@ fn buildWasmPixie(
         link(root, pm.kit);
         link(root, shared.paint);
         // Explicit apps → pixelops exception (linkAppException call site)
-        linkAppException(root, shared.pixelops, "apps/editor/apps/pixie(blit.zig) → pixelops (shared SIMD blend for downscale blit)");
+        linkAppException(root, shared.pixelops, "apps/editor/apps/pixie → pixelops (shared SIMD blend for the downscale blit, shared u32 fill for the frame clear)");
     }
 
     const exe = b.addExecutable(.{
@@ -2110,6 +2110,18 @@ pub fn build(b: *std.Build) void {
     const bench_canvas_step = b.step("bench-canvas", "Run Canvas composite/compositeStraight micro-benchmark (ReleaseFast)");
     bench_canvas_step.dependOn(&b.addRunArtifact(bench_canvas_exe).step);
 
+    // bench-fill: compare the u32 fill strategies behind pixelops.fill32 / fillRect32
+    // (@memset vs a @Vector store loop vs seeding a block and replicating it with @memcpy).
+    const bench_fill_root = b.createModule(.{
+        .root_source_file = b.path("bench/fill.zig"),
+        .target = target,
+        .optimize = .ReleaseFast,
+    });
+    bench_fill_root.addImport("pixelops", bench_pixelops_mod);
+    const bench_fill_exe = b.addExecutable(.{ .name = "bench_fill", .root_module = bench_fill_root });
+    const bench_fill_step = b.step("bench-fill", "Run u32 fill (framebuffer clear / rect fill) micro-benchmark (ReleaseFast)");
+    bench_fill_step.dependOn(&b.addRunArtifact(bench_fill_exe).step);
+
     // bench-sprite: measure drawSprite / drawSpriteEx plain/flip/2x/tint.
     // No display/audio. Before/after comparisons stay on ReleaseFast.
     const bench_sprite_mod = b.createModule(.{
@@ -3020,7 +3032,7 @@ fn addPixieExe(
     link(root, pm.kit_menu);
     link(root, common.paint);
     // Explicit apps → pixelops exception (linkAppException call site)
-    linkAppException(root, common.pixelops, "apps/editor/apps/pixie(blit.zig) → pixelops (shared SIMD blend for downscale blit)");
+    linkAppException(root, common.pixelops, "apps/editor/apps/pixie → pixelops (shared SIMD blend for the downscale blit, shared u32 fill for the frame clear)");
 
     platform.setupExecutableForPlatform(b, exe, platform_type, optimize, platform_root, sdk_paths, .{ .enable_menu = true });
     return exe;
@@ -3064,6 +3076,7 @@ fn addPatchExe(
     link(root, common.spectrogram); // Signal visualization (master scope/spectrogram/level meter)
     link(root, common.scope);
     link(root, common.serde); // graph_io.zig (serialize: versioned-container serialization of node/edge topology)
+    linkAppException(root, common.pixelops, "apps/patch → pixelops (shared u32 fill for the per-frame framebuffer and viz-strip clears)");
     linkAppException(root, common.synth, "apps/patch/lofi.zig uses the generative layer directly (SampleTap / AtomicF32)");
     linkAppException(root, common.dsp, "apps/patch/lofi.zig uses the generative layer directly (FFT band energy checks)");
     linkAudioBackend(exe, target.result.os.tag); // macOS=AudioToolbox / Linux=asound / Windows=ole32
