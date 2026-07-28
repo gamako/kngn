@@ -73,6 +73,13 @@ curl -sf -o /dev/null -w "%{http_code}\n" http://127.0.0.1:8080/pixie.wasm
 
 Every response must be `200`.
 
+> **A fetch-path smoke and a passing `zig build package-web` are not enough.** Open
+> `http://127.0.0.1:8080/index.html` (pixie) in a browser and check both DevTools →
+> Console (no `App.init failed`, no uncaught error) and the canvas itself (a visible
+> UI, not a black screen). A regression here can compile clean and pass every fetch
+> check while still failing only inside the wasm runtime — see the note under
+> "Build" above.
+
 ### Synth (COOP/COEP required)
 
 SharedArrayBuffer + AudioWorklet need **cross-origin isolation**.

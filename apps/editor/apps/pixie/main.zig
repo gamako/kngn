@@ -82,6 +82,14 @@ comptime {
 
 const WINDOW_W: u32 = 780;
 const WINDOW_H: u32 = 600;
+
+/// Whether the appshell persistence layer (window_state / recent files / autosave /
+/// preferences) has a directory-capable filesystem to save into. Wasm's WASI shim
+/// (`web/kngn.js`) is a flat file store with no directory concept at all (`path_open`
+/// rejects `O_DIRECTORY` and `path_create_directory` is unconditionally unsupported),
+/// so on wasm every appshell save/load/scan call below is skipped and the session
+/// keeps its state in memory only, never touching an app-data or autosave directory.
+const appshell_dir_supported = builtin.os.tag != .wasi and builtin.os.tag != .freestanding;
 /// Default canvas size at startup (runtime size is `doc.width` / `doc.height`).
 const DEFAULT_CANVAS_W: u32 = 256;
 const DEFAULT_CANVAS_H: u32 = 256;
@@ -416,16 +424,17 @@ const App = struct {
     /// Load window_state before startup and return WindowOptions.
     /// After platform.init, before Window.create. On failure: default 780x600.
     /// fb_mode=.physical (HiDPI crisp UI + nearest-neighbor canvas).
+    /// On wasm (no directory-capable filesystem, see `appshell_dir_supported`), always
+    /// returns `fallback_opts` without attempting to open a data directory.
     pub fn windowBootstrap(gpa: std.mem.Allocator, io: std.Io) !platform.WindowOptions {
         const fallback_opts: platform.WindowOptions = .{
             .position = null,
             .size = .{ .width = WINDOW_W, .height = WINDOW_H },
             .fb_mode = .physical,
         };
+        if (comptime !appshell_dir_supported) return fallback_opts;
         // KNGN_APPSHELL_DIR is a native-only development override; wasm has no process env to read.
-        const override_path = if (comptime builtin.os.tag == .wasi or builtin.os.tag == .freestanding)
-            null
-        else if (std.c.getenv("KNGN_APPSHELL_DIR")) |value|
+        const override_path = if (std.c.getenv("KNGN_APPSHELL_DIR")) |value|
             std.mem.span(value)
         else
             null;
@@ -483,10 +492,13 @@ const App = struct {
     /// Also persists PanelHost visibility/extents into Preferences.
     /// size=0 (facade safe default / fetch failure) skips window_state save so existing state is kept.
     /// Preferences always attempts persist+save regardless of geometry success; failures are log-only.
+    /// On wasm (no directory-capable filesystem), both persistPanels (via preferences.save) and
+    /// window_state.save are no-ops; see `appshell_dir_supported`.
     pub fn onWindowShutdown(self: *App, win: *platform.Window) void {
         self.persistPanels() catch |err| {
             std.log.err("pixie: preferences save failed: {s}", .{@errorName(err)});
         };
+        if (comptime !appshell_dir_supported) return;
         const geo = win.getGeometry();
         if (geo.size.width == 0 or geo.size.height == 0) {
             std.log.warn("pixie: window_state save skipped (invalid geometry size={d}x{d})", .{ geo.size.width, geo.size.height });
@@ -901,7 +913,9 @@ const App = struct {
     }
 
     fn clearProjectAfterSave(self: *App) void {
-        self.autosave.clear() catch |err| self.setSaveMsg("Autosave clear failed: {s}", .{@errorName(err)});
+        if (comptime appshell_dir_supported) {
+            self.autosave.clear() catch |err| self.setSaveMsg("Autosave clear failed: {s}", .{@errorName(err)});
+        }
         self.syncProjectState();
     }
 
@@ -2951,9 +2965,12 @@ const App = struct {
         return .{ .user_data = self, .read = panelPersistRead, .write = panelPersistWrite };
     }
 
+    /// Persists PanelHost layout into the in-memory Preferences, then saves it to disk.
+    /// The disk save is skipped on wasm (no directory-capable filesystem); the in-memory
+    /// state still updates so the current session's panel layout stays consistent.
     fn persistPanels(self: *App) !void {
         try self.panel_host.persist(self.panelPersistence());
-        try self.preferences.save(self.io, self.data_dir, "preferences.ash");
+        if (comptime appshell_dir_supported) try self.preferences.save(self.io, self.data_dir, "preferences.ash");
     }
 
     /// Update the display-only Tool Options title every frame (stable name unchanged; only Panel.title).
@@ -3571,6 +3588,9 @@ fn appshellDigest(ctx: *anyopaque, buf: []u8) []const u8 {
 }
 
 fn activeAutosavePresent(app: *const App) bool {
+    // No autosave file is ever written on wasm (no directory-capable filesystem), so it is
+    // never present; skip touching the uninitialized autosave dir handle.
+    if (comptime !appshell_dir_supported) return false;
     const name = appshell.paths.autosaveFileName(app.io, app.gpa, app.autosave.current_path) catch return false;
     defer app.gpa.free(name);
     app.autosave.dir.access(app.io, name, .{}) catch return false;
@@ -6397,6 +6417,12 @@ pub const panic = if (builtin.cpu.arch.isWasm())
 else
     std.debug.FullPanic(std.debug.defaultPanic);
 
+/// Clears the active document's autosave file, skipped on wasm (no directory-capable
+/// filesystem; there is never a file to clear there).
+fn clearAutosave(app: *App) !void {
+    if (comptime appshell_dir_supported) try app.autosave.clear();
+}
+
 fn hostNewDocument(ctx: *anyopaque) !void {
     const app: *App = @ptrCast(@alignCast(ctx));
     if (app.pending_png_path) |path| {
@@ -6404,7 +6430,7 @@ fn hostNewDocument(ctx: *anyopaque) !void {
         app.gpa.free(path);
         app.pending_png_path = null;
         try app.setProjectPath(null);
-        try app.autosave.clear();
+        try clearAutosave(app);
         try app.autosave.setPath(null);
         return;
     }
@@ -6417,7 +6443,7 @@ fn hostNewDocument(ctx: *anyopaque) !void {
     if (app.current_path) |old| app.gpa.free(old);
     app.current_path = null;
     try app.setProjectPath(null);
-    try app.autosave.clear();
+    try clearAutosave(app);
     try app.autosave.setPath(null);
 }
 
@@ -6425,7 +6451,7 @@ fn hostOpenDocument(ctx: *anyopaque, path: []const u8) !void {
     const app: *App = @ptrCast(@alignCast(ctx));
     try loadProjectPath(app, path);
     try app.recent.push(path);
-    try app.autosave.clear();
+    try clearAutosave(app);
     try app.autosave.setPath(path);
 }
 
@@ -6436,7 +6462,7 @@ fn hostSaveDocument(ctx: *anyopaque, path: []const u8) !void {
     defer app.gpa.free(bytes);
     try appshell.file_safety.writeAtomic(app.io, path, bytes, .{ .backup = true });
     try app.recent.push(path);
-    try app.autosave.clear();
+    try clearAutosave(app);
     try app.autosave.setPath(path);
     try app.setProjectPath(path);
 }
@@ -6552,7 +6578,12 @@ fn recoverAutosave(app: *App) !void {
     errdefer decoded.deinit();
     try actions.validateCanvasSize(decoded.width, decoded.height);
     try app.host.adoptRecovered(candidate.envelope.original_path);
-    try appshell.autosave.discardCandidate(app.io, app.autosave.dir, candidate.file_name);
+    // Unreachable on wasm (recovery scanning is skipped there, so app.recovery is always null
+    // and the early return above already fires); guarded anyway since app.autosave.dir is
+    // uninitialized on wasm.
+    if (comptime appshell_dir_supported) {
+        try appshell.autosave.discardCandidate(app.io, app.autosave.dir, candidate.file_name);
+    }
     app.doc.deinit();
     app.doc = decoded;
     decoded = undefined;
@@ -6574,7 +6605,10 @@ fn recoverAutosave(app: *App) !void {
 
 fn discardRecovery(app: *App) !void {
     const candidate = &(app.recovery orelse return error.NoRecoveryPending);
-    try appshell.autosave.discardCandidate(app.io, app.autosave.dir, candidate.file_name);
+    // Unreachable on wasm; see the matching comment in recoverAutosave.
+    if (comptime appshell_dir_supported) {
+        try appshell.autosave.discardCandidate(app.io, app.autosave.dir, candidate.file_name);
+    }
     candidate.deinit();
     app.recovery = null;
     app.refreshTitle();
@@ -6619,23 +6653,46 @@ fn appInit(gpa: std.mem.Allocator, io: std.Io) !*App {
     errdefer gpa.free(onion_scratch);
 
     // KNGN_APPSHELL_DIR is a native-only development override; wasm has no process env to read.
-    const override_path = if (comptime builtin.os.tag == .wasi or builtin.os.tag == .freestanding)
+    const override_path = if (comptime !appshell_dir_supported)
         null
     else if (std.c.getenv("KNGN_APPSHELL_DIR")) |value|
         std.mem.span(value)
     else
         null;
-    var data_dir = try appshell.paths.openAppDataDir(io, gpa, "pixie", override_path);
-    errdefer data_dir.close(io);
-    var autosave_dir = try appshell.paths.openAutosaveDir(io, data_dir);
-    errdefer autosave_dir.close(io);
+    // On wasm data_dir/autosave_dir stay undefined and are never touched (no directory-capable
+    // filesystem there; see `appshell_dir_supported`). recent/autosave/recovery still exist so the
+    // in-memory parts of their API (setPath, markDirty, items(), push) keep working for the session.
+    //
+    // Every errdefer below stays a single statement directly in this function's top-level scope
+    // (an if/else *expression* picks the value, never an if *statement* wrapping the errdefer), so
+    // it guards every later fallible step in appInit. An errdefer's reach ends at the closing
+    // brace of the block it is written in, so nesting it inside a conditional block here would
+    // silently stop covering failures below that block.
+    var data_dir: std.Io.Dir = if (comptime appshell_dir_supported)
+        try appshell.paths.openAppDataDir(io, gpa, "pixie", override_path)
+    else
+        undefined;
+    errdefer if (comptime appshell_dir_supported) data_dir.close(io);
+    var autosave_dir: std.Io.Dir = if (comptime appshell_dir_supported)
+        try appshell.paths.openAutosaveDir(io, data_dir)
+    else
+        undefined;
+    errdefer if (comptime appshell_dir_supported) autosave_dir.close(io);
     var recent = appshell.recent_files.RecentFiles.init(gpa, 10);
     errdefer recent.deinit();
-    _ = try recent.load(io, data_dir, "recent_files.ash");
-    _ = try recent.pruneMissing(io, std.Io.Dir.cwd());
-    var autosave_controller = try appshell.autosave.Controller.init(gpa, io, autosave_dir, null);
+    if (comptime appshell_dir_supported) {
+        _ = try recent.load(io, data_dir, "recent_files.ash");
+        _ = try recent.pruneMissing(io, std.Io.Dir.cwd());
+    }
+    var autosave_controller: appshell.autosave.Controller = if (comptime appshell_dir_supported)
+        try appshell.autosave.Controller.init(gpa, io, autosave_dir, null)
+    else
+        try appshell.autosave.Controller.init(gpa, io, undefined, null);
     errdefer autosave_controller.deinit();
-    var recovery = try appshell.autosave.scan(gpa, io, autosave_dir);
+    var recovery: ?appshell.autosave.Candidate = if (comptime appshell_dir_supported)
+        try appshell.autosave.scan(gpa, io, autosave_dir)
+    else
+        null;
     errdefer if (recovery) |*candidate| candidate.deinit();
 
     var size_w_buf = try gui.TextBuffer.init(gpa, "");
@@ -6688,9 +6745,11 @@ fn appInit(gpa: std.mem.Allocator, io: std.Io) !*App {
     errdefer self.gui_font.deinit();
     self.ctx.font = self.gui_font.asFont();
 
-    _ = self.preferences.load(io, data_dir, "preferences.ash") catch |err| {
-        std.log.err("pixie: preferences load failed: {s}", .{@errorName(err)});
-    };
+    if (comptime appshell_dir_supported) {
+        _ = self.preferences.load(io, data_dir, "preferences.ash") catch |err| {
+            std.log.err("pixie: preferences load failed: {s}", .{@errorName(err)});
+        };
+    }
 
     self.panel_host = try gui.PanelHost.init(self.panels[0..], .{
         .left = .{ .extent = LEFT_PANE_DEFAULT, .min_extent = LEFT_PANE_MIN, .max_extent = 800 },
@@ -6752,18 +6811,24 @@ fn appDeinit(self: *App) void {
         self.native_menu_active = false;
         self.native_menu_registered = false;
     }
-    if (self.recovery == null and !self.host.isDirty()) {
-        self.autosave.clear() catch |err| std.log.err("pixie: autosave clear failed: {s}", .{@errorName(err)});
+    // Wasm has no directory-capable filesystem (see `appshell_dir_supported`), so none of
+    // recent/autosave/data_dir/autosave_dir is opened; skip every save/close on it.
+    if (comptime appshell_dir_supported) {
+        if (self.recovery == null and !self.host.isDirty()) {
+            self.autosave.clear() catch |err| std.log.err("pixie: autosave clear failed: {s}", .{@errorName(err)});
+        }
+        self.recent.save(self.io, self.data_dir, "recent_files.ash") catch |err| std.log.err("pixie: recent save failed: {s}", .{@errorName(err)});
     }
-    self.recent.save(self.io, self.data_dir, "recent_files.ash") catch |err| std.log.err("pixie: recent save failed: {s}", .{@errorName(err)});
     if (self.pending_png_path) |p| gpa.free(p);
     self.host.deinit();
     if (self.recovery) |*candidate| candidate.deinit();
     self.autosave.deinit();
     self.recent.deinit();
     self.preferences.deinit();
-    self.autosave_dir.close(self.io);
-    self.data_dir.close(self.io);
+    if (comptime appshell_dir_supported) {
+        self.autosave_dir.close(self.io);
+        self.data_dir.close(self.io);
+    }
     if (self.current_path) |p| gpa.free(p);
     if (self.current_project_path) |p| gpa.free(p);
     if (self.palette_path) |p| gpa.free(p);
@@ -7285,8 +7350,10 @@ fn appFrame(self: *App, win: *platform.Window, now: f64) !bool {
     // Even if save/load is pending in the same frame as a quit request, do not open dialogs while quitting.
     if (self.running) self.runPendingFileOp();
 
-    if (self.running and self.recovery == null and !platform.netsyncActive()) {
-        _ = self.autosave.tick(now, self, snapshotProject) catch |err| self.setSaveMsg("Autosave failed: {s}", .{@errorName(err)});
+    if (comptime appshell_dir_supported) {
+        if (self.running and self.recovery == null and !platform.netsyncActive()) {
+            _ = self.autosave.tick(now, self, snapshotProject) catch |err| self.setSaveMsg("Autosave failed: {s}", .{@errorName(err)});
+        }
     }
 
     // End of frame: detect unrecorded undoable edits → expire redo-candidate epochs

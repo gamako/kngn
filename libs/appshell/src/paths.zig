@@ -7,6 +7,12 @@ const builtin = @import("builtin");
 ///
 /// `override_path` is expected to be absolute. Ordinary env vars are read via Zig 0.16 std.c getenv,
 /// while directory ops stay limited to std.Io.Dir.
+///
+/// This repository's browser build (`web/kngn.js`'s WASI shim) is a flat, file-only in-memory
+/// store with no directory concept at all, so without `override_path` this fails with
+/// `error.PersistenceUnsupported` there rather than opening a real directory; see `defaultPath`.
+/// Callers that run on wasm should treat that as "no persistence available" and skip calling
+/// this rather than surface it as a fatal error.
 pub fn openAppDataDir(
     io: std.Io,
     allocator: std.mem.Allocator,
@@ -83,6 +89,12 @@ fn defaultPath(buf: []u8, base_buf: []u8, app_name: []const u8) ![]const u8 {
             const root = env("APPDATA") orelse env("LOCALAPPDATA") orelse return error.AppDataNotFound;
             break :blk try std.fmt.bufPrint(base_buf, "{s}", .{root});
         },
+        // Not an env-var lookup failure: wasm has no HOME to be missing in the first place, and
+        // even a resolved path could not be opened (this repository's browser WASI shim, see
+        // openAppDataDir's doc comment, has no directory concept at all). Name the error for
+        // what it is rather than reusing HomeNotFound, which would misleadingly imply setting
+        // HOME would fix it.
+        .wasi, .freestanding => return error.PersistenceUnsupported,
         else => blk: {
             if (env("XDG_CONFIG_HOME")) |xdg| break :blk try std.fmt.bufPrint(base_buf, "{s}", .{xdg});
             const home = env("HOME") orelse return error.HomeNotFound;
