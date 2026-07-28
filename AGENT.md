@@ -40,8 +40,7 @@ This repository is public. Everything in it must make sense to a reader who has
 repository, or the author's notes. The rules below are binding for every change.
 
 **Two independent axes.** "Write in English" (rule 1) and "carry no task-tracker
-id" (rule 3) are separate requirements, and the exemptions belong to the first
-one only:
+id" (rule 3) are separate requirements, and each has its own exemptions:
 
 | | English (rule 1) | No task id (rule 3) |
 |---|---|---|
@@ -49,6 +48,7 @@ one only:
 | `test "..."` names, build step descriptions | applies | applies |
 | **User-visible UI strings** | **exempt** | applies |
 | **Japanese test fixtures** | **exempt** | applies |
+| **Commit messages** | applies | **exempt** |
 
 The exemption means "do not translate this text", not "never touch this text". A
 window title reading `GUI Torture Suite (<task id>)` keeps its wording and loses
@@ -57,12 +57,14 @@ part of user-facing text.
 
 ### 1. Language
 
-English, in: source comments, `docs/adr/`, `docs/plans/`, every `README.md`, and
-this file.
+English, in: source comments, `docs/adr/`, `docs/plans/`, every `README.md`, this
+file, and **commit messages**. A commit message is published together with the
+code it changes and is read by the same audience, so it is subject to the same
+rule; the history is documentation.
 
 Japanese stays in the private tiers, which are **not** part of this repository:
-the task tracker, the meta repository's `docs/` and `tools/`, development notes,
-and commit messages.
+the task tracker, the meta repository's `docs/` and `tools/`, and development
+notes.
 
 Two things inside this repository stay as they are, because they are data rather
 than prose: **Japanese test fixtures** (multibyte-handling test data, e.g. in
@@ -84,7 +86,10 @@ values, not in file names, not in documentation. Those ids resolve only in the
 private tracker, so to a reader here they are dead references that look live.
 
 Provenance is still recoverable without them: `jj file annotate` gives the
-commit, and the commit message carries the id.
+commit, and the commit message carries the id. The commit message is the single
+intended home for an id, and rule 3 does not reach it. A reader without the
+tracker still loses nothing, because the message states what changed and why on
+its own.
 
 This rule reaches into string literals, per the two-axis table above. Removing an
 id from a string keeps the surrounding wording: a window title becomes
@@ -558,7 +563,10 @@ jj log                        # show the history
 
 ## Commit convention
 
-Conventional Commits:
+Conventional Commits, written in English — the history is part of what a reader of
+this repository gets (rule 1 of the comment and documentation policy). The subject
+says what changed and carries the task id in brackets — `[TASK-NN]`, the one place
+an id is allowed (rule 3) — and the body says why.
 
 ```
 <type>: <subject>
