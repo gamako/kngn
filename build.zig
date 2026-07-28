@@ -693,6 +693,52 @@ pub fn build(b: *std.Build) void {
     const test_command_types_step = b.step("test-command-types", "Run menu Command type-only model tests");
     test_command_types_step.dependOn(&run_command_types_test.step);
 
+    // The platform facade's own unit tests (event-scale normalisation / framebuffer snapshot
+    // contract). `zig test` only collects `test` blocks declared in the root file itself, not ones
+    // reached through a relative `@import` (the OS backend dispatch inside core/platform.zig), so a
+    // wrapper module that merely imports "platform" (as platform_menu_test_mod below does) would never
+    // run these — same policy as the frame-pacing/MIDI/capture dedicated roots. Rooting the test module
+    // directly at core/platform.zig and building it with the same `createPlatformModule` helper the
+    // production module uses works with no extra native archive: the facade's tests exercise only pure
+    // logic (comptime-unreachable native calls are never analysed, let alone linked).
+    const platform_facade_test_mod = platform.createPlatformModule(
+        b,
+        target,
+        b.path("core/platform.zig"),
+        platform_root,
+        platform.defaultBackend(target_os),
+        shared_modules.types.mod,
+        shared_modules.command_types.mod,
+        shared_modules.harness.mod,
+        .{},
+    );
+    const platform_facade_test = b.addTest(.{ .root_module = platform_facade_test_mod });
+    const run_platform_facade_test = b.addRunArtifact(platform_facade_test);
+    const test_platform_facade_step = b.step("test-platform-facade", "Run platform facade unit tests (event-scale normalisation / framebuffer snapshot contract)");
+    test_platform_facade_step.dependOn(&run_platform_facade_test.step);
+
+    // The macOS backend's own unit tests (same "root file only" collection rule as above). Its
+    // `test` blocks reference no link-time C function (guarded by `builtin.is_test`; `@cInclude`
+    // still resolves the C type/constant references at comptime), so `@cInclude("platform.h")`
+    // only needs the include path, not the native .o archive.
+    if (target_os == .macos) {
+        const platform_macos_test_mod = b.createModule(.{
+            .root_source_file = b.path("core/platform_macos.zig"),
+            .target = target,
+            .optimize = optimize,
+            .link_libc = true,
+        });
+        platform_macos_test_mod.addIncludePath(platform_root);
+        platform_macos_test_mod.addImport("platform_types", shared_modules.types.mod);
+        platform_macos_test_mod.addImport("command_types", shared_modules.command_types.mod);
+        const macos_opts = b.addOptions();
+        macos_opts.addOption([]const u8, "platform_backend", platform.backendName(platform.defaultBackend(target_os)));
+        macos_opts.addOption(bool, "enable_menu", false);
+        platform_macos_test_mod.addOptions("build_options", macos_opts);
+        const platform_macos_test = b.addTest(.{ .root_module = platform_macos_test_mod });
+        test_platform_facade_step.dependOn(&b.addRunArtifact(platform_macos_test).step);
+    }
+
     const platform_menu_test_mod = b.createModule(.{
         .root_source_file = b.path("core/platform_menu_test.zig"),
         .target = target,
@@ -2005,6 +2051,7 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(test_mcp_step);
     test_step.dependOn(test_command_step);
     test_step.dependOn(test_command_types_step);
+    test_step.dependOn(test_platform_facade_step);
     test_step.dependOn(test_platform_menu_step);
     test_step.dependOn(test_platform_null_step);
     test_step.dependOn(test_platform_clipboard_step);
