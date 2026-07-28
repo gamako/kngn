@@ -108,7 +108,7 @@ The missing section shows these 15 items: Accordion, Alert / Message Dialog, Bre
 
 ## 10. Cross-cutting gaps
 
-### AC#1: Sources, missing sections, cross-cutting holes
+### Sources, missing sections, and cross-cutting holes
 
 - Sources stay in §2, APG 30 patterns in §3, ImGui sections in §4, and the crosswalk in §5.
 - The 15 missing items and follow-up categories must match §9 and the gallery missing section.
@@ -173,11 +173,6 @@ Detail, file:line, and reproduction scripts live with the torture suite plan and
 6. Hit-test / clip / child rect behavior for zero-size / overflow containers is undefined
 7. Rect-cache sync lag when layout changes during drag: current contract is spelled out in §16
 8. Auto-ID same-label collisions: current contract and `Id` variant usage rules are spelled out in §17
-
-## AC#5 / AC#6 self-check
-
-- AC#5: §2 records APG URL, living document, no version label, 30 patterns, fetch date; ImGui URL, v1.92.6, fetch date.
-- AC#6: §7 and §10 record missing disabled API, individual PopupItem.enabled / Command.enabled handling, stepgrid editable, missing focus and semantic role, and missing dedicated query API.
 
 ## 14. Settings shell observations
 
