@@ -1427,7 +1427,7 @@ fn redrawTitle(st: *State) void {
 fn allocShmBufferSized(st: *State, b: *ShmBuffer, w: i32, h: i32) bool {
     if (w <= 0 or h <= 0) return false;
     const dims = computeShmDims(@intCast(w), @intCast(h)) orelse return false;
-    const fd = memfd_create("video-proto-wayland-csd", MFD_CLOEXEC);
+    const fd = memfd_create("kngn-wayland-csd", MFD_CLOEXEC);
     if (fd < 0) return false;
     if (ftruncate(fd, @intCast(dims.size)) != 0) {
         _ = close(fd);
@@ -2074,7 +2074,7 @@ fn setupBuffers(st: *State) Error!void {
 }
 
 fn setupOneBuffer(st: *State, b: *ShmBuffer, dims: ShmDims) Error!void {
-    const fd = memfd_create("video-proto-wayland", MFD_CLOEXEC);
+    const fd = memfd_create("kngn-wayland", MFD_CLOEXEC);
     if (fd < 0) return error.WindowCreationFailed;
     errdefer _ = close(fd);
     if (ftruncate(fd, @intCast(dims.size)) != 0) return error.WindowCreationFailed;
@@ -2127,7 +2127,7 @@ fn reallocBuffer(st: *State, i: usize) bool {
     const dims = computeShmDims(st.width, st.height) orelse return false;
 
     // phase 1: allocate the new resources into locals
-    const fd = memfd_create("video-proto-wayland", MFD_CLOEXEC);
+    const fd = memfd_create("kngn-wayland", MFD_CLOEXEC);
     if (fd < 0) return false;
     if (ftruncate(fd, @intCast(dims.size)) != 0) {
         _ = close(fd);

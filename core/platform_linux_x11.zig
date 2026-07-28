@@ -931,9 +931,9 @@ fn setupBlit(st: *State, visual: ?*c.Visual, depth: c_uint, width: u32, height: 
     const dpy = st.display;
 
     // Try the shm path when XShm is available.
-    // Setting the environment variable VIDEO_PROTO_DISABLE_XSHM skips XShm and forces the XPutImage path
+    // Setting the environment variable KNGN_DISABLE_XSHM skips XShm and forces the XPutImage path
     // (which is how the fallback is checked in an environment where XShm does work).
-    const disable_shm = std.c.getenv("VIDEO_PROTO_DISABLE_XSHM") != null;
+    const disable_shm = std.c.getenv("KNGN_DISABLE_XSHM") != null;
     if (!disable_shm and c.XShmQueryExtension(dpy) != 0) {
         if (trySetupShm(st, visual, depth, width, height)) {
             try classifyAndSetupBacking(st, width, height);

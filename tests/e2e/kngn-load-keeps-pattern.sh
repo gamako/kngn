@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# VPRJ load must not wipe a saved pattern via seed reset (solo bit-identical + netsync SYNC).
+# KNGN load must not wipe a saved pattern via seed reset (solo bit-identical + netsync SYNC).
 # When direnv is required, set KNGN_MAIN_DIR to the video-proto-main path (borrow the flake outside the workspace).
 set -euo pipefail
 
@@ -74,8 +74,8 @@ quit_pid() {
 log "=== solo E2E ==="
 SOLO_PORT=/tmp/t151-solo.port
 SOLO_OUT="$WORKDIR/solo-out"
-BEFORE="$WORKDIR/before.vprj"
-AFTER="$WORKDIR/after.vprj"
+BEFORE="$WORKDIR/before.kngn"
+AFTER="$WORKDIR/after.kngn"
 
 solo_pid=$(start_patch "$SOLO_PORT" "$SOLO_OUT")
 wait_port "$SOLO_PORT" "$solo_pid"
@@ -94,7 +94,7 @@ log "solo after load masks: $(printf '%s' "$after_load_digest" | grep -oE '"patt
 "$DRIVE" --port-file "$SOLO_PORT" "action save_project $AFTER"
 
 if ! cmp -s "$BEFORE" "$AFTER"; then
-  log "FAIL: VPRJ bit mismatch after save→load→save"
+  log "FAIL: KNGN bit mismatch after save→load→save"
   ls -la "$BEFORE" "$AFTER"
   exit 1
 fi
@@ -170,7 +170,7 @@ quit_pid "$CLIENT_PORT" "$client_pid"
 rm -f "$HOST_PORT" "$CLIENT_PORT"
 
 log "netsync PASS: host/client pattern masks match"
-log "ALL VPRJ load pattern E2E PASSED"
+log "ALL KNGN load pattern E2E PASSED"
 log "solo_before_patterns=$(printf '%s' "$before_digest" | grep -oE '"patterns":\{[^}]+\}')"
 log "solo_after_load_patterns=$(printf '%s' "$after_load_digest" | grep -oE '"patterns":\{[^}]+\}')"
 log "netsync_host_patterns=$(printf '%s' "$host_digest" | grep -oE '"patterns":\{[^}]+\}')"

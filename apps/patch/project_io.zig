@@ -1,6 +1,6 @@
 //! apps/patch: unified project serialization.
 //!
-//! Chunks placed in a libs/serde versioned container (magic = `VPRJ`, schema_version=2):
+//! Chunks placed in a libs/serde versioned container (magic = `KNGN`, schema_version=2):
 //!   - SPRM: scalar Params (the existing MPRJ flat packer)
 //!   - PTRN: grid/303 pattern (PatternPayload, 33B)
 //!   - SEED: base_seed + notation_seed + notation_counter (20B)
@@ -12,7 +12,7 @@
 //!   - LEDG: the entire group.Ledger (fixed length)
 //!   - GENR: LofiPatch's generation-role -> saved-handle mapping (unified format only)
 //!
-//! The writer emits only VPRJ. The reader auto-detects VPRJ plus the legacy MDLP / MPRJ / PTCG formats.
+//! The writer emits only KNGN. The reader auto-detects KNGN plus the legacy MDLP / MPRJ / PTCG formats.
 //! Schema 1 (no NIDM/NREF) falls back to deterministic numbering by node appearance order.
 //!
 //! **ModuleKind compatibility**: the enum ordinal is part of the persisted format. New kinds may only be appended at the end.
@@ -30,8 +30,8 @@ const pattern_io = @import("pattern_io.zig");
 const graph_io = @import("graph_io.zig");
 const group = @import("group.zig");
 
-/// 'VPRJ' (video-proto project), a little-endian u32.
-pub const magic: u32 = @as(u32, 'V') | (@as(u32, 'P') << 8) | (@as(u32, 'R') << 16) | (@as(u32, 'J') << 24);
+/// 'KNGN', a little-endian u32.
+pub const magic: u32 = @as(u32, 'K') | (@as(u32, 'N') << 8) | (@as(u32, 'G') << 16) | (@as(u32, 'N') << 24);
 /// The legacy MPRJ magic (read compatibility only; the writer never emits it).
 pub const mprj_magic: u32 = @as(u32, 'M') | (@as(u32, 'P') << 8) | (@as(u32, 'R') << 16) | (@as(u32, 'J') << 24);
 /// schema 2 means NIDM/NREF are present. The reader also accepts schema 1 (falling back to numbering).
@@ -66,7 +66,7 @@ pub const NodeIdRef = struct {
     id: NodeId,
 };
 
-pub const FormatKind = enum { vprj, mdlp, mprj, ptcg };
+pub const FormatKind = enum { kngn, mdlp, mprj, ptcg };
 
 pub const DecodeError = error{
     MissingSprm,
@@ -982,7 +982,7 @@ pub const EncodeInput = struct {
     genr: GenRoleHandles,
 };
 
-/// Encodes an entire VPRJ (caller frees the result).
+/// Encodes an entire KNGN (caller frees the result).
 pub fn encode(comptime P: type, gpa: std.mem.Allocator, params: P, input: EncodeInput) ![]u8 {
     var w = try serde.Writer.init(gpa, magic, schema_version);
     errdefer w.deinit();
@@ -1041,7 +1041,7 @@ pub fn encode(comptime P: type, gpa: std.mem.Allocator, params: P, input: Encode
     return w.finish();
 }
 
-/// For generating legacy MPRJ fixtures (test-only; the production writer emits only VPRJ).
+/// For generating legacy MPRJ fixtures (test-only; the production writer emits only KNGN).
 pub fn encodeMprj(
     comptime P: type,
     gpa: std.mem.Allocator,
@@ -1090,7 +1090,7 @@ fn emptyDecoded(comptime P: type, format: FormatKind) Decoded(P) {
     };
 }
 
-fn decodeVprj(comptime P: type, gpa: std.mem.Allocator, bytes: []const u8) !Decoded(P) {
+fn decodeKngn(comptime P: type, gpa: std.mem.Allocator, bytes: []const u8) !Decoded(P) {
     const container = try serde.Container.parse(bytes, magic);
     if (container.schemaVersion() > schema_version) return error.UnsupportedSchemaVersion;
     const file_schema = container.schemaVersion();
@@ -1215,7 +1215,7 @@ fn decodeVprj(comptime P: type, gpa: std.mem.Allocator, bytes: []const u8) !Deco
     }
 
     return .{
-        .format = .vprj,
+        .format = .kngn,
         .params = try unpackFrom(P, sprm_b),
         .pattern = unpackPattern(ptrn_b),
         .seed = unpackSeed(seed_b),
@@ -1296,7 +1296,7 @@ fn decodeFromPtcg(comptime P: type, gpa: std.mem.Allocator, bytes: []const u8) !
 pub fn decode(comptime P: type, gpa: std.mem.Allocator, bytes: []const u8) !Decoded(P) {
     if (bytes.len < 4) return error.BadMagic;
     const m = std.mem.readInt(u32, bytes[0..4], .little);
-    if (m == magic) return decodeVprj(P, gpa, bytes);
+    if (m == magic) return decodeKngn(P, gpa, bytes);
     if (m == pattern_io.magic) return decodeFromMdlp(P, gpa, bytes);
     if (m == mprj_magic) return decodeFromMprj(P, gpa, bytes);
     if (m == graph_io.magic) return decodeFromPtcg(P, gpa, bytes);
@@ -1377,7 +1377,27 @@ fn sampleInput() EncodeInput {
     };
 }
 
-test "VPRJ encode/decode: full field round-trip" {
+test "KNGN magic: encode writes KNGN, and the retired VPRJ magic is rejected" {
+    const gpa = testing.allocator;
+    const params = TestParams{ .tempo = 120, .kick_mute = false, .idx = 0 };
+
+    const bytes = try encode(TestParams, gpa, params, sampleInput());
+    defer gpa.free(bytes);
+    try testing.expectEqualSlices(u8, "KNGN", bytes[0..4]);
+
+    var got = try decode(TestParams, gpa, bytes);
+    defer got.deinit(gpa);
+    try testing.expect(got.format == .kngn);
+
+    // The retired magic is not in the reader's accepted set, so a file written by an older
+    // build is refused rather than misread.
+    const retired = try gpa.dupe(u8, bytes);
+    defer gpa.free(retired);
+    @memcpy(retired[0..4], "VPRJ");
+    try testing.expectError(error.BadMagic, decode(TestParams, gpa, retired));
+}
+
+test "KNGN encode/decode: full field round-trip" {
     const gpa = testing.allocator;
     const params = TestParams{ .tempo = 140, .kick_mute = true, .idx = 2 };
     var ledger: group.Ledger = .{};
@@ -1400,7 +1420,7 @@ test "VPRJ encode/decode: full field round-trip" {
     var got = try decode(TestParams, gpa, bytes);
     defer got.deinit(gpa);
 
-    try testing.expect(got.format == .vprj);
+    try testing.expect(got.format == .kngn);
     try testing.expectEqual(params, got.params);
     try testing.expectEqual(input.pattern, got.pattern);
     try testing.expectEqual(input.seed, got.seed);
@@ -1420,7 +1440,7 @@ test "VPRJ encode/decode: full field round-trip" {
     try testing.expectEqual(input.next_node_id, got.next_node_id);
 }
 
-test "VPRJ encode→decode→encode: canonical bytes bit-identical" {
+test "KNGN encode→decode→encode: canonical bytes bit-identical" {
     const gpa = testing.allocator;
     const params = TestParams{ .tempo = 96, .idx = 1 };
     const input = sampleInput();
@@ -1444,7 +1464,7 @@ test "VPRJ encode→decode→encode: canonical bytes bit-identical" {
     try testing.expectEqualSlices(u8, a, b);
 }
 
-test "VPRJ decode: unknown chunk skip / DuplicateChunk / missing required" {
+test "KNGN decode: unknown chunk skip / DuplicateChunk / missing required" {
     const gpa = testing.allocator;
     const input = sampleInput();
     // unknown skip
@@ -1513,7 +1533,7 @@ test "VPRJ decode: unknown chunk skip / DuplicateChunk / missing required" {
     }
 }
 
-test "VPRJ decode: UnsupportedSchemaVersion / CrcMismatch / CorruptLedger" {
+test "KNGN decode: UnsupportedSchemaVersion / CrcMismatch / CorruptLedger" {
     const gpa = testing.allocator;
     const input = sampleInput();
     {
@@ -1632,13 +1652,13 @@ test "ModuleKind ordinal stability: sidechain=25, slew..=logic=26..30" {
     try testing.expectEqual(@as(u8, 30), @intFromEnum(graph_io.ModuleKind.logic));
 }
 
-test "VPRJ file I/O: save→load round-trip" {
+test "KNGN file I/O: save→load round-trip" {
     const gpa = testing.allocator;
     const io = testing.io;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     var path_buf: [96]u8 = undefined;
-    const path = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}/project_io_test.vprj", .{&tmp.sub_path});
+    const path = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}/project_io_test.kngn", .{&tmp.sub_path});
 
     const params = TestParams{ .tempo = 96, .idx = 1 };
     const input = sampleInput();
@@ -1856,7 +1876,7 @@ test "NPRM round-trip: all ModuleKind descriptors + 303 fixture bit-identical" {
     try testing.expectEqualSlices(u8, bytes, again);
 }
 
-test "NPRM absent: legacy VPRJ keeps apply_node_params=false" {
+test "NPRM absent: legacy schema 1 keeps apply_node_params=false" {
     const gpa = testing.allocator;
     const input = sampleInput();
     // schema 1 (no NIDM/NREF) = fallback numbering

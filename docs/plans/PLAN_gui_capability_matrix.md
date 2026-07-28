@@ -22,7 +22,7 @@ The matrix sources below are the primary documents fetched by the orchestrator v
 |---|---|---|
 | WAI-ARIA APG Patterns | https://www.w3.org/WAI/ARIA/apg/patterns/ | living document, no version label, 2026-07-17 |
 | Dear ImGui | https://github.com/ocornut/imgui | v1.92.6, 2026-07-17 |
-| video-proto libs/gui | libs/gui/src/widgets.zig / popup.zig / menu.zig / stepgrid.zig | workspace tree, 2026-07-17 |
+| KNGN libs/gui | libs/gui/src/widgets.zig / popup.zig / menu.zig / stepgrid.zig | workspace tree, 2026-07-17 |
 
 ## 3. APG 30 patterns
 

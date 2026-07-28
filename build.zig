@@ -3,7 +3,7 @@ const std = @import("std");
 const platform = @import("build_helpers/platform.zig");
 const macos = @import("build_helpers/macos.zig");
 
-const APP_NAME = "video_proto";
+const APP_NAME = "kngn_demo";
 
 // ============================================================
 // ADR-007 R1: layer tags and dependency wiring checks
@@ -1835,7 +1835,7 @@ pub fn build(b: *std.Build) void {
     const run_modular_pattern_io_test = b.addRunArtifact(modular_pattern_io_test);
     test_app_modular_step.dependOn(&run_modular_pattern_io_test.step);
 
-    // apps/patch integrated project serialize (VPRJ). serde + modular (graph_io) + group/pattern_io.
+    // apps/patch integrated project serialize (KNGN). serde + modular (graph_io) + group/pattern_io.
     const modular_project_io_test_mod = b.createModule(.{
         .root_source_file = b.path("apps/patch/project_io.zig"),
         .target = target,

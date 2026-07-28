@@ -54,7 +54,7 @@ nix develop --command zig build test-platform-input
 
 # Headless verification (for an SSH environment with no GUI session): run under Xvfb and take a PNG
 nix develop --command bash scripts/xvfb-screenshot.sh out.png                 # capture the root window (a smoke test)
-nix develop --command bash scripts/xvfb-screenshot.sh out.png -- zig-out/bin/video_proto  # capture the application
+nix develop --command bash scripts/xvfb-screenshot.sh out.png -- zig-out/bin/kngn_demo  # capture the application
 
 # Synthesising input with xdotool: send keys, mouse and wheel to the application under Xvfb
 #   DISPLAY=:99 xdotool key a / mousemove X Y / click 1 / click 4 (wheel up)
@@ -85,8 +85,8 @@ weston (its headless backend) plus `weston-screenshooter`.
 
 ```bash
 nix develop --command bash scripts/wayland-screenshot.sh out.png                                  # capture the compositor output (a smoke test)
-nix develop --command bash scripts/wayland-screenshot.sh out.png -- zig-out/bin/video_proto        # capture the main program (a smoke test of the rainbow display)
-WAYLAND_SHOT_COMPOSITOR=weston nix develop --command bash scripts/wayland-screenshot.sh out.png -- zig-out/bin/video_proto
+nix develop --command bash scripts/wayland-screenshot.sh out.png -- zig-out/bin/kngn_demo        # capture the main program (a smoke test of the rainbow display)
+WAYLAND_SHOT_COMPOSITOR=weston nix develop --command bash scripts/wayland-screenshot.sh out.png -- zig-out/bin/kngn_demo
 ```
 
 > How a compositor starts headless, its output name, and the screenshooter's permissions

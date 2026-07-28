@@ -197,13 +197,13 @@ snapshot fb で PNG を撮って、自分で見て確認してから報告して
 ```zig
 // build.zig.zon
 .dependencies = .{
-    .video_proto = .{ .path = "../video-proto-main" },   // または zig fetch --save <url>
+    .kngn = .{ .path = "../video-proto-main" },   // または zig fetch --save <url>
 },
 ```
 
 ```zig
 // build.zig
-const dep = b.dependency("video_proto", .{ .target = target, .optimize = optimize });
+const dep = b.dependency("kngn", .{ .target = target, .optimize = optimize });
 
 exe.root_module.addImport("kit", dep.module("kit"));        // 純 Zig の部分
 exe.root_module.linkLibrary(dep.artifact(native_lib_name)); // ネイティブ .o アーカイブ

@@ -442,7 +442,7 @@ fn publishControls(patch: *LofiPatch, p: Params) void {
 }
 
 /// One-shot apply of legacy SPRM / Params transport fields into graph param_db.
-/// For load_pattern (no NPRM) and offline render. Not called on a full VPRJ load where NPRM is authoritative.
+/// For load_pattern (no NPRM) and offline render. Not called on a full KNGN load where NPRM is authoritative.
 /// Params is deprecated storage (not the live authoritative source).
 fn publishDeprecatedGraphFromParams(patch: *LofiPatch, p: Params) void {
     var batch: patchmod.ParamBatch = .{};
@@ -1186,12 +1186,12 @@ const App = struct {
         return null;
     }
 
-    /// Append `.vprj` when the extension is missing (dialog return path; caller frees).
-    fn ensureVprjExt(gpa: std.mem.Allocator, path: []const u8) ![]u8 {
-        if (path.len >= 5 and std.ascii.eqlIgnoreCase(path[path.len - 5 ..], ".vprj")) {
+    /// Append `.kngn` when the extension is missing (dialog return path; caller frees).
+    fn ensureKngnExt(gpa: std.mem.Allocator, path: []const u8) ![]u8 {
+        if (path.len >= 5 and std.ascii.eqlIgnoreCase(path[path.len - 5 ..], ".kngn")) {
             return gpa.dupe(u8, path);
         }
-        return std.fmt.allocPrint(gpa, "{s}.vprj", .{path});
+        return std.fmt.allocPrint(gpa, "{s}.kngn", .{path});
     }
 
     /// Run pending File ops at a safe point after framebuffer unlock (dialogs forbidden while locked).
@@ -1202,17 +1202,17 @@ const App = struct {
         switch (op) {
             .save_project => {
                 const maybe = platform.saveFileDialog(gpa, self.io, .{
-                    .default_name = "untitled.vprj",
-                    .allowed_ext = "vprj",
+                    .default_name = "untitled.kngn",
+                    .allowed_ext = "kngn",
                 }) catch return; // Ignore DialogFailed (headless) etc. and keep RT running
                 const path = maybe orelse return;
                 defer gpa.free(path);
-                const final_path = ensureVprjExt(gpa, path) catch return;
+                const final_path = ensureKngnExt(gpa, path) catch return;
                 defer gpa.free(final_path);
                 actionSaveProjectFile(self, final_path) catch {};
             },
             .open_project => {
-                const maybe = platform.openFileDialog(gpa, self.io, .{ .allowed_ext = "vprj" }) catch return;
+                const maybe = platform.openFileDialog(gpa, self.io, .{ .allowed_ext = "kngn" }) catch return;
                 const path = maybe orelse return;
                 defer gpa.free(path);
                 // Same path as actionLoadProject (args = path).
@@ -4806,11 +4806,11 @@ fn actionRemoveMacro(ctx: *anyopaque, args: []const u8, buf: []u8) anyerror![]co
 }
 
 // ============================================================================
-// save_graph / load_graph (VPRJ-compatible aliases; legacy PTCG still loads).
+// save_graph / load_graph (KNGN-compatible aliases; legacy PTCG still loads).
 //
 // Hot-path declaration: save/load are event only. Do not touch the RT path.
-// save_graph = full VPRJ save (same content as save_project).
-// load_graph = apply graph/Ledger/GENR from VPRJ. PTCG also loads (empty Ledger reset; GENR disabled).
+// save_graph = full KNGN save (same content as save_project).
+// load_graph = apply graph/Ledger/GENR from KNGN. PTCG also loads (empty Ledger reset; GENR disabled).
 // ============================================================================
 
 fn collectNodesEdges(app: *App, node_buf: *[MAX_MODULES]project_io.NodeEntry, edge_buf: *[MAX_EDGES]project_io.EdgeEntry) struct { nodes: []project_io.NodeEntry, edges: []project_io.EdgeEntry } {
@@ -5054,7 +5054,7 @@ fn applyGraphReplace(
         restoreNodeIdsFromRefs(app, &mapping, refs_buf[0..nodes.len], next);
     }
 
-    // master output is outside VPRJ chunks; restore staging output from the GENR output role
+    // master output is outside KNGN chunks; restore staging output from the GENR output role
     // (without it, load is silent. Legacy PTCG has no GENR so does not setOutput).
     if (app.patch.output_h != project_io.INVALID_ROLE_HANDLE and app.dyn.isActive(app.patch.output_h)) {
         app.dyn.setOutput(app.patch.output_h);
@@ -5066,7 +5066,7 @@ fn applyGraphReplace(
 
 /// Publish params + pattern.
 /// `quantize_bar=true`: required when the same load also applies seed (so seed's anchor reset does not wipe the pattern;
-/// at the bar boundary, seed→pending_bar_cmd last-wins). VPRJ/MPRJ load / SYNC.
+/// at the bar boundary, seed→pending_bar_cmd last-wins). KNGN/MPRJ load / SYNC.
 /// `quantize_bar=false`: pattern-only (load_pattern). Apply immediately (as before).
 /// Callers pass `loaded.apply_seed_song` to mean "quantize only when pattern and seed share a format".
 /// The combo `apply_params_pattern=true` and `apply_seed_song=false` does not exist in current formats.
@@ -5124,8 +5124,8 @@ fn actionLoadGraph(ctx: *anyopaque, args: []const u8, buf: []u8) anyerror![]cons
 
     if (!decoded.apply_graph) return error.UnsupportedFormat;
 
-    const ledger_ptr: ?*const group.Ledger = if (decoded.apply_ledger and decoded.format == .vprj) &decoded.ledger else null;
-    const genr_opt: ?project_io.GenRoleHandles = if (decoded.apply_genr and decoded.format == .vprj) decoded.genr else null;
+    const ledger_ptr: ?*const group.Ledger = if (decoded.apply_ledger and decoded.format == .kngn) &decoded.ledger else null;
+    const genr_opt: ?project_io.GenRoleHandles = if (decoded.apply_genr and decoded.format == .kngn) decoded.genr else null;
     const nprm_opt: ?[]const project_io.NodeParamRecord = if (decoded.apply_node_params) decoded.node_params else null;
     // PTCG: apply_ledger/genr are true but empty/INVALID (decodeFromPtcg)
     const result = if (decoded.format == .ptcg)
@@ -5206,14 +5206,14 @@ fn registerPatchActions(app: *App) void {
         .ctx = app,
         .run = actionSaveGraph,
         .network_policy = patchPolicy("save_graph"),
-        .desc = "save integrated VPRJ project (alias of save_project)",
+        .desc = "save integrated KNGN project (alias of save_project)",
     });
     platform.registerAction(.{
         .name = "load_graph",
         .ctx = app,
         .run = actionLoadGraph,
         .network_policy = patchPolicy("load_graph"),
-        .desc = "load graph/Ledger/GENR from VPRJ (or legacy PTCG); reject while synced",
+        .desc = "load graph/Ledger/GENR from KNGN (or legacy PTCG); reject while synced",
     });
     // Full re-layout of the display graph (local_only; no args; no undo/history)
     platform.registerAction(.{
@@ -5497,12 +5497,12 @@ fn integratedStateSyncImport(ctx: *anyopaque, bytes: []const u8) anyerror!void {
     const gpa = std.heap.c_allocator;
     var decoded = try project_io.decode(Params, gpa, bytes);
     defer decoded.deinit(gpa);
-    if (decoded.format != .vprj) return error.UnsupportedFormat;
+    if (decoded.format != .kngn) return error.UnsupportedFormat;
 
     // Destructive apply only after validation completes (capacity is inside applyGraphReplace)
     const nprm_opt: ?[]const project_io.NodeParamRecord = if (decoded.apply_node_params) decoded.node_params else null;
     _ = try applyGraphReplace(app, decoded.nodes, decoded.edges, &decoded.ledger, decoded.genr, nprm_opt, decoded.node_id_refs, decoded.next_node_id);
-    // SYNC, like VPRJ load, stages pattern as pending (quantize_bar) → seed last-wins.
+    // SYNC, like KNGN load, stages pattern as pending (quantize_bar) → seed last-wins.
     applyParamsPattern(app, decoded.params, decoded.pattern, true);
     applySeedSong(app, decoded.seed, decoded.song);
 }
@@ -6406,11 +6406,11 @@ fn actionSetPitch(ctx: *anyopaque, args: []const u8, buf: []u8) anyerror![]const
 }
 
 // ============================================================================
-// save_pattern / load_pattern (VPRJ-compatible aliases; legacy MDLP still loads).
+// save_pattern / load_pattern (KNGN-compatible aliases; legacy MDLP still loads).
 //
 // Hot-path declaration: save/load are event only. Do not touch the RT path.
-// save_pattern = full VPRJ save (same content as save_project).
-// load_pattern = apply SPRM/PTRN only from VPRJ/MDLP.
+// save_pattern = full KNGN save (same content as save_project).
+// load_pattern = apply SPRM/PTRN only from KNGN/MDLP.
 // ============================================================================
 
 /// Map the current `PatternCommand` into `pattern_io.PatternPayload` (app-free plain struct).
@@ -6700,7 +6700,7 @@ fn payloadToSong(rev: u32, p: project_io.SongPayload) SongData {
     return out;
 }
 
-/// `save_project <path>`: full VPRJ (graph+Ledger+pattern+Song+Params+seed+GENR). local_only; not recorded.
+/// `save_project <path>`: full KNGN (graph+Ledger+pattern+Song+Params+seed+GENR). local_only; not recorded.
 fn actionSaveProject(ctx: *anyopaque, args: []const u8, buf: []u8) anyerror![]const u8 {
     _ = buf;
     const app = actionApp(ctx);
@@ -6710,7 +6710,7 @@ fn actionSaveProject(ctx: *anyopaque, args: []const u8, buf: []u8) anyerror![]co
     return "ok";
 }
 
-/// `load_project <path>`: auto-detect VPRJ or legacy MDLP/MPRJ/PTCG. local_only; not recorded.
+/// `load_project <path>`: auto-detect KNGN or legacy MDLP/MPRJ/PTCG. local_only; not recorded.
 fn actionLoadProject(ctx: *anyopaque, args: []const u8, buf: []u8) anyerror![]const u8 {
     const app = actionApp(ctx);
     const path = try gen_actions.parsePath(args);
@@ -6724,8 +6724,8 @@ fn actionLoadProject(ctx: *anyopaque, args: []const u8, buf: []u8) anyerror![]co
     defer loaded.deinit(gpa);
 
     if (loaded.apply_graph) {
-        const ledger_ptr: ?*const group.Ledger = if (loaded.apply_ledger and loaded.format == .vprj) &loaded.ledger else null;
-        const genr_opt: ?project_io.GenRoleHandles = if (loaded.apply_genr and loaded.format == .vprj) loaded.genr else null;
+        const ledger_ptr: ?*const group.Ledger = if (loaded.apply_ledger and loaded.format == .kngn) &loaded.ledger else null;
+        const genr_opt: ?project_io.GenRoleHandles = if (loaded.apply_genr and loaded.format == .kngn) loaded.genr else null;
         const nprm_opt: ?[]const project_io.NodeParamRecord = if (loaded.apply_node_params) loaded.node_params else null;
         const result = if (loaded.format == .ptcg)
             try applyGraphReplace(app, loaded.nodes, loaded.edges, null, null, null, loaded.node_id_refs, loaded.next_node_id)
@@ -7057,14 +7057,14 @@ fn registerActions(app: *App) void {
         .ctx = app,
         .run = actionSavePattern,
         .network_policy = patchPolicy("save_pattern"),
-        .desc = "save integrated VPRJ project (alias of save_project)",
+        .desc = "save integrated KNGN project (alias of save_project)",
     });
     platform.registerAction(.{
         .name = "load_pattern",
         .ctx = app,
         .run = actionLoadPattern,
         .network_policy = patchPolicy("load_pattern"),
-        .desc = "load SPRM/PTRN from VPRJ (or legacy MDLP); reject while synced",
+        .desc = "load SPRM/PTRN from KNGN (or legacy MDLP); reject while synced",
     });
     platform.registerAction(.{ .name = "seed", .ctx = app, .run = recordedAction("seed"), .network_policy = patchPolicy("seed") });
     // mini-notation. Recipes record the raw notation text (replay re-evaluates in counter order → deterministic).
@@ -7090,20 +7090,20 @@ fn registerActions(app: *App) void {
     platform.registerAction(.{ .name = "recipe_replay", .ctx = app, .run = actionRecipeReplay, .network_policy = patchPolicy("recipe_replay") });
     // render: reject during a session (offline copy cannot reproduce the host mutation stream). solo is OK.
     platform.registerAction(.{ .name = "render", .ctx = app, .run = actionRender, .network_policy = patchPolicy("render") });
-    // Integrated project serialisation (VPRJ). Not recorded.
+    // Integrated project serialisation (KNGN). Not recorded.
     platform.registerAction(.{
         .name = "save_project",
         .ctx = app,
         .run = actionSaveProject,
         .network_policy = patchPolicy("save_project"),
-        .desc = "save integrated VPRJ project (graph+Ledger+pattern+Song+Params+seed)",
+        .desc = "save integrated KNGN project (graph+Ledger+pattern+Song+Params+seed)",
     });
     platform.registerAction(.{
         .name = "load_project",
         .ctx = app,
         .run = actionLoadProject,
         .network_policy = patchPolicy("load_project"),
-        .desc = "load VPRJ or legacy MDLP/MPRJ/PTCG; reject while synced",
+        .desc = "load KNGN or legacy MDLP/MPRJ/PTCG; reject while synced",
     });
 }
 

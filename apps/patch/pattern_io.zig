@@ -8,8 +8,8 @@
 //!   - PTRN: grid/303 pattern (`PatternPayload`. Fixed layout, explicit offsets. Same convention as
 //!     document_io.zig's DOCH).
 //!
-//! The canonical project save path is `project_io.zig` (VPRJ). This file maintains the legacy MDLP
-//! reader/encoder and remains the single source for PTRN/SPRM layout. VPRJ's PTRN/SPRM use the same 33B /
+//! The canonical project save path is `project_io.zig` (KNGN). This file maintains the legacy MDLP
+//! reader/encoder and remains the single source for PTRN/SPRM layout. KNGN's PTRN/SPRM use the same 33B /
 //! flat Params layout. The unified reader detects the MDLP magic and delegates to this decode.
 //!
 //! **Avoiding circular imports**: does not import `Params`/`PatternCommand` (concrete types from

@@ -1,6 +1,6 @@
 # libs/gui
 
-Immediate-mode GUI library for video-proto. Standalone and platform-independent;
+Immediate-mode GUI library for KNGN. Standalone and platform-independent;
 `cd libs/gui && zig build test` runs the unit tests on their own.
 
 ## Layout

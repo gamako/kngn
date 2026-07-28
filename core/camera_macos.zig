@@ -5,7 +5,7 @@
 //! head of `core/objc_runtime.zig`).
 //!
 //! **Frame delivery**: `AVCaptureVideoDataOutput`'s sample buffer delegate (the dynamically created ObjC
-//! subclass `VPCameraCaptureDelegate`) is called on a dispatch queue for capture (a dedicated GCD thread),
+//! subclass `KngnCameraCaptureDelegate`) is called on a dispatch queue for capture (a dedicated GCD thread),
 //! and publishes the `CVPixelBuffer` (with `kCVPixelFormatType_32BGRA` requested explicitly) straight into
 //! `capture_types.TripleBuffer` as canonical BGRA. Normalising it is only a row copy absorbing the stride
 //! (`copyBgraRows`, with no per-pixel arithmetic). Because BGRA is requested explicitly, converting from a
@@ -207,15 +207,15 @@ fn sampleBufferCallback(self_: objc.Id, _cmd: objc.SEL, output: objc.Id, sample_
     });
 }
 
-/// Dynamically creates `VPCameraCaptureDelegate` (an NSObject subclass implementing only
+/// Dynamically creates `KngnCameraCaptureDelegate` (an NSObject subclass implementing only
 /// `captureOutput:didOutputSampleBuffer:fromConnection:`) on the first call alone. It is registered exactly once per
 /// process (`objc_allocateClassPair` returns null when a class of the same name already exists, and in that case
 /// a guard picks up the existing class with `objc_getClass`).
 fn ensureDelegateClass() objc.Class {
     if (delegate_class) |c| return c;
     const superclass = objc.getClass("NSObject");
-    const cls = objc.objc_allocateClassPair(superclass, "VPCameraCaptureDelegate", 0) orelse {
-        delegate_class = objc.getClass("VPCameraCaptureDelegate");
+    const cls = objc.objc_allocateClassPair(superclass, "KngnCameraCaptureDelegate", 0) orelse {
+        delegate_class = objc.getClass("KngnCameraCaptureDelegate");
         return delegate_class;
     };
     const sel_name = objc.sel("captureOutput:didOutputSampleBuffer:fromConnection:");
@@ -379,7 +379,7 @@ pub fn open(allocator: std.mem.Allocator, cfg: Config) types.CaptureError!VideoD
     objc.msgSend(void, dict, objc.sel("release"), .{});
     objc.msgSend(void, output, objc.sel("setAlwaysDiscardsLateVideoFrames:"), .{true});
 
-    const queue = dispatch_queue_create("video-proto.camera.capture", null);
+    const queue = dispatch_queue_create("kngn.camera.capture", null);
     if (queue == null) return error.OpenFailed;
     errdefer dispatch_release(queue);
 

@@ -1123,7 +1123,7 @@ pub const LofiPatch = struct {
         // --- generation RNG ---
         self.mut_noise.state = seedmod.deriveU32(base, .mutate);
         // anchor_register param contract is 0..65535 (16 bit). deriveU32 is full-width u32, so mask it.
-        // (Unmasked, VPRJ NPRM validate returns OutOfRange and save→load breaks)
+        // (Unmasked, KNGN NPRM validate returns OutOfRange and save→load breaks)
         const treg = seedmod.deriveU32(base, .ambient_turing_register) & 0xFFFF;
         if (self.ptr(.random, self.ambient_random_h)) |ambient_random| {
             ambient_random.noise.state = seedmod.deriveU32(base, .ambient_random);
@@ -1294,7 +1294,7 @@ pub const LofiPatch = struct {
         return sum / n;
     }
 
-    /// Fixed-order snapshot of generation role handles (VPRJ GENR; event only).
+    /// Fixed-order snapshot of generation role handles (KNGN GENR; event only).
     /// Does not change render / processBlock order or RT access.
     pub fn snapshotGenRoles(self: *const LofiPatch) project_io.GenRoleHandles {
         var g: project_io.GenRoleHandles = .{};
@@ -2553,7 +2553,7 @@ test "same-bar seed then pattern → both applied at boundary" {
 }
 
 test "seed + quantized saved pattern → bar restores edited masks" {
-    // VPRJ-load equivalent: requestSeed + quantize_bar pattern on the same bar.
+    // KNGN-load equivalent: requestSeed + quantize_bar pattern on the same bar.
     // After applyBaseSeed resets to the default anchor, pending applies the saved masks last-wins.
     const sr: f32 = 48000;
     const chunk: u32 = 4800;

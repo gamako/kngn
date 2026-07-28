@@ -80,7 +80,7 @@ static BOOL menuKeyEquivalentForKey(int32_t key, NSString** out_eq) {
         case PLATFORM_KEY_F19: u = NSF19FunctionKey; break;
         case PLATFORM_KEY_F20: u = NSF20FunctionKey; break;
         default:
-            NSLog(@"[video-proto] menu: unsupported keyEquivalent key=%d (item registered without shortcut)", (int)key);
+            NSLog(@"[kngn] menu: unsupported keyEquivalent key=%d (item registered without shortcut)", (int)key);
             return NO;
     }
     *out_eq = [NSString stringWithCharacters:&u length:1];
@@ -124,7 +124,7 @@ static NSString* menuNSStringOrEmpty(const char* utf8, const char* field) {
     if (!utf8 || utf8[0] == '\0') return @"";
     NSString* s = [NSString stringWithUTF8String:utf8];
     if (!s) {
-        NSLog(@"[video-proto] menu: invalid UTF-8 in %s — using empty string", field);
+        NSLog(@"[kngn] menu: invalid UTF-8 in %s — using empty string", field);
         return @"";
     }
     return s;
@@ -199,7 +199,7 @@ void platform_register_menu(PlatformWindow* window, const PlatformMenuItem* item
                 if (top.length == 0) {
                     // An empty or invalid UTF-8 top-level name falls back to "Menu" (the items are kept)
                     if (src->top_menu && src->top_menu[0] != '\0') {
-                        NSLog(@"[video-proto] menu: empty/invalid top_menu — fallback to \"Menu\"");
+                        NSLog(@"[kngn] menu: empty/invalid top_menu — fallback to \"Menu\"");
                     }
                     top = @"Menu";
                 }

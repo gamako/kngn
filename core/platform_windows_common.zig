@@ -354,7 +354,7 @@ fn restoreThreadDpiAwareness() void {
 // ============================================================================
 // init and shutdown (one window class and one QPC frequency per process)
 // ============================================================================
-const class_name = std.unicode.utf8ToUtf16LeStringLiteral("VideoProtoWindowClass");
+const class_name = std.unicode.utf8ToUtf16LeStringLiteral("KngnWindowClass");
 
 var g_hinstance: ?HINSTANCE = null;
 var g_class_registered: bool = false;

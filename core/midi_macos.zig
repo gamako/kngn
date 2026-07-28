@@ -227,7 +227,7 @@ pub fn open(allocator: std.mem.Allocator) Error!Device {
         .sources = &[_]SourceEntry{},
     };
 
-    const client_name = c.CFStringCreateWithCString(null, "video-proto-midi", c.kCFStringEncodingUTF8);
+    const client_name = c.CFStringCreateWithCString(null, "kngn-midi", c.kCFStringEncodingUTF8);
     if (client_name == null) {
         allocator.destroy(state);
         return error.OpenFailed;
@@ -241,7 +241,7 @@ pub fn open(allocator: std.mem.Allocator) Error!Device {
     }
     state.client = client;
 
-    const port_name = c.CFStringCreateWithCString(null, "video-proto-midi-in", c.kCFStringEncodingUTF8);
+    const port_name = c.CFStringCreateWithCString(null, "kngn-midi-in", c.kCFStringEncodingUTF8);
     if (port_name == null) {
         _ = c.MIDIClientDispose(client);
         allocator.destroy(state);

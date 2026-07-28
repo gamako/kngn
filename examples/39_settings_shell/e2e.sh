@@ -9,7 +9,7 @@ KNGN_ROOT="${KNGN_ROOT:-/Users/gamako/gamako/project/zig/video-proto/video-proto
 E2E_PORT="${E2E_PORT:-9210}"
 E2E_WIDTH="${E2E_WIDTH:-1024}"
 E2E_HEIGHT="${E2E_HEIGHT:-768}"
-KNGN_HARNESS_OUT="${KNGN_HARNESS_OUT:-$(mktemp -d /tmp/vp-settings-shell.XXXXXX)}"
+KNGN_HARNESS_OUT="${KNGN_HARNESS_OUT:-$(mktemp -d /tmp/kngn-settings-shell.XXXXXX)}"
 PORT_FILE="$KNGN_HARNESS_OUT/harness.port"
 LOG="$KNGN_HARNESS_OUT/e2e.log"
 DRIVE="$ROOT/scripts/drive"
@@ -291,7 +291,7 @@ if [[ "$tx" == "-1" ]]; then
 fi
 read -r cx cy <<<"$(rect_center "$tx" "$ty" "$tw" "$th")"
 click_xy "$cx" "$cy"
-drive "inject commit /tmp/video-proto-workspace; step 1"
+drive "inject commit /tmp/kngn-workspace; step 1"
 digest_state >/dev/null
 expect_state "focused=editor.workspace_path"
 expect_state "editor_workspace_path_bytes>0"

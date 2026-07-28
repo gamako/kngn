@@ -33,7 +33,7 @@ else switch (builtin.os.tag) {
     .macos => @import("audio_macos.zig"),
     .linux => @import("audio_linux.zig"),
     .windows => @import("audio_windows.zig"),
-    else => @compileError("video-proto: unsupported OS for audio backend: " ++ @tagName(builtin.os.tag)),
+    else => @compileError("kngn: unsupported OS for audio backend: " ++ @tagName(builtin.os.tag)),
 };
 
 /// wasm: keeps the AudioWorklet export in the link. A no-op on native.

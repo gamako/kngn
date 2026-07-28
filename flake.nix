@@ -1,5 +1,5 @@
 {
-  description = "video-proto: Zig 0.16 dev environment";
+  description = "kngn: Zig 0.16 dev environment";
 
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-25.11";

@@ -1,4 +1,4 @@
-# video-proto
+# KNGN
 
 A cross-platform environment for prototyping video and graphics. An application layer
 written in Zig sits on a low-level API layer implemented per platform (macOS:

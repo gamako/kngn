@@ -4,9 +4,9 @@
 //! EDGE chunk × M (connections) repeatedly (the same convention `document_io.zig` in `libs/paint` uses to repeat LAYR chunk
 //! once per layer — laying a variable number of small chunks under a repeated tag).
 //!
-//! The canonical project save path is `project_io.zig` (VPRJ). This file maintains the legacy PTCG
+//! The canonical project save path is `project_io.zig` (KNGN). This file maintains the legacy PTCG
 //! reader/encoder (fixture and conversion from the unified reader) and remains the single source for NODE/EDGE layout.
-//! New save paths should use the VPRJ writer; do not call the PTCG writer from a new save path.
+//! New save paths should use the KNGN writer; do not call the PTCG writer from a new save path.
 //!
 //! **ModuleKind compatibility**: the enum ordinal is part of the persisted format. New ModuleKind values must be
 //! appended only at the end of the enum. Reordering, removing, or renaming existing tags is forbidden. Unknown ordinals are

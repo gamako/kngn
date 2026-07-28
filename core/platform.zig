@@ -57,7 +57,7 @@ else switch (builtin.os.tag) {
     .macos => @import("platform_macos.zig"),
     .linux => @import("platform_linux.zig"),
     .windows => @import("platform_windows.zig"),
-    else => @compileError("video-proto: unsupported OS for platform backend: " ++ @tagName(builtin.os.tag)),
+    else => @compileError("kngn: unsupported OS for platform backend: " ++ @tagName(builtin.os.tag)),
 };
 
 /// The null runtime covers native operating systems only (wasm keeps its compile-time DOM canvas branch).
