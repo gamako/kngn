@@ -254,8 +254,8 @@ const Drag = union(enum) {
     none,
     pan: struct { start_pan: Vec2f, start_mouse: Vec2f },
     node: struct { handle: Handle, grab_offset: Vec2f }, // node.pos = mouseWorld + grab_offset (always a real handle)
-    // Collapsed-box drag: update ledger.groups[gid].pos; do not touch layout (never index a synthetic handle into
-    // app.layout[h]. Expanded-frame headers are not draggable = selection only.
+    // Collapsed-box drag: update ledger.groups[gid].pos and translate member layout slots by the same
+    // delta (never index a synthetic handle into app.layout[h]). Expanded-frame headers are not draggable = selection only.
     group: struct { gid: group.GroupId, grab_offset: Vec2f },
     // Connection pending (ghost cable from origin port to cursor). detach!=null means a drag-off from a connected
     // input; disconnect is deferred until commit (mouse_up) so one gesture = at most one publish and a failed/
@@ -2373,8 +2373,8 @@ fn onMouseDown(app: *App, modifiers: platform.ModifierFlags) void {
             }
             app.drag = .none;
         } else if (group.groupIdFromHandle(h)) |gid| {
-            // Collapsed-box body drag: update ledger.groups[gid].pos; do not touch app.layout
-            // (never index a synthetic handle into app.layout[h]).
+            // Collapsed-box body drag: update ledger.groups[gid].pos and translate member layout slots
+            // by the same delta (never index a synthetic handle into app.layout[h]).
             selection.clear(&app.multi_selected);
             app.selected = .{ .group = gid };
             app.drag = .{ .group = .{ .gid = gid, .grab_offset = app.ledger.groups[gid].pos.sub(mw) } };
@@ -2771,7 +2771,8 @@ fn onMouseMove(app: *App) void {
         },
         .group => |gd| {
             const mw = app.mouseWorld();
-            app.ledger.groups[gd.gid].pos = mw.add(gd.grab_offset);
+            const new_pos = mw.add(gd.grab_offset);
+            app.ledger.setPosAndTranslateMembers(gd.gid, new_pos, app.layout[0..]);
         },
         .cable => {}, // pending is drawn every frame from app.mouse (no state update)
         .rect_select => {}, // Rect is drawn by drawFrame from mouseWorld (no state update)

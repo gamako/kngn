@@ -182,6 +182,32 @@ pub const Ledger = struct {
         return self.group_of[h] != null and self.group_of[h].? == gid;
     }
 
+    /// Sets a group's position and translates its members when the group is collapsed.
+    /// `layout` is indexed by real handles; synthetic handles are never members.
+    pub fn setPosAndTranslateMembers(
+        self: *Ledger,
+        gid: GroupId,
+        new_pos: Vec2f,
+        layout: []Vec2f,
+    ) void {
+        if (gid >= MAX_GROUPS or !self.groups[gid].active) return;
+
+        const old_pos = self.groups[gid].pos;
+        const delta = new_pos.sub(old_pos);
+
+        if (self.groups[gid].collapsed) {
+            for (self.group_of, 0..) |owner, h| {
+                if (owner == null or owner.? != gid) continue;
+                if (h >= layout.len) continue;
+                layout[h] = layout[h].add(delta);
+            }
+        }
+
+        // This assignment must remain after the member loop. Every caller passes the
+        // position that it wants to become the new group position.
+        self.groups[gid].pos = new_pos;
+    }
+
     fn memberCount(self: *const Ledger, gid: GroupId) usize {
         var n: usize = 0;
         for (self.group_of) |go| {
@@ -714,4 +740,82 @@ test "group: resolvePort passes through real refs and resolves synthetic refs, r
     try testing.expectEqual(@as(?PortRef, null), s.l.resolvePort(.{ .handle = handleOfGroup(s.gid), .is_input = true, .index = 5 }));
     // An inactive gid.
     try testing.expectEqual(@as(?PortRef, null), s.l.resolvePort(.{ .handle = handleOfGroup(1), .is_input = true, .index = 0 }));
+}
+
+test "group: manual collapsed-box move keeps members aligned after expansion" {
+    var layout_arr = [_]Vec2f{.{ .x = 0, .y = 0 }} ** GROUP_HANDLE_BASE;
+    layout_arr[3] = .{ .x = 130, .y = 250 };
+    layout_arr[7] = .{ .x = 290, .y = 205 };
+
+    var ledger: Ledger = .{};
+    ledger.groups[1] = .{
+        .active = true,
+        .collapsed = true,
+        .kind = .drum_machine,
+        .pos = .{ .x = 100, .y = 200 },
+    };
+    ledger.assign(3, 1);
+    ledger.assign(7, 1);
+
+    ledger.setPosAndTranslateMembers(1, .{ .x = 180, .y = 140 }, layout_arr[0..]);
+
+    try testing.expectApproxEqAbs(@as(f32, 180), ledger.groups[1].pos.x, 1e-4);
+    try testing.expectApproxEqAbs(@as(f32, 140), ledger.groups[1].pos.y, 1e-4);
+    try testing.expectApproxEqAbs(@as(f32, 210), layout_arr[3].x, 1e-4);
+    try testing.expectApproxEqAbs(@as(f32, 190), layout_arr[3].y, 1e-4);
+    try testing.expectApproxEqAbs(@as(f32, 370), layout_arr[7].x, 1e-4);
+    try testing.expectApproxEqAbs(@as(f32, 145), layout_arr[7].y, 1e-4);
+
+    ledger.groups[1].collapsed = false;
+    const flat = [_]NodeGeom{
+        .{ .handle = 3, .pos = layout_arr[3], .n_in = 0, .n_out = 0 },
+        .{ .handle = 7, .pos = layout_arr[7], .n_in = 0, .n_out = 0 },
+    };
+    var expanded: [2]NodeGeom = undefined;
+    const n = ledger.mapNodesForCollapsed(&flat, &expanded);
+    try testing.expectEqual(@as(usize, 2), n);
+    try testing.expectApproxEqAbs(@as(f32, 210), expanded[0].pos.x, 1e-4);
+    try testing.expectApproxEqAbs(@as(f32, 190), expanded[0].pos.y, 1e-4);
+    try testing.expectApproxEqAbs(@as(f32, 370), expanded[1].pos.x, 1e-4);
+    try testing.expectApproxEqAbs(@as(f32, 145), expanded[1].pos.y, 1e-4);
+}
+
+test "group: collapsed-box move preserves hand-made member offsets" {
+    var layout_arr = [_]Vec2f{.{ .x = 0, .y = 0 }} ** GROUP_HANDLE_BASE;
+    layout_arr[4] = .{ .x = 57, .y = 93 };
+    layout_arr[9] = .{ .x = 122, .y = 27 };
+
+    var ledger: Ledger = .{};
+    ledger.groups[2] = .{
+        .active = true,
+        .collapsed = true,
+        .kind = .drum_machine,
+        .pos = .{ .x = 10, .y = 20 },
+    };
+    ledger.assign(4, 2);
+    ledger.assign(9, 2);
+
+    ledger.setPosAndTranslateMembers(2, .{ .x = 210, .y = 140 }, layout_arr[0..]);
+
+    try testing.expectApproxEqAbs(@as(f32, 257), layout_arr[4].x, 1e-4);
+    try testing.expectApproxEqAbs(@as(f32, 213), layout_arr[4].y, 1e-4);
+    try testing.expectApproxEqAbs(@as(f32, 322), layout_arr[9].x, 1e-4);
+    try testing.expectApproxEqAbs(@as(f32, 147), layout_arr[9].y, 1e-4);
+    try testing.expectApproxEqAbs(@as(f32, 47), layout_arr[4].x - ledger.groups[2].pos.x, 1e-4);
+    try testing.expectApproxEqAbs(@as(f32, 73), layout_arr[4].y - ledger.groups[2].pos.y, 1e-4);
+    try testing.expectApproxEqAbs(@as(f32, 112), layout_arr[9].x - ledger.groups[2].pos.x, 1e-4);
+    try testing.expectApproxEqAbs(@as(f32, 7), layout_arr[9].y - ledger.groups[2].pos.y, 1e-4);
+
+    ledger.groups[2].collapsed = false;
+    const flat = [_]NodeGeom{
+        .{ .handle = 4, .pos = layout_arr[4], .n_in = 0, .n_out = 0 },
+        .{ .handle = 9, .pos = layout_arr[9], .n_in = 0, .n_out = 0 },
+    };
+    var expanded: [2]NodeGeom = undefined;
+    const n = ledger.mapNodesForCollapsed(&flat, &expanded);
+    try testing.expectEqual(@as(usize, 2), n);
+    try testing.expectApproxEqAbs(@as(f32, 257), expanded[0].pos.x, 1e-4);
+    try testing.expectApproxEqAbs(@as(f32, 213), expanded[0].pos.y, 1e-4);
+    try testing.expectApproxEqAbs(@as(f32, 322), expanded[1].pos.x, 1e-4);
+    try testing.expectApproxEqAbs(@as(f32, 147), expanded[1].pos.y, 1e-4);
 }

@@ -145,7 +145,7 @@ fn writeBackTargets(
         if (!containsHandle(target_handles, ng.handle)) continue;
         if (group.groupIdFromHandle(ng.handle)) |gid| {
             if (gid < group.MAX_GROUPS and ledger.groups[gid].active) {
-                ledger.groups[gid].pos = ng.pos;
+                ledger.setPosAndTranslateMembers(gid, ng.pos, layout);
             }
         } else if (ng.handle < layout.len) {
             layout[ng.handle] = ng.pos;
@@ -351,12 +351,13 @@ fn averageSourceCenterY(
     return sum / @as(f32, @floatFromInt(count));
 }
 
-/// A real node writes to layout[handle]; a synthetic handle writes to groups[gid].pos. A synthetic handle is never used to index layout.
+/// A real node writes to layout[handle]; a synthetic handle writes to groups[gid].pos
+/// (and translates collapsed members by the same delta). A synthetic handle is never used to index layout.
 fn writeBack(nodes: []const NodeGeom, layout: []Vec2f, ledger: *group.Ledger) void {
     for (nodes) |ng| {
         if (group.groupIdFromHandle(ng.handle)) |gid| {
             if (gid < group.MAX_GROUPS and ledger.groups[gid].active) {
-                ledger.groups[gid].pos = ng.pos;
+                ledger.setPosAndTranslateMembers(gid, ng.pos, layout);
             }
         } else if (ng.handle < layout.len) {
             layout[ng.handle] = ng.pos;
@@ -524,7 +525,7 @@ test "layout: cycle A-B-C-A finishes with finite positions and keeps feedback ed
     try testing.expectEqual(@as(Handle, 0), edges[2].dst_handle);
 }
 
-test "layout: collapsed synthetic group is one node and writes group.pos only" {
+test "layout: collapsed synthetic group is one node and translates member layout" {
     const gid: group.GroupId = 0;
     const box_h = group.handleOfGroup(gid);
     // external 0 -> box, box -> external 1. The box's order key is the minimum member key, 5 (member handles are 5,6 but are hidden)
@@ -551,9 +552,6 @@ test "layout: collapsed synthetic group is one node and writes group.pos only" {
     ledger.assign(5, gid);
     ledger.assign(6, gid);
 
-    // A snapshot verifying that the synthetic-index-equivalent part of layout is untouched
-    const layout_before = layout_arr;
-
     apply(&nodes, &edges, &keys, &layout_arr, &ledger, ORIGIN_Y);
 
     try testing.expect(isFinitePos(ledger.groups[gid].pos));
@@ -562,12 +560,56 @@ test "layout: collapsed synthetic group is one node and writes group.pos only" {
     // Real nodes are written into layout
     try testing.expectApproxEqAbs(nodes[0].pos.x, layout_arr[0].x, 1e-4);
     try testing.expectApproxEqAbs(nodes[2].pos.x, layout_arr[1].x, 1e-4);
-    // The layout for member handles 5,6 is out of the display and stays unchanged (write-back targets are separated)
-    try testing.expectApproxEqAbs(layout_before[5].x, layout_arr[5].x, 1e-4);
-    try testing.expectApproxEqAbs(layout_before[6].x, layout_arr[6].x, 1e-4);
+    // Member layout slots follow the box by the same delta (old box (-1,-1) -> laid out (184,24)).
+    try testing.expectApproxEqAbs(@as(f32, 227), layout_arr[5].x, 1e-4);
+    try testing.expectApproxEqAbs(@as(f32, 67), layout_arr[5].y, 1e-4);
+    try testing.expectApproxEqAbs(@as(f32, 227), layout_arr[6].x, 1e-4);
+    try testing.expectApproxEqAbs(@as(f32, 67), layout_arr[6].y, 1e-4);
     // Monotonic in x for forward edges
     try testing.expect(nodes[0].pos.x < nodes[1].pos.x);
     try testing.expect(nodes[1].pos.x < nodes[2].pos.x);
+}
+
+test "layout: auto-layout keeps collapsed members aligned after expansion" {
+    const gid: group.GroupId = 0;
+    const box_h = group.handleOfGroup(gid);
+    var nodes = [_]NodeGeom{
+        .{ .handle = box_h, .pos = .{ .x = 300, .y = 200 }, .n_in = 1, .n_out = 1, .grid_rows = 2 },
+    };
+    var layout_arr = [_]Vec2f{.{ .x = 0, .y = 0 }} ** group.GROUP_HANDLE_BASE;
+    layout_arr[5] = .{ .x = 325, .y = 280 };
+    layout_arr[6] = .{ .x = 500, .y = 390 };
+    var ledger: group.Ledger = .{};
+    ledger.groups[gid] = .{
+        .active = true,
+        .collapsed = true,
+        .kind = .drum_machine,
+        .pos = .{ .x = 300, .y = 200 },
+    };
+    ledger.assign(5, gid);
+    ledger.assign(6, gid);
+
+    apply(&nodes, &.{}, &.{0}, layout_arr[0..], &ledger, ORIGIN_Y);
+
+    try testing.expectApproxEqAbs(@as(f32, 24), ledger.groups[gid].pos.x, 1e-4);
+    try testing.expectApproxEqAbs(@as(f32, 24), ledger.groups[gid].pos.y, 1e-4);
+    try testing.expectApproxEqAbs(@as(f32, 49), layout_arr[5].x, 1e-4);
+    try testing.expectApproxEqAbs(@as(f32, 104), layout_arr[5].y, 1e-4);
+    try testing.expectApproxEqAbs(@as(f32, 224), layout_arr[6].x, 1e-4);
+    try testing.expectApproxEqAbs(@as(f32, 214), layout_arr[6].y, 1e-4);
+
+    ledger.groups[gid].collapsed = false;
+    const flat = [_]NodeGeom{
+        .{ .handle = 5, .pos = layout_arr[5], .n_in = 0, .n_out = 0 },
+        .{ .handle = 6, .pos = layout_arr[6], .n_in = 0, .n_out = 0 },
+    };
+    var expanded: [2]NodeGeom = undefined;
+    const n = ledger.mapNodesForCollapsed(&flat, &expanded);
+    try testing.expectEqual(@as(usize, 2), n);
+    try testing.expectApproxEqAbs(@as(f32, 49), expanded[0].pos.x, 1e-4);
+    try testing.expectApproxEqAbs(@as(f32, 104), expanded[0].pos.y, 1e-4);
+    try testing.expectApproxEqAbs(@as(f32, 224), expanded[1].pos.x, 1e-4);
+    try testing.expectApproxEqAbs(@as(f32, 214), expanded[1].pos.y, 1e-4);
 }
 
 test "layout: synthetic handle never indexes layout array" {
