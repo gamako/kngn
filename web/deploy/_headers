@@ -12,10 +12,10 @@
   Cross-Origin-Embedder-Policy: require-corp
 
 # Same-origin subresources loaded by synth.html (COEP: require-corp).
-/vp.js
+/kngn.js
   Cross-Origin-Resource-Policy: same-origin
 
-/vp-worklet.js
+/kngn-worklet.js
   Cross-Origin-Resource-Policy: same-origin
 
 /synth.wasm

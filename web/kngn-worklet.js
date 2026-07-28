@@ -1,6 +1,6 @@
 // video-proto AudioWorkletProcessor
 // Synchronously create a 2nd Instance from the same WebAssembly.Module + SharedArrayBuffer Memory as main,
-// and push-drive vp_audio_render from process().
+// and push-drive kngn_audio_render from process().
 //
 // stack: take the top of the worklet-only stack that main reserved in shared memory
 //        and set it on exports.__stack_pointer.
@@ -9,9 +9,9 @@
 //
 // instantiate at boot (g_state unset) is safe: process only reads g_state inside the running gate.
 
-const SENTINEL_MAGIC = 0x56504153; // 'VPAS' — must match audio_web.zig
+const SENTINEL_MAGIC = 0x4B4E4153; // hex digits spell 'KNAS' — must match audio_web.zig
 
-class VpAudioProcessor extends AudioWorkletProcessor {
+class KngnAudioProcessor extends AudioWorkletProcessor {
   /**
    * @param {{ processorOptions?: {
    *   module: WebAssembly.Module,
@@ -39,21 +39,21 @@ class VpAudioProcessor extends AudioWorkletProcessor {
 
     try {
       if (!opts.module || !opts.memory) {
-        throw new Error("vp-worklet: missing module/memory");
+        throw new Error("kngn-worklet: missing module/memory");
       }
       // The worklet only needs the audio-path env (it never calls present/log).
       // wasi may be touched by stdlib, so pass a minimal no-op surface.
       const imports = {
         env: {
           memory: opts.memory,
-          vp_now: () => currentTime,
-          vp_present: () => {},
-          vp_log: () => {},
-          vp_set_cursor: () => {},
-          vp_audio_open: () => 0,
-          vp_audio_start: () => {},
-          vp_audio_stop: () => {},
-          vp_audio_close: () => {},
+          kngn_now: () => currentTime,
+          kngn_present: () => {},
+          kngn_log: () => {},
+          kngn_set_cursor: () => {},
+          kngn_audio_open: () => 0,
+          kngn_audio_start: () => {},
+          kngn_audio_stop: () => {},
+          kngn_audio_close: () => {},
         },
         wasi_snapshot_preview1: makeWasiStub(),
       };
@@ -68,13 +68,13 @@ class VpAudioProcessor extends AudioWorkletProcessor {
       }
 
       // Runtime sentinel: confirm the magic main set is still on shared memory after the 2nd Instance
-      if (typeof exp.vp_audio_check_sentinel !== "function") {
-        throw new Error("vp-worklet: missing vp_audio_check_sentinel");
+      if (typeof exp.kngn_audio_check_sentinel !== "function") {
+        throw new Error("kngn-worklet: missing kngn_audio_check_sentinel");
       }
-      const got = exp.vp_audio_check_sentinel() >>> 0;
+      const got = exp.kngn_audio_check_sentinel() >>> 0;
       if (got !== SENTINEL_MAGIC) {
         throw new Error(
-          "vp-worklet: sentinel mismatch (got 0x" +
+          "kngn-worklet: sentinel mismatch (got 0x" +
             got.toString(16) +
             ", want 0x" +
             SENTINEL_MAGIC.toString(16) +
@@ -82,13 +82,13 @@ class VpAudioProcessor extends AudioWorkletProcessor {
         );
       }
 
-      this._render = exp.vp_audio_render;
+      this._render = exp.kngn_audio_render;
       this._outPtr =
-        typeof exp.vp_audio_render_buf === "function"
-          ? exp.vp_audio_render_buf() >>> 0
+        typeof exp.kngn_audio_render_buf === "function"
+          ? exp.kngn_audio_render_buf() >>> 0
           : 0;
       if (typeof this._render !== "function" || this._outPtr === 0) {
-        throw new Error("vp-worklet: missing vp_audio_render / render buf");
+        throw new Error("kngn-worklet: missing kngn_audio_render / render buf");
       }
       this._ready = true;
       this.port.postMessage({ type: "ready", sentinel: got });
@@ -160,7 +160,7 @@ class VpAudioProcessor extends AudioWorkletProcessor {
         this._errLogged = true;
         this.port.postMessage({
           type: "error",
-          message: "vp_audio_render: " + String(e && e.message ? e.message : e),
+          message: "kngn_audio_render: " + String(e && e.message ? e.message : e),
         });
       }
       for (let c = 0; c < output.length; c++) output[c].fill(0);
@@ -211,4 +211,4 @@ function makeWasiStub() {
   };
 }
 
-registerProcessor("vp-audio-processor", VpAudioProcessor);
+registerProcessor("kngn-audio-processor", KngnAudioProcessor);

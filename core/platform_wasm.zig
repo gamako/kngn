@@ -1,8 +1,8 @@
 //! The wasm32-wasi platform backend
 //!
-//! It connects to the JS glue (web/vp.js) through `extern "env"` and `export`.
-//! The framebuffer is allocated with wasm_allocator, and present hands it to `vp_present` after a
-//! BGRA→RGBA swizzle (pixelops SIMD). JS pushes input onto the queue with `vp_push_*`, and Zig drains it in nextEvent.
+//! It connects to the JS glue (web/kngn.js) through `extern "env"` and `export`.
+//! The framebuffer is allocated with wasm_allocator, and present hands it to `kngn_present` after a
+//! BGRA→RGBA swizzle (pixelops SIMD). JS pushes input onto the queue with `kngn_push_*`, and Zig drains it in nextEvent.
 //!
 //! Hot path declaration: the all-pixel swizzle in present runs every frame. Input and init happen at event time and at initialisation only.
 
@@ -31,16 +31,16 @@ const CursorShape = types.CursorShape;
 // The JS import table (env)
 // ============================================================================
 
-extern "env" fn vp_now() f64;
-extern "env" fn vp_present(ptr: [*]const u8, w: u32, h: u32) void;
-extern "env" fn vp_log(ptr: [*]const u8, len: u32) void;
-extern "env" fn vp_set_cursor(shape: c_int) void;
+extern "env" fn kngn_now() f64;
+extern "env" fn kngn_present(ptr: [*]const u8, w: u32, h: u32) void;
+extern "env" fn kngn_log(ptr: [*]const u8, len: u32) void;
+extern "env" fn kngn_set_cursor(shape: c_int) void;
 /// Fire the browser file picker (allowed_ext is a hint and may be empty). Both Zig and JS guard against firing it twice.
-extern "env" fn vp_request_open(ext_ptr: [*]const u8, ext_len: u32) void;
+extern "env" fn kngn_request_open(ext_ptr: [*]const u8, ext_len: u32) void;
 /// `navigator.clipboard.writeText` (text/plain).
-extern "env" fn vp_clipboard_write(ptr: [*]const u8, len: u32) void;
-/// Start `navigator.clipboard.readText` asynchronously. The result arrives through `vp_clipboard_text`.
-extern "env" fn vp_request_paste() void;
+extern "env" fn kngn_clipboard_write(ptr: [*]const u8, len: u32) void;
+/// Start `navigator.clipboard.readText` asynchronously. The result arrives through `kngn_clipboard_text`.
+extern "env" fn kngn_request_paste() void;
 
 // ============================================================================
 // A DOM KeyboardEvent.code → KeyCode (a pure data table on the Zig side, in the style of platform_linux_input)
@@ -116,12 +116,12 @@ fn domCodeToKeyCode(code: []const u8) KeyCode {
 /// The fixed scratch JS writes a KeyboardEvent.code string into (up to 32B, which a DOM code fits comfortably).
 var dom_code_scratch: [32]u8 = undefined;
 
-export fn vp_dom_code_scratch() [*]u8 {
+export fn kngn_dom_code_scratch() [*]u8 {
     return &dom_code_scratch;
 }
 
 /// The DOM code written into scratch (len bytes) → a KeyCode (i32). Anything unknown is UNKNOWN(-1).
-export fn vp_dom_code_to_keycode(len: u32) i32 {
+export fn kngn_dom_code_to_keycode(len: u32) i32 {
     const n = @min(len, dom_code_scratch.len);
     return @intFromEnum(domCodeToKeyCode(dom_code_scratch[0..n]));
 }
@@ -176,7 +176,7 @@ fn buttonFromDom(b: i32) MouseButton {
 }
 
 /// kind: 0=move, 1=down, 2=up
-export fn vp_push_key(down: bool, code: i32, mods: u32, is_repeat: bool) void {
+export fn kngn_push_key(down: bool, code: i32, mods: u32, is_repeat: bool) void {
     const key: KeyCode = @enumFromInt(code);
     const kev = KeyEvent{
         .key = key,
@@ -186,13 +186,13 @@ export fn vp_push_key(down: bool, code: i32, mods: u32, is_repeat: bool) void {
     queuePush(if (down) .{ .key_down = kev } else .{ .key_up = kev });
 }
 
-export fn vp_push_char(codepoint: u32, mods: u32) void {
+export fn kngn_push_char(codepoint: u32, mods: u32) void {
     // Control characters are not emitted (the CharEvent contract of platform_types)
     if (codepoint < 0x20 or codepoint == 0x7f) return;
     queuePush(.{ .char_input = .{ .codepoint = codepoint, .modifiers = modsFromC(mods) } });
 }
 
-export fn vp_push_mouse(kind: i32, x: i32, y: i32, button: i32, buttons: u32, mods: u32) void {
+export fn kngn_push_mouse(kind: i32, x: i32, y: i32, button: i32, buttons: u32, mods: u32) void {
     const mev = MouseEvent{
         .x = x,
         .y = y,
@@ -207,7 +207,7 @@ export fn vp_push_mouse(kind: i32, x: i32, y: i32, button: i32, buttons: u32, mo
     });
 }
 
-export fn vp_push_scroll(x: i32, y: i32, dx: f32, dy: f32, mods: u32) void {
+export fn kngn_push_scroll(x: i32, y: i32, dx: f32, dy: f32, mods: u32) void {
     queuePush(.{
         .mouse_scroll = .{
             .x = x,
@@ -229,7 +229,7 @@ var pixels_buf: []u32 = &.{};
 var rgba_buf: []u8 = &.{};
 var fb_w: u32 = 0;
 var fb_h: u32 = 0;
-/// 0 = nothing pending. vp_resize sets it, and the top of the next lockFramebuffer applies it (at a frame boundary).
+/// 0 = nothing pending. kngn_resize sets it, and the top of the next lockFramebuffer applies it (at a frame boundary).
 var pending_w: u32 = 0;
 var pending_h: u32 = 0;
 const default_gpa: std.mem.Allocator = if (builtin.cpu.arch.isWasm())
@@ -252,7 +252,7 @@ fn clampResizeDim(w: u32, h: u32) struct { w: u32, h: u32 } {
 }
 
 /// Called from the JS ResizeObserver. It keeps the value pending, rather than swapping the buffer mid-frame.
-export fn vp_resize(w: u32, h: u32) void {
+export fn kngn_resize(w: u32, h: u32) void {
     const c = clampResizeDim(w, h);
     pending_w = c.w;
     pending_h = c.h;
@@ -359,11 +359,11 @@ pub const Window = struct {
         if (pixels_buf.len == 0 or rgba_buf.len == 0) return;
         const src = std.mem.sliceAsBytes(pixels_buf);
         pixelops.swizzleBgraToRgba(rgba_buf, src);
-        vp_present(rgba_buf.ptr, fb_w, fb_h);
+        kngn_present(rgba_buf.ptr, fb_w, fb_h);
     }
 
     pub fn setCursor(_: Window, shape: CursorShape) void {
-        vp_set_cursor(@intFromEnum(shape));
+        kngn_set_cursor(@intFromEnum(shape));
     }
 
     /// wasm has no OS window title, so this is a no-op.
@@ -419,7 +419,7 @@ pub fn init() Error!void {}
 pub fn shutdown() void {}
 
 pub fn getTime() f64 {
-    return vp_now();
+    return kngn_now();
 }
 
 // ============================================================================
@@ -510,17 +510,17 @@ var open_dialog: OpenDialogMachine = .{};
 /// The fixed scratch JS writes a picked path string into (up to 256B).
 var file_path_scratch: [256]u8 = undefined;
 
-export fn vp_file_path_scratch() [*]u8 {
+export fn kngn_file_path_scratch() [*]u8 {
     return &file_path_scratch;
 }
 
 /// Deliver the virtual path written into scratch (len bytes) to the open state machine, making it picked.
-export fn vp_file_picked(len: u32) void {
+export fn kngn_file_picked(len: u32) void {
     const n = @min(len, file_path_scratch.len);
     open_dialog.onPicked(file_path_scratch[0..n]);
 }
 
-export fn vp_file_cancelled() void {
+export fn kngn_file_cancelled() void {
     open_dialog.onCancelled();
 }
 
@@ -528,9 +528,9 @@ fn requestOpenJs(ext: []const u8) void {
     if (builtin.is_test) return;
     if (ext.len == 0) {
         // JS reads len=0 as "no filter" and never reads ptr.
-        vp_request_open(@as([*]const u8, @ptrFromInt(1)), 0);
+        kngn_request_open(@as([*]const u8, @ptrFromInt(1)), 0);
     } else {
-        vp_request_open(ext.ptr, @intCast(ext.len));
+        kngn_request_open(ext.ptr, @intCast(ext.len));
     }
 }
 
@@ -568,12 +568,12 @@ var clipboard_paste_state: ClipboardPasteState = .idle;
 var clipboard_text_scratch: [64]u8 = undefined;
 var clipboard_text_len: u32 = 0;
 
-export fn vp_clipboard_text_scratch() [*]u8 {
+export fn kngn_clipboard_text_scratch() [*]u8 {
     return &clipboard_text_scratch;
 }
 
 /// Called after JS has written the readText result into scratch.
-export fn vp_clipboard_text(len: u32) void {
+export fn kngn_clipboard_text(len: u32) void {
     const n = @min(len, clipboard_text_scratch.len);
     clipboard_text_len = n;
     clipboard_paste_state = .delivered;
@@ -583,7 +583,7 @@ export fn vp_clipboard_text(len: u32) void {
 pub fn clipboardWrite(text: []const u8) void {
     if (text.len == 0) return;
     if (builtin.is_test) return;
-    vp_clipboard_write(text.ptr, @intCast(text.len));
+    kngn_clipboard_write(text.ptr, @intCast(text.len));
 }
 
 /// Request a paste asynchronously. A second request is ignored.
@@ -592,7 +592,7 @@ pub fn clipboardRequestPaste() void {
     clipboard_paste_state = .requested;
     clipboard_text_len = 0;
     if (builtin.is_test) return;
-    vp_request_paste();
+    kngn_request_paste();
 }
 
 /// Return the text slice once it has arrived and go back to idle. Not yet arrived gives null.
@@ -610,7 +610,7 @@ fn clipboardResetForTest() void {
 /// Logging for freestanding (expected to be called from std_options.logFn).
 pub fn logMessage(msg: []const u8) void {
     if (msg.len == 0) return;
-    vp_log(msg.ptr, @intCast(msg.len));
+    kngn_log(msg.ptr, @intCast(msg.len));
 }
 
 test "buttonFromDom: a DOM MouseEvent.button → a MouseButton" {
@@ -646,45 +646,45 @@ fn testResetFramebufferState() void {
     pending_h = 0;
 }
 
-test "vp_resize: lockFramebuffer applies the new size" {
+test "kngn_resize: lockFramebuffer applies the new size" {
     testResetFramebufferState();
     defer testResetFramebufferState();
 
     var win = try Window.create(320, 240, "t");
     defer win.destroy();
 
-    vp_resize(640, 480);
+    kngn_resize(640, 480);
     const fb = win.lockFramebuffer() orelse unreachable;
     try std.testing.expectEqual(@as(u32, 640), fb.width);
     try std.testing.expectEqual(@as(u32, 480), fb.height);
     try std.testing.expectEqual(@as(usize, 640 * 480), fb.pixels.len);
 }
 
-test "vp_resize: with several calls, the last value wins" {
+test "kngn_resize: with several calls, the last value wins" {
     testResetFramebufferState();
     defer testResetFramebufferState();
 
-    vp_resize(400, 300);
-    vp_resize(500, 400);
-    vp_resize(640, 480);
+    kngn_resize(400, 300);
+    kngn_resize(500, 400);
+    kngn_resize(640, 480);
     try std.testing.expectEqual(@as(u32, 640), pending_w);
     try std.testing.expectEqual(@as(u32, 480), pending_h);
 }
 
-test "vp_resize: clamped to a minimum of 320x240 and a maximum of 8192" {
+test "kngn_resize: clamped to a minimum of 320x240 and a maximum of 8192" {
     testResetFramebufferState();
     defer testResetFramebufferState();
 
-    vp_resize(10, 10);
+    kngn_resize(10, 10);
     try std.testing.expectEqual(@as(u32, 320), pending_w);
     try std.testing.expectEqual(@as(u32, 240), pending_h);
 
-    vp_resize(10000, 10000);
+    kngn_resize(10000, 10000);
     try std.testing.expectEqual(@as(u32, 8192), pending_w);
     try std.testing.expectEqual(@as(u32, 8192), pending_h);
 }
 
-test "vp_resize: on an OOM the old framebuffer survives and the pending value is kept for a retry" {
+test "kngn_resize: on an OOM the old framebuffer survives and the pending value is kept for a retry" {
     testResetFramebufferState();
     defer testResetFramebufferState();
 
@@ -695,7 +695,7 @@ test "vp_resize: on an OOM the old framebuffer survives and the pending value is
     var failing = std.testing.FailingAllocator.init(default_gpa, .{ .fail_index = 0 });
     gpa = failing.allocator();
 
-    vp_resize(640, 480);
+    kngn_resize(640, 480);
     const fb = win.lockFramebuffer() orelse unreachable; // drawing continues on the old framebuffer
     try std.testing.expectEqual(@as(u32, 320), fb.width);
     try std.testing.expectEqual(@as(u32, 240), fb.height);
@@ -710,7 +710,7 @@ test "vp_resize: on an OOM the old framebuffer survives and the pending value is
     try std.testing.expectEqual(@as(u32, 0), pending_w);
 }
 
-test "vp_resize: the framebuffer keeps its old size while the pending value is unconsumed" {
+test "kngn_resize: the framebuffer keeps its old size while the pending value is unconsumed" {
     testResetFramebufferState();
     defer testResetFramebufferState();
 
@@ -718,7 +718,7 @@ test "vp_resize: the framebuffer keeps its old size while the pending value is u
     defer win.destroy();
 
     _ = win.lockFramebuffer() orelse unreachable;
-    vp_resize(640, 480);
+    kngn_resize(640, 480);
     try std.testing.expectEqual(@as(u32, 320), fb_w);
     try std.testing.expectEqual(@as(u32, 240), fb_h);
     try std.testing.expectEqual(@as(usize, 320 * 240), pixels_buf.len);
@@ -832,7 +832,7 @@ test "openFileDialog: request→DialogPending / picked→the path / cancel→nul
     // simulate JS deliver
     const path_src = "pick/usako.png";
     @memcpy(file_path_scratch[0..path_src.len], path_src);
-    vp_file_picked(@intCast(path_src.len));
+    kngn_file_picked(@intCast(path_src.len));
 
     const got = try openFileDialog(a, undefined, .{ .allowed_ext = "png" });
     defer if (got) |p| a.free(p);
@@ -841,7 +841,7 @@ test "openFileDialog: request→DialogPending / picked→the path / cancel→nul
 
     // cancel path
     try std.testing.expectError(error.DialogPending, openFileDialog(a, undefined, .{}));
-    vp_file_cancelled();
+    kngn_file_cancelled();
     const cancelled = try openFileDialog(a, undefined, .{});
     try std.testing.expect(cancelled == null);
 }
@@ -880,7 +880,7 @@ test "clipboard paste machine: request → deliver → take → idle" {
 
     const text = "#FF00AA";
     @memcpy(clipboard_text_scratch[0..text.len], text);
-    vp_clipboard_text(@intCast(text.len));
+    kngn_clipboard_text(@intCast(text.len));
     try std.testing.expectEqual(ClipboardPasteState.delivered, clipboard_paste_state);
 
     const got = clipboardTakePaste() orelse unreachable;

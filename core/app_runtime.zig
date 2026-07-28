@@ -1,7 +1,7 @@
 //! Frame-driven application runtime
 //!
 //! (1) It absorbs the push/pull difference of frame driving in one place. An App provides init, frame and deinit;
-//! on native the existing pull loop is confined here, and on wasm it becomes the `vp_frame` export driven by rAF.
+//! on native the existing pull loop is confined here, and on wasm it becomes the `kngn_frame` export driven by rAF.
 //! (2) Event delivery, (3) the framebuffer and (4) audio all keep their existing paths.
 //!
 //! The surface an App provides:
@@ -82,11 +82,11 @@ pub fn Runtime(comptime App: type) type {
         /// Referencing it from the wasm root brings the export into the analysis.
         pub fn enableWasmExports() void {
             if (!builtin.cpu.arch.isWasm()) return;
-            _ = &vp_init;
-            _ = &vp_frame;
+            _ = &kngn_init;
+            _ = &kngn_frame;
         }
 
-        export fn vp_init() void {
+        export fn kngn_init() void {
             if (!builtin.cpu.arch.isWasm()) return;
             const gpa = std.heap.wasm_allocator;
             // A real std.Io coming from Io.Threaded's single-threaded global
@@ -94,31 +94,31 @@ pub fn Runtime(comptime App: type) type {
             const io = std.Io.Threaded.global_single_threaded.io();
 
             platform.init() catch {
-                const msg = "vp_init: platform.init failed";
+                const msg = "kngn_init: platform.init failed";
                 const env = struct {
-                    extern "env" fn vp_log(ptr: [*]const u8, len: u32) void;
+                    extern "env" fn kngn_log(ptr: [*]const u8, len: u32) void;
                 };
-                env.vp_log(msg, msg.len);
+                env.kngn_log(msg, msg.len);
                 return;
             };
 
             const win = createAppWindow(gpa, io) catch {
-                const msg = "vp_init: Window.create failed";
+                const msg = "kngn_init: Window.create failed";
                 const env = struct {
-                    extern "env" fn vp_log(ptr: [*]const u8, len: u32) void;
+                    extern "env" fn kngn_log(ptr: [*]const u8, len: u32) void;
                 };
-                env.vp_log(msg, msg.len);
+                env.kngn_log(msg, msg.len);
                 platform.shutdown();
                 return;
             };
             g_win = win;
 
             const app_ptr = App.init(gpa, io) catch {
-                const msg = "vp_init: App.init failed";
+                const msg = "kngn_init: App.init failed";
                 const env = struct {
-                    extern "env" fn vp_log(ptr: [*]const u8, len: u32) void;
+                    extern "env" fn kngn_log(ptr: [*]const u8, len: u32) void;
                 };
-                env.vp_log(msg, msg.len);
+                env.kngn_log(msg, msg.len);
                 // symmetrical with the native path's defer window.destroy and platform.shutdown
                 win.destroy();
                 g_win = null;
@@ -129,7 +129,7 @@ pub fn Runtime(comptime App: type) type {
             g_running = true;
         }
 
-        export fn vp_frame(now_ms: f64) void {
+        export fn kngn_frame(now_ms: f64) void {
             if (!builtin.cpu.arch.isWasm()) return;
             const app = g_app orelse return;
             var win = g_win orelse return;

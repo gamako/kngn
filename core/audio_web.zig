@@ -1,11 +1,11 @@
 //! Web Audio backend (AudioWorklet plus SharedArrayBuffer / wasm shared memory)
 //!
 //! Symmetrically with native's real-time callback, AudioWorkletProcessor.process() push-drives
-//! `export fn vp_audio_render`. The main thread and the worklet share one wasm module and
+//! `export fn kngn_audio_render`. The main thread and the worklet share one wasm module and
 //! one shared linear memory across two Instances, so the lock-free machinery of libs/synth is used unmodified.
 //!
 //! ## The EffectiveConfig.sample_rate policy
-//! `vp_audio_open`'s return value gives the real sample rate of the `AudioContext` JS constructed.
+//! `kngn_audio_open`'s return value gives the real sample rate of the `AudioContext` JS constructed.
 //! An AudioContext can be created at open time (its sampleRate is settled even before autoplay), which makes this
 //! simpler than returning the requested value and writing it back atomically later, and makes `device.config()` correct straight after open.
 //!
@@ -15,17 +15,17 @@
 //! **Binary analysis confirms both of synth.wasm's data segments are passive (with a DataCount section)** —
 //! so a second `WebAssembly.Instance` re-applying the data and overwriting `g_state` cannot happen
 //! by construction.
-//! On top of that, a runtime sentinel (`vp_audio_set_sentinel` / `vp_audio_check_sentinel`) demonstrates on every
+//! On top of that, a runtime sentinel (`kngn_audio_set_sentinel` / `kngn_audio_check_sentinel`) demonstrates on every
 //! start-up that the shared state the main thread wrote survives the second instantiate.
 //!
 //! ## The second Instance at boot, and g_state
-//! The worklet Instance is created in `boot()`, **before vp_init and open**, so that a failed instantiate is
+//! The worklet Instance is created in `boot()`, **before kngn_init and open**, so that a failed instantiate is
 //! detected before open succeeds. At that point `g_state.callback` is unset, but the worklet is safe because it
 //! reads `g_state` only while the `running` atomic (acquire) is 1. The callback is set by the
 //! later `open()`, and running=1 by `start()`.
 //!
 //! ## Hot path declaration
-//! Real-time (per sample): `vp_audio_render` → the `render_callback` it holds. No alloc, lock, IO or panic within that region.
+//! Real-time (per sample): `kngn_audio_render` → the `render_callback` it holds. No alloc, lock, IO or panic within that region.
 //! No new loop is added (the callback writes samples straight into the out_ptr the caller passes).
 //! Before start and after close, an atomic flag guards it as a no-op. When the return value is 0 the worklet silences its outputs.
 
@@ -64,14 +64,14 @@ pub const EffectiveConfig = struct {
 };
 
 // ============================================================================
-// the JS env imports (vp.js)
+// the JS env imports (kngn.js)
 // ============================================================================
 
 /// Prepares the AudioContext and the worklet. On success the real sample rate (>0), and 0 on failure.
-extern "env" fn vp_audio_open(sample_rate: u32, channels: u32, buffer_frames: u32) u32;
-extern "env" fn vp_audio_start() void;
-extern "env" fn vp_audio_stop() void;
-extern "env" fn vp_audio_close() void;
+extern "env" fn kngn_audio_open(sample_rate: u32, channels: u32, buffer_frames: u32) u32;
+extern "env" fn kngn_audio_start() void;
+extern "env" fn kngn_audio_stop() void;
+extern "env" fn kngn_audio_close() void;
 
 // ============================================================================
 // Module-level state (in the shared linear memory, visible from both the main and worklet Instances)
@@ -91,8 +91,9 @@ var g_state: RenderState = .{};
 
 /// The sentinel showing that the shared state survives the second instantiate.
 /// The main thread writes the magic right after boot, and the worklet reads it right after instantiate.
-/// magic = 'VPAS' (the u32 literal read as 0x56504153 little-endian).
-const SENTINEL_MAGIC: u32 = 0x56504153;
+/// magic = 0x4B4E4153, whose hex digits spell 'KNAS'. Both sides compare the same u32,
+/// so the worklet's copy must hold this exact value.
+const SENTINEL_MAGIC: u32 = 0x4B4E4153;
 var g_instantiate_sentinel: u32 = 0;
 
 /// The stack region for the worklet Instance alone (a static buffer inside the shared memory).
@@ -108,24 +109,24 @@ const MAX_CHANNELS = 2;
 var render_scratch: [MAX_RENDER_FRAMES * MAX_CHANNELS]f32 = undefined;
 
 /// main: called in boot before the second Instance is created. It writes the magic into the shared memory.
-export fn vp_audio_set_sentinel() void {
+export fn kngn_audio_set_sentinel() void {
     g_instantiate_sentinel = SENTINEL_MAGIC;
 }
 
 /// worklet: called right after the second instantiate. SENTINEL_MAGIC when the magic matches, and 0 when it does not.
-export fn vp_audio_check_sentinel() u32 {
+export fn kngn_audio_check_sentinel() u32 {
     if (g_instantiate_sentinel == SENTINEL_MAGIC) return SENTINEL_MAGIC;
     return 0;
 }
 
 /// JS and the worklet read the stack top (a byte address) through this.
-export fn vp_audio_worklet_stack_top() u32 {
+export fn kngn_audio_worklet_stack_top() u32 {
     const base = @intFromPtr(&worklet_stack);
     return @intCast(base + WORKLET_STACK_BYTES);
 }
 
 /// JS and the worklet read the head of the render output buffer through this.
-export fn vp_audio_render_buf() u32 {
+export fn kngn_audio_render_buf() u32 {
     return @intCast(@intFromPtr(&render_scratch));
 }
 
@@ -133,7 +134,7 @@ export fn vp_audio_render_buf() u32 {
 /// **No alloc, locking, IO or panic.**
 /// The return value: 1 = samples were written to out_ptr / 0 = skipped (and the worklet must silence its outputs).
 /// frames > MAX, before start, and after close all give 0 (so a stale scratch is never output).
-export fn vp_audio_render(out_ptr: u32, frames: u32, channels: u32, sample_rate: u32) u32 {
+export fn kngn_audio_render(out_ptr: u32, frames: u32, channels: u32, sample_rate: u32) u32 {
     if (g_state.running.load(.acquire) == 0) return 0;
     if (frames == 0 or channels == 0) return 0;
     if (frames > MAX_RENDER_FRAMES) return 0;
@@ -161,18 +162,18 @@ pub const AudioDevice = struct {
     pub fn start(_: AudioDevice) Error!void {
         if (!g_state.opened) return error.StartFailed;
         g_state.running.store(1, .release);
-        vp_audio_start();
+        kngn_audio_start();
     }
 
     pub fn stop(_: AudioDevice) void {
         g_state.running.store(0, .release);
-        if (g_state.opened) vp_audio_stop();
+        if (g_state.opened) kngn_audio_stop();
     }
 
     pub fn close(self: AudioDevice) void {
         self.stop();
         if (g_state.opened) {
-            vp_audio_close();
+            kngn_audio_close();
             g_state.opened = false;
         }
         g_state.callback = undefined;
@@ -193,7 +194,7 @@ pub fn open(_: std.mem.Allocator, cfg: Config) Error!AudioDevice {
 
     // JS: confirm the worklet has booted (audioReady). The return value is the real sampleRate (0 = failure).
     // No COOP/COEP, no SharedArrayBuffer, a failed worklet load, or a failed sentinel all give 0.
-    const actual_sr = vp_audio_open(cfg.sample_rate, cfg.channels, cfg.buffer_frames);
+    const actual_sr = kngn_audio_open(cfg.sample_rate, cfg.channels, cfg.buffer_frames);
     if (actual_sr == 0) {
         g_state.callback = undefined;
         g_state.userdata = null;
@@ -252,9 +253,9 @@ pub fn NullWebStub(comptime B: type) type {
 // A hook keeping the references alive in a wasm build, so that an unreferenced export is not dropped even with rdynamic.
 pub fn enableAudioExports() void {
     if (!builtin.cpu.arch.isWasm()) return;
-    _ = &vp_audio_render;
-    _ = &vp_audio_worklet_stack_top;
-    _ = &vp_audio_render_buf;
-    _ = &vp_audio_set_sentinel;
-    _ = &vp_audio_check_sentinel;
+    _ = &kngn_audio_render;
+    _ = &kngn_audio_worklet_stack_top;
+    _ = &kngn_audio_render_buf;
+    _ = &kngn_audio_set_sentinel;
+    _ = &kngn_audio_check_sentinel;
 }

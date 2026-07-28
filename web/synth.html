@@ -13,7 +13,7 @@
       image-rendering: pixelated;
       cursor: default;
     }
-    #vp-audio-hint {
+    #kngn-audio-hint {
       display: none;
       padding: 8px 14px;
       background: #3a3020;
@@ -23,7 +23,7 @@
       cursor: pointer;
       user-select: none;
     }
-    #vp-error {
+    #kngn-error {
       display: none;
       max-width: 40rem;
       padding: 10px;
@@ -37,11 +37,11 @@
 </head>
 <body data-wasm="synth.wasm" data-audio="1" data-shared="1">
   <div id="wrap">
-    <canvas id="vp-canvas" width="1080" height="520" tabindex="0"></canvas>
-    <div id="vp-audio-hint">Click or press a key to enable audio (browser autoplay policy)</div>
-    <div id="vp-error"></div>
+    <canvas id="kngn-canvas" width="1080" height="520" tabindex="0"></canvas>
+    <div id="kngn-audio-hint">Click or press a key to enable audio (browser autoplay policy)</div>
+    <div id="kngn-error"></div>
     <div class="note">A..K = C4..C5 · requires COOP/COEP (scripts/serve-web.py)</div>
   </div>
-  <script type="module" src="./vp.js"></script>
+  <script type="module" src="./kngn.js"></script>
 </body>
 </html>

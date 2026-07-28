@@ -21,12 +21,12 @@
     Cross-Origin-Embedder-Policy = "require-corp"
 
 [[headers]]
-  for = "/vp.js"
+  for = "/kngn.js"
   [headers.values]
     Cross-Origin-Resource-Policy = "same-origin"
 
 [[headers]]
-  for = "/vp-worklet.js"
+  for = "/kngn-worklet.js"
   [headers.values]
     Cross-Origin-Resource-Policy = "same-origin"
 

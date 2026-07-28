@@ -504,7 +504,7 @@ const Rt = app_runtime.Runtime(App);
 
 pub fn enableWasmRuntime() void {
     Rt.enableWasmExports();
-    // Keep audio_web exports (vp_audio_render / stack_top / render_buf) alive against DCE
+    // Keep audio_web exports (kngn_audio_render / stack_top / render_buf) alive against DCE
     audio.enableWebAudioExports();
 }
 

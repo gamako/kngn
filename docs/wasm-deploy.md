@@ -12,8 +12,8 @@ Output of `zig build package-web` (`zig-out/web/`):
 | `pixie.wasm` | Pixie wasm | not required |
 | `synth.html` | Synth entry | **required** |
 | `synth.wasm` | Synth wasm (shared memory) | **required** |
-| `vp.js` | Shared JS glue | load from an isolated page when using synth |
-| `vp-worklet.js` | AudioWorklet | load from an isolated page when using synth |
+| `kngn.js` | Shared JS glue | load from an isolated page when using synth |
+| `kngn-worklet.js` | AudioWorklet | load from an isolated page when using synth |
 | `_headers` | Cloudflare Pages | synth header rules |
 | `netlify.toml` | Netlify (may be copied to the repo root) | synth header rules |
 | `serve-coop-coep.py` | Local COOP/COEP check | development |
@@ -22,10 +22,10 @@ Output of `zig build package-web` (`zig-out/web/`):
 
 Dev (`web/`) and packaged (`zig-out/web/`) use the **same directory-relative paths**:
 
-- `index.html` → `./vp.js` → default `./pixie.wasm`
-- `synth.html` (`data-wasm="synth.wasm"`) → `./vp.js` → `./synth.wasm` + `./vp-worklet.js`
+- `index.html` → `./kngn.js` → default `./pixie.wasm`
+- `synth.html` (`data-wasm="synth.wasm"`) → `./kngn.js` → `./synth.wasm` + `./kngn-worklet.js`
 
-`vp.js` fetches wasm with `new URL("./<wasm>", import.meta.url)`, so every file above must sit in
+`kngn.js` fetches wasm with `new URL("./<wasm>", import.meta.url)`, so every file above must sit in
 the same directory.
 
 ## Build
@@ -67,7 +67,7 @@ Fetch-path smoke (another terminal):
 
 ```bash
 curl -sf -o /dev/null -w "%{http_code}\n" http://127.0.0.1:8080/index.html
-curl -sf -o /dev/null -w "%{http_code}\n" http://127.0.0.1:8080/vp.js
+curl -sf -o /dev/null -w "%{http_code}\n" http://127.0.0.1:8080/kngn.js
 curl -sf -o /dev/null -w "%{http_code}\n" http://127.0.0.1:8080/pixie.wasm
 ```
 
@@ -122,7 +122,7 @@ Upload the **contents** of `zig-out/web/` as the publish directory.
 
 ### GitHub Pages
 
-- **Pixie only** (`index.html` + `pixie.wasm` + `vp.js`). Custom response headers cannot be set, so COOP/COEP is unavailable.
+- **Pixie only** (`index.html` + `pixie.wasm` + `kngn.js`). Custom response headers cannot be set, so COOP/COEP is unavailable.
 - **Synth is not possible** (SharedArrayBuffer required). A client-side fake isolation via
   [coi-serviceworker](https://github.com/gzuidhof/coi-serviceworker) exists but needs a first-load
   reload and is **not** bundled here.
@@ -138,7 +138,7 @@ Upload the **contents** of `zig-out/web/` as the publish directory.
 | Cloudflare Pages / Netlify | set explicitly in `_headers` / `netlify.toml` |
 | GitHub Pages | often `application/wasm` (verify; fall back to `instantiate` if needed) |
 
-`vp.js` falls back to `compile` + `instantiate` when streaming fails, but production should still
+`kngn.js` falls back to `compile` + `instantiate` when streaming fails, but production should still
 serve `application/wasm`.
 
 ## Public-URL smoke check

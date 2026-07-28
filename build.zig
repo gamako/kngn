@@ -117,8 +117,8 @@ fn installWebStaticAssets(b: *std.Build) WebStaticInstalls {
     return .{
         .html = b.addInstallFile(b.path("web/index.html"), "web/index.html"),
         .synth_html = b.addInstallFile(b.path("web/synth.html"), "web/synth.html"),
-        .js = b.addInstallFile(b.path("web/vp.js"), "web/vp.js"),
-        .worklet = b.addInstallFile(b.path("web/vp-worklet.js"), "web/vp-worklet.js"),
+        .js = b.addInstallFile(b.path("web/kngn.js"), "web/kngn.js"),
+        .worklet = b.addInstallFile(b.path("web/kngn-worklet.js"), "web/kngn-worklet.js"),
         .headers = b.addInstallFile(b.path("web/deploy/_headers"), "web/_headers"),
         .netlify = b.addInstallFile(b.path("web/deploy/netlify.toml"), "web/netlify.toml"),
         .serve_script = b.addInstallFile(b.path("web/deploy/serve-coop-coep.py"), "web/serve-coop-coep.py"),

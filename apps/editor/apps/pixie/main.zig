@@ -6374,16 +6374,16 @@ fn wasmLogFn(
     var buf: [512]u8 = undefined;
     const msg = std.fmt.bufPrint(&buf, format, args) catch return;
     const env = struct {
-        extern "env" fn vp_log(ptr: [*]const u8, len: u32) void;
+        extern "env" fn kngn_log(ptr: [*]const u8, len: u32) void;
     };
-    env.vp_log(msg.ptr, @intCast(msg.len));
+    env.kngn_log(msg.ptr, @intCast(msg.len));
 }
 
 fn wasmPanic(msg: []const u8, _: ?usize) noreturn {
     const env = struct {
-        extern "env" fn vp_log(ptr: [*]const u8, len: u32) void;
+        extern "env" fn kngn_log(ptr: [*]const u8, len: u32) void;
     };
-    env.vp_log(msg.ptr, @intCast(@min(msg.len, std.math.maxInt(u32))));
+    env.kngn_log(msg.ptr, @intCast(@min(msg.len, std.math.maxInt(u32))));
     @trap();
 }
 

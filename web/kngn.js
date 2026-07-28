@@ -1,8 +1,8 @@
 // video-proto wasm JS glue (audio + file/clipboard)
 // import table:
-//   env: vp_now / vp_present / vp_log / vp_set_cursor
-//        + vp_audio_open / vp_audio_start / vp_audio_stop / vp_audio_close (audio app)
-//        + vp_request_open / vp_clipboard_write / vp_request_paste (file dialog / clipboard)
+//   env: kngn_now / kngn_present / kngn_log / kngn_set_cursor
+//        + kngn_audio_open / kngn_audio_start / kngn_audio_stop / kngn_audio_close (audio app)
+//        + kngn_request_open / kngn_clipboard_write / kngn_request_paste (file dialog / clipboard)
 //   wasi_snapshot_preview1: hand-written shim + in-memory FS (path_open/fd_read/write/seek/close)
 //
 // boot options (from a script type=module import, or data-*):
@@ -11,16 +11,16 @@
 //   audio: true enables the AudioWorklet path (requires sharedMemory)
 //
 // Time contract:
-//   - App frame time is always env.vp_now (performance.now based, seconds)
+//   - App frame time is always env.kngn_now (performance.now based, seconds)
 //   - WASI clock_time_get is for stdlib internals only. monotonic is also performance.now based
-// DOM → vp_push_* (KeyCode conversion is a Zig-side table. JS only identifies code strings and calls exports)
+// DOM → kngn_push_* (KeyCode conversion is a Zig-side table. JS only identifies code strings and calls exports)
 //
 // File I/O:
-//   - open: <input type=file> → register bytes at virtual path `pick/<name>` → vp_file_picked
+//   - open: <input type=file> → register bytes at virtual path `pick/<name>` → kngn_file_picked
 //   - save: Zig writes a path via WASI write → Blob download on fd_close
 //   - OPFS is not used (download/pick round-trip is enough for .pix)
 
-const canvas = document.getElementById("vp-canvas");
+const canvas = document.getElementById("kngn-canvas");
 const ctx2d = canvas.getContext("2d", { alpha: false });
 
 /** @type {WebAssembly.Memory} */
@@ -52,7 +52,7 @@ let audioGestureBound = false;
  */
 let audioReady = false;
 const WORKLET_READY_TIMEOUT_MS = 5000;
-const SENTINEL_MAGIC = 0x56504153;
+const SENTINEL_MAGIC = 0x4B4E4153;
 
 // ---- WASI preview1 errno / clockid (minimal surface for the measured imports) ----
 const WASI_ESUCCESS = 0;
@@ -305,8 +305,8 @@ function ensureFileInput() {
     input.value = ""; // Allow re-selecting the same file
     if (!file) {
       openPickerBusy = false;
-      if (instance && typeof instance.exports.vp_file_cancelled === "function") {
-        instance.exports.vp_file_cancelled();
+      if (instance && typeof instance.exports.kngn_file_cancelled === "function") {
+        instance.exports.kngn_file_cancelled();
       }
       return;
     }
@@ -321,16 +321,16 @@ function ensureFileInput() {
         deliverPickedPath(vpath);
       } catch (e) {
         console.error("file pick deliver failed:", e);
-        if (instance && typeof instance.exports.vp_file_cancelled === "function") {
-          instance.exports.vp_file_cancelled();
+        if (instance && typeof instance.exports.kngn_file_cancelled === "function") {
+          instance.exports.kngn_file_cancelled();
         }
       }
     };
     reader.onerror = () => {
       openPickerBusy = false;
       console.error("FileReader error");
-      if (instance && typeof instance.exports.vp_file_cancelled === "function") {
-        instance.exports.vp_file_cancelled();
+      if (instance && typeof instance.exports.kngn_file_cancelled === "function") {
+        instance.exports.kngn_file_cancelled();
       }
     };
     reader.readAsArrayBuffer(file);
@@ -338,8 +338,8 @@ function ensureFileInput() {
   // cancel: some browsers expose a cancel event
   input.addEventListener("cancel", () => {
     openPickerBusy = false;
-    if (instance && typeof instance.exports.vp_file_cancelled === "function") {
-      instance.exports.vp_file_cancelled();
+    if (instance && typeof instance.exports.kngn_file_cancelled === "function") {
+      instance.exports.kngn_file_cancelled();
     }
   });
   document.body.appendChild(input);
@@ -349,17 +349,17 @@ function ensureFileInput() {
 
 function deliverPickedPath(vpath) {
   // Caller already clampUtf8(..., 256) on vpath. Do not re-truncate here (avoids key mismatch).
-  if (!instance || typeof instance.exports.vp_file_path_scratch !== "function") return;
+  if (!instance || typeof instance.exports.kngn_file_path_scratch !== "function") return;
   const enc = new TextEncoder();
   const bytes = enc.encode(vpath);
-  const scratch = instance.exports.vp_file_path_scratch();
+  const scratch = instance.exports.kngn_file_path_scratch();
   const view = new Uint8Array(memory.buffer, scratch, 256);
   view.set(bytes);
-  instance.exports.vp_file_picked(bytes.length);
+  instance.exports.kngn_file_picked(bytes.length);
 }
 
 /**
- * Zig `vp_request_open` — fire <input type=file>.
+ * Zig `kngn_request_open` — fire <input type=file>.
  * @param {number} extPtr
  * @param {number} extLen
  */
@@ -388,8 +388,8 @@ function envRequestOpen(extPtr, extLen) {
   } catch (e) {
     openPickerBusy = false;
     console.error("file input click failed:", e);
-    if (instance && typeof instance.exports.vp_file_cancelled === "function") {
-      instance.exports.vp_file_cancelled();
+    if (instance && typeof instance.exports.kngn_file_cancelled === "function") {
+      instance.exports.kngn_file_cancelled();
     }
   }
 }
@@ -412,14 +412,14 @@ function envClipboardWrite(ptr, len) {
 
 function envRequestPaste() {
   const deliver = (text) => {
-    if (!instance || typeof instance.exports.vp_clipboard_text_scratch !== "function") return;
+    if (!instance || typeof instance.exports.kngn_clipboard_text_scratch !== "function") return;
     const enc = new TextEncoder();
     const bytes = enc.encode(String(text || ""));
-    const scratch = instance.exports.vp_clipboard_text_scratch();
+    const scratch = instance.exports.kngn_clipboard_text_scratch();
     const view = new Uint8Array(memory.buffer, scratch, 64);
     const n = Math.min(bytes.length, 64);
     view.set(bytes.subarray(0, n));
-    instance.exports.vp_clipboard_text(n);
+    instance.exports.kngn_clipboard_text(n);
   };
   if (!navigator.clipboard || !navigator.clipboard.readText) {
     deliver("");
@@ -449,7 +449,7 @@ const wasi = {
   },
   clock_time_get(clockId, _precision, timePtr) {
     // monotonic = performance.now based. realtime = Date.now.
-    // App time uses vp_now (this function is stdlib-internal only).
+    // App time uses kngn_now (this function is stdlib-internal only).
     let ns;
     if (clockId === WASI_CLOCK_MONOTONIC) {
       ns = BigInt(Math.trunc(performance.now() * 1e6));
@@ -799,16 +799,16 @@ function canvasLogicalXY(e) {
 function writeDomCode(code) {
   const enc = new TextEncoder();
   const bytes = enc.encode(code);
-  const scratch = instance.exports.vp_dom_code_scratch();
+  const scratch = instance.exports.kngn_dom_code_scratch();
   const view = new Uint8Array(memory.buffer, scratch, 32);
   const n = Math.min(bytes.length, 32);
   view.set(bytes.subarray(0, n));
-  return instance.exports.vp_dom_code_to_keycode(n);
+  return instance.exports.kngn_dom_code_to_keycode(n);
 }
 
 function pushKey(e, down) {
   const code = writeDomCode(e.code);
-  instance.exports.vp_push_key(down, code, modsFromEvent(e), !!e.repeat);
+  instance.exports.kngn_push_key(down, code, modsFromEvent(e), !!e.repeat);
 }
 
 function shouldPreventKey(e) {
@@ -833,7 +833,7 @@ function reportCanvasSize() {
   const w = Math.round(canvas.clientWidth);
   const h = Math.round(canvas.clientHeight);
   if (w > 0 && h > 0) {
-    instance.exports.vp_resize(w, h);
+    instance.exports.kngn_resize(w, h);
   }
 }
 
@@ -847,7 +847,7 @@ function bindResize() {
 
 function showAudioError(msg) {
   console.error(msg);
-  const el = document.getElementById("vp-error");
+  const el = document.getElementById("kngn-error");
   if (el) {
     el.textContent = String(msg);
     el.style.display = "block";
@@ -857,7 +857,7 @@ function showAudioError(msg) {
 function ensureAudioGestureResume() {
   if (audioGestureBound) return;
   audioGestureBound = true;
-  const hint = document.getElementById("vp-audio-hint");
+  const hint = document.getElementById("kngn-audio-hint");
   const tryResume = async () => {
     // After stop, a later gesture must not resume unintentionally
     if (!audioWantRunning) return;
@@ -886,7 +886,7 @@ function ensureAudioGestureResume() {
 }
 
 /**
- * boot: after the main Instance is created and before vp_init, build AudioWorkletNode
+ * boot: after the main Instance is created and before kngn_init, build AudioWorkletNode
  * and await worklet-side 2nd Instance + sentinel ready.
  * g_state is unset yet, but the worklet only reads it inside the running gate, so this is safe.
  * @param {number} channels
@@ -898,16 +898,16 @@ function prepareAudioWorkletNode(channels) {
       reject(new Error("prepareAudioWorkletNode: ctx/module/memory/instance missing"));
       return;
     }
-    if (typeof instance.exports.vp_audio_set_sentinel !== "function") {
-      reject(new Error("prepareAudioWorkletNode: missing vp_audio_set_sentinel"));
+    if (typeof instance.exports.kngn_audio_set_sentinel !== "function") {
+      reject(new Error("prepareAudioWorkletNode: missing kngn_audio_set_sentinel"));
       return;
     }
     // main writes the magic on shared memory (before worklet instantiate)
-    instance.exports.vp_audio_set_sentinel();
+    instance.exports.kngn_audio_set_sentinel();
 
     const stackTop =
-      typeof instance.exports.vp_audio_worklet_stack_top === "function"
-        ? instance.exports.vp_audio_worklet_stack_top() >>> 0
+      typeof instance.exports.kngn_audio_worklet_stack_top === "function"
+        ? instance.exports.kngn_audio_worklet_stack_top() >>> 0
         : 0;
     if (!stackTop) {
       reject(new Error("prepareAudioWorkletNode: missing stack top"));
@@ -920,7 +920,7 @@ function prepareAudioWorkletNode(channels) {
     const timer = setTimeout(() => {
       if (settled) return;
       settled = true;
-      reject(new Error("vp-worklet: ready timeout (" + WORKLET_READY_TIMEOUT_MS + "ms)"));
+      reject(new Error("kngn-worklet: ready timeout (" + WORKLET_READY_TIMEOUT_MS + "ms)"));
     }, WORKLET_READY_TIMEOUT_MS);
 
     try {
@@ -930,7 +930,7 @@ function prepareAudioWorkletNode(channels) {
         } catch (_) {}
         audioNode = null;
       }
-      audioNode = new AudioWorkletNode(audioCtx, "vp-audio-processor", {
+      audioNode = new AudioWorkletNode(audioCtx, "kngn-audio-processor", {
         numberOfInputs: 0,
         numberOfOutputs: 1,
         outputChannelCount: [audioChannels],
@@ -949,7 +949,7 @@ function prepareAudioWorkletNode(channels) {
           if ((data.sentinel >>> 0) !== SENTINEL_MAGIC) {
             settled = true;
             clearTimeout(timer);
-            reject(new Error("vp-worklet: ready with bad sentinel 0x" + (data.sentinel >>> 0).toString(16)));
+            reject(new Error("kngn-worklet: ready with bad sentinel 0x" + (data.sentinel >>> 0).toString(16)));
             return;
           }
           settled = true;
@@ -959,12 +959,12 @@ function prepareAudioWorkletNode(channels) {
         }
         if (data.type === "error") {
           if (settled) {
-            console.error("vp-worklet:", data.message);
+            console.error("kngn-worklet:", data.message);
             return;
           }
           settled = true;
           clearTimeout(timer);
-          reject(new Error("vp-worklet: " + data.message));
+          reject(new Error("kngn-worklet: " + data.message));
         }
       };
       audioNode.connect(audioCtx.destination);
@@ -979,7 +979,7 @@ function prepareAudioWorkletNode(channels) {
 }
 
 /**
- * Zig `vp_audio_open` → confirm the boot-time worklet and return the real sample rate.
+ * Zig `kngn_audio_open` → confirm the boot-time worklet and return the real sample rate.
  * Node creation already ran at boot. Returns 0 unless audioReady.
  * @returns {number} actual sample rate, or 0 on failure
  */
@@ -989,23 +989,23 @@ function envAudioOpen(sampleRate, channels, bufferFrames) {
   void channels;
   try {
     if (typeof SharedArrayBuffer === "undefined") {
-      console.error("vp_audio_open: SharedArrayBuffer unavailable (need COOP/COEP)");
+      console.error("kngn_audio_open: SharedArrayBuffer unavailable (need COOP/COEP)");
       return 0;
     }
     if (!globalThis.crossOriginIsolated) {
       console.error(
-        "vp_audio_open: crossOriginIsolated=false (serve with COOP/COEP; scripts/serve-web.py)",
+        "kngn_audio_open: crossOriginIsolated=false (serve with COOP/COEP; scripts/serve-web.py)",
       );
       return 0;
     }
     if (!audioReady || !audioCtx || !audioNode) {
-      console.error("vp_audio_open: worklet not ready (boot failed or not audio app)");
+      console.error("kngn_audio_open: worklet not ready (boot failed or not audio app)");
       return 0;
     }
     ensureAudioGestureResume();
     return audioCtx.sampleRate | 0;
   } catch (e) {
-    console.error("vp_audio_open failed:", e);
+    console.error("kngn_audio_open failed:", e);
     return 0;
   }
 }
@@ -1045,10 +1045,10 @@ function makeImportObject() {
   return {
     env: {
       // Canonical app time (frame / getTime). Do not use the WASI clock.
-      vp_now() {
+      kngn_now() {
         return performance.now() / 1000;
       },
-      vp_present(ptr, w, h) {
+      kngn_present(ptr, w, h) {
         // memory growth detaches the old ArrayBuffer, so rebuild the view from buffer every time
         const nbytes = (w * h * 4) >>> 0;
         const wasmView = new Uint8ClampedArray(memory.buffer, ptr, nbytes);
@@ -1064,21 +1064,21 @@ function makeImportObject() {
         imageData.data.set(wasmView);
         ctx2d.putImageData(imageData, 0, 0);
       },
-      vp_log(ptr, len) {
+      kngn_log(ptr, len) {
         const bytes = new Uint8Array(memory.buffer, ptr, len);
         console.log(new TextDecoder().decode(bytes));
       },
-      vp_set_cursor(shape) {
+      kngn_set_cursor(shape) {
         canvas.style.cursor = CURSOR_CSS[shape] || "default";
       },
-      vp_audio_open: envAudioOpen,
-      vp_audio_start: envAudioStart,
-      vp_audio_stop: envAudioStop,
-      vp_audio_close: envAudioClose,
+      kngn_audio_open: envAudioOpen,
+      kngn_audio_start: envAudioStart,
+      kngn_audio_stop: envAudioStop,
+      kngn_audio_close: envAudioClose,
       // file dialog / clipboard
-      vp_request_open: envRequestOpen,
-      vp_clipboard_write: envClipboardWrite,
-      vp_request_paste: envRequestPaste,
+      kngn_request_open: envRequestOpen,
+      kngn_clipboard_write: envClipboardWrite,
+      kngn_request_paste: envRequestPaste,
     },
     wasi_snapshot_preview1: wasi,
   };
@@ -1096,22 +1096,22 @@ function bindInput() {
   // Committed characters (char_input). Control keys are also filtered on the Zig side
   canvas.addEventListener("keypress", (e) => {
     if (e.charCode && e.charCode >= 0x20) {
-      instance.exports.vp_push_char(e.charCode, modsFromEvent(e));
+      instance.exports.kngn_push_char(e.charCode, modsFromEvent(e));
     }
   });
 
   canvas.addEventListener("mousemove", (e) => {
     const { x, y } = canvasLogicalXY(e);
-    instance.exports.vp_push_mouse(0, x, y, -1, buttonsFromEvent(e), modsFromEvent(e));
+    instance.exports.kngn_push_mouse(0, x, y, -1, buttonsFromEvent(e), modsFromEvent(e));
   });
   canvas.addEventListener("mousedown", (e) => {
     canvas.focus();
     const { x, y } = canvasLogicalXY(e);
-    instance.exports.vp_push_mouse(1, x, y, buttonIndex(e), buttonsFromEvent(e), modsFromEvent(e));
+    instance.exports.kngn_push_mouse(1, x, y, buttonIndex(e), buttonsFromEvent(e), modsFromEvent(e));
   });
   canvas.addEventListener("mouseup", (e) => {
     const { x, y } = canvasLogicalXY(e);
-    instance.exports.vp_push_mouse(2, x, y, buttonIndex(e), buttonsFromEvent(e), modsFromEvent(e));
+    instance.exports.kngn_push_mouse(2, x, y, buttonIndex(e), buttonsFromEvent(e), modsFromEvent(e));
   });
   canvas.addEventListener(
     "wheel",
@@ -1119,7 +1119,7 @@ function bindInput() {
       e.preventDefault(); // Suppress page scroll
       const { x, y } = canvasLogicalXY(e);
       // DOM wheel is positive downward → flip dy to match the pixie/gui convention
-      instance.exports.vp_push_scroll(x, y, -e.deltaX, -e.deltaY, modsFromEvent(e));
+      instance.exports.kngn_push_scroll(x, y, -e.deltaX, -e.deltaY, modsFromEvent(e));
     },
     { passive: false },
   );
@@ -1155,7 +1155,7 @@ export async function boot(opts = {}) {
       );
     }
     audioCtx = new AC({ sampleRate: 48000 });
-    await audioCtx.audioWorklet.addModule(new URL("./vp-worklet.js", import.meta.url).href);
+    await audioCtx.audioWorklet.addModule(new URL("./kngn-worklet.js", import.meta.url).href);
   }
 
   const resp = await fetch(new URL("./" + wasmUrl, import.meta.url).href);
@@ -1182,7 +1182,7 @@ export async function boot(opts = {}) {
     memory = /** @type {WebAssembly.Memory} */ (instance.exports.memory);
   }
 
-  // audio: finish 2nd Instance + sentinel checks before vp_init (failure → open also fails)
+  // audio: finish 2nd Instance + sentinel checks before kngn_init (failure → open also fails)
   if (useAudio) {
     try {
       await prepareAudioWorkletNode(2);
@@ -1198,10 +1198,10 @@ export async function boot(opts = {}) {
 
   bindInput();
   bindResize();
-  instance.exports.vp_init();
+  instance.exports.kngn_init();
 
   function loop(ts) {
-    instance.exports.vp_frame(ts); // rAF ms. Zig divides by 1000
+    instance.exports.kngn_frame(ts); // rAF ms. Zig divides by 1000
     requestAnimationFrame(loop);
   }
   requestAnimationFrame(loop);
@@ -1225,10 +1225,10 @@ function defaultOptsFromPage() {
 }
 
 // Auto-start at the top level of a type=module script (import { boot } also works)
-if (!globalThis.__vpManualBoot) {
+if (!globalThis.__kngnManualBoot) {
   boot(defaultOptsFromPage()).catch((err) => {
     console.error(err);
-    const el = document.getElementById("vp-error");
+    const el = document.getElementById("kngn-error");
     if (el) {
       el.textContent = String(err && err.message ? err.message : err);
       el.style.display = "block";
