@@ -3,7 +3,7 @@
 set -euo pipefail
 
 ROOT=$(cd "$(dirname "$0")/../.." && pwd)
-MAIN="${VP_MAIN_DIR:-$ROOT}"
+MAIN="${KNGN_MAIN_DIR:-$ROOT}"
 DRIVE="$ROOT/scripts/drive"
 E2E="$ROOT/.e2e/netsync-history-thumb"
 NETSYNC_PORT=9211
@@ -25,7 +25,7 @@ start_pixie() {
   shift 2
   mkdir -p "$out_dir"
   rm -f "$port_file"
-  env VP_HARNESS_HEADLESS=1 VP_HARNESS_LIVE=1 VP_HARNESS_PORT_FILE="$port_file" VP_HARNESS_OUT="$out_dir" "$@" \
+  env KNGN_HARNESS_PORT_FILE="$port_file" KNGN_HARNESS_OUT="$out_dir" "$@" \
     direnv exec "$MAIN" zig build run-pixie >"$out_dir/app.log" 2>&1 &
   echo $!
 }
@@ -134,11 +134,11 @@ if [[ -z "$solo_json" ]]; then
   # snapshot may write relative to harness out; try digest path
   solo_json=$(drive_s 'snapshot history' 2>/dev/null; ls -la "$SOLO_OUT"/ 2>/dev/null; find "$SOLO_OUT" -name '*history*' 2>/dev/null)
 fi
-# Re-fetch: snapshot history <path> writes file; also try without path under VP_HARNESS_OUT
+# Re-fetch: snapshot history <path> writes file; also try without path under KNGN_HARNESS_OUT
 if [[ ! -f "$SOLO_OUT/solo-history.json" ]]; then
   drive_s "snapshot history solo-history.json" >/dev/null 2>&1 || true
 fi
-# harness writes under VP_HARNESS_OUT when relative
+# harness writes under KNGN_HARNESS_OUT when relative
 solo_json=$(cat "$SOLO_OUT/solo-history.json" 2>/dev/null || cat "$SOLO_OUT/history.json" 2>/dev/null || true)
 if [[ -z "$solo_json" ]]; then
   log "FAIL: solo history snapshot missing; out=$(ls -la "$SOLO_OUT")"
@@ -172,9 +172,9 @@ solo_pid=""
 
 # ---------------------------------------------------------------------------
 log "=== netsync history thumb E2E ==="
-host_pid=$(start_pixie "$HOST_PORT" "$HOST_OUT" VP_NETSYNC_HOST=1 VP_NETSYNC_PORT="$NETSYNC_PORT")
+host_pid=$(start_pixie "$HOST_PORT" "$HOST_OUT" KNGN_NETSYNC_HOST=1 KNGN_NETSYNC_PORT="$NETSYNC_PORT")
 wait_port "$HOST_PORT" "$host_pid"
-client_pid=$(start_pixie "$CLIENT_PORT" "$CLIENT_OUT" VP_NETSYNC_CONNECT=127.0.0.1:"$NETSYNC_PORT")
+client_pid=$(start_pixie "$CLIENT_PORT" "$CLIENT_OUT" KNGN_NETSYNC_CONNECT=127.0.0.1:"$NETSYNC_PORT")
 wait_port "$CLIENT_PORT" "$client_pid"
 
 # join

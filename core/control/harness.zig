@@ -7,10 +7,10 @@
 //! With the environment unset, every API is a no-op (matching existing behaviour exactly).
 //!
 //! ## The transports (where a command comes from)
-//! - **replay (a file)**: `VP_HARNESS_SCRIPT=<file>` is read in full, always on a manual clock. step advances a virtual frame, and EOF or quit exits automatically.
-//! - **listen (TCP loopback)**: `VP_HARNESS_LISTEN[=port]` listens on `127.0.0.1`.
+//! - **replay (a file)**: `KNGN_HARNESS_SCRIPT=<file>` is read in full, always on a manual clock. step advances a virtual frame, and EOF or quit exits automatically.
+//! - **listen (TCP loopback)**: `KNGN_HARNESS_LISTEN[=port]` listens on `127.0.0.1`.
 //!   No value, an empty value or `0` means ephemeral, and a positive value a fixed port. The default is the free-run clock (the application runs itself, with a non-blocking drain).
-//!   Adding `VP_HARNESS_MANUAL_CLOCK=1` gives the equivalent of the older step-driven behaviour (a blocking accept and read).
+//!   Adding `KNGN_HARNESS_MANUAL_CLOCK=1` gives the equivalent of the older step-driven behaviour (a blocking accept and read).
 //! - **The script format == the listen protocol**: the parser and the execution model are shared. They differ only in the source (a file or a socket) and
 //!   the clock mode (manual is driven by the gate, while free-run waits on a frame barrier or an await).
 //!
@@ -20,7 +20,7 @@
 //!   - live  : to the connection, an unprefixed protocol line `<probe> <payload>` / `<path>`
 //!
 //! ## record and replay are symmetrical
-//! Appending the commands received live to `VP_HARNESS_RECORD=<file>` gives a file that can be passed to `VP_HARNESS_SCRIPT` and replayed
+//! Appending the commands received live to `KNGN_HARNESS_RECORD=<file>` gives a file that can be passed to `KNGN_HARNESS_SCRIPT` and replayed
 //! (the grammar and the state transitions are symmetrical. `fb` is bit-deterministic under the virtual clock, while `audio` depends on real time in the RT thread and is not guaranteed bit-identical).
 //!
 //! ## What it depends on, and what it does not
@@ -157,7 +157,7 @@ var have_frame = false;
 // The most recent EventStats (pushed by present)
 var last_stats: EventStats = .{ .mouse_move_merge_count = 0, .mouse_scroll_merge_count = 0, .event_drop_count = 0 };
 
-// The null runtime query (platform settles VP_HEADLESS and exposes it as a compatibility query).
+// The null runtime query (platform settles KNGN_HEADLESS and exposes it as a compatibility query).
 // The primary framebuffer is owned by platform_null.Window; harness only hooks observation.
 var config_parsed = false;
 var pending_script_path: ?[]const u8 = null;
@@ -165,14 +165,14 @@ var pending_listen_raw: ?[]const u8 = null; // The environment value, when prese
 var pending_manual_clock = false;
 var headless_active = false;
 
-// A measurement-only mode that skips the frame copy on each present (the VP_HARNESS_SKIP_FRAME_COPY variable).
+// A measurement-only mode that skips the frame copy on each present (the KNGN_HARNESS_SKIP_FRAME_COPY variable).
 // The default is false, matching the old behaviour bit for bit. While it is on, the snapshot and digest of `fb`, `canvas` and
 // friends hold meaningless values, but `digest stats`'s frame counter still increments, so it remains usable for measuring fps.
 var skip_frame_copy = false;
 
 // The synthetic capture source: a fake mic and camera built into harness. There is no facade wiring into
 // camera.zig or audio.zig; it is self-contained within this module (the `capture` command plus the `capture` probe).
-var capture_synthetic_requested = false; // VP_HARNESS_CAPTURE_SYNTHETIC env
+var capture_synthetic_requested = false; // KNGN_HARNESS_CAPTURE_SYNTHETIC env
 var synth_video: ?capture_synthetic.SyntheticVideoDevice = null;
 var synth_audio: ?capture_synthetic.SyntheticAudioDevice = null;
 
@@ -410,7 +410,7 @@ pub const registerAction = action_registry.registerAction;
 pub const findAction = action_registry.findAction;
 pub const setActionErrorDetail = action_registry.setActionErrorDetail;
 
-/// The pure interpretation of a `VP_HARNESS_LISTEN` value (no IO; for unit testing).
+/// The pure interpretation of a `KNGN_HARNESS_LISTEN` value (no IO; for unit testing).
 /// - null = the variable is unset (do not listen)
 /// - empty or "0" = ephemeral (port=0, ok)
 /// - a positive integer = a fixed port
@@ -467,34 +467,34 @@ fn decideTransport(script: bool, listen: ListenPortParse, manual_clock: bool) Tr
 /// Called exactly once at the very start of platform.init(). It only reads the environment and causes no IO side effect (it neither reads the script nor listens)
 /// (it is split into two stages with `startTransport()` so that the transport decision is settled before
 /// whether `backend.init()` is needed).
-/// headless (`VP_HEADLESS`) is settled by platform and passed in through `setHeadlessActive` (this function does not read it).
+/// headless (`KNGN_HEADLESS`) is settled by platform and passed in through `setHeadlessActive` (this function does not read it).
 pub fn parseConfig() void {
     if (config_parsed) return;
     config_parsed = true;
 
-    pending_script_path = getEnv("VP_HARNESS_SCRIPT");
-    pending_listen_raw = getEnv("VP_HARNESS_LISTEN");
-    pending_manual_clock = if (getEnv("VP_HARNESS_MANUAL_CLOCK")) |v| std.mem.eql(u8, v, "1") else false;
-    if (getEnv("VP_HARNESS_OUT")) |d| out_dir = d;
+    pending_script_path = getEnv("KNGN_HARNESS_SCRIPT");
+    pending_listen_raw = getEnv("KNGN_HARNESS_LISTEN");
+    pending_manual_clock = if (getEnv("KNGN_HARNESS_MANUAL_CLOCK")) |v| std.mem.eql(u8, v, "1") else false;
+    if (getEnv("KNGN_HARNESS_OUT")) |d| out_dir = d;
 
-    capture_synthetic_requested = getEnv("VP_HARNESS_CAPTURE_SYNTHETIC") != null;
-    skip_frame_copy = if (getEnv("VP_HARNESS_SKIP_FRAME_COPY")) |v| std.mem.eql(u8, v, "1") else false;
+    capture_synthetic_requested = getEnv("KNGN_HARNESS_CAPTURE_SYNTHETIC") != null;
+    skip_frame_copy = if (getEnv("KNGN_HARNESS_SKIP_FRAME_COPY")) |v| std.mem.eql(u8, v, "1") else false;
 }
 
-/// The compatibility setter platform calls once it has settled `VP_HEADLESS=1`.
+/// The compatibility setter platform calls once it has settled `KNGN_HEADLESS=1`.
 /// audio, midi, capture and the rest consult it through `isHeadlessActive()`. The wasm stub is a no-op.
 pub fn setHeadlessActive(active: bool) void {
     headless_active = active;
 }
 
-/// The null runtime test (platform sets it through `setHeadlessActive`; the source of truth in the environment is `VP_HEADLESS`).
+/// The null runtime test (platform sets it through `setHeadlessActive`; the source of truth in the environment is `KNGN_HEADLESS`).
 /// Used to decide whether the facade makes a Window a null backend, and to keep audio and midi off the native path.
 pub fn isHeadlessActive() bool {
     return headless_active;
 }
 
 /// Whether the synthetic capture source (a mic or a camera) is enabled.
-/// `true` only when the `VP_HARNESS_CAPTURE_SYNTHETIC` variable is set and harness is enabled (replay or live).
+/// `true` only when the `KNGN_HARNESS_CAPTURE_SYNTHETIC` variable is set and harness is enabled (replay or live).
 /// By default (the variable unset) it is always `false` (zero regression).
 ///
 /// **A caution, and an important limitation**: `core/camera.zig` and `core/audio.zig` are not wired to this, so even
@@ -509,7 +509,7 @@ pub fn isHeadlessActive() bool {
 /// The condition for enabling it follows the same rule as the existing audio output: harness's environment read
 /// (`parseConfig()`) runs only through `platform.init()`, so in a capture-only application that never calls
 /// `platform.init()` this function always returns `false` (the same known limitation as an audio-only application
-/// such as `examples/15_audio_tone` being unable to interpret `VP_HEADLESS`).
+/// such as `examples/15_audio_tone` being unable to interpret `KNGN_HEADLESS`).
 pub fn isCaptureSyntheticActive() bool {
     return capture_synthetic_requested and isEnabled();
 }
@@ -553,7 +553,7 @@ pub fn startTransport() void {
         std.debug.print("[harness] listen failed: {s}\n", .{@errorName(err)});
         return; // left disabled
     };
-    record_path = getEnv("VP_HARNESS_RECORD");
+    record_path = getEnv("KNGN_HARNESS_RECORD");
     mode = .live;
     action_registry.setEnabled(true);
     const chosen = server.socket.address.getPort();
@@ -1016,7 +1016,7 @@ pub fn onStats(s: EventStats) void {
 }
 
 /// Called at present: takes the owned copy of the frame to settle it, and advances frame_index.
-/// With `VP_HARNESS_SKIP_FRAME_COPY=1` (the measurement-only mode) the copy is skipped and only frame_index advances
+/// With `KNGN_HARNESS_SKIP_FRAME_COPY=1` (the measurement-only mode) the copy is skipped and only frame_index advances
 /// (the snapshot and digest of fb, canvas and friends hold meaningless values, but `digest stats`'s frame, used for measuring fps, still increments).
 pub fn onPresent() void {
     if (skip_frame_copy) {
@@ -1225,7 +1225,7 @@ fn recordRequest(bytes: []const u8) void {
 }
 
 fn writePortFile(port: u16) void {
-    const path = getEnv("VP_HARNESS_PORT_FILE") orelse (std.fmt.bufPrint(&port_file_buf, "{s}/harness.port", .{out_dir}) catch return);
+    const path = getEnv("KNGN_HARNESS_PORT_FILE") orelse (std.fmt.bufPrint(&port_file_buf, "{s}/harness.port", .{out_dir}) catch return);
     var pbuf: [16]u8 = undefined;
     const txt = std.fmt.bufPrint(&pbuf, "{d}\n", .{port}) catch return;
     std.Io.Dir.cwd().writeFile(io_val, .{ .sub_path = path, .data = txt }) catch |err| {
@@ -2021,7 +2021,7 @@ fn reportAction(pass: bool, name: []const u8, msg: []const u8) void {
 //   capture audio open [sr] [ch] [hz]  # open the synthetic mic and start it at once (reopening it if it is already open)
 //   capture audio close                # close the synthetic mic (stop, join, close)
 //
-// While `isCaptureSyntheticActive()` (true only with the `VP_HARNESS_CAPTURE_SYNTHETIC` variable set and harness enabled) is
+// While `isCaptureSyntheticActive()` (true only with the `KNGN_HARNESS_CAPTURE_SYNTHETIC` variable set and harness enabled) is
 // false, everything fails fast (a warnLine only, with no state change; the same thinking as the existing handling of an
 // unknown `inject` token). There is no facade wiring into camera.zig or audio.zig (see `isCaptureSyntheticActive()`'s doc
 // comment). The implementation is delegated to `core/capture_synthetic.zig`, and what happens here is only owning the
@@ -2031,7 +2031,7 @@ fn reportAction(pass: bool, name: []const u8, msg: []const u8) void {
 // ============================================================================
 
 fn handleCapture(it: *Tok) void {
-    if (!isCaptureSyntheticActive()) return warnLine("capture: unavailable, VP_HARNESS_CAPTURE_SYNTHETIC being unset or harness disabled");
+    if (!isCaptureSyntheticActive()) return warnLine("capture: unavailable, KNGN_HARNESS_CAPTURE_SYNTHETIC being unset or harness disabled");
     const domain = it.next() orelse return warnLine("capture: video|audio is missing");
     if (std.mem.eql(u8, domain, "video")) {
         handleCaptureVideo(it);

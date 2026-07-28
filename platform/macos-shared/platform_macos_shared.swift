@@ -1,6 +1,6 @@
 import Cocoa
 import UniformTypeIdentifiers
-#if VP_ENABLE_GAMEPAD
+#if KNGN_ENABLE_GAMEPAD
 import GameController
 #endif
 
@@ -25,9 +25,9 @@ import GameController
 // ========================================
 
 let EVENT_QUEUE_SIZE = 256
-let keyTraceEnabled = ProcessInfo.processInfo.environment["VP_KEY_TRACE"] == "1"
-// Diagnostics: a trace of IME and document access as it happens (off by default; VP_IME_TRACE=1 enables it).
-let imeTraceEnabled = ProcessInfo.processInfo.environment["VP_IME_TRACE"] == "1"
+let keyTraceEnabled = ProcessInfo.processInfo.environment["KNGN_KEY_TRACE"] == "1"
+// Diagnostics: a trace of IME and document access as it happens (off by default; KNGN_IME_TRACE=1 enables it).
+let imeTraceEnabled = ProcessInfo.processInfo.environment["KNGN_IME_TRACE"] == "1"
 
 func keyTrace(_ message: String) {
     guard keyTraceEnabled else { return }
@@ -442,10 +442,10 @@ final class QuitWindowDelegate: NSObject, NSWindowDelegate {
 // ========================================
 //
 // Opt-in: the GameController framework uses the same opt-in linking as audio, and only an executable
-// that uses a gamepad (examples/22_gamepad) gets `-DVP_ENABLE_GAMEPAD` from build.zig
+// that uses a gamepad (examples/22_gamepad) gets `-DKNGN_ENABLE_GAMEPAD` from build.zig
 // (see compilePlatformLayer in build_helpers/platform.zig). In an executable without the opt-in this
 // whole block is not compiled and no GameController symbol is referenced at all (nor shown by `otool -L`).
-#if VP_ENABLE_GAMEPAD
+#if KNGN_ENABLE_GAMEPAD
 //
 // The mapping from GCController to an index (0..<PLATFORM_MAX_GAMEPADS) is held as module-level state.
 // A single window is assumed (as in the rest of the code), so a connect/disconnect event is pushed
@@ -545,7 +545,7 @@ func gamepadDetachWindow(_ handle: PlatformWindowHandle) {
         gamepadEventWindow = nil
     }
 }
-#endif // VP_ENABLE_GAMEPAD
+#endif // KNGN_ENABLE_GAMEPAD
 
 // ========================================
 // The native menu bridge
@@ -553,7 +553,7 @@ func gamepadDetachWindow(_ handle: PlatformWindowHandle) {
 //
 // The shared platform_macos_menu.m holds the NSMenu itself; this backend only pushes a
 // MENU_COMMAND onto the EventQueue and asks whether a keyEquivalent was consumed.
-#if VP_ENABLE_MENU
+#if KNGN_ENABLE_MENU
 
 @_silgen_name("platform_menu_consume_key_equivalent")
 func platform_menu_consume_key_equivalent(_ ns_event: UnsafeMutableRawPointer?) -> Bool
@@ -571,7 +571,7 @@ func platform_menu_enqueue_command(_ window: UnsafeMutableRawPointer?, _ command
     _ = handle.event_queue.push(ev)
 }
 
-#endif // VP_ENABLE_MENU
+#endif // KNGN_ENABLE_MENU
 
 // ========================================
 // The IME state, shared by both backends
@@ -1178,7 +1178,7 @@ private func createWindowImpl(width: Int32, height: Int32, title: UnsafePointer<
     // Start driving the drawing (swift: start the CADisplayLink; metal: a no-op, since isPaused is set in the factory)
     backendView.startPresentation()
 
-    #if VP_ENABLE_GAMEPAD
+    #if KNGN_ENABLE_GAMEPAD
     // Gamepads: make this window the active one and take in the controllers already connected
     gamepadAttachWindow(platformWindow)
     #endif
@@ -1296,14 +1296,14 @@ func platform_run(platformWindow: UnsafeMutableRawPointer?) -> Void {
 func platform_destroy_window(platformWindow: UnsafeMutableRawPointer?) -> Void {
     guard let platformWindow = platformWindow else { return }
 
-    #if VP_ENABLE_MENU
+    #if KNGN_ENABLE_MENU
     // menu: detach the delivery target before releasing, so a late MenuTarget action cannot use freed memory
     platform_menu_window_will_destroy(platformWindow)
     #endif
 
     // Recover the PlatformWindowHandle from the handle and release it
     let handle = Unmanaged<PlatformWindowHandle>.fromOpaque(platformWindow).takeRetainedValue()
-    #if VP_ENABLE_GAMEPAD
+    #if KNGN_ENABLE_GAMEPAD
     // gamepads: drop the reference when this window is the active one
     gamepadDetachWindow(handle)
     #endif
@@ -1348,7 +1348,7 @@ func platform_poll_events(platformWindow: UnsafeMutableRawPointer?) -> Bool {
     while let event = app.nextEvent(matching: .any, until: Date.distantPast, inMode: .default, dequeue: true) {
         // Add a keyboard event to the event queue
         if event.type == .keyDown || event.type == .keyUp {
-            #if VP_ENABLE_MENU
+            #if KNGN_ENABLE_MENU
             // Preventing a keyEquivalent from firing twice.
             // performKeyEquivalent is delegated to the shared menu TU, and once it is consumed no key_down is
             // pushed and nothing goes to the inputContext either (the same semantics as objc).
@@ -1587,7 +1587,7 @@ func platform_get_event(window: UnsafeMutableRawPointer?, event: UnsafeMutableRa
 // header), so the symbol has to be defined even in an executable without the opt-in. An always-false
 // fallback that references no GameController type is provided in the #else branch, rather than relying
 // on dead code elimination on the Zig side to avoid a link error (defensive by design).
-#if VP_ENABLE_GAMEPAD
+#if KNGN_ENABLE_GAMEPAD
 //
 // GCExtendedGamepad.buttonA/B/X/Y are already normalised by Apple by physical position (the A/B and
 // X/Y swap of a Nintendo-style controller is absorbed by the GameController framework itself), so this
@@ -1634,7 +1634,7 @@ func platform_get_gamepad_state(window: UnsafeMutableRawPointer?, index: Int32, 
 func platform_get_gamepad_state(window: UnsafeMutableRawPointer?, index: Int32, out_state: UnsafeMutablePointer<PlatformGamepadState>?) -> Bool {
     return false // the opt-in is off (no GameController type is referenced at all)
 }
-#endif // VP_ENABLE_GAMEPAD
+#endif // KNGN_ENABLE_GAMEPAD
 
 // ========================================
 // File selection dialogs

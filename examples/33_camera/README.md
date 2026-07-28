@@ -21,9 +21,9 @@ cd examples/33_camera && zig build run
 
 ```bash
 TMPD=$(mktemp -d)
-VP_HEADLESS=1 \
-  VP_HARNESS_SCRIPT=examples/33_camera/e2e.txt \
-  VP_HARNESS_OUT=$TMPD \
+KNGN_HEADLESS=1 \
+  KNGN_HARNESS_SCRIPT=examples/33_camera/e2e.txt \
+  KNGN_HARNESS_OUT=$TMPD \
   zig build run-example_33
 ```
 

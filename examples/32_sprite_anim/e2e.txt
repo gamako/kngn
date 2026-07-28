@@ -2,8 +2,8 @@
 # Preconditions: 640×360 / fixed background / deterministic draw without a fixed seed / harness virtual clock
 # Example run:
 #   TMPD=$(mktemp -d)
-#   VP_HEADLESS=1 VP_HARNESS_SCRIPT=examples/32_sprite_anim/e2e.txt \
-#     VP_HARNESS_OUT=$TMPD zig build run-example_32
+#   KNGN_HEADLESS=1 KNGN_HARNESS_SCRIPT=examples/32_sprite_anim/e2e.txt \
+#     KNGN_HARNESS_OUT=$TMPD zig build run-example_32
 
 step 1
 snapshot fb

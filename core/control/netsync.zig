@@ -130,7 +130,7 @@ pub const PeerOriginView = struct {
     active: bool,
 };
 
-/// The host's own fixed identity (peer_id=0). There is no environment variable such as `VP_NETSYNC_HOST_ACTOR`.
+/// The host's own fixed identity (peer_id=0). There is no environment variable such as `KNGN_NETSYNC_HOST_ACTOR`.
 pub const HOST_PEER_ID: u32 = 0;
 pub const HOST_ACTOR_KIND: ActorKind = .human;
 pub const HOST_LABEL: []const u8 = "host";
@@ -1600,19 +1600,19 @@ pub fn initFromEnv() void {
     const already = started or role != .disabled;
     peers_mutex.unlock(io_val);
     if (already) return;
-    const host_req = getEnv("VP_NETSYNC_HOST") != null;
-    const connect = getEnv("VP_NETSYNC_CONNECT");
+    const host_req = getEnv("KNGN_NETSYNC_HOST") != null;
+    const connect = getEnv("KNGN_NETSYNC_CONNECT");
     if (host_req and connect != null) {
-        std.debug.print("[netsync] VP_NETSYNC_HOST and VP_NETSYNC_CONNECT cannot both be given; disabling.\n", .{});
+        std.debug.print("[netsync] KNGN_NETSYNC_HOST and KNGN_NETSYNC_CONNECT cannot both be given; disabling.\n", .{});
         return;
     }
     if (host_req) {
-        const port_s = getEnv("VP_NETSYNC_PORT") orelse {
-            std.debug.print("[netsync] VP_NETSYNC_HOST=1 needs VP_NETSYNC_PORT; disabling.\n", .{});
+        const port_s = getEnv("KNGN_NETSYNC_PORT") orelse {
+            std.debug.print("[netsync] KNGN_NETSYNC_HOST=1 needs KNGN_NETSYNC_PORT; disabling.\n", .{});
             return;
         };
         const port = std.fmt.parseInt(u16, port_s, 10) catch {
-            std.debug.print("[netsync] VP_NETSYNC_PORT is invalid; disabling.\n", .{});
+            std.debug.print("[netsync] KNGN_NETSYNC_PORT is invalid; disabling.\n", .{});
             return;
         };
         initHost(port);
@@ -1620,21 +1620,21 @@ pub fn initFromEnv() void {
     }
     if (connect) |c| {
         const addr = parseConnectAddr(c) orelse {
-            std.debug.print("[netsync] VP_NETSYNC_CONNECT is invalid (expected ip:port): {s}\n", .{c});
+            std.debug.print("[netsync] KNGN_NETSYNC_CONNECT is invalid (expected ip:port): {s}\n", .{c});
             return;
         };
-        const kind = parseActorEnv(getEnv("VP_NETSYNC_ACTOR"));
-        const label = getEnv("VP_NETSYNC_LABEL") orelse default_client_label;
+        const kind = parseActorEnv(getEnv("KNGN_NETSYNC_ACTOR"));
+        const label = getEnv("KNGN_NETSYNC_LABEL") orelse default_client_label;
         setClientIdentity(kind, label);
         initClient(addr);
     }
 }
 
-/// Interprets `VP_NETSYNC_ACTOR` (the default is human; an invalid value warns and gives human). The tests call it too.
+/// Interprets `KNGN_NETSYNC_ACTOR` (the default is human; an invalid value warns and gives human). The tests call it too.
 pub fn parseActorEnv(raw: ?[]const u8) ActorKind {
     const s = raw orelse return .human;
     return ActorKind.fromToken(s) orelse {
-        std.debug.print("[netsync] VP_NETSYNC_ACTOR is invalid (expected human|agent): {s} — treating it as human\n", .{s});
+        std.debug.print("[netsync] KNGN_NETSYNC_ACTOR is invalid (expected human|agent): {s} — treating it as human\n", .{s});
         return .human;
     };
 }
@@ -6283,7 +6283,7 @@ test "netsync: an agent HELLO registers in the host's peer table with kind=agent
     try testing.expect(std.mem.indexOf(u8, snap, "\"peers\":[") != null);
 }
 
-test "netsync: setClientIdentity keeps the equivalent of VP_NETSYNC_ACTOR and VP_NETSYNC_LABEL" {
+test "netsync: setClientIdentity keeps the equivalent of KNGN_NETSYNC_ACTOR and KNGN_NETSYNC_LABEL" {
     resetForTest();
     defer resetForTest();
     const kind = parseActorEnv("agent");

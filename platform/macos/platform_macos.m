@@ -1,11 +1,11 @@
 #import <Cocoa/Cocoa.h>
 #import <QuartzCore/QuartzCore.h>
 #import <UniformTypeIdentifiers/UniformTypeIdentifiers.h>
-#if defined(VP_ENABLE_GAMEPAD)
+#if defined(KNGN_ENABLE_GAMEPAD)
 #import <GameController/GameController.h>
 #endif
 #include "platform.h"
-#if defined(VP_ENABLE_MENU)
+#if defined(KNGN_ENABLE_MENU)
 #include "macos/platform_macos_menu.h"
 #endif
 #include <math.h>
@@ -101,7 +101,7 @@ static void key_trace(const char* fmt, ...) {
     va_end(args);
 }
 
-// Diagnostics: a trace of IME and document access as it happens (off by default; VP_IME_TRACE=1 enables it).
+// Diagnostics: a trace of IME and document access as it happens (off by default; KNGN_IME_TRACE=1 enables it).
 static void ime_trace(const char* fmt, ...) {
     if (!g_ime_trace_enabled) return;
     va_list args;
@@ -137,10 +137,10 @@ static void ime_preview_utf8(const char* s, char* out, size_t cap) {
 // ========================================
 //
 // Opt-in: the GameController framework uses the same opt-in linking as audio, and only an executable
-// that uses a gamepad (examples/22_gamepad) gets `-DVP_ENABLE_GAMEPAD` from build.zig
+// that uses a gamepad (examples/22_gamepad) gets `-DKNGN_ENABLE_GAMEPAD` from build.zig
 // (see compilePlatformLayer in build_helpers/platform.zig). In an executable without the opt-in this
 // whole block is not compiled and no GameController symbol is referenced at all (nor shown by `otool -L`).
-#if defined(VP_ENABLE_GAMEPAD)
+#if defined(KNGN_ENABLE_GAMEPAD)
 //
 // Holds the mapping from GCController to an index (0..PLATFORM_MAX_GAMEPADS-1). Under ARC a strong
 // array is fine (the GameController framework retains the GCController itself while it is connected).
@@ -254,9 +254,9 @@ static void gamepadDetachWindow(PlatformWindow* window) {
         g_gamepad_event_window = NULL;
     }
 }
-#endif // VP_ENABLE_GAMEPAD
+#endif // KNGN_ENABLE_GAMEPAD
 
-#if defined(VP_ENABLE_MENU)
+#if defined(KNGN_ENABLE_MENU)
 // The bridge from the shared menu TU. Pushes a MENU_COMMAND onto the objc EventQueue.
 void platform_menu_enqueue_command(PlatformWindow* window, uint32_t command_id) {
     if (!window) return;
@@ -1860,9 +1860,9 @@ static PlatformKeyCode mapKeyCodeToPlatform(unsigned short keyCode) {
 
 // Platform initialisation
 bool platform_init(void) {
-    const char* trace = getenv("VP_KEY_TRACE");
+    const char* trace = getenv("KNGN_KEY_TRACE");
     g_key_trace_enabled = trace && strcmp(trace, "1") == 0;
-    const char* ime = getenv("VP_IME_TRACE");
+    const char* ime = getenv("KNGN_IME_TRACE");
     g_ime_trace_enabled = ime && strcmp(ime, "1") == 0;
     return true;
 }
@@ -1988,7 +1988,7 @@ PlatformWindow* platform_create_window_ex(int width, int height, const char* tit
         [platformWindow->view startDisplayLink];
     }
 
-#if defined(VP_ENABLE_GAMEPAD)
+#if defined(KNGN_ENABLE_GAMEPAD)
     // Gamepads: make this window the active one and take in the controllers already connected
     gamepadAttachWindow(platformWindow);
 #endif
@@ -2126,11 +2126,11 @@ void platform_run(PlatformWindow* platformWindow) {
 void platform_destroy_window(PlatformWindow* platformWindow) {
     if (!platformWindow) return;
 
-#if defined(VP_ENABLE_MENU)
+#if defined(KNGN_ENABLE_MENU)
     // menu: detach the delivery target before releasing, so a late MenuTarget action cannot use freed memory
     platform_menu_window_will_destroy(platformWindow);
 #endif
-#if defined(VP_ENABLE_GAMEPAD)
+#if defined(KNGN_ENABLE_GAMEPAD)
     // gamepads: drop the reference when this window is the active one
     gamepadDetachWindow(platformWindow);
 #endif
@@ -2183,7 +2183,7 @@ bool platform_poll_events(PlatformWindow* platformWindow) {
                                            dequeue:YES])) {
             // Add a keyboard event to the event queue
             if (event.type == NSEventTypeKeyDown || event.type == NSEventTypeKeyUp) {
-#if defined(VP_ENABLE_MENU)
+#if defined(KNGN_ENABLE_MENU)
                 // Preventing a keyEquivalent from firing twice:
                 // this loop does not [NSApp sendEvent:] a key event but pushes it straight onto the C event queue,
                 // so AppKit's standard sendEvent → mainMenu performKeyEquivalent path is never taken.
@@ -2402,7 +2402,7 @@ bool platform_get_event(PlatformWindow* window, PlatformEvent* event) {
 // to be defined even in an executable without the opt-in. An always-false fallback that references
 // no GameController type is provided in the #else branch, rather than relying on dead code
 // elimination on the Zig side to avoid a link error (defensive by design).
-#if defined(VP_ENABLE_GAMEPAD)
+#if defined(KNGN_ENABLE_GAMEPAD)
 //
 // GCExtendedGamepad.buttonA/B/X/Y are already normalised by Apple by physical position (the A/B and
 // X/Y swap of a Nintendo-style controller is absorbed by the GameController framework itself; Apple's
@@ -2454,7 +2454,7 @@ bool platform_get_gamepad_state(PlatformWindow* window, int index, PlatformGamep
     (void)out_state;
     return false; // the opt-in is off (no GameController type is referenced at all)
 }
-#endif // VP_ENABLE_GAMEPAD
+#endif // KNGN_ENABLE_GAMEPAD
 
 // ========================================
 // File selection dialogs

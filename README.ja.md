@@ -9,7 +9,7 @@
 
 <!-- TODO: ヒーロー画像。
      「AI が pixie で線を 1 本引いた」だけでは絵として弱いので、題材から別途考える。
-     harness で headless 撮影できる（VP_HEADLESS=1 + snapshot fb）ので、
+     harness で headless 撮影できる（KNGN_HEADLESS=1 + snapshot fb）ので、
      決まればスクリプト 1 本で撮れる。 -->
 
 エージェントは Web アプリなら自分の仕事を確認できます。DOM という既製の観測対象があり、
@@ -49,19 +49,19 @@ snapshot fb /tmp/out.png
 quit
 EOF
 
-VP_APPSHELL_DIR=/tmp/kngn-demo VP_HEADLESS=1 VP_HARNESS_SCRIPT=/tmp/script.txt zig build run-pixie
+KNGN_APPSHELL_DIR=/tmp/kngn-demo KNGN_HEADLESS=1 KNGN_HARNESS_SCRIPT=/tmp/script.txt zig build run-pixie
 # → /tmp/out.png に描画結果。digest canvas の 1 行はそのまま assert に使える
-#   VP_APPSHELL_DIR でアプリ状態を隔離しているので、同じビルドなら PNG はビット単位で再現する
+#   KNGN_APPSHELL_DIR でアプリ状態を隔離しているので、同じビルドなら PNG はビット単位で再現する
 ```
 
-`set_tool` と `VP_APPSHELL_DIR` は決定性のためです。前者はツール状態を、後者は保存された
+`set_tool` と `KNGN_APPSHELL_DIR` は決定性のためです。前者はツール状態を、後者は保存された
 ウィンドウサイズやパネル配置を固定します。どちらも省くと、手元の pixie の状態次第で絵が変わります。
 
 同じアプリを MCP サーバーとして立てれば、エージェントの道具になります。
 
 ```bash
 zig build mcp                                   # → zig-out/bin/vp-mcp
-VP_HEADLESS=1 VP_HARNESS_LISTEN= VP_HARNESS_PORT_FILE=/tmp/vp.port zig build run-pixie &
+KNGN_HEADLESS=1 KNGN_HARNESS_LISTEN= KNGN_HARNESS_PORT_FILE=/tmp/vp.port zig build run-pixie &
 zig-out/bin/vp-mcp --port-file /tmp/vp.port     # stdio JSON-RPC
 ```
 
@@ -101,10 +101,10 @@ KNGN はそれを WebView なしでやります。ただし**タダではあり�
 - ピーク RSS 34.4 MB
 
 > MacBook Pro (Apple M1 Max, 10-core, 64 GB) / macOS 26.5 / ReleaseFast / Metal バックエンド。
-> `VP_APPSHELL_DIR` でアプリ状態を隔離した既定ウィンドウ（780×600）で、warm 20 回の平均。
+> `KNGN_APPSHELL_DIR` でアプリ状態を隔離した既定ウィンドウ（780×600）で、warm 20 回の平均。
 > 初回のみページキャッシュミスで 0.6 s。**数字はウィンドウサイズと保存済み状態に依存します**
 > — 復元された大きなウィンドウでは PNG も RSS も増えます。
-> ヘッドレスでは `VP_HEADLESS=1` が backend の初期化ごと飛ばすので、**時間も RSS も backend に
+> ヘッドレスでは `KNGN_HEADLESS=1` が backend の初期化ごと飛ばすので、**時間も RSS も backend に
 > ほとんど依存しません**（objc でも 102 ms / 34.3 MB。違うのはバイナリサイズだけで objc は 2.4 MB）。
 
 **ジッタ**は測定値ではなく契約の話です。Zig のランタイムに tracing GC はなく、リアルタイム音声の
@@ -182,7 +182,7 @@ pub fn main() !void {
 ```
 KNGN (https://github.com/gamako/video-proto-main) を使ってデスクトップアプリを作って。
 まず AGENT.md と docs/harness.md を読んで、kit だけを import すること。
-実装したら VP_HEADLESS=1 + VP_HARNESS_SCRIPT でヘッドレス実行して、
+実装したら KNGN_HEADLESS=1 + KNGN_HARNESS_SCRIPT でヘッドレス実行して、
 snapshot fb で PNG を撮って、自分で見て確認してから報告して。
 ```
 
@@ -247,7 +247,7 @@ apps  →  kit  →  libs  →  core  →  platform      （一方向依存。bu
   `inject key_down Z cmd` で undo できる**。
 - **構造化エラー** — 失敗時に `code=file_not_found next=check path or use save first` のような
   自己回復ヒントを返せる。エージェントが次の手を選べる。
-- **完全ディスプレイレス** — `VP_HEADLESS=1` で `platform.init()` がネイティブ初期化ごと飛ばし、
+- **完全ディスプレイレス** — `KNGN_HEADLESS=1` で `platform.init()` がネイティブ初期化ごと飛ばし、
   実行時に null バックエンドを選ぶ。CI でもコンテナでも動く。
 - **決定論と記録** — シードの規約と recipe（コマンド列の保存・再生）があるので、
   同じ入力から同じ出力が再現できる。record → replay 対称。

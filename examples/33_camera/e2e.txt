@@ -3,9 +3,9 @@
 # CRC oracle is the aarch64-darwin capture. Re-capture on other platforms if it diverges.
 # Example run:
 #   TMPD=$(mktemp -d)
-#   VP_HEADLESS=1 VP_HARNESS_SCRIPT=examples/33_camera/e2e.txt \
-#     VP_HARNESS_OUT=$TMPD zig build run-example_33
-# snapshot with path omitted → $VP_HARNESS_OUT/frame_<n>.png (do not leave PNGs in the repo)
+#   KNGN_HEADLESS=1 KNGN_HARNESS_SCRIPT=examples/33_camera/e2e.txt \
+#     KNGN_HARNESS_OUT=$TMPD zig build run-example_33
+# snapshot with path omitted → $KNGN_HARNESS_OUT/frame_<n>.png (do not leave PNGs in the repo)
 
 # --- 1. Initial view (checkerboard + marker sprite) ---
 step 1

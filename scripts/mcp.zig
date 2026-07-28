@@ -1,6 +1,6 @@
 //! vp-mcp: harness listen TCP ↔ stdio MCP server.
 //!
-//! Attach to a running app (`VP_HARNESS_LISTEN`) and build MCP tools dynamically from capabilities.
+//! Attach to a running app (`KNGN_HARNESS_LISTEN`) and build MCP tools dynamically from capabilities.
 //! Pure std + `std.Io.net` only (no platform/audio dependency, no module import).
 //!
 //! Usage:
@@ -55,14 +55,14 @@ pub fn main(init: std.process.Init) !void {
 
     const port: u16 = port_opt orelse blk: {
         if (port_file) |pf| break :blk try readPortFile(io, gpa, pf);
-        if (init.environ_map.get("VP_HARNESS_LISTEN")) |pe| {
+        if (init.environ_map.get("KNGN_HARNESS_LISTEN")) |pe| {
             const trimmed = std.mem.trim(u8, pe, " \t");
             if (trimmed.len > 0 and !std.mem.eql(u8, trimmed, "0")) {
-                break :blk std.fmt.parseInt(u16, trimmed, 10) catch return die("VP_HARNESS_LISTEN value is invalid\n");
+                break :blk std.fmt.parseInt(u16, trimmed, 10) catch return die("KNGN_HARNESS_LISTEN value is invalid\n");
             }
         }
-        if (init.environ_map.get("VP_HARNESS_PORT_FILE")) |pf| break :blk try readPortFile(io, gpa, pf);
-        return die("port is unknown (set one of --port / --port-file / VP_HARNESS_LISTEN / VP_HARNESS_PORT_FILE)\n");
+        if (init.environ_map.get("KNGN_HARNESS_PORT_FILE")) |pf| break :blk try readPortFile(io, gpa, pf);
+        return die("port is unknown (set one of --port / --port-file / KNGN_HARNESS_LISTEN / KNGN_HARNESS_PORT_FILE)\n");
     };
 
     const out_arg = out_opt orelse blk: {
@@ -971,7 +971,7 @@ fn handleToolsCall(session: *Session, msg_gpa: std.mem.Allocator, id: json.Value
     if (tool.kind == .snapshot) {
         const first = firstLineOf(trimmed);
         if (!std.fs.path.isAbsolute(first)) {
-            return try errorResponse(msg_gpa, id, -32000, "snapshot path is not absolute; set VP_HARNESS_OUT / --out correctly and restart vp-mcp");
+            return try errorResponse(msg_gpa, id, -32000, "snapshot path is not absolute; set KNGN_HARNESS_OUT / --out correctly and restart vp-mcp");
         }
         return try toolResultResponse(msg_gpa, id, first, false);
     }

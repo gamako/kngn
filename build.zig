@@ -458,7 +458,7 @@ pub fn build(b: *std.Build) void {
                 addRunStep(
                     b,
                     "run-example_20",
-                    "Run 20_capture_demo example (uses -Dplatform option; set VP_HARNESS_CAPTURE_SYNTHETIC=1 + VP_HEADLESS=1 for headless synthetic mic/camera verification)",
+                    "Run 20_capture_demo example (uses -Dplatform option; set KNGN_HARNESS_CAPTURE_SYNTHETIC=1 + KNGN_HEADLESS=1 for headless synthetic mic/camera verification)",
                     capture_demo_exe,
                     b.args,
                 );
@@ -621,7 +621,7 @@ pub fn build(b: *std.Build) void {
     // modules (makePlatformModules), so they are unaffected. Address when demand appears.
     // ========================================
     if (target_os == .macos) {
-        // enable_gamepad_ext aligns VP_ENABLE_GAMEPAD on the native archive with the platform module.
+        // enable_gamepad_ext aligns KNGN_ENABLE_GAMEPAD on the native archive with the platform module.
         // GameController framework linking stays on the consumer side (explicit on the exe when enabled).
         _ = addPlatformNativeLib(b, target, optimize, platform_root, .objc, "platform_native_objc", enable_gamepad_ext);
         _ = addPlatformNativeLib(b, target, optimize, platform_root, .swift, "platform_native_swift", enable_gamepad_ext);
@@ -728,7 +728,7 @@ pub fn build(b: *std.Build) void {
     platform_null_test_mod.addImport("command_types", shared_modules.command_types.mod);
     const platform_null_test = b.addTest(.{ .root_module = platform_null_test_mod });
     const run_platform_null_test = b.addRunArtifact(platform_null_test);
-    const test_platform_null_step = b.step("test-platform-null", "Run platform_null (VP_HEADLESS) unit tests");
+    const test_platform_null_step = b.step("test-platform-null", "Run platform_null (KNGN_HEADLESS) unit tests");
     test_platform_null_step.dependOn(&run_platform_null_test.step);
 
     const platform_clipboard_test_mod = b.createModule(.{
@@ -2979,7 +2979,7 @@ fn addPixieExe(
         }),
     });
     // apps are kit-only consumers (R5). paint is an editor-family shared lib (not in kit; in flux) and is direct-imported.
-    // Native menu opt-in: kit_menu (enable_menu=true) + shared menu.m (-DVP_ENABLE_MENU).
+    // Native menu opt-in: kit_menu (enable_menu=true) + shared menu.m (-DKNGN_ENABLE_MENU).
     // Shared across macOS objc/swift/metal. Do not change the enable_menu default of false.
     const root = appRoot(exe, "pixie");
     link(root, pm.kit_menu);
@@ -3109,7 +3109,7 @@ fn addCaptureDemoExe(
     exe.root_module.addImport("harness", common.harness.mod); // for isCaptureSyntheticActive()
     exe.root_module.addImport("camera", common.camera.mod); // Real camera capture (macOS implementation / stub elsewhere)
     exe.root_module.addImport("audio", common.audio.mod); // Real mic capture extension (via audio.zig)
-    exe.root_module.addImport("capture_synthetic", common.capture_synthetic.mod); // Harness-built-in synthetic source (only when VP_HARNESS_CAPTURE_SYNTHETIC=1)
+    exe.root_module.addImport("capture_synthetic", common.capture_synthetic.mod); // Harness-built-in synthetic source (only when KNGN_HARNESS_CAPTURE_SYNTHETIC=1)
     exe.root_module.addImport("spectrogram", common.spectrogram.mod);
     exe.root_module.addImport("scope", common.scope.mod);
     exe.root_module.addImport("synth", common.synth.mod); // SampleTap (lock-free mic-capture-callback → main-thread visualization handoff)
@@ -3257,7 +3257,7 @@ fn addPlatformNativeLib(
     // Gamepad opt-in for the external-consumer native archive.
     // Same boolean as build_options.enable_gamepad on the SharedModules public "platform".
     // The archive is .o only and does not include the GameController framework (consumer exe links it).
-    // When enable_gamepad=true, -DVP_ENABLE_GAMEPAD is passed to .m/.swift and the real backend is enabled.
+    // When enable_gamepad=true, -DKNGN_ENABLE_GAMEPAD is passed to .m/.swift and the real backend is enabled.
     const compiled = platform.compilePlatformLayer(b, platform_type, optimize, platform_root, .{
         .enable_gamepad = enable_gamepad,
     });

@@ -155,7 +155,7 @@ harness's own `capture` command and `capture` probe** (see [harness.md](harness.
 
 **The facades are not wired to it.** Each facade verb tests
 `harness.isCaptureSyntheticActive()` at its head — which holds when
-`VP_HARNESS_CAPTURE_SYNTHETIC` is set and the harness is enabled — and that branch
+`KNGN_HARNESS_CAPTURE_SYNTHETIC` is set and the harness is enabled — and that branch
 returns `error.Unsupported`. So `camera.open()` and `audio.openCapture()` never reach the
 synthetic source, and a real backend is bypassed without a substitute. What this facade fixes
 is the branch point and its name, nothing more.

@@ -9,7 +9,7 @@
 
 <!-- TODO: hero image. "an AI drew one stroke in pixie" is too weak a picture on its own,
      so the subject needs thought. The harness can capture it headlessly
-     (VP_HEADLESS=1 plus snapshot fb), so once the subject is settled it is one script. -->
+     (KNGN_HEADLESS=1 plus snapshot fb), so once the subject is settled it is one script. -->
 
 An agent can check its own work when it builds a web app. The DOM is a ready-made thing to
 observe, and headless browsers and screenshots are standard equipment. A native app has
@@ -51,12 +51,12 @@ snapshot fb /tmp/out.png
 quit
 EOF
 
-VP_APPSHELL_DIR=/tmp/kngn-demo VP_HEADLESS=1 VP_HARNESS_SCRIPT=/tmp/script.txt zig build run-pixie
+KNGN_APPSHELL_DIR=/tmp/kngn-demo KNGN_HEADLESS=1 KNGN_HARNESS_SCRIPT=/tmp/script.txt zig build run-pixie
 # → the drawing lands in /tmp/out.png, and the one line from digest canvas asserts directly.
-#   VP_APPSHELL_DIR isolates the application state, so the same build reproduces the PNG bit for bit.
+#   KNGN_APPSHELL_DIR isolates the application state, so the same build reproduces the PNG bit for bit.
 ```
 
-`set_tool` and `VP_APPSHELL_DIR` are there for determinism: the first pins the tool
+`set_tool` and `KNGN_APPSHELL_DIR` are there for determinism: the first pins the tool
 state, the second pins the saved window size and panel layout. Leave either out and the
 picture depends on whatever state your own pixie happens to hold.
 
@@ -64,7 +64,7 @@ Stand the same application up as an MCP server and it becomes a tool for an agen
 
 ```bash
 zig build mcp                                   # → zig-out/bin/vp-mcp
-VP_HEADLESS=1 VP_HARNESS_LISTEN= VP_HARNESS_PORT_FILE=/tmp/vp.port zig build run-pixie &
+KNGN_HEADLESS=1 KNGN_HARNESS_LISTEN= KNGN_HARNESS_PORT_FILE=/tmp/vp.port zig build run-pixie &
 zig-out/bin/vp-mcp --port-file /tmp/vp.port     # stdio JSON-RPC
 ```
 
@@ -110,9 +110,9 @@ selection, bezier, undo, PNG in and out):
 
 > MacBook Pro (Apple M1 Max, 10-core, 64 GB) / macOS 26.5 / ReleaseFast / Metal backend.
 > Averaged over 20 warm runs at the default window size (780×600), with the application
-> state isolated through `VP_APPSHELL_DIR`. The first run costs 0.6 s to page-cache
+> state isolated through `KNGN_APPSHELL_DIR`. The first run costs 0.6 s to page-cache
 > misses. **The numbers depend on window size and saved state** — a restored large window
-> grows both the PNG and the RSS. In headless mode `VP_HEADLESS=1` skips backend
+> grows both the PNG and the RSS. In headless mode `KNGN_HEADLESS=1` skips backend
 > initialisation altogether, so **time and RSS barely depend on the backend** (objc gives
 > 102 ms and 34.3 MB too; only the binary differs, at 2.4 MB).
 
@@ -197,7 +197,7 @@ how to use the harness are all in there.
 ```
 Build me a desktop app using KNGN (https://github.com/gamako/video-proto-main).
 Read AGENT.md and docs/harness.md first, and import only kit.
-Once it is implemented, run it headlessly with VP_HEADLESS=1 and VP_HARNESS_SCRIPT,
+Once it is implemented, run it headlessly with KNGN_HEADLESS=1 and KNGN_HARNESS_SCRIPT,
 take a PNG with snapshot fb, look at it yourself, and report only after you have checked.
 ```
 
@@ -266,7 +266,7 @@ build with a panic** on a reverse dependency or a skipped layer.
 - **Structured errors** — a failure can carry a self-recovery hint such as
   `code=file_not_found next=check path or use save first`, letting an agent pick its next
   move.
-- **Fully display-less** — `VP_HEADLESS=1` makes `platform.init()` skip native
+- **Fully display-less** — `KNGN_HEADLESS=1` makes `platform.init()` skip native
   initialisation entirely and select a null backend at runtime. It runs in CI and in a
   container.
 - **Determinism and recording** — a seed convention and recipes (saving and replaying a

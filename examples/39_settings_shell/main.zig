@@ -738,8 +738,8 @@ pub fn main(init: std.process.Init) !void {
     try platform.init();
     defer platform.shutdown();
 
-    const screen_w = parseDim(envSlice("VP_GUI_WIDTH"), DEFAULT_W, "VP_GUI_WIDTH");
-    const screen_h = parseDim(envSlice("VP_GUI_HEIGHT"), DEFAULT_H, "VP_GUI_HEIGHT");
+    const screen_w = parseDim(envSlice("KNGN_GUI_WIDTH"), DEFAULT_W, "KNGN_GUI_WIDTH");
+    const screen_h = parseDim(envSlice("KNGN_GUI_HEIGHT"), DEFAULT_H, "KNGN_GUI_HEIGHT");
 
     var window = try platform.Window.create(screen_w, screen_h, "Settings Shell");
     defer window.destroy();

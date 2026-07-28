@@ -1,7 +1,7 @@
 # E2E: integrated minigame capstone (climb playability)
 # Preconditions: 640×360 / FixedTimeStep 60Hz / harness virtual clock / objc
 # CRC oracle is the aarch64-darwin capture. Re-capture on other platforms if it diverges.
-# snapshot fb with path omitted → $VP_HARNESS_OUT/frame_<n>.png
+# snapshot fb with path omitted → $KNGN_HARNESS_OUT/frame_<n>.png
 # audio: silent=0 only (onsets checked in live smoke)
 # Platforms: floor top=336(y=322) / P1 top=272(y=258) / P2 top=208(y=194) / P3 top=144(y=130).
 # JUMP_V=-8.0. Climb the left-to-right stepped platforms one arc-jump at a time (give steps enough margin to land).

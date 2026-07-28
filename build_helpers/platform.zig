@@ -232,7 +232,7 @@ fn generateXdgDecorationPrivateCode(b: *std.Build) std.Build.LazyPath {
 /// Each example's build.zig only needs this one call for all platform setup.
 ///
 /// `features`: macOS-backend opt-in (gamepad=GameController / menu=NSMenu).
-/// Only true flags pass `-DVP_ENABLE_*` into the .o compile. Ignored on Linux/Windows backends.
+/// Only true flags pass `-DKNGN_ENABLE_*` into the .o compile. Ignored on Linux/Windows backends.
 pub fn setupExecutableForPlatform(
     b: *std.Build,
     exe: *std.Build.Step.Compile,
@@ -357,11 +357,11 @@ pub const StandaloneSpec = struct {
     /// Enable the real gamepad backend (GameController framework; meaningful on macOS only)
     /// (opt-in, symmetric with `link_audio`). When true, platform module
     /// `build_options.enable_gamepad` is true, the macOS backend .o compile also gets
-    /// `-DVP_ENABLE_GAMEPAD`, and GameController is linked. Default false
+    /// `-DKNGN_ENABLE_GAMEPAD`, and GameController is linked. Default false
     /// (existing standalone exes unchanged). Only examples/22_gamepad opts in.
     link_gamepad: bool = false,
     /// Native menu (NSMenu; shared across macOS objc/swift/metal). When true,
-    /// `build_options.enable_menu` + shared `platform_macos_menu.m` (`-DVP_ENABLE_MENU`).
+    /// `build_options.enable_menu` + shared `platform_macos_menu.m` (`-DKNGN_ENABLE_MENU`).
     /// Default false. Only pixie opts in.
     link_menu: bool = false,
     /// png module (libs/png). **If the caller builds png and passes png-dependent modules (sprite/core, …) in `extra`,
@@ -708,9 +708,9 @@ pub const PlatformCompileResult = struct {
 /// `platform_root` is a LazyPath to the `platform/` directory.
 /// Parent project: `b.path("platform")`; examples:
 /// `b.path("../../platform")`.
-/// `features`: only true flags pass `-DVP_ENABLE_*` into the .o compile (gamepad/menu opt-in).
+/// `features`: only true flags pass `-DKNGN_ENABLE_*` into the .o compile (gamepad/menu opt-in).
 /// When enable_menu=true, also compile shared `platform_macos_menu.m` and return it.
-/// .m/.swift sources gate on `#if defined(VP_ENABLE_GAMEPAD)` / `#if defined(VP_ENABLE_MENU)`.
+/// .m/.swift sources gate on `#if defined(KNGN_ENABLE_GAMEPAD)` / `#if defined(KNGN_ENABLE_MENU)`.
 pub fn compilePlatformLayer(
     b: *std.Build,
     platform_type: PlatformType,
@@ -749,7 +749,7 @@ fn buildMenuObject(
         "objective-c",
     });
     compile_cmd.addPrefixedDirectoryArg("-I", platform_root);
-    compile_cmd.addArg("-DVP_ENABLE_MENU");
+    compile_cmd.addArg("-DKNGN_ENABLE_MENU");
     compile_cmd.addArgs(&.{
         "-fobjc-arc",
         objcOptFlag(optimize),
@@ -798,11 +798,11 @@ fn buildObjC(
         "objective-c",
     });
     compile_cmd.addPrefixedDirectoryArg("-I", platform_root);
-    // Gamepad opt-in. Enables `#if defined(VP_ENABLE_GAMEPAD)` in platform_macos.m.
-    if (features.enable_gamepad) compile_cmd.addArg("-DVP_ENABLE_GAMEPAD");
-    // Native menu opt-in. `-DVP_ENABLE_MENU` for bridge + poll consumption.
+    // Gamepad opt-in. Enables `#if defined(KNGN_ENABLE_GAMEPAD)` in platform_macos.m.
+    if (features.enable_gamepad) compile_cmd.addArg("-DKNGN_ENABLE_GAMEPAD");
+    // Native menu opt-in. `-DKNGN_ENABLE_MENU` for bridge + poll consumption.
     // NSMenu body lives in shared platform_macos_menu.m (added by makeCompileResult).
-    if (features.enable_menu) compile_cmd.addArg("-DVP_ENABLE_MENU");
+    if (features.enable_menu) compile_cmd.addArg("-DKNGN_ENABLE_MENU");
     compile_cmd.addArgs(&.{
         "-fobjc-arc",
         objcOptFlag(optimize),
@@ -838,12 +838,12 @@ fn buildSwift(
         "-framework",
         "QuartzCore",
     });
-    // Gamepad opt-in. Enables `#if VP_ENABLE_GAMEPAD` in shared platform_macos_shared.swift.
+    // Gamepad opt-in. Enables `#if KNGN_ENABLE_GAMEPAD` in shared platform_macos_shared.swift.
     // `-import-objc-header` takes the next token as the bridging-header path, so place the define before it
-    // (otherwise `-import-objc-header` would consume `-DVP_ENABLE_GAMEPAD` as a path).
-    if (features.enable_gamepad) compile_cmd.addArg("-DVP_ENABLE_GAMEPAD");
+    // (otherwise `-import-objc-header` would consume `-DKNGN_ENABLE_GAMEPAD` as a path).
+    if (features.enable_gamepad) compile_cmd.addArg("-DKNGN_ENABLE_GAMEPAD");
     // Native menu opt-in. Bridge + poll consumption; body is shared menu.m.
-    if (features.enable_menu) compile_cmd.addArg("-DVP_ENABLE_MENU");
+    if (features.enable_menu) compile_cmd.addArg("-DKNGN_ENABLE_MENU");
     compile_cmd.addArg("-import-objc-header");
     compile_cmd.addFileArg(platform_root.path(b, "platform.h"));
     compile_cmd.addArgs(&.{ "-c", "-o" });
@@ -880,11 +880,11 @@ fn buildMetal(
         "-framework",
         "MetalKit",
     });
-    // Gamepad opt-in. Enables `#if VP_ENABLE_GAMEPAD` in shared platform_macos_shared.swift.
+    // Gamepad opt-in. Enables `#if KNGN_ENABLE_GAMEPAD` in shared platform_macos_shared.swift.
     // `-import-objc-header` takes the next token as the bridging-header path, so place the define before it.
-    if (features.enable_gamepad) compile_cmd.addArg("-DVP_ENABLE_GAMEPAD");
+    if (features.enable_gamepad) compile_cmd.addArg("-DKNGN_ENABLE_GAMEPAD");
     // Native menu opt-in. Bridge + poll consumption; body is shared menu.m.
-    if (features.enable_menu) compile_cmd.addArg("-DVP_ENABLE_MENU");
+    if (features.enable_menu) compile_cmd.addArg("-DKNGN_ENABLE_MENU");
     compile_cmd.addArg("-import-objc-header");
     compile_cmd.addFileArg(platform_root.path(b, "platform.h"));
     compile_cmd.addArgs(&.{ "-c", "-o" });

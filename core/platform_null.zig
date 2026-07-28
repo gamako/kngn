@@ -1,7 +1,7 @@
 //! The null platform backend
 //!
 //! An "invisible window" with no display, no compositor, no GPU and no OS window at all.
-//! The facade picks it at runtime when `VP_HEADLESS=1`. The primary framebuffer is owned by
+//! The facade picks it at runtime when `KNGN_HEADLESS=1`. The primary framebuffer is owned by
 //! `Window`, and the harness only takes observation copies (onLock/onPresent).
 //!
 //! Hot path declaration:

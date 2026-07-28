@@ -1,12 +1,12 @@
 //! drive: CLI driver for the headless harness listen transport (TCP loopback).
 //!
 //! Send one request and get one response against a background app listening on
-//! `VP_HARNESS_LISTEN[=port]`. State lives in the app process (connections are disposable).
+//! `KNGN_HARNESS_LISTEN[=port]`. State lives in the app process (connections are disposable).
 //!
 //! Usage:
 //!   drive --port 54321 'inject key_down A; step 3; digest fb'
 //!   drive --port-file /tmp/vp.port 'step 1; digest fb'
-//!   (when --port / --port-file are omitted, read env VP_HARNESS_LISTEN (positive port) / VP_HARNESS_PORT_FILE)
+//!   (when --port / --port-file are omitted, read env KNGN_HARNESS_LISTEN (positive port) / KNGN_HARNESS_PORT_FILE)
 //!
 //! The command string is the remaining args joined with spaces. The harness splits on `;` / newlines into multiple commands.
 //! After send, half-close the write side and print the response (digest text / snapshot path) to stdout, then exit.
@@ -42,17 +42,17 @@ pub fn main(init: std.process.Init) !void {
     }
     if (cmd.items.len == 0) return die("missing command string (example: drive --port-file /tmp/vp.port 'step 1; digest fb')\n");
 
-    // port resolution: --port > --port-file > env VP_HARNESS_LISTEN (positive) > env VP_HARNESS_PORT_FILE
+    // port resolution: --port > --port-file > env KNGN_HARNESS_LISTEN (positive) > env KNGN_HARNESS_PORT_FILE
     const port: u16 = port_opt orelse blk: {
         if (port_file) |pf| break :blk try readPortFile(io, gpa, pf);
-        if (init.environ_map.get("VP_HARNESS_LISTEN")) |pe| {
+        if (init.environ_map.get("KNGN_HARNESS_LISTEN")) |pe| {
             const trimmed = std.mem.trim(u8, pe, " \t");
             if (trimmed.len > 0 and !std.mem.eql(u8, trimmed, "0")) {
-                break :blk std.fmt.parseInt(u16, trimmed, 10) catch return die("VP_HARNESS_LISTEN value is invalid\n");
+                break :blk std.fmt.parseInt(u16, trimmed, 10) catch return die("KNGN_HARNESS_LISTEN value is invalid\n");
             }
         }
-        if (init.environ_map.get("VP_HARNESS_PORT_FILE")) |pf| break :blk try readPortFile(io, gpa, pf);
-        return die("port is unknown (set one of --port / --port-file / VP_HARNESS_LISTEN / VP_HARNESS_PORT_FILE)\n");
+        if (init.environ_map.get("KNGN_HARNESS_PORT_FILE")) |pf| break :blk try readPortFile(io, gpa, pf);
+        return die("port is unknown (set one of --port / --port-file / KNGN_HARNESS_LISTEN / KNGN_HARNESS_PORT_FILE)\n");
     };
 
     // connect → send → write half-close → receive response → stdout

@@ -1,5 +1,5 @@
 # input/state torture
-# Launch: VP_GUI_TORTURE_CASE=input_state
+# Launch: KNGN_GUI_TORTURE_CASE=input_state
 # Coords measured with unshifted pad_top=12 (slider knob @ value0)
 step 4
 digest layout

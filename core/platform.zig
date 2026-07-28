@@ -16,11 +16,11 @@
 //!   - `nextEvent`  = injected events (and from native, only quit passes through)
 //!   - `present`    = the `fb` probe capture (an owned copy)
 //!   - `getTime`    = the virtual clock
-//! With env `VP_HARNESS_SCRIPT` unset every hook passes straight through (behaviour is identical).
+//! With env `KNGN_HARNESS_SCRIPT` unset every hook passes straight through (behaviour is identical).
 //!
 //! ## Fully display-less (the platform/null backend)
 //!
-//! With `VP_HEADLESS=1` the facade picks `platform_null` at runtime and never calls the native
+//! With `KNGN_HEADLESS=1` the facade picks `platform_null` at runtime and never calls the native
 //! backend's `init` or connects to a display. The primary framebuffer is owned by the null `Window`,
 //! and the harness only takes observation copies (`onLock`/`onPresent`). SCRIPT/LIVE are optional (a display-less run on its own works).
 //! `Framebuffer` is the facade's own struct (`pixels/width/height` plus `unlock()`), holding a
@@ -64,12 +64,12 @@ else switch (builtin.os.tag) {
 const null_runtime_supported = !builtin.cpu.arch.isWasm();
 const null_backend = if (null_runtime_supported) @import("platform_null.zig") else struct {};
 
-/// The runtime choice settled by `VP_HEADLESS=1` (set at the top of `platform.init`; always false on wasm).
+/// The runtime choice settled by `KNGN_HEADLESS=1` (set at the top of `platform.init`; always false on wasm).
 var runtime_null: bool = false;
 
 fn envHeadlessOne() bool {
     if (comptime !null_runtime_supported) return false;
-    const v = std.c.getenv("VP_HEADLESS") orelse return false;
+    const v = std.c.getenv("KNGN_HEADLESS") orelse return false;
     return std.mem.eql(u8, std.mem.span(v), "1");
 }
 
@@ -92,7 +92,7 @@ fn nativePumpPoll(ctx: *anyopaque) bool {
 // - A modal dialog (a file dialog) must not be opened from the callback.
 // - An application designed to call pollEvents while holding lockFramebuffer cannot register one.
 // - Module-level state, assuming a single process and a single window (the same design as harness / registerProbe).
-// - While the harness is enabled (VP_HARNESS_*) nothing is registered at all, so that frame_index, the
+// - While the harness is enabled (KNGN_HARNESS_*) nothing is registered at all, so that frame_index, the
 //   virtual clock and replay's bit determinism stay intact (symmetrical with registerProbe being a no-op while the harness is disabled).
 
 /// The callback type through which a backend asks the application for one frame during an OS modal loop.
@@ -164,7 +164,7 @@ pub const GamepadDisconnect = types.GamepadDisconnect;
 /// A caller uses `pixels/width/height/unlock()` plus the immutable snapshot of that same frame
 /// (`logical_size` / `framebuffer_size` / `content_scale` / `scale_epoch`).
 /// `width`/`height` are backwards-compatible aliases of `framebuffer_size`.
-/// Inside is a tagged union of native (the compile-time backend) and null (`VP_HEADLESS`).
+/// Inside is a tagged union of native (the compile-time backend) and null (`KNGN_HEADLESS`).
 pub const Framebuffer = struct {
     pixels: []u32,
     width: u32, // == framebuffer_size.width
@@ -342,7 +342,7 @@ pub const Window = struct {
     /// `.{}` behaves exactly like plain create. w/h are overridden only when `opts.size` is given.
     /// When the backend implements `createWithOptions` that is used; otherwise a request for
     /// transparency or borderless gives `error.Unsupported`, and with neither it falls back to create.
-    /// The null runtime (`VP_HEADLESS=1`) accepts the options and runs on the CPU framebuffer alone
+    /// The null runtime (`KNGN_HEADLESS=1`) accepts the options and runs on the CPU framebuffer alone
     /// (nothing is displayed, but the framebuffer alpha can still be checked through a digest; the position is always null).
     /// Hot path declaration: initialisation only (a single window creation).
     pub fn createWithOptions(width: u32, height: u32, title: [:0]const u8, opts: WindowOptions) Error!Window {
@@ -529,7 +529,7 @@ pub const Window = struct {
 
     /// Set the cursor shape (the system cursor).
     /// Hot path declaration: called **at event time only** (a tool change and the like), never per frame
-    /// or in real time, so the performance rules do not apply. The null runtime (nothing to display, i.e. VP_HEADLESS) is a no-op.
+    /// or in real time, so the performance rules do not apply. The null runtime (nothing to display, i.e. KNGN_HEADLESS) is a no-op.
     /// It is not a value a probe observes (its effect shows only on screen), so the harness needs no hook for it.
     pub fn setCursor(self: Window, shape: CursorShape) void {
         if (self.isNull()) return;
@@ -573,7 +573,7 @@ pub const Window = struct {
 
     /// Opt in to the backend asking the application for one frame during an OS modal loop (a live
     /// resize, say). With nothing registered the backend calls nothing and behaviour is unchanged.
-    /// While the harness is enabled (VP_HARNESS_*) and under the null runtime nothing is registered at all (a no-op).
+    /// While the harness is enabled (KNGN_HARNESS_*) and under the null runtime nothing is registered at all (a no-op).
     /// The re-entrancy guard lives in the facade's `redrawWrapper` (it blocks a callback during a callback).
     pub fn setRedrawCallback(self: Window, ctx: *anyopaque, cb: RedrawFn) void {
         if (self.isNull() or harness.isEnabled()) return;
@@ -707,7 +707,7 @@ pub const Window = struct {
 pub fn init() Error!void {
     // The frame pacing learning state. Re-initialising the process must not carry a bad value over.
     pacer.reset();
-    // VP_HEADLESS is settled before harness.parseConfig. Only the value "1" selects the null runtime.
+    // KNGN_HEADLESS is settled before harness.parseConfig. Only the value "1" selects the null runtime.
     // The copilot order is: harness.parseConfig → copilot.parseConfig → backend init →
     // harness.startTransport → copilot.startTransport (exclusivity is settled at parseConfig time, from which env vars are present).
     runtime_null = envHeadlessOne();

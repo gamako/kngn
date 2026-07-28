@@ -37,12 +37,12 @@ zig build run
 
 ```bash
 TMPD=$(mktemp -d)
-VP_HEADLESS=1 \
-VP_HARNESS_SCRIPT=examples/34_action_map/e2e.txt \
-VP_HARNESS_OUT=$TMPD \
+KNGN_HEADLESS=1 \
+KNGN_HARNESS_SCRIPT=examples/34_action_map/e2e.txt \
+KNGN_HARNESS_OUT=$TMPD \
 zig build run-example_34
 ```
 
 `digest action_map` observes `binding` / `move_source` / `move_x` / `move_y` / `jump_*` /
-`attack_*`. `snapshot fb` may omit the path (`$VP_HARNESS_OUT/frame_<n>.png`).
+`attack_*`. `snapshot fb` may omit the path (`$KNGN_HARNESS_OUT/frame_<n>.png`).
 See [`docs/harness.md`](../../docs/harness.md).

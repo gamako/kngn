@@ -191,7 +191,7 @@ video-proto-main/
 │       ├── harness.zig # the headless verification harness (input injection, frame capture, a virtual clock)
 │       ├── action_registry.zig # the action registry (the write and operate counterpart to a probe)
 │       ├── command.zig # the semantic command execution model for co-piloting (a human and an AI together)
-│       ├── copilot.zig # the copilot transport: a third control plane coexisting with the ordinary UX (VP_COPILOT_*)
+│       ├── copilot.zig # the copilot transport: a third control plane coexisting with the ordinary UX (KNGN_COPILOT_*)
 │       └── netsync.zig # networked concurrent editing (see docs/netsync.md)
 ├── src/               # Zig not yet moved (R8 is opportunistic: moved into libs by whichever task next touches it)
 │   ├── main.zig       # the main program (an HSV rainbow gradient)

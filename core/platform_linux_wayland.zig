@@ -1583,7 +1583,7 @@ pub const Window = struct {
         // Deciding the decoration mode. It happens after the toplevel is created and before the first commit (v1's ordering constraint).
         // FORCE_CSD (for debugging) creates no decoration object and settles on csd at once. A missing manager settles it at once too (csd or none).
         // The 0.16 std has no libc-independent getenv, so libc's getenv is used (as in the x11 backend).
-        const force_csd = std.c.getenv("VP_WAYLAND_FORCE_CSD") != null;
+        const force_csd = std.c.getenv("KNGN_WAYLAND_FORCE_CSD") != null;
         if (fullscreen) {
             // Fullscreen is always undecorated. No deco_obj is created and it settles on .none (so no CSD title bar is
             // built). On a compositor with no decoration manager the ordinary path would fall to .csd depending on
@@ -1595,7 +1595,7 @@ pub const Window = struct {
             // CLIENT_SIDE explicitly (when there is a manager; sway and others draw SSD by default, so it is
             // required), and it draws no CSD of its own either (syncDecorations is a no-op while st.borderless).
             // A compositor with no manager has no SSD to begin with, so .none is enough. Whatever
-            // VP_WAYLAND_FORCE_CSD (which forces CSD on an ordinary window, for debugging) says, CLIENT_SIDE is requested whenever a manager exists (borderless means zero decoration).
+            // KNGN_WAYLAND_FORCE_CSD (which forces CSD on an ordinary window, for debugging) says, CLIENT_SIDE is requested whenever a manager exists (borderless means zero decoration).
             if (st.deco_manager != null) {
                 st.deco_obj = c.zxdg_decoration_manager_v1_get_toplevel_decoration(st.deco_manager, st.toplevel);
                 if (st.deco_obj) |d| {

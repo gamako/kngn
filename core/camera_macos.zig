@@ -510,7 +510,7 @@ test "open: exceeding the resolution bound gives ConfigFailed without calling AV
 
 // ============================================================================
 // Tests for manual verification only (SkipZigTest by default; a real camera is opened only when
-// `VP_MANUAL_CAPTURE_TEST=1` is set on real hardware. They touch the TCC dialogue and a real device, so they are not in the automated tests)
+// `KNGN_MANUAL_CAPTURE_TEST=1` is set on real hardware. They touch the TCC dialogue and a real device, so they are not in the automated tests)
 // ============================================================================
 
 fn sleepMs(ms: u64) void {
@@ -521,8 +521,8 @@ fn sleepMs(ms: u64) void {
     _ = std.c.nanosleep(&req, null);
 }
 
-test "[MANUAL] open a real camera and confirm a few frames arrive (runs only with VP_MANUAL_CAPTURE_TEST=1)" {
-    if (std.c.getenv("VP_MANUAL_CAPTURE_TEST") == null) return error.SkipZigTest;
+test "[MANUAL] open a real camera and confirm a few frames arrive (runs only with KNGN_MANUAL_CAPTURE_TEST=1)" {
+    if (std.c.getenv("KNGN_MANUAL_CAPTURE_TEST") == null) return error.SkipZigTest;
     const allocator = testing.allocator;
 
     const perm = try requestPermission();

@@ -2,7 +2,7 @@
 //!
 //! It is called from the built-in `capture` probe and the `capture video|audio ...` commands of
 //! `core/control/harness.zig`. **The real camera.zig and audio.zig facades are not wired to it**: with
-//! `VP_HARNESS_CAPTURE_SYNTHETIC` set, `camera.open()` and `audio.openCapture()` return
+//! `KNGN_HARNESS_CAPTURE_SYNTHETIC` set, `camera.open()` and `audio.openCapture()` return
 //! `error.Unsupported` rather than reaching this file. The only route in is the harness's own `capture`
 //! command and probe.
 //! It depends on `capture_types` (the shared data plane types) alone, and is independent of the real camera and audio backends.

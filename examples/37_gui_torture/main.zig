@@ -174,12 +174,12 @@ fn parseDim(env: ?[]const u8, default: u32, name: []const u8) u32 {
 }
 
 fn readCaseFromEnv() ?Case {
-    const raw = envSlice("VP_GUI_TORTURE_CASE") orelse return null;
+    const raw = envSlice("KNGN_GUI_TORTURE_CASE") orelse return null;
     return Case.fromName(raw);
 }
 
 fn readRowCountFromEnv() ?u32 {
-    const raw = envSlice("VP_GUI_TORTURE_ROWS") orelse return null;
+    const raw = envSlice("KNGN_GUI_TORTURE_ROWS") orelse return null;
     return std.fmt.parseInt(u32, raw, 10) catch null;
 }
 
@@ -765,8 +765,8 @@ pub fn main(init: std.process.Init) !void {
     try platform.init();
     defer platform.shutdown();
 
-    const screen_w = parseDim(envSlice("VP_GUI_WIDTH"), DEFAULT_W, "VP_GUI_WIDTH");
-    const screen_h = parseDim(envSlice("VP_GUI_HEIGHT"), DEFAULT_H, "VP_GUI_HEIGHT");
+    const screen_w = parseDim(envSlice("KNGN_GUI_WIDTH"), DEFAULT_W, "KNGN_GUI_WIDTH");
+    const screen_h = parseDim(envSlice("KNGN_GUI_HEIGHT"), DEFAULT_H, "KNGN_GUI_HEIGHT");
 
     var window = try platform.Window.create(screen_w, screen_h, "GUI Torture Suite");
     defer window.destroy();

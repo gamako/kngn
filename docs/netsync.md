@@ -9,11 +9,11 @@ variables unset it passes through completely.
 
 | Variable | Meaning |
 |---|---|
-| `VP_NETSYNC_HOST=1` | listen as the host (`VP_NETSYNC_PORT` required) |
-| `VP_NETSYNC_PORT` | the host's listen port |
-| `VP_NETSYNC_CONNECT=ip:port` | connect as a client |
-| `VP_NETSYNC_ACTOR=human\|agent` | the actor kind in the client's HELLO (default `human`; an invalid value warns and falls back to human) |
-| `VP_NETSYNC_LABEL=<display name>` | the display label in the client's HELLO (default `client`, at most 200 bytes) |
+| `KNGN_NETSYNC_HOST=1` | listen as the host (`KNGN_NETSYNC_PORT` required) |
+| `KNGN_NETSYNC_PORT` | the host's listen port |
+| `KNGN_NETSYNC_CONNECT=ip:port` | connect as a client |
+| `KNGN_NETSYNC_ACTOR=human\|agent` | the actor kind in the client's HELLO (default `human`; an invalid value warns and falls back to human) |
+| `KNGN_NETSYNC_LABEL=<display name>` | the display label in the client's HELLO (default `client`, at most 200 bytes) |
 
 Specifying `HOST` and `CONNECT` together disables netsync. A failure to listen or
 connect is fail-soft (the application continues without netsync).
@@ -21,7 +21,7 @@ connect is fail-soft (the application continues without netsync).
 **Relationship with the copilot transport**: during a netsync session, the copilot
 transport's operate commands (`action`, `begin_tx`, `end_tx`, `cancel_tx`) are
 rejected (observe — digest and snapshot — is still allowed). An agent's operations go
-through a dedicated peer connection with `VP_NETSYNC_ACTOR=agent`.
+through a dedicated peer connection with `KNGN_NETSYNC_ACTOR=agent`.
 
 **The teardown contract**: the `Executor` is a borrow owned by the caller, and
 `platform.shutdown` drops the netsync and copilot borrows before the teardown that
@@ -102,10 +102,10 @@ so on) have been promoted to `.relay`.
 # Start up (sleeping is acceptable only while waiting for the port file to appear;
 # netsync is on 9110 and the port files live in the workspace's .e2e)
 mkdir -p .e2e
-VP_HEADLESS=1 VP_HARNESS_LISTEN= VP_HARNESS_PORT_FILE=./.e2e/host.port \
-  VP_NETSYNC_HOST=1 VP_NETSYNC_PORT=9110 zig build run-pixie &
-VP_HEADLESS=1 VP_HARNESS_LISTEN= VP_HARNESS_PORT_FILE=./.e2e/client.port \
-  VP_NETSYNC_CONNECT=127.0.0.1:9110 zig build run-pixie &
+KNGN_HEADLESS=1 KNGN_HARNESS_LISTEN= KNGN_HARNESS_PORT_FILE=./.e2e/host.port \
+  KNGN_NETSYNC_HOST=1 KNGN_NETSYNC_PORT=9110 zig build run-pixie &
+KNGN_HEADLESS=1 KNGN_HARNESS_LISTEN= KNGN_HARNESS_PORT_FILE=./.e2e/client.port \
+  KNGN_NETSYNC_CONNECT=127.0.0.1:9110 zig build run-pixie &
 
 # The client has finished joining. In free-run no step needs injecting into the host;
 # await holds one connection and waits.
@@ -177,7 +177,7 @@ scripts/drive --port-file ./.e2e/client.port 'quit'
   displaying kind and label.
 - **The host itself**: peer_id 0 is a fixed identity (`HOST_ACTOR_KIND=.human`,
   `HOST_LABEL="host"`). No host-side environment variable (a
-  `VP_NETSYNC_HOST_ACTOR` and the like) is provided.
+  `KNGN_NETSYNC_HOST_ACTOR` and the like) is provided.
 - **Compatibility with an older peer**: with no PEER_INFO received, the history display
   falls back to `#<peer_id>` (it does not freeze).
 
@@ -185,10 +185,10 @@ scripts/drive --port-file ./.e2e/client.port 'quit'
 
 ```bash
 mkdir -p .e2e
-VP_HEADLESS=1 VP_HARNESS_LISTEN= VP_HARNESS_PORT_FILE=./.e2e/host.port \
-  VP_NETSYNC_HOST=1 VP_NETSYNC_PORT=9110 zig build run-pixie &
-VP_HEADLESS=1 VP_HARNESS_LISTEN= VP_HARNESS_PORT_FILE=./.e2e/client.port \
-  VP_NETSYNC_CONNECT=127.0.0.1:9110 VP_NETSYNC_ACTOR=agent VP_NETSYNC_LABEL=bot \
+KNGN_HEADLESS=1 KNGN_HARNESS_LISTEN= KNGN_HARNESS_PORT_FILE=./.e2e/host.port \
+  KNGN_NETSYNC_HOST=1 KNGN_NETSYNC_PORT=9110 zig build run-pixie &
+KNGN_HEADLESS=1 KNGN_HARNESS_LISTEN= KNGN_HARNESS_PORT_FILE=./.e2e/client.port \
+  KNGN_NETSYNC_CONNECT=127.0.0.1:9110 KNGN_NETSYNC_ACTOR=agent KNGN_NETSYNC_LABEL=bot \
   zig build run-pixie &
 scripts/drive --port-file ./.e2e/client.port 'await netsync awaiting_sync=0 600'
 scripts/drive --port-file ./.e2e/host.port 'action stroke 10 10 60 10'

@@ -1,6 +1,6 @@
 //! The copilot/assist transport: a third control plane that coexists with the ordinary UX.
 //!
-//! Opting in through `VP_COPILOT_*` makes it listen on TCP loopback, so an agent can observe through a probe and
+//! Opting in through `KNGN_COPILOT_*` makes it listen on TCP loopback, so an agent can observe through a probe and
 //! operate through an action. Unlike harness live (which is verification-only and stops the application at a step gate),
 //! it **brings no step gate with it**: commands are handled non-blockingly by `pump()` on each frame, and a user's
 //! ordinary operations mix with an agent's within one session. An operate passes through `CommandExecutor`
@@ -19,7 +19,7 @@
 //! function.
 //!
 //! ## Mutual exclusion (one control transport per process)
-//! If any `VP_HARNESS_*` variable exists (SCRIPT, LISTEN, VP_HEADLESS), `VP_COPILOT_*` is warned about and ignored
+//! If any `KNGN_HARNESS_*` variable exists (SCRIPT, LISTEN, KNGN_HEADLESS), `KNGN_COPILOT_*` is warned about and ignored
 //! (the decision is based on the variable existing, is settled at `parseConfig()` and is deterministic; it does not depend on whether harness's listen succeeded).
 //!
 //! ## The connection model (a non-blocking state machine)
@@ -131,21 +131,21 @@ pub fn parseConfig() void {
     if (config_parsed) return;
     config_parsed = true;
 
-    const requested = getEnv("VP_COPILOT") != null or getEnv("VP_COPILOT_PORT") != null;
+    const requested = getEnv("KNGN_COPILOT") != null or getEnv("KNGN_COPILOT_PORT") != null;
     if (!requested) return;
 
-    const harness_env_present = getEnv("VP_HARNESS_SCRIPT") != null or
-        getEnv("VP_HARNESS_LISTEN") != null or
-        getEnv("VP_HEADLESS") != null;
+    const harness_env_present = getEnv("KNGN_HARNESS_SCRIPT") != null or
+        getEnv("KNGN_HARNESS_LISTEN") != null or
+        getEnv("KNGN_HEADLESS") != null;
     if (!decideEnabled(requested, harness_env_present)) {
-        std.debug.print("[copilot] VP_HARNESS_* is active, so VP_COPILOT_* is ignored (one control transport per process)\n", .{});
+        std.debug.print("[copilot] KNGN_HARNESS_* is active, so KNGN_COPILOT_* is ignored (one control transport per process)\n", .{});
         return;
     }
     if (comptime builtin.os.tag == .windows) {
-        std.debug.print("[copilot] the copilot transport is unsupported on Windows; ignoring VP_COPILOT_*\n", .{});
+        std.debug.print("[copilot] the copilot transport is unsupported on Windows; ignoring KNGN_COPILOT_*\n", .{});
         return;
     }
-    if (getEnv("VP_COPILOT_PORT")) |pe| req_port = std.fmt.parseInt(u16, pe, 10) catch 0;
+    if (getEnv("KNGN_COPILOT_PORT")) |pe| req_port = std.fmt.parseInt(u16, pe, 10) catch 0;
     enabled_pending = true;
 }
 
@@ -219,7 +219,7 @@ fn dispatchHarnessAction(ctx: *anyopaque, name: []const u8, args: []const u8, bu
 }
 
 fn writePortFile(port: u16) void {
-    const path = getEnv("VP_COPILOT_PORT_FILE") orelse return; // with it omitted, only the stderr message
+    const path = getEnv("KNGN_COPILOT_PORT_FILE") orelse return; // with it omitted, only the stderr message
     var pbuf: [16]u8 = undefined;
     const txt = std.fmt.bufPrint(&pbuf, "{d}\n", .{port}) catch return;
     std.Io.Dir.cwd().writeFile(io_val, .{ .sub_path = path, .data = txt }) catch |err| {
@@ -924,7 +924,7 @@ test "copilot: 7 a request over 64KiB gets an error response and is not run" {
     try testing.expectEqualStrings("error: request too large\n", cs.resp[0..cs.resp_len]);
 }
 
-test "copilot: 8 mutual exclusion, so copilot is disabled alongside VP_HARNESS_*" {
+test "copilot: 8 mutual exclusion, so copilot is disabled alongside KNGN_HARNESS_*" {
     try testing.expect(!decideEnabled(true, true)); // the presence of a harness variable disables it
     try testing.expect(decideEnabled(true, false));
     try testing.expect(!decideEnabled(false, false));

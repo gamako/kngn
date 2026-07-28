@@ -2,9 +2,9 @@
 # Float values are measured and baked after the probe landed (matches hand calculation).
 # Example run:
 #   TMPD=$(mktemp -d)
-#   VP_HEADLESS=1 VP_HARNESS_SCRIPT=examples/34_action_map/e2e.txt \
-#     VP_HARNESS_OUT=$TMPD zig build run-example_34
-# snapshot with path omitted → $VP_HARNESS_OUT/frame_<n>.png
+#   KNGN_HEADLESS=1 KNGN_HARNESS_SCRIPT=examples/34_action_map/e2e.txt \
+#     KNGN_HARNESS_OUT=$TMPD zig build run-example_34
+# snapshot with path omitted → $KNGN_HARNESS_OUT/frame_<n>.png
 
 step 1
 snapshot fb

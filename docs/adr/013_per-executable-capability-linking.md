@@ -35,8 +35,8 @@ deviation recorded under Consequences exists.
 |---|---|
 | Audio output | `linkAudioBackend(exe, os)` at the executable's build site (macOS: AudioToolbox and CoreAudio, plus the capture frameworks — see the deviation noted under Consequences; Linux: the `alsa` pkg-config name; Windows: `ole32`) |
 | MIDI | `linkMidiBackend(exe, os)` (macOS: CoreMIDI and CoreFoundation; every other system uses the null backend and needs nothing) |
-| Gamepad | `enable_gamepad` — `-DVP_ENABLE_GAMEPAD` to the native sources plus the GameController framework. The one user-facing option, `-Denable_gamepad=true`, covers the published external module and the native archive; internal executables opt in per backend, independently of it |
-| Native menu | `enable_menu` — `-DVP_ENABLE_MENU` plus compiling the shared `platform/macos/platform_macos_menu.m` translation unit |
+| Gamepad | `enable_gamepad` — `-DKNGN_ENABLE_GAMEPAD` to the native sources plus the GameController framework. The one user-facing option, `-Denable_gamepad=true`, covers the published external module and the native archive; internal executables opt in per backend, independently of it |
+| Native menu | `enable_menu` — `-DKNGN_ENABLE_MENU` plus compiling the shared `platform/macos/platform_macos_menu.m` translation unit |
 
 Audio and MIDI are opted into by *calling* a helper, so their default is
 structural: an executable that does not call it does not get them. Gamepad and
@@ -62,7 +62,7 @@ and event-poll path, the code lives in a translation unit that is compiled for
 *every* executable (`platform_macos.m`, `platform_macos_shared.swift`). Omitting
 the framework is not enough there — the code would still be compiled, and would
 then fail to link against the framework that was withheld. Conditional compilation
-(`#if defined(VP_ENABLE_GAMEPAD)` / `#if VP_ENABLE_MENU`) is what removes the code
+(`#if defined(KNGN_ENABLE_GAMEPAD)` / `#if KNGN_ENABLE_MENU`) is what removes the code
 itself.
 
 That reason alone is sufficient. A second one reinforces it, in the narrower case
@@ -93,7 +93,7 @@ separating because they are not the same reason:
 
 - **Menu — symbol existence.** `platform.h` declares `platform_register_menu`
   unconditionally, but the definition exists only when the native side was compiled
-  with `-DVP_ENABLE_MENU`. So the Zig facade gates its call sites on
+  with `-DKNGN_ENABLE_MENU`. So the Zig facade gates its call sites on
   `build_options.enable_menu` (plus the backend being a macOS one); without that
   gate a non-menu executable would reference an undefined symbol. **Here the Zig
   gate is load-bearing for linking.**

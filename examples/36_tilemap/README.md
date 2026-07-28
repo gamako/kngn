@@ -30,13 +30,13 @@ cd examples/36_tilemap && zig build run
 
 ```bash
 TMPD=$(mktemp -d)
-VP_HEADLESS=1 \
-VP_HARNESS_SCRIPT=examples/36_tilemap/e2e.txt \
-VP_HARNESS_OUT=$TMPD \
+KNGN_HEADLESS=1 \
+KNGN_HARNESS_SCRIPT=examples/36_tilemap/e2e.txt \
+KNGN_HARNESS_OUT=$TMPD \
 zig build run-example_36
 ```
 
-- Snapshot path omitted → `$VP_HARNESS_OUT/frame_<n>.png`
+- Snapshot path omitted → `$KNGN_HARNESS_OUT/frame_<n>.png`
 - Each `digest fb` is followed by `expect fb crc=...` (measured values baked in)
 - Confirm CRC is green and open `$TMPD/frame_*.png` to inspect terrain and character
 
@@ -48,7 +48,7 @@ See [`docs/harness.md`](../../docs/harness.md).
 TMPD=$(mktemp -d)
 MEASURE=$TMPD/measure.txt
 sed '/^expect fb crc=/d' examples/36_tilemap/e2e.txt > "$MEASURE"
-VP_HEADLESS=1 VP_HARNESS_SCRIPT="$MEASURE" VP_HARNESS_OUT="$TMPD" \
+KNGN_HEADLESS=1 KNGN_HARNESS_SCRIPT="$MEASURE" KNGN_HARNESS_OUT="$TMPD" \
   zig build run-example_36 2>&1 | tee "$TMPD/replay.log"
 rg 'crc=' "$TMPD/replay.log"
 ```

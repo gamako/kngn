@@ -5,14 +5,14 @@ set -euo pipefail
 
 SCRIPT_DIR=$(cd "$(dirname "$0")" && pwd)
 ROOT=$(cd "$SCRIPT_DIR/../.." && pwd)
-VP_ROOT="${VP_ROOT:-/Users/gamako/gamako/project/zig/video-proto/video-proto-main}"
+KNGN_ROOT="${KNGN_ROOT:-/Users/gamako/gamako/project/zig/video-proto/video-proto-main}"
 E2E_PORT="${E2E_PORT:-9230}"
 E2E_WIDTH="${E2E_WIDTH:-1024}"
 E2E_HEIGHT="${E2E_HEIGHT:-768}"
 E2E_TIMEOUT_SEC="${E2E_TIMEOUT_SEC:-60}"
-VP_HARNESS_OUT="${VP_HARNESS_OUT:-$(mktemp -d /tmp/vp-list-menu.XXXXXX)}"
-PORT_FILE="$VP_HARNESS_OUT/harness.port"
-LOG="$VP_HARNESS_OUT/e2e.log"
+KNGN_HARNESS_OUT="${KNGN_HARNESS_OUT:-$(mktemp -d /tmp/vp-list-menu.XXXXXX)}"
+PORT_FILE="$KNGN_HARNESS_OUT/harness.port"
+LOG="$KNGN_HARNESS_OUT/e2e.log"
 DRIVE="$ROOT/scripts/drive"
 
 # port range guard
@@ -21,7 +21,7 @@ if [[ "$E2E_PORT" -lt 9230 || "$E2E_PORT" -gt 9239 ]]; then
   exit 1
 fi
 
-mkdir -p "$VP_HARNESS_OUT"
+mkdir -p "$KNGN_HARNESS_OUT"
 : >"$LOG"
 
 log() { echo "$@" | tee -a "$LOG"; }
@@ -45,18 +45,18 @@ cd "$ROOT"
 
 if [[ ! -x "$ROOT/zig-out/bin/drive" ]]; then
   log "[e2e] building drive..."
-  direnv exec "$VP_ROOT" zig build drive >>"$LOG" 2>&1
+  direnv exec "$KNGN_ROOT" zig build drive >>"$LOG" 2>&1
 fi
 
-log "[e2e] out=$VP_HARNESS_OUT port=$E2E_PORT size=${E2E_WIDTH}x${E2E_HEIGHT}"
+log "[e2e] out=$KNGN_HARNESS_OUT port=$E2E_PORT size=${E2E_WIDTH}x${E2E_HEIGHT}"
 
-VP_GUI_WIDTH="$E2E_WIDTH" \
-VP_GUI_HEIGHT="$E2E_HEIGHT" \
-VP_HEADLESS=1 \
-VP_HARNESS_LISTEN="$E2E_PORT" \
-VP_HARNESS_PORT_FILE="$PORT_FILE" \
-VP_HARNESS_OUT="$VP_HARNESS_OUT" \
-direnv exec "$VP_ROOT" zig build run-example_40 >>"$LOG" 2>&1 &
+KNGN_GUI_WIDTH="$E2E_WIDTH" \
+KNGN_GUI_HEIGHT="$E2E_HEIGHT" \
+KNGN_HEADLESS=1 \
+KNGN_HARNESS_LISTEN="$E2E_PORT" \
+KNGN_HARNESS_PORT_FILE="$PORT_FILE" \
+KNGN_HARNESS_OUT="$KNGN_HARNESS_OUT" \
+direnv exec "$KNGN_ROOT" zig build run-example_40 >>"$LOG" 2>&1 &
 APP_PID=$!
 log "[e2e] started pid=$APP_PID"
 

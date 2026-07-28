@@ -32,7 +32,7 @@ make_script() {
 run_case() {
     local name=$1 app_dir=$2 script=$3
     mkdir -p "$app_dir" "$OUT/$name"
-    VP_APPSHELL_DIR="$app_dir" VP_HEADLESS=1 VP_HARNESS_SCRIPT="$script" VP_HARNESS_OUT="$OUT/$name" "$APP" >"$OUT/$name/app.log" 2>&1
+    KNGN_APPSHELL_DIR="$app_dir" KNGN_HEADLESS=1 KNGN_HARNESS_SCRIPT="$script" KNGN_HARNESS_OUT="$OUT/$name" "$APP" >"$OUT/$name/app.log" 2>&1
 }
 
 # Quit: Cancel then Discard.
@@ -89,7 +89,7 @@ recovery_app="$APPS/recovery"
 crash_script="$OUT/recovery-crash.txt"
 make_script "$crash_script" 'step 3' 'action stroke 30 30 80 80' 'digest canvas' 'step 1000000000'
 mkdir -p "$recovery_app" "$OUT/recovery-crash"
-VP_APPSHELL_DIR="$recovery_app" VP_HEADLESS=1 VP_HARNESS_SCRIPT="$crash_script" VP_HARNESS_OUT="$OUT/recovery-crash" "$APP" >"$OUT/recovery-crash/app.log" 2>&1 &
+KNGN_APPSHELL_DIR="$recovery_app" KNGN_HEADLESS=1 KNGN_HARNESS_SCRIPT="$crash_script" KNGN_HARNESS_OUT="$OUT/recovery-crash" "$APP" >"$OUT/recovery-crash/app.log" 2>&1 &
 crash_pid=$!
 autosave_file=
 for _ in $(seq 1 200); do
@@ -115,7 +115,7 @@ test -z "$(find "$recovery_app/autosave" -name '*.autosave' -print -quit 2>/dev/
 
 # Second candidate: explicit Discard recovery.
 mkdir -p "$OUT/recovery-crash-2"
-VP_APPSHELL_DIR="$recovery_app" VP_HEADLESS=1 VP_HARNESS_SCRIPT="$crash_script" VP_HARNESS_OUT="$OUT/recovery-crash-2" "$APP" >"$OUT/recovery-crash-2/app.log" 2>&1 &
+KNGN_APPSHELL_DIR="$recovery_app" KNGN_HEADLESS=1 KNGN_HARNESS_SCRIPT="$crash_script" KNGN_HARNESS_OUT="$OUT/recovery-crash-2" "$APP" >"$OUT/recovery-crash-2/app.log" 2>&1 &
 crash_pid=$!
 autosave_file=
 for _ in $(seq 1 200); do
@@ -135,14 +135,14 @@ test -z "$(find "$recovery_app/autosave" -name '*.autosave' -print -quit 2>/dev/
 
 # Netsync: bind failure is an allowed sandbox skip; successful runs use drive quit.
 netsync_status=skipped
-if test "${VP_E2E_NETSYNC:-1}" = 1; then
+if test "${KNGN_E2E_NETSYNC:-1}" = 1; then
     "$ZIG_BIN" build drive >/dev/null 2>&1 || true
     drive="$ROOT/zig-out/bin/drive"
     host_port="$E2E/host.port"
     client_port="$E2E/client.port"
-    VP_APPSHELL_DIR="$APPS/netsync-host" VP_HEADLESS=1 VP_HARNESS_LISTEN= VP_HARNESS_PORT_FILE="$host_port" VP_NETSYNC_HOST=1 VP_NETSYNC_PORT=9130 "$APP" >"$OUT/netsync-host.log" 2>&1 &
+    KNGN_APPSHELL_DIR="$APPS/netsync-host" KNGN_HEADLESS=1 KNGN_HARNESS_LISTEN= KNGN_HARNESS_PORT_FILE="$host_port" KNGN_NETSYNC_HOST=1 KNGN_NETSYNC_PORT=9130 "$APP" >"$OUT/netsync-host.log" 2>&1 &
     host_pid=$!
-    VP_APPSHELL_DIR="$APPS/netsync-client" VP_HEADLESS=1 VP_HARNESS_LISTEN= VP_HARNESS_PORT_FILE="$client_port" VP_NETSYNC_CONNECT=127.0.0.1:9130 "$APP" >"$OUT/netsync-client.log" 2>&1 &
+    KNGN_APPSHELL_DIR="$APPS/netsync-client" KNGN_HEADLESS=1 KNGN_HARNESS_LISTEN= KNGN_HARNESS_PORT_FILE="$client_port" KNGN_NETSYNC_CONNECT=127.0.0.1:9130 "$APP" >"$OUT/netsync-client.log" 2>&1 &
     client_pid=$!
     for _ in $(seq 1 100); do
         test -f "$host_port" && test -f "$client_port" && break
@@ -166,6 +166,6 @@ if test "${VP_E2E_NETSYNC:-1}" = 1; then
         wait "$client_pid" 2>/dev/null || true
     fi
 else
-    echo 'appshell_e2e: netsync skipped by VP_E2E_NETSYNC=0' >&2
+    echo 'appshell_e2e: netsync skipped by KNGN_E2E_NETSYNC=0' >&2
 fi
 echo "appshell_e2e: ok (recovery_crc=$after_crc netsync=$netsync_status)"

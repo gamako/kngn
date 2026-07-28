@@ -126,7 +126,7 @@ class MetalRenderer: NSObject, MTKViewDelegate {
     private var lastFrameTime: CFAbsoluteTime
     private var frameCount: Int
     private var totalFrameTime: Double
-    // The FPS log is printed only with VP_METAL_FPS_LOG=1 (silent by default)
+    // The FPS log is printed only with KNGN_METAL_FPS_LOG=1 (silent by default)
     private let fpsLogEnabled: Bool
 
     init(device: MTLDevice, width: Int, height: Int, callback: FrameCallback?, userdata: UnsafeMutableRawPointer?) {
@@ -141,7 +141,7 @@ class MetalRenderer: NSObject, MTKViewDelegate {
         self.frameCount = 0
         self.totalFrameTime = 0.0
         // The env var is read once at initialisation (avoiding a getenv per frame)
-        self.fpsLogEnabled = ProcessInfo.processInfo.environment["VP_METAL_FPS_LOG"] == "1"
+        self.fpsLogEnabled = ProcessInfo.processInfo.environment["KNGN_METAL_FPS_LOG"] == "1"
 
         super.init()
 
@@ -272,7 +272,7 @@ class MetalRenderer: NSObject, MTKViewDelegate {
     }
 
     // Log the FPS every 60 frames (so that sticking at ~60fps can be observed when checking fifo pacing).
-    // It prints only while fpsLogEnabled (VP_METAL_FPS_LOG=1); the measurement itself always runs.
+    // It prints only while fpsLogEnabled (KNGN_METAL_FPS_LOG=1); the measurement itself always runs.
     private func updatePerfStats() {
         frameCount += 1
         let now = CFAbsoluteTimeGetCurrent()

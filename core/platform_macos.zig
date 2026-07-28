@@ -240,7 +240,7 @@ var ime_trace_state: ?bool = null;
 
 fn keyTraceEnabled() bool {
     if (key_trace_state) |enabled| return enabled;
-    const enabled = if (std.c.getenv("VP_KEY_TRACE")) |value|
+    const enabled = if (std.c.getenv("KNGN_KEY_TRACE")) |value|
         std.mem.eql(u8, std.mem.span(value), "1")
     else
         false;
@@ -250,7 +250,7 @@ fn keyTraceEnabled() bool {
 
 fn imeTraceEnabled() bool {
     if (ime_trace_state) |enabled| return enabled;
-    const enabled = if (std.c.getenv("VP_IME_TRACE")) |value|
+    const enabled = if (std.c.getenv("KNGN_IME_TRACE")) |value|
         std.mem.eql(u8, std.mem.span(value), "1")
     else
         false;

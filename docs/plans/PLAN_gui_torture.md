@@ -27,10 +27,10 @@ independence, volume) through the harness.
 
 ## Case selection
 
-- env: `VP_GUI_TORTURE_CASE=layout|text|input_state|ids_popup|volume|negative_auto_id`
+- env: `KNGN_GUI_TORTURE_CASE=layout|text|input_state|ids_popup|volume|negative_auto_id`
 - or PAGE_DOWN / PAGE_UP (during volume, toggles 500/1000 rows)
-- Window size: `VP_GUI_WIDTH` / `VP_GUI_HEIGHT` (default 1024x768; 0 / parse failure → warn + default; clamp 4096)
-- Volume rows: `VP_GUI_TORTURE_ROWS=500|1000` (default 500)
+- Window size: `KNGN_GUI_WIDTH` / `KNGN_GUI_HEIGHT` (default 1024x768; 0 / parse failure → warn + default; clamp 4096)
+- Volume rows: `KNGN_GUI_TORTURE_ROWS=500|1000` (default 500)
 
 ## Probe contract (DIGEST_BUF_LEN=1024, top-level k=v)
 
@@ -45,16 +45,16 @@ replay measurements**, not invented expectations.
 
 ```bash
 # Ordinary E2E (e.g. layout)
-VP_HEADLESS=1 \
-VP_GUI_TORTURE_CASE=layout \
-VP_HARNESS_SCRIPT=examples/37_gui_torture/e2e_layout.txt \
-VP_HARNESS_OUT=$(mktemp -d) \
+KNGN_HEADLESS=1 \
+KNGN_GUI_TORTURE_CASE=layout \
+KNGN_HARNESS_SCRIPT=examples/37_gui_torture/e2e_layout.txt \
+KNGN_HARNESS_OUT=$(mktemp -d) \
 zig build run-example_37
 
 # 100x100 in a separate process
-VP_GUI_WIDTH=100 VP_GUI_HEIGHT=100 VP_GUI_TORTURE_CASE=layout \
-VP_HEADLESS=1 VP_HARNESS_SCRIPT=examples/37_gui_torture/e2e_layout_100x100.txt \
-VP_HARNESS_OUT=$(mktemp -d) zig build run-example_37
+KNGN_GUI_WIDTH=100 KNGN_GUI_HEIGHT=100 KNGN_GUI_TORTURE_CASE=layout \
+KNGN_HEADLESS=1 KNGN_HARNESS_SCRIPT=examples/37_gui_torture/e2e_layout_100x100.txt \
+KNGN_HARNESS_OUT=$(mktemp -d) zig build run-example_37
 
 # Negative
 bash examples/37_gui_torture/negative_auto_id.sh

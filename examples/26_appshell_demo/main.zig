@@ -45,7 +45,7 @@ pub fn main() !void {
     try platform.init();
     defer platform.shutdown();
 
-    const override_path = if (std.c.getenv("VP_APPSHELL_DIR")) |value| std.mem.span(value) else null;
+    const override_path = if (std.c.getenv("KNGN_APPSHELL_DIR")) |value| std.mem.span(value) else null;
     var data_dir = try appshell.paths.openAppDataDir(io, allocator, "video-proto-example-26", override_path);
     defer data_dir.close(io);
     var autosave_dir = try appshell.paths.openAutosaveDir(io, data_dir);

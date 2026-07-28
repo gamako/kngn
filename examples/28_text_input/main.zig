@@ -198,8 +198,8 @@ pub fn main(init: std.process.Init) !void {
     var second_buffer = try gui.TextBuffer.init(gpa, "A long second input demonstrates horizontal caret scrolling");
     defer second_buffer.deinit();
 
-    // VP_EXAMPLE_28_FONT=bitmap|outline. Unset means outline (bit-identical to current).
-    const font_mode = if (std.c.getenv("VP_EXAMPLE_28_FONT")) |v| std.mem.span(v) else "outline";
+    // KNGN_EXAMPLE_28_FONT=bitmap|outline. Unset means outline (bit-identical to current).
+    const font_mode = if (std.c.getenv("KNGN_EXAMPLE_28_FONT")) |v| std.mem.span(v) else "outline";
     const prefer_bitmap = std.mem.eql(u8, font_mode, "bitmap");
 
     // Font bytes must outlive FontFace (kept for main's lifetime).

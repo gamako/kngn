@@ -18,7 +18,7 @@
 //!
 //! ## Driving it headless, with no real device
 //!
-//! With `VP_HEADLESS=1` the null device of `audio_null.zig` is opened in place of `backend`
+//! With `KNGN_HEADLESS=1` the null device of `audio_null.zig` is opened in place of `backend`
 //! (the real OS device): no real device, pure Zig, a backend-owned real-time thread. `AudioDevice.inner` becomes a
 //! tagged union (`native` / `null_dev`) and the code merely branches on it; the public `Error`, `Config`, `EffectiveConfig`
 //! and `RenderCallback` do not change at all, because `NullBackend(backend)` aliases the backend's types.
@@ -126,7 +126,7 @@ pub const AudioDevice = struct {
 ///     (no real device, a backend-owned real-time thread).
 ///
 /// Testing `isHeadlessActive()` before `isEnabled()` is deliberate: headless is decided by the
-/// `VP_HEADLESS=1` that platform settled (`harness.setHeadlessActive`), and can hold even when the transport ends up
+/// `KNGN_HEADLESS=1` that platform settled (`harness.setHeadlessActive`), and can hold even when the transport ends up
 /// `.disabled` because the script failed to load or the like (this pairs with the decision to skip
 /// `backend.init()` itself in `platform.zig`). Consulting `isEnabled()` first would, in that edge case,
 /// open a real audio device despite headless having been asked for.

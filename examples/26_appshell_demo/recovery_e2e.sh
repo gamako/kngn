@@ -60,10 +60,10 @@ APP_BIN="$PREFIX/bin/example_26_appshell_demo_objc"
 test -x "$APP_BIN"
 echo "recovery e2e: running $APP_BIN"
 
-VP_APPSHELL_DIR="$APP_DIR" \
-VP_HEADLESS=1 \
-VP_HARNESS_SCRIPT="$CRASH_SCRIPT" \
-VP_HARNESS_OUT="$OUT_DIR/crash" \
+KNGN_APPSHELL_DIR="$APP_DIR" \
+KNGN_HEADLESS=1 \
+KNGN_HARNESS_SCRIPT="$CRASH_SCRIPT" \
+KNGN_HARNESS_OUT="$OUT_DIR/crash" \
 "$APP_BIN" >"$CRASH_LOG" 2>&1 &
 app_pid=$!
 
@@ -83,10 +83,10 @@ crash_status=$?
 set -e
 test "$crash_status" -ne 0
 
-VP_APPSHELL_DIR="$APP_DIR" \
-VP_HEADLESS=1 \
-VP_HARNESS_SCRIPT="$RECOVER_SCRIPT" \
-VP_HARNESS_OUT="$OUT_DIR/recover" \
+KNGN_APPSHELL_DIR="$APP_DIR" \
+KNGN_HEADLESS=1 \
+KNGN_HARNESS_SCRIPT="$RECOVER_SCRIPT" \
+KNGN_HARNESS_OUT="$OUT_DIR/recover" \
 "$APP_BIN" >"$RECOVER_LOG" 2>&1
 
 before_crc=$(sed -n 's/.*canvas_crc=\([0-9A-Fa-f]*\).*/\1/p' "$CRASH_LOG" | head -n 1)
@@ -98,19 +98,19 @@ test "$before_crc" = "$after_crc"
 residual=$(find "$APP_DIR/autosave" -type f -name '*.autosave' -print -quit 2>/dev/null || true)
 test -z "$residual"
 
-VP_APPSHELL_DIR="$APP_DIR" \
-VP_HEADLESS=1 \
-VP_HARNESS_SCRIPT="$SAVE_SCRIPT" \
-VP_HARNESS_OUT="$OUT_DIR/save" \
+KNGN_APPSHELL_DIR="$APP_DIR" \
+KNGN_HEADLESS=1 \
+KNGN_HARNESS_SCRIPT="$SAVE_SCRIPT" \
+KNGN_HARNESS_OUT="$OUT_DIR/save" \
 "$APP_BIN" >"$SAVE_LOG" 2>&1
 test -f "$APP_DIR/saved.pix"
 residual=$(find "$APP_DIR/autosave" -type f -name '*.autosave' -print -quit 2>/dev/null || true)
 test -z "$residual"
 
-VP_APPSHELL_DIR="$APP_DIR" \
-VP_HEADLESS=1 \
-VP_HARNESS_SCRIPT="$DISCARD_SCRIPT" \
-VP_HARNESS_OUT="$OUT_DIR/discard" \
+KNGN_APPSHELL_DIR="$APP_DIR" \
+KNGN_HEADLESS=1 \
+KNGN_HARNESS_SCRIPT="$DISCARD_SCRIPT" \
+KNGN_HARNESS_OUT="$OUT_DIR/discard" \
 "$APP_BIN" >"$DISCARD_LOG" 2>&1
 residual=$(find "$APP_DIR/autosave" -type f -name '*.autosave' -print -quit 2>/dev/null || true)
 test -z "$residual"

@@ -142,7 +142,7 @@ section=<name> index=<i> widgets=<n> missing=<n> schema=v0 hot=<name|none> activ
 | 7 | stepgrid | 1 | 0 | 16 step row |
 | 8 | missing | 15 | 15 | 15 placeholders |
 
-`examples/35_gui_gallery/e2e.txt` runs `digest gallery` and path-omitted `snapshot fb` for each section. Do not add PNGs to the repository; visually inspect runtime artifacts under `VP_HARNESS_OUT`. Fixed window is 1024×640, initial section is overview, font is `gui.default_font`.
+`examples/35_gui_gallery/e2e.txt` runs `digest gallery` and path-omitted `snapshot fb` for each section. Do not add PNGs to the repository; visually inspect runtime artifacts under `KNGN_HARNESS_OUT`. Fixed window is 1024×640, initial section is overview, font is `gui.default_font`.
 
 ## 12. Update rules
 

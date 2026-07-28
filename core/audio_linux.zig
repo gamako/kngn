@@ -521,18 +521,18 @@ test "capture.enumerate and requestPermission: calling the real ALSA neither cra
     // requestPermission is a trial open of the default PCH. Even through the PipeWire bridge, the open returns at once.
     const perm = try capture.requestPermission();
     try testing.expect(perm == .granted or perm == .denied or perm == .not_determined);
-    if (std.c.getenv("VP_CAPTURE_SMOKE") != null) {
+    if (std.c.getenv("KNGN_CAPTURE_SMOKE") != null) {
         std.debug.print("[alsa smoke] enumerate -> {d} card(s)", .{devices.len});
         for (devices) |d| std.debug.print(" [{s}={s}]", .{ d.id, d.name });
         std.debug.print("; requestPermission -> {s}\n", .{@tagName(perm)});
     }
 }
 
-// For manual verification only (SkipZigTest by default; it runs only with VP_CAPTURE_FULL_SMOKE=1, since it takes a real microphone).
+// For manual verification only (SkipZigTest by default; it runs only with KNGN_CAPTURE_FULL_SMOKE=1, since it takes a real microphone).
 // It checks on real hardware the whole cycle of open, start, the capture callback, stop and close, and whether stop()'s
 // snd_pcm_drop unblocks the blocking readi so that the join completes. A missing device or PipeWire is tolerated best-effort.
 test "capture full cycle (manual): open, start, the callback, stop and close go round on a real microphone without hanging" {
-    if (std.c.getenv("VP_CAPTURE_FULL_SMOKE") == null) return error.SkipZigTest;
+    if (std.c.getenv("KNGN_CAPTURE_FULL_SMOKE") == null) return error.SkipZigTest;
     var frames: std.atomic.Value(u64) = .init(0);
     var dev = capture.open(testing.allocator, .{ .sample_rate = 48000, .channels = 1, .capture_callback = smokeMicCallback, .userdata = &frames }) catch |err| {
         std.debug.print("[alsa full] open failed: {s} (best-effort: a missing sink or PipeWire is tolerated)\n", .{@errorName(err)});

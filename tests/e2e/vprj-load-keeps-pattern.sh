@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
 # VPRJ load must not wipe a saved pattern via seed reset (solo bit-identical + netsync SYNC).
-# When direnv is required, set VP_MAIN_DIR to the video-proto-main path (borrow the flake outside the workspace).
+# When direnv is required, set KNGN_MAIN_DIR to the video-proto-main path (borrow the flake outside the workspace).
 set -euo pipefail
 
 ROOT=$(cd "$(dirname "$0")/../.." && pwd)
-MAIN="${VP_MAIN_DIR:-$ROOT}"
+MAIN="${KNGN_MAIN_DIR:-$ROOT}"
 DRIVE="$ROOT/scripts/drive"
 cd "$ROOT"
 WORKDIR=$(mktemp -d /tmp/t151-XXXXXX)
@@ -20,8 +20,8 @@ start_patch() {
   shift 2
   mkdir -p "$out_dir"
   rm -f "$port_file"
-  # extra args are NAME=value env assignments (e.g. VP_NETSYNC_HOST=1)
-  env VP_HEADLESS=1 VP_HARNESS_LISTEN= VP_HARNESS_PORT_FILE="$port_file" VP_HARNESS_OUT="$out_dir" "$@" \
+  # extra args are NAME=value env assignments (e.g. KNGN_NETSYNC_HOST=1)
+  env KNGN_HEADLESS=1 KNGN_HARNESS_LISTEN= KNGN_HARNESS_PORT_FILE="$port_file" KNGN_HARNESS_OUT="$out_dir" "$@" \
     direnv exec "$MAIN" zig build run-patch >"$out_dir/app.log" 2>&1 &
   echo $!
 }
@@ -112,13 +112,13 @@ CLIENT_PORT=/tmp/t151-client.port
 HOST_OUT="$WORKDIR/host-out"
 CLIENT_OUT="$WORKDIR/client-out"
 
-host_pid=$(start_patch "$HOST_PORT" "$HOST_OUT" VP_NETSYNC_HOST=1 VP_NETSYNC_PORT=9150)
+host_pid=$(start_patch "$HOST_PORT" "$HOST_OUT" KNGN_NETSYNC_HOST=1 KNGN_NETSYNC_PORT=9150)
 wait_port "$HOST_PORT" "$host_pid"
 "$DRIVE" --port-file "$HOST_PORT" "$PATTERN_ACTIONS"
 host_pre=$(wait_masks "$HOST_PORT" "$host_pid")
 log "host pre-join masks: $(printf '%s' "$host_pre" | grep -oE '"patterns":\{[^}]+\}')"
 
-client_pid=$(start_patch "$CLIENT_PORT" "$CLIENT_OUT" VP_NETSYNC_CONNECT=127.0.0.1:9150)
+client_pid=$(start_patch "$CLIENT_PORT" "$CLIENT_OUT" KNGN_NETSYNC_CONNECT=127.0.0.1:9150)
 wait_port "$CLIENT_PORT" "$client_pid"
 
 synced=0

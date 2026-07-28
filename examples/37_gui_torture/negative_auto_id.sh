@@ -5,7 +5,7 @@ set -u
 
 SCRIPT_DIR=$(cd "$(dirname "$0")" && pwd)
 ROOT=$(cd "$SCRIPT_DIR/../.." && pwd)
-VP_ROOT="${VP_ROOT:-/Users/gamako/gamako/project/zig/video-proto/video-proto-main}"
+KNGN_ROOT="${KNGN_ROOT:-/Users/gamako/gamako/project/zig/video-proto/video-proto-main}"
 OUT=$(mktemp -d)
 trap 'rm -rf "$OUT"' EXIT
 
@@ -13,11 +13,11 @@ cd "$ROOT"
 
 echo "[negative_auto_id] running Debug headless negative case..."
 set +e
-VP_GUI_TORTURE_CASE=negative_auto_id \
-VP_HEADLESS=1 \
-VP_HARNESS_SCRIPT="$SCRIPT_DIR/negative_auto_id.txt" \
-VP_HARNESS_OUT="$OUT" \
-direnv exec "$VP_ROOT" zig build run-example_37 -Doptimize=Debug \
+KNGN_GUI_TORTURE_CASE=negative_auto_id \
+KNGN_HEADLESS=1 \
+KNGN_HARNESS_SCRIPT="$SCRIPT_DIR/negative_auto_id.txt" \
+KNGN_HARNESS_OUT="$OUT" \
+direnv exec "$KNGN_ROOT" zig build run-example_37 -Doptimize=Debug \
   >"$OUT/stdout.txt" 2>"$OUT/stderr.txt"
 status=$?
 set -e

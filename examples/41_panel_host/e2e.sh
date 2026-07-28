@@ -4,7 +4,7 @@ set -euo pipefail
 
 SCRIPT_DIR=$(cd "$(dirname "$0")" && pwd)
 ROOT=$(cd "$SCRIPT_DIR/../.." && pwd)
-VP_ROOT="${VP_ROOT:-/Users/gamako/gamako/project/zig/video-proto/video-proto-main}"
+KNGN_ROOT="${KNGN_ROOT:-/Users/gamako/gamako/project/zig/video-proto/video-proto-main}"
 E2E_WIDTH="${E2E_WIDTH:-1024}"
 E2E_HEIGHT="${E2E_HEIGHT:-768}"
 E2E_TIMEOUT_SEC="${E2E_TIMEOUT_SEC:-60}"
@@ -19,13 +19,13 @@ rm -f "$REPLAY_PORT"
 mkdir -p "$REPLAY_OUT"
 log "[e2e] === replay === out=$REPLAY_OUT"
 
-VP_GUI_WIDTH="$E2E_WIDTH" \
-VP_GUI_HEIGHT="$E2E_HEIGHT" \
-VP_HEADLESS=1 \
-VP_HARNESS_SCRIPT="$SCRIPT_DIR/e2e_replay.txt" \
-VP_HARNESS_PORT_FILE="$REPLAY_PORT" \
-VP_HARNESS_OUT="$REPLAY_OUT" \
-direnv exec "$VP_ROOT" zig build run-example_41
+KNGN_GUI_WIDTH="$E2E_WIDTH" \
+KNGN_GUI_HEIGHT="$E2E_HEIGHT" \
+KNGN_HEADLESS=1 \
+KNGN_HARNESS_SCRIPT="$SCRIPT_DIR/e2e_replay.txt" \
+KNGN_HARNESS_PORT_FILE="$REPLAY_PORT" \
+KNGN_HARNESS_OUT="$REPLAY_OUT" \
+direnv exec "$KNGN_ROOT" zig build run-example_41
 log "[e2e] replay PASS"
 log "[e2e] replay snapshots:"
 ls -1 "$REPLAY_OUT"/*.png 2>/dev/null || true
@@ -40,7 +40,7 @@ log "[e2e] === live === out=$LIVE_OUT"
 
 if [[ ! -x "$ROOT/zig-out/bin/drive" ]]; then
   log "[e2e] building drive..."
-  direnv exec "$VP_ROOT" zig build drive >>"$LOG" 2>&1
+  direnv exec "$KNGN_ROOT" zig build drive >>"$LOG" 2>&1
 fi
 
 APP_PID=""
@@ -60,13 +60,13 @@ trap cleanup EXIT
 
 cd "$ROOT"
 
-VP_GUI_WIDTH="$E2E_WIDTH" \
-VP_GUI_HEIGHT="$E2E_HEIGHT" \
-VP_HEADLESS=1 \
-VP_HARNESS_LISTEN= \
-VP_HARNESS_PORT_FILE="$PORT_FILE" \
-VP_HARNESS_OUT="$LIVE_OUT" \
-direnv exec "$VP_ROOT" zig build run-example_41 >>"$LOG" 2>&1 &
+KNGN_GUI_WIDTH="$E2E_WIDTH" \
+KNGN_GUI_HEIGHT="$E2E_HEIGHT" \
+KNGN_HEADLESS=1 \
+KNGN_HARNESS_LISTEN= \
+KNGN_HARNESS_PORT_FILE="$PORT_FILE" \
+KNGN_HARNESS_OUT="$LIVE_OUT" \
+direnv exec "$KNGN_ROOT" zig build run-example_41 >>"$LOG" 2>&1 &
 APP_PID=$!
 log "[e2e] started pid=$APP_PID"
 

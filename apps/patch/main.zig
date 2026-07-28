@@ -531,7 +531,7 @@ const App = struct {
     meta_events: [MAX_META_EVENTS]MetaEvent = [_]MetaEvent{.{}} ** MAX_META_EVENTS,
     meta_head: u32 = 0,
     meta_filled: u32 = 0,
-    // appshell Preferences (panel/slot persistence; VP_APPSHELL_DIR).
+    // appshell Preferences (panel/slot persistence; KNGN_APPSHELL_DIR).
     prefs: appshell.preferences.Preferences = undefined,
     prefs_dir: ?std.Io.Dir = null,
     prefs_dirty: bool = false,
@@ -3201,7 +3201,7 @@ pub fn main(init: std.process.Init) !void {
 
     // appshell Preferences (panel/slot persistence).
     app.prefs = appshell.preferences.Preferences.init(allocator);
-    const override_path = if (std.c.getenv("VP_APPSHELL_DIR")) |v| std.mem.span(v) else null;
+    const override_path = if (std.c.getenv("KNGN_APPSHELL_DIR")) |v| std.mem.span(v) else null;
     if (appshell.paths.openAppDataDir(app.io, allocator, "patch", override_path)) |dir| {
         app.prefs_dir = dir;
         _ = app.prefs.load(app.io, dir, "preferences.ash") catch {};

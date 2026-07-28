@@ -473,19 +473,19 @@ test "enumerate and requestPermission: calling the real V4L2 neither crashes nor
     defer types.freeDeviceList(testing.allocator, devices);
     const perm = try requestPermission();
     try testing.expect(perm == .granted or perm == .denied or perm == .not_determined);
-    if (std.c.getenv("VP_CAPTURE_SMOKE") != null) {
+    if (std.c.getenv("KNGN_CAPTURE_SMOKE") != null) {
         std.debug.print("[v4l2 smoke] enumerate -> {d} device(s)", .{devices.len});
         for (devices) |d| std.debug.print(" [{s}={s}]", .{ d.id, d.name });
         std.debug.print("; requestPermission -> {s}\n", .{@tagName(perm)});
     }
 }
 
-// For manual verification only (SkipZigTest by default; it runs only with VP_CAPTURE_FULL_SMOKE=1, since it takes a real camera).
+// For manual verification only (SkipZigTest by default; it runs only with KNGN_CAPTURE_FULL_SMOKE=1, since it takes a real camera).
 // It checks on real hardware the whole cycle of open, start, pollLatestFrame, stop and close, and above all whether stop()'s
 // STREAMOFF reliably unblocks the blocking DQBUF so that the join completes (the same manual test convention as
-// audio_macos.zig's VP_MANUAL_CAPTURE_TEST). A lack of YUYV support or of a device is tolerated best-effort (NoDevice and ConfigFailed skip).
+// audio_macos.zig's KNGN_MANUAL_CAPTURE_TEST). A lack of YUYV support or of a device is tolerated best-effort (NoDevice and ConfigFailed skip).
 test "full cycle (manual): open, start, pollLatestFrame, stop and close go round on a real camera without hanging" {
-    if (std.c.getenv("VP_CAPTURE_FULL_SMOKE") == null) return error.SkipZigTest;
+    if (std.c.getenv("KNGN_CAPTURE_FULL_SMOKE") == null) return error.SkipZigTest;
     var dev = open(testing.allocator, .{ .width = 640, .height = 480, .frame_rate = 30 }) catch |err| {
         std.debug.print("[v4l2 full] open failed: {s} (best-effort: a lack of YUYV support or of a device is tolerated)\n", .{@errorName(err)});
         return;

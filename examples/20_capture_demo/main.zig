@@ -5,7 +5,7 @@
 //!
 //! ## Choosing the data source (production vs headless verification)
 //!
-//! Branches on `harness.isCaptureSyntheticActive()` (true only when `VP_HARNESS_CAPTURE_SYNTHETIC=1`
+//! Branches on `harness.isCaptureSyntheticActive()` (true only when `KNGN_HARNESS_CAPTURE_SYNTHETIC=1`
 //! and the harness is enabled; core/control/harness.zig):
 //! - **Production (default)**: `core/camera.zig` (macOS=AVFoundation real backend / else stub) and
 //!   the capture extension of `core/audio.zig` (macOS=AUHAL input real backend / else stub).
@@ -159,7 +159,7 @@ fn micCallback(frame: audio.AudioInFrame, userdata: ?*anyopaque) void {
 /// fail-fast.
 fn openRealVideo(allocator: std.mem.Allocator) VideoSource {
     if (harness.isHeadlessActive()) {
-        std.debug.print("[capture_demo] headless active: not attempting real camera (TCC wait can hang; use VP_HARNESS_CAPTURE_SYNTHETIC=1)\n", .{});
+        std.debug.print("[capture_demo] headless active: not attempting real camera (TCC wait can hang; use KNGN_HARNESS_CAPTURE_SYNTHETIC=1)\n", .{});
         return .none;
     }
     const perm = camera.requestPermission() catch |err| {
@@ -197,7 +197,7 @@ fn openSyntheticVideo(allocator: std.mem.Allocator) VideoSource {
 /// the same `avRequestAccessBlocking`).
 fn openRealMic(allocator: std.mem.Allocator, app: *App) MicSource {
     if (harness.isHeadlessActive()) {
-        std.debug.print("[capture_demo] headless active: not attempting real mic (TCC wait can hang; use VP_HARNESS_CAPTURE_SYNTHETIC=1)\n", .{});
+        std.debug.print("[capture_demo] headless active: not attempting real mic (TCC wait can hang; use KNGN_HARNESS_CAPTURE_SYNTHETIC=1)\n", .{});
         return .none;
     }
     const perm = audio.requestCapturePermission() catch |err| {
@@ -372,7 +372,7 @@ pub fn main() !void {
     var window = try platform.Window.create(WIN_W, WIN_H, "20_capture_demo - mic viz + camera canvas");
     defer window.destroy();
 
-    // Data-source choice: synthetic only when VP_HARNESS_CAPTURE_SYNTHETIC=1 and harness is enabled
+    // Data-source choice: synthetic only when KNGN_HARNESS_CAPTURE_SYNTHETIC=1 and harness is enabled
     // (harness.isCaptureSyntheticActive() in core/control/harness.zig). Default is production (real backend).
     const synthetic_mode = harness.isCaptureSyntheticActive();
     std.debug.print("[capture_demo] mode={s}\n", .{if (synthetic_mode) "synthetic (headless verification)" else "real (production; requires camera/mic + TCC permission)"});

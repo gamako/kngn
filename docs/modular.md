@@ -155,7 +155,7 @@ Checking acceptance headlessly (sound comes out on macOS hardware; the audio dig
 taken live):
 
 ```bash
-VP_HARNESS_LISTEN= VP_HARNESS_PORT_FILE=/tmp/vp.port zig build run-patch &     # start in the background
+KNGN_HARNESS_LISTEN= KNGN_HARNESS_PORT_FILE=/tmp/vp.port zig build run-patch &     # start in the background
 scripts/drive --port-file /tmp/vp.port 'digest audio'                        # → check silent=0 and rms>0
 scripts/drive --port-file /tmp/vp.port 'quit'
 ```

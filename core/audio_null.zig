@@ -1,6 +1,6 @@
 //! Null audio output device (an L1 audio output primitive)
 //!
-//! The output with no real device, for the headless harness (`VP_HEADLESS=1`). Pure Zig and OS independent
+//! The output with no real device, for the headless harness (`KNGN_HEADLESS=1`). Pure Zig and OS independent
 //! (no `@cImport`, the same ABI strategy as audio_linux and audio_windows). `start()` spawns a playback thread
 //! (`std.Thread`) and pulls the render callback with real-time pacing (sleeping for exactly one period's worth of
 //! time), following audio_linux's push-thread pattern. That way the behaviour an application sees — another thread

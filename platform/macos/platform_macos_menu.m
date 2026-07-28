@@ -4,7 +4,7 @@
 //
 // objc, swift and metal all link this same translation unit.
 // Opt-in: build_helpers compiles this file only when enable_menu=true, passing
-// `-DVP_ENABLE_MENU`. An executable that does not use menus never links this TU (nm shows no symbol).
+// `-DKNGN_ENABLE_MENU`. An executable that does not use menus never links this TU (nm shows no symbol).
 // NSMenu needs no extra framework, since AppKit is linked already.
 //
 // Hot path declaration: building and rebuilding happen only on the first registration or a structural
@@ -15,7 +15,7 @@
 #include "macos/platform_macos_menu.h"
 #include <string.h>
 
-#if defined(VP_ENABLE_MENU)
+#if defined(KNGN_ENABLE_MENU)
 
 static NSMenu* g_menu_main = nil;
 static PlatformWindow* g_menu_event_window = NULL;
@@ -257,4 +257,4 @@ bool platform_menu_consume_key_equivalent(void* ns_event) {
     return [g_menu_main performKeyEquivalent:event] ? true : false;
 }
 
-#endif // VP_ENABLE_MENU
+#endif // KNGN_ENABLE_MENU

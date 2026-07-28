@@ -15,7 +15,7 @@ foundation. This document is the authority on the contracts of those layers.
 Graphics run on the main thread (driven by CADisplayLink on macOS and so on); audio is
 driven by a render callback. On macOS, CoreAudio pulls on an OS real-time thread; on
 Linux (ALSA) and Windows (WASAPI) the backend spawns its own playback thread
-(`std.Thread`) and pushes. Under `VP_HEADLESS`, the null device (`core/audio_null.zig`)
+(`std.Thread`) and pushes. Under `KNGN_HEADLESS`, the null device (`core/audio_null.zig`)
 spawns a real-time pull thread that paces the same callback by sleeping one period at
 a time. On wasm, an AudioWorklet `process()` push-drives `vp_audio_render` in shared
 memory (`core/audio_web.zig`). **Inside the callback, malloc, locking, IO and panic are

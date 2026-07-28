@@ -241,7 +241,7 @@ typestate machine:
    `wait` and `timeout` do not wait in real time and decide immediately**, which keeps
    the virtual clock consistent and replay deterministic. What "decide immediately"
    means differs between headless and non-headless:
-   - **Headless** (`VP_HEADLESS=1`): the null window never calls a backend, so a frame
+   - **Headless** (`KNGN_HEADLESS=1`): the null window never calls a backend, so a frame
      slot is always immediately available (fixed `.framebuffer`/`.ready`).
    - **Non-headless** (a native window with replay or live): `beginFrame` and
      `waitFrame` respect the native backend's lock result as-is and merely **skip the
@@ -259,7 +259,7 @@ typestate machine:
    harness's injection path).
 4. **Complete pass-through when the environment is unset is preserved**: as with the
    existing four hooks, the new hooks pass straight through when
-   `VP_HARNESS_SCRIPT`/`LIVE` are unset. The bit-identical `fb` digest must not regress.
+   `KNGN_HARNESS_SCRIPT`/`LIVE` are unset. The bit-identical `fb` digest must not regress.
 5. **A loop built on `beginFrame(wait)` alone is explicitly outside the harness step
    gate**: the step gate (`pollGate`) stays anchored on `pollEvents()`. A caller that
    never calls `pollEvents()` and loops on `beginFrame(.wait)` alone is not covered by

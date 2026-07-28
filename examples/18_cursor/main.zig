@@ -7,7 +7,7 @@
 //!   - 0: hidden
 //!
 //! The real OS cursor is not captured in the framebuffer, so the background colour also changes per state. That lets
-//! headless replay (VP_HEADLESS) confirm via fb digest that "state transitions including setCursor do not crash and
+//! headless replay (KNGN_HEADLESS) confirm via fb digest that "state transitions including setCursor do not crash and
 //! still run" (the automatable part). The real OS cursor look
 //! (arrow/crosshair/hidden) is confirmed by manual visual check (not verifiable headless).
 //!

@@ -131,7 +131,7 @@ snapshot fb /tmp/pixie-png-drop-after-undo.png
 quit
 ```
 
-Run with `VP_HARNESS_HEADLESS=1`, `VP_HARNESS_SCRIPT=<script>`, `VP_HARNESS_OUT=<out>`. Assert:
+Run with `KNGN_HEADLESS=1`, `KNGN_HARNESS_SCRIPT=<script>`, `KNGN_HARNESS_OUT=<out>`. Assert:
 
 - layer 0 crc/nz unchanged across the drop (original layer kept)
 - layer 1 exists with `nz >= 1` (exact fragment from first measurement, or regex)

@@ -422,10 +422,10 @@ const App = struct {
             .size = .{ .width = WINDOW_W, .height = WINDOW_H },
             .fb_mode = .physical,
         };
-        // VP_APPSHELL_DIR is a native-only development override; wasm has no process env to read.
+        // KNGN_APPSHELL_DIR is a native-only development override; wasm has no process env to read.
         const override_path = if (comptime builtin.os.tag == .wasi or builtin.os.tag == .freestanding)
             null
-        else if (std.c.getenv("VP_APPSHELL_DIR")) |value|
+        else if (std.c.getenv("KNGN_APPSHELL_DIR")) |value|
             std.mem.span(value)
         else
             null;
@@ -6618,10 +6618,10 @@ fn appInit(gpa: std.mem.Allocator, io: std.Io) !*App {
     const onion_scratch = try gpa.alloc(u32, canvas_pixel_count);
     errdefer gpa.free(onion_scratch);
 
-    // VP_APPSHELL_DIR is a native-only development override; wasm has no process env to read.
+    // KNGN_APPSHELL_DIR is a native-only development override; wasm has no process env to read.
     const override_path = if (comptime builtin.os.tag == .wasi or builtin.os.tag == .freestanding)
         null
-    else if (std.c.getenv("VP_APPSHELL_DIR")) |value|
+    else if (std.c.getenv("KNGN_APPSHELL_DIR")) |value|
         std.mem.span(value)
     else
         null;

@@ -1,5 +1,5 @@
 # ids/popup torture
-# Launch: VP_GUI_TORTURE_CASE=ids_popup
+# Launch: KNGN_GUI_TORTURE_CASE=ids_popup
 # expect values baked from a 2026-07-17 headless replay
 step 4
 digest state

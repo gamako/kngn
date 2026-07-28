@@ -5,7 +5,7 @@
 set -euo pipefail
 
 ROOT=$(cd "$(dirname "$0")/../.." && pwd)
-MAIN="${VP_MAIN_DIR:-$ROOT}"
+MAIN="${KNGN_MAIN_DIR:-$ROOT}"
 DRIVE="$ROOT/scripts/drive"
 E2E="$ROOT/.e2e/consecutive-stroke"
 NETSYNC_PORT=9212
@@ -25,7 +25,7 @@ start_pixie() {
   shift 2
   mkdir -p "$out_dir"
   rm -f "$port_file"
-  env VP_HARNESS_HEADLESS=1 VP_HARNESS_LIVE=1 VP_HARNESS_PORT_FILE="$port_file" VP_HARNESS_OUT="$out_dir" "$@" \
+  env KNGN_HARNESS_PORT_FILE="$port_file" KNGN_HARNESS_OUT="$out_dir" "$@" \
     direnv exec "$MAIN" zig build run-pixie >"$out_dir/app.log" 2>&1 &
   echo $!
 }
@@ -108,9 +108,9 @@ drag_points() {
 }
 
 log "=== consecutive stroke (pending-clear race) ==="
-host_pid=$(start_pixie "$HOST_PORT" "$HOST_OUT" VP_NETSYNC_HOST=1 VP_NETSYNC_PORT="$NETSYNC_PORT")
+host_pid=$(start_pixie "$HOST_PORT" "$HOST_OUT" KNGN_NETSYNC_HOST=1 KNGN_NETSYNC_PORT="$NETSYNC_PORT")
 wait_port "$HOST_PORT" "$host_pid"
-client_pid=$(start_pixie "$CLIENT_PORT" "$CLIENT_OUT" VP_NETSYNC_CONNECT=127.0.0.1:"$NETSYNC_PORT")
+client_pid=$(start_pixie "$CLIENT_PORT" "$CLIENT_OUT" KNGN_NETSYNC_CONNECT=127.0.0.1:"$NETSYNC_PORT")
 wait_port "$CLIENT_PORT" "$client_pid"
 
 for i in $(seq 1 2000); do

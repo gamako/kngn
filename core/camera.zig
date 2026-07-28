@@ -10,7 +10,7 @@
 //! ## The seam for the harness synthetic source
 //!
 //! Each capture function tests `harness.isCaptureSyntheticActive()` at its head, which holds when
-//! `VP_HARNESS_CAPTURE_SYNTHETIC` is set and harness is enabled. **This facade is not wired to the
+//! `KNGN_HARNESS_CAPTURE_SYNTHETIC` is set and harness is enabled. **This facade is not wired to the
 //! synthetic source**, so that branch returns `error.Unsupported`: the synthetic source is reached only
 //! through the harness's own `capture` command and probe. The branch point and its name are all this facade fixes.
 //!

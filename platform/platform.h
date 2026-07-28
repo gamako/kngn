@@ -581,7 +581,7 @@ void platform_get_event_stats(PlatformWindow* window, PlatformEventStats* out);
 // the enum below (a=bit0 … guide=bit14) and matches the field order of GamepadButtons on the Zig side.
 // Triggers are exposed as axes only, never as buttons. Sticks and triggers carry raw values (no deadzone).
 //
-// The macOS backends implement this behind `VP_ENABLE_GAMEPAD`, which build.zig passes only to an
+// The macOS backends implement this behind `KNGN_ENABLE_GAMEPAD`, which build.zig passes only to an
 // executable that uses a gamepad.
 
 // The bit-mask form of PlatformGamepadState.buttons_mask
@@ -627,7 +627,7 @@ bool platform_get_gamepad_state(PlatformWindow* window, int index, PlatformGamep
 // - Strings are UTF-8, NUL-terminated, and **valid only for the duration of the call** (the backend copies them).
 // - The hierarchy is one level of top menu plus its items (no submenus; a separator is expressed through kind).
 // - The menu bar belongs to the application, so the window argument is ignored and the last registration replaces the whole bar.
-// - Implemented by the macOS objc/swift/metal backends, compiled conditionally on `#if defined(VP_ENABLE_MENU)`
+// - Implemented by the macOS objc/swift/metal backends, compiled conditionally on `#if defined(KNGN_ENABLE_MENU)`
 //   (the same shape as the gamepad opt-in; the shared translation unit is platform_macos_menu.m).
 //   An executable that does not use menus references no menu symbol at all.
 
@@ -645,7 +645,7 @@ typedef struct PlatformMenuItem {
     uint8_t checked;           // 0/1 (a toggle item)
 } PlatformMenuItem;
 
-// Whether native menus are available in this build (VP_ENABLE_MENU plus a macOS native implementation).
+// Whether native menus are available in this build (KNGN_ENABLE_MENU plus a macOS native implementation).
 bool platform_menu_available(void);
 
 // Replace the menu bar with items[0..count) (the last registration is the whole bar). window is ignored by contract.

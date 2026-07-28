@@ -1,5 +1,5 @@
 # volume E2E (500 then 1000 via PAGE_DOWN)
-# Launch: VP_GUI_TORTURE_CASE=volume
+# Launch: KNGN_GUI_TORTURE_CASE=volume
 step 4
 digest state
 digest layout

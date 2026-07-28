@@ -17,7 +17,7 @@ Phases, all implemented:
   `platform.registerProbe(...)` (the editor registers twelve, `canvas` and `undo` and
   `tool` among them; the synth registers `voices` and `patch`). See "Adding a custom
   probe".
-- **Fully display-less** operation: `VP_HEADLESS=1` makes `platform.init()` skip
+- **Fully display-less** operation: `KNGN_HEADLESS=1` makes `platform.init()` skip
   the native `backend.init()` entirely and select `platform_null` at runtime. A
   script or a listener is optional, so a display-less run needs neither. See
   "Fully display-less" below.
@@ -51,7 +51,7 @@ inject scroll 0 -3 ctrl    # scroll <dx> <dy> [modifiers...]
 step 5                     # manual/replay: drive 5 frames / free-run: a frame barrier of 5 presents
 await fb crc=8702DD71 60   # await <probe> <key><op><value> [timeout]  (timeout is a frame budget; 0 = compare once)
 await audio silent=0       # free-run holds the connection and waits for the app; manual drives frames and waits
-snapshot fb  /tmp/out.png  # save the most recent presented frame as PNG (default $VP_HARNESS_OUT/frame_<n>.png)
+snapshot fb  /tmp/out.png  # save the most recent presented frame as PNG (default $KNGN_HARNESS_OUT/frame_<n>.png)
 snapshot audio /tmp/a.wav  # save the most recent audio tap as PCM16 WAV (default audio_<n>.wav)
 snapshot stats /tmp/s.json # save stats as JSON (default stats_<n>.json)
 digest fb                  # fb <w>x<h> crc=<hex> top=[#RRGGBB:NN%,...]
@@ -291,7 +291,7 @@ cat > /tmp/script.txt <<'EOF'
 inject key_down A; step 2; digest fb; snapshot fb /tmp/out.png
 quit
 EOF
-VP_HARNESS_SCRIPT=/tmp/script.txt VP_HARNESS_OUT=/tmp zig build run            # the main program (examples, synth and so on work unmodified too)
+KNGN_HARNESS_SCRIPT=/tmp/script.txt KNGN_HARNESS_OUT=/tmp zig build run            # the main program (examples, synth and so on work unmodified too)
 # → read /tmp/*.png to look at it, and assert on the digest
 #   (re-running the same script produces bit-identical PNGs — it is deterministic)
 
@@ -305,27 +305,27 @@ per request per response. State stays in the process.
 
 ```bash
 zig build drive                                   # build zig-out/bin/drive once (a plain zig build includes it)
-VP_HARNESS_LISTEN= VP_HARNESS_PORT_FILE=/tmp/vp.port VP_HARNESS_OUT=/tmp \
-  VP_HARNESS_RECORD=/tmp/live.txt zig build run-synth &        # background (the ephemeral port is written to /tmp/vp.port)
-# For a fixed port use VP_HARNESS_LISTEN=<n>. The port also appears on stderr.
-# For the old step-driven behaviour, add VP_HARNESS_MANUAL_CLOCK=1.
+KNGN_HARNESS_LISTEN= KNGN_HARNESS_PORT_FILE=/tmp/vp.port KNGN_HARNESS_OUT=/tmp \
+  KNGN_HARNESS_RECORD=/tmp/live.txt zig build run-synth &        # background (the ephemeral port is written to /tmp/vp.port)
+# For a fixed port use KNGN_HARNESS_LISTEN=<n>. The port also appears on stderr.
+# For the old step-driven behaviour, add KNGN_HARNESS_MANUAL_CLOCK=1.
 scripts/drive --port-file /tmp/vp.port 'inject key_down A; step 5; digest fb'   # → returns fb ... on stdout
 scripts/drive --port-file /tmp/vp.port 'digest audio'                          # → audio rms=.. f0=.. ..
 scripts/drive --port-file /tmp/vp.port 'snapshot fb /tmp/out.png'              # → /tmp/out.png
 scripts/drive --port-file /tmp/vp.port 'quit'                                  # terminate the application
 # Record → replay symmetry: replaying the log above reproduces the same command sequence
-VP_HARNESS_SCRIPT=/tmp/live.txt VP_HARNESS_OUT=/tmp zig build run-synth
+KNGN_HARNESS_SCRIPT=/tmp/live.txt KNGN_HARNESS_OUT=/tmp zig build run-synth
 ```
 
 | Environment variable | Role |
 |---|---|
-| `VP_HARNESS_SCRIPT=<file>` | enables **replay** (the file transport; always a manual clock) |
-| `VP_HARNESS_LISTEN[=port]` | enables **listening** (TCP loopback; no value, empty or `0` means ephemeral, a positive value is a fixed port; free-run by default) |
-| `VP_HARNESS_MANUAL_CLOCK=1` | subordinate to LISTEN: makes the socket a manual clock, equivalent to the old step-driven behaviour (blocking) |
-| `VP_HARNESS_PORT_FILE=<file>` | where the chosen port is written (default `$VP_HARNESS_OUT/harness.port`) |
-| `VP_HARNESS_RECORD=<file>` | append the commands received while listening (replayable via `VP_HARNESS_SCRIPT`) |
-| `VP_HARNESS_OUT=<dir>` | the default directory for an omitted snapshot path and for the port file |
-| `VP_HEADLESS=1` | **fully display-less**: `platform.init` selects the null backend. A script or listener is optional (it can run alone). See below |
+| `KNGN_HARNESS_SCRIPT=<file>` | enables **replay** (the file transport; always a manual clock) |
+| `KNGN_HARNESS_LISTEN[=port]` | enables **listening** (TCP loopback; no value, empty or `0` means ephemeral, a positive value is a fixed port; free-run by default) |
+| `KNGN_HARNESS_MANUAL_CLOCK=1` | subordinate to LISTEN: makes the socket a manual clock, equivalent to the old step-driven behaviour (blocking) |
+| `KNGN_HARNESS_PORT_FILE=<file>` | where the chosen port is written (default `$KNGN_HARNESS_OUT/harness.port`) |
+| `KNGN_HARNESS_RECORD=<file>` | append the commands received while listening (replayable via `KNGN_HARNESS_SCRIPT`) |
+| `KNGN_HARNESS_OUT=<dir>` | the default directory for an omitted snapshot path and for the port file |
+| `KNGN_HEADLESS=1` | **fully display-less**: `platform.init` selects the null backend. A script or listener is optional (it can run alone). See below |
 
 > Specifying SCRIPT and LISTEN together is an error and disables the harness (one
 > transport per process). MANUAL_CLOCK alone, without LISTEN, is also invalid. With
@@ -335,13 +335,13 @@ VP_HARNESS_SCRIPT=/tmp/live.txt VP_HARNESS_OUT=/tmp zig build run-synth
 > non-blocking accept of free-run currently exists only as a POSIX `poll(0)`
 > implementation, and the Windows branch always reports `not_ready` (a silent no-op
 > that never accepts a connection — the port file and the listen log appear, but
-> `drive` cannot connect). **On Windows, add `VP_HARNESS_MANUAL_CLOCK=1`** to use the
+> `drive` cannot connect). **On Windows, add `KNGN_HARNESS_MANUAL_CLOCK=1`** to use the
 > old step-driven path (a blocking accept). macOS and Linux are fine with the free-run
 > default.
 
 ## Fully display-less
 
-With `VP_HEADLESS=1`, `platform.init()` does not call the native `backend.init()` at
+With `KNGN_HEADLESS=1`, `platform.init()` does not call the native `backend.init()` at
 all (no X11 or Wayland display connection, and no macOS WindowServer connection). It
 selects `core/platform_null.zig` at runtime, where the `Window` owns a primary CPU
 framebuffer (a `w*h` buffer of `u32`). The harness merely takes an observation copy in
@@ -365,7 +365,7 @@ optional, so a display-less run with no transport at all is possible.
 - **The framebuffer crc is bit-identical to a non-headless run** (measured; headless
   changes nothing about what is drawn).
 - A known limit: an audio-only application that never calls `platform.init()` (such as
-  `examples/15_audio_tone`) cannot interpret `VP_HEADLESS`, because the decision is
+  `examples/15_audio_tone`) cannot interpret `KNGN_HEADLESS`, because the decision is
   made in `platform.init()`. That said, the harness assumes a frame loop
   (`window.pollEvents()`), and an application without a window could never be driven by
   a replay script in the first place (there is no synchronisation point corresponding
@@ -495,7 +495,7 @@ Rules and limits:
   the same predicate as `expect` within a frame budget (a timeout of 0 means compare
   once). While listening in free-run, the application keeps running even with no
   commands outstanding, and an empty drain is a single `poll(0)` on the listener.
-  Under **manual LISTEN** (`VP_HARNESS_MANUAL_CLOCK=1`), it blocks on accepting and
+  Under **manual LISTEN** (`KNGN_HARNESS_MANUAL_CLOCK=1`), it blocks on accepting and
   reading the next connection, as before. With **a real display plus manual**, the
   native `pollEvents()` is pumped at a short interval through the facade even while
   waiting. **Free-run does not use `NativePump`** (to avoid polling twice).
@@ -503,9 +503,9 @@ Rules and limits:
   compositor.
 - **The virtual clock**: only under a manual clock is `getTime()` equal to
   `frame_index/60`. Free-run uses the backend's real time.
-- **Limits**: creating a real window is required only when `VP_HEADLESS` is unset (a
+- **Limits**: creating a real window is required only when `KNGN_HEADLESS` is unset (a
   display is needed: usually fine on macOS, Xvfb or a real session on Linux).
-  **`VP_HEADLESS=1` is fully display-less** (see above). `audio` depends on real time
+  **`KNGN_HEADLESS=1` is fully display-less** (see above). `audio` depends on real time
   on the real-time thread, so a bit-identical digest across record → replay is not
   guaranteed (`fb` is bit-deterministic under the manual virtual clock, and equally so
   headless — the framebuffer crc was measured bit-identical between headless and
@@ -534,14 +534,14 @@ generates MCP tools dynamically from capabilities (the application is unmodified
 ```bash
 zig build mcp                    # → zig-out/bin/vp-mcp
 # with the application started headless and listening:
-VP_HEADLESS=1 VP_HARNESS_LISTEN= VP_HARNESS_PORT_FILE=/tmp/vp.port zig build run-pixie &
+KNGN_HEADLESS=1 KNGN_HARNESS_LISTEN= KNGN_HARNESS_PORT_FILE=/tmp/vp.port zig build run-pixie &
 zig-out/bin/vp-mcp --port-file /tmp/vp.port
 # or scripts/mcp --port-file /tmp/vp.port
 ```
 
 - **Arguments**: `--port` and `--port-file` (the same precedence as `drive`, plus the
-  environment variables `VP_HARNESS_LISTEN` for a positive value and
-  `VP_HARNESS_PORT_FILE`), plus `--out <dir>` for where snapshots go (default
+  environment variables `KNGN_HARNESS_LISTEN` for a positive value and
+  `KNGN_HARNESS_PORT_FILE`), plus `--out <dir>` for where snapshots go (default
   `$TMPDIR/vp-mcp-<port>`; made absolute and created at startup).
 - **At startup** it takes `digest capabilities` once and fails to start if
   `"truncated":true`. The tool table is fixed from then on (it does not follow an

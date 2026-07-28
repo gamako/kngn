@@ -13,7 +13,7 @@ went unnoticed. Take the difference in `frame` from `digest stats` under free-ru
 real-time clock):
 
 ```bash
-VP_HARNESS_LISTEN= VP_HARNESS_PORT_FILE=/tmp/x.port VP_HARNESS_SKIP_FRAME_COPY=1 \
+KNGN_HARNESS_LISTEN= KNGN_HARNESS_PORT_FILE=/tmp/x.port KNGN_HARNESS_SKIP_FRAME_COPY=1 \
   zig build run-pixie -Doptimize=ReleaseFast &
 until [ -s /tmp/x.port ]; do sleep 0.1; done         # wait for the port file to appear
 sleep 5                                              # warm up
@@ -27,7 +27,7 @@ scripts/drive --port-file /tmp/x.port 'quit'          # always quit (never pkill
   ADR-002 and ADR-005). It is not the number of times the compositor actually displayed
   anything. **Ignore `virtual_fps`** in the same JSON: it is a fixed value derived from
   the virtual clock.
-- `VP_HARNESS_SKIP_FRAME_COPY=1` is a measurement-only mode that excludes the harness's
+- `KNGN_HARNESS_SKIP_FRAME_COPY=1` is a measurement-only mode that excludes the harness's
   per-present copy, and **`digest fb` cannot be taken in the same run** (check the
   framebuffer dimensions in a separate run without the skip).
 
@@ -42,7 +42,7 @@ There is a worked example of drawing the wrong conclusion by not aligning these.
    and conditions, so measure it each time).
 2. **The actual framebuffer size**: record the `WxH` from `digest fb` (the editor's size
    changes with its persisted window state).
-3. **Whether there is a display**: `VP_HEADLESS=1` has no present cost and a 1x
+3. **Whether there is a display**: `KNGN_HEADLESS=1` has no present cost and a 1x
    framebuffer, so it is an order of magnitude away from an on-screen `.physical` 2x
    (the same window measured ≈1020fps headless at 1x against ≈101fps on-screen at 2x).
    Never mix them in a comparison.

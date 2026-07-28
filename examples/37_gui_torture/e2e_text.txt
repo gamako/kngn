@@ -1,5 +1,5 @@
 # text torture
-# Launch: VP_GUI_TORTURE_CASE=text
+# Launch: KNGN_GUI_TORTURE_CASE=text
 # expect values baked from a 2026-07-17 headless replay
 step 3
 digest state

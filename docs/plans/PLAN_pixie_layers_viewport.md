@@ -105,7 +105,7 @@ from unreachability.
 
 ## Verification method (as planned)
 
-Set `VP_APPSHELL_DIR` to a temp dir and size Pixie around 420×360 via existing `window_state.ash`.
+Set `KNGN_APPSHELL_DIR` to a temp dir and size Pixie around 420×360 via existing `window_state.ash`.
 Open Palette + Color / Tool Options / Layers; `action add_layer` 15–20 times. Do not commit ash/PNG.
 
 Representative replay (Palette open prepared via header click or persisted PanelHost settings;
@@ -126,7 +126,7 @@ snapshot fb /tmp/pixie-layers-viewport-after.png
 quit
 ```
 
-Replay with `VP_HEADLESS=1 VP_HARNESS_SCRIPT=... VP_HARNESS_OUT=... zig build run-pixie` and visually
+Replay with `KNGN_HEADLESS=1 KNGN_HARNESS_SCRIPT=... KNGN_HARNESS_OUT=... zig build run-pixie` and visually
 inspect `snapshot fb` PNGs. Before: Layers viewport and/or PanelHost scrollbar visible. After:
 bottom thumbnail / name / visibility / opacity controls fully visible; Tool Options slider/toggle
 and Color/Palette bottoms intact. Optionally thumb-drag the outer scrollbar. On a real macOS
