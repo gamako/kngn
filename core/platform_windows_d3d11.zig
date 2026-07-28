@@ -16,6 +16,15 @@
 //! The method order of a vtbl and the struct layouts are copied verbatim from the `d3d11.h` / `dxgi.h` /
 //! `dxgiformat.h` shipped with zig (IUnknown's QueryInterface/AddRef/Release are fixed as the first three). The MinGW import libs shipped with zig (d3d11 and dxgi) resolve `D3D11CreateDeviceAndSwapChain`.
 //!
+//! ## Device creation
+//!   `D3D11CreateDeviceAndSwapChain` is tried with a hardware driver first and, when that fails, with
+//!   WARP, the software rasteriser shipped with Windows. WARP drives the same DXGI swap chain
+//!   (`DXGI_SWAP_EFFECT_DISCARD` plus `Present(1, 0)`), so the two paths present through identical
+//!   semantics and only the rasteriser differs. Creation fails only when both driver types fail.
+//!   No minimum feature level is requested: this backend only uploads to a texture, copies it and
+//!   presents, none of which a feature level gates. The driver in use is logged once at creation
+//!   (`info` for hardware, `warn` for WARP), so it is visible in a Debug or ReleaseSafe build.
+//!
 //! ## resize
 //!   present compares core's size against D3DState's, and on a difference `resizeSwapChain` calls
 //!   `IDXGISwapChain.ResizeBuffers` and rebuilds the upload texture and the backbuffer (lazily).
@@ -47,6 +56,8 @@ const BOOL = common.BOOL;
 // ============================================================================
 const D3D11_SDK_VERSION: UINT = 7;
 const D3D_DRIVER_TYPE_HARDWARE: c_int = 1;
+const D3D_DRIVER_TYPE_WARP: c_int = 5;
+const E_FAIL: HRESULT = @bitCast(@as(u32, 0x80004005));
 const DXGI_FORMAT_B8G8R8A8_UNORM: c_int = 0x57;
 const DXGI_SWAP_EFFECT_DISCARD: c_int = 0;
 const D3D11_USAGE_DEFAULT: c_int = 0;
@@ -222,6 +233,66 @@ pub const openFileDialog = common.openFileDialog;
 // Window — common.Core + D3D11/DXGI presentation
 // ============================================================================
 
+// The three objects `D3D11CreateDeviceAndSwapChain` produces together.
+const Devices = struct {
+    device: *ID3D11Device,
+    context: *ID3D11DeviceContext,
+    swap_chain: *IDXGISwapChain,
+};
+
+// The outcome of one creation attempt. A `.failed` attempt owns nothing: everything the call
+// produced is released before it is returned, so the caller can retry with another driver type
+// without leaking. The HRESULT travels with the failure so the caller can report why it fell back.
+const CreateResult = union(enum) {
+    ok: Devices,
+    failed: HRESULT,
+};
+
+/// Attempt device, immediate context and swap chain creation with one driver type.
+/// Runs at window creation time, once per driver type tried.
+fn createDeviceAndSwapChain(driver_type: c_int, desc: *const DXGI_SWAP_CHAIN_DESC) CreateResult {
+    var swap_chain_opt: ?*IDXGISwapChain = null;
+    var device_opt: ?*ID3D11Device = null;
+    var context_opt: ?*ID3D11DeviceContext = null;
+    const hr = D3D11CreateDeviceAndSwapChain(
+        null, // the default adapter
+        driver_type,
+        null,
+        0,
+        null, // the default feature level list; this backend requires no minimum
+        0,
+        D3D11_SDK_VERSION,
+        desc,
+        &swap_chain_opt,
+        &device_opt,
+        null,
+        &context_opt,
+    );
+    // A failed call is not documented to leave every out parameter null, so release what it did produce.
+    if (hr < 0) return releaseAttempt(swap_chain_opt, device_opt, context_opt, hr);
+    // A success missing any of the three is unusable; release the rest rather than keep a partial set.
+    if (swap_chain_opt == null or device_opt == null or context_opt == null) {
+        return releaseAttempt(swap_chain_opt, device_opt, context_opt, E_FAIL);
+    }
+    return .{ .ok = .{
+        .device = device_opt.?,
+        .context = context_opt.?,
+        .swap_chain = swap_chain_opt.?,
+    } };
+}
+
+fn releaseAttempt(
+    swap_chain: ?*IDXGISwapChain,
+    device: ?*ID3D11Device,
+    context: ?*ID3D11DeviceContext,
+    hr: HRESULT,
+) CreateResult {
+    if (swap_chain) |sc| _ = sc.lpVtbl.Release(sc);
+    if (device) |d| _ = d.lpVtbl.Release(d);
+    if (context) |c| _ = c.lpVtbl.Release(c);
+    return .{ .failed = hr };
+}
+
 // The D3D11/DXGI presentation state. It lives on the heap because present resizes lazily (Window is a
 // value receiver and cannot update its own fields for good, so the mutable resources, the swap chain and the textures, are shared through *D3DState).
 const D3DState = struct {
@@ -291,29 +362,33 @@ pub const Window = struct {
         desc.SwapEffect = DXGI_SWAP_EFFECT_DISCARD; // the bitblt model (a natural fit for the upload path; backbuffer 0 is stable)
         desc.Flags = 0;
 
-        var swap_chain_opt: ?*IDXGISwapChain = null;
-        var device_opt: ?*ID3D11Device = null;
-        var context_opt: ?*ID3D11DeviceContext = null;
-        const hr = D3D11CreateDeviceAndSwapChain(
-            null, // the default adapter
-            D3D_DRIVER_TYPE_HARDWARE,
-            null,
-            0,
-            null, // the default feature level
-            0,
-            D3D11_SDK_VERSION,
-            &desc,
-            &swap_chain_opt,
-            &device_opt,
-            null,
-            &context_opt,
-        );
-        if (hr < 0) return error.WindowCreationFailed;
-        const swap_chain = swap_chain_opt orelse return error.WindowCreationFailed;
+        // A hardware device is unavailable on a machine with no graphics adapter, so fall back to
+        // the WARP software rasteriser rather than failing to open a window at all.
+        // Set when WARP is in use, holding the HRESULT of the hardware attempt it replaced.
+        var hardware_failure: ?HRESULT = null;
+        const devices = switch (createDeviceAndSwapChain(D3D_DRIVER_TYPE_HARDWARE, &desc)) {
+            .ok => |d| d,
+            .failed => |hw_hr| switch (createDeviceAndSwapChain(D3D_DRIVER_TYPE_WARP, &desc)) {
+                .ok => |d| blk: {
+                    hardware_failure = hw_hr;
+                    break :blk d;
+                },
+                // Neither driver type works here, so the window cannot be opened at all. Report both
+                // HRESULTs: this is the only place that knows why, and the caller sees one opaque error.
+                .failed => |warp_hr| {
+                    std.log.err(
+                        "platform_windows_d3d11: no D3D11 device (hardware hr=0x{x:0>8}, WARP hr=0x{x:0>8})",
+                        .{ @as(u32, @bitCast(hw_hr)), @as(u32, @bitCast(warp_hr)) },
+                    );
+                    return error.WindowCreationFailed;
+                },
+            },
+        };
+        const swap_chain = devices.swap_chain;
         errdefer _ = swap_chain.lpVtbl.Release(swap_chain);
-        const device = device_opt orelse return error.WindowCreationFailed;
+        const device = devices.device;
         errdefer _ = device.lpVtbl.Release(device);
-        const context = context_opt orelse return error.WindowCreationFailed;
+        const context = devices.context;
         errdefer _ = context.lpVtbl.Release(context);
 
         // The swap chain backbuffer (DISCARD with a fixed size, so taking it at create time is enough; resize support is follow-up work).
@@ -354,6 +429,17 @@ pub const Window = struct {
             .width = width,
             .height = height,
         };
+
+        // Report the driver in use, now that the window is fully built. Only the surviving path is
+        // reported, so the message describes what the caller got rather than what was attempted.
+        if (hardware_failure) |hw_hr| {
+            std.log.warn(
+                "platform_windows_d3d11: no hardware device (hr=0x{x:0>8}); presenting through the WARP software rasteriser",
+                .{@as(u32, @bitCast(hw_hr))},
+            );
+        } else {
+            std.log.info("platform_windows_d3d11: presenting through a hardware device", .{});
+        }
         return .{ .core = core, .d3d = d3d };
     }
 
