@@ -167,6 +167,8 @@ fn buildWasmPixie(
 ) WasmExeBuild {
     const wasm_max_opts = b.addOptions();
     wasm_max_opts.addOption(usize, "max_modules", @as(usize, 48));
+    wasm_max_opts.addOption(bool, "has_frame_cap", false);
+    wasm_max_opts.addOption(u32, "frame_cap_hz", @as(u32, 0));
     const shared = SharedModules.init(b, true, false, false, 48, wasm_max_opts.createModule(), target.result.os.tag);
     const pm = makePlatformModules(b, target, .wasm, &shared, false);
 
@@ -233,6 +235,8 @@ fn buildWasmSynth(
     // wasm_shared=false → single_threaded=true (wasm_allocator ok). atomics come from the target feature.
     const wasm_max_opts = b.addOptions();
     wasm_max_opts.addOption(usize, "max_modules", @as(usize, 48));
+    wasm_max_opts.addOption(bool, "has_frame_cap", false);
+    wasm_max_opts.addOption(u32, "frame_cap_hz", @as(u32, 0));
     const shared = SharedModules.init(b, true, false, false, 48, wasm_max_opts.createModule(), base_target.result.os.tag);
     const pm = makePlatformModules(b, target, .wasm, &shared, false);
 
@@ -377,6 +381,15 @@ pub fn build(b: *std.Build) void {
     }
     const max_modules_opts = b.addOptions();
     max_modules_opts.addOption(usize, "max_modules", max_modules_option);
+    // Frame-rate cap for app_runtime (`-Dframe-cap`). Piggybacks on this shared options
+    // module (createModule once) so every consumer gets one root — see comment above.
+    const frame_cap_option = b.option(
+        u32,
+        "frame-cap",
+        "Native loop frame rate cap in Hz (omit to use App.frame_period_s)",
+    );
+    max_modules_opts.addOption(bool, "has_frame_cap", frame_cap_option != null);
+    max_modules_opts.addOption(u32, "frame_cap_hz", frame_cap_option orelse 0);
     const max_modules_mod = max_modules_opts.createModule();
 
     // ========================================
@@ -392,6 +405,7 @@ pub fn build(b: *std.Build) void {
             .root_source_file = b.path("core/app_runtime.zig"),
         }) };
         link(app_runtime_ext, shared_modules.platform);
+        app_runtime_ext.mod.addImport("build_options", max_modules_mod);
         const kit_ext: TaggedModule = .{ .layer = .kit, .name = "kit", .mod = b.addModule("kit", .{
             .root_source_file = b.path("kit/kit.zig"),
         }) };
@@ -1777,6 +1791,7 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
     kit_test_app_runtime.addImport("platform", shared_modules.platform.mod);
+    kit_test_app_runtime.addImport("build_options", max_modules_mod);
     const kit_test_root = b.createModule(.{
         .root_source_file = b.path("kit/kit.zig"),
         .target = target,
@@ -2527,6 +2542,7 @@ fn makePlatformModules(b: *std.Build, target: std.Build.ResolvedTarget, backend:
         .single_threaded = if (backend == .wasm) !wasm_shared else null,
     }) };
     link(app_runtime, platform_mod);
+    app_runtime.mod.addImport("build_options", common.max_modules_mod);
 
     const app_runtime_gamepad: TaggedModule = .{ .layer = .core, .name = "app_runtime", .mod = b.createModule(.{
         .root_source_file = b.path("core/app_runtime.zig"),
@@ -2534,6 +2550,7 @@ fn makePlatformModules(b: *std.Build, target: std.Build.ResolvedTarget, backend:
         .single_threaded = if (backend == .wasm) !wasm_shared else null,
     }) };
     link(app_runtime_gamepad, platform_gamepad_mod);
+    app_runtime_gamepad.mod.addImport("build_options", common.max_modules_mod);
 
     const app_runtime_menu: TaggedModule = .{ .layer = .core, .name = "app_runtime", .mod = b.createModule(.{
         .root_source_file = b.path("core/app_runtime.zig"),
@@ -2541,6 +2558,7 @@ fn makePlatformModules(b: *std.Build, target: std.Build.ResolvedTarget, backend:
         .single_threaded = if (backend == .wasm) !wasm_shared else null,
     }) };
     link(app_runtime_menu, platform_menu_mod);
+    app_runtime_menu.mod.addImport("build_options", common.max_modules_mod);
 
     // kit umbrella (per backend; ADR-007 R4). Keep 1:1 with pub imports in kit/kit.zig.
     const kit: TaggedModule = .{ .layer = .kit, .name = "kit", .mod = b.createModule(.{

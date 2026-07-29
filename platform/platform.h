@@ -152,6 +152,10 @@ bool platform_poll_events(PlatformWindow* window);
 // - Over a long run the drift against the system clock can accumulate
 double platform_get_time(void);
 
+// Display refresh rate in Hz (main screen). Returns 0 on failure / unavailable.
+// Queried once at startup (event time), never per frame.
+double platform_display_refresh_hz(void);
+
 // Begin accessing the framebuffer.
 // out_width, out_height: receive the framebuffer size
 // Returns: a pointer to the pixel buffer (canonical BGRA, u32 0xAARRGGBB, 32-bit)

@@ -122,6 +122,32 @@ pub const getTime = common.getTime;
 pub const saveFileDialog = common.saveFileDialog;
 pub const openFileDialog = common.openFileDialog;
 
+/// Display refresh via XRandR, loaded at runtime with `std.DynLib` (no link-time Xrandr dependency).
+/// Returns null when libXrandr is missing, symbols are absent, or the rate is non-positive.
+/// Queried once at startup (event-time), never per frame.
+pub fn displayRefreshHz() ?f64 {
+    const dpy = g_display orelse return null;
+    var lib = std.DynLib.open("libXrandr.so.2") catch return null;
+    defer lib.close();
+
+    const XRRScreenConfiguration = opaque {};
+    const GetScreenInfoFn = *const fn (?*c.Display, c.Window) callconv(.c) ?*XRRScreenConfiguration;
+    const ConfigCurrentRateFn = *const fn (?*XRRScreenConfiguration) callconv(.c) c_short;
+    const FreeScreenConfigInfoFn = *const fn (?*XRRScreenConfiguration) callconv(.c) void;
+
+    const get_info = lib.lookup(GetScreenInfoFn, "XRRGetScreenInfo") orelse return null;
+    const current_rate = lib.lookup(ConfigCurrentRateFn, "XRRConfigCurrentRate") orelse return null;
+    const free_info = lib.lookup(FreeScreenConfigInfoFn, "XRRFreeScreenConfigInfo") orelse return null;
+
+    const screen = c.XDefaultScreen(dpy);
+    const root = c.XRootWindow(dpy, screen);
+    const config = get_info(dpy, root) orelse return null;
+    defer free_info(config);
+    const rate = current_rate(config);
+    if (rate <= 0) return null;
+    return @floatFromInt(rate);
+}
+
 /// `XDestroyImage` is an Xlib macro (`(*((img)->f.destroy_image))(img)`), and @cImport translates the
 /// optional function pointer without unwrapping it, so it cannot be called as it stands. The function pointer is invoked by hand.
 inline fn destroyImage(img: *c.XImage) void {

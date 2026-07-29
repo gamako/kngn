@@ -707,6 +707,7 @@ pub const Window = struct {
 pub fn init() Error!void {
     // The frame pacing learning state. Re-initialising the process must not carry a bad value over.
     pacer.reset();
+    cached_display_refresh_hz = null;
     // KNGN_HEADLESS is settled before harness.parseConfig. Only the value "1" selects the null runtime.
     // The copilot order is: harness.parseConfig → copilot.parseConfig → backend init →
     // harness.startTransport → copilot.startTransport (exclusivity is settled at parseConfig time, from which env vars are present).
@@ -741,6 +742,7 @@ pub fn init() Error!void {
 }
 
 pub fn shutdown() void {
+    cached_display_refresh_hz = null;
     // Close the OS resource behind frame pacing (Windows's waitable timer handle).
     if (comptime builtin.os.tag == .windows) windows_wait.deinit();
     // app_runtime's defers run in reverse order of registration, so App.deinit runs first.
@@ -1148,8 +1150,45 @@ pub fn frameDelay(nanoseconds: u64) void {
 /// The pure pacing logic (the decision, the EWMA learning and the constants) lives in `core/frame_pacing.zig` (OS independent, and unit tested).
 const frame_pacing = @import("frame_pacing.zig");
 
+/// Re-export so `app_runtime` can compute the target period without importing `frame_pacing.zig`
+/// into a second module (a file may belong to only one module).
+pub const targetPeriodS = frame_pacing.targetPeriodS;
+
 /// The pacing learning state, owned by the main thread alone. The real-time thread never touches it.
 var pacer: frame_pacing.Pacer = .{};
+
+/// Cached display refresh in Hz. Owned here (same main-thread state as `pacer`).
+/// Invalidated on `init` / `shutdown`. Filled by the first `displayRefreshHz()` call.
+var cached_display_refresh_hz: ?f64 = null;
+
+/// Map a native refresh query to a finite positive Hz (failure / 0 / non-finite → 60).
+pub fn normalizeDisplayRefreshHz(raw: ?f64) f64 {
+    const v = raw orelse return 60.0;
+    if (!std.math.isFinite(v) or !(v > 0)) return 60.0;
+    return v;
+}
+
+/// Display refresh rate in Hz for pacing. Always finite and positive.
+///
+/// Queried once at startup (event-time), never per frame. The first call may hit the native
+/// backend; later calls return the process cache. Headless / manual-clock / backends without a
+/// query return 60. Moving the window to another display does not refresh this cache.
+pub fn displayRefreshHz() f64 {
+    if (cached_display_refresh_hz) |hz| return hz;
+    const raw: ?f64 = blk: {
+        // Facade unit tests do not link the native C ABI; skip the query there.
+        if (comptime builtin.is_test) break :blk null;
+        if (runtime_null) break :blk null;
+        if (harness.isManualClock()) break :blk null;
+        if (comptime @hasDecl(native_backend, "displayRefreshHz")) {
+            break :blk native_backend.displayRefreshHz();
+        }
+        break :blk null;
+    };
+    const hz = normalizeDisplayRefreshHz(raw);
+    cached_display_refresh_hz = hz;
+    return hz;
+}
 
 /// The pacing driver with the clock and the high-resolution sleep injected (injected at comptime, so no indirect call).
 const PaceDriver = frame_pacing.Driver(getTime, sleepPrecise);
@@ -1244,4 +1283,21 @@ test "FramebufferSnapshot logical and physical size contract" {
     };
     try std.testing.expectEqual(@as(u32, 1600), physical.framebuffer_size.width);
     try std.testing.expectEqual(@as(u32, 800), physical.logical_size.width);
+}
+
+test "normalizeDisplayRefreshHz maps failure/0/non-finite to 60" {
+    try std.testing.expectEqual(@as(f64, 60.0), normalizeDisplayRefreshHz(null));
+    try std.testing.expectEqual(@as(f64, 60.0), normalizeDisplayRefreshHz(0.0));
+    try std.testing.expectEqual(@as(f64, 60.0), normalizeDisplayRefreshHz(-1.0));
+    try std.testing.expectEqual(@as(f64, 60.0), normalizeDisplayRefreshHz(std.math.nan(f64)));
+    try std.testing.expectEqual(@as(f64, 60.0), normalizeDisplayRefreshHz(std.math.inf(f64)));
+    try std.testing.expectEqual(@as(f64, 120.0), normalizeDisplayRefreshHz(120.0));
+}
+
+test "displayRefreshHz serves the process cache without a native query" {
+    // Facade tests do not link the macOS C ABI; seed the cache so the call never reaches native.
+    cached_display_refresh_hz = 75.0;
+    try std.testing.expectEqual(@as(f64, 75.0), displayRefreshHz());
+    try std.testing.expectEqual(@as(f64, 75.0), displayRefreshHz());
+    cached_display_refresh_hz = null;
 }

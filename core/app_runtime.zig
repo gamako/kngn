@@ -13,20 +13,33 @@
 //! opt-in:
 //! - `pub fn windowBootstrap(gpa, io) !platform.WindowOptions` — after platform.init, before Window.create
 //! - `pub fn onWindowShutdown(self: *App, win: *platform.Window) void` — before destroy and before deinit
-//! - `pub const frame_period_s: f64` — the native loop's target period (1/60 by default; `0` disables pacing)
+//! - `pub const frame_period_s: f64` — native-loop period fallback when `-Dframe-cap` is unset
+//!   (1/60 by default; `0` disables pacing). Overridden by `-Dframe-cap=<Hz>` when set.
+//!
+//! **Hot path declaration**: the wait is once per frame (`framePaceUntil`); display refresh is queried
+//! once after Window.create (event-time), never inside the frame loop.
 
 const std = @import("std");
 const builtin = @import("builtin");
 const platform = @import("platform");
+const build_options = @import("build_options");
 
 pub fn Runtime(comptime App: type) type {
     return struct {
         const Self = @This();
 
-        /// The target frame period in seconds, 60fps by default. An App holding `pub const frame_period_s: f64` overrides it, and
-        /// `0` (or less) disables pacing so the loop runs freely (the deadline lands at or before now, and `framePaceUntil` returns at once).
-        /// It applies to the native loop only (wasm is paced by rAF, so it does not pace).
-        const frame_period_s: f64 = if (@hasDecl(App, "frame_period_s")) App.frame_period_s else 1.0 / 60.0;
+        /// Fallback period from the App (or 1/60). Used only when `-Dframe-cap` is unset.
+        const app_frame_period_s: f64 = if (@hasDecl(App, "frame_period_s")) App.frame_period_s else 1.0 / 60.0;
+
+        /// Cap in Hz from `-Dframe-cap`, or derived from `app_frame_period_s` when the option is unset.
+        /// `0` disables pacing. wasm ignores this (rAF paces).
+        fn resolveCapHz() f64 {
+            if (comptime build_options.has_frame_cap) {
+                return @floatFromInt(build_options.frame_cap_hz);
+            }
+            if (!(app_frame_period_s > 0) or !std.math.isFinite(app_frame_period_s)) return 0;
+            return 1.0 / app_frame_period_s;
+        }
 
         fn createAppWindow(gpa: std.mem.Allocator, io: std.Io) !platform.Window {
             if (@hasDecl(App, "windowBootstrap")) {
@@ -36,11 +49,23 @@ pub fn Runtime(comptime App: type) type {
             return platform.Window.create(App.window.w, App.window.h, App.window.title);
         }
 
+        /// Warn once when the cap is not an integer divisor of the display refresh (judder risk).
+        fn warnIfNonDivisorCap(refresh_hz: f64, cap_hz: f64) void {
+            if (!(cap_hz > 0) or !(refresh_hz > 0)) return;
+            if (!(cap_hz < refresh_hz)) return;
+            const ratio = refresh_hz / cap_hz;
+            const nearest = @round(ratio);
+            if (@abs(ratio - nearest) > 0.01) {
+                std.log.warn("frame cap {d:.0} Hz is not an integer divisor of display refresh {d:.0} Hz; display intervals may judder", .{ cap_hz, refresh_hz });
+            }
+        }
+
         /// native: takes a `std.process.Init` and owns the pull loop.
         /// The same shape as the existing editor: `while (running and pollEvents()) { running = frame(...) }`.
-        /// **The runtime owns the frame pacing**: each time round the loop it calls `framePaceUntil(t0 + frame_period_s)` once,
+        /// **The runtime owns the frame pacing**: each time round the loop it calls `framePaceUntil(t0 + period_s)` once,
         /// through `defer` (so it waits exactly once even on the path where `app.frame` returns an error or running=false).
-        /// The period is `frame_period_s` (60fps by default, overridden by `App.frame_period_s`, and `0` disables pacing).
+        /// The period is `1/min(displayRefreshHz(), cap)` computed once after Window.create (refresh is never queried per frame).
+        /// Cap comes from `-Dframe-cap` when set, otherwise from `App.frame_period_s` (default 1/60; `0` disables pacing).
         /// The deadline is based on **the same `t0`** that is passed to `app.frame` as `now`, so there is no double wait.
         /// Under the harness's manual clock (a replay) `framePaceUntil` is a no-op, so replay speed does not drop.
         /// The shutdown order is `onWindowShutdown → App.deinit → Window.destroy`.
@@ -53,6 +78,20 @@ pub fn Runtime(comptime App: type) type {
 
             var win = try createAppWindow(gpa, io);
             defer win.destroy();
+
+            // Event-time: query refresh once after the window exists; never again in the frame loop.
+            const refresh_hz = platform.displayRefreshHz();
+            const cap_hz = resolveCapHz();
+            const frame_period_s = platform.targetPeriodS(refresh_hz, cap_hz);
+            // One line, once per process: the pacing target is otherwise invisible, and a measured
+            // frame rate cannot be judged without knowing which refresh the run resolved (a machine
+            // with an adaptive-refresh or multi-display setup does not always report the same value).
+            std.log.info("frame pacing: display refresh {d:.0} Hz, cap {d:.0} Hz, period {d:.2} ms", .{
+                refresh_hz,
+                cap_hz,
+                frame_period_s * 1000.0,
+            });
+            warnIfNonDivisorCap(refresh_hz, cap_hz);
 
             const app = try App.init(gpa, io);
             defer app.deinit();

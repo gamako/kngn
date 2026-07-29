@@ -2254,6 +2254,16 @@ double platform_get_time(void) {
     return (double)ns / 1e9;
 }
 
+// Main-screen refresh rate in Hz. Returns 0 when unavailable.
+// Queried once at startup (event time), never per frame.
+double platform_display_refresh_hz(void) {
+    NSScreen* screen = [NSScreen mainScreen];
+    if (!screen) return 0.0;
+    const NSInteger fps = screen.maximumFramesPerSecond;
+    if (fps <= 0) return 0.0;
+    return (double)fps;
+}
+
 // Begin accessing the framebuffer (the existing wrapper; the width/height projection of lock_ex)
 uint32_t* platform_lock_framebuffer(PlatformWindow* platformWindow, int* out_width, int* out_height) {
     PlatformFramebufferMetrics metrics;

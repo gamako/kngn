@@ -134,6 +134,9 @@ const BITMAPINFO = extern struct { bmiHeader: BITMAPINFOHEADER, bmiColors: [1]u3
 // The Win32 APIs behind the transparent present (UpdateLayeredWindow), dragging, always-on-top and the menu.
 extern "user32" fn GetDC(hWnd: ?HWND) callconv(.winapi) ?win.HDC;
 extern "user32" fn ReleaseDC(hWnd: ?HWND, hDC: win.HDC) callconv(.winapi) c_int;
+extern "gdi32" fn GetDeviceCaps(hdc: win.HDC, index: c_int) callconv(.winapi) c_int;
+/// VERTRES / HORZRES companion: current display refresh rate in Hz (0 or 1 = hardware default / unknown).
+const VREFRESH: c_int = 116;
 extern "user32" fn UpdateLayeredWindow(hWnd: HWND, hdcDst: ?win.HDC, pptDst: ?*const POINT, psize: ?*const SIZE, hdcSrc: ?win.HDC, pptSrc: ?*const POINT, crKey: DWORD, pblend: ?*const BLENDFUNCTION, dwFlags: DWORD) callconv(.winapi) BOOL;
 extern "user32" fn SetWindowPos(hWnd: HWND, hWndInsertAfter: ?HWND, X: c_int, Y: c_int, cx: c_int, cy: c_int, uFlags: UINT) callconv(.winapi) BOOL;
 extern "user32" fn SetWindowTextW(hWnd: HWND, lpString: LPCWSTR) callconv(.winapi) BOOL;
@@ -402,6 +405,16 @@ pub fn getTime() f64 {
     var counter: i64 = 0;
     if (QueryPerformanceCounter(&counter) == 0) return 0;
     return @as(f64, @floatFromInt(counter)) / g_qpc_freq;
+}
+
+/// Primary display refresh in Hz via GetDeviceCaps(VREFRESH), or null when unavailable.
+/// Queried once at startup (event-time), never per frame.
+pub fn displayRefreshHz() ?f64 {
+    const hdc = GetDC(null) orelse return null;
+    defer _ = ReleaseDC(null, hdc);
+    const rate = GetDeviceCaps(hdc, VREFRESH);
+    if (rate <= 1) return null;
+    return @floatFromInt(rate);
 }
 
 // ============================================================================

@@ -369,6 +369,67 @@ following were filed as follow-up work:
   best-effort documentation, are now in place (Follow-up ①–③). Implementing
   `beginFrame` / `waitFrame` remains Follow-up ④.
 
+## Caller-side target period (refresh follow + rate cap)
+
+The pull-loop target period is no longer a fixed `1/60`. After `Window.create`,
+`core/app_runtime.zig` queries `platform.displayRefreshHz()` **once** (event-time; never
+inside the frame loop) and computes
+
+```text
+period = 1 / min(refresh_hz, cap_hz)
+```
+
+via `frame_pacing.targetPeriodS`. Cap selection:
+
+1. **`-Dframe-cap=<Hz>`** (build option) wins when set.
+2. Otherwise `App.frame_period_s` is treated as the period fallback
+   (`cap = 1/period`; default `1/60`; `<= 0` disables pacing).
+3. Runtime mutation (`setFrameCap`, Preferences) is **not** provided — comptime /
+   build-time only keeps learning-state reset trivial (`pacer.reset` on `platform.init`).
+
+wasm is paced by rAF and ignores the native cap option.
+
+### Overshoot estimate hold vs utilisation
+
+`MAX_EST_NS` (the EWMA hold ceiling) is **64ms**, so long periods (e.g. 10fps) can keep a
+learned overshoot proportional to timer slack. Each `decide` call utilises at most
+**one quarter of the target frame period** (`period_ns / 4`, learned from consecutive
+deadlines; falls back to `remaining_ns / 4` on the first frame or after a discarded
+delta). A 60fps period therefore still spends at most ~4.17ms on correction — matching
+the historical hard 4ms ceiling even when work has already consumed part of the remainder.
+
+### Display refresh query
+
+| Backend | Source | Failure → |
+|---|---|---|
+| macOS objc / swift / metal | `NSScreen.maximumFramesPerSecond` via `platform_display_refresh_hz` | facade 60Hz |
+| Windows GDI / D3D11 | `GetDeviceCaps(VREFRESH)` on the primary DC | facade 60Hz |
+| Linux X11 | XRandR current rate via **`std.DynLib` (`libXrandr.so.2`)** | facade 60Hz |
+| Linux Wayland | first `wl_output.mode` with `WL_OUTPUT_MODE_CURRENT` (mHz→Hz) | facade 60Hz |
+| headless / manual clock / missing decl | no native query | facade 60Hz |
+
+**XRandR is deliberately not linked.** Linking `Xrandr` would push a new system-library
+requirement into `build_helpers/` standalone builds and into external consumers that
+depend on this package via `.path` and link their own platform stack. Runtime `dlopen` of
+`libXrandr.so.2` keeps the link graph unchanged; a missing library or symbol yields
+`null` and the 60Hz facade fallback.
+
+The cache lives in `core/platform.zig` (same main-thread ownership as the pacer).
+`init` / `shutdown` invalidate it. **Known limits:**
+
+- Moving the window to another display does not re-query refresh.
+- Windows `GetDeviceCaps` and X11's default screen may not match the monitor that
+  currently hosts the window (multi-monitor).
+- Wayland uses the first valid current mode, not a window-local output.
+- A cap that is not an integer divisor of refresh produces judder; the runtime logs a
+  one-shot warning. Recommended caps on a 60Hz display: 60 / 30 / 20 / 15 / 12 / 10.
+  The warning is about the *evenness* of display intervals, not the average rate:
+  measured on a 60Hz display, caps of 24, 25 and 40Hz each reach their rate within 1.2%
+  (see the frame-cap table in
+  [../performance-measurement.md](../performance-measurement.md)).
+- Caps in the 10–30Hz range reduce input responsiveness; they are for power saving, not
+  interactive editing.
+
 ## Revision history
 
 | Version | Date | Changes |
@@ -378,3 +439,4 @@ following were filed as follow-up work:
 | 1.2 | 2026-07-05 | Added references to [ADR-008](008_frame-pacing-api-and-fatal-state.md) from the wait/skip policy and fatal state policy sections, now that the API shape and the separation are settled. The decision itself is unchanged. |
 | 1.3 | 2026-07-27 | Status / tier table / D3D11 section / Follow-up ①–③ updated to match the implemented D3D11 backend and the documented best-effort non-guarantees. Follow-up ④ and the decision itself are unchanged. |
 | 1.4 | 2026-07-27 | Resize contract wording distinguishes buffer dimensions (`fb.width/height`) from GUI layout size (`logical_size` / `logicalSize()`), citing [ADR-011](011_high-dpi-coordinates-and-fb-modes.md). The decision itself is unchanged. |
+| 1.5 | 2026-07-29 | Caller-side target period: display-refresh follow, `-Dframe-cap`, 64ms EWMA hold with period/4 utilisation (remaining/4 only when the period is unknown), XRandR via DynLib, and known multi-monitor / judder / input-latency limits. |

@@ -25,8 +25,11 @@ const std = @import("std");
 
 /// The fixed margin for waking early (it absorbs the error in what has been learned).
 pub const MARGIN_NS: u64 = 200_000; // 200µs
-/// The upper bound on the overshoot estimate. It stops one huge oversleep from wrecking the estimate and stalling pacing forever.
-pub const MAX_EST_NS: u64 = 4_000_000; // 4ms
+/// Upper bound on the overshoot estimate *held* by the EWMA (64ms). Separated from the per-frame
+/// utilisation cap inside `decide` (`period_ns / 4`, or `remaining_ns / 4` when the period is
+/// unknown), so long periods can keep a large learned value without spending more than a quarter
+/// of the frame period on correction.
+pub const MAX_EST_NS: u64 = 64_000_000; // 64ms
 /// A remaining time above this is taken to be a clock jump or a wake from sleep, and resets what has been learned.
 pub const MAX_REMAINING_S: f64 = 1.0;
 /// The EWMA weight (1/8).
@@ -51,7 +54,7 @@ pub fn requestNs(remaining_ns: u64, est_ns: u64, margin_ns: u64) u64 {
 
 /// The EWMA update of the overshoot estimate.
 /// - The overshoot is `actual - request` (not the other way round). A negative value (waking early) counts as 0.
-/// - `request == 0` (a frame that did not sleep) has nothing to observe, so **the estimate is halved** to guarantee recovery.
+/// - `request == 0` (a frame that does not sleep) has nothing to observe, so **the estimate is halved** to guarantee recovery.
 /// - It is clamped at `MAX_EST_NS` (the safeguard that stops an outlier stalling pacing forever).
 pub fn updateEwma(prev_ns: u64, request_ns: u64, actual_ns: u64) u64 {
     if (request_ns == 0) return prev_ns / 2;
@@ -67,23 +70,65 @@ pub fn updateEwma(prev_ns: u64, request_ns: u64, actual_ns: u64) u64 {
 /// The pacing decision (the input guards live here too, as the single window an implementation cannot bypass).
 /// deadline and now are seconds on a monotonic clock. **They are checked while still f64 and only then converted to ns**
 /// (converting to an integer first would trap on Inf or on a huge value).
-pub fn decide(deadline_s: f64, now_s: f64, est_ns: u64) Decision {
+///
+/// `period_ns` is the target frame period in ns (`0` = unknown, e.g. the first frame). The estimate
+/// used for the sleep request is capped at `period_ns / 4` when known, otherwise `remaining_ns / 4`.
+/// A known period keeps 60fps behaviour in line with the historical ~4ms ceiling
+/// (`16.67ms / 4 ≈ 4.17ms`) even when work has already consumed part of the frame.
+pub fn decide(deadline_s: f64, now_s: f64, est_ns: u64, period_ns: u64) Decision {
     if (!std.math.isFinite(deadline_s) or !std.math.isFinite(now_s)) return .no_wait;
     const remaining_s = deadline_s - now_s;
     if (!(remaining_s > 0)) return .no_wait; // false even when a NaN gets in
     if (remaining_s > MAX_REMAINING_S) return .reset;
     const remaining_ns: u64 = @intFromFloat(remaining_s * 1_000_000_000.0);
-    return .{ .sleep = requestNs(remaining_ns, est_ns, MARGIN_NS) };
+    const util_cap_ns: u64 = if (period_ns > 0) period_ns / 4 else remaining_ns / 4;
+    const est_effective_ns = @min(est_ns, util_cap_ns);
+    return .{ .sleep = requestNs(remaining_ns, est_effective_ns, MARGIN_NS) };
+}
+
+/// Target frame period in seconds from display refresh and a rate cap.
+///
+/// - Invalid / non-positive `refresh_hz` falls back to 60Hz.
+/// - `cap_hz <= 0` or a non-finite `cap_hz` returns 0 (pacing disabled; same convention as `App.frame_period_s`).
+/// - Otherwise `1 / min(refresh_hz, cap_hz)`.
+pub fn targetPeriodS(refresh_hz: f64, cap_hz: f64) f64 {
+    if (!(cap_hz > 0) or !std.math.isFinite(cap_hz)) return 0;
+    const refresh = if (std.math.isFinite(refresh_hz) and refresh_hz > 0) refresh_hz else 60.0;
+    return 1.0 / @min(refresh, cap_hz);
 }
 
 /// What has been learned (owned by the main thread; never touched from a real-time thread).
+/// `last_deadline_s` / `period_ns` track the target period from consecutive deadlines so `decide`
+/// can use a period-based utilisation cap without an extra API on `framePaceUntil`.
 pub const Pacer = struct {
     est_overshoot_ns: u64 = 0,
+    /// Previous pacing deadline (NaN until the first finite deadline is recorded).
+    last_deadline_s: f64 = std.math.nan(f64),
+    /// Last adopted period in ns (`0` = unknown).
+    period_ns: u64 = 0,
 
     pub fn reset(self: *Pacer) void {
         self.est_overshoot_ns = 0;
+        self.last_deadline_s = std.math.nan(f64);
+        self.period_ns = 0;
     }
 };
+
+/// Derive the period from consecutive deadlines. A delta in `(0, MAX_REMAINING_S]` is adopted;
+/// anything else discards the stored period (caller then falls back to `remaining_ns / 4`).
+fn periodNsFromDeadlines(pacer: *Pacer, deadline_s: f64) u64 {
+    if (!std.math.isFinite(pacer.last_deadline_s) or !std.math.isFinite(deadline_s)) {
+        return 0;
+    }
+    const delta = deadline_s - pacer.last_deadline_s;
+    if (delta > 0 and delta <= MAX_REMAINING_S) {
+        const period_ns: u64 = @intFromFloat(delta * 1_000_000_000.0);
+        pacer.period_ns = period_ns;
+        return period_ns;
+    }
+    pacer.period_ns = 0;
+    return 0;
+}
 
 /// The pacing executor, with the clock (returning seconds) and the sleep (taking a request in ns) injected at comptime.
 /// They are comptime parameters so that no indirect call is created.
@@ -93,11 +138,15 @@ pub fn Driver(comptime clock: fn () f64, comptime sleeper: fn (u64) void) type {
         /// **a complete no-op** (it neither reads the clock nor touches what has been learned).
         pub fn pace(pacer: *Pacer, deadline_s: f64, manual_clock: bool) void {
             if (manual_clock) return;
+            const period_ns = periodNsFromDeadlines(pacer, deadline_s);
             const before = clock();
-            switch (decide(deadline_s, before, pacer.est_overshoot_ns)) {
-                .no_wait => {},
+            switch (decide(deadline_s, before, pacer.est_overshoot_ns, period_ns)) {
+                .no_wait => {
+                    if (std.math.isFinite(deadline_s)) pacer.last_deadline_s = deadline_s;
+                },
                 .reset => pacer.reset(),
                 .sleep => |request_ns| {
+                    if (std.math.isFinite(deadline_s)) pacer.last_deadline_s = deadline_s;
                     if (request_ns == 0) {
                         // Decay the estimate even on a frame that does not sleep (the recovery path).
                         pacer.est_overshoot_ns = updateEwma(pacer.est_overshoot_ns, 0, 0);
@@ -143,13 +192,14 @@ test "updateEwma learns overshoot=actual-request and counts waking early as 0" {
 }
 
 test "updateEwma clamps at the upper bound and always recovers when request==0 (so it never stalls forever)" {
-    // even an outlier worth a 1 second oversleep does not exceed the 4ms bound
+    // even an outlier worth a 1 second oversleep does not exceed the 64ms bound
     try std.testing.expect(updateEwma(0, 10_000_000, 1_010_000_000) <= MAX_EST_NS);
     // once it is pinned at the bound, a run of frames that do not sleep halves it back down
     var est: u64 = MAX_EST_NS;
     var frames: u32 = 0;
     while (est > MARGIN_NS and frames < 32) : (frames += 1) est = updateEwma(est, 0, 0);
-    try std.testing.expect(frames <= 6); // 4ms to 200µs is five halvings
+    // 64ms → 200µs needs more than five halvings; still recovers within the 32-frame window
+    try std.testing.expect(frames <= 16);
     // after recovering, the remainder of 16.67ms again produces a sizeable sleep request
     try std.testing.expect(requestNs(16_666_666, est, MARGIN_NS) > 15_000_000);
 }
@@ -157,21 +207,66 @@ test "updateEwma clamps at the upper bound and always recovers when request==0 (
 test "decide's input guards (not finite, a deadline in the past, a clock jump)" {
     const nan = std.math.nan(f64);
     const inf = std.math.inf(f64);
-    try std.testing.expectEqual(Decision.no_wait, decide(nan, 100.0, 0));
-    try std.testing.expectEqual(Decision.no_wait, decide(100.0, nan, 0));
-    try std.testing.expectEqual(Decision.no_wait, decide(inf, 100.0, 0)); // not finite takes priority over remaining>1s
-    try std.testing.expectEqual(Decision.no_wait, decide(-inf, 100.0, 0));
-    try std.testing.expectEqual(Decision.no_wait, decide(100.0, 100.0, 0)); // the same instant
-    try std.testing.expectEqual(Decision.no_wait, decide(99.9, 100.0, 0)); // in the past
-    try std.testing.expectEqual(Decision.reset, decide(101.5, 100.0, 0)); // over 1 second = a clock jump
-    switch (decide(100.016_666_666, 100.0, 0)) { // the ordinary case
+    try std.testing.expectEqual(Decision.no_wait, decide(nan, 100.0, 0, 0));
+    try std.testing.expectEqual(Decision.no_wait, decide(100.0, nan, 0, 0));
+    try std.testing.expectEqual(Decision.no_wait, decide(inf, 100.0, 0, 0)); // not finite takes priority over remaining>1s
+    try std.testing.expectEqual(Decision.no_wait, decide(-inf, 100.0, 0, 0));
+    try std.testing.expectEqual(Decision.no_wait, decide(100.0, 100.0, 0, 0)); // the same instant
+    try std.testing.expectEqual(Decision.no_wait, decide(99.9, 100.0, 0, 0)); // in the past
+    try std.testing.expectEqual(Decision.reset, decide(101.5, 100.0, 0, 0)); // over 1 second = a clock jump
+    switch (decide(100.016_666_666, 100.0, 0, 0)) { // the ordinary case
         .sleep => |ns| try std.testing.expect(ns > 16_000_000 and ns < 16_666_666),
         else => return error.TestUnexpectedResult,
     }
-    switch (decide(100.001, 100.0, 4_000_000)) { // the estimate eats up the whole remainder
+}
+
+test "decide period/4 keeps 60fps behaviour; unknown period falls back to remaining/4" {
+    // period 16.666666ms, remaining 10ms, held est 4ms → util = min(4ms, 4.166666ms) = 4ms
+    // request = 10ms − 4ms − 200µs = 5.8ms (same as the historical hard 4ms ceiling)
+    const period_60: u64 = 16_666_666;
+    switch (decide(100.010, 100.0, 4_000_000, period_60)) {
+        .sleep => |ns| try std.testing.expectEqual(@as(u64, 5_800_000), ns),
+        else => return error.TestUnexpectedResult,
+    }
+    // period unknown: util = remaining/4 = 2.5ms → request = 7.3ms (not the 60fps-stable path)
+    switch (decide(100.010, 100.0, 4_000_000, 0)) {
+        .sleep => |ns| try std.testing.expectEqual(@as(u64, 7_300_000), ns),
+        else => return error.TestUnexpectedResult,
+    }
+    // 10fps period 100ms, held est 64ms → util = 25ms (period/4, not remaining/4)
+    const now_s: f64 = 100.0;
+    const deadline_s: f64 = 100.1;
+    const remaining_ns: u64 = @intFromFloat((deadline_s - now_s) * 1_000_000_000.0);
+    const expected_10fps = remaining_ns - 25_000_000 - MARGIN_NS;
+    switch (decide(deadline_s, now_s, MAX_EST_NS, 100_000_000)) {
+        .sleep => |ns| try std.testing.expectEqual(expected_10fps, ns),
+        else => return error.TestUnexpectedResult,
+    }
+}
+
+test "decide unknown-period fallback caps at remaining/4" {
+    // remaining = 1ms, held est = 64ms, period unknown → effective = 0.25ms
+    switch (decide(100.001, 100.0, MAX_EST_NS, 0)) {
+        .sleep => |ns| try std.testing.expectEqual(@as(u64, 550_000), ns),
+        else => return error.TestUnexpectedResult,
+    }
+    // remaining tiny enough that remaining/4 + margin eats it → request 0
+    switch (decide(100.000_2, 100.0, MAX_EST_NS, 0)) {
         .sleep => |ns| try std.testing.expectEqual(@as(u64, 0), ns),
         else => return error.TestUnexpectedResult,
     }
+}
+
+test "targetPeriodS refresh/cap/fallback" {
+    try std.testing.expectApproxEqAbs(@as(f64, 1.0 / 60.0), targetPeriodS(60.0, 120.0), 1e-12);
+    try std.testing.expectApproxEqAbs(@as(f64, 1.0 / 30.0), targetPeriodS(60.0, 30.0), 1e-12);
+    try std.testing.expectApproxEqAbs(@as(f64, 1.0 / 60.0), targetPeriodS(0.0, 60.0), 1e-12); // bad refresh → 60
+    try std.testing.expectApproxEqAbs(@as(f64, 1.0 / 60.0), targetPeriodS(std.math.nan(f64), 60.0), 1e-12);
+    try std.testing.expectApproxEqAbs(@as(f64, 1.0 / 60.0), targetPeriodS(60.0, 60.0), 1e-12); // cap == refresh
+    try std.testing.expectEqual(@as(f64, 0.0), targetPeriodS(60.0, 0.0));
+    try std.testing.expectEqual(@as(f64, 0.0), targetPeriodS(60.0, -1.0));
+    try std.testing.expectEqual(@as(f64, 0.0), targetPeriodS(60.0, std.math.nan(f64)));
+    try std.testing.expectEqual(@as(f64, 0.0), targetPeriodS(60.0, std.math.inf(f64)));
 }
 
 /// A fake clock and fake sleep for the tests. `sleeper` pretends that the requested ns plus overshoot_ns elapsed.
@@ -217,6 +312,7 @@ test "Driver: it does not sleep for a deadline in the past or a clock jump (and 
     FakeDriver.pace(&pacer, Fake.now_s + 5.0, false); // over 1 second = a clock jump
     try std.testing.expectEqual(@as(u32, 0), Fake.sleep_calls);
     try std.testing.expectEqual(@as(u64, 0), pacer.est_overshoot_ns); // reset
+    try std.testing.expectEqual(@as(u64, 0), pacer.period_ns);
 }
 
 test "Driver: with 20% timer slack the mean period converges on the target (reproducing the measurement)" {
@@ -244,30 +340,32 @@ test "Driver: with 20% timer slack the mean period converges on the target (repr
 
 test "Driver: what has been learned decays even on a frame where request==0 (through the Driver path)" {
     Fake.reset(0);
-    // Making the estimate eat the whole remainder (1ms left against a 4ms estimate) makes decide return a sleep of 0.
+    // remaining ≈ 200µs: remaining/4 + margin zeros the request even with a large held estimate (period unknown)
     var pacer: Pacer = .{ .est_overshoot_ns = MAX_EST_NS };
-    FakeDriver.pace(&pacer, Fake.now_s + 0.001, false);
+    FakeDriver.pace(&pacer, Fake.now_s + 0.000_2, false);
     try std.testing.expectEqual(@as(u32, 0), Fake.sleep_calls); // the OS sleep is not called
     try std.testing.expectEqual(MAX_EST_NS / 2, pacer.est_overshoot_ns); // but what has been learned is halved
     // repeating it keeps bringing it down, so it never stalls forever
     const before = pacer.est_overshoot_ns;
-    FakeDriver.pace(&pacer, Fake.now_s + 0.001, false);
+    FakeDriver.pace(&pacer, Fake.now_s + 0.000_2, false);
     try std.testing.expect(pacer.est_overshoot_ns < before);
     try std.testing.expectEqual(@as(u32, 0), Fake.sleep_calls);
 }
 
-test "Driver: pacing comes back within a few frames even after a huge oversleep" {
+test "Driver: after a huge oversleep sleep resumes within a few frames" {
     const period_s: f64 = 1.0 / 60.0;
     Fake.reset(1_000_000_000); // a pathological sleep that oversleeps by 1 second
     var pacer: Pacer = .{};
     FakeDriver.pace(&pacer, Fake.now_s + period_s, false);
     try std.testing.expect(pacer.est_overshoot_ns <= MAX_EST_NS);
 
-    // From here on the sleep behaves normally. While the estimate eats the remainder it sleeps 0 (decaying what is learned), and eventually the sleep comes back.
+    // From here on the sleep behaves normally. Assert that an OS sleep actually resumes
+    // (not merely that the held estimate fell below the utilisation cap).
     Fake.overshoot_ns = 0;
     var recovered = false;
     var frames: u32 = 0;
-    while (frames < 16) : (frames += 1) {
+    const loop_limit: u32 = 16;
+    while (frames < loop_limit) : (frames += 1) {
         const calls_before = Fake.sleep_calls;
         FakeDriver.pace(&pacer, Fake.now_s + period_s, false);
         if (Fake.sleep_calls > calls_before) {
@@ -276,5 +374,41 @@ test "Driver: pacing comes back within a few frames even after a huge oversleep"
         }
     }
     try std.testing.expect(recovered);
-    try std.testing.expect(frames <= 6);
+    // Bound below the loop limit so a vacuous pass at the ceiling is rejected.
+    try std.testing.expect(frames <= 8);
+}
+
+test "Driver: 5-60fps converges with 20% slack and 7ms work" {
+    const rates = [_]f64{ 5, 10, 15, 20, 30, 60 };
+    for (rates) |hz| {
+        const period_s: f64 = 1.0 / hz;
+        Fake.reset(0);
+        var pacer: Pacer = .{};
+        var period_errs: [64]i64 = undefined;
+        var err_i: usize = 0;
+        var frame: u32 = 0;
+        const total_frames: u32 = 400;
+        while (frame < total_frames) : (frame += 1) {
+            const t0 = Fake.now_s;
+            // 7ms of frame work before pacing
+            Fake.now_s += 0.007;
+            Fake.overshoot_ns = @intFromFloat(@as(f64, @floatFromInt(@max(Fake.last_request_ns, 1))) * 0.20);
+            const calls_before = Fake.sleep_calls;
+            FakeDriver.pace(&pacer, t0 + period_s, false);
+            // at most one sleep per frame
+            try std.testing.expect(Fake.sleep_calls - calls_before <= 1);
+            try std.testing.expect(pacer.est_overshoot_ns <= MAX_EST_NS);
+            const err_ns = @as(i64, @intFromFloat((Fake.now_s - t0) * 1e9)) - @as(i64, @intFromFloat(period_s * 1e9));
+            if (frame + 64 >= total_frames) {
+                period_errs[err_i] = err_ns;
+                err_i += 1;
+            }
+        }
+        try std.testing.expectEqual(@as(usize, 64), err_i);
+        // Mean absolute error of the final 64 frames within 500µs (signed means would cancel).
+        var abs_sum: u64 = 0;
+        for (period_errs) |e| abs_sum += @abs(e);
+        const mean_abs = abs_sum / 64;
+        try std.testing.expect(mean_abs < 500_000);
+    }
 }

@@ -299,12 +299,15 @@ pub fn setupExecutableForPlatform(
             exe.root_module.link_libc = true;
             exe.root_module.linkSystemLibrary("user32", .{}); // CreateWindowExW / message pump / input
             exe.root_module.linkSystemLibrary("comdlg32", .{}); // GetSaveFileNameW / GetOpenFileNameW
+            // gdi32 belongs to the shared layer, not to one backend: platform_windows_common.zig calls
+            // GetDeviceCaps(VREFRESH) for the display refresh, so both backends need it.
+            exe.root_module.linkSystemLibrary("gdi32", .{});
             switch (platform_type) {
-                // GDI: software blit (StretchDIBits / BITMAPINFO).
-                .gdi => exe.root_module.linkSystemLibrary("gdi32", .{}),
+                // GDI: software blit (StretchDIBits / BITMAPINFO) on top of the shared gdi32 above.
+                .gdi => {},
                 // D3D11-DXGI: GPU upload path. The only named export is d3d11.dll's D3D11CreateDeviceAndSwapChain
                 // (swap chain / DXGI are only touched via COM vtbls from the d3d11-created objects, so no dxgi.dll
-                // import). gdi32 is also unnecessary.
+                // import).
                 .d3d11 => exe.root_module.linkSystemLibrary("d3d11", .{}),
                 else => unreachable,
             }
@@ -636,6 +639,14 @@ pub fn buildStandalone(
                 .root_source_file = .{ .cwd_relative = b.fmt("{s}/app_runtime.zig", .{core_dir}) },
             });
             kit_app_runtime_mod.addImport("platform", platform_mod);
+            // app_runtime reads `build_options.has_frame_cap` / `frame_cap_hz` (the root build's
+            // `-Dframe-cap`). An external consumer has no such option, so supply the "unset" values:
+            // the target period then comes from `App.frame_period_s` as before. Without this import,
+            // instantiating `Runtime(App)` outside this repository fails to compile.
+            const kit_app_runtime_opts = b.addOptions();
+            kit_app_runtime_opts.addOption(bool, "has_frame_cap", false);
+            kit_app_runtime_opts.addOption(u32, "frame_cap_hz", @as(u32, 0));
+            kit_app_runtime_mod.addImport("build_options", kit_app_runtime_opts.createModule());
             kit_mod.addImport("app_runtime", kit_app_runtime_mod);
             // midi: kit.zig imports unconditionally. core/midi.zig depends on platform_types and
             // harness (synthetic FIFO); harness is per-backend, so midi is also created per backend

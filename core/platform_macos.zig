@@ -101,6 +101,14 @@ pub fn getTime() f64 {
     return c.platform_get_time();
 }
 
+/// Native display refresh in Hz, or null on failure / non-positive / non-finite.
+/// Queried once at startup (event-time), never per frame.
+pub fn displayRefreshHz() ?f64 {
+    const hz = c.platform_display_refresh_hz();
+    if (!std.math.isFinite(hz) or !(hz > 0)) return null;
+    return hz;
+}
+
 /// Show or hide the Dock icon and the menu bar (application-wide, not per window).
 /// visible=false selects accessory (behaving like a background app). Initialisation and event time only.
 pub fn setDockVisible(visible: bool) void {

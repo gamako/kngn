@@ -29,6 +29,7 @@ pub const Framebuffer = backend.Framebuffer;
 pub const init = backend.init;
 pub const shutdown = backend.shutdown;
 pub const getGeometry = backend.getGeometry; // window geometry
+pub const displayRefreshHz = backend.displayRefreshHz;
 
 // The drawing-independent shared implementation (each backend re-exports it from platform_windows_common).
 pub const getTime = backend.getTime;

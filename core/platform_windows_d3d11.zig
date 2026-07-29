@@ -226,6 +226,7 @@ pub const Framebuffer = common.Framebuffer;
 pub const init = common.init;
 pub const shutdown = common.shutdown;
 pub const getTime = common.getTime;
+pub const displayRefreshHz = common.displayRefreshHz;
 pub const saveFileDialog = common.saveFileDialog;
 pub const openFileDialog = common.openFileDialog;
 

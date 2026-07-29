@@ -258,7 +258,22 @@ const OutputSlot = struct {
     version: u32 = 1,
     output: ?*c.struct_wl_output = null,
     scale: i32 = 1,
+    /// Current mode refresh in mHz (wl_output.mode); 0 means unknown / not yet notified.
+    refresh_mhz: i32 = 0,
 };
+
+/// First valid current-mode refresh seen this process (Hz). Cleared on shutdown of the owning window path via clearOutputRefreshCache.
+var g_output_refresh_hz: ?f64 = null;
+
+fn clearOutputRefreshCache() void {
+    g_output_refresh_hz = null;
+}
+
+/// Display refresh from the first wl_output current mode, or null when none is known yet.
+/// Queried once at startup (event-time), never per frame.
+pub fn displayRefreshHz() ?f64 {
+    return g_output_refresh_hz;
+}
 
 // ============================================================================
 // init and shutdown (one Display per process)
@@ -275,6 +290,7 @@ pub fn shutdown() void {
         c.wl_display_disconnect(d);
         g_display = null;
     }
+    clearOutputRefreshCache();
 }
 
 // ============================================================================
@@ -541,12 +557,18 @@ fn outputGeometry(
 }
 
 fn outputMode(data: ?*anyopaque, output: ?*c.struct_wl_output, flags: u32, width: i32, height: i32, refresh: i32) callconv(.c) void {
-    _ = data;
-    _ = output;
-    _ = flags;
     _ = width;
     _ = height;
-    _ = refresh;
+    const st: *State = @ptrCast(@alignCast(data.?));
+    // Hot path declaration: event time only (compositor mode notify).
+    const current: u32 = 0x1; // WL_OUTPUT_MODE_CURRENT
+    if ((flags & current) == 0) return;
+    if (findOutputByPtr(st, output)) |idx| {
+        st.outputs[idx].refresh_mhz = refresh;
+    }
+    if (refresh > 0 and g_output_refresh_hz == null) {
+        g_output_refresh_hz = @as(f64, @floatFromInt(refresh)) / 1000.0;
+    }
 }
 
 fn outputDone(data: ?*anyopaque, output: ?*c.struct_wl_output) callconv(.c) void {

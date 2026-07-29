@@ -57,9 +57,10 @@ Measured: the patch canvas with objc went 41.8 → 60.1fps, with metal 37.0 → 
 the synth 44.2 → 58.7fps.
 
 - **An application using `core/app_runtime.zig` (`Runtime(App)`) has pacing owned by the
-  runtime** (the editor and the synth). The period defaults to 1/60, an App can override
-  it with `pub const frame_period_s: f64`, and `0` disables pacing. Such an application
-  does not call `framePaceUntil` itself.
+  runtime** (the editor and the synth). The period is
+  `1 / min(displayRefreshHz(), cap)` computed once after `Window.create`. Cap comes from
+  `-Dframe-cap=<Hz>` when set, otherwise from `App.frame_period_s` (default `1/60`; `0`
+  disables pacing). Such an application does not call `framePaceUntil` itself.
 - **An application with its own main loop** (the patch canvas) calls it itself: take the
   frame start `frame_t0` at the top of the loop and **register
   `defer platform.framePaceUntil(...)` before `lockFramebuffer`**. That way an early
@@ -135,3 +136,61 @@ conditions is 10.43ms, so the 0.63ms difference is present and other unmeasured 
 - This is one measurement point (the editor, objc, 2x) and is **not** a substitute for
   the performance matrix ADR-011 R10 asks for (1x/1.5x/2x × gui/font/canvas/viz × frame
   time and peak memory).
+
+## Frame-cap measurement (`-Dframe-cap`, free-run)
+
+Caps are measured one at a time (rebuild per cap). Free-run harness, ReleaseFast, objc:
+
+```bash
+for hz in 60 30 20 10; do
+  rm -f /tmp/kngn-frame-cap-${hz}.port
+  KNGN_HARNESS_LISTEN= \
+  KNGN_HARNESS_PORT_FILE=/tmp/kngn-frame-cap-${hz}.port \
+  KNGN_HARNESS_OUT=/tmp/kngn-frame-cap \
+  KNGN_HARNESS_SKIP_FRAME_COPY=1 \
+    zig build run-pixie -Dplatform=objc -Doptimize=ReleaseFast -Dframe-cap=$hz &
+  until [ -s /tmp/kngn-frame-cap-${hz}.port ]; do sleep 0.1; done
+  sleep 5
+  scripts/kngn ctl --port-file /tmp/kngn-frame-cap-${hz}.port 'digest stats'   # frame1
+  sleep 10
+  scripts/kngn ctl --port-file /tmp/kngn-frame-cap-${hz}.port 'digest stats'   # frame2
+  scripts/kngn ctl --port-file /tmp/kngn-frame-cap-${hz}.port 'quit'
+  # fps = (frame2 - frame1) / 10; ignore virtual_fps
+done
+```
+
+Pass criterion: `(measured - target) / target` within ±2%. The target is
+`min(reported refresh, cap)`, not the cap: a cap above the refresh is clamped, so
+`-Dframe-cap=120` on a 60Hz display targets 60.
+
+**Measure with nothing else running.** A concurrent build starves the loop and the
+numbers come out far below target — in one run a contaminated measurement read 36fps
+against a 60fps target, which looks exactly like a pacing bug.
+
+Each run prints its resolved target once, so a recorded number can be checked later:
+
+```text
+info: frame pacing: display refresh 60 Hz, cap 30 Hz, period 33.33 ms
+```
+
+Measured on aarch64-macos, the editor, objc, ReleaseFast, `.physical` 2x, 10s windows
+after a 5s warm-up:
+
+| backend | reported refresh | cap | target fps | measured fps | error | pass |
+|---|---:|---:|---:|---:|---:|---|
+| objc | 60 | 60 | 60 | 59.84 | -0.27% | yes |
+| objc | 60 | 30 | 30 | 29.96 | -0.13% | yes |
+| objc | 60 | 20 | 20 | 19.81 | -0.95% | yes |
+| objc | 60 | 10 | 10 | 9.87 | -1.30% | yes |
+| objc | 60 | 24 | 24 | 23.75 | -1.04% | yes (judder warning) |
+| objc | 60 | 25 | 25 | 24.70 | -1.20% | yes (judder warning) |
+| objc | 60 | 40 | 40 | 39.70 | -0.75% | yes (judder warning) |
+| objc | 60 | 120 | 60 | 59.97 | -0.05% | yes (cap clamped to refresh) |
+
+Two things this pins down:
+
+- The timer path reaches its target across 10–60fps, so the utilisation cap on the
+  learned overshoot (a quarter of the frame period) is doing its job at long periods.
+- **A cap that is not a divisor of the refresh still reaches its rate.** 24, 25 and 40Hz
+  all land within 1.2% of target on a 60Hz display; what the warning is about is the
+  *evenness* of display intervals (a 2-3 refresh pattern), not the average rate.

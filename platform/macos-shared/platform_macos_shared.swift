@@ -1468,6 +1468,16 @@ func platform_get_time() -> Double {
     return Double(ns) / 1e9
 }
 
+// Main-screen refresh rate in Hz. Returns 0 when unavailable.
+// Queried once at startup (event time), never per frame.
+@_cdecl("platform_display_refresh_hz")
+func platform_display_refresh_hz() -> Double {
+    guard let screen = NSScreen.main else { return 0 }
+    let fps = screen.maximumFramesPerSecond
+    if fps <= 0 { return 0 }
+    return Double(fps)
+}
+
 @_cdecl("platform_lock_framebuffer")
 func platform_lock_framebuffer(platformWindow: UnsafeMutableRawPointer?, out_width: UnsafeMutablePointer<Int32>?, out_height: UnsafeMutablePointer<Int32>?) -> UnsafeMutablePointer<UInt32>? {
     var metrics = PlatformFramebufferMetrics(
