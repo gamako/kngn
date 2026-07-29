@@ -272,6 +272,12 @@ pub const KitLibs = struct {
     /// If the caller wires gamepad into gfx, pass the **same instance**.
     /// null: buildStandalone creates its own (existing consumers unchanged).
     gamepad: ?*std.Build.Module = null,
+    /// kit.pixelops. The shared pixel primitives are part of the public umbrella, so kit.zig
+    /// imports it unconditionally and a standalone build must supply it too. gui, font and paint
+    /// already take a pixelops module, so pass the **same instance** — separate instances put the
+    /// same lib.zig in two modules and fail to compile.
+    /// null: buildStandalone creates its own.
+    pixelops: ?*std.Build.Module = null,
 };
 
 /// Link L1 output system libraries per OS onto a standalone exe that uses audio
@@ -474,6 +480,15 @@ pub fn buildStandalone(
                 break :blk m;
             };
             kit_mod.addImport("gamepad", kit_gamepad_mod);
+            // pixelops: kit.zig re-exports it, so the module has to be present even when the
+            // application never names it. Reuse the caller's instance (gui/font/paint share one).
+            const kit_pixelops_mod: *std.Build.Module = if (kl.pixelops) |px|
+                px
+            else
+                b.createModule(.{
+                    .root_source_file = .{ .cwd_relative = b.fmt("{s}/libs/pixelops/src/lib.zig", .{kit_root}) },
+                });
+            kit_mod.addImport("pixelops", kit_pixelops_mod);
             // recipe: kit.zig imports unconditionally (same as top-level build.zig
             // `link(kit, common.recipe)`). libs/recipe is a headless lib that depends only on serde.
             // The serde module **must share one instance** with the caller (when paint etc. also use serde);

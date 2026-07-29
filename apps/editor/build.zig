@@ -134,6 +134,9 @@ pub fn build(b: *std.Build) void {
             .serde = serde,
             // Same gamepad instance as gfx(action_map) (avoid dual module)
             .gamepad = gamepad_mod,
+            // Same pixelops instance as gui/font/paint: kit re-exports pixelops, and two
+            // instances of the same lib.zig do not compile.
+            .pixelops = pixelops,
         },
         .extra = &.{
             .{ .name = "paint", .module = paint },
