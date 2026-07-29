@@ -34,6 +34,8 @@ pub const NativePump = struct {
     }
 };
 
+pub const InputBlocker = *const fn (ctx: *anyopaque, event: Event) ?[]const u8;
+
 pub const Probe = struct {
     name: []const u8,
     ctx: *anyopaque,
@@ -42,6 +44,7 @@ pub const Probe = struct {
     digest: ?*const fn (ctx: *anyopaque, buf: []u8) []const u8 = null,
     desc: []const u8 = "",
     args: ?[]const ArgSpec = null,
+    input_blocker: ?InputBlocker = null,
 };
 
 pub fn isEnabled() bool {

@@ -56,7 +56,7 @@ snapshot audio /tmp/a.wav  # save the most recent audio tap as PCM16 WAV (defaul
 snapshot stats /tmp/s.json # save stats as JSON (default stats_<n>.json)
 digest fb                  # fb <w>x<h> crc=<hex> top=[#RRGGBB:NN%,...]
 digest audio               # audio rms=<f> peak=<f> f0=<Hz> silent=<0|1> frames=<n> band_low/mid/high=<0..1> centroid=<Hz> onsets=<n> lufs=<f>
-digest stats               # {"frame":..,"virtual_fps":60.0,"mouse_move_merge_count":..,...} (one line of JSON)
+digest stats               # {"frame":..,"virtual_fps":60.0,"mouse_move_merge_count":..,"mouse_scroll_merge_count":..,"event_drop_count":..,"modal_blocked_injections":..} (one line of JSON)
 digest capabilities        # {"probes":[{"name":..,"ext":..,"snapshot":bool,"digest":bool,"desc":..(,"args":[...])},...],"actions":[{"name":..,"desc":..(,"args":[...])},...]}
 snapshot capabilities /tmp/c.json # save capabilities as JSON (default capabilities_<n>.json)
 action <name> [args...]    # run a high-level operation the app registered (the write counterpart to a probe's read)
@@ -81,7 +81,9 @@ ratios summing to ≈1), `centroid` in Hz, `onsets` (peaks in the spectral flux)
 No second probe name (`audio2` and the like) is created; keys are added to `audio`.
 Analysis runs only when a digest is requested, so the real-time path is unchanged.
 `virtual_fps` is a fixed value derived from the virtual clock (≈60) and is **not**
-real performance.
+real performance. `modal_blocked_injections` counts injected events that a registered
+probe's `input_blocker` reported as consumed by application state (see "Blocked
+injection warnings" below). Existing keys are unchanged; this key is additive.
 
 ### capabilities (the introspection probe)
 
@@ -132,6 +134,10 @@ built-in. Currently:
   (`colors=N used=M top=[#RRGGBB:NN%,...]` — the palette size, the number of unique
   colours in the composite, and the top four), plus `timeline`, `panels`, `menu`,
   `appshell` and `presence`. Twelve in total.
+  - `appshell` payload:
+    `dirty=0|1 path=... confirm=none|close|new|open recent=N recent0=... recovery=pending|none modal=recovery|confirmation|size|none autosave=0|1 netsync=0|1 title=... geom=WxH pos=...`.
+    `modal=` is the top-level modal kind (priority: recovery → confirmation → size → none).
+    `recovery=` and `confirm=` stay for compatibility.
 - The synth: `voices`
   (`{"active":N,"capacity":16,"voices":[{"note":..,"stage":".."}]}`) and `patch`
   (the current patch as JSON).
@@ -326,6 +332,50 @@ KNGN_HARNESS_SCRIPT=/tmp/live.txt KNGN_HARNESS_OUT=/tmp zig build run-synth
 | `KNGN_HARNESS_RECORD=<file>` | append the commands received while listening (replayable via `KNGN_HARNESS_SCRIPT`) |
 | `KNGN_HARNESS_OUT=<dir>` | the default directory for an omitted snapshot path and for the port file |
 | `KNGN_HEADLESS=1` | **fully display-less**: `platform.init` selects the null backend. A script or listener is optional (it can run alone). See below |
+
+### App-data isolation for unattended runs
+
+`libs/appshell` redirects the default application-data directory to a per-process
+temporary path when a run is unattended. Explicit `KNGN_APPSHELL_DIR` always wins
+(automatic isolation does not apply). See ADR-017.
+
+| env state | isolate |
+|---|---:|
+| `KNGN_HARNESS_SCRIPT` present | yes |
+| `KNGN_HEADLESS` is `1` | yes |
+| `KNGN_HARNESS_LISTEN` present, `KNGN_HEADLESS` unset | no |
+| `KNGN_HARNESS_MANUAL_CLOCK` alone | no |
+| copilot env only | no |
+
+The temporary path is `<temp>/kngn-appdata-<pid>-<nonce>/<app_name>`, where `<temp>` is
+`TEMP` / `TMP` / `%LOCALAPPDATA%\Temp` on Windows and `TMPDIR` or `/tmp` elsewhere. It is
+created once per process and logged once to stderr. It is not deleted on exit.
+
+### Blocked injection warnings
+
+When an application registers a probe with `input_blocker` and that callback returns a
+static label for an injected event, the harness treats the event as consumed by
+application state — not only a full-absorb modal (`"recovery"`, `"confirmation"`), but
+also event-specific sinks such as size-dialog confirm keys (`"size"`) or inline text
+edit (`"text_edit"`). The callback may inspect the event so the answer can depend on
+kind and payload.
+
+The harness then:
+
+- still delivers the event unchanged;
+- increments `modal_blocked_injections` in `digest stats`;
+- prints
+  `[harness] warning: an injected event was consumed by "<label>"`
+  to stderr (and, in live, a `warning: ...` response line).
+
+The same label while it stays non-null warns once; after a null return, a later non-null
+label warns again. This does not affect `expect_failures` or exit codes.
+
+The counter says "application state took this event", not "this was a mistake": a script that
+deliberately drives a modal (clicking its buttons through `inject`) increments it too.
+Read it as "injection went to a consuming state instead of the main surface" and decide from the
+script's intent — a non-zero count on a script that never meant to touch that state is the
+signal worth chasing.
 
 > Specifying SCRIPT and LISTEN together is an error and disables the harness (one
 > transport per process). MANUAL_CLOCK alone, without LISTEN, is also invalid. With

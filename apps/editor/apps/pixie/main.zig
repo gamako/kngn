@@ -3574,6 +3574,14 @@ fn appshellDigest(ctx: *anyopaque, buf: []u8) []const u8 {
     const path = app.host.currentPath() orelse "none";
     const recent0 = if (app.recent.items().len > 0) app.recent.items()[0] else "none";
     const recovery = if (app.recovery != null) "pending" else "none";
+    const modal = if (app.recovery != null)
+        "recovery"
+    else if (app.host.confirmation() != .none)
+        "confirmation"
+    else if (app.size_dialog != null)
+        "size"
+    else
+        "none";
     // Geometry is additive (headless = size only / pos=none. Detects silent false wiring).
     const geo = if (app.os_window) |win| win.getGeometry() else platform.WindowGeometry{
         .position = null,
@@ -3584,13 +3592,14 @@ fn appshellDigest(ctx: *anyopaque, buf: []u8) []const u8 {
         (std.fmt.bufPrint(&pos_buf, "{d},{d}", .{ p.x, p.y }) catch "err")
     else
         "none";
-    return std.fmt.bufPrint(buf, "dirty={d} path={s} confirm={s} recent={d} recent0={s} recovery={s} autosave={d} netsync={d} title={s} geom={d}x{d} pos={s}", .{
+    return std.fmt.bufPrint(buf, "dirty={d} path={s} confirm={s} recent={d} recent0={s} recovery={s} modal={s} autosave={d} netsync={d} title={s} geom={d}x{d} pos={s}", .{
         @intFromBool(app.host.isDirty()),
         path,
         @tagName(app.host.confirmation()),
         app.recent.items().len,
         recent0,
         recovery,
+        modal,
         @intFromBool(activeAutosavePresent(app)),
         @intFromBool(platform.netsyncActive()),
         title,
@@ -3598,6 +3607,36 @@ fn appshellDigest(ctx: *anyopaque, buf: []u8) []const u8 {
         geo.size.height,
         pos,
     }) catch buf[0..0];
+}
+
+/// Self-report for harness: returns a static label when the given injected event will be
+/// consumed by an application state instead of reaching the main canvas / shortcut path.
+///
+/// Priority (first match wins):
+/// 1. `recovery` — every event (full absorb)
+/// 2. `confirmation` — every event (full absorb)
+/// 3. `size` — `key_down` ESCAPE / ENTER / KP_ENTER while the size dialog is open
+/// 4. `text_edit` — `key_down` and `char_input` while layer-rename or text-layer edit is active
+///
+/// Other events under size_dialog / text edit return null (they still reach GUI or pass through).
+fn pixieInputBlocker(ctx: *anyopaque, event: platform.Event) ?[]const u8 {
+    const app: *App = @ptrCast(@alignCast(ctx));
+    if (app.recovery != null) return "recovery";
+    if (app.host.confirmation() != .none) return "confirmation";
+    if (app.size_dialog != null) {
+        switch (event) {
+            .key_down => |k| if (k.key == .ESCAPE or k.key == .ENTER or k.key == .KP_ENTER) return "size",
+            else => {},
+        }
+        return null;
+    }
+    if (app.rename_in.active or app.text_in.active) {
+        return switch (event) {
+            .key_down, .char_input => "text_edit",
+            else => null,
+        };
+    }
+    return null;
 }
 
 fn activeAutosavePresent(app: *const App) bool {
@@ -6819,7 +6858,7 @@ fn appInit(gpa: std.mem.Allocator, io: std.Io) !*App {
     platform.registerProbe(.{ .name = "panels", .ctx = self, .ext = "txt", .digest = panelsDigest, .desc = "right-slot panel rects: fb_h/bottom/ok/RightSlot + Color/Palette/Tool/Layers y,h" });
     platform.registerProbe(.{ .name = "palette", .ctx = self, .ext = "txt", .digest = paletteDigest, .desc = "palette size + canvas color histogram top4" });
     platform.registerProbe(.{ .name = "menu", .ctx = self, .ext = "txt", .digest = menuDigest, .desc = "menu open/items/enabled/checked/pending_file_op" });
-    platform.registerProbe(.{ .name = "appshell", .ctx = self, .ext = "txt", .digest = appshellDigest, .desc = "pixie appshell dirty/recent/recovery/autosave/title/geometry state" });
+    platform.registerProbe(.{ .name = "appshell", .ctx = self, .ext = "txt", .digest = appshellDigest, .desc = "pixie appshell dirty/recent/recovery/modal/autosave/title/geometry state", .input_blocker = pixieInputBlocker });
     platform.registerProbe(.{ .name = "presence", .ctx = self, .ext = "txt", .digest = presenceDigest, .desc = "ephemeral presence overlay: count/point/highlight/suggest + per-peer coords" });
     registerActions(self);
     registerStateSync(self);

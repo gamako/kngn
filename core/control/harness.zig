@@ -157,6 +157,13 @@ var have_frame = false;
 // The most recent EventStats (pushed by present)
 var last_stats: EventStats = .{ .mouse_move_merge_count = 0, .mouse_scroll_merge_count = 0, .event_drop_count = 0 };
 
+// Count of injected events that a registered probe's input_blocker reported as consumed.
+// Exposed via `digest stats` as `modal_blocked_injections`. Does not affect expect_failures or exit codes.
+var modal_blocked_injections: u64 = 0;
+// Rate-limit key for the blocked-injection warning: last non-null label that already warned.
+// Resets to null when a blocker returns null, so the next non-null label warns again.
+var last_blocker_warn_label: ?[]const u8 = null;
+
 // The null runtime query (platform settles KNGN_HEADLESS and exposes it as a compatibility query).
 // The primary framebuffer is owned by platform_null.Window; harness only hooks observation.
 var config_parsed = false;
@@ -274,6 +281,14 @@ pub const NativePump = struct {
 /// The args signature type shared by actions and probes (action_registry is the single source).
 pub const ArgSpec = action_registry.ArgSpec;
 
+/// A probe callback that reports whether an injected event will be consumed by application state
+/// (a full-absorb modal, size-dialog confirm keys, inline text edit, …) instead of the main surface.
+/// Returns a static label (`"recovery"`, `"confirmation"`, `"size"`, `"text_edit"`, …) when the
+/// event is consumed, or null when it is not. The callback may inspect `event` so the answer can
+/// depend on the event kind and payload. harness never interprets the label beyond rate-limiting
+/// the warning and including it in the message.
+pub const InputBlocker = *const fn (ctx: *anyopaque, event: Event) ?[]const u8;
+
 /// A custom probe an application registers. **The framework does not interpret its contents**:
 /// it writes the raw bytes snapshot returns straight to a file, and passes the one line digest returns to the existing sink.
 /// All the meaning of a probe (turning it into a PNG, formatting JSON) is closed inside the application's callback.
@@ -296,6 +311,9 @@ pub const Probe = struct {
     /// The args signature (optional, backwards compatible). The same contract as Action's:
     /// **null = unspecified (no args in the JSON) / an empty slice = explicitly no arguments**. Every probe today leaves it null.
     args: ?[]const ArgSpec = null,
+    /// Optional self-report: called only from `nextInjectedEvent` for harness-injected events (never for native input).
+    /// A non-null return means application state will consume the event; the event is still delivered unchanged.
+    input_blocker: ?InputBlocker = null,
 };
 
 /// Registers a custom probe. An application calls it through `platform.registerProbe(...)` after `platform.init()`.
@@ -948,15 +966,50 @@ fn pendingPredicateActual() ?[]const u8 {
 }
 
 /// Returns one of this frame's injected events, or null once they are exhausted (resetting for the next frame).
+/// When a registered probe's `input_blocker` reports a modal label, increments `modal_blocked_injections`
+/// and emits a rate-limited warning (same label while it stays non-null warns once; a null reset then
+/// a later non-null label warns again). The event is still returned unchanged.
 pub fn nextInjectedEvent() ?Event {
     if (inject_read < inject_count) {
         const ev = inject_buf[inject_read];
         inject_read += 1;
+        noteModalBlockedInjection(ev);
         return ev;
     }
     inject_read = 0;
     inject_count = 0;
     return null;
+}
+
+fn noteModalBlockedInjection(ev: Event) void {
+    var label: ?[]const u8 = null;
+    for (probes[0..probe_count]) |p| {
+        if (p.input_blocker) |blocker| {
+            if (blocker(p.ctx, ev)) |l| {
+                label = l;
+                break;
+            }
+        }
+    }
+    if (label) |l| {
+        modal_blocked_injections += 1;
+        const already = if (last_blocker_warn_label) |prev| std.mem.eql(u8, prev, l) else false;
+        if (!already) {
+            last_blocker_warn_label = l;
+            warnModalBlocked(l);
+        }
+    } else {
+        last_blocker_warn_label = null;
+    }
+}
+
+fn warnModalBlocked(label: []const u8) void {
+    std.debug.print("[harness] warning: an injected event was consumed by \"{s}\"\n", .{label});
+    if (mode == .live) {
+        appendResp("warning: an injected event was consumed by \"");
+        appendResp(label);
+        appendResp("\"\n");
+    }
 }
 
 /// Returns one synthetic MIDI event for this frame, resetting for the next frame once the FIFO is exhausted.
@@ -2890,12 +2943,13 @@ fn writeWav(io: std.Io, path: []const u8, interleaved: []const f32, channels: u3
 // ============================================================================
 
 fn formatStatsPayload(buf: []u8) []u8 {
-    return std.fmt.bufPrint(buf, "{{\"frame\":{d},\"virtual_fps\":{d:.1},\"mouse_move_merge_count\":{d},\"mouse_scroll_merge_count\":{d},\"event_drop_count\":{d}}}", .{
+    return std.fmt.bufPrint(buf, "{{\"frame\":{d},\"virtual_fps\":{d:.1},\"mouse_move_merge_count\":{d},\"mouse_scroll_merge_count\":{d},\"event_drop_count\":{d},\"modal_blocked_injections\":{d}}}", .{
         frame_index,
         VIRTUAL_FPS,
         last_stats.mouse_move_merge_count,
         last_stats.mouse_scroll_merge_count,
         last_stats.event_drop_count,
+        modal_blocked_injections,
     }) catch buf[0..0];
 }
 
@@ -3038,6 +3092,8 @@ fn resetForTest() void {
     pending_wait = .none;
     expect_failures = 0;
     frame_index = 0;
+    modal_blocked_injections = 0;
+    last_blocker_warn_label = null;
     inject_count = 0;
     inject_read = 0;
     midi_count = 0;
@@ -3725,16 +3781,115 @@ test "encodeWav: the byte offsets of the PCM16 RIFF/WAVE header, asserted agains
     try testing.expectEqual(@as(u32, 8), std.mem.readInt(u32, bytes[40..44], .little)); // data_size
 }
 
-test "the stats payload: one line of JSON (frame, virtual_fps, EventStats)" {
+test "the stats payload: one line of JSON (frame, virtual_fps, EventStats, modal_blocked_injections)" {
     resetForTest();
     frame_index = 12;
     last_stats = .{ .mouse_move_merge_count = 3, .mouse_scroll_merge_count = 1, .event_drop_count = 0 };
+    modal_blocked_injections = 2;
     var buf: [512]u8 = undefined;
     const json = formatStatsPayload(&buf);
     try testing.expectEqualStrings(
-        "{\"frame\":12,\"virtual_fps\":60.0,\"mouse_move_merge_count\":3,\"mouse_scroll_merge_count\":1,\"event_drop_count\":0}",
+        "{\"frame\":12,\"virtual_fps\":60.0,\"mouse_move_merge_count\":3,\"mouse_scroll_merge_count\":1,\"event_drop_count\":0,\"modal_blocked_injections\":2}",
         json,
     );
+}
+
+const TestBlockerCtx = struct { label: ?[]const u8 = null, calls: usize = 0 };
+fn testInputBlocker(ctx: *anyopaque, event: Event) ?[]const u8 {
+    _ = event;
+    const c: *TestBlockerCtx = @ptrCast(@alignCast(ctx));
+    c.calls += 1;
+    return c.label;
+}
+
+test "input_blocker: non-null label warns once per stretch and increments modal_blocked_injections" {
+    resetForTest();
+    var c = TestBlockerCtx{ .label = "recovery" };
+    registerProbe(.{ .name = "appshell", .ctx = &c, .digest = testProbeDigest, .input_blocker = testInputBlocker });
+
+    // Capture stderr is impractical here; assert the counter and rate-limit state instead.
+    const move = Event{ .mouse_move = .{ .x = 1, .y = 2, .button = .none, .buttons = .{}, .modifiers = .{} } };
+    queue(move);
+    queue(.{ .mouse_move = .{ .x = 3, .y = 4, .button = .none, .buttons = .{}, .modifiers = .{} } });
+    _ = nextInjectedEvent();
+    try testing.expectEqual(@as(u64, 1), modal_blocked_injections);
+    try testing.expectEqualStrings("recovery", last_blocker_warn_label.?);
+    _ = nextInjectedEvent();
+    try testing.expectEqual(@as(u64, 2), modal_blocked_injections);
+    try testing.expectEqualStrings("recovery", last_blocker_warn_label.?); // same label: no second warn state change
+    try testing.expectEqual(@as(usize, 0), expect_failures);
+
+    // null resets the rate-limit key
+    c.label = null;
+    queue(.{ .mouse_move = .{ .x = 5, .y = 6, .button = .none, .buttons = .{}, .modifiers = .{} } });
+    _ = nextInjectedEvent();
+    try testing.expectEqual(@as(u64, 2), modal_blocked_injections); // not blocked
+    try testing.expect(last_blocker_warn_label == null);
+
+    // a later non-null label warns again
+    c.label = "confirmation";
+    queue(.{ .mouse_move = .{ .x = 7, .y = 8, .button = .none, .buttons = .{}, .modifiers = .{} } });
+    _ = nextInjectedEvent();
+    try testing.expectEqual(@as(u64, 3), modal_blocked_injections);
+    try testing.expectEqualStrings("confirmation", last_blocker_warn_label.?);
+    try testing.expectEqual(@as(usize, 0), expect_failures);
+    probe_count = 0;
+}
+
+test "input_blocker: null return does not warn or increment" {
+    resetForTest();
+    var c = TestBlockerCtx{ .label = null };
+    registerProbe(.{ .name = "appshell", .ctx = &c, .digest = testProbeDigest, .input_blocker = testInputBlocker });
+    queue(.{ .key_down = .{ .key = .A, .is_repeat = false, .modifiers = .{} } });
+    _ = nextInjectedEvent();
+    try testing.expectEqual(@as(u64, 0), modal_blocked_injections);
+    try testing.expect(last_blocker_warn_label == null);
+    try testing.expectEqual(@as(usize, 1), c.calls);
+    probe_count = 0;
+}
+
+test "input_blocker: size and text_edit labels rate-limit independently" {
+    resetForTest();
+    var c = TestBlockerCtx{ .label = "size" };
+    registerProbe(.{ .name = "appshell", .ctx = &c, .digest = testProbeDigest, .input_blocker = testInputBlocker });
+
+    queue(.{ .key_down = .{ .key = .ENTER, .is_repeat = false, .modifiers = .{} } });
+    queue(.{ .key_down = .{ .key = .ESCAPE, .is_repeat = false, .modifiers = .{} } });
+    _ = nextInjectedEvent();
+    try testing.expectEqual(@as(u64, 1), modal_blocked_injections);
+    try testing.expectEqualStrings("size", last_blocker_warn_label.?);
+    _ = nextInjectedEvent();
+    try testing.expectEqual(@as(u64, 2), modal_blocked_injections);
+    try testing.expectEqualStrings("size", last_blocker_warn_label.?);
+
+    c.label = null;
+    queue(.{ .mouse_move = .{ .x = 1, .y = 1, .button = .none, .buttons = .{}, .modifiers = .{} } });
+    _ = nextInjectedEvent();
+    try testing.expect(last_blocker_warn_label == null);
+
+    c.label = "text_edit";
+    queue(.{ .char_input = .{ .codepoint = 'a', .modifiers = .{} } });
+    queue(.{ .key_down = .{ .key = .A, .is_repeat = false, .modifiers = .{} } });
+    _ = nextInjectedEvent();
+    try testing.expectEqual(@as(u64, 3), modal_blocked_injections);
+    try testing.expectEqualStrings("text_edit", last_blocker_warn_label.?);
+    _ = nextInjectedEvent();
+    try testing.expectEqual(@as(u64, 4), modal_blocked_injections);
+    try testing.expectEqualStrings("text_edit", last_blocker_warn_label.?);
+    try testing.expectEqual(@as(usize, 0), expect_failures);
+    probe_count = 0;
+}
+
+test "input_blocker: capabilities JSON form is unchanged when a blocker is registered" {
+    resetForTest();
+    var c = TestBlockerCtx{ .label = "recovery" };
+    registerProbe(.{ .name = "appshell", .ctx = &c, .ext = "txt", .desc = "d", .digest = testProbeDigest, .input_blocker = testInputBlocker });
+    var buf: [DIGEST_BUF_LEN]u8 = undefined;
+    _ = &buf;
+    const json = formatCapabilitiesPayload(&capabilities_buf);
+    try testing.expect(std.mem.indexOf(u8, json, "\"name\":\"appshell\"") != null);
+    try testing.expect(std.mem.indexOf(u8, json, "input_blocker") == null);
+    probe_count = 0;
 }
 
 const TestProbeCtx = struct { value: u32 };
