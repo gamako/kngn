@@ -68,10 +68,43 @@ KB values are `file_size / 1024` floored.
 Pre-`simd128` reference (2026-07-29 macOS, `package-web`): Debug 5865 / 3549 KB,
 ReleaseFast 4088 / 1672 KB, ReleaseSmall 1133 / 426 KB.
 
+**What ReleaseSmall costs, measured** (same setup as the `simd128` measurement below —
+Chrome 150 headless, aarch64-macos, 2026-07-30, per-frame work inside the
+`requestAnimationFrame` callback, both builds with `simd128`):
+
+| Canvas | ReleaseSmall | ReleaseFast |
+|---|---|---|
+| 2560x1440 | 4.34 / 4.34 ms median | **4.27 / 4.235 ms** median |
+| 780x600 | 1.375 ms median, 2.165 ms p95 | **1.295 ms** median, **1.89 ms** p95 |
+
+ReleaseSmall costs roughly **2% of per-frame CPU at 2560x1440 and 6% at 780x600** against
+ReleaseFast, and neither build dropped a frame on a 120Hz display (the `requestAnimationFrame`
+interval stayed at 8.33ms in every run, against 4.3ms of work). It is the default anyway,
+because 3.6x smaller delivery matters more than that margin for a build whose point is being
+downloadable. A deployment that needs the margin passes `-Doptimize=ReleaseFast` explicitly.
+
 ### simd128 (WebAssembly SIMD)
 
 Both pixie and synth wasm targets enable the **`simd128`** CPU feature so `libs/pixelops`
 `@Vector(16, u8)` paths emit real SIMD instructions instead of scalar expansion.
+
+**What this bought, measured** (Chrome 150 headless, aarch64-macos, 2026-07-30, pixie
+`ReleaseSmall`, 400 frames per run with the first 60 discarded, timing the work inside the
+`requestAnimationFrame` callback):
+
+| Canvas | Without `simd128` (median per run) | With `simd128` (median per run) |
+|---|---|---|
+| 780x600 | 1.29 / 1.445 / 1.40 / 1.335 ms | 1.53 / 1.31 / 1.48 / 1.415 ms |
+| 2560x1440 | 4.355 / 4.345 ms | 4.325 / 4.34 ms |
+
+**No difference that can be distinguished from run-to-run variation**, at either size — the
+ordering even flips between runs at the smaller size. Enlarging the canvas 7.9x does not
+separate them either, so the per-frame cost is dominated by something other than the
+vectorisable pixel loops. The instructions are genuinely in the binary (`wasm-objdump -d`
+counts 1190 `v128.*`, 192 `i8x16.*`, 412 `i16x8.*` and 164 `i32x4.*` in `pixie.wasm`), and
+the feature stays enabled for that reason: the shared implementation the performance rules
+mandate is no longer silently scalar on this target. Do not cite `simd128` as a frame-rate
+improvement.
 
 **Browser baseline** (ships without a polyfill):
 
