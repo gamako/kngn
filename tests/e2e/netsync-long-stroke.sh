@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # A 300-point UI drag over netsync relay must not vanish (host/client crc match, nz>0).
 # When direnv is broken in a workspace, borrow the main flake via KNGN_MAIN_DIR.
+# Control path: semicolon batches + harness await (no shell sleep/poll drain).
 set -euo pipefail
 
 ROOT=$(cd "$(dirname "$0")/../.." && pwd)
@@ -48,7 +49,7 @@ wait_port() {
   local port_file=$1 pid=$2
   local i
   for i in $(seq 1 2000); do
-    kill -0 "$pid" 2>/dev/null || { log "FAIL: process $pid died before port $port_file"; tail -40 "$E2E"/*/app.log 2>/dev/null || true; exit 1; }
+    kill -0 "$pid" 2>/dev/null || { log "FAIL: process $pid died before port $port_file"; exit 1; }
     [[ -f "$port_file" ]] && return 0
     sleep 0.05
   done
@@ -79,41 +80,7 @@ trap cleanup EXIT
 drive_h() { "$KNGN" ctl --port-file "$HOST_PORT" "$1"; }
 drive_c() { "$KNGN" ctl --port-file "$CLIENT_PORT" "$1"; }
 
-# Alternate host+client steps while waiting on the condition
-wait_until() {
-  local who=$1 # host|client|both
-  local pattern=$2
-  local i out=""
-  for i in $(seq 1 4000); do
-    drive_h 'step 1' >/dev/null 2>&1 || true
-    drive_c 'step 1' >/dev/null 2>&1 || true
-    case "$who" in
-      host) out=$(drive_h 'digest netsync' 2>/dev/null || true) ;;
-      client) out=$(drive_c 'digest netsync' 2>/dev/null || true) ;;
-      both)
-        local ho co
-        ho=$(drive_h 'digest netsync' 2>/dev/null || true)
-        co=$(drive_c 'digest netsync' 2>/dev/null || true)
-        if printf '%s\n' "$ho" | grep -qE "$pattern" && printf '%s\n' "$co" | grep -qE "$pattern"; then
-          printf '%s\n' "$ho"
-          return 0
-        fi
-        sleep 0.05
-        continue
-        ;;
-    esac
-    if printf '%s\n' "$out" | grep -qE "$pattern"; then
-      printf '%s\n' "$out"
-      return 0
-    fi
-    sleep 0.05
-  done
-  log "FAIL: timeout waiting pattern=$pattern who=$who last=$out"
-  exit 1
-}
-
 parse_kv() {
-  # parse_kv TEXT KEY → value after key=
   local text=$1 key=$2
   printf '%s' "$text" | grep -oE "${key}=[^ ]+" | head -1 | cut -d= -f2-
 }
@@ -124,10 +91,69 @@ cell_to_screen() {
   if [[ "$den" == "1" ]]; then
     echo $((ox + cx * num)) $((oy + cy * num))
   else
-    # shrink: inverse of dx*den+half ≈ cx → dx = (cx - half) / den
     local half=$(( (den - 1) / 2 ))
     echo $((ox + (cx - half) / den)) $((oy + (cy - half) / den))
   fi
+}
+
+# Manual-clock peers only advance while their harness connection is stepped.
+# Stage a bounded host pump, then await on the client (which drives client frames).
+# Small chunks avoid burning full frame budgets when the condition is almost ready.
+wait_join() {
+  local budget=2000
+  local chunk=10
+  local rem=$budget
+  local out="" rc=0
+  set +e
+  out=$(drive_c "await netsync awaiting_sync=0 0" 2>&1)
+  rc=$?
+  set -e
+  if [[ $rc -eq 0 ]]; then
+    log "join ok"
+    return 0
+  fi
+  while (( rem > 0 )); do
+    drive_h "step ${chunk}" >/dev/null
+    set +e
+    out=$(drive_c "await netsync awaiting_sync=0 ${chunk}" 2>&1)
+    rc=$?
+    set -e
+    if [[ $rc -eq 0 ]]; then
+      log "join ok"
+      return 0
+    fi
+    rem=$((rem - chunk))
+  done
+  log "FAIL: join timeout last=$out"
+  exit 1
+}
+
+# Drain both peers to last_seq >= min_seq with pending clear and no reject.
+# last_seq lower bound uses strict > (await has no >=): last_seq>(min_seq-1).
+# Alternating bounded step batches (no shell sleep); await timeout 0 is the ready check.
+wait_drain() {
+  local min_seq=$1
+  local bound=$((min_seq - 1))
+  local budget=8000
+  local chunk=20
+  local rem=$budget
+  local cout="" hout="" crc=0 hrc=0
+  while (( rem > 0 )); do
+    drive_h "step ${chunk}" >/dev/null
+    set +e
+    cout=$(drive_c "step ${chunk}; await netsync awaiting_sync=0 0; await netsync pending=0 0; await netsync last_seq>${bound} 0; await netsync last_reject=none 0" 2>&1)
+    crc=$?
+    hout=$(drive_h "await netsync awaiting_sync=0 0; await netsync pending=0 0; await netsync last_seq>${bound} 0; await netsync last_reject=none 0" 2>&1)
+    hrc=$?
+    set -e
+    if [[ $crc -eq 0 && $hrc -eq 0 ]]; then
+      log "drain ok min_seq=$min_seq"
+      return 0
+    fi
+    rem=$((rem - chunk))
+  done
+  log "FAIL: netsync drain timeout min_seq=$min_seq client='$cout' host='$hout'"
+  exit 1
 }
 
 log "=== netsync 300-point stroke E2E ==="
@@ -136,20 +162,17 @@ wait_port "$HOST_PORT" "$host_pid"
 client_pid=$(start_pixie "$CLIENT_PORT" "$CLIENT_OUT" KNGN_NETSYNC_CONNECT=127.0.0.1:"$NETSYNC_PORT")
 wait_port "$CLIENT_PORT" "$client_pid"
 
-wait_until client 'awaiting_sync=0' >/dev/null
-log "join ok"
-
-# layout + baseline
+wait_join
 drive_c 'step 3; action set_tool pen; action set_color FF0000' >/dev/null
 drive_h 'step 3' >/dev/null
-wait_until both 'awaiting_sync=0' >/dev/null
+wait_join
 
-baseline=$(drive_c 'digest netsync' 2>/dev/null || true)
+baseline=$(drive_c 'digest netsync')
 baseline_seq=$(parse_kv "$baseline" last_seq)
 baseline_seq=${baseline_seq:-0}
 log "baseline last_seq=$baseline_seq"
 
-canvas=$(drive_c 'step 1; digest canvas' 2>/dev/null || true)
+canvas=$(drive_c 'step 1; digest canvas')
 ox=$(parse_kv "$canvas" origin_x)
 oy=$(parse_kv "$canvas" origin_y)
 znum=$(parse_kv "$canvas" zoom_num)
@@ -174,69 +197,40 @@ fi
 vx=$((vx + 1)); vy=$((vy + 1))
 
 # 300 distinct canvas points: (vx + i%50, vy + 10 + i/50) for i=0..299
-# Important: canvas_input reads mouse_pos once per frame, so
-# each point is `inject mouse_move + step 1` (one frame each; consecutive moves in one step keep only the last coord).
+# Important: canvas_input reads mouse_pos once per frame, so each point is
+# `inject mouse_move + step 1` (one frame each; consecutive moves in one step keep only the last coord).
+# One semicolon batch keeps one control connection for the whole drag.
 read -r sx0 sy0 < <(cell_to_screen "$ox" "$oy" "$znum" "$zden" "$vx" $((vy + 10)))
-drive_c "inject mouse_move $sx0 $sy0; inject mouse_down left; step 1" >/dev/null
-drive_h 'step 1' >/dev/null
-
-for i in $(seq 0 299); do
-  cx=$((vx + i % 50))
-  cy=$((vy + 10 + i / 50))
+batch="inject mouse_move $sx0 $sy0; inject mouse_down left; step 1"
+local_i=0
+for local_i in $(seq 0 299); do
+  cx=$((vx + local_i % 50))
+  cy=$((vy + 10 + local_i / 50))
   read -r sx sy < <(cell_to_screen "$ox" "$oy" "$znum" "$zden" "$cx" "$cy")
-  drive_c "inject mouse_move $sx $sy; step 1" >/dev/null
-  # Also pump the host regularly (accept/COMMIT)
-  if (( i % 5 == 0 )); then
-    drive_h 'step 1' >/dev/null
-  fi
+  batch+="; inject mouse_move $sx $sy; step 1"
 done
-
 read -r sx sy < <(cell_to_screen "$ox" "$oy" "$znum" "$zden" $((vx + 299 % 50)) $((vy + 10 + 299 / 50)))
-drive_c "inject mouse_move $sx $sy; inject mouse_up left; step 1" >/dev/null
-drive_h 'step 1' >/dev/null
+batch+="; inject mouse_move $sx $sy; inject mouse_up left; step 1"
+drive_c "$batch" >/dev/null
+# Host was frozen during the client drag; pump it so accept/COMMIT can start, then drain.
+drive_h 'step 20' >/dev/null
 
-# Wait first for pending clear + last_seq advance (expect chunk count >= 3)
 expect_seq=$((baseline_seq + 3))
-log "waiting netsync drain (expect last_seq>=$expect_seq, pending=0)..."
-local_ok=0
-for i in $(seq 1 8000); do
-  drive_h 'step 1' >/dev/null 2>&1 || true
-  drive_c 'step 1' >/dev/null 2>&1 || true
-  ho=$(drive_h 'digest netsync' 2>/dev/null || true)
-  co=$(drive_c 'digest netsync' 2>/dev/null || true)
-  hs=$(parse_kv "$ho" last_seq); hs=${hs:-0}
-  cs=$(parse_kv "$co" last_seq); cs=${cs:-0}
-  hp=$(parse_kv "$ho" pending); hp=${hp:-9}
-  cp=$(parse_kv "$co" pending); cp=${cp:-9}
-  ha=$(parse_kv "$ho" awaiting_sync); ha=${ha:-1}
-  ca=$(parse_kv "$co" awaiting_sync); ca=${ca:-1}
-  hr=$(parse_kv "$ho" last_reject); hr=${hr:-x}
-  cr=$(parse_kv "$co" last_reject); cr=${cr:-x}
-  if [[ "$ha" == "0" && "$ca" == "0" && "$hp" == "0" && "$cp" == "0" \
-        && "$hs" -ge "$expect_seq" && "$cs" -ge "$expect_seq" \
-        && "$hr" == "none" && "$cr" == "none" ]]; then
-    local_ok=1
-    log "drain ok host_seq=$hs client_seq=$cs"
-    break
-  fi
-  sleep 0.05
-done
-if [[ "$local_ok" != "1" ]]; then
-  log "FAIL: netsync drain timeout host='$ho' client='$co'"
-  exit 1
-fi
+log "waiting netsync drain (expect last_seq>=$expect_seq via last_seq>$((expect_seq - 1)), pending=0)..."
+wait_drain "$expect_seq"
 
-# Only then judge the canvas, after pending has cleared
-host_canvas=$(drive_h 'digest canvas' 2>/dev/null || true)
-client_canvas=$(drive_c 'digest canvas' 2>/dev/null || true)
+# Final digests after pending has cleared
+host_net=$(drive_h 'digest netsync')
+client_net=$(drive_c 'digest netsync')
+hs=$(parse_kv "$host_net" last_seq); hs=${hs:-0}
+cs=$(parse_kv "$client_net" last_seq); cs=${cs:-0}
+log "drain sequences host_seq=$hs client_seq=$cs"
+
+host_canvas=$(drive_h 'digest canvas')
+client_canvas=$(drive_c 'digest canvas')
 log "host canvas: $host_canvas"
 log "client canvas: $client_canvas"
 
-# layer0 nested: id=... crc=... nz=...
-extract_l0() {
-  printf '%s' "$1" | grep -oE 'id=[0-9]+ name=[^ ]+ .*nz=[0-9]+' | head -1
-}
-# Prefer first layer's crc/nz from digest (format: ... {id=N ... crc=XXXXXXXX nz=N} ...)
 host_nz=$(printf '%s' "$host_canvas" | grep -oE 'nz=[0-9]+' | head -1 | cut -d= -f2)
 client_nz=$(printf '%s' "$client_canvas" | grep -oE 'nz=[0-9]+' | head -1 | cut -d= -f2)
 host_crc=$(printf '%s' "$host_canvas" | grep -oE 'crc=[0-9A-Fa-f]+' | head -1 | cut -d= -f2)
@@ -264,7 +258,6 @@ if [[ "$host_comp" != "$client_comp" ]]; then
   exit 1
 fi
 
-# record for parent summary
 {
   echo "nz=$host_nz"
   echo "crc=$host_crc"

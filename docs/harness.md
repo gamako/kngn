@@ -552,15 +552,23 @@ Rules and limits:
   waiting. **Free-run does not use `NativePump`** (to avoid polling twice).
   **Headless** does not pass a pump callback at all, since nothing is connected to a
   compositor.
-- **The virtual clock**: only under a manual clock is `getTime()` equal to
-  `frame_index/60`. Free-run uses the backend's real time.
+- **The virtual clock** (manual only; free-run uses the backend's real time):
+  - `frame_index` starts at **0** and increments at **present** / `onPresent` (after
+    the application frame has run).
+  - `getTime()` / harness `now()` returns `frame_index / 60`.
+  - Therefore after `step N`, `now()` is `N/60`, but the application frame that just
+    ran received `frame(now)` = `(N-1)/60`. Do not treat the time seen inside that
+    frame as equal to the post-step `now()`.
+  - When comparing output across targets or backends, **align frame numbers first**.
+    The default path of `snapshot fb` (no path argument) is
+    `frame_<frame_index>.png` under `KNGN_HARNESS_OUT`, which can confirm alignment.
 - **Limits**: creating a real window is required only when `KNGN_HEADLESS` is unset (a
   display is needed: usually fine on macOS, Xvfb or a real session on Linux).
   **`KNGN_HEADLESS=1` is fully display-less** (see above). `audio` depends on real time
   on the real-time thread, so a bit-identical digest across record → replay is not
   guaranteed (`fb` is bit-deterministic under the manual virtual clock, and equally so
   headless — the framebuffer crc was measured bit-identical between headless and
-  non-headless). **But an application with audio (the modular and patch runs) has a
+  non-headless). **But an application with audio (the synth and patch runs) has a
   non-deterministic framebuffer crc too**: port-activity glow, the mini scopes and the
   visualisation strip all draw from real-time state, and consecutive runs of the same
   program were measured with differing crcs (2026-07-15). So do not use the framebuffer

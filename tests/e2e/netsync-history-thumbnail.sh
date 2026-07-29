@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
 # History thumbnails during netsync (self/peer both thumb=true, bbox!=null) + solo regression.
+# Control path: semicolon batches + harness await (no shell sleep/poll drain).
 set -euo pipefail
 
 ROOT=$(cd "$(dirname "$0")/../.." && pwd)
@@ -88,36 +89,63 @@ parse_kv() {
   printf '%s' "$text" | grep -oE "${key}=[^ ]+" | head -1 | cut -d= -f2-
 }
 
-wait_drain() {
-  local min_seq=$1
-  local i ho co hs cs hp cp
-  for i in $(seq 1 4000); do
-    drive_h 'step 1' >/dev/null 2>&1 || true
-    drive_c 'step 1' >/dev/null 2>&1 || true
-    ho=$(drive_h 'digest netsync' 2>/dev/null || true)
-    co=$(drive_c 'digest netsync' 2>/dev/null || true)
-    hs=$(parse_kv "$ho" last_seq); hs=${hs:-0}
-    cs=$(parse_kv "$co" last_seq); cs=${cs:-0}
-    hp=$(parse_kv "$ho" pending); hp=${hp:-9}
-    cp=$(parse_kv "$co" pending); cp=${cp:-9}
-    if [[ "$hp" == "0" && "$cp" == "0" && "$hs" -ge "$min_seq" && "$cs" -ge "$min_seq" ]]; then
+wait_join() {
+  local budget=2000
+  local chunk=10
+  local rem=$budget
+  local out="" rc=0
+  set +e
+  out=$(drive_c "await netsync awaiting_sync=0 0" 2>&1)
+  rc=$?
+  set -e
+  if [[ $rc -eq 0 ]]; then
+    log "join ok"
+    return 0
+  fi
+  while (( rem > 0 )); do
+    drive_h "step ${chunk}" >/dev/null
+    set +e
+    out=$(drive_c "await netsync awaiting_sync=0 ${chunk}" 2>&1)
+    rc=$?
+    set -e
+    if [[ $rc -eq 0 ]]; then
+      log "join ok"
       return 0
     fi
-    sleep 0.05
+    rem=$((rem - chunk))
   done
-  log "FAIL: drain timeout min_seq=$min_seq host='$ho' client='$co'"
+  log "FAIL: join timeout last=$out"
+  exit 1
+}
+
+# Drain both peers to last_seq >= min_seq. last_seq lower bound: last_seq>(min_seq-1).
+wait_drain() {
+  local min_seq=$1
+  local bound=$((min_seq - 1))
+  local budget=4000
+  local chunk=20
+  local rem=$budget
+  local cout="" hout="" crc=0 hrc=0
+  while (( rem > 0 )); do
+    drive_h "step ${chunk}" >/dev/null
+    set +e
+    cout=$(drive_c "step ${chunk}; await netsync pending=0 0; await netsync last_seq>${bound} 0" 2>&1)
+    crc=$?
+    hout=$(drive_h "await netsync pending=0 0; await netsync last_seq>${bound} 0" 2>&1)
+    hrc=$?
+    set -e
+    if [[ $crc -eq 0 && $hrc -eq 0 ]]; then
+      return 0
+    fi
+    rem=$((rem - chunk))
+  done
+  log "FAIL: drain timeout min_seq=$min_seq client='$cout' host='$hout'"
   exit 1
 }
 
 # Assert history JSON has stroke with actor_peer=P, thumb=true, bbox not null
 assert_stroke_thumb() {
   local json=$1 peer=$2 label=$3
-  # Extract stroke objects; look for actor_peer matching
-  if ! printf '%s' "$json" | grep -qE "\"name\":\"stroke\"[^}]*\"actor_peer\":${peer}" \
-    && ! printf '%s' "$json" | grep -qE "\"actor_peer\":${peer}[^}]*\"name\":\"stroke\""; then
-    # order of keys is fixed: actor_peer before name... actually actor then actor_peer then kind then name
-    :
-  fi
   # Fixed key order in appendEntryJson: ... actor_peer, kind, name, ... thumb, bbox
   local hit
   hit=$(printf '%s' "$json" | grep -oE '\{"seq":[0-9]+,"actor":"[^"]*","actor_peer":'"${peer}"'[^}]+\}' | grep '"name":"stroke"' | head -1 || true)
@@ -146,17 +174,10 @@ log "=== solo regression ==="
 solo_pid=$(start_pixie "$SOLO_PORT" "$SOLO_OUT")
 wait_port "$SOLO_PORT" "$solo_pid"
 drive_s 'step 2; action set_tool pen; action set_color 00FF00; action stroke 5 5 40 5; step 2' >/dev/null
-solo_hist=$(drive_s "snapshot history $SOLO_OUT/solo-history.json" 2>/dev/null || true)
-solo_json=$(cat "$SOLO_OUT/solo-history.json" 2>/dev/null || true)
-if [[ -z "$solo_json" ]]; then
-  # snapshot may write relative to harness out; try digest path
-  solo_json=$(drive_s 'snapshot history' 2>/dev/null; ls -la "$SOLO_OUT"/ 2>/dev/null; find "$SOLO_OUT" -name '*history*' 2>/dev/null)
-fi
-# Re-fetch: snapshot history <path> writes file; also try without path under KNGN_HARNESS_OUT
+drive_s "snapshot history $SOLO_OUT/solo-history.json" >/dev/null
 if [[ ! -f "$SOLO_OUT/solo-history.json" ]]; then
-  drive_s "snapshot history solo-history.json" >/dev/null 2>&1 || true
+  drive_s "snapshot history solo-history.json" >/dev/null
 fi
-# harness writes under KNGN_HARNESS_OUT when relative
 solo_json=$(cat "$SOLO_OUT/solo-history.json" 2>/dev/null || cat "$SOLO_OUT/history.json" 2>/dev/null || true)
 if [[ -z "$solo_json" ]]; then
   log "FAIL: solo history snapshot missing; out=$(ls -la "$SOLO_OUT")"
@@ -168,7 +189,6 @@ if ! printf '%s' "$solo_json" | grep -q '"name":"stroke"'; then
 fi
 solo_stroke=$(printf '%s' "$solo_json" | grep -oE '\{"seq":[0-9]+,"actor":"[^"]*","actor_peer":null[^}]*"name":"stroke"[^}]*\}' | head -1 || true)
 if [[ -z "$solo_stroke" ]]; then
-  # fallback: any stroke object
   solo_stroke=$(printf '%s' "$solo_json" | grep -oE '\{[^}]*"name":"stroke"[^}]*\}' | head -1 || true)
 fi
 if [[ -z "$solo_stroke" ]]; then
@@ -195,13 +215,7 @@ wait_port "$HOST_PORT" "$host_pid"
 client_pid=$(start_pixie "$CLIENT_PORT" "$CLIENT_OUT" KNGN_NETSYNC_CONNECT=127.0.0.1:"$NETSYNC_PORT")
 wait_port "$CLIENT_PORT" "$client_pid"
 
-# join
-for i in $(seq 1 2000); do
-  drive_h 'step 1' >/dev/null 2>&1 || true
-  out=$(drive_c 'step 1; digest netsync' 2>/dev/null || true)
-  printf '%s' "$out" | grep -q 'awaiting_sync=0' && break
-  sleep 0.05
-done
+wait_join
 
 drive_h 'step 2; action set_tool pen; action set_color FF0000' >/dev/null
 drive_c 'step 2; action set_tool pen; action set_color 0000FF' >/dev/null
