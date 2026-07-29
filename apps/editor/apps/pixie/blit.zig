@@ -10,7 +10,8 @@
 
 const std = @import("std");
 const core = @import("paint");
-const pixelops = @import("pixelops");
+const kit = @import("kit");
+const pixelops = kit.pixelops;
 const zoom_mod = @import("zoom.zig");
 pub const Zoom = zoom_mod.Zoom;
 

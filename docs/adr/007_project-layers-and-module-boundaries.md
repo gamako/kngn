@@ -201,18 +201,18 @@ shells alone**, which makes the judgement simple (R6, R8).
   module path" compile error — two lines of defence.
 - **Only localised exceptions**, each behind an explicit API. The authoritative
   list is the `linkCoreException` / `linkAppException` call sites in `build.zig`
-  (also summarised in `AGENT.md`). The current set is seven edges:
+  (also summarised in `AGENT.md`). The current set is five edges:
   ① `linkCoreException` — `harness(core/control) → png(libs/png)` (encoding
   snapshots and crc32; png is a dependency-free pure Zig leaf lib, so headlessness is
   preserved); ② `harness(core/control) → dsp` (spectrum analysis behind the audio
   digest: band, centroid, onset; analysis runs only when a digest is requested, never
   touching the real-time path); ③ `platform(core) → pixelops(libs/pixelops)`
-  (BGRA→RGBA SIMD swizzle for wasm present). ④–⑦ `linkAppException` —
-  `apps/editor/apps/pixie → pixelops` (downscale blit SIMD); `example_26 → paint`
-  (demo direct import); `apps/patch/lofi.zig → synth` and `→ dsp` (generative-layer
-  types such as `SampleTap` / `AtomicF32` and FFT band-energy checks, keeping a
-  pure-test root platform-free). Kit and a direct import of the same lib are the
-  same module instance, so type identity holds.
+  (BGRA→RGBA SIMD swizzle for wasm present). ④–⑤ `linkAppException` —
+  `example_26 → paint` (demo direct import); `apps/patch/lofi.zig → synth` and
+  `→ dsp` (generative-layer types such as `SampleTap` / `AtomicF32` and FFT
+  band-energy checks, keeping a pure-test root platform-free). Apps reach pixelops
+  through `kit.pixelops` (stable re-export), not a direct exception. Kit and a
+  direct import of the same lib are the same module instance, so type identity holds.
 - **The allow-list for direct imports by apps** (libs not in kit because they are
   still in flux): modular, paint, viz (spectrogram/scope). It is managed by
   `TaggedModule.app_direct_ok=true`, and wiring an app directly to a lib that *is*
@@ -271,3 +271,10 @@ shells alone**, which makes the judgement simple (R6, R8).
   `core/control`, stated in ADR-014) and to the linking mechanism it relies on
   (ADR-013). R7 itself is unchanged: the exception is narrow, its grounds are
   written down, and the conditions that would end it are too.
+- 2026-07-30 pixelops promoted into kit (`kit.pixelops`). The two
+  `linkAppException` edges `apps/editor/apps/pixie → pixelops` and
+  `apps/patch → pixelops` were removed; apps use the kit re-export. Remaining
+  exception set is five edges (three `linkCoreException`, two
+  `linkAppException`). `platform → pixelops` stays (core cannot link libs
+  without an exception; needed for wasm present). The R1–R8 decisions themselves
+  are unchanged.

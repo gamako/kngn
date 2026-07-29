@@ -8,13 +8,14 @@
 //! - control:  core/control/harness.zig (control+obs plane: probe / replay / live / virtual clock)
 //! - types:    core/platform_types.zig (type-only shared types: KeyCode / Event, …)
 //! - audio:    core/audio.zig facade (L1 audio output)
-//! - gui / png / font / dsp / synth / sound / gmath / gfx / appshell: stable libs
+//! - gui / png / font / dsp / synth / sound / gmath / gfx / appshell / pixelops: stable libs
 //! - gamepad: src/gamepad.zig (gamepad input helper; platform_types-only
 //!   headless lib at layer=.lib. Keyboard and other gfx helpers live under libs/gfx and
 //!   are also exposed via kit.gfx)
 //! - recipe: libs/recipe (save/replay of CommandRecord sequences; std + serde only)
 //! - sound: libs/sound (WAV decode + SE/BGM mixer; dsp + synth)
 //! - gfx: libs/gfx (sprite / fixed_timestep / fps_counter / keyboard / atlas / animation)
+//! - pixelops: libs/pixelops (shared SIMD blend / u32 fill for all-pixel loops)
 //!
 //! **Libs still in flux (modular / paint / viz, …) stay out.** Apps import those directly as
 //! "internal / may break", and promote them into kit once the API settles (maturity gate).
@@ -41,6 +42,7 @@ pub const gfx = @import("gfx");
 pub const appshell = @import("appshell");
 pub const app_runtime = @import("app_runtime");
 pub const sound = @import("sound");
+pub const pixelops = @import("pixelops");
 
 // ============================================================================
 // platform.Event → gui.InputEvent adapter

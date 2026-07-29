@@ -73,9 +73,9 @@ fn linkCoreException(consumer: TaggedModule, dep: TaggedModule, comptime reason:
 }
 
 /// app → lib direct-import exceptions. The full set is the linkAppException call sites:
-///   - apps/editor/apps/pixie → pixelops (downscale blit SIMD)
 ///   - example_26 → paint; apps/patch/lofi.zig → synth / dsp (keeps a pure-test root platform-free)
 /// A kit-listed dep is the same module instance kit exposes, so type identity holds.
+/// (pixie / patch use kit.pixelops; they do not need a direct pixelops exception.)
 fn linkAppException(consumer: TaggedModule, dep: TaggedModule, comptime reason: []const u8) void {
     comptime std.debug.assert(reason.len > 0);
     std.debug.assert(consumer.layer == .app and dep.layer == .lib);
@@ -161,15 +161,20 @@ const WasmBuildOpts = struct {
 
 fn buildWasmPixie(
     b: *std.Build,
-    target: std.Build.ResolvedTarget,
+    base_target: std.Build.ResolvedTarget,
     optimize: std.builtin.OptimizeMode,
     opts: WasmBuildOpts,
 ) WasmExeBuild {
+    // Keep the caller's CPU / OS / ABI / existing feature set; add simd128 for pixelops @Vector paths.
+    var query = base_target.query;
+    query.cpu_features_add.addFeatureSet(std.Target.wasm.featureSet(&.{.simd128}));
+    const target = b.resolveTargetQuery(query);
+
     const wasm_max_opts = b.addOptions();
     wasm_max_opts.addOption(usize, "max_modules", @as(usize, 48));
     wasm_max_opts.addOption(bool, "has_frame_cap", false);
     wasm_max_opts.addOption(u32, "frame_cap_hz", @as(u32, 0));
-    const shared = SharedModules.init(b, true, false, false, 48, wasm_max_opts.createModule(), target.result.os.tag);
+    const shared = SharedModules.init(b, true, false, false, 48, wasm_max_opts.createModule(), base_target.result.os.tag);
     const pm = makePlatformModules(b, target, .wasm, &shared, false);
 
     const pixie_mod = b.createModule(.{
@@ -182,8 +187,7 @@ fn buildWasmPixie(
         const root = TaggedModule{ .mod = pixie_mod, .layer = .app, .name = "pixie" };
         link(root, pm.kit);
         link(root, shared.paint);
-        // Explicit apps → pixelops exception (linkAppException call site)
-        linkAppException(root, shared.pixelops, "apps/editor/apps/pixie → pixelops (shared SIMD blend for the downscale blit, shared u32 fill for the frame clear)");
+        // pixelops is re-exported via kit (kit.pixelops); no direct apps → pixelops link.
     }
 
     const exe = b.addExecutable(.{
@@ -223,12 +227,13 @@ fn buildWasmSynth(
     optimize: std.builtin.OptimizeMode,
     opts: WasmBuildOpts,
 ) WasmExeBuild {
-    // Target with atomics + bulk_memory added (shared memory required)
+    // Target with atomics + bulk_memory (shared memory / AudioWorklet) plus simd128
+    // (pixelops @Vector paths and any other SIMD in the synth graph).
     const query = std.Target.Query{
         .cpu_arch = .wasm32,
         .os_tag = base_target.result.os.tag, // wasi
         .abi = base_target.result.abi,
-        .cpu_features_add = std.Target.wasm.featureSet(&.{ .atomics, .bulk_memory }),
+        .cpu_features_add = std.Target.wasm.featureSet(&.{ .atomics, .bulk_memory, .simd128 }),
     };
     const target = b.resolveTargetQuery(query);
 
@@ -313,6 +318,13 @@ pub fn build(b: *std.Build) void {
     // ========================================
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
+    // Wasm packaging defaults to ReleaseSmall when neither -Doptimize nor --release is given.
+    // Explicit -Doptimize=… / --release=… always wins (same value as `optimize` above).
+    // Native apps keep the Debug default from standardOptimizeOption.
+    const wasm_optimize: std.builtin.OptimizeMode = if (b.user_input_options.contains("optimize") or b.release_mode != .off)
+        optimize
+    else
+        .ReleaseSmall;
     const target_os = target.result.os.tag;
     const is_wasm = target.result.cpu.arch.isWasm();
 
@@ -321,7 +333,7 @@ pub fn build(b: *std.Build) void {
     // Even under wasi, skip the native backend loop and use the dedicated path. pixie only.
     // ========================================
     if (is_wasm) {
-        buildWasm(b, target, optimize);
+        buildWasm(b, target, wasm_optimize);
         return;
     }
 
@@ -605,7 +617,7 @@ pub fn build(b: *std.Build) void {
 
     // ----- wasm web distribution package -----
     // Cross-compile from the native target into zig-out/web/. The web/ layout used in development is unchanged.
-    packageWebFromNative(b, optimize);
+    packageWebFromNative(b, wasm_optimize);
 
     // ========================================
     // platform native object archive lib (for external packages) — macOS only
@@ -1444,7 +1456,9 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
     blit_test_mod.addImport("paint", blit_core);
-    blit_test_mod.addImport("pixelops", shared_modules.pixelops.mod);
+    // blit.zig uses kit.pixelops (same instance as shared_modules.pixelops).
+    const blit_pm = makePlatformModules(b, target, default_be, &shared_modules, false);
+    blit_test_mod.addImport("kit", blit_pm.kit.mod);
     const blit_test = b.addTest(.{ .root_module = blit_test_mod });
     const run_blit_test = b.addRunArtifact(blit_test);
 
@@ -2368,7 +2382,9 @@ pub fn build(b: *std.Build) void {
         .optimize = .ReleaseFast,
     });
     bench_blit_mod.addImport("paint", bench_blit_core);
-    bench_blit_mod.addImport("pixelops", bench_pixelops_mod);
+    // blit.zig uses kit.pixelops (same path as the app). Kit is wired via makePlatformModules.
+    const bench_blit_pm = makePlatformModules(b, target, default_be, &shared_modules, false);
+    bench_blit_mod.addImport("kit", bench_blit_pm.kit.mod);
     const bench_blit_root = b.createModule(.{
         .root_source_file = b.path("bench/blit.zig"),
         .target = target,
@@ -2487,6 +2503,7 @@ fn wireKitImports(kit: TaggedModule, platform_mod: TaggedModule, common: *const 
     link(kit, common.gfx); // kit.gfx
     link(kit, common.appshell); // kit.appshell
     link(kit, common.sound); // kit.sound
+    link(kit, common.pixelops); // kit.pixelops (shared SIMD blend / u32 fill)
     link(kit, app_runtime);
 }
 
@@ -3127,8 +3144,7 @@ fn addPixieExe(
     const root = appRoot(exe, "pixie");
     link(root, pm.kit_menu);
     link(root, common.paint);
-    // Explicit apps → pixelops exception (linkAppException call site)
-    linkAppException(root, common.pixelops, "apps/editor/apps/pixie → pixelops (shared SIMD blend for the downscale blit, shared u32 fill for the frame clear)");
+    // pixelops is re-exported via kit (kit.pixelops); no direct apps → pixelops link.
 
     platform.setupExecutableForPlatform(b, exe, platform_type, optimize, platform_root, sdk_paths, .{ .enable_menu = true });
     return exe;
@@ -3172,7 +3188,7 @@ fn addPatchExe(
     link(root, common.spectrogram); // Signal visualization (master scope/spectrogram/level meter)
     link(root, common.scope);
     link(root, common.serde); // graph_io.zig (serialize: versioned-container serialization of node/edge topology)
-    linkAppException(root, common.pixelops, "apps/patch → pixelops (shared u32 fill for the per-frame framebuffer and viz-strip clears)");
+    // pixelops is re-exported via kit (kit.pixelops); no direct apps → pixelops link.
     linkAppException(root, common.synth, "apps/patch/lofi.zig uses the generative layer directly (SampleTap / AtomicF32)");
     linkAppException(root, common.dsp, "apps/patch/lofi.zig uses the generative layer directly (FFT band energy checks)");
     linkAudioBackend(exe, target.result.os.tag); // macOS=AudioToolbox / Linux=asound / Windows=ole32

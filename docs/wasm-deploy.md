@@ -36,17 +36,67 @@ the same directory.
 > and `std.c.getenv` is unavailable without libc). **Run the two steps below whenever you touch
 > `core/control/`, the platform facade, `libs/appshell`, or anything a wasm root imports.**
 
+### Optimize mode
+
+- **Default for wasm** (`zig build package-web` and `-Dtarget=wasm32-wasi` without `-Doptimize`):
+  **ReleaseSmall**. Native apps still default to Debug.
+- **Explicit wins**: `-Doptimize=Debug` / `ReleaseFast` / `ReleaseSafe` / `ReleaseSmall`, and
+  `--release=fast` / `safe` / `small`, always override the default.
+
+### Install behaviour of individual wasm build steps
+
+| Step | What it does | Writes `zig-out/web/`? |
+|------|----------------|------------------------|
+| `package-web` | Compiles pixie + synth wasm and installs wasm + static assets into `zig-out/web/` | **yes** |
+| `build-pixie-wasm` / `build-synth-wasm` | Compile-only (depends on the compile step only) | **no** |
+| `-Dtarget=wasm32-wasi build-pixie` / `build-synth-wasm` | Same compile-only shape under a direct wasm target | **no** (unless the step is also pulled into an install graph) |
+
+Use **`zig build package-web`** whenever you need distributable files under `zig-out/web/`.
+
+### Binary size by optimize (measured)
+
+Sizes below are for the **final wasm artefacts after `simd128` was enabled** on both pixie and
+synth targets (`zig build -Doptimize=… package-web` on aarch64-macos, 2026-07-30).
+KB values are `file_size / 1024` floored.
+
+| optimize | pixie.wasm | synth.wasm | notes |
+|----------|----------:|----------:|-------|
+| Debug | 5811 KB | 3538 KB | explicit `-Doptimize=Debug` |
+| ReleaseFast | 4111 KB | 1669 KB | explicit `-Doptimize=ReleaseFast` |
+| ReleaseSmall | 1129 KB | 425 KB | default for `package-web` when `-Doptimize` is omitted |
+
+Pre-`simd128` reference (2026-07-29 macOS, `package-web`): Debug 5865 / 3549 KB,
+ReleaseFast 4088 / 1672 KB, ReleaseSmall 1133 / 426 KB.
+
+### simd128 (WebAssembly SIMD)
+
+Both pixie and synth wasm targets enable the **`simd128`** CPU feature so `libs/pixelops`
+`@Vector(16, u8)` paths emit real SIMD instructions instead of scalar expansion.
+
+**Browser baseline** (ships without a polyfill):
+
+| Browser | Minimum version |
+|---------|-----------------|
+| Chrome | 91+ |
+| Firefox | 89+ |
+| Safari | 16.4+ |
+
+Older Safari (and other engines without SIMD) are **out of support** for these wasm builds.
+Synth still also needs `atomics` + `bulk_memory` (SharedArrayBuffer / AudioWorklet); that is
+unchanged and still requires COOP/COEP isolation (see below).
+
 From the repository root:
 
 ```bash
 # Full package (recommended; cross-compiles wasm from a native target)
+# Default optimize is ReleaseSmall when -Doptimize is omitted.
 zig build package-web
 
-# Individual (native target)
+# Individual compile-only steps (do NOT install into zig-out/web/)
 zig build build-pixie-wasm
 zig build build-synth-wasm
 
-# When targeting wasm (-Dtarget=wasm32-wasi)
+# When targeting wasm (-Dtarget=wasm32-wasi); same ReleaseSmall default
 zig build -Dtarget=wasm32-wasi package-web
 zig build -Dtarget=wasm32-wasi build-pixie
 zig build -Dtarget=wasm32-wasi build-synth-wasm

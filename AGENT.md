@@ -203,11 +203,9 @@ kngn/
 > `harness(core/control) → png(libs/png)` (encoding a framebuffer snapshot as PNG, and
 > crc32), `harness → dsp` (the spectrum analysis behind the audio digest),
 > `platform → pixelops` (the BGRA→RGBA SIMD swizzle for a wasm present),
-> `pixie(apps) → pixelops` (sharing the SIMD blend of a downscaling blit and the u32 fill
-> of the frame clear), `patch(apps) → pixelops` (the same u32 fill for its framebuffer and
-> viz-strip clears),
 > `example_26 → paint` (a direct paint import in the demo), and
 > `apps/patch/lofi.zig → synth` / `→ dsp` (using the generative layer directly).
+> Apps reach pixelops through `kit.pixelops` (re-export), not via `linkAppException`.
 > Migration follows R8's deferred policy, and files not yet moved stay in `src/`.
 
 ## Quick start
@@ -346,6 +344,13 @@ by the backend (`core/platform_macos.zig`).
   [docs/performance-measurement.md](docs/performance-measurement.md))
 
 ## Performance rules
+
+**Scope of the technical rules**: they apply to any code that implements these hot
+paths — code in this repository and code written by external kit consumers alike.
+**Repository obligations**: when such code lands in this repository, adding a
+bit-identical SIMD-vs-scalar test and recording bench before/after numbers are
+required duties of that change (not of external kit users who only consume the
+published surface).
 
 Rules from an audit of every hot path. They carry the same weight as the real-time
 contract (see [docs/audio-and-synth.md](docs/audio-and-synth.md)) and are **mandatory
