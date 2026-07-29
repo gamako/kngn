@@ -1,27 +1,26 @@
-# PLAN: GUI layout torture suite
+# 37_gui_torture: GUI layout torture suite
 
-## Purpose
-
-Where `examples/35_gui_gallery` is the happy-path catalogue, this suite regression-tests
-`libs/gui` edge and failure cases (nesting, zero-size, overflow, leftover state, ID
-independence, volume) through the harness.
+Where `examples/35_gui_gallery` is the happy-path catalogue, this suite
+regression-tests `libs/gui` edge and failure cases (nesting, zero-size, overflow,
+leftover state, ID independence, volume) through the harness.
 
 **`libs/gui` itself is not modified** (observe public API / pub state only).
 
 ## Hot-path declaration
 
-- `examples/37_gui_torture/main.zig`: widget construction is per-frame O(N). No full-framebuffer
-  loops or RT paths are added.
+- `main.zig`: widget construction is per-frame O(N). No full-framebuffer loops or
+  RT paths are added.
 - `bench/gui_frame.zig`: bench runs only (warmup 100 × measure 1000).
-- `tests/gui_leak.zig`: 300-frame measurement only. Does not affect the standing path.
+- `tests/gui_leak.zig`: 300-frame measurement only. Does not affect the standing
+  path.
 
 ## Layout
 
 | Path | Role |
 |---|---|
-| `examples/37_gui_torture/main.zig` | Case switching + custom probes `state` / `layout` / `scroll` |
-| `examples/37_gui_torture/e2e_*.txt` | Headless replay (ordinary cases) |
-| `examples/37_gui_torture/negative_auto_id.{txt,sh}` | Debug-assert negative case (expect non-zero exit) |
+| `main.zig` | Case switching + custom probes `state` / `layout` / `scroll` |
+| `e2e_*.txt` | Headless replay (ordinary cases) |
+| `negative_auto_id.{txt,sh}` | Debug-assert negative case (expect non-zero exit) |
 | `bench/gui_frame.zig` | Full Context frame bench (`bench-gui-frame`) |
 | `tests/gui_leak.zig` | PerIdStateStore leak measurement (`test-gui-leak`) |
 
@@ -38,8 +37,8 @@ independence, volume) through the harness.
 - **layout**: `case` / `screen_w` / `screen_h` / `overflow` / `draw_ok` / `layout_completed` / `render_completed` + per-case rects (pane*/slider/text_input/popup_*, …)
 - **scroll**: `outer_scroll_y` / `inner_scroll_y` / viewport rects
 
-Key names match the digests observed after implementation. Scripts bake the **first headless
-replay measurements**, not invented expectations.
+Key names match the digests observed after implementation. Scripts bake
+measured replay values, not invented expectations.
 
 ## Running
 
@@ -75,4 +74,5 @@ cd examples/37_gui_torture && zig build
 
 ## Related
 
-- Happy-path matrix: `docs/plans/PLAN_gui_capability_matrix.md`
+- Happy-path matrix: [`docs/plans/PLAN_gui_capability_matrix.md`](../../docs/plans/PLAN_gui_capability_matrix.md)
+- Frame order, hit-test timing, text and PerIdStateStore contracts: `libs/gui/README.md`

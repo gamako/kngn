@@ -156,23 +156,23 @@ section=<name> index=<i> widgets=<n> missing=<n> schema=v0 hot=<name|none> activ
 
 The abnormal / boundary suite that pairs with the normal path (this matrix + `examples/35_gui_gallery`) is:
 
-- Plan: `docs/plans/PLAN_gui_torture.md`
+- README: `examples/37_gui_torture/README.md`
 - Example: `examples/37_gui_torture` (probes: `state` / `layout` / `scroll`)
 - Bench: `zig build bench-gui-frame` (full Context frame, 500/1000 rows)
 - Leak: `zig build test-gui-leak` (PerIdStateStore cap assert: final=3072, max≤4096)
 
 ### Gaps found in the torture suite (summary)
 
-Detail, file:line, and reproduction scripts live with the torture suite plan and example.
+Detail, file:line, and reproduction scripts live with the torture suite example.
 
-1. Nested ScrollArea wheel does not prefer the inner area; outer/inner change together
-2. PerIdStateStore had no trim/TTL/cap, so long-lived ID churn grew monotonically → **LRU cap introduced** (see §18)
+1. Nested ScrollArea wheel does not prefer the inner area; outer/inner change together → **resolved**: wheel consumption is LIFO inner-first, with an edge-remainder propagating outward, in `endScrollArea` (see "Frame order and hit-test timing" in `libs/gui/README.md`, and the nested-wheel unit tests in `libs/gui/src/widgets.zig`)
+2. PerIdStateStore had no trim/TTL/cap, so long-lived ID churn grew monotonically → **LRU cap introduced** (see "PerIdStateStore lifetime and LRU cap" in `libs/gui/README.md`)
 3. TextBuffer / textInputId has no max-length API
-4. Newline / CJK / emoji measure / coverage: default-font observation contract is spelled out in §17
+4. Newline / CJK / emoji measure / coverage: default-font observation contract is spelled out in "Text measurement and drawing" in `libs/gui/README.md`
 5. Small-screen outer overflow for long popup item text is not yet documented as a contract
 6. Hit-test / clip / child rect behavior for zero-size / overflow containers is undefined
-7. Rect-cache sync lag when layout changes during drag: current contract is spelled out in §16
-8. Auto-ID same-label collisions: current contract and `Id` variant usage rules are spelled out in §17
+7. Rect-cache sync lag when layout changes during drag: current contract is spelled out in "Frame order and hit-test timing" in `libs/gui/README.md`
+8. Auto-ID same-label collisions: current contract and `Id` variant usage rules are spelled out in "Text measurement and drawing" in `libs/gui/README.md`
 
 ## 14. Settings shell observations
 
@@ -247,191 +247,3 @@ libs/gui itself was not changed. Gaps are recorded as example-side custom/hack o
 ### 15.3 Size checks
 
 Launch 640×360 / 1024×768 / 1440×900 as separate processes and visually inspect path-omitted `snapshot fb`. Adjust padding/gap by width; do not use fixed absolute placement.
-
-## 16. Layout and input timing contract
-
-> **Observation as of 2026-07-18**: The following is the contract of the current libs/gui implementation.
-> If concurrent work changes clip / hit-test boundaries, read that section together with this one.
-
-### 16.1 Frame order
-
-| Stage | Work | Evidence |
-|---|---|---|
-| `beginFrame` | arena reset; input/id_stack/state init; draw_list reset; layout root created (not yet measured/placed) | `libs/gui/src/context.zig:220-243` |
-| widget calls | synchronous hit-test against previous-frame `rect_cache`; build this frame's layout tree | `libs/gui/src/widgets.zig:203-206` |
-| `endFrame` | `layout.measure` → `layout.place` → `rect_cache.clearRetainingCapacity` → `updateRectCache` → `emitNode` → `frame_active=false` | `libs/gui/src/context.zig:245-260` |
-
-`endFrame` does not hit-test. Focus clear and active stuck prevention are only the state updates at the end of `endFrame` (`context.zig:261-270`).
-
-### 16.2 When the rect cache is visible
-
-- `updateRectCache` runs only after measure/place in `endFrame` (`context.zig:256-257`).
-- Registration covers only `beginBox` nodes with `cfg.id != 0`. Stores `{rect, clip, measured_w, measured_h}` (`context.zig:420-429`).
-- `getNodeRect` / `getNodeCachedRect` / `getNodeMeasured` return previous-frame settled values. They are not updated right after `beginFrame` either (`context.zig:377-404`).
-- First frame, unknown IDs, and auto-numbered nodes (`beginBox` with `cfg.id==0`) return null.
-- Duplicate explicit IDs in the same frame are a Debug assert contract violation (`context.zig:424-425`).
-
-### 16.3 Layout changes during drag
-
-Drags that change layout show a one-frame lag (current contract; not adopted as a fix target):
-
-```text
-Frame N:
-  read previous-frame rect
-  → buttonBehavior decides active / held from previous-frame rect
-  → layout changes while widgets are built
-  → endFrame stores new rect in cache and draws the new layout
-
-Frame N+1:
-  hit-test against the new rect cache
-```
-
-Frame N draws the new layout and hit-tests the old layout. Hard to observe under ordinary static layout, slider drag, or scroll.
-
-### 16.4 Adopted approach and rejected alternatives
-
-**Adopted**: Keep synchronous hit-test against the previous-frame rect cache as the current contract.
-
-**Rejected** (same-frame rect reflection):
-
-| Option | Why rejected |
-|---|---|
-| A: Finalize layout before widget construction | Sibling measure and parent sizing mean final rects cannot be known before all widgets are built |
-| B: Re-run hit-test after endFrame | Collides with synchronous return APIs (`ButtonResult` / `changed`). Needs event retention, re-evaluation, and ordering rules |
-| C: Predicted rect per widget | Not applicable to general widgets with flex/scroll/popup/dynamic label width. Would duplicate layout and hit-test paths |
-
-Real harm is limited to cases such as parent layout change during drag, display switching, and release position mismatch between old and new rects.
-
-### 16.5 Torture-suite E2E evidence
-
-`examples/37_gui_torture/e2e_input_state.txt` pins the observed values for the current contract.
-
-- During F1 layout shift, `active=slider`, `dragging=1`, and `layout_generation=1` are held (`e2e_input_state.txt:17-25`)
-- After mouse up, `active_is_zero=1` (`e2e_input_state.txt:27-30`)
-
-### 16.6 Boundary with the wheel contract
-
-Scroll wheel input is a scroll-specific delivery contract: same-frame reflection in `endScrollArea` (inner-first consumption; scroll offset applied to the viewport node). See the `ScrollState` comment at `context.zig:64-66`.
-
-Treat that separately from any general contract that would reflect arbitrary layout changes into same-frame hit-test. Wheel behavior and rect-cache lag are not in conflict.
-
-## 17. Text measure/draw contract
-
-> **Observation as of 2026-07-18**: The following observation contract assumes `gui.default_font` (spleen 8×16 bitmap).
-> Glyph coverage and advance for a different `Font` implementation follow that implementation's contract.
-
-### 17.1 Scope and Font dependence
-
-- Targets: `Font.measure` / `Font.drawTo` / `TextLayout` / label-family widgets / `textInputId`
-- Default font: ASCII `32..127` 8×16 bitmap (`libs/gui/src/font.zig:13-19`, `font.zig:208-215`)
-- No font chain / emoji font / glyph fallback in `libs/gui`
-
-### 17.2 Newlines
-
-| Path | Behavior | Evidence |
-|---|---|---|
-| label / selectableLabel etc. (display) | `\n` is not stripped. Measured as 1 codepoint at 8px. Draw skips (out of glyph range); advance still moves 8px (no line advance) | `font.zig:18-19`, `font.zig:81-85` |
-| TextInput (edit) | Typed char / paste / selection replacement do not insert newlines or ASCII controls | `widgets.zig:500`, `widgets.zig:619-621`, `text_edit.zig:377`, `text_edit.zig:418` |
-
-Default font is a single-line draw contract (no height growth from newlines).
-
-### 17.3 CJK
-
-Valid UTF-8 CJK is handled as one codepoint.
-
-| Item | default font | Evidence |
-|---|---|---|
-| measure | 8px per character | `font.zig:57-61` |
-| TextLayout | byte offset / prefix_width for one codepoint | `text_edit.zig:54-79` |
-| draw | no glyph (skipped) | `font.zig:81-85` |
-| advance | 8px even without a glyph | `font.zig:64-71` |
-| fallback | none | — |
-
-`wordRange` treats a contiguous non-ASCII run as one word. Grapheme clusters / language-specific segmentation are unimplemented (`text_edit.zig:112-128`).
-
-### 17.4 emoji
-
-Emoji that is valid UTF-8 is also per codepoint. Under the default font, like CJK: no glyph drawn, advance 8px.
-
-ZWJ sequences / variation selectors / skin tones are not handled as graphemes; each constituent codepoint is processed. Visual one-emoji units are not guaranteed to match logical width.
-
-### 17.5 Default font coverage and fallback
-
-- Coverage: set bits for ASCII `32..127` bitmaps (`font.zig:101-120`)
-- Non-ASCII: not replaced with `.notdef` or a substitute glyph; draw is skipped (`font.zig:81-85`)
-- Fallback font / font chain: none
-
-### 17.6 measure / draw advance / ink width
-
-Default font `measure`:
-
-- valid UTF-8: codepoint count × 8
-- invalid UTF-8: byte count × 8
-- missing glyph / newline / CJK / emoji: all advance 8px
-
-`drawTo` also advances 8px per codepoint, so logical measure and draw-cursor width match. Because glyphs may be skipped, **logical width is not ink pixel width**.
-
-Layout text leaf: width = `Font.measure`, height = `Font.metrics().line_height` (`libs/gui/src/layout.zig:166-169`).
-
-### 17.7 TextLayout / caret / selection / hit-test
-
-`buildTextLayout` builds per-codepoint UTF-8 byte offsets, logical advance, and cumulative `prefix_widths` (`text_edit.zig:54-79`).
-
-- `selectableLabel`: width = `prefix_widths[count]`, height = line_height (`widgets.zig:294-298`)
-- `textInputId`: selection / caret / scroll / hit-test use `prefix_widths` (`widgets.zig:351-378`)
-- `.fit` width = `Font.measure` + padding (`widgets.zig:596-600`)
-- ink height = `ascent + descent` (not line_height; `widgets.zig:531-533`)
-
-`hitTest` returns a **codepoint index** (not a byte offset), using advance midpoints as boundaries (`text_edit.zig:91-100`).
-
-### 17.8 Auto ID and same-label collisions
-
-Label-family auto IDs are `IdStack.make(label)` = current seed + label hash (`libs/gui/src/id.zig:83-85`).
-
-Covered APIs: `button` / `buttonEx` / `selectableLabel` / `sliderI32` / `sliderF32` / `svSquare` / `hueBar` / `checkbox` / `toggle` / `radio` (each `id_stack.make` call is in `widgets.zig`). `colorSwatch` uses `makeInt(color value)`. `textInputId` has no auto-ID variant.
-
-Same label in the same `IdStack` scope → same ID → Debug assert in `endFrame`'s `updateRectCache` (`context.zig:424-425`).
-
-Negative E2E: `examples/37_gui_torture/negative_auto_id.sh` (expects non-zero exit plus assert/panic traces).
-
-**Usage rule**: For adjacent same labels, use explicit-ID variants such as `buttonId` / `selectableLabelId`, or split scope with `id_stack.push(i)`.
-
-Last-wins overwrite in Release builds is not a contracted allowed behavior; the premise is "do not use duplicate IDs".
-
-### 17.9 Usage rules and non-goals
-
-| Item | Status |
-|---|---|
-| Multi-line layout / wrapping | Unsupported (single-line contract) |
-| Grapheme cluster handling | Unsupported (codepoint unit) |
-| Glyph fallback / emoji font | Not added |
-| Newline line advance (label display) | Unsupported (advance only) |
-| Auto-ID same label | Detected by Debug assert (at `endFrame` cache update) |
-
-Observation E2E: `examples/37_gui_torture/e2e_text.txt` (ASCII/CJK/emoji/newline labels, 500-codepoint measure, TextInput caret/selection at codepoint boundaries).
-
-## 18. PerIdStateStore lifetime / LRU cap
-
-`PerIdStateStore` (`libs/gui/src/state.zig`) holds per-ID selection / caret / double-click / TextInput horizontal scroll.
-
-| Item | Contract |
-|---|---|
-| Method | frame-generation touch + ID-linked LRU |
-| Default caps | `max_entries=4096`, `trim_to=3072` |
-| touch | `getOrPut` (`Context.perIdState`) records the current frame and moves to LRU tail. `get` does not touch |
-| trim trigger | Only at the frame boundary at the end of `Context.endFrame` (when `count > max_entries`) |
-| Protected | current-frame touch / `active_id` / `focused_id` / `hot_id` / `next_hot_id` |
-| Hidden | When over cap, oldest LRU entries may be discarded. On re-show, `PerIdState` returns to defaults |
-| Caller-owned | `TextBuffer` and ScrollArea `*Vec2f` live outside the store (unaffected by trim) |
-
-| widget | store state | Behavior after trim |
-|---|---|---|
-| `selectableLabelId` | selection / dragging / double-click | Initial selection on recreate |
-| `textInputId` | selection / caret / `scroll_x` / blink | TextBuffer kept; edit state reset |
-| `beginScrollArea` | caller-owned `Vec2f` | Unaffected by store trim |
-
-Verification entry points:
-
-- unit: `zig build test-gui` (LRU / protect / re-init tests in `state.zig` / `context.zig`)
-- leak: `zig build test-gui-leak` (even with 30,000 unique IDs: final=3072, max_observed≤4096)
-- E2E: `examples/39_settings_shell/e2e.sh` scenario 5 (`editor_scroll_y` kept by the app while another section is shown; rect_cache miss clamp right after re-show is ScrollArea contract)

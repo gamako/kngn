@@ -60,3 +60,81 @@ scope to avoid that.
 - percent is relative to the parent's content box (padding deducted, gap not). Floor truncation;
   leftover pixels are absorbed by grow children
 - `clip_children` affects drawing only, not layout
+
+## Frame order and hit-test timing
+
+A widget call (`ctx.button(...)` and friends) hits-test and returns its result
+synchronously, but this frame's own layout is not known yet at that point — layout
+(`layout.measure` then `layout.place`) runs once, in `endFrame`, after every widget
+for the frame has been built (sibling measurement and parent sizing mean it cannot
+run any earlier). So a widget call hits-test against the **rect cache from the
+previous completed frame** instead: draw uses this frame's new layout, hit-test
+still uses the old one, for that one frame. This is a deliberate one-frame lag,
+invisible under static layout, and visible only when a drag or similar input
+changes the layout on the same frame that reads it.
+
+The full contract — what `beginFrame`/`endFrame` each do, what the rect cache
+holds and when it updates, and the clip/hit-test visibility rules — is written as
+the current contract at the top of `src/context.zig`, and repeated on
+`Context.getNodeRect` / `getNodeCachedRect` / `getNodeMeasured` /
+`updateRectCache`. Why the previous-frame cache was chosen over the alternatives
+is [ADR-016](../../docs/adr/016_gui-sync-hit-test-against-previous-frame-rect-cache.md).
+
+**Scroll wheel is a separate, same-frame contract.** `endScrollArea` applies
+unconsumed wheel delta immediately, before the frame's `endFrame` — nested
+`ScrollArea`s consume it LIFO (innermost first), and whatever an inner area could
+not move at an edge is left for the next enclosing one. See the `ScrollState` doc
+comment in `context.zig`. This is unrelated to the hit-test lag above: general
+widget rects settle one frame late, but a `ScrollArea`'s own scroll offset settles
+in the same frame the wheel event arrives.
+
+Verification: `zig build test-gui` (nested-wheel unit tests in `widgets.zig`);
+`examples/37_gui_torture` case `input_state` (`e2e_input_state.txt` pins values
+across a layout-shifting drag) and case `scroll` (nested-wheel digests).
+
+## Text measurement and drawing
+
+The default font (`BitmapFont`, `src/font.zig`) covers ASCII `32..127` at a fixed
+8px advance per codepoint and draws a single line only — no wrap, no newline
+handling (a `\n` in a label is not stripped but does not start a new line
+either). A codepoint outside ASCII (CJK, emoji, any other non-ASCII text) has no
+glyph: drawing it is skipped, but measurement and the draw cursor still advance
+8px, so **logical width is not ink pixel width** for such text. There is no font
+chain or fallback glyph. `measure` and `drawTo` always agree on advance, by
+construction. The full contract, including invalid-UTF-8 handling, is the doc
+comment at the top of `font.zig`; codepoint-indexed layout, caret and selection
+(`TextLayout`, `hitTest`, `wordRange`) are documented at the top of
+`text_edit.zig` and used by `selectableLabel` / `textInputId`.
+
+Auto-generated widget IDs hash the label text (`IdStack.make`); using the same
+label twice in the same ID-stack scope collides on ID, which
+`Context.updateRectCache` treats as a contract violation (a Debug assert; Release
+silently keeps the last write, so duplicate labels must not be relied on either
+way). Use an explicit-ID variant (`buttonId`, `selectableLabelId`, ...) or scope
+with `id_stack.push(i)` to avoid the collision. `textInputId` has no auto-ID
+variant.
+
+Verification: `zig build test-gui` (measure/draw/layout unit tests); `examples/
+37_gui_torture` case `text` (ASCII/CJK/emoji/newline measurement, caret and
+selection at codepoint boundaries) and `negative_auto_id.sh` (duplicate-ID assert,
+non-zero exit expected).
+
+## PerIdStateStore lifetime and LRU cap
+
+`PerIdStateStore` (`src/state.zig`) holds the per-widget-ID state that must
+survive across frames — text selection, caret position, double-click timing, and
+`textInputId`'s horizontal scroll. It is capacity-bounded rather than growing
+without limit: `max_entries=4096`, trimmed down to `trim_to=3072` at the end of
+`Context.endFrame` (never mid-frame) once the count exceeds the cap, using an
+ID-linked LRU list. An entry touched this frame, or matching the current
+`active_id` / `focused_id` / `hot_id` / `next_hot_id`, is protected from eviction
+even if it is the oldest by LRU order. An evicted widget's state resets to
+defaults if that ID is shown again later. `TextBuffer` and a `ScrollArea`'s
+caller-owned `*Vec2f` live outside the store, so eviction never touches them. The
+full contract is the doc comment on `PerIdStateStore` in `state.zig`.
+
+Verification: `zig build test-gui` (LRU eviction, protection and re-init unit
+tests in `state.zig` / `context.zig`); `zig build test-gui-leak` (30,000 unique
+IDs measured down to final=3072, max observed≤4096); `examples/39_settings_shell/
+e2e.sh` scenario 5 (a scroll position kept by the app while its section is
+hidden, unaffected by store trim).
