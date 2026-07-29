@@ -62,9 +62,10 @@ alternatives, trade-offs and the measurements behind them go to an ADR; design
 spanning several work items goes to `docs/plans/`; operating procedures stay in
 the meta repository.
 
-The full rules, including the self-check procedure, live in `AGENT.md` under
-"Comment and documentation policy". This ADR records *why*; `AGENT.md` records
-*what to do*.
+The binding rules live in `AGENT.md` under "Comment and documentation
+policy"; the self-check procedure that verifies them lives in
+`docs/comment-policy.md`. This ADR records *why*; `AGENT.md` records *what to
+do*; `docs/comment-policy.md` records *how to check it*.
 
 ## Consequences
 
@@ -83,10 +84,10 @@ file could not be read. The public tree
 stays clean while provenance stays complete, including for those eleven.
 
 Enforcement is by convention and review, not tooling: this repository gains no
-lint step and no build step for the policy. `AGENT.md` states the self-check —
-which comment syntax applies where, and every construct that can hold a `//` or
-`#` without starting a comment — and the meta repository's review checklist
-includes policy conformance. The task-id half of that check is a `jj file list`
+lint step and no build step for the policy. `docs/comment-policy.md` states
+the self-check — which comment syntax applies where, and every construct that
+can hold a `//` or `#` without starting a comment — and the meta repository's
+review checklist includes policy conformance. The task-id half of that check is a `jj file list`
 sweep anyone can run here; the comment half needs a real lexer, which lives with
 the migration tooling in the private repository rather than in this build. The
 trade-off is accepted deliberately: the alternative was a ratchet enforced by
