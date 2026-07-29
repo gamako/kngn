@@ -739,6 +739,61 @@ pub fn build(b: *std.Build) void {
         test_platform_facade_step.dependOn(&b.addRunArtifact(platform_macos_test).step);
     }
 
+    // The Linux backends' own unit tests (same "root file only" collection rule as above).
+    // Rooting each test module directly at its backend file and building it with the same
+    // `createPlatformModule` helper the production module uses applies the `linkSystemLibrary`
+    // calls (X11/Xext for x11; wayland-client/wayland-cursor/xkbcommon plus the generated
+    // xdg-shell/xdg-decoration client headers for wayland) that resolving each backend's
+    // `@cImport` needs, with no extra native archive.
+    if (target_os == .linux) {
+        const platform_linux_x11_test_mod = platform.createPlatformModule(
+            b,
+            target,
+            b.path("core/platform_linux_x11.zig"),
+            platform_root,
+            .x11,
+            shared_modules.types.mod,
+            shared_modules.command_types.mod,
+            shared_modules.harness.mod,
+            .{},
+        );
+        const platform_linux_x11_test = b.addTest(.{ .root_module = platform_linux_x11_test_mod });
+        test_platform_facade_step.dependOn(&b.addRunArtifact(platform_linux_x11_test).step);
+
+        const platform_linux_wayland_test_mod = platform.createPlatformModule(
+            b,
+            target,
+            b.path("core/platform_linux_wayland.zig"),
+            platform_root,
+            .wayland,
+            shared_modules.types.mod,
+            shared_modules.command_types.mod,
+            shared_modules.harness.mod,
+            .{},
+        );
+        const platform_linux_wayland_test = b.addTest(.{ .root_module = platform_linux_wayland_test_mod });
+        test_platform_facade_step.dependOn(&b.addRunArtifact(platform_linux_wayland_test).step);
+    }
+
+    // The Windows backend's shared Win32 layer (`platform_windows_common.zig`) own unit tests
+    // (same "root file only" collection rule as above). It has no `@cImport`: its user32/gdi32/
+    // comdlg32 externs resolve against zig's bundled MinGW import libs, so only the system
+    // libraries need linking (no include path, unlike the macOS/Linux backends above).
+    if (target_os == .windows) {
+        const platform_windows_common_test_mod = b.createModule(.{
+            .root_source_file = b.path("core/platform_windows_common.zig"),
+            .target = target,
+            .optimize = optimize,
+            .link_libc = true,
+        });
+        platform_windows_common_test_mod.addImport("platform_types", shared_modules.types.mod);
+        platform_windows_common_test_mod.linkSystemLibrary("user32", .{});
+        platform_windows_common_test_mod.linkSystemLibrary("gdi32", .{});
+        platform_windows_common_test_mod.linkSystemLibrary("comdlg32", .{});
+        const platform_windows_common_test = b.addTest(.{ .root_module = platform_windows_common_test_mod });
+        test_platform_facade_step.dependOn(&b.addRunArtifact(platform_windows_common_test).step);
+    }
+
     const platform_menu_test_mod = b.createModule(.{
         .root_source_file = b.path("core/platform_menu_test.zig"),
         .target = target,
@@ -1012,6 +1067,29 @@ pub fn build(b: *std.Build) void {
         const audio_macos_capture_test = b.addTest(.{ .root_module = audio_macos_capture_test_mod });
         test_capture_types_step.dependOn(&b.addRunArtifact(audio_macos_capture_test).step);
     }
+
+    // core/camera_stub.zig's own unit tests (same "root file only" collection rule noted above).
+    // The stub is OS-independent (it only `@import`s `capture_types`, with no `@cImport` or
+    // extern fn), so this root builds and runs on every OS regardless of which backend
+    // camera.zig's `builtin.os.tag` dispatch actually selects for the host running this build.
+    const camera_stub_test_mod = b.createModule(.{
+        .root_source_file = b.path("core/camera_stub.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    camera_stub_test_mod.addImport("capture_types", shared_modules.capture_types.mod);
+    const camera_stub_test = b.addTest(.{ .root_module = camera_stub_test_mod });
+    test_capture_types_step.dependOn(&b.addRunArtifact(camera_stub_test).step);
+
+    // core/audio_capture_stub.zig's own unit tests, same reasoning as camera_stub above.
+    const audio_capture_stub_test_mod = b.createModule(.{
+        .root_source_file = b.path("core/audio_capture_stub.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    audio_capture_stub_test_mod.addImport("capture_types", shared_modules.capture_types.mod);
+    const audio_capture_stub_test = b.addTest(.{ .root_module = audio_capture_stub_test_mod });
+    test_capture_types_step.dependOn(&b.addRunArtifact(audio_capture_stub_test).step);
 
     if (target_os == .linux) {
         const camera_v4l2_test_mod = b.createModule(.{
