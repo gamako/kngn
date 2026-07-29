@@ -174,7 +174,7 @@ fn buildWasmPixie(
     wasm_max_opts.addOption(usize, "max_modules", @as(usize, 48));
     wasm_max_opts.addOption(bool, "has_frame_cap", false);
     wasm_max_opts.addOption(u32, "frame_cap_hz", @as(u32, 0));
-    const shared = SharedModules.init(b, true, false, false, 48, wasm_max_opts.createModule(), base_target.result.os.tag);
+    const shared = SharedModules.init(b, true, false, false, 48, wasm_max_opts.createModule(), target, .wasm);
     const pm = makePlatformModules(b, target, .wasm, &shared, false);
 
     const pixie_mod = b.createModule(.{
@@ -242,7 +242,7 @@ fn buildWasmSynth(
     wasm_max_opts.addOption(usize, "max_modules", @as(usize, 48));
     wasm_max_opts.addOption(bool, "has_frame_cap", false);
     wasm_max_opts.addOption(u32, "frame_cap_hz", @as(u32, 0));
-    const shared = SharedModules.init(b, true, false, false, 48, wasm_max_opts.createModule(), base_target.result.os.tag);
+    const shared = SharedModules.init(b, true, false, false, 48, wasm_max_opts.createModule(), target, .wasm);
     const pm = makePlatformModules(b, target, .wasm, &shared, false);
 
     const synth_mod = b.createModule(.{
@@ -408,7 +408,7 @@ pub fn build(b: *std.Build) void {
     // Shared modules (OS/backend-independent; shared by main + examples + pixie + synth)
     // Also includes the external public modules (platform/png/font/gui).
     // ========================================
-    const shared_modules = SharedModules.init(b, false, false, enable_gamepad_ext, max_modules_option, max_modules_mod, target_os);
+    const shared_modules = SharedModules.init(b, false, false, enable_gamepad_ext, max_modules_option, max_modules_mod, target, platform_option);
 
     // External public kit umbrella. Reuses SharedModules instances so type identity holds.
     // Obtained via dep.module("kit"). platform / gui / gamepad etc. are the same module instances through kit.
@@ -623,16 +623,15 @@ pub fn build(b: *std.Build) void {
     // platform native object archive lib (for external packages) — macOS only
     // Separated from the facade module (addModule "platform"). Externals linkLibrary
     // dep.artifact("platform_native_<plat>"). Archive of .o only; framework / Swift runtime / search paths
-    // are applied on the consumer exe side (C-style approach: vendor the macos/swift build helpers onto the exe).
+    // are applied on the consumer exe side (C-style: build_helpers.setupConsumerExe, or vendor macos/swift helpers).
     //
-    // Known limit (Linux external consumption unsupported): the public model (facade module + native .o archive)
-    // assumes a macOS backend (Obj-C/Swift compiled separately). Using `dep.module("platform")` as an external
-    // package on Linux: (1) the facade selects platform_linux.zig, and
-    // `@import("build_options")`(platform_backend) resolves because SharedModules.init stamps the OS default (x11),
-    // but (2) there is no X11 include / `linkSystemLibrary("X11"/"Xext")`, and (3) the Linux backend is pure Zig
-    // so a separate .o archive is unnecessary — so it still does not work. Fixing it would require making the
-    // public module backend-aware (add the X11 link). This project's internal builds use per-backend
-    // modules (makePlatformModules), so they are unaffected. Address when demand appears.
+    // Public module vs executable (current): the public platform module is backend-aware for
+    // `@cImport` resolution — X11 (`X11`/`Xext`) and Wayland (`wayland-client`/`wayland-cursor`/
+    // `xkbcommon` + generated protocol headers) live on the module. Executable-only requirements
+    // stay on the consumer: macOS native `.o` archive / frameworks / Swift runtime, Wayland
+    // private `.c` sources, Windows system libs + `subsystem = .Windows`. Linux and Windows need
+    // no native archive; only macOS publishes `platform_native_*` below. Prefer
+    // `build_helpers.setupConsumerExe` rather than hand-rolling these links.
     // ========================================
     if (target_os == .macos) {
         // enable_gamepad_ext aligns KNGN_ENABLE_GAMEPAD on the native archive with the platform module.
@@ -2690,28 +2689,32 @@ const SharedModules = struct {
     /// `enable_gamepad`: build_options for the external public platform module (default false).
     /// `max_modules` / `max_modules_mod`: concurrent modular module limit (default 48).
     /// The wasm path passes enable_gamepad=false and max_modules=48.
-    /// `target_os`: used to compute the platform_backend default. External consumers link their own .o, so
-    /// the value itself is ignored by them, but internal tests (test-platform-menu etc.) that touch `platform.Window`
-    /// pull in OS dispatchers such as core/platform_linux.zig which check build_options.platform_backend;
-    /// a host-OS-mismatched fixed value (e.g. hard-coded "objc") causes `@compileError` on Linux/Windows.
-    fn init(b: *std.Build, is_wasm: bool, wasm_shared: bool, enable_gamepad: bool, max_modules: usize, max_modules_mod: *std.Build.Module, target_os: std.Target.Os.Tag) SharedModules {
-        // External public module (addModule). Available via dep.module("platform").
-        // Facade. Carries link_libc + include path for @cImport("platform.h").
+    /// `target`: resolved target for the public platform module (needed by `linkSystemLibrary`).
+    /// `platform_backend`: value of `-Dplatform` (or the OS default). Stamped into
+    /// `build_options.platform_backend` and used to attach `@cImport`-required system libs
+    /// (X11/Wayland). Must match the backend the consumer executable links against.
+    fn init(b: *std.Build, is_wasm: bool, wasm_shared: bool, enable_gamepad: bool, max_modules: usize, max_modules_mod: *std.Build.Module, target: std.Build.ResolvedTarget, platform_backend: platform.PlatformType) SharedModules {
+        // External public module (addModule). Available via dep.module("platform") and via kit.
+        // Facade. Carries link_libc + include path for @cImport("platform.h"), plus backend-specific
+        // system libs/headers needed for @cImport (see platform.configurePublicPlatformModule).
+        // target is set so linkSystemLibrary can resolve pkg-config for the selected OS.
         const platform_mod: TaggedModule = .{ .layer = .core, .name = "platform", .mod = b.addModule("platform", .{
             .root_source_file = b.path("core/platform.zig"),
+            .target = target,
             .link_libc = true,
         }) };
         platform_mod.mod.addIncludePath(b.path("platform"));
-        // build_options (gamepad/menu/gamepad-ext opt-in): the facade for external consumers (tictactoe etc.; dep.module("platform"))
-        // also roots at core/platform.zig, so the same named import is required.
-        // enable_gamepad opts in with `-Denable_gamepad=true` (default false = safe side).
-        // platform_backend is the OS default backend name (a thin stub assuming external consumers link their own
-        // platform .o, so it does not affect the real backend; OS alignment is still required to avoid @compileError in internal tests).
+        platform.configurePublicPlatformModule(b, platform_mod.mod, platform_backend);
+        // build_options (gamepad/menu opt-in + platform_backend): the facade for external consumers
+        // (tictactoe etc.; dep.module("platform") / dep.module("kit")) roots at core/platform.zig,
+        // so the same named import is required. enable_gamepad opts in with `-Denable_gamepad=true`
+        // (default false = safe side). platform_backend must match the consumer's chosen backend
+        // so OS dispatchers do not @compileError.
         {
             const opts = b.addOptions();
             opts.addOption(bool, "enable_gamepad", enable_gamepad);
             opts.addOption(bool, "enable_menu", false);
-            opts.addOption([]const u8, "platform_backend", platform.backendName(platform.defaultBackend(target_os)));
+            opts.addOption([]const u8, "platform_backend", platform.backendName(platform_backend));
             platform_mod.mod.addOptions("build_options", opts);
         }
 

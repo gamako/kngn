@@ -2,51 +2,24 @@
 //!
 //! Shared by the parent build.zig and examples/*/build.zig.
 //! Inputs are LazyPaths so they carry build-graph dependencies.
+//!
+//! External consumers should import `consumer.zig` (the supported vendor surface).
+//! This file re-exports the shared types/backend helpers from there and keeps
+//! kngn-internal helpers (`createPlatformModule`, `buildStandalone`, …).
 
 const std = @import("std");
 const macos = @import("macos.zig");
-const swift = @import("swift.zig");
+const consumer = @import("consumer.zig");
 
-pub const PlatformType = enum {
-    // macOS backends (via C ABI platform.h. Zig facade/backend is shared; only the .o link differs)
-    objc,
-    swift,
-    metal,
-    // Linux backends (pure Zig. x11 and wayland)
-    x11,
-    wayland,
-    // Windows backends (pure Zig. gdi=GDI software blit/best-effort; d3d11=D3D11-DXGI/tier-1)
-    gdi,
-    d3d11,
-    // wasm32-wasi (JS glue + canvas. stdlib is wasi; draw/input via env import)
-    wasm,
-};
-
-/// Default backend for the OS (used when `-Dplatform` is omitted).
-pub fn defaultBackend(os: std.Target.Os.Tag) PlatformType {
-    return switch (os) {
-        .macos => .metal, // Metal meets the first-class frame pacing contract of ADR-005 (vsync gating); objc and swift are best-effort
-        .linux => .x11,
-        .windows => .gdi, // GDI is the default for now (d3d11 is opt-in)
-        .wasi => .wasm, // wasm32-wasi
-        .freestanding => .wasm, // Legacy freestanding alias; the canonical target is wasi
-        else => .objc, // Unreachable in practice: build.zig's OS check rejects it first
-    };
-}
-
-/// Backends **implemented** for the OS.
-/// (targets of `install-all` and full-backend builds. Linux always builds both x11 and wayland for
-/// regression coverage; default is x11. wayland is also implemented)
-pub fn implementedBackends(os: std.Target.Os.Tag) []const PlatformType {
-    return switch (os) {
-        .macos => &.{ .objc, .swift, .metal },
-        .linux => &.{ .x11, .wayland },
-        .windows => &.{ .gdi, .d3d11 },
-        .wasi => &.{.wasm}, // wasm32-wasi-only branch is the main path
-        .freestanding => &.{.wasm},
-        else => &.{},
-    };
-}
+// Re-export the external-consumer surface (single implementation lives in consumer.zig).
+pub const PlatformType = consumer.PlatformType;
+pub const PlatformFeatures = consumer.PlatformFeatures;
+pub const defaultBackend = consumer.defaultBackend;
+pub const implementedBackends = consumer.implementedBackends;
+pub const assertBackendForOs = consumer.assertBackendForOs;
+pub const backendName = consumer.backendName;
+pub const resolveBackend = consumer.resolveBackend;
+pub const setupConsumerExe = consumer.setupConsumerExe;
 
 /// Whether an L1 audio-output backend is implemented for the OS (macOS=AudioToolbox / Linux=ALSA / Windows=WASAPI).
 /// Used by both top-level build.zig and standalone as the gate for audio-required targets (synth / example_15)
@@ -55,30 +28,35 @@ pub fn audioSupported(os: std.Target.Os.Tag) bool {
     return os == .macos or os == .linux or os == .windows;
 }
 
-/// Validate that the `-Dplatform` backend is valid for the target OS.
-/// Mismatches (e.g. a macOS backend on Linux) become a build error.
-/// (exit with a clear one-line message instead of a panic stack trace)
-pub fn assertBackendForOs(backend: PlatformType, os: std.Target.Os.Tag) void {
-    for (implementedBackends(os)) |b| {
-        if (b == backend) return;
+/// Attach `@cImport`-required system libraries and include paths to a public platform module.
+///
+/// Modules carry what `@cImport` needs to compile; executable-only requirements
+/// (macOS native archive / frameworks / Swift runtime, Wayland private `.c`,
+/// Windows system libs + subsystem) stay on `setupConsumerExe`.
+///
+/// Runs at build-graph configuration time only (not per-frame / RT).
+pub fn configurePublicPlatformModule(b: *std.Build, mod: *std.Build.Module, backend: PlatformType) void {
+    switch (backend) {
+        .x11 => {
+            // platform_linux_x11.zig `@cImport`s Xlib/XShm; linkSystemLibrary also
+            // supplies pkg-config Cflags for header resolve and propagates libs to the exe.
+            mod.linkSystemLibrary("X11", .{});
+            mod.linkSystemLibrary("Xext", .{});
+        },
+        .wayland => {
+            // platform_linux_wayland.zig `@cImport`s wayland-client / cursor / xkbcommon
+            // plus generated xdg-shell / xdg-decoration headers.
+            mod.linkSystemLibrary("wayland-client", .{});
+            mod.linkSystemLibrary("wayland-cursor", .{});
+            mod.linkSystemLibrary("xkbcommon", .{});
+            mod.addIncludePath(consumer.generateXdgShellClientHeaderDir(b));
+            mod.addIncludePath(consumer.generateXdgDecorationClientHeaderDir(b));
+        },
+        // macOS uses platform.h via the include path already on the module; native .o is exe-side.
+        // Windows uses extern fn (no @cImport); system libs are exe-side.
+        // wasm has no system libs.
+        .objc, .swift, .metal, .gdi, .d3d11, .wasm => {},
     }
-    const valid = switch (os) {
-        .macos => "objc / swift / metal",
-        .linux => "x11 / wayland",
-        .windows => "gdi / d3d11",
-        .wasi, .freestanding => "wasm",
-        else => "(none)",
-    };
-    std.log.err(
-        "-Dplatform={s} is not valid for OS={s}. Valid values: {s}",
-        .{ @tagName(backend), @tagName(os), valid },
-    );
-    std.process.exit(1);
-}
-
-/// Backend suffix for exe / run-step names.
-pub fn backendName(backend: PlatformType) []const u8 {
-    return @tagName(backend);
 }
 
 /// Create the platform module (`core/platform.zig`).
@@ -95,13 +73,6 @@ pub fn backendName(backend: PlatformType) []const u8 {
 /// Parent build.zig uses `b.path(...)`; standalone uses
 /// `.{ .cwd_relative = PROJECT_ROOT ++ ... }`.
 ///
-/// Opt-in feature flags for the macOS platform layer (gamepad / menu).
-/// Bundled into an options struct so more bools can be added without growing the parameter list.
-pub const PlatformFeatures = struct {
-    enable_gamepad: bool = false,
-    enable_menu: bool = false,
-};
-
 pub fn createPlatformModule(
     b: *std.Build,
     target: std.Build.ResolvedTarget,
@@ -160,67 +131,11 @@ pub fn createPlatformModule(
         mod.linkSystemLibrary("wayland-client", .{});
         mod.linkSystemLibrary("wayland-cursor", .{}); // system cursor (wl_cursor_theme / @cInclude <wayland-cursor.h>)
         mod.linkSystemLibrary("xkbcommon", .{});
-        mod.addIncludePath(generateXdgShellClientHeaderDir(b));
-        mod.addIncludePath(generateXdgDecorationClientHeaderDir(b)); // SSD/CSD decoration
+        mod.addIncludePath(consumer.generateXdgShellClientHeaderDir(b));
+        mod.addIncludePath(consumer.generateXdgDecorationClientHeaderDir(b)); // SSD/CSD decoration
     }
 
     return mod;
-}
-
-// ============================================================================
-// xdg-shell protocol glue
-//
-// Wayland window management uses the xdg-shell protocol. Generate client-header (.h) and
-// private-code (.c) at build time via the standard `wayland-scanner` path (no hand-writing). Pull `xdg-shell.xml` from
-// `pkg-config --variable=pkgdatadir wayland-protocols` (assumes the nix devShell).
-//
-// Generation runs per backend×exe, symmetric with macOS clang'ing platform_macos.m per exe
-// inside setupExecutableForPlatform, without widening the helper signature (scanner is cheap).
-// ============================================================================
-
-/// Generate `xdg-shell-client-protocol.h` and return its parent directory (for the include path).
-/// Used to resolve Wayland backend `@cImport("xdg-shell-client-protocol.h")`.
-fn generateXdgShellClientHeaderDir(b: *std.Build) std.Build.LazyPath {
-    const cmd = b.addSystemCommand(&.{
-        "sh",                                                                                                                            "-c",
-        // $0=sh, $1=output path (addOutputFileArg). Locate xdg-shell.xml via pkg-config.
-        "wayland-scanner client-header \"$(pkg-config --variable=pkgdatadir wayland-protocols)/stable/xdg-shell/xdg-shell.xml\" \"$1\"", "sh",
-    });
-    return cmd.addOutputFileArg("xdg-shell-client-protocol.h").dirname();
-}
-
-/// Generate `xdg-shell-protocol.c` (protocol marshalling body) and return a LazyPath.
-/// Add it as a C source on the exe (references wl_proxy_*, so wayland-client must be linked).
-fn generateXdgShellPrivateCode(b: *std.Build) std.Build.LazyPath {
-    const cmd = b.addSystemCommand(&.{
-        "sh",                                                                                                                           "-c",
-        "wayland-scanner private-code \"$(pkg-config --variable=pkgdatadir wayland-protocols)/stable/xdg-shell/xdg-shell.xml\" \"$1\"", "sh",
-    });
-    return cmd.addOutputFileArg("xdg-shell-protocol.c");
-}
-
-// xdg-decoration protocol glue (SSD request / CSD fallback)
-// Same shape as xdg-shell. XML lives under wayland-protocols unstable/xdg-decoration. As of 2026-07 upstream has not
-// moved it to staging (still under unstable/). If the path drifts, confirm on a Linux machine with
-// `find "$(pkg-config --variable=pkgdatadir wayland-protocols)" -iname '*decoration*'`.
-// wl_subcompositor is a core wayland-client interface (declared in wayland-client.h); no scanner generation needed.
-
-/// Generate `xdg-decoration-unstable-v1-client-protocol.h` and return its parent directory (for the include path).
-fn generateXdgDecorationClientHeaderDir(b: *std.Build) std.Build.LazyPath {
-    const cmd = b.addSystemCommand(&.{
-        "sh",                                                                                                                                                    "-c",
-        "wayland-scanner client-header \"$(pkg-config --variable=pkgdatadir wayland-protocols)/unstable/xdg-decoration/xdg-decoration-unstable-v1.xml\" \"$1\"", "sh",
-    });
-    return cmd.addOutputFileArg("xdg-decoration-unstable-v1-client-protocol.h").dirname();
-}
-
-/// Generate `xdg-decoration-unstable-v1-protocol.c` (marshalling body) and return a LazyPath.
-fn generateXdgDecorationPrivateCode(b: *std.Build) std.Build.LazyPath {
-    const cmd = b.addSystemCommand(&.{
-        "sh",                                                                                                                                                   "-c",
-        "wayland-scanner private-code \"$(pkg-config --variable=pkgdatadir wayland-protocols)/unstable/xdg-decoration/xdg-decoration-unstable-v1.xml\" \"$1\"", "sh",
-    });
-    return cmd.addOutputFileArg("xdg-decoration-unstable-v1-protocol.c");
 }
 
 /// Set up the platform layer on an executable.
@@ -247,6 +162,7 @@ pub fn setupExecutableForPlatform(
             // macOS backends require an SDK
             const sdk = sdk_paths orelse @panic("macOS backend requires SDK paths (check the OS branch in build.zig)");
 
+            // Internal path: compile the platform layer .o into this exe (not the published archive).
             const compiled = compilePlatformLayer(b, platform_type, optimize, platform_root, features);
             for (compiled.obj_files) |obj| {
                 exe.root_module.addObjectFile(obj);
@@ -257,65 +173,11 @@ pub fn setupExecutableForPlatform(
                 exe.step.dependOn(&step.step);
             }
 
-            macos.linkMacOSFrameworks(b, exe, sdk, features.enable_gamepad);
-
-            switch (platform_type) {
-                .objc => {},
-                .swift => swift.linkSwiftRuntime(b, exe, sdk, &.{}),
-                .metal => {
-                    exe.root_module.linkFramework("Metal", .{});
-                    exe.root_module.linkFramework("MetalKit", .{});
-                    swift.linkSwiftRuntime(b, exe, sdk, &.{
-                        "swiftMetalKit",
-                        "swiftModelIO",
-                    });
-                },
-                else => unreachable,
-            }
+            consumer.linkMacosFrameworksAndRuntime(b, exe, sdk, platform_type, features);
         },
-        .x11 => {
-            // X11/Xlib backend (pure Zig). No .o compile or frameworks.
-            // Xlib symbols propagate from createPlatformModule's linkSystemLibrary("X11"/"Xext")
-            // to the exe, so only enable libc here.
-            exe.root_module.link_libc = true;
-        },
-        .wayland => {
-            // Wayland backend (pure Zig). Compile the generated xdg-shell-protocol.c per exe
-            // (symmetric with macOS addObjectFile of platform_macos.m; do not widen the helper signature).
-            // The .c references wl_proxy_*, so linking wayland-client is required.
-            // Also linkSystemLibrary wayland-client on the exe so .c compile (header resolve) and
-            // symbol resolve are reliable (do not rely on module propagation alone).
-            exe.root_module.link_libc = true;
-            exe.root_module.linkSystemLibrary("wayland-client", .{});
-            exe.root_module.linkSystemLibrary("wayland-cursor", .{}); // system cursor
-            exe.root_module.addCSourceFile(.{ .file = generateXdgShellPrivateCode(b) });
-            exe.root_module.addCSourceFile(.{ .file = generateXdgDecorationPrivateCode(b) }); // xdg-decoration private code
-        },
-        .gdi, .d3d11 => {
-            // Windows backend (pure Zig). platform_windows.zig (dispatcher) calls Win32 via extern fn
-            // (no @cImport). No SDK/xcrun; zig's bundled MinGW import libs resolve the link
-            // (kernel32 is auto-linked by zig). libc is not required (std.os.windows + extern fn only), but
-            // enable it to match other OS behaviour. Shared window/input/dialog uses user32 / comdlg32.
-            exe.root_module.link_libc = true;
-            exe.root_module.linkSystemLibrary("user32", .{}); // CreateWindowExW / message pump / input
-            exe.root_module.linkSystemLibrary("comdlg32", .{}); // GetSaveFileNameW / GetOpenFileNameW
-            // gdi32 belongs to the shared layer, not to one backend: platform_windows_common.zig calls
-            // GetDeviceCaps(VREFRESH) for the display refresh, so both backends need it.
-            exe.root_module.linkSystemLibrary("gdi32", .{});
-            switch (platform_type) {
-                // GDI: software blit (StretchDIBits / BITMAPINFO) on top of the shared gdi32 above.
-                .gdi => {},
-                // D3D11-DXGI: GPU upload path. The only named export is d3d11.dll's D3D11CreateDeviceAndSwapChain
-                // (swap chain / DXGI are only touched via COM vtbls from the d3d11-created objects, so no dxgi.dll
-                // import).
-                .d3d11 => exe.root_module.linkSystemLibrary("d3d11", .{}),
-                else => unreachable,
-            }
-            // Use the Windows subsystem for GUI apps (the default console subsystem would open a
-            // console window on launch). Tools whose console output is the point (e.g. example_06 bench)
-            // override to .Console at the caller. std.debug.print is a no-op when no console is attached.
-            exe.subsystem = .Windows;
-        },
+        .x11 => consumer.linkX11Exe(exe),
+        .wayland => consumer.linkWaylandExe(b, exe),
+        .gdi, .d3d11 => consumer.linkWindowsExe(exe, platform_type),
         .wasm => {
             // wasm32-wasi. No native .o / system lib.
             // entry/rdynamic/single_threaded are set on build.zig's wasm branch.

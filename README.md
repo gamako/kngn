@@ -216,21 +216,56 @@ An external project imports only `kit`. The working example is
 },
 ```
 
+Vendor `build_helpers/consumer.zig` from this repository (plus `macos.zig` and
+`swift.zig` when targeting macOS) into your project so the consumer executable can
+apply links that do not travel through `linkLibrary`. That is the supported surface;
+do not copy the full internal `platform.zig`.
+
 ```zig
 // build.zig
-const dep = b.dependency("kngn", .{ .target = target, .optimize = optimize });
+const helpers = @import("build_helpers/consumer.zig");
+const macos = @import("build_helpers/macos.zig");
 
-exe.root_module.addImport("kit", dep.module("kit"));        // the pure Zig part
-exe.root_module.linkLibrary(dep.artifact(native_lib_name)); // the native .o archive
+const backend = helpers.resolveBackend(b, target); // -Dplatform, or the OS default
+const dep = b.dependency("kngn", .{
+    .target = target,
+    .optimize = optimize,
+    .platform = backend, // must match the executable backend
+});
+
+exe.root_module.addImport("kit", dep.module("kit"));
+
+const sdk = if (target.result.os.tag == .macos)
+    macos.resolveMacOSSDKPaths(b, null, null)
+else
+    null;
+helpers.setupConsumerExe(b, exe, dep, backend, sdk, .{});
 ```
 
-Targeting macOS also means applying the framework and Swift runtime linking on the
-consumer's own executable (the C-style approach): vendor `build_helpers/macos.zig` and
-`build_helpers/swift.zig` into your project, exactly as tictactoe does.
+Pass the same backend to both `b.dependency(... .platform = backend)` and
+`setupConsumerExe`. Do not switch on the backend in your own `build.zig` for ordinary
+linking — the helper owns OS differences.
 
-> Consuming `dep.module("platform")` externally **currently assumes macOS**. On Linux the
-> public module does not carry the X11 linking, so it does not work as is — the
-> limitation is spelled out in `build.zig`.
+| Backend | Values of `-Dplatform` | Public module carries | Consumer exe (`setupConsumerExe`) |
+|---|---|---|---|
+| macOS | `objc` / `swift` / `metal` (default `metal`) | `platform.h` include, libc | `platform_native_*` archive, frameworks, Swift/Metal runtime |
+| Linux | `x11` / `wayland` (default `x11`) | X11 or Wayland system libs + Wayland generated headers | Wayland private `.c` sources (X11: libc only) |
+| Windows | `gdi` / `d3d11` (default `gdi`) | (no `@cImport`; pure Zig) | `user32` / `comdlg32` / `gdi32` (+ `d3d11`), `subsystem = .Windows` |
+
+Linux needs the usual desktop development packages (`pkg-config`, X11 or Wayland
+headers and libraries). Wayland also needs `wayland-scanner` and `wayland-protocols`
+so the build can generate protocol glue at configure time.
+
+To ship several backends from one consumer tree, call `b.dependency` once per backend
+value (Zig caches package instances per option set) and wire each executable with the
+matching backend:
+
+```zig
+inline for (.{ .objc, .swift, .metal }) |be| {
+    const dep = b.dependency("kngn", .{ .target = target, .optimize = optimize, .platform = be });
+    // create exe, addImport("kit"), setupConsumerExe(..., be, sdk, .{})
+}
+```
 
 ## What is inside
 
