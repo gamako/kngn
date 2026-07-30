@@ -1,8 +1,17 @@
-//! Web Audio backend (AudioWorklet plus SharedArrayBuffer / wasm shared memory)
+//! Web Audio backend (transport-neutral render export for the browser)
 //!
-//! Symmetrically with native's real-time callback, AudioWorkletProcessor.process() push-drives
-//! `export fn kngn_audio_render`. The main thread and the worklet share one wasm module and
-//! one shared linear memory across two Instances, so the lock-free machinery of libs/synth is used unmodified.
+//! JS glue chooses the transport; this module always exports the same ABI:
+//! `kngn_audio_render(out_ptr, frames, channels, sample_rate)` writes up to
+//! `MAX_RENDER_FRAMES` interleaved f32 samples into the buffer at `out_ptr`.
+//!
+//! Two transports use that export:
+//! - **worklet_shared**: AudioWorklet `process()` calls it on a second wasm Instance
+//!   that shares linear memory with the main Instance (needs COOP/COEP).
+//! - **worklet_postmessage**: the **main thread** calls it and postMessages blocks
+//!   to a worklet that only plays from a fixed ring (no COOP/COEP; higher latency;
+//!   main-thread stalls underrun audio).
+//!
+//! Either side may call `kngn_audio_render`. RT contract is identical for both.
 //!
 //! ## The EffectiveConfig.sample_rate policy
 //! `kngn_audio_open`'s return value gives the real sample rate of the `AudioContext` JS constructed.
@@ -130,9 +139,10 @@ export fn kngn_audio_render_buf() u32 {
     return @intCast(@intFromPtr(&render_scratch));
 }
 
-/// The real-time entry point called from AudioWorklet process.
+/// Real-time render entry: callable from the AudioWorklet (shared transport) or the
+/// main thread (postMessage transport). Kept by `rdynamic` on the wasm exe.
 /// **No alloc, locking, IO or panic.**
-/// The return value: 1 = samples were written to out_ptr / 0 = skipped (and the worklet must silence its outputs).
+/// Return: 1 = samples written to out_ptr / 0 = skipped (caller must silence outputs).
 /// frames > MAX, before start, and after close all give 0 (so a stale scratch is never output).
 export fn kngn_audio_render(out_ptr: u32, frames: u32, channels: u32, sample_rate: u32) u32 {
     if (g_state.running.load(.acquire) == 0) return 0;

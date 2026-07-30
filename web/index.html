@@ -24,8 +24,11 @@
     }
   </style>
 </head>
-<body>
+<body data-wasm="pixie.wasm"
+      data-audio-transport="none"
+      data-shared="0">
   <canvas id="kngn-canvas" width="780" height="600" tabindex="0"></canvas>
+  <!-- kngn:inline-module -->
   <script type="module" src="./kngn.js"></script>
 </body>
 </html>

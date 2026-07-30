@@ -21,6 +21,22 @@ pub const backendName = consumer.backendName;
 pub const resolveBackend = consumer.resolveBackend;
 pub const setupConsumerExe = consumer.setupConsumerExe;
 
+// Wasm app + web package surface (single implementation in consumer.zig).
+pub const WasmAudio = consumer.WasmAudio;
+pub const WasmImport = consumer.WasmImport;
+pub const WasmAppSpec = consumer.WasmAppSpec;
+pub const WasmLinkContext = consumer.WasmLinkContext;
+pub const WasmLinker = consumer.WasmLinker;
+pub const WasmAppBuild = consumer.WasmAppBuild;
+pub const PerAppWebInstall = consumer.PerAppWebInstall;
+pub const WebStaticInstalls = consumer.WebStaticInstalls;
+pub const WasmWebAssets = consumer.WasmWebAssets;
+pub const AddWasmAppOptions = consumer.AddWasmAppOptions;
+pub const AddWasmWebPackageOptions = consumer.AddWasmWebPackageOptions;
+pub const validateWasmAppSpec = consumer.validateWasmAppSpec;
+pub const addWasmApp = consumer.addWasmApp;
+pub const addWasmWebPackage = consumer.addWasmWebPackage;
+
 /// Whether an L1 audio-output backend is implemented for the OS (macOS=AudioToolbox / Linux=ALSA / Windows=WASAPI).
 /// Used by both top-level build.zig and standalone as the gate for audio-required targets (synth / example_15)
 /// (one place for the decision).

@@ -3,7 +3,7 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>Synth (wasm)</title>
+  <title>Synth (postMessage audio)</title>
   <style>
     html, body { margin: 0; height: 100%; background: #101018; color: #ccc; font-family: system-ui, sans-serif; }
     #wrap { display: flex; flex-direction: column; align-items: center; justify-content: center; height: 100%; gap: 8px; }
@@ -32,18 +32,22 @@
       color: #ffc0c0;
       white-space: pre-wrap;
     }
-    .note { font-size: 12px; opacity: 0.7; }
+    .note { font-size: 12px; opacity: 0.7; max-width: 40rem; text-align: center; }
   </style>
 </head>
-<body data-wasm="synth.wasm"
+<body data-wasm="synth_postmessage.wasm"
       data-audio="1"
-      data-audio-transport="worklet_shared"
-      data-shared="1">
+      data-audio-transport="worklet_postmessage"
+      data-shared="0">
   <div id="wrap">
     <canvas id="kngn-canvas" width="1080" height="520" tabindex="0"></canvas>
     <div id="kngn-audio-hint">Click or press a key to enable audio (browser autoplay policy)</div>
     <div id="kngn-error"></div>
-    <div class="note">A..K = C4..C5 · requires COOP/COEP (scripts/serve-web.py)</div>
+    <div class="note">
+      A..K = C4..C5 · postMessage audio (no COOP/COEP).
+      Main-thread render; heavy frames can underrun (~24–30 ms queue).
+      Prefer the shared build for live keyboard playing.
+    </div>
   </div>
   <!-- kngn:inline-module -->
   <script type="module" src="./kngn.js"></script>

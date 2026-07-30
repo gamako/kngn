@@ -10,23 +10,92 @@ Output of `zig build package-web` (`zig-out/web/`):
 |----------|------|-----------|
 | `index.html` | Pixie entry | not required |
 | `pixie.wasm` | Pixie wasm | not required |
-| `synth.html` | Synth entry | **required** |
+| `pixie.single.html` | Pixie single-file package | not required |
+| `synth.html` | Synth (shared audio) | **required** |
 | `synth.wasm` | Synth wasm (shared memory) | **required** |
-| `kngn.js` | Shared JS glue | load from an isolated page when using synth |
-| `kngn-worklet.js` | AudioWorklet | load from an isolated page when using synth |
-| `_headers` | Cloudflare Pages | synth header rules |
-| `netlify.toml` | Netlify (may be copied to the repo root) | synth header rules |
+| `synth-postmessage.html` | Synth (postMessage audio) | not required |
+| `synth_postmessage.wasm` | Synth wasm (non-shared) | not required |
+| `synth.single.html` | Synth single-file (postMessage audio) | not required |
+| `kngn.js` | Shared JS glue | — |
+| `kngn-worklet.js` | AudioWorklet (shared + postMessage) | — |
+| `_headers` | Cloudflare Pages | shared synth header rules |
+| `netlify.toml` | Netlify (may be copied to the repo root) | shared synth header rules |
 | `serve-coop-coep.py` | Local COOP/COEP check | development |
 
 ### HTML / JS fetch paths
 
-Dev (`web/`) and packaged (`zig-out/web/`) use the **same directory-relative paths**:
+- `index.html` → `data-wasm="pixie.wasm"` + `data-audio-transport="none"`
+- `synth.html` → `data-wasm="synth.wasm"` + `data-audio-transport="worklet_shared"` (needs isolation)
+- `synth-postmessage.html` → `data-wasm="synth_postmessage.wasm"` + `data-audio-transport="worklet_postmessage"`
 
-- `index.html` → `./kngn.js` → default `./pixie.wasm`
-- `synth.html` (`data-wasm="synth.wasm"`) → `./kngn.js` → `./synth.wasm` + `./kngn-worklet.js`
+Audio transport comes from `data-audio-transport` or embedded options; the glue does not guess from the app name.
 
-`kngn.js` fetches wasm with `new URL("./<wasm>", import.meta.url)`, so every file above must sit in
-the same directory.
+### Audio transports
+
+| Transport | Where render runs | SharedArrayBuffer | Typical use |
+|---|---|---|---|
+| `.none` | — | no | Pixie / silent apps |
+| `.worklet_shared` | AudioWorklet (2nd wasm Instance) | **yes** (COOP/COEP) | Live keyboard synth |
+| `.worklet_postmessage` | **main thread**, worklet plays ring | no | file:// / GitHub Pages |
+
+**postMessage contract**: main-thread `kngn_audio_render` shares the rAF thread with drawing.
+Heavy frames underrun audio. Queue = 8 blocks × 128 frames (~21 ms @ 48 kHz prefill);
+refill when ≤4 blocks remain. Larger queue raises latency. Underruns surface on `#kngn-error`
+(no silent fallback to `.none`).
+
+### Delivery matrix (measured / designed)
+
+| Delivery | `.none` | `.worklet_postmessage` | `.worklet_shared` | Latency |
+|---|---|---|---|---|
+| `file://` | single HTML OK | single HTML OK; **user gesture** for AudioContext | **no** (no headers) | none: n/a; postMessage: ~24–30 ms |
+| GitHub Pages | single HTML OK | single HTML OK | **no** (no custom headers) | postMessage: ~24–30 ms |
+| Cloudflare / Netlify | single HTML OK | single HTML OK | multi-file OK with headers; single HTML = **build error** | shared: low ms; postMessage: ~24–30 ms |
+| `serve-coop-coep.py` | OK | OK | multi-file OK | shared: low ms |
+
+It is not “single file vs SharedArrayBuffer” that conflict — it is **hosts that cannot set
+COOP/COEP** vs shared audio. `.worklet_shared` × `single_html` is a hard build error.
+
+### Single-file HTML (`package-web-single`)
+
+Produces `pixie.single.html` and `synth.single.html` (postMessage audio + embedded worklet).
+
+Marker `<!-- kngn:inline-module -->` before the glue script; packer embeds wasm base64 + glue
+(+ worklet source for postMessage). Self-containment is markup-scanned (not raw `grep` for `fetch`).
+
+Host-only packer unit tests: `zig build test-pack-single-html` (also in `zig build test`).
+
+### Audio measurement notes
+
+Browser wasm has no harness `digest audio` probe. Verification uses the same field names via an
+optional `?audio_probe=1` path: an `AnalyserNode` after the worklet, then
+`fetch('/report?d=transport=…&silent=…&rms=…&peak=…')` on plain HTTP. Values are **not** required
+to match native `digest audio` bit-for-bit.
+
+Diagnostic `?audio_probe=1` injects one note through `kngn_push_key` (same path as the DOM
+keyboard) and reports AnalyserNode levels (not a harness probe). Example access-log lines:
+
+```text
+transport=worklet_postmessage&silent=0&rms=0.070515&peak=0.171650&sr=48000&n=4096&probe_note=KeyA
+transport=worklet_shared&silent=0&rms=0.069330&peak=0.171650&sr=48000&n=4096&probe_note=KeyA
+```
+
+Native harness with a held note (`inject key_down A`):
+
+```text
+digest audio rms=0.0770 peak=0.2147 silent=0 frames=4096
+```
+
+### Single-file sizes (ReleaseSmall default, aarch64-macos)
+
+| Artefact | raw bytes |
+|---|---:|
+| `pixie.wasm` | ~1.16 MiB |
+| `pixie.single.html` | ~1.52 MiB |
+| `synth.wasm` (shared) | ~425 KiB |
+| `synth_postmessage.wasm` | ~425 KiB |
+| `synth.single.html` (postMessage) | ~626 KiB |
+
+`file://` uses raw HTML size (no gzip).
 
 ## Build
 
@@ -47,11 +116,13 @@ the same directory.
 
 | Step | What it does | Writes `zig-out/web/`? |
 |------|----------------|------------------------|
-| `package-web` | Compiles pixie + synth wasm and installs wasm + static assets into `zig-out/web/` | **yes** |
+| `package-web` | Compiles pixie + synth wasm and installs multi-file wasm + static assets | **yes** |
+| `package-web-single` | Packs `pixie.single.html` and `synth.single.html` (embedded wasm + glue; synth uses postMessage audio) | **yes** (single HTML only) |
 | `build-pixie-wasm` / `build-synth-wasm` | Compile-only (depends on the compile step only) | **no** |
 | `-Dtarget=wasm32-wasi build-pixie` / `build-synth-wasm` | Same compile-only shape under a direct wasm target | **no** (unless the step is also pulled into an install graph) |
 
-Use **`zig build package-web`** whenever you need distributable files under `zig-out/web/`.
+Use **`zig build package-web`** for the multi-file deploy root, and **`zig build package-web-single`**
+when you need a self-contained `file://` HTML.
 
 ### Binary size by optimize (measured)
 

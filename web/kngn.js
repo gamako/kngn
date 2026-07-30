@@ -5,10 +5,12 @@
 //        + kngn_request_open / kngn_clipboard_write / kngn_request_paste (file dialog / clipboard)
 //   wasi_snapshot_preview1: hand-written shim + in-memory FS (path_open/fd_read/write/seek/close)
 //
-// boot options (from a script type=module import, or data-*):
-//   wasm: "pixie.wasm" | "synth.wasm" (default pixie.wasm)
-//   sharedMemory: true imports shared memory (required for synth audio)
-//   audio: true enables the AudioWorklet path (requires sharedMemory)
+// boot options (from a script type=module import, data-* attrs, or __kngnEmbedded):
+//   wasm: filename (default pixie.wasm)
+//   audioTransport: "none" | "worklet_shared" | "worklet_postmessage"
+//   sharedMemory: true only with worklet_shared (COOP/COEP required)
+//   embedded + wasmBase64: single-HTML package (no fetch of .wasm)
+//   workletSource: embedded worklet text for postMessage single-HTML
 //
 // Time contract:
 //   - App frame time is always env.kngn_now (performance.now based, seconds)
@@ -845,6 +847,23 @@ function bindResize() {
 
 // ---- audio env imports ----
 
+/** @type {"none"|"worklet_shared"|"worklet_postmessage"} */
+let audioTransport = "none";
+
+// postMessage queue: 8 blocks of 128 frames × 2 ch. Prefill 8; refill when ≤4 remain.
+// Contract: main-thread render shares the rAF thread — heavy frames underrun audio;
+// increasing QUEUE_BLOCKS lowers underrun risk but raises latency (~2.67 ms/block @48 kHz).
+const PM_BLOCK_FRAMES = 128;
+const PM_CHANNELS = 2;
+const PM_QUEUE_BLOCKS = 8;
+const PM_REFILL_AT = 4;
+const PM_POOL_SIZE = 10;
+/** @type {ArrayBuffer[]} */
+let pmPool = [];
+/** Blocks currently held by the worklet ring (not yet returned). */
+let pmInFlight = 0;
+let pmSchedulerBound = false;
+
 function showAudioError(msg) {
   console.error(msg);
   const el = document.getElementById("kngn-error");
@@ -872,6 +891,10 @@ function ensureAudioGestureResume() {
     if (audioCtx.state === "running" && hint) {
       hint.style.display = "none";
     }
+    // Start / top-up the postMessage queue after the context is running.
+    if (audioTransport === "worklet_postmessage") {
+      pmEnsureQueue();
+    }
   };
   // Resume on click / key (autoplay policy)
   const onGesture = () => {
@@ -885,24 +908,148 @@ function ensureAudioGestureResume() {
   }
 }
 
+function pmAllocBlock() {
+  if (pmPool.length > 0) return /** @type {ArrayBuffer} */ (pmPool.pop());
+  return new ArrayBuffer(PM_BLOCK_FRAMES * PM_CHANNELS * 4);
+}
+
+/** Render `n` blocks on the main thread and post them to the worklet (transferable). */
+function pmRenderAndSend(n) {
+  if (!instance || !audioNode || !memory) return;
+  const outPtr =
+    typeof instance.exports.kngn_audio_render_buf === "function"
+      ? instance.exports.kngn_audio_render_buf() >>> 0
+      : 0;
+  if (!outPtr || typeof instance.exports.kngn_audio_render !== "function") return;
+  const sr = (audioCtx && audioCtx.sampleRate) || 48000;
+  for (let b = 0; b < n; b++) {
+    const ab = pmAllocBlock();
+    const f32 = new Float32Array(ab);
+    const ok = instance.exports.kngn_audio_render(outPtr, PM_BLOCK_FRAMES, PM_CHANNELS, sr | 0);
+    if (ok) {
+      const wasmView = new Float32Array(memory.buffer, outPtr, PM_BLOCK_FRAMES * PM_CHANNELS);
+      f32.set(wasmView);
+    } else {
+      f32.fill(0);
+    }
+    audioNode.port.postMessage(
+      { type: "audio", buffer: ab, frames: PM_BLOCK_FRAMES, channels: PM_CHANNELS },
+      [ab],
+    );
+    pmInFlight += 1;
+  }
+}
+
+function pmEnsureQueue() {
+  if (audioTransport !== "worklet_postmessage" || !audioReady || !audioNode) return;
+  if (pmInFlight < PM_QUEUE_BLOCKS) {
+    pmRenderAndSend(PM_QUEUE_BLOCKS - pmInFlight);
+  }
+}
+
+/** Last underrun count observed via poll-stats (main thread only). */
+let pmLastUnderruns = 0;
+let pmStatsPollBound = false;
+
+function pmOnWorkletMessage(data) {
+  if (data.type === "buffer-return" && data.buffer) {
+    if (pmPool.length < PM_POOL_SIZE) pmPool.push(data.buffer);
+    pmInFlight = Math.max(0, pmInFlight - 1);
+    if (pmInFlight <= PM_REFILL_AT) {
+      pmEnsureQueue();
+    }
+    return;
+  }
+  if (data.type === "stats") {
+    // Worklet process() only increments counters; main observes them here (non-RT).
+    if (typeof data.underruns === "number" && data.underruns > pmLastUnderruns) {
+      pmLastUnderruns = data.underruns;
+      const msg =
+        "audio transport underrun (postMessage queue empty; count=" +
+        data.underruns +
+        "). Heavy main-thread frames stall audio. Larger queue raises latency.";
+      showAudioError(msg);
+    }
+    if (data.quantumMismatches > 0) {
+      showAudioError(
+        "audio worklet quantum mismatch (only 128-frame quanta are supported; count=" +
+          data.quantumMismatches +
+          ")",
+      );
+    }
+    if (data.viewDetached) {
+      // Worklet rebuilds the view on this non-RT poll; a sticky flag means rebuild failed.
+      showAudioError(
+        "audio worklet lost its render buffer view (wasm memory grew and rebuild failed); reload the page",
+      );
+    }
+    if (data.renderErrors > 0) {
+      showAudioError("audio worklet render errors: " + data.renderErrors);
+    }
+    return;
+  }
+}
+
+/** Ask the worklet for RT counters (non-RT request/response; process() never posts). */
+function pollWorkletStats() {
+  if (!audioNode) return;
+  try {
+    audioNode.port.postMessage({ type: "poll-stats" });
+  } catch (_) {}
+}
+
 /**
- * boot: after the main Instance is created and before kngn_init, build AudioWorkletNode
- * and await worklet-side 2nd Instance + sentinel ready.
- * g_state is unset yet, but the worklet only reads it inside the running gate, so this is safe.
+ * After main-thread memory.grow (e.g. kngn_init), tell the shared worklet to rebuild
+ * its prebuilt Float32Array view on the non-RT message path (process never allocates).
+ */
+function requestSharedViewRebuild() {
+  if (audioTransport !== "worklet_shared" || !audioNode) return;
+  try {
+    audioNode.port.postMessage({ type: "rebuild-view" });
+  } catch (_) {}
+}
+
+function ensureWorkletStatsPoll() {
+  if (pmStatsPollBound) return;
+  pmStatsPollBound = true;
+  const tick = () => {
+    if (audioReady && audioNode) pollWorkletStats();
+    setTimeout(tick, 250);
+  };
+  setTimeout(tick, 250);
+}
+
+/**
+ * Load the worklet module from an embedded source string or from kngn-worklet.js.
+ * @param {string|undefined} workletSource
+ * @returns {Promise<void>}
+ */
+async function loadWorkletModule(workletSource) {
+  if (!audioCtx) throw new Error("AudioContext missing");
+  if (workletSource) {
+    // data: URLs work under file://. blob: URLs are blocked there as "local resource".
+    const url = "data:text/javascript;charset=utf-8," + encodeURIComponent(workletSource);
+    await audioCtx.audioWorklet.addModule(url);
+  } else {
+    await audioCtx.audioWorklet.addModule(new URL("./kngn-worklet.js", import.meta.url).href);
+  }
+}
+
+/**
+ * Shared-memory path: second Instance + sentinel on the worklet.
  * @param {number} channels
  * @returns {Promise<void>}
  */
-function prepareAudioWorkletNode(channels) {
+function prepareSharedWorkletNode(channels) {
   return new Promise((resolve, reject) => {
     if (!audioCtx || !wasmModule || !memory || !instance) {
-      reject(new Error("prepareAudioWorkletNode: ctx/module/memory/instance missing"));
+      reject(new Error("prepareSharedWorkletNode: ctx/module/memory/instance missing"));
       return;
     }
     if (typeof instance.exports.kngn_audio_set_sentinel !== "function") {
-      reject(new Error("prepareAudioWorkletNode: missing kngn_audio_set_sentinel"));
+      reject(new Error("prepareSharedWorkletNode: missing kngn_audio_set_sentinel"));
       return;
     }
-    // main writes the magic on shared memory (before worklet instantiate)
     instance.exports.kngn_audio_set_sentinel();
 
     const stackTop =
@@ -910,7 +1057,7 @@ function prepareAudioWorkletNode(channels) {
         ? instance.exports.kngn_audio_worklet_stack_top() >>> 0
         : 0;
     if (!stackTop) {
-      reject(new Error("prepareAudioWorkletNode: missing stack top"));
+      reject(new Error("prepareSharedWorkletNode: missing stack top"));
       return;
     }
 
@@ -935,6 +1082,7 @@ function prepareAudioWorkletNode(channels) {
         numberOfOutputs: 1,
         outputChannelCount: [audioChannels],
         processorOptions: {
+          transport: "shared",
           module: wasmModule,
           memory: memory,
           stackTop: stackTop,
@@ -965,7 +1113,10 @@ function prepareAudioWorkletNode(channels) {
           settled = true;
           clearTimeout(timer);
           reject(new Error("kngn-worklet: " + data.message));
+          return;
         }
+        // stats / other non-RT diagnostics from the worklet.
+        pmOnWorkletMessage(data);
       };
       audioNode.connect(audioCtx.destination);
     } catch (e) {
@@ -979,6 +1130,199 @@ function prepareAudioWorkletNode(channels) {
 }
 
 /**
+ * postMessage path: worklet is a ring only; main thread owns kngn_audio_render.
+ * @param {number} channels
+ * @returns {Promise<void>}
+ */
+function preparePostMessageWorkletNode(channels) {
+  return new Promise((resolve, reject) => {
+    if (!audioCtx || !instance) {
+      reject(new Error("preparePostMessageWorkletNode: ctx/instance missing"));
+      return;
+    }
+    audioChannels = channels || 2;
+    const actualSr = audioCtx.sampleRate | 0;
+    let settled = false;
+    const timer = setTimeout(() => {
+      if (settled) return;
+      settled = true;
+      reject(new Error("kngn-worklet: postmessage ready timeout (" + WORKLET_READY_TIMEOUT_MS + "ms)"));
+    }, WORKLET_READY_TIMEOUT_MS);
+
+    try {
+      if (audioNode) {
+        try {
+          audioNode.disconnect();
+        } catch (_) {}
+        audioNode = null;
+      }
+      // Seed the transferable pool once (not on the RT path).
+      pmPool = [];
+      for (let i = 0; i < PM_POOL_SIZE; i++) {
+        pmPool.push(new ArrayBuffer(PM_BLOCK_FRAMES * PM_CHANNELS * 4));
+      }
+      pmInFlight = 0;
+
+      audioNode = new AudioWorkletNode(audioCtx, "kngn-audio-processor", {
+        numberOfInputs: 0,
+        numberOfOutputs: 1,
+        outputChannelCount: [audioChannels],
+        processorOptions: {
+          transport: "postmessage",
+          channels: audioChannels,
+          sampleRate: actualSr,
+        },
+      });
+      audioNode.port.onmessage = (ev) => {
+        const data = ev.data || {};
+        if (data.type === "ready") {
+          if (settled) return;
+          settled = true;
+          clearTimeout(timer);
+          // Prefill 8 blocks (silence until Zig start() sets running=1).
+          pmEnsureQueue();
+          if (!pmSchedulerBound) {
+            pmSchedulerBound = true;
+            // Top up on animation frames when the context is running (event-time, not RT).
+            const tick = () => {
+              if (audioTransport === "worklet_postmessage" && audioReady) {
+                if (audioCtx && audioCtx.state === "running") pmEnsureQueue();
+              }
+              requestAnimationFrame(tick);
+            };
+            requestAnimationFrame(tick);
+          }
+          resolve();
+          return;
+        }
+        if (data.type === "error") {
+          if (settled) {
+            console.error("kngn-worklet:", data.message);
+            return;
+          }
+          settled = true;
+          clearTimeout(timer);
+          reject(new Error("kngn-worklet: " + data.message));
+          return;
+        }
+        pmOnWorkletMessage(data);
+      };
+      audioNode.connect(audioCtx.destination);
+    } catch (e) {
+      if (!settled) {
+        settled = true;
+        clearTimeout(timer);
+        reject(e);
+      }
+    }
+  });
+}
+
+/**
+ * Diagnostic-only audio probe (query `audio_probe=1`).
+ *
+ * Contract (does not run when the query is absent — normal mode is unchanged):
+ * 1. Attach an AnalyserNode after the worklet for output-side measurement.
+ * 2. Resume the AudioContext if needed (headless may use --autoplay-policy).
+ * 3. Inject one note-on through the **same** exports as the DOM keyboard path:
+ *    writeDomCode("KeyA") → kngn_push_key(true, code, 0, false) (synth maps A → C4).
+ * 4. Wait hundreds of ms while rAF keeps calling kngn_frame so the app processes the event.
+ * 5. Sample silent / rms / peak; report via fetch("/report?d=...") for the static server log.
+ * 6. Note-off via the same kngn_push_key path.
+ *
+ * Not a product feature. Never enable from normal UI chrome.
+ */
+function maybeStartAudioProbe() {
+  const params = new URLSearchParams(location.search);
+  if (params.get("audio_probe") !== "1") return;
+  if (!audioCtx || !audioNode || !instance) return;
+  try {
+    const analyser = audioCtx.createAnalyser();
+    analyser.fftSize = 4096;
+    audioNode.connect(analyser);
+    const buf = new Float32Array(analyser.fftSize);
+
+    const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+    const sampleOnce = () => {
+      analyser.getFloatTimeDomainData(buf);
+      let peak = 0;
+      let sumSq = 0;
+      for (let i = 0; i < buf.length; i++) {
+        const v = buf[i];
+        const a = v < 0 ? -v : v;
+        if (a > peak) peak = a;
+        sumSq += v * v;
+      }
+      const rms = Math.sqrt(sumSq / buf.length);
+      const silent = peak < 1e-5 && rms < 1e-5 ? 1 : 0;
+      return {
+        silent,
+        rms,
+        peak,
+        report:
+          "transport=" +
+          audioTransport +
+          "&silent=" +
+          silent +
+          "&rms=" +
+          rms.toFixed(6) +
+          "&peak=" +
+          peak.toFixed(6) +
+          "&sr=" +
+          (audioCtx.sampleRate | 0) +
+          "&n=" +
+          buf.length +
+          "&probe_note=KeyA",
+      };
+    };
+
+    const postReport = (report) => {
+      void fetch("/report?d=" + encodeURIComponent(report)).catch(() => {});
+      console.log("audio_probe", report);
+    };
+
+    void (async () => {
+      // Diagnostic path only: force intent-to-run so postMessage refill continues.
+      audioWantRunning = true;
+      if (audioCtx.state === "suspended") {
+        try {
+          await audioCtx.resume();
+        } catch (e) {
+          console.warn("audio_probe: resume failed", e);
+        }
+      }
+      // Let the app finish open/start after kngn_init.
+      await sleep(800);
+      if (audioTransport === "worklet_postmessage") pmEnsureQueue();
+
+      // Same keyboard entry as pushKey(e, true) for KeyboardEvent.code === "KeyA".
+      const code = writeDomCode("KeyA");
+      instance.exports.kngn_push_key(true, code, 0, false);
+
+      // Hold the note while frames run (rAF → kngn_frame drains the event queue).
+      await sleep(700);
+      if (audioTransport === "worklet_postmessage") pmEnsureQueue();
+      await sleep(200);
+
+      let best = sampleOnce();
+      // A few samples; keep the loudest (in case of brief underrun at the edges).
+      for (let i = 0; i < 4; i++) {
+        await sleep(150);
+        const s = sampleOnce();
+        if (s.rms > best.rms || s.peak > best.peak) best = s;
+        postReport(s.report);
+      }
+      postReport(best.report);
+
+      instance.exports.kngn_push_key(false, code, 0, false);
+    })();
+  } catch (e) {
+    console.warn("audio_probe setup failed:", e);
+  }
+}
+
+/**
  * Zig `kngn_audio_open` → confirm the boot-time worklet and return the real sample rate.
  * Node creation already ran at boot. Returns 0 unless audioReady.
  * @returns {number} actual sample rate, or 0 on failure
@@ -988,15 +1332,17 @@ function envAudioOpen(sampleRate, channels, bufferFrames) {
   void bufferFrames;
   void channels;
   try {
-    if (typeof SharedArrayBuffer === "undefined") {
-      console.error("kngn_audio_open: SharedArrayBuffer unavailable (need COOP/COEP)");
-      return 0;
-    }
-    if (!globalThis.crossOriginIsolated) {
-      console.error(
-        "kngn_audio_open: crossOriginIsolated=false (serve with COOP/COEP; scripts/serve-web.py)",
-      );
-      return 0;
+    if (audioTransport === "worklet_shared") {
+      if (typeof SharedArrayBuffer === "undefined") {
+        console.error("kngn_audio_open: SharedArrayBuffer unavailable (need COOP/COEP)");
+        return 0;
+      }
+      if (!globalThis.crossOriginIsolated) {
+        console.error(
+          "kngn_audio_open: crossOriginIsolated=false (serve with COOP/COEP; scripts/serve-web.py)",
+        );
+        return 0;
+      }
     }
     if (!audioReady || !audioCtx || !audioNode) {
       console.error("kngn_audio_open: worklet not ready (boot failed or not audio app)");
@@ -1127,49 +1473,93 @@ function bindInput() {
 }
 
 /**
+ * Decode a standard base64 string to an ArrayBuffer (embedded single-HTML package).
+ * @param {string} b64
+ * @returns {ArrayBuffer}
+ */
+function base64ToArrayBuffer(b64) {
+  const bin = atob(b64);
+  const bytes = new Uint8Array(bin.length);
+  for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+  return bytes.buffer;
+}
+
+/**
  * @param {{
  *   wasm?: string,
  *   sharedMemory?: boolean,
  *   audio?: boolean,
+ *   audioTransport?: string,
+ *   embedded?: boolean,
+ *   wasmBase64?: string,
+ *   workletSource?: string,
  *   initialPages?: number,
  *   maxPages?: number,
  * }} [opts]
  */
 export async function boot(opts = {}) {
   const wasmUrl = opts.wasm || "pixie.wasm";
-  const useShared = !!(opts.sharedMemory || opts.audio);
-  const useAudio = !!opts.audio;
+  // Transport is the sole mode selector. sharedMemory must not enable shared audio when
+  // transport is none or postmessage (contradictory options → hard error).
+  const transport = opts.audioTransport || (opts.audio ? "worklet_shared" : "none");
+  audioTransport = transport;
+  if (opts.sharedMemory && transport !== "worklet_shared") {
+    throw new Error(
+      "invalid boot options: sharedMemory=true requires audioTransport=worklet_shared (got " +
+        transport +
+        ")",
+    );
+  }
+  const useShared = transport === "worklet_shared";
+  const usePostMessage = transport === "worklet_postmessage";
+  const useAudio = useShared || usePostMessage;
   const initialPages = opts.initialPages || 256; // 16 MiB
   const maxPages = opts.maxPages || 1024; // 64 MiB
+  const embedded = !!(opts.embedded && opts.wasmBase64);
 
   canvas.focus();
   audioReady = false;
 
-  if (useAudio) {
-    // addModule must target the same AudioContext that creates the node.
-    const AC = window.AudioContext || window.webkitAudioContext;
-    if (!AC) throw new Error("AudioContext not available");
+  if (useShared) {
+    // Hard fail: do not start the app without isolation (no silent fallback).
     if (typeof SharedArrayBuffer === "undefined" || !globalThis.crossOriginIsolated) {
       throw new Error(
-        "audio requires cross-origin isolation (COOP/COEP). Use: python3 scripts/serve-web.py zig-out/web",
+        "This application requires cross-origin isolation for shared audio.\n" +
+          "Serve it with COOP/COEP headers, or use a postmessage audio build.",
       );
     }
-    audioCtx = new AC({ sampleRate: 48000 });
-    await audioCtx.audioWorklet.addModule(new URL("./kngn-worklet.js", import.meta.url).href);
   }
 
-  const resp = await fetch(new URL("./" + wasmUrl, import.meta.url).href);
-  const bytes = await resp.arrayBuffer();
+  if (useAudio) {
+    const AC = window.AudioContext || window.webkitAudioContext;
+    if (!AC) throw new Error("AudioContext not available");
+    if (typeof AudioWorkletNode === "undefined") {
+      throw new Error("AudioWorklet is not available in this browser");
+    }
+    audioCtx = new AC({ sampleRate: 48000 });
+    try {
+      await loadWorkletModule(opts.workletSource);
+    } catch (e) {
+      throw new Error(
+        "audioWorklet.addModule failed: " + String(e && e.message ? e.message : e),
+      );
+    }
+  }
+
+  /** @type {ArrayBuffer} */
+  let bytes;
+  if (embedded) {
+    bytes = base64ToArrayBuffer(opts.wasmBase64);
+  } else {
+    // Multi-file package: fetch wasm next to this module (or next to the page for inline modules).
+    const resp = await fetch(new URL("./" + wasmUrl, import.meta.url).href);
+    bytes = await resp.arrayBuffer();
+  }
   wasmModule = await WebAssembly.compile(bytes);
 
   const importObject = makeImportObject();
 
   if (useShared) {
-    if (typeof SharedArrayBuffer === "undefined" || !globalThis.crossOriginIsolated) {
-      throw new Error(
-        "shared memory requires cross-origin isolation (COOP/COEP). Use: python3 scripts/serve-web.py",
-      );
-    }
     memory = new WebAssembly.Memory({
       initial: initialPages,
       maximum: maxPages,
@@ -1182,23 +1572,26 @@ export async function boot(opts = {}) {
     memory = /** @type {WebAssembly.Memory} */ (instance.exports.memory);
   }
 
-  // audio: finish 2nd Instance + sentinel checks before kngn_init (failure → open also fails)
-  if (useAudio) {
-    try {
-      await prepareAudioWorkletNode(2);
-      audioReady = true;
-      ensureAudioGestureResume();
-    } catch (e) {
-      audioReady = false;
-      showAudioError(e && e.message ? e.message : e);
-      // Graphics continue. audio.open returns OpenFailed.
-      console.warn("audio disabled:", e);
-    }
+  // Audio worklet setup before kngn_init. Failures stop boot (no half-started audio).
+  if (useShared) {
+    await prepareSharedWorkletNode(2);
+    audioReady = true;
+    ensureAudioGestureResume();
+    ensureWorkletStatsPoll();
+    maybeStartAudioProbe();
+  } else if (usePostMessage) {
+    await preparePostMessageWorkletNode(2);
+    audioReady = true;
+    ensureAudioGestureResume();
+    ensureWorkletStatsPoll();
+    maybeStartAudioProbe();
   }
 
   bindInput();
   bindResize();
   instance.exports.kngn_init();
+  // kngn_init may grow SharedArrayBuffer memory and detach the worklet's prebuilt view.
+  requestSharedViewRebuild();
 
   function loop(ts) {
     instance.exports.kngn_frame(ts); // rAF ms. Zig divides by 1000
@@ -1207,21 +1600,44 @@ export async function boot(opts = {}) {
   requestAnimationFrame(loop);
 }
 
-// Default: index.html with no data attribute or query loads pixie
+/**
+ * Resolve boot options from an embedded single-HTML prelude or from page
+ * data- attributes or the query string.
+ * Explicit data-audio-transport / embedded audioTransport win; the app name is not guessed.
+ */
 function defaultOptsFromPage() {
+  const emb = globalThis.__kngnEmbedded;
+  if (emb && emb.embedded) {
+    const transport = emb.audioTransport || "none";
+    return {
+      wasm: emb.wasm || "pixie.wasm",
+      audioTransport: transport,
+      audio: transport === "worklet_shared" || transport === "worklet_postmessage",
+      sharedMemory: !!emb.sharedMemory,
+      embedded: true,
+      wasmBase64: emb.wasmBase64,
+      workletSource: emb.workletSource,
+    };
+  }
+
   const params = new URLSearchParams(location.search);
   const body = document.body;
-  const wasm =
-    params.get("wasm") || body?.dataset?.wasm || (location.pathname.includes("synth") ? "synth.wasm" : "pixie.wasm");
-  const audio =
-    params.get("audio") === "1" ||
-    body?.dataset?.audio === "1" ||
-    wasm.includes("synth");
+  const wasm = params.get("wasm") || body?.dataset?.wasm || "pixie.wasm";
+  // Prefer explicit transport; fall back to legacy data-audio / data-shared for older HTML.
+  const transport =
+    params.get("audio-transport") ||
+    body?.dataset?.audioTransport ||
+    (params.get("audio") === "1" || body?.dataset?.audio === "1" ? "worklet_shared" : "none");
   const sharedMemory =
     params.get("shared") === "1" ||
     body?.dataset?.shared === "1" ||
-    audio;
-  return { wasm, audio, sharedMemory };
+    transport === "worklet_shared";
+  return {
+    wasm,
+    audioTransport: transport,
+    audio: transport === "worklet_shared" || transport === "worklet_postmessage",
+    sharedMemory,
+  };
 }
 
 // Auto-start at the top level of a type=module script (import { boot } also works)

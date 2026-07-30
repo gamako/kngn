@@ -249,3 +249,427 @@ pub fn setupConsumerExe(
         .wasm => {},
     }
 }
+
+// ============================================================================
+// Wasm app + web package helpers
+//
+// Spec-driven builders for wasm32-wasi apps and the multi-file web package under
+// zig-out/web/. All functions run at build-graph configuration time only.
+// ============================================================================
+
+/// Audio transport selected for a wasm app at build time.
+/// JS glue and worklet code read the same choice from HTML data attributes or
+/// embedded package options; they do not infer transport from the app name.
+pub const WasmAudio = enum {
+    /// No audio path. AudioContext / AudioWorklet are not started.
+    none,
+    /// Shared wasm memory + dual Instance (main + AudioWorklet). Requires COOP/COEP.
+    worklet_shared,
+    /// Non-shared memory; main thread renders and postMessages blocks to the worklet.
+    worklet_postmessage,
+};
+
+/// Named module import wired onto the app module (`app_module.addImport`).
+pub const WasmImport = struct {
+    name: []const u8,
+    module: *std.Build.Module,
+};
+
+/// Build-time description of one wasm web app.
+///
+/// Memory / entry / rdynamic / install layout are applied by `addWasmApp` from
+/// these fields so root and external consumers cannot drift on the wasm ABI.
+pub const WasmAppSpec = struct {
+    name: []const u8,
+
+    target_query: std.Target.Query,
+    app_source: std.Build.LazyPath,
+    wasm_root_source: std.Build.LazyPath,
+    /// Import name the wasm root uses for the app module (e.g. `"pixie"`, `"synth_app"`).
+    wasm_root_import_name: []const u8,
+
+    imports: []const WasmImport = &.{},
+    extra_link_libraries: []const *std.Build.Step.Compile = &.{},
+
+    single_threaded: bool = true,
+
+    audio: WasmAudio = .none,
+
+    shared_memory: bool = false,
+    import_memory: bool = false,
+    export_memory: bool = false,
+    /// When 0, leave the Compile step default (unset).
+    initial_memory: u64 = 0,
+    max_memory: ?u64 = null,
+    /// When 0, leave the Compile step default (unset).
+    stack_size: u64 = 0,
+    export_symbol_names: []const []const u8 = &.{},
+
+    html_source: std.Build.LazyPath,
+    /// Install destination relative to the prefix (e.g. `"web/index.html"`).
+    html_install_path: []const u8,
+
+    /// When true, a single-HTML pack step is required (configured by the package helper).
+    single_html: bool = false,
+    /// Basename for `web/<basename>.single.html` (default = `name`).
+    /// Use when the wasm artifact name differs from the desired single-HTML name
+    /// (e.g. name=`synth_postmessage`, single_html_basename=`synth` → `synth.single.html`).
+    single_html_basename: ?[]const u8 = null,
+};
+
+/// Context passed to an optional root-only dependency linker.
+pub const WasmLinkContext = struct {
+    app_module: *std.Build.Module,
+    root_module: *std.Build.Module,
+    exe: *std.Build.Step.Compile,
+    spec: *const WasmAppSpec,
+};
+
+/// Callback that wires internal modules onto an already-created app module.
+/// External consumers leave this null and use `WasmAppSpec.imports` instead.
+pub const WasmLinker = struct {
+    context: *anyopaque,
+    apply: *const fn (*anyopaque, WasmLinkContext) void,
+};
+
+/// Result of building one wasm app (artifact + install steps).
+pub const WasmAppBuild = struct {
+    exe: *std.Build.Step.Compile,
+    install: *std.Build.Step.InstallArtifact,
+    html_install: *std.Build.Step.InstallFile,
+    /// Set when single-HTML packing is configured for this app.
+    single_html_install: ?*std.Build.Step.InstallFile = null,
+};
+
+/// Per-app install edges for the web package step.
+pub const PerAppWebInstall = struct {
+    name: []const u8,
+    wasm_install: *std.Build.Step.InstallArtifact,
+    html_install: *std.Build.Step.InstallFile,
+    single_html_install: ?*std.Build.Step.InstallFile = null,
+};
+
+/// Static web assets plus per-app wasm/HTML installs under `zig-out/web/`.
+pub const WebStaticInstalls = struct {
+    apps: []const PerAppWebInstall,
+    js: *std.Build.Step.InstallFile,
+    worklet: *std.Build.Step.InstallFile,
+    headers: *std.Build.Step.InstallFile,
+    netlify: *std.Build.Step.InstallFile,
+    serve_script: *std.Build.Step.InstallFile,
+
+    pub fn dependOnAll(self: WebStaticInstalls, step: *std.Build.Step) void {
+        for (self.apps) |app| {
+            step.dependOn(&app.wasm_install.step);
+            step.dependOn(&app.html_install.step);
+            if (app.single_html_install) |single| step.dependOn(&single.step);
+        }
+        step.dependOn(&self.js.step);
+        step.dependOn(&self.worklet.step);
+        step.dependOn(&self.headers.step);
+        step.dependOn(&self.netlify.step);
+        step.dependOn(&self.serve_script.step);
+    }
+
+    pub fn dependOnShared(self: WebStaticInstalls, step: *std.Build.Step) void {
+        step.dependOn(&self.js.step);
+        step.dependOn(&self.worklet.step);
+        step.dependOn(&self.headers.step);
+        step.dependOn(&self.netlify.step);
+        step.dependOn(&self.serve_script.step);
+    }
+};
+
+/// Shared (non-app) web package assets.
+pub const WasmWebAssets = struct {
+    js: std.Build.LazyPath,
+    worklet: std.Build.LazyPath,
+    headers: std.Build.LazyPath,
+    netlify: std.Build.LazyPath,
+    serve_script: std.Build.LazyPath,
+    /// Host packer source (`cli/pack-single-html.zig`). Required when any app has `single_html`.
+    packer: ?std.Build.LazyPath = null,
+};
+
+pub const AddWasmAppOptions = struct {
+    /// When true, fold the wasm and HTML install steps into `zig build` (the install step).
+    default_install: bool = true,
+};
+
+pub const AddWasmWebPackageOptions = struct {
+    apps: []const WasmAppSpec,
+    assets: WasmWebAssets,
+    optimize: std.builtin.OptimizeMode,
+    linker: ?WasmLinker = null,
+    /// When true, fold wasm/HTML/shared static installs into the default install step.
+    default_install: bool = false,
+    /// When true, create the multi-file `package-web` step (wasm + HTML + shared assets).
+    create_package_step: bool = true,
+    package_step_name: []const u8 = "package-web",
+    package_step_description: []const u8 = "Package wasm web deploy bundle to zig-out/web/",
+    /// When true, create a step that depends only on single-HTML installs for apps that request them.
+    create_single_package_step: bool = false,
+    single_package_step_name: []const u8 = "package-web-single",
+    single_package_step_description: []const u8 = "Package single-file HTML (embedded wasm + glue) to zig-out/web/",
+};
+
+/// Validate audio/memory/target consistency for a resolved wasm target.
+pub fn validateWasmAppSpec(spec: *const WasmAppSpec, target: std.Build.ResolvedTarget) void {
+    switch (spec.audio) {
+        .none => {
+            if (spec.shared_memory or spec.import_memory) {
+                std.log.err(
+                    "wasm app '{s}': audio=none requires shared_memory=false and import_memory=false",
+                    .{spec.name},
+                );
+                std.process.exit(1);
+            }
+        },
+        .worklet_postmessage => {
+            if (spec.shared_memory or spec.import_memory) {
+                std.log.err(
+                    "wasm app '{s}': audio=worklet_postmessage requires shared_memory=false and import_memory=false",
+                    .{spec.name},
+                );
+                std.process.exit(1);
+            }
+        },
+        .worklet_shared => {
+            if (!spec.shared_memory or !spec.import_memory) {
+                std.log.err(
+                    "wasm app '{s}': audio=worklet_shared requires shared_memory=true and import_memory=true",
+                    .{spec.name},
+                );
+                std.process.exit(1);
+            }
+            if (!target.result.cpu.has(.wasm, .atomics) or !target.result.cpu.has(.wasm, .bulk_memory)) {
+                std.log.err(
+                    "wasm app '{s}': audio=worklet_shared requires target features atomics and bulk_memory",
+                    .{spec.name},
+                );
+                std.process.exit(1);
+            }
+        },
+    }
+
+    // Single-HTML: shared audio needs response headers (impossible for file:// / single file).
+    // none and worklet_postmessage are allowed (postmessage embeds the worklet source).
+    if (spec.single_html and spec.audio == .worklet_shared) {
+        std.log.err(
+            "wasm app '{s}': single_html cannot use audio=worklet_shared (needs COOP/COEP headers)",
+            .{spec.name},
+        );
+        std.process.exit(1);
+    }
+}
+
+/// Build one wasm app from `spec` and install `web/<name>.wasm` plus its HTML.
+///
+/// Common wasm ABI (entry, rdynamic, memory, exports) is applied here.
+/// Optional `linker` only wires modules onto the already-created app module.
+pub fn addWasmApp(
+    b: *std.Build,
+    optimize: std.builtin.OptimizeMode,
+    spec: *const WasmAppSpec,
+    linker: ?WasmLinker,
+    opts: AddWasmAppOptions,
+) WasmAppBuild {
+    const target = b.resolveTargetQuery(spec.target_query);
+    validateWasmAppSpec(spec, target);
+
+    const app_module = b.createModule(.{
+        .root_source_file = spec.app_source,
+        .target = target,
+        .optimize = optimize,
+        .single_threaded = spec.single_threaded,
+    });
+    for (spec.imports) |imp| {
+        app_module.addImport(imp.name, imp.module);
+    }
+
+    const root_module = b.createModule(.{
+        .root_source_file = spec.wasm_root_source,
+        .target = target,
+        .optimize = optimize,
+        .single_threaded = spec.single_threaded,
+    });
+    if (spec.export_symbol_names.len != 0) {
+        root_module.export_symbol_names = spec.export_symbol_names;
+    }
+
+    const exe = b.addExecutable(.{
+        .name = spec.name,
+        .root_module = root_module,
+    });
+    exe.entry = .disabled;
+    exe.rdynamic = true;
+    exe.shared_memory = spec.shared_memory;
+    exe.import_memory = spec.import_memory;
+    exe.export_memory = spec.export_memory;
+    if (spec.initial_memory != 0) exe.initial_memory = spec.initial_memory;
+    if (spec.max_memory) |max_memory| exe.max_memory = max_memory;
+    if (spec.stack_size != 0) exe.stack_size = spec.stack_size;
+    exe.root_module.addImport(spec.wasm_root_import_name, app_module);
+    for (spec.extra_link_libraries) |lib| {
+        exe.root_module.linkLibrary(lib);
+    }
+
+    if (linker) |l| {
+        l.apply(l.context, .{
+            .app_module = app_module,
+            .root_module = root_module,
+            .exe = exe,
+            .spec = spec,
+        });
+    }
+
+    const wasm_install = b.addInstallArtifact(exe, .{
+        .dest_dir = .{ .override = .{ .custom = "web" } },
+    });
+    if (opts.default_install) b.getInstallStep().dependOn(&wasm_install.step);
+
+    const html_install = b.addInstallFile(spec.html_source, spec.html_install_path);
+    if (opts.default_install) b.getInstallStep().dependOn(&html_install.step);
+
+    return .{
+        .exe = exe,
+        .install = wasm_install,
+        .html_install = html_install,
+        .single_html_install = null,
+    };
+}
+
+/// Host packer executable (not installed). Shared across apps in one package call.
+fn makePackerExe(b: *std.Build, packer_source: std.Build.LazyPath) *std.Build.Step.Compile {
+    return b.addExecutable(.{
+        .name = "pack-single-html",
+        .root_module = b.createModule(.{
+            .root_source_file = packer_source,
+            .target = b.graph.host,
+            .optimize = .ReleaseSafe,
+        }),
+    });
+}
+
+/// Run the packer and install `web/<name>.single.html`. Does not install the packer itself.
+fn addSingleHtmlPack(
+    b: *std.Build,
+    packer_exe: *std.Build.Step.Compile,
+    app: *const WasmAppBuild,
+    spec: *const WasmAppSpec,
+    assets: WasmWebAssets,
+    default_install: bool,
+) *std.Build.Step.InstallFile {
+    const run = b.addRunArtifact(packer_exe);
+    run.setName(b.fmt("pack-single-html {s}", .{spec.name}));
+    run.addArg("--html");
+    run.addFileArg(spec.html_source);
+    run.addArg("--js");
+    run.addFileArg(assets.js);
+    run.addArg("--wasm");
+    run.addFileArg(app.exe.getEmittedBin());
+    run.addArg("--wasm-name");
+    run.addArg(b.fmt("{s}.wasm", .{spec.name}));
+    run.addArg("--audio");
+    run.addArg(@tagName(spec.audio));
+    if (spec.shared_memory) run.addArg("--shared-memory");
+    if (spec.audio == .worklet_postmessage) {
+        run.addArg("--worklet");
+        run.addFileArg(assets.worklet);
+    }
+    run.addArg("--out");
+    const single_base = spec.single_html_basename orelse spec.name;
+    const out = run.addOutputFileArg(b.fmt("{s}.single.html", .{single_base}));
+
+    const install_path = b.fmt("web/{s}.single.html", .{single_base});
+    const install = b.addInstallFile(out, install_path);
+    if (default_install) b.getInstallStep().dependOn(&install.step);
+    return install;
+}
+
+/// Build every app in `options.apps`, install shared web assets, and optionally
+/// create the `package-web` / `package-web-single` steps. Returns one `WasmAppBuild`
+/// per app (caller may attach dedicated compile-only build steps to each `exe`).
+pub fn addWasmWebPackage(b: *std.Build, options: AddWasmWebPackageOptions) []WasmAppBuild {
+    const apps = b.allocator.alloc(WasmAppBuild, options.apps.len) catch @panic("OOM");
+    const per_app = b.allocator.alloc(PerAppWebInstall, options.apps.len) catch @panic("OOM");
+
+    var any_single = false;
+    for (options.apps) |spec| {
+        if (spec.single_html) any_single = true;
+    }
+    if (any_single and options.assets.packer == null) {
+        std.log.err("addWasmWebPackage: single_html apps require assets.packer (cli/pack-single-html.zig)", .{});
+        std.process.exit(1);
+    }
+    const packer_exe: ?*std.Build.Step.Compile = if (any_single)
+        makePackerExe(b, options.assets.packer.?)
+    else
+        null;
+
+    for (options.apps, 0..) |*spec, i| {
+        apps[i] = addWasmApp(b, options.optimize, spec, options.linker, .{
+            .default_install = options.default_install,
+        });
+        if (spec.single_html) {
+            apps[i].single_html_install = addSingleHtmlPack(
+                b,
+                packer_exe.?,
+                &apps[i],
+                spec,
+                options.assets,
+                options.default_install,
+            );
+        }
+        per_app[i] = .{
+            .name = spec.name,
+            .wasm_install = apps[i].install,
+            .html_install = apps[i].html_install,
+            .single_html_install = apps[i].single_html_install,
+        };
+    }
+
+    const static_assets = WebStaticInstalls{
+        .apps = per_app,
+        .js = b.addInstallFile(options.assets.js, "web/kngn.js"),
+        .worklet = b.addInstallFile(options.assets.worklet, "web/kngn-worklet.js"),
+        .headers = b.addInstallFile(options.assets.headers, "web/_headers"),
+        .netlify = b.addInstallFile(options.assets.netlify, "web/netlify.toml"),
+        .serve_script = b.addInstallFile(options.assets.serve_script, "web/serve-coop-coep.py"),
+    };
+
+    if (options.default_install) {
+        // Per-app wasm/HTML already joined the install step in addWasmApp.
+        static_assets.dependOnShared(b.getInstallStep());
+    }
+
+    if (options.create_package_step) {
+        const package_step = b.step(options.package_step_name, options.package_step_description);
+        // Multi-file package: wasm + multi-file HTML + shared assets (not single HTML).
+        for (per_app) |app| {
+            package_step.dependOn(&app.wasm_install.step);
+            package_step.dependOn(&app.html_install.step);
+        }
+        static_assets.dependOnShared(package_step);
+    }
+
+    if (options.create_single_package_step) {
+        const single_step = b.step(options.single_package_step_name, options.single_package_step_description);
+        var any: bool = false;
+        for (per_app) |app| {
+            if (app.single_html_install) |s| {
+                single_step.dependOn(&s.step);
+                any = true;
+            }
+        }
+        if (!any) {
+            std.log.err(
+                "addWasmWebPackage: create_single_package_step is set but no app has single_html",
+                .{},
+            );
+            std.process.exit(1);
+        }
+    }
+
+    return apps;
+}

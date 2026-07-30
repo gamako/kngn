@@ -87,211 +87,166 @@ fn appRoot(exe: *std.Build.Step.Compile, name: []const u8) TaggedModule {
     return .{ .mod = exe.root_module, .layer = .app, .name = name };
 }
 
-const WasmExeBuild = struct {
-    exe: *std.Build.Step.Compile,
-    install: *std.Build.Step.InstallArtifact,
-};
-
-const WebStaticInstalls = struct {
-    html: *std.Build.Step.InstallFile,
-    synth_html: *std.Build.Step.InstallFile,
-    js: *std.Build.Step.InstallFile,
-    worklet: *std.Build.Step.InstallFile,
-    headers: *std.Build.Step.InstallFile,
-    netlify: *std.Build.Step.InstallFile,
-    serve_script: *std.Build.Step.InstallFile,
-
-    fn dependOnAll(self: WebStaticInstalls, step: *std.Build.Step) void {
-        step.dependOn(&self.html.step);
-        step.dependOn(&self.synth_html.step);
-        step.dependOn(&self.js.step);
-        step.dependOn(&self.worklet.step);
-        step.dependOn(&self.headers.step);
-        step.dependOn(&self.netlify.step);
-        step.dependOn(&self.serve_script.step);
-    }
-};
-
-/// Install HTML/JS + hosting config templates into zig-out/web/.
-fn installWebStaticAssets(b: *std.Build) WebStaticInstalls {
+/// Shared web assets for the in-tree `package-web` layout.
+fn defaultWasmWebAssets(b: *std.Build) platform.WasmWebAssets {
     return .{
-        .html = b.addInstallFile(b.path("web/index.html"), "web/index.html"),
-        .synth_html = b.addInstallFile(b.path("web/synth.html"), "web/synth.html"),
-        .js = b.addInstallFile(b.path("web/kngn.js"), "web/kngn.js"),
-        .worklet = b.addInstallFile(b.path("web/kngn-worklet.js"), "web/kngn-worklet.js"),
-        .headers = b.addInstallFile(b.path("web/deploy/_headers"), "web/_headers"),
-        .netlify = b.addInstallFile(b.path("web/deploy/netlify.toml"), "web/netlify.toml"),
-        .serve_script = b.addInstallFile(b.path("web/deploy/serve-coop-coep.py"), "web/serve-coop-coep.py"),
+        .js = b.path("web/kngn.js"),
+        .worklet = b.path("web/kngn-worklet.js"),
+        .headers = b.path("web/deploy/_headers"),
+        .netlify = b.path("web/deploy/netlify.toml"),
+        .serve_script = b.path("web/deploy/serve-coop-coep.py"),
+        .packer = b.path("cli/pack-single-html.zig"),
     };
 }
 
-fn addPackageWebStep(
-    b: *std.Build,
-    pixie: WasmExeBuild,
-    synth: WasmExeBuild,
-    static_assets: WebStaticInstalls,
-) void {
-    const package_step = b.step(
-        "package-web",
-        "Package wasm web deploy bundle to zig-out/web/ (pixie + synth + static assets)",
-    );
-    package_step.dependOn(&pixie.install.step);
-    package_step.dependOn(&synth.install.step);
-    static_assets.dependOnAll(package_step);
+/// Root-only linker: SharedModules + makePlatformModules + layer-checked `link()`.
+/// Keeps TaggedModule / flux wiring out of the public consumer surface.
+fn makeInternalWasmLinker(b: *std.Build) platform.WasmLinker {
+    const Ctx = struct {
+        b: *std.Build,
+
+        fn apply(ctx_ptr: *anyopaque, link_ctx: platform.WasmLinkContext) void {
+            const self: *@This() = @ptrCast(@alignCast(ctx_ptr));
+            const bb = self.b;
+            const target = link_ctx.app_module.resolved_target orelse {
+                std.debug.panic("internal wasm linker: app module has no resolved target", .{});
+            };
+
+            // wasm_shared=false → single_threaded on platform modules (wasm_allocator).
+            // Atomics for shared-memory apps come from the target feature set, not multi-threaded Zig.
+            const wasm_max_opts = bb.addOptions();
+            wasm_max_opts.addOption(usize, "max_modules", @as(usize, 48));
+            wasm_max_opts.addOption(bool, "has_frame_cap", false);
+            wasm_max_opts.addOption(u32, "frame_cap_hz", @as(u32, 0));
+            const shared = SharedModules.init(bb, true, false, false, 48, wasm_max_opts.createModule(), target, .wasm);
+            const pm = makePlatformModules(bb, target, .wasm, &shared, false);
+
+            if (std.mem.eql(u8, link_ctx.spec.name, "pixie")) {
+                const root = TaggedModule{ .mod = link_ctx.app_module, .layer = .app, .name = "pixie" };
+                link(root, pm.kit);
+                link(root, shared.paint);
+                // pixelops is re-exported via kit (kit.pixelops); no direct apps → pixelops link.
+            } else if (std.mem.eql(u8, link_ctx.spec.name, "synth") or
+                std.mem.eql(u8, link_ctx.spec.name, "synth_postmessage"))
+            {
+                // Shared and postMessage synth share the same app module graph; only the
+                // wasm memory / audio transport differ (see WasmAppSpec.audio).
+                const root = TaggedModule{ .mod = link_ctx.app_module, .layer = .app, .name = "synth" };
+                link(root, pm.kit);
+                link(root, shared.spectrogram);
+                link(root, shared.scope);
+                link(root, shared.serde);
+            } else {
+                std.debug.panic("internal wasm linker: unknown app '{s}'", .{link_ctx.spec.name});
+            }
+        }
+    };
+
+    const ctx = b.allocator.create(Ctx) catch @panic("OOM");
+    ctx.* = .{ .b = b };
+    return .{ .context = ctx, .apply = Ctx.apply };
 }
 
-/// wasm32-wasi-only build (pixie + synth audio).
-/// pixie stays non-shared / single_threaded (no browser regressions).
-/// Only synth uses shared memory + atomics (AudioWorklet 2nd Instance).
-/// Root is wasm_root.zig (no main) to avoid the wasi command/_start path (reactor = export-driven).
-fn buildWasm(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode) void {
-    const pixie = buildWasmPixie(b, target, optimize, .{ .build_step_name = "build-pixie" });
-    const synth = buildWasmSynth(b, target, optimize, .{ .build_step_name = "build-synth-wasm" });
-    const static_assets = installWebStaticAssets(b);
-    static_assets.dependOnAll(b.getInstallStep());
-    addPackageWebStep(b, pixie, synth, static_assets);
-}
-
-const WasmBuildOpts = struct {
-    /// When true, fold the wasm install into `zig build` (the install step).
-    default_install: bool = true,
-    /// When null, do not create a dedicated build step (for cross-compile via package-web).
-    build_step_name: ?[]const u8,
-};
-
-fn buildWasmPixie(
-    b: *std.Build,
-    base_target: std.Build.ResolvedTarget,
-    optimize: std.builtin.OptimizeMode,
-    opts: WasmBuildOpts,
-) WasmExeBuild {
+/// pixie + synth (shared) + synth_postmessage WasmAppSpec values for the in-tree web package.
+/// When `with_single_html` is true, pixie and the postMessage synth produce `*.single.html`.
+fn makeWasmAppSpecs(b: *std.Build, base_target: std.Build.ResolvedTarget, with_single_html: bool) [3]platform.WasmAppSpec {
     // Keep the caller's CPU / OS / ABI / existing feature set; add simd128 for pixelops @Vector paths.
-    var query = base_target.query;
-    query.cpu_features_add.addFeatureSet(std.Target.wasm.featureSet(&.{.simd128}));
-    const target = b.resolveTargetQuery(query);
+    var pixie_query = base_target.query;
+    pixie_query.cpu_features_add.addFeatureSet(std.Target.wasm.featureSet(&.{.simd128}));
 
-    const wasm_max_opts = b.addOptions();
-    wasm_max_opts.addOption(usize, "max_modules", @as(usize, 48));
-    wasm_max_opts.addOption(bool, "has_frame_cap", false);
-    wasm_max_opts.addOption(u32, "frame_cap_hz", @as(u32, 0));
-    const shared = SharedModules.init(b, true, false, false, 48, wasm_max_opts.createModule(), target, .wasm);
-    const pm = makePlatformModules(b, target, .wasm, &shared, false);
-
-    const pixie_mod = b.createModule(.{
-        .root_source_file = b.path("apps/editor/apps/pixie/main.zig"),
-        .target = target,
-        .optimize = optimize,
-        .single_threaded = true,
-    });
-    {
-        const root = TaggedModule{ .mod = pixie_mod, .layer = .app, .name = "pixie" };
-        link(root, pm.kit);
-        link(root, shared.paint);
-        // pixelops is re-exported via kit (kit.pixelops); no direct apps → pixelops link.
-    }
-
-    const exe = b.addExecutable(.{
-        .name = "pixie",
-        .root_module = b.createModule(.{
-            .root_source_file = b.path("apps/editor/apps/pixie/wasm_root.zig"),
-            .target = target,
-            .optimize = optimize,
-            .single_threaded = true,
-        }),
-    });
-    exe.entry = .disabled;
-    exe.rdynamic = true;
-    exe.root_module.addImport("pixie", pixie_mod);
-
-    const wasm_install = b.addInstallArtifact(exe, .{
-        .dest_dir = .{ .override = .{ .custom = "web" } },
-    });
-    if (opts.default_install) b.getInstallStep().dependOn(&wasm_install.step);
-    if (opts.build_step_name) |name| {
-        addBuildStep(b, name, "Build Pixie wasm (wasm32-wasi)", exe);
-    }
-    return .{ .exe = exe, .install = wasm_install };
-}
-
-/// synth wasm: SharedArrayBuffer + atomics + dual Instance (main + AudioWorklet).
-/// notes: pixie stays non-shared. Only apps that use audio go shared (minimize regressions).
-///
-/// Why single_threaded=true is kept:
-/// - zig 0.16 `std.heap.wasm_allocator` has no multi-thread implementation
-/// - but with `+atomics` on the target, single_threaded still emits i32.atomic.*
-///   (single- and multi-threaded atomic instructions match)
-/// - Zig Thread is not spawned (JS-side main + AudioWorklet Instances share memory)
-fn buildWasmSynth(
-    b: *std.Build,
-    base_target: std.Build.ResolvedTarget,
-    optimize: std.builtin.OptimizeMode,
-    opts: WasmBuildOpts,
-) WasmExeBuild {
-    // Target with atomics + bulk_memory (shared memory / AudioWorklet) plus simd128
+    // atomics + bulk_memory (shared memory / AudioWorklet) plus simd128
     // (pixelops @Vector paths and any other SIMD in the synth graph).
-    const query = std.Target.Query{
+    const synth_shared_query = std.Target.Query{
         .cpu_arch = .wasm32,
         .os_tag = base_target.result.os.tag, // wasi
         .abi = base_target.result.abi,
         .cpu_features_add = std.Target.wasm.featureSet(&.{ .atomics, .bulk_memory, .simd128 }),
     };
-    const target = b.resolveTargetQuery(query);
 
-    // wasm_shared=false → single_threaded=true (wasm_allocator ok). atomics come from the target feature.
-    const wasm_max_opts = b.addOptions();
-    wasm_max_opts.addOption(usize, "max_modules", @as(usize, 48));
-    wasm_max_opts.addOption(bool, "has_frame_cap", false);
-    wasm_max_opts.addOption(u32, "frame_cap_hz", @as(u32, 0));
-    const shared = SharedModules.init(b, true, false, false, 48, wasm_max_opts.createModule(), target, .wasm);
-    const pm = makePlatformModules(b, target, .wasm, &shared, false);
+    // postMessage synth: non-shared memory (no atomics/import_memory). simd128 only.
+    var synth_pm_query = base_target.query;
+    synth_pm_query.cpu_features_add.addFeatureSet(std.Target.wasm.featureSet(&.{.simd128}));
 
-    const synth_mod = b.createModule(.{
-        .root_source_file = b.path("apps/synth/main.zig"),
-        .target = target,
+    return .{
+        .{
+            .name = "pixie",
+            .target_query = pixie_query,
+            .app_source = b.path("apps/editor/apps/pixie/main.zig"),
+            .wasm_root_source = b.path("apps/editor/apps/pixie/wasm_root.zig"),
+            .wasm_root_import_name = "pixie",
+            .single_threaded = true,
+            .audio = .none,
+            .html_source = b.path("web/index.html"),
+            .html_install_path = "web/index.html",
+            .single_html = with_single_html,
+        },
+        .{
+            .name = "synth",
+            .target_query = synth_shared_query,
+            .app_source = b.path("apps/synth/main.zig"),
+            .wasm_root_source = b.path("apps/synth/wasm_root.zig"),
+            .wasm_root_import_name = "synth_app",
+            // single_threaded=true: zig 0.16 wasm_allocator has no multi-thread path;
+            // +atomics on the target still emits i32.atomic.* for the JS dual-Instance setup.
+            .single_threaded = true,
+            .audio = .worklet_shared,
+            .shared_memory = true,
+            .import_memory = true,
+            .export_memory = false,
+            // 16 MiB initial / 64 MiB max (FB 1080×520 + audio stack/scratch + synth state)
+            .initial_memory = 16 * 1024 * 1024,
+            .max_memory = 64 * 1024 * 1024,
+            // MasterEffects(65536) is ~0.5MiB+. Leave headroom for init temporaries on the stack.
+            .stack_size = 2 * 1024 * 1024,
+            // The worklet swaps the __stack_pointer Global per Instance.
+            .export_symbol_names = &.{"__stack_pointer"},
+            .html_source = b.path("web/synth.html"),
+            .html_install_path = "web/synth.html",
+            // worklet_shared × single HTML is a build error (COOP/COEP required).
+            .single_html = false,
+        },
+        // Second delivery of the same synth app: main-thread render + postMessage worklet.
+        // For file:// / hosts that cannot set COOP/COEP. Higher latency than shared.
+        .{
+            .name = "synth_postmessage",
+            .target_query = synth_pm_query,
+            .app_source = b.path("apps/synth/main.zig"),
+            .wasm_root_source = b.path("apps/synth/wasm_root.zig"),
+            .wasm_root_import_name = "synth_app",
+            .single_threaded = true,
+            .audio = .worklet_postmessage,
+            .shared_memory = false,
+            .import_memory = false,
+            .export_memory = false,
+            .initial_memory = 16 * 1024 * 1024,
+            .max_memory = 64 * 1024 * 1024,
+            .stack_size = 2 * 1024 * 1024,
+            .html_source = b.path("web/synth-postmessage.html"),
+            .html_install_path = "web/synth-postmessage.html",
+            .single_html = with_single_html,
+            .single_html_basename = "synth",
+        },
+    };
+}
+
+/// wasm32-wasi-only build (pixie + synth audio).
+/// Root is wasm_root.zig (no main) to avoid the wasi command/_start path (reactor = export-driven).
+fn buildWasm(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode) void {
+    var specs = makeWasmAppSpecs(b, target, true);
+    const apps = platform.addWasmWebPackage(b, .{
+        .apps = &specs,
+        .assets = defaultWasmWebAssets(b),
         .optimize = optimize,
-        .single_threaded = true,
+        .linker = makeInternalWasmLinker(b),
+        .default_install = true,
+        .create_package_step = true,
+        .package_step_description = "Package wasm web deploy bundle to zig-out/web/ (pixie + synth + static assets)",
+        .create_single_package_step = true,
+        .single_package_step_description = "Package single-file HTML (pixie + postMessage synth) to zig-out/web/",
     });
-    {
-        const root = TaggedModule{ .mod = synth_mod, .layer = .app, .name = "synth" };
-        link(root, pm.kit);
-        link(root, shared.spectrogram);
-        link(root, shared.scope);
-        link(root, shared.serde);
-    }
-
-    const root_mod = b.createModule(.{
-        .root_source_file = b.path("apps/synth/wasm_root.zig"),
-        .target = target,
-        .optimize = optimize,
-        .single_threaded = true,
-    });
-    // The worklet swaps the __stack_pointer Global per Instance
-    root_mod.export_symbol_names = &.{"__stack_pointer"};
-
-    const exe = b.addExecutable(.{
-        .name = "synth",
-        .root_module = root_mod,
-    });
-    exe.entry = .disabled;
-    exe.rdynamic = true;
-    exe.shared_memory = true;
-    exe.import_memory = true;
-    exe.export_memory = false;
-    // 16 MiB initial / 64 MiB max (FB 1080×520 + audio stack/scratch + synth state)
-    exe.initial_memory = 16 * 1024 * 1024;
-    exe.max_memory = 64 * 1024 * 1024;
-    // MasterEffects(65536) is ~0.5MiB+. Leave headroom for init temporaries on the stack.
-    exe.stack_size = 2 * 1024 * 1024;
-    exe.root_module.addImport("synth_app", synth_mod);
-
-    const wasm_install = b.addInstallArtifact(exe, .{
-        .dest_dir = .{ .override = .{ .custom = "web" } },
-    });
-    if (opts.default_install) b.getInstallStep().dependOn(&wasm_install.step);
-    if (opts.build_step_name) |name| {
-        addBuildStep(b, name, "Build Synth wasm (shared memory + AudioWorklet)", exe);
-    }
-    return .{ .exe = exe, .install = wasm_install };
+    addBuildStep(b, "build-pixie", "Build Pixie wasm (wasm32-wasi)", apps[0].exe);
+    addBuildStep(b, "build-synth-wasm", "Build Synth wasm (shared memory + AudioWorklet)", apps[1].exe);
+    addBuildStep(b, "build-synth-postmessage-wasm", "Build Synth wasm (postMessage audio, no shared memory)", apps[2].exe);
 }
 
 /// Cross-compile wasm web artifacts from the native target into zig-out/web/.
@@ -300,16 +255,21 @@ fn packageWebFromNative(b: *std.Build, optimize: std.builtin.OptimizeMode) void 
         .cpu_arch = .wasm32,
         .os_tag = .wasi,
     });
-    const cross_opts = WasmBuildOpts{
+    var specs = makeWasmAppSpecs(b, wasi_target, true);
+    const apps = platform.addWasmWebPackage(b, .{
+        .apps = &specs,
+        .assets = defaultWasmWebAssets(b),
+        .optimize = optimize,
+        .linker = makeInternalWasmLinker(b),
         .default_install = false,
-        .build_step_name = null,
-    };
-    const pixie = buildWasmPixie(b, wasi_target, optimize, cross_opts);
-    const synth = buildWasmSynth(b, wasi_target, optimize, cross_opts);
-    const static_assets = installWebStaticAssets(b);
-    addPackageWebStep(b, pixie, synth, static_assets);
-    addBuildStep(b, "build-pixie-wasm", "Build Pixie wasm for web (wasm32-wasi)", pixie.exe);
-    addBuildStep(b, "build-synth-wasm", "Build Synth wasm for web (shared memory + AudioWorklet)", synth.exe);
+        .create_package_step = true,
+        .package_step_description = "Package wasm web deploy bundle to zig-out/web/ (pixie + synth + static assets)",
+        .create_single_package_step = true,
+        .single_package_step_description = "Package single-file HTML (pixie + postMessage synth) to zig-out/web/",
+    });
+    addBuildStep(b, "build-pixie-wasm", "Build Pixie wasm for web (wasm32-wasi)", apps[0].exe);
+    addBuildStep(b, "build-synth-wasm", "Build Synth wasm for web (shared memory + AudioWorklet)", apps[1].exe);
+    addBuildStep(b, "build-synth-postmessage-wasm", "Build Synth wasm for web (postMessage audio, no shared memory)", apps[2].exe);
 }
 
 pub fn build(b: *std.Build) void {
@@ -330,9 +290,51 @@ pub fn build(b: *std.Build) void {
 
     // ========================================
     // wasm-only branch (wasm32-wasi)
-    // Even under wasi, skip the native backend loop and use the dedicated path. pixie only.
+    // Even under wasi, skip the native backend loop and use the dedicated path.
+    // Also publish dep.module("kit") / platform so an external package that depends on
+    // kngn with a wasm target can import kit for its own wasm app.
     // ========================================
     if (is_wasm) {
+        // Public modules for external wasm consumers (dep.module("kit")).
+        // is_wasm=true uses createModule for internal package graphs elsewhere; here we
+        // deliberately publish via addModule so the dependency surface exists.
+        const wasm_pub_opts = b.addOptions();
+        wasm_pub_opts.addOption(usize, "max_modules", @as(usize, 48));
+        wasm_pub_opts.addOption(bool, "has_frame_cap", false);
+        wasm_pub_opts.addOption(u32, "frame_cap_hz", @as(u32, 0));
+        const wasm_pub_shared = SharedModules.init(
+            b,
+            true,
+            false,
+            false,
+            48,
+            wasm_pub_opts.createModule(),
+            target,
+            .wasm,
+        );
+        // SharedModules with is_wasm=true uses createModule for platform/png/… so register
+        // the public names explicitly for external consumers.
+        _ = b.modules.put(b.graph.arena, b.dupe("platform"), wasm_pub_shared.platform.mod) catch @panic("OOM");
+        _ = b.modules.put(b.graph.arena, b.dupe("png"), wasm_pub_shared.png.mod) catch @panic("OOM");
+        _ = b.modules.put(b.graph.arena, b.dupe("gmath"), wasm_pub_shared.gmath.mod) catch @panic("OOM");
+        _ = b.modules.put(b.graph.arena, b.dupe("font"), wasm_pub_shared.font.mod) catch @panic("OOM");
+        _ = b.modules.put(b.graph.arena, b.dupe("gui"), wasm_pub_shared.gui.mod) catch @panic("OOM");
+        const app_runtime_wasm: TaggedModule = .{ .layer = .core, .name = "app_runtime", .mod = b.createModule(.{
+            .root_source_file = b.path("core/app_runtime.zig"),
+            .target = target,
+            .single_threaded = true,
+        }) };
+        link(app_runtime_wasm, wasm_pub_shared.platform);
+        app_runtime_wasm.mod.addImport("build_options", wasm_pub_shared.max_modules_mod);
+        const kit_wasm: TaggedModule = .{ .layer = .kit, .name = "kit", .mod = b.addModule("kit", .{
+            .root_source_file = b.path("kit/kit.zig"),
+            .target = target,
+            .single_threaded = true,
+        }) };
+        wireKitImports(kit_wasm, wasm_pub_shared.platform, &wasm_pub_shared, app_runtime_wasm);
+        // BGRA→RGBA SIMD swizzle (same exception as makePlatformModules for wasm).
+        linkCoreException(wasm_pub_shared.platform, wasm_pub_shared.pixelops, "BGRA→RGBA SIMD swizzle for wasm present");
+
         buildWasm(b, target, wasm_optimize);
         return;
     }
@@ -2137,7 +2139,30 @@ pub fn build(b: *std.Build) void {
     // Note: this runs tests only. Example build regression is covered by ordinary `zig build` (examples always install every backend).
     //     `-Dinstall-all=true` also installs main/pixie for every backend.
     // ========================================
+    // Host-only packer + postMessage ring invariant tests (no wasm compile).
+    const pack_single_html_test_mod = b.createModule(.{
+        .root_source_file = b.path("cli/pack-single-html.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    const pack_single_html_test = b.addTest(.{ .root_module = pack_single_html_test_mod });
+    const run_pack_single_html_test = b.addRunArtifact(pack_single_html_test);
+    const audio_pm_ring_test_mod = b.createModule(.{
+        .root_source_file = b.path("cli/audio_pm_ring.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    const audio_pm_ring_test = b.addTest(.{ .root_module = audio_pm_ring_test_mod });
+    const run_audio_pm_ring_test = b.addRunArtifact(audio_pm_ring_test);
+    const test_pack_single_html_step = b.step(
+        "test-pack-single-html",
+        "Run single-HTML packer unit tests and postMessage ring invariants (host-only)",
+    );
+    test_pack_single_html_step.dependOn(&run_pack_single_html_test.step);
+    test_pack_single_html_step.dependOn(&run_audio_pm_ring_test.step);
+
     const test_step = b.step("test", "Run all unit/integration tests");
+    test_step.dependOn(test_pack_single_html_step);
     test_step.dependOn(test_frame_pacing_step);
     test_step.dependOn(test_png_roundtrip_step);
     test_step.dependOn(test_core_step);
@@ -2709,11 +2734,21 @@ const SharedModules = struct {
         // Facade. Carries link_libc + include path for @cImport("platform.h"), plus backend-specific
         // system libs/headers needed for @cImport (see platform.configurePublicPlatformModule).
         // target is set so linkSystemLibrary can resolve pkg-config for the selected OS.
-        const platform_mod: TaggedModule = .{ .layer = .core, .name = "platform", .mod = b.addModule("platform", .{
-            .root_source_file = b.path("core/platform.zig"),
-            .target = target,
-            .link_libc = true,
-        }) };
+        //
+        // When is_wasm, use createModule so the internal wasm package graph does not overwrite
+        // the native public modules registered for external consumers (dep.module("platform")).
+        const platform_mod: TaggedModule = .{ .layer = .core, .name = "platform", .mod = if (is_wasm)
+            b.createModule(.{
+                .root_source_file = b.path("core/platform.zig"),
+                .target = target,
+                .link_libc = true,
+            })
+        else
+            b.addModule("platform", .{
+                .root_source_file = b.path("core/platform.zig"),
+                .target = target,
+                .link_libc = true,
+            }) };
         platform_mod.mod.addIncludePath(b.path("platform"));
         platform.configurePublicPlatformModule(b, platform_mod.mod, platform_backend);
         // build_options (gamepad/menu opt-in + platform_backend): the facade for external consumers
@@ -2730,9 +2765,10 @@ const SharedModules = struct {
         }
 
         // External public module. dep.module("png").
-        const png: TaggedModule = .{ .layer = .lib, .name = "png", .mod = b.addModule("png", .{
-            .root_source_file = b.path("libs/png/src/lib.zig"),
-        }) };
+        const png: TaggedModule = .{ .layer = .lib, .name = "png", .mod = if (is_wasm)
+            b.createModule(.{ .root_source_file = b.path("libs/png/src/lib.zig") })
+        else
+            b.addModule("png", .{ .root_source_file = b.path("libs/png/src/lib.zig") }) };
 
         // libs/pixelops: shared pixel-blend primitives (premul/straight blend + div255 +
         // clip-hoist). sprite / paint blend / font Color.blend delegate here.
@@ -2742,9 +2778,10 @@ const SharedModules = struct {
 
         // libs/gmath: platform-independent f32 game math and collision primitives.
         // It is a stable L2-L3 library and is publicly exposed through kit.gmath.
-        const gmath: TaggedModule = .{ .layer = .lib, .name = "gmath", .mod = b.addModule("gmath", .{
-            .root_source_file = b.path("libs/gmath/src/lib.zig"),
-        }) };
+        const gmath: TaggedModule = .{ .layer = .lib, .name = "gmath", .mod = if (is_wasm)
+            b.createModule(.{ .root_source_file = b.path("libs/gmath/src/lib.zig") })
+        else
+            b.addModule("gmath", .{ .root_source_file = b.path("libs/gmath/src/lib.zig") }) };
 
         // libs/serde: versioned-container serialization (std only; no link needed).
         // Flux lib: not in kit; apps may direct-import (app_direct_ok=true). First adopter is
@@ -2828,9 +2865,10 @@ const SharedModules = struct {
         // libs/font: shared font abstraction + canonical pixel/geom primitives (below gui)
         // BMFont loader (bmfont.zig) depends on png to decode the PNG atlas.
         // External public module. dep.module("font"). Depends on png.
-        const font: TaggedModule = .{ .layer = .lib, .name = "font", .mod = b.addModule("font", .{
-            .root_source_file = b.path("libs/font/src/lib.zig"),
-        }) };
+        const font: TaggedModule = .{ .layer = .lib, .name = "font", .mod = if (is_wasm)
+            b.createModule(.{ .root_source_file = b.path("libs/font/src/lib.zig") })
+        else
+            b.addModule("font", .{ .root_source_file = b.path("libs/font/src/lib.zig") }) };
         link(font, png);
         link(font, pixelops); // Color.blend in color.zig delegates here
 
@@ -2841,9 +2879,10 @@ const SharedModules = struct {
         text_mod.addImport("font", font.mod);
 
         // External public module. dep.module("gui"). Depends on font.
-        const gui: TaggedModule = .{ .layer = .lib, .name = "gui", .mod = b.addModule("gui", .{
-            .root_source_file = b.path("libs/gui/src/gui.zig"),
-        }) };
+        const gui: TaggedModule = .{ .layer = .lib, .name = "gui", .mod = if (is_wasm)
+            b.createModule(.{ .root_source_file = b.path("libs/gui/src/gui.zig") })
+        else
+            b.addModule("gui", .{ .root_source_file = b.path("libs/gui/src/gui.zig") }) };
         link(gui, font);
         link(gui, pixelops); // drawImage SIMD in render.zig
         link(gui, command_types);

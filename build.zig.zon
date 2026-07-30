@@ -81,6 +81,10 @@
         // so they must be included for the package to be self-contained.
         "apps",
         "examples",
+        // Web glue / deploy templates and the single-HTML packer (external consumers
+        // reach these via dep.path("web/...") and dep.path("cli/pack-single-html.zig")).
+        "web",
+        "cli",
         "LICENSE",
         // For example...
         //"README.md",
