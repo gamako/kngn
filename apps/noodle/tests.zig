@@ -1,4 +1,4 @@
-//! apps/patch: test-patch aggregate root.
+//! apps/noodle: test-noodle aggregate root.
 //!
 //! Combines unit tests for canvas.zig (camera/hit-test/clip-detection) and group.zig (group ledger,
 //! expose derivation, display mapping) into 1 target. No display/audio needed; independent of platform/gui/modular.

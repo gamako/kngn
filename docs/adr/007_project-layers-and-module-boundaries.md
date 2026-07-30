@@ -208,7 +208,7 @@ shells alone**, which makes the judgement simple (R6, R8).
   digest: band, centroid, onset; analysis runs only when a digest is requested, never
   touching the real-time path); ③ `platform(core) → pixelops(libs/pixelops)`
   (BGRA→RGBA SIMD swizzle for wasm present). ④–⑤ `linkAppException` —
-  `example_26 → paint` (demo direct import); `apps/patch/lofi.zig → synth` and
+  `example_26 → paint` (demo direct import); `apps/noodle/lofi.zig → synth` and
   `→ dsp` (generative-layer types such as `SampleTap` / `AtomicF32` and FFT
   band-energy checks, keeping a pure-test root platform-free). Apps reach pixelops
   through `kit.pixelops` (stable re-export), not a direct exception. Kit and a
@@ -264,8 +264,8 @@ shells alone**, which makes the judgement simple (R6, R8).
   keys stayed bit-stable; the extension is additive and creates no new probe name.
 - 2026-07-27 Exception inventory refreshed to the current seven
   `linkCoreException` / `linkAppException` edges in `build.zig` (platform→pixelops;
-  pixie→pixelops; example_26→paint; `apps/patch/lofi.zig`→synth/dsp). Replaced the
-  stale `apps/modular/patch.zig` path with `apps/patch/lofi.zig`. The R1–R8
+  pixie→pixelops; example_26→paint; `apps/noodle/lofi.zig`→synth/dsp). Replaced the
+  stale `apps/modular/patch.zig` path with `apps/noodle/lofi.zig`. The R1–R8
   decisions themselves are unchanged.
 - 2026-07-27 R7 gained a pointer to its one recorded exception (netsync in
   `core/control`, stated in ADR-014) and to the linking mechanism it relies on
@@ -273,7 +273,7 @@ shells alone**, which makes the judgement simple (R6, R8).
   written down, and the conditions that would end it are too.
 - 2026-07-30 pixelops promoted into kit (`kit.pixelops`). The two
   `linkAppException` edges `apps/editor/apps/pixie → pixelops` and
-  `apps/patch → pixelops` were removed; apps use the kit re-export. Remaining
+  `apps/noodle → pixelops` were removed; apps use the kit re-export. Remaining
   exception set is five edges (three `linkCoreException`, two
   `linkAppException`). `platform → pixelops` stays (core cannot link libs
   without an exception; needed for wasm present). The R1–R8 decisions themselves

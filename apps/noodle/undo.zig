@@ -1,4 +1,4 @@
-//! apps/patch: fixed-length undo payload store.
+//! apps/noodle: fixed-length undo payload store.
 //!
 //! Hot path: **event-time only** (the main-thread path for GUI operations / action application). Never runs on a
 //! per-frame loop or an RT (per-sample) path. Holds no per-operation allocator or mutex; self-contained with fixed-capacity value types.

@@ -13,7 +13,7 @@
 //! - 113 real targets fit; 114 real targets are rejected wholesale
 //!
 //! Hot path: event time only (layout / drag commit). Not per-frame or audio RT.
-//! Depends on std only so test-patch can collect it without App / kit / modular.
+//! Depends on std only so test-noodle can collect it without App / kit / modular.
 
 const std = @import("std");
 const testing = std.testing;

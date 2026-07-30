@@ -73,9 +73,9 @@ fn linkCoreException(consumer: TaggedModule, dep: TaggedModule, comptime reason:
 }
 
 /// app → lib direct-import exceptions. The full set is the linkAppException call sites:
-///   - example_26 → paint; apps/patch/lofi.zig → synth / dsp (keeps a pure-test root platform-free)
+///   - example_26 → paint; apps/noodle/lofi.zig → synth / dsp (keeps a pure-test root platform-free)
 /// A kit-listed dep is the same module instance kit exposes, so type identity holds.
-/// (pixie / patch use kit.pixelops; they do not need a direct pixelops exception.)
+/// (pixie / noodle use kit.pixelops; they do not need a direct pixelops exception.)
 fn linkAppException(consumer: TaggedModule, dep: TaggedModule, comptime reason: []const u8) void {
     comptime std.debug.assert(reason.len > 0);
     std.debug.assert(consumer.layer == .app and dep.layer == .lib);
@@ -378,7 +378,7 @@ pub fn build(b: *std.Build) void {
         "Enable gamepad for external platform module and native archive (default false)",
     ) orelse false;
 
-    // modular/patch concurrent module limit. Default 48 = bit-identical with the current default.
+    // modular/noodle concurrent module limit. Default 48 = bit-identical with the current default.
     // Lower bound: enough for the default lofi patch + macros. Upper bound: u16 handle / a sensible memory range.
     // Create the Options Module once via createModule; all consumers share it through addImport
     // (addOptions creates a Module each call, so the same options.zig would become 2 roots and compile-error).
@@ -442,7 +442,7 @@ pub fn build(b: *std.Build) void {
     var default_main: ?*std.Build.Step.Compile = null;
     var default_pixie: ?*std.Build.Step.Compile = null;
     var default_synth: ?*std.Build.Step.Compile = null;
-    var default_patch: ?*std.Build.Step.Compile = null;
+    var default_noodle: ?*std.Build.Step.Compile = null;
 
     for (backends) |be| {
         const is_default = (be == platform_option);
@@ -463,11 +463,11 @@ pub fn build(b: *std.Build) void {
 
         // ----- Synth app (apps/synth) — PC-keyboard performance MVP. audio backend: macOS/Linux/Windows -----
         if (audio_supported) {
-            // ----- Patch app (apps/patch) — patch-canvas UI + live rewiring. audio-capable OSes -----
-            const patch_exe = addPatchExe(b, target, optimize, platform_root, sdk_paths, be, artifactName(b, "patch", be, default_be), &shared_modules, &pm);
-            if (is_default) default_patch = patch_exe;
-            if (install_all) b.installArtifact(patch_exe);
-            addRunStep(b, b.fmt("run-patch-{s}", .{platform.backendName(be)}), b.fmt("Run patch canvas ({s})", .{platform.backendName(be)}), patch_exe, b.args);
+            // ----- Noodle app (apps/noodle) — patch-canvas UI + live rewiring. audio-capable OSes -----
+            const noodle_exe = addNoodleExe(b, target, optimize, platform_root, sdk_paths, be, artifactName(b, "noodle", be, default_be), &shared_modules, &pm);
+            if (is_default) default_noodle = noodle_exe;
+            if (install_all) b.installArtifact(noodle_exe);
+            addRunStep(b, b.fmt("run-noodle-{s}", .{platform.backendName(be)}), b.fmt("Run noodle, the modular patch canvas ({s})", .{platform.backendName(be)}), noodle_exe, b.args);
 
             const synth_exe = addSynthExe(b, target, optimize, platform_root, sdk_paths, be, artifactName(b, "synth", be, default_be), &shared_modules, &pm);
             if (is_default) default_synth = synth_exe;
@@ -595,10 +595,10 @@ pub fn build(b: *std.Build) void {
         addBuildStep(b, "build-synth", "Build synth app only (uses -Dplatform option)", ds);
     }
 
-    // patch canvas is also audio-capable OSes only (it makes sound; default_patch is null otherwise).
-    if (default_patch) |dp| {
-        addRunStep(b, "run-patch", "Run patch canvas (uses -Dplatform option)", dp, b.args);
-        addBuildStep(b, "build-patch", "Build patch canvas only (uses -Dplatform option)", dp);
+    // noodle is also audio-capable OSes only (it makes sound; default_noodle is null otherwise).
+    if (default_noodle) |dp| {
+        addRunStep(b, "run-noodle", "Run noodle, the modular patch canvas (uses -Dplatform option)", dp, b.args);
+        addBuildStep(b, "build-noodle", "Build noodle only (uses -Dplatform option)", dp);
     }
 
     // ----- The command line tool -----
@@ -1928,25 +1928,25 @@ pub fn build(b: *std.Build) void {
     const test_modular_step = b.step("test-modular", "Run libs/modular unit tests");
     test_modular_step.dependOn(&run_modular_test.step);
 
-    // apps/patch generative-layer tests (LofiPatch offline render: non-silent/finite/deterministic CRC).
+    // apps/noodle generative-layer tests (LofiPatch offline render: non-silent/finite/deterministic CRC).
     const modular_app_test_mod = b.createModule(.{
-        .root_source_file = b.path("apps/patch/lofi.zig"),
+        .root_source_file = b.path("apps/noodle/lofi.zig"),
         .target = target,
         .optimize = optimize,
     });
     modular_app_test_mod.addImport("modular", shared_modules.modular.mod);
-    modular_app_test_mod.addImport("synth", shared_modules.synth.mod); // patch uses AtomicF32
-    modular_app_test_mod.addImport("dsp", shared_modules.dsp.mod); // patch verifies band energy via FFT
+    modular_app_test_mod.addImport("synth", shared_modules.synth.mod); // noodle uses AtomicF32
+    modular_app_test_mod.addImport("dsp", shared_modules.dsp.mod); // noodle verifies band energy via FFT
     modular_app_test_mod.addImport("serde", shared_modules.serde.mod); // via project_io (GENR)
     const modular_app_test = b.addTest(.{ .root_module = modular_app_test_mod });
     const run_modular_app_test = b.addRunArtifact(modular_app_test);
-    const test_app_modular_step = b.step("test-app-modular", "Run apps/patch LofiPatch tests");
+    const test_app_modular_step = b.step("test-app-modular", "Run apps/noodle LofiPatch tests");
     test_app_modular_step.dependOn(&run_modular_app_test.step);
 
-    // apps/patch generation action pure parser. std only.
+    // apps/noodle generation action pure parser. std only.
     const modular_actions_test = b.addTest(.{
         .root_module = b.createModule(.{
-            .root_source_file = b.path("apps/patch/gen_actions.zig"),
+            .root_source_file = b.path("apps/noodle/gen_actions.zig"),
             .target = target,
             .optimize = optimize,
         }),
@@ -1954,10 +1954,10 @@ pub fn build(b: *std.Build) void {
     const run_modular_actions_test = b.addRunArtifact(modular_actions_test);
     test_app_modular_step.dependOn(&run_modular_actions_test.step);
 
-    // apps/patch WAV writer. std only; streaming PCM16 RIFF/WAVE.
+    // apps/noodle WAV writer. std only; streaming PCM16 RIFF/WAVE.
     const modular_wav_test = b.addTest(.{
         .root_module = b.createModule(.{
-            .root_source_file = b.path("apps/patch/wav.zig"),
+            .root_source_file = b.path("apps/noodle/wav.zig"),
             .target = target,
             .optimize = optimize,
         }),
@@ -1965,10 +1965,10 @@ pub fn build(b: *std.Build) void {
     const run_modular_wav_test = b.addRunArtifact(modular_wav_test);
     test_app_modular_step.dependOn(&run_modular_wav_test.step);
 
-    // apps/patch scalar params + grid/303 pattern serialize. std + serde only;
+    // apps/noodle scalar params + grid/303 pattern serialize. std + serde only;
     // no App/kit/modular (PatternPayload is a plain struct; main.zig converts to/from PatternCommand).
     const modular_pattern_io_test_mod = b.createModule(.{
-        .root_source_file = b.path("apps/patch/pattern_io.zig"),
+        .root_source_file = b.path("apps/noodle/pattern_io.zig"),
         .target = target,
         .optimize = optimize,
     });
@@ -1977,9 +1977,9 @@ pub fn build(b: *std.Build) void {
     const run_modular_pattern_io_test = b.addRunArtifact(modular_pattern_io_test);
     test_app_modular_step.dependOn(&run_modular_pattern_io_test.step);
 
-    // apps/patch integrated project serialize (KNGN). serde + modular (graph_io) + group/pattern_io.
+    // apps/noodle integrated project serialize (KNGN). serde + modular (graph_io) + group/pattern_io.
     const modular_project_io_test_mod = b.createModule(.{
-        .root_source_file = b.path("apps/patch/project_io.zig"),
+        .root_source_file = b.path("apps/noodle/project_io.zig"),
         .target = target,
         .optimize = optimize,
     });
@@ -1991,10 +1991,10 @@ pub fn build(b: *std.Build) void {
     const run_modular_project_io_test = b.addRunArtifact(modular_project_io_test);
     test_app_modular_step.dependOn(&run_modular_project_io_test.step);
 
-    // apps/patch seed derive. std only.
+    // apps/noodle seed derive. std only.
     const modular_seed_test = b.addTest(.{
         .root_module = b.createModule(.{
-            .root_source_file = b.path("apps/patch/seed.zig"),
+            .root_source_file = b.path("apps/noodle/seed.zig"),
             .target = target,
             .optimize = optimize,
         }),
@@ -2002,9 +2002,9 @@ pub fn build(b: *std.Build) void {
     const run_modular_seed_test = b.addRunArtifact(modular_seed_test);
     test_app_modular_step.dependOn(&run_modular_seed_test.step);
 
-    // apps/patch CommandRecord wiring contract. command is std only; uses existing APIs.
+    // apps/noodle CommandRecord wiring contract. command is std only; uses existing APIs.
     const modular_cmd_seed_test_mod = b.createModule(.{
-        .root_source_file = b.path("apps/patch/cmd_seed_test.zig"),
+        .root_source_file = b.path("apps/noodle/cmd_seed_test.zig"),
         .target = target,
         .optimize = optimize,
     });
@@ -2014,20 +2014,20 @@ pub fn build(b: *std.Build) void {
     test_app_modular_step.dependOn(&run_modular_cmd_seed_test.step);
 
     // patch undo CommandAdapter contract (pattern/ring/epoch; no main)
-    const patch_undo_cmd_test_mod = b.createModule(.{
-        .root_source_file = b.path("apps/patch/undo_cmd_test.zig"),
+    const noodle_undo_cmd_test_mod = b.createModule(.{
+        .root_source_file = b.path("apps/noodle/undo_cmd_test.zig"),
         .target = target,
         .optimize = optimize,
     });
-    patch_undo_cmd_test_mod.addImport("command", command_test_mod);
-    const patch_undo_cmd_test = b.addTest(.{ .root_module = patch_undo_cmd_test_mod });
-    const run_patch_undo_cmd_test = b.addRunArtifact(patch_undo_cmd_test);
-    test_app_modular_step.dependOn(&run_patch_undo_cmd_test.step);
+    noodle_undo_cmd_test_mod.addImport("command", command_test_mod);
+    const noodle_undo_cmd_test = b.addTest(.{ .root_module = noodle_undo_cmd_test_mod });
+    const run_noodle_undo_cmd_test = b.addRunArtifact(noodle_undo_cmd_test);
+    test_app_modular_step.dependOn(&run_noodle_undo_cmd_test.step);
 
-    // apps/patch pure-logic test aggregate root (canvas: camera transform / hit-test / clip detect + group: group ledger /
+    // apps/noodle pure-logic test aggregate root (canvas: camera transform / hit-test / clip detect + group: group ledger /
     // expose derivation / display mapping. no display/audio)
     const patch_tests_mod = b.createModule(.{
-        .root_source_file = b.path("apps/patch/tests.zig"),
+        .root_source_file = b.path("apps/noodle/tests.zig"),
         .target = target,
         .optimize = optimize,
     });
@@ -2037,13 +2037,13 @@ pub fn build(b: *std.Build) void {
     patch_tests_mod.addImport("build_options", max_modules_mod);
     const patch_tests = b.addTest(.{ .root_module = patch_tests_mod });
     const run_patch_tests = b.addRunArtifact(patch_tests);
-    const test_patch_step = b.step("test-patch", "Run apps/patch canvas + group logic tests");
+    const test_patch_step = b.step("test-noodle", "Run apps/noodle canvas + group logic tests");
     test_patch_step.dependOn(&run_patch_tests.step);
 
-    // apps/patch layout target-list wire format (std only; encode/decode + args budget).
+    // apps/noodle layout target-list wire format (std only; encode/decode + args budget).
     const patch_layout_wire_test = b.addTest(.{
         .root_module = b.createModule(.{
-            .root_source_file = b.path("apps/patch/layout_wire.zig"),
+            .root_source_file = b.path("apps/noodle/layout_wire.zig"),
             .target = target,
             .optimize = optimize,
         }),
@@ -2051,10 +2051,10 @@ pub fn build(b: *std.Build) void {
     const run_patch_layout_wire_test = b.addRunArtifact(patch_layout_wire_test);
     test_patch_step.dependOn(&run_patch_layout_wire_test.step);
 
-    // apps/patch action pure parser. std only; no App/kit/modular; no imports.
+    // apps/noodle action pure parser. std only; no App/kit/modular; no imports.
     const patch_actions_test = b.addTest(.{
         .root_module = b.createModule(.{
-            .root_source_file = b.path("apps/patch/actions.zig"),
+            .root_source_file = b.path("apps/noodle/actions.zig"),
             .target = target,
             .optimize = optimize,
         }),
@@ -2062,10 +2062,10 @@ pub fn build(b: *std.Build) void {
     const run_patch_actions_test = b.addRunArtifact(patch_actions_test);
     test_patch_step.dependOn(&run_patch_actions_test.step);
 
-    // apps/patch node/edge topology serialize. std + serde + modular (ModuleKind
+    // apps/noodle node/edge topology serialize. std + serde + modular (ModuleKind
     // single source) only; no App/kit/canvas.
     const patch_graph_io_test_mod = b.createModule(.{
-        .root_source_file = b.path("apps/patch/graph_io.zig"),
+        .root_source_file = b.path("apps/noodle/graph_io.zig"),
         .target = target,
         .optimize = optimize,
     });
@@ -2075,16 +2075,16 @@ pub fn build(b: *std.Build) void {
     const run_patch_graph_io_test = b.addRunArtifact(patch_graph_io_test);
     test_patch_step.dependOn(&run_patch_graph_io_test.step);
 
-    // apps/patch macro builder tests (DrumMachine template: preflight/rollback/determinism/sound regression)
+    // apps/noodle macro builder tests (DrumMachine template: preflight/rollback/determinism/sound regression)
     const patch_macro_test_mod = b.createModule(.{
-        .root_source_file = b.path("apps/patch/macro.zig"),
+        .root_source_file = b.path("apps/noodle/macro.zig"),
         .target = target,
         .optimize = optimize,
     });
     patch_macro_test_mod.addImport("modular", shared_modules.modular.mod);
     const patch_macro_test = b.addTest(.{ .root_module = patch_macro_test_mod });
     const run_patch_macro_test = b.addRunArtifact(patch_macro_test);
-    const test_macro_step = b.step("test-macro", "Run apps/patch macro (DrumMachine template) tests");
+    const test_macro_step = b.step("test-macro", "Run apps/noodle macro (DrumMachine template) tests");
     test_macro_step.dependOn(&run_patch_macro_test.step);
 
     // src/dsp tests (Oscillator / Envelope / Filter / Mixer)
@@ -2479,7 +2479,7 @@ pub fn build(b: *std.Build) void {
     // bench-lofi: compare LofiPatch.render before/after DynGraph swap under the same conditions.
     // patch needs only modular/synth/dsp, same as the pure-test root.
     const bench_lofi_patch_mod = b.createModule(.{
-        .root_source_file = b.path("apps/patch/lofi.zig"),
+        .root_source_file = b.path("apps/noodle/lofi.zig"),
         .target = target,
         .optimize = .ReleaseFast,
     });
@@ -2716,7 +2716,7 @@ const SharedModules = struct {
     gamepad: TaggedModule, // src/gamepad.zig (gamepad input helper; headless lib depending only on platform_types; kit-listed)
     sound: TaggedModule, // libs/sound (WAV decode + SE/BGM mixer; dsp + synth; kit-listed)
     midi: TaggedModule, // core/midi.zig (MIDI facade)
-    /// modular/patch -Dmax-modules. Referenced by group.zig / addPatchExe.
+    /// modular/patch -Dmax-modules. Referenced by group.zig / addNoodleExe.
     max_modules: usize,
     /// Shared build_options Module (max_modules). createModule once; all consumers addImport.
     max_modules_mod: *std.Build.Module,
@@ -3204,13 +3204,13 @@ fn addPixieExe(
 }
 
 // ============================================================
-// Helper: set up a patch app exe for one backend (apps/patch)
+// Helper: set up a patch app exe for one backend (apps/noodle)
 // platform + gui + modular (dynamic graph engine) + audio (live rewiring makes sound).
 // canvas.zig/group.zig/macro.zig are pulled in via relative @import from main.zig (same module)
-// (apps/patch/main.zig relative-imports lofi.zig. macro.zig's
+// (apps/noodle/main.zig relative-imports lofi.zig. macro.zig's
 // @import("modular") resolves the "modular" named import already registered on this exe.root_module).
 // ============================================================
-fn addPatchExe(
+fn addNoodleExe(
     b: *std.Build,
     target: std.Build.ResolvedTarget,
     optimize: std.builtin.OptimizeMode,
@@ -3224,7 +3224,7 @@ fn addPatchExe(
     const exe = b.addExecutable(.{
         .name = name,
         .root_module = b.createModule(.{
-            .root_source_file = b.path("apps/patch/main.zig"),
+            .root_source_file = b.path("apps/noodle/main.zig"),
             .target = target,
             .optimize = optimize,
         }),
@@ -3242,10 +3242,10 @@ fn addPatchExe(
     link(root, common.scope);
     link(root, common.serde); // graph_io.zig (serialize: versioned-container serialization of node/edge topology)
     // pixelops is re-exported via kit (kit.pixelops); no direct apps → pixelops link.
-    linkAppException(root, common.synth, "apps/patch/lofi.zig uses the generative layer directly (SampleTap / AtomicF32)");
-    linkAppException(root, common.dsp, "apps/patch/lofi.zig uses the generative layer directly (FFT band energy checks)");
+    linkAppException(root, common.synth, "apps/noodle/lofi.zig uses the generative layer directly (SampleTap / AtomicF32)");
+    linkAppException(root, common.dsp, "apps/noodle/lofi.zig uses the generative layer directly (FFT band energy checks)");
     linkAudioBackend(exe, target.result.os.tag); // macOS=AudioToolbox / Linux=asound / Windows=ole32
-    // Opt-in link so run-patch can use kit.midi (CoreMIDI).
+    // Opt-in link so run-noodle can use kit.midi (CoreMIDI).
     linkMidiBackend(exe, target.result.os.tag);
 
     // Gamepad opt-in off. Native menu opt-in on.

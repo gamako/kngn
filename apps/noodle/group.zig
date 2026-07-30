@@ -1,7 +1,7 @@
-//! apps/patch: the group/macro ledger.
+//! apps/noodle: the group/macro ledger.
 //!
 //! Pure Zig with no platform / gui / modular imports (on par with canvas.zig). Types are imported from canvas.zig.
-//! Fixed allocation only, no dynamic allocation. Unit-testable without display/audio (test-patch).
+//! Fixed allocation only, no dynamic allocation. Unit-testable without display/audio (test-noodle).
 //!
 //! Design: a macro's members are ordinary primitive modules, each holding a handle on the DynGraph.
 //! Which handle belongs to which macro, whether it is collapsed, and which ports are exposed outward are held by this ledger on the main (UI) side,
@@ -453,7 +453,7 @@ fn sortExposed(list: []ExposedPort) void {
 }
 
 // ============================================================================
-// tests (no display/audio needed; test-patch)
+// tests (no display/audio needed; test-noodle)
 // ============================================================================
 const testing = std.testing;
 

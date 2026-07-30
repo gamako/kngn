@@ -1,4 +1,4 @@
-//! apps/patch: offline WAV export.
+//! apps/noodle: offline WAV export.
 //!
 //! Hot-path declaration: event-time only (`action render` / unit tests). Chunk-loops LofiPatch offline
 //! on the main thread. Never touches the RT playback path (live patch's render / onAudioSamples)

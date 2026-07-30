@@ -1,4 +1,4 @@
-//! The lo-fi minimal techno generative patch for apps/patch.
+//! The lo-fi minimal techno generative patch for apps/noodle.
 //!
 //! Two generation streams run together on the libs/modular graph engine:
 //!   - Foreground (grid/303): an editable StepSeq, clock-synced, drives Kick/Hat/Clap/Bass.

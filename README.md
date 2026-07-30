@@ -317,7 +317,7 @@ probe, and the MCP server are in [`docs/harness.md`](docs/harness.md).
 
 ```bash
 direnv allow                  # with nix plus direnv (recommended); zig 0.16.0 lands on PATH
-zig build run-pixie           # the pixel editor. Also run / run-synth / run-patch / run-example_NN
+zig build run-pixie           # the pixel editor. Also run / run-synth / run-noodle / run-example_NN
 zig build test                # every test
 ```
 

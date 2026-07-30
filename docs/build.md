@@ -85,7 +85,7 @@ zig build -Dplatform=metal       # pick a backend
 zig build run                    # the main program (an HSV rainbow gradient)
 zig build run-pixie              # the pixel editor
 zig build run-synth              # the synth (A..K = C4..C5, ESC quits)
-zig build run-patch              # the modular patch canvas
+zig build run-noodle              # the modular patch canvas
 zig build run-example_01         # one example (01..41)
 
 zig build --release=fast         # a release build

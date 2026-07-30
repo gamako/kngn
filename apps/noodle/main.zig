@@ -1,4 +1,4 @@
-//! apps/patch (run-patch): visually displays a minimal patch on the dynamic graph engine (DynGraph)
+//! apps/noodle (run-noodle): visually displays a minimal patch on the dynamic graph engine (DynGraph)
 //! as a patch-canvas UI.
 //!
 //! Modules are drawn as node rectangles plus port dots (kind colours audio/cv/gate) plus cable lines; pan (background drag) /
@@ -8,7 +8,7 @@
 //! UI layout state (node world positions, camera, hover, selected, group ledger) lives on the GUI (main thread)
 //! and is kept separate from the RT graph description (connections/order) — not published. Drawing reads currentView()'s
 //! published topology for display.
-//! Pure geometry / hit-test / clip logic lives in canvas.zig (platform-free; unit-tested via test-patch).
+//! Pure geometry / hit-test / clip logic lives in canvas.zig (platform-free; unit-tested via test-noodle).
 //!
 //! Groups/macros (DrumMachine) display as a single collapsed node box; expanding reveals the internal
 //! primitive subgraph (one level of nesting). Macro members exist as ordinary primitive modules on
@@ -190,7 +190,7 @@ fn midiBindingDescriptorsExist() bool {
 }
 
 /// Canonical app name for recipe / diagnostics (compatible with existing modular recipes).
-const APP_NAME = "modular";
+const APP_NAME = "noodle";
 
 const WIN_W = 960;
 // Add a visualisation strip (VIS_H) at the bottom (canvas usable height = fb_h - VIS_H).
@@ -1268,12 +1268,12 @@ const App = struct {
         return null;
     }
 
-    /// Append `.vprj` when the extension is missing (dialog return path; caller frees).
+    /// Append `.noodle` when the extension is missing (dialog return path; caller frees).
     fn ensureKngnExt(gpa: std.mem.Allocator, path: []const u8) ![]u8 {
-        if (path.len >= 5 and std.ascii.eqlIgnoreCase(path[path.len - 5 ..], ".vprj")) {
+        if (path.len >= 7 and std.ascii.eqlIgnoreCase(path[path.len - 7 ..], ".noodle")) {
             return gpa.dupe(u8, path);
         }
-        return std.fmt.allocPrint(gpa, "{s}.vprj", .{path});
+        return std.fmt.allocPrint(gpa, "{s}.noodle", .{path});
     }
 
     /// Run pending File ops at a safe point after framebuffer unlock (dialogs forbidden while locked).
@@ -1284,8 +1284,8 @@ const App = struct {
         switch (op) {
             .save_project => {
                 const maybe = platform.saveFileDialog(gpa, self.io, .{
-                    .default_name = "untitled.vprj",
-                    .allowed_ext = "vprj",
+                    .default_name = "untitled.noodle",
+                    .allowed_ext = "noodle",
                 }) catch return; // Ignore DialogFailed (headless) etc. and keep RT running
                 const path = maybe orelse return;
                 defer gpa.free(path);
@@ -1294,7 +1294,7 @@ const App = struct {
                 actionSaveProjectFile(self, final_path) catch {};
             },
             .open_project => {
-                const maybe = platform.openFileDialog(gpa, self.io, .{ .allowed_ext = "vprj" }) catch return;
+                const maybe = platform.openFileDialog(gpa, self.io, .{ .allowed_ext = "noodle" }) catch return;
                 const path = maybe orelse return;
                 defer gpa.free(path);
                 // Same path as actionLoadProject (args = path).
@@ -2216,7 +2216,7 @@ fn routeUiAction(app: *App, name: []const u8, args: []const u8) void {
 fn routeUiActionInto(app: *App, name: []const u8, args: []const u8, out_buf: []u8) ?[]const u8 {
     if (platform.netsyncActive()) {
         return platform.routeAction(name, args, out_buf) catch |err| {
-            std.debug.print("patch: routeAction {s} failed: {s}\n", .{ name, @errorName(err) });
+            std.debug.print("noodle: routeAction {s} failed: {s}\n", .{ name, @errorName(err) });
             return null;
         };
     }
@@ -2224,7 +2224,7 @@ fn routeUiActionInto(app: *App, name: []const u8, args: []const u8, out_buf: []u
         .actor = .local_user,
         .record_policy = .record,
     }, out_buf) catch |err| {
-        std.debug.print("patch: executeAction {s} failed: {s}\n", .{ name, @errorName(err) });
+        std.debug.print("noodle: executeAction {s} failed: {s}\n", .{ name, @errorName(err) });
         return null;
     };
     return res.output;
@@ -3022,7 +3022,7 @@ fn itemHandle(item: ?Item) ?Handle {
 /// (updateViz republishes). (2) Different display handles exposing the same real member/port → return may match
 /// (updateViz does not republish). updateViz detects change by
 /// `new_ports[] (this return) != app.tap_ports[]`, separately from slot retention (handle match).
-/// Body is `group.resolveExposedPort` (extracted App-free and pinned by test-patch).
+/// Body is `group.resolveExposedPort` (extracted App-free and pinned by test-noodle).
 fn resolveTapPort(app: *const App, dh: Handle) i32 {
     // app.dyn is already *DynGraph. &app.dyn would be ** and duck-typed method resolve would fail.
     return group.resolveExposedPort(&app.ledger, app.dyn, dh);
@@ -3328,14 +3328,14 @@ fn drawVizLabels(app: *const App, dl: *gui.DrawList, spec: *const Spec) void {
 }
 
 pub fn main(init: std.process.Init) !void {
-    std.debug.print("apps/patch: patch canvas (drag=move/pan, scroll=zoom, ESC quits)\n", .{});
+    std.debug.print("apps/noodle: patch canvas (drag=move/pan, scroll=zoom, ESC quits)\n", .{});
     const allocator = std.heap.c_allocator;
 
     try platform.init();
     defer platform.shutdown();
 
     // .physical fb (HiDPI). Layout uses logical_size; content_scale at the draw exit.
-    var window = try platform.Window.createWithOptions(WIN_W, WIN_H, "patch canvas (modular)", .{
+    var window = try platform.Window.createWithOptions(WIN_W, WIN_H, "noodle", .{
         .fb_mode = .physical,
     });
     defer window.destroy();
@@ -3418,7 +3418,7 @@ pub fn main(init: std.process.Init) !void {
     // appshell Preferences (panel/slot persistence).
     app.prefs = appshell.preferences.Preferences.init(allocator);
     const override_path = if (std.c.getenv("KNGN_APPSHELL_DIR")) |v| std.mem.span(v) else null;
-    if (appshell.paths.openAppDataDir(app.io, allocator, "patch", override_path)) |dir| {
+    if (appshell.paths.openAppDataDir(app.io, allocator, "noodle", override_path)) |dir| {
         app.prefs_dir = dir;
         _ = app.prefs.load(app.io, dir, "preferences.ash") catch {};
         panel_host.restore(panelPersistence(&app));
@@ -3428,7 +3428,7 @@ pub fn main(init: std.process.Init) !void {
             panel_host.setSlotVisible(.left, true);
         }
     } else |err| {
-        std.debug.print("apps/patch: preferences dir open failed: {s}\n", .{@errorName(err)});
+        std.debug.print("apps/noodle: preferences dir open failed: {s}\n", .{@errorName(err)});
     }
     // Startup auto-layout is a 1-shot apply inside the main loop (first time centerRect is non-null).
 
@@ -3445,7 +3445,7 @@ pub fn main(init: std.process.Init) !void {
     const viz_pixels = try allocator.alloc(u32, VIZ_BITMAP_W * VIS_H);
     defer allocator.free(viz_pixels);
 
-    platform.registerProbe(.{ .name = "patch", .ctx = &app, .ext = "json", .snapshot = patchSnapshot, .digest = patchDigest });
+    platform.registerProbe(.{ .name = "noodle", .ctx = &app, .ext = "json", .snapshot = patchSnapshot, .digest = patchDigest });
     platform.registerProbe(.{ .name = "group", .ctx = &app, .ext = "json", .snapshot = null, .digest = groupDigest });
     platform.registerProbe(.{ .name = "viz", .ctx = &app, .ext = "json", .snapshot = vizSnapshot, .digest = vizDigest });
     platform.registerProbe(.{ .name = "modular", .ctx = &app, .ext = "json", .snapshot = modularSnapshot, .digest = modularDigest });
@@ -3475,7 +3475,7 @@ pub fn main(init: std.process.Init) !void {
         return;
     };
     defer device.stop();
-    std.debug.print("apps/patch: drag between ports to patch / add from the palette / Delete removes / scroll=zoom. Audio is running.\n", .{});
+    std.debug.print("apps/noodle: drag between ports to patch / add from the palette / Delete removes / scroll=zoom. Audio is running.\n", .{});
 
     var stereo: [2048]f32 = undefined;
     var mono: [1024]f32 = undefined;
@@ -3678,7 +3678,7 @@ pub fn main(init: std.process.Init) !void {
                 .height = .{ .fixed = content_h_i },
             });
             panel_host.build(&gui_ctx) catch |err| {
-                std.debug.print("apps/patch: PanelHost.build failed: {s}\n", .{@errorName(err)});
+                std.debug.print("apps/noodle: PanelHost.build failed: {s}\n", .{@errorName(err)});
             };
             gui_ctx.endBox();
             // VIS_H spacer (keeps PanelHost content above the strip so they do not overlap).
@@ -3725,14 +3725,14 @@ pub fn main(init: std.process.Init) !void {
         app.prefs_dir = null;
     }
     app.prefs.deinit();
-    std.debug.print("apps/patch: done.\n", .{});
+    std.debug.print("apps/noodle: done.\n", .{});
 }
 
 // ============================================================================
 // harness custom probe: publish topology (node list + connections) + offscreen counts.
 // digest stays within the framework's fixed 1024B.
-// The `patch` probe is invariant = always shows the flat topology (real handles; unaffected by collapsed).
-// Nesting is machine-checked by pairing with the `group` probe (groupDigest) — digest patch × digest group.
+// The `noodle` probe is invariant = always shows the flat topology (real handles; unaffected by collapsed).
+// Nesting is machine-checked by pairing with the `group` probe (groupDigest) — digest noodle × digest group.
 // ============================================================================
 fn offscreenOf(app: *const App) canvas.OffscreenCounts {
     var node_buf: [MAX_MODULES]NodeGeom = undefined;
@@ -3829,7 +3829,7 @@ fn menuDigest(ctx: *anyopaque, buf: []u8) []const u8 {
     }) catch buf[0..0];
 }
 
-/// snapshot patch: independent of digest's 1024B limit; return all nodes/edges + layout as raw JSON.
+/// snapshot noodle: independent of digest's 1024B limit; return all nodes/edges + layout as raw JSON.
 fn patchSnapshot(ctx: *anyopaque, allocator: std.mem.Allocator) anyerror![]u8 {
     const app: *App = @ptrCast(@alignCast(ctx));
     var sn_buf: [MAX_MODULES]graph_io.StableNode = undefined;
@@ -3859,7 +3859,7 @@ fn patchSnapshot(ctx: *anyopaque, allocator: std.mem.Allocator) anyerror![]u8 {
 
 // ============================================================================
 // harness custom probe: `group` — publish the group ledger (nested topology).
-// Pair `digest patch` (flat topology) × `digest group` (membership/expose) to machine-check nesting.
+// Pair `digest noodle` (flat topology) × `digest group` (membership/expose) to machine-check nesting.
 // digest stays within the framework's fixed 1024B; no snapshot (null).
 // ============================================================================
 fn groupDigest(ctx: *anyopaque, buf: []u8) []const u8 {
@@ -4435,11 +4435,11 @@ fn doUndo(app: *App) void {
     var buf: [128]u8 = undefined;
     if (platform.netsyncActive()) {
         _ = platform.routeAction("undo", "", &buf) catch |err| {
-            std.debug.print("patch: undo failed: {s}\n", .{@errorName(err)});
+            std.debug.print("noodle: undo failed: {s}\n", .{@errorName(err)});
         };
     } else {
         _ = app.cmd_exec.undoOne(.local_user, &buf) catch |err| {
-            std.debug.print("patch: undoOne failed: {s}\n", .{@errorName(err)});
+            std.debug.print("noodle: undoOne failed: {s}\n", .{@errorName(err)});
         };
     }
     resyncUiAfterHistoryChange(app);
@@ -4449,11 +4449,11 @@ fn doRedo(app: *App) void {
     var buf: [128]u8 = undefined;
     if (platform.netsyncActive()) {
         _ = platform.routeAction("redo", "", &buf) catch |err| {
-            std.debug.print("patch: redo failed: {s}\n", .{@errorName(err)});
+            std.debug.print("noodle: redo failed: {s}\n", .{@errorName(err)});
         };
     } else {
         _ = app.cmd_exec.redoOne(.local_user, &buf) catch |err| {
-            std.debug.print("patch: redoOne failed: {s}\n", .{@errorName(err)});
+            std.debug.print("noodle: redoOne failed: {s}\n", .{@errorName(err)});
         };
     }
     resyncUiAfterHistoryChange(app);
@@ -4692,7 +4692,7 @@ fn restoreNodeIdsFromRefs(app: *App, mapping: []const ?Handle, refs: []const pro
 /// NodeRef → runtime Handle. Reject bare handle / group synthetic / stale id during netsync.
 fn resolveNodeRef(app: *const App, ref: actions.NodeRef, require_id_during_netsync: bool) !Handle {
     if (require_id_during_netsync and actions.nodeRefRejectDuringNetsync(ref, platform.netsyncActive())) {
-        platform.setActionErrorDetail("id_required", "use #<id> from digest patch during netsync");
+        platform.setActionErrorDetail("id_required", "use #<id> from digest noodle during netsync");
         return error.IdRequired;
     }
     switch (ref) {
@@ -4722,7 +4722,7 @@ fn resolveNodeRef(app: *const App, ref: actions.NodeRef, require_id_during_netsy
 
 fn nodeRefToId(app: *const App, ref: actions.NodeRef, forbid_handle: bool) !u64 {
     if (forbid_handle and ref == .handle) {
-        platform.setActionErrorDetail("id_required", "use #<id> from digest patch during netsync");
+        platform.setActionErrorDetail("id_required", "use #<id> from digest noodle during netsync");
         return error.IdRequired;
     }
     const h = try resolveNodeRef(app, ref, false);
@@ -5372,8 +5372,8 @@ fn actionLoadGraph(ctx: *anyopaque, args: []const u8, buf: []u8) anyerror![]cons
 
     if (!decoded.apply_graph) return error.UnsupportedFormat;
 
-    const ledger_ptr: ?*const group.Ledger = if (decoded.apply_ledger and decoded.format == .kngn) &decoded.ledger else null;
-    const genr_opt: ?project_io.GenRoleHandles = if (decoded.apply_genr and decoded.format == .kngn) decoded.genr else null;
+    const ledger_ptr: ?*const group.Ledger = if (decoded.apply_ledger and decoded.format == .noodle) &decoded.ledger else null;
+    const genr_opt: ?project_io.GenRoleHandles = if (decoded.apply_genr and decoded.format == .noodle) decoded.genr else null;
     const nprm_opt: ?[]const project_io.NodeParamRecord = if (decoded.apply_node_params) decoded.node_params else null;
     // PTCG: apply_ledger/genr are true but empty/INVALID (decodeFromPtcg)
     const result = if (decoded.format == .ptcg)
@@ -6109,7 +6109,7 @@ fn integratedStateSyncImport(ctx: *anyopaque, bytes: []const u8) anyerror!void {
     const gpa = std.heap.c_allocator;
     var decoded = try project_io.decode(Params, gpa, bytes);
     defer decoded.deinit(gpa);
-    if (decoded.format != .kngn) return error.UnsupportedFormat;
+    if (decoded.format != .noodle) return error.UnsupportedFormat;
 
     // Destructive apply only after validation completes (capacity is inside applyGraphReplace)
     const nprm_opt: ?[]const project_io.NodeParamRecord = if (decoded.apply_node_params) decoded.node_params else null;
@@ -6454,7 +6454,7 @@ fn persistPanelPrefs(app: *App) void {
         app.panel_host.setSlotVisible(.right, app.pre_hide_right_visible);
     }
     app.panel_host.persist(panelPersistence(app)) catch |err| {
-        std.debug.print("apps/patch: panel persist failed: {s}\n", .{@errorName(err)});
+        std.debug.print("apps/noodle: panel persist failed: {s}\n", .{@errorName(err)});
         if (was_hidden) {
             app.panel_host.setSlotVisible(.left, false);
             app.panel_host.setSlotVisible(.right, false);
@@ -6466,7 +6466,7 @@ fn persistPanelPrefs(app: *App) void {
         app.panel_host.setSlotVisible(.right, false);
     }
     app.prefs.save(app.io, dir, "preferences.ash") catch |err| {
-        std.debug.print("apps/patch: preferences save failed: {s}\n", .{@errorName(err)});
+        std.debug.print("apps/noodle: preferences save failed: {s}\n", .{@errorName(err)});
         return;
     };
     app.prefs_dirty = false;
@@ -7336,8 +7336,8 @@ fn actionLoadProject(ctx: *anyopaque, args: []const u8, buf: []u8) anyerror![]co
     defer loaded.deinit(gpa);
 
     if (loaded.apply_graph) {
-        const ledger_ptr: ?*const group.Ledger = if (loaded.apply_ledger and loaded.format == .kngn) &loaded.ledger else null;
-        const genr_opt: ?project_io.GenRoleHandles = if (loaded.apply_genr and loaded.format == .kngn) loaded.genr else null;
+        const ledger_ptr: ?*const group.Ledger = if (loaded.apply_ledger and loaded.format == .noodle) &loaded.ledger else null;
+        const genr_opt: ?project_io.GenRoleHandles = if (loaded.apply_genr and loaded.format == .noodle) loaded.genr else null;
         const nprm_opt: ?[]const project_io.NodeParamRecord = if (loaded.apply_node_params) loaded.node_params else null;
         const result = if (loaded.format == .ptcg)
             try applyGraphReplace(app, loaded.nodes, loaded.edges, null, null, null, loaded.node_id_refs, loaded.next_node_id)

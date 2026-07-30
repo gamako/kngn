@@ -186,11 +186,11 @@ kngn/
 │   ├── appshell/      # headless application state persistence (Preferences, WindowState, RecentFiles, DocumentHost). In kit
 │   ├── modular/       # the modular graph engine (not in kit — still in flux)
 │   ├── paint/         # the editor family's shared core (promoted from apps/editor/core by ADR-007 R6; not in kit)
-│   └── viz/           # visualisation (spectrogram and scope; shared by synth, modular and patch; not in kit)
+│   └── viz/           # visualisation (spectrogram and scope; shared by synth, modular and noodle; not in kit)
 ├── apps/              # L4, terminal consumers (kit-only per R5; only the in-flux libs modular/paint/viz may be imported directly)
 │   ├── editor/apps/pixie/ # the pixel editor (pen, eraser, layers, selection, bezier, the DB16 palette, undo, PNG)
 │   ├── synth/         # playing the synth from the PC keyboard (run-synth)
-│   └── patch/         # lo-fi generation plus the patch canvas (run-patch)
+│   └── noodle/        # the modular patch canvas: lo-fi generation plus live rewiring (run-noodle)
 └── docs/              # documentation (see the index above)
 ```
 
@@ -204,7 +204,7 @@ kngn/
 > crc32), `harness → dsp` (the spectrum analysis behind the audio digest),
 > `platform → pixelops` (the BGRA→RGBA SIMD swizzle for a wasm present),
 > `example_26 → paint` (a direct paint import in the demo), and
-> `apps/patch/lofi.zig → synth` / `→ dsp` (using the generative layer directly).
+> `apps/noodle/lofi.zig → synth` / `→ dsp` (using the generative layer directly).
 > Apps reach pixelops through `kit.pixelops` (re-export), not via `linkAppException`.
 > Migration follows R8's deferred policy, and files not yet moved stay in `src/`.
 
@@ -274,7 +274,7 @@ are implemented:
 - **Libraries**: `libs/png`, `libs/gui`, `libs/font`, `libs/synth`, `libs/sound`,
   `libs/pixelops`, `libs/gfx`, `libs/gmath`, `libs/serde`, `libs/recipe`,
   `libs/appshell`, `libs/modular`, `libs/paint`, `libs/viz`.
-- **Applications**: the pixel editor, the synth, and the patch canvas.
+- **Applications**: the pixel editor, the synth, and noodle (the modular patch canvas).
 - **The audio and synthesis layers**: see
   [docs/audio-and-synth.md](docs/audio-and-synth.md).
 - **The headless verification harness**: see [docs/harness.md](docs/harness.md).
@@ -462,9 +462,9 @@ cost, so **always also measure the application's real frame rate**. The procedur
 # Build every platform variant (also used as a build regression check for examples and platform)
 zig build -Dinstall-all=true
 
-# The module limit for the modular engine and the patch canvas (default 48 = bit-identical to today; range 48..=4096)
-# zig build -Dmax-modules=96 build-patch
-# zig build -Dmax-modules=96 test-modular test-app-modular test-patch
+# The module limit for the modular engine and noodle (default 48 = bit-identical to today; range 48..=4096)
+# zig build -Dmax-modules=96 build-noodle
+# zig build -Dmax-modules=96 test-modular test-app-modular test-noodle
 
 # Run every test (the aggregate; it bundles every test-*)
 zig build test
@@ -512,8 +512,8 @@ zig build run-pixie -Doptimize=ReleaseFast
 # The synth (play from the PC keyboard: A..K = C4..C5, ESC quits)
 zig build run-synth
 
-# The patch canvas (lo-fi generation plus the canvas; ESC quits)
-zig build run-patch
+# noodle, the modular patch canvas (lo-fi generation plus the canvas; ESC quits)
+zig build run-noodle
 
 # A specific example, from the root
 zig build run-example_01        # 01_timed_window

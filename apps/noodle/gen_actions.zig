@@ -1,4 +1,4 @@
-//! A pure parser for the generation-layer harness actions of apps/patch.
+//! A pure parser for the generation-layer harness actions of apps/noodle.
 //!
 //! Hot-path declaration: parsing results here are dispatched only at event time (once per harness
 //! `action <name> [args]` command). It is neither a per-frame per-pixel loop nor a per-sample RT path,

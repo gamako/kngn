@@ -1,7 +1,7 @@
-//! apps/patch: pure geometry / hit-test logic for the patch canvas.
+//! apps/noodle: pure geometry / hit-test logic for the patch canvas.
 //!
 //! Pure Zig with no platform / gui / modular imports. Camera transforms, node/port geometry, hit-testing,
-//! and viewport-containment checks (automatic off-screen detection) are provided here, unit-testable without display/audio (test-patch).
+//! and viewport-containment checks (automatic off-screen detection) are provided here, unit-testable without display/audio (test-noodle).
 //! Drawing/input (main.zig) only layers window, DrawList, and events on top of this logic.
 
 const std = @import("std");
@@ -689,7 +689,7 @@ fn portCircleInside(center: Vec2f, r: f32, vw: f32, vh: f32) bool {
 }
 
 // ============================================================================
-// tests (no display/audio needed; test-patch)
+// tests (no display/audio needed; test-noodle)
 // ============================================================================
 const testing = std.testing;
 

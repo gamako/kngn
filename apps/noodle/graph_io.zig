@@ -1,4 +1,4 @@
-//! apps/patch: serialization of the DynGraph node/edge topology (legacy PTCG format).
+//! apps/noodle: serialization of the DynGraph node/edge topology (legacy PTCG format).
 //!
 //! On top of libs/serde's versioned container, lay NODE chunk × N (node = kind + world coordinates) and
 //! EDGE chunk × M (connections) repeatedly (the same convention `document_io.zig` in `libs/paint` uses to repeat LAYR chunk
@@ -19,7 +19,7 @@
 //! Master output (`DynGraph.setOutput`) is also out of scope (there is no `set_output` action; it currently exists only in the
 //! default startup patch. If it becomes an action later, add an OUTP chunk to this file).
 //!
-//! **Avoiding circular imports**: does not import `App`/`Handle`/`Vec2f` (concrete types from apps/patch/main.zig and
+//! **Avoiding circular imports**: does not import `App`/`Handle`/`Vec2f` (concrete types from apps/noodle/main.zig and
 //! canvas.zig). Depends only on `modular` (the single source for `ModuleKind`) (since main.zig already directly imports it
 //! as a "flowing lib, app_direct_ok", this file is self-contained with the same dependency it uses).
 //!

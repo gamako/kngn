@@ -1,4 +1,4 @@
-//! apps/patch: pure parser for harness actions.
+//! apps/noodle: pure parser for harness actions.
 //!
 //! Hot-path declaration: parsing here runs only "on events" (once per harness
 //! `action <name> [args]` command dispatch). Neither a per-frame all-pixel loop nor a per-sample RT path,

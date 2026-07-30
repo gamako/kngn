@@ -1,4 +1,4 @@
-//! apps/patch: serialization of scalar parameters plus the grid/303 pattern (legacy MDLP).
+//! apps/noodle: serialization of scalar parameters plus the grid/303 pattern (legacy MDLP).
 //!
 //! Places 2 chunks in libs/serde's versioned container:
 //!   - SPRM: scalar `Params` (tempo/gain/mute, etc). Generically serializes main.zig's concrete type via comptime
@@ -13,7 +13,7 @@
 //! flat Params layout. The unified reader detects the MDLP magic and delegates to this decode.
 //!
 //! **Avoiding circular imports**: does not import `Params`/`PatternCommand` (concrete types from
-//! apps/patch/main.zig, lofi.zig). main.zig performs the conversion with `PatternPayload`
+//! apps/noodle/main.zig, lofi.zig). main.zig performs the conversion with `PatternPayload`
 //! (`patternToPayload`/`payloadToPatternCommand`).
 //!
 //! Scope: only the "contents of the pattern" (on/lock/accent/slide/deg + evolve) are saved. `rev` (the revision
@@ -98,7 +98,7 @@ fn unpackFrom(comptime T: type, bytes: []const u8) error{NonFiniteField}!T {
 
 // ── grid/303 pattern (fixed layout, equivalent to PatternCommand's contents; rev not included) ───────────────────
 
-/// Plain struct holding `PatternCommand`'s (apps/patch/lofi.zig) contents in an app-independent form.
+/// Plain struct holding `PatternCommand`'s (apps/noodle/lofi.zig) contents in an app-independent form.
 /// main.zig performs the conversion with `PatternCommand`.
 pub const PatternPayload = struct {
     evolve: bool = true,

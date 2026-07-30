@@ -1,7 +1,7 @@
-//! apps/patch: multi-node selection set.
+//! apps/noodle: multi-node selection set.
 //!
 //! Pure operations on a fixed bool array. Local UI state independent of App.selected.
-//! Does not import platform / gui / modular (unit-testable via test-patch).
+//! Does not import platform / gui / modular (unit-testable via test-noodle).
 
 const std = @import("std");
 const testing = std.testing;

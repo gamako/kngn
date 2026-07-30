@@ -676,7 +676,7 @@ pub const StepSeq = struct {
     }
 
     // --- Atomic accessors for pattern masks / playhead step ---
-    // Dynamic patch apps (apps/patch) edit the fold-box grid/303 while running (GUI store) / read the playhead
+    // Dynamic patch apps (apps/noodle) edit the fold-box grid/303 while running (GUI store) / read the playhead
     // every frame (GUI load). RT process loads the mask on a rising edge and load/stores step on a rising edge.
     // Only the cross-thread fields — mask(u16×3) and step(u8) — are touched with `@atomicLoad`/`@atomicStore(.monotonic)`
     // (field definitions and init syntax stay plain; do not wrap in std.atomic.Value).

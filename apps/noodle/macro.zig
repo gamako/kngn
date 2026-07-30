@@ -1,4 +1,4 @@
-//! apps/patch: template builder for macros (DrumMachine / BassMachine).
+//! apps/noodle: template builder for macros (DrumMachine / BassMachine).
 //!
 //! Pure logic depending on modular (DynGraph). Does not depend on platform/gui/canvas/group
 //! (registering the ledger entry in group.Ledger is done by main.zig only after confirming publish succeeded).

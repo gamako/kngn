@@ -1,4 +1,4 @@
-//! apps/patch: a Sugiyama-style layered layout for the display graph.
+//! apps/noodle: a Sugiyama-style layered layout for the display graph.
 //!
 //! Ranks and vertically stacks the display nodes/edges returned by mapNodesForCollapsed / buildDisplayEdges,
 //! writing real nodes to layout[handle], collapsed macro boxes to ledger.groups[gid].pos, and making an
@@ -6,7 +6,7 @@
 //!
 //! Hot-path declaration: runs only when the auto_layout / auto_layout_selected action is invoked (event time).
 //! It never touches per-frame drawing or the RT path.
-//! Pure Zig with no platform / gui / modular imports (only canvas / group). Unit-testable via test-patch.
+//! Pure Zig with no platform / gui / modular imports (only canvas / group). Unit-testable via test-noodle.
 
 const std = @import("std");
 const canvas = @import("canvas.zig");
@@ -409,7 +409,7 @@ fn findNode(nodes: []const NodeGeom, h: Handle) ?NodeGeom {
 }
 
 // ============================================================================
-// tests (no display/audio needed; test-patch)
+// tests (no display/audio needed; test-noodle)
 // ============================================================================
 const testing = std.testing;
 

@@ -17,7 +17,7 @@ const FRAMES: u32 = 512;
 const CHANNELS: u32 = 2;
 const BLOCKS: usize = 4000;
 
-/// Minimal patch (equivalent to apps/patch buildPatch; 6 nodes):
+/// Minimal patch (equivalent to apps/noodle buildPatch; 6 nodes):
 /// Clock→Euclid / VCO→VCF / LFO→VCF.cutoff / VCF→Output.
 fn buildSmall(g: *DynGraph) !void {
     const clock = try g.add(.clock, .{ .bpm = 120, .ppqn = 4 });

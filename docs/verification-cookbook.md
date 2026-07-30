@@ -100,7 +100,7 @@ Two things about that comparison are easy to get wrong:
 - **Pass condition**: the two crcs are identical.
 - **Limits**: this holds under the virtual clock (manual-clock replay) for
   applications with no real-time audio thread. An application with an audio
-  thread (recipe 6's `run-patch` note) draws real-time visualisations into the
+  thread (recipe 6's `run-noodle` note) draws real-time visualisations into the
   same frame, so its `fb` crc is not expected to repeat — see recipe 6's
   limits.
 
@@ -130,7 +130,7 @@ Two things about that comparison are easy to get wrong:
   fields fall in the expected range (an `expect audio rms>0.01` style
   threshold, say).
 - **Limits**: **an application with an audio thread does not have a
-  reproducible `fb` crc** (`run-patch` is the example: a port-activity glow, a
+  reproducible `fb` crc** (`run-noodle` is the example: a port-activity glow, a
   mini-scope, and a visualisation strip all draw from real-time state, so the
   frame differs run to run even under an identical script). Do not use `fb`
   crc as a regression oracle for such an application. The alternatives are: a

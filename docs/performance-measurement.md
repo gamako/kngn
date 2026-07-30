@@ -85,7 +85,7 @@ the synth 44.2 → 58.7fps.
   `examples/38_minigame`, which budget a real-time frame with bare `platform.sleep` so the
   audio pull still advances under a manual clock, and `examples/15_audio_tone`, whose sleep
   is the program's own lifetime.
-- Worked examples of pacing: **an own loop** is `apps/patch/main.zig` (the defer at the
+- Worked examples of pacing: **an own loop** is `apps/noodle/main.zig` (the defer at the
   top of the loop body); **through the runtime** is `core/app_runtime.zig` (its consumers,
   the editor and the synth, never call it themselves).
 

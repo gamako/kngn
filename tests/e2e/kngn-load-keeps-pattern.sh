@@ -7,7 +7,7 @@ ROOT=$(cd "$(dirname "$0")/../.." && pwd)
 MAIN="${KNGN_MAIN_DIR:-$ROOT}"
 KNGN="$ROOT/scripts/kngn"
 cd "$ROOT"
-WORKDIR=$(mktemp -d /tmp/t151-XXXXXX)
+WORKDIR=$(mktemp -d /tmp/kngn-load-keeps-pattern-XXXXXX)
 trap 'rm -rf "$WORKDIR"' EXIT
 
 PATTERN_EXPECT='"kick":"1981".*"hat":"1050".*"clap":"c444".*"bass_on":"4949"'
@@ -22,7 +22,7 @@ start_patch() {
   rm -f "$port_file"
   # extra args are NAME=value env assignments (e.g. KNGN_NETSYNC_HOST=1)
   env KNGN_HEADLESS=1 KNGN_HARNESS_LISTEN= KNGN_HARNESS_PORT_FILE="$port_file" KNGN_HARNESS_OUT="$out_dir" "$@" \
-    direnv exec "$MAIN" zig build run-patch >"$out_dir/app.log" 2>&1 &
+    direnv exec "$MAIN" zig build run-noodle >"$out_dir/app.log" 2>&1 &
   echo $!
 }
 
@@ -72,7 +72,7 @@ quit_pid() {
 # solo: save → load → cross a bar → save → cmp bit-identical
 # ---------------------------------------------------------------------------
 log "=== solo E2E ==="
-SOLO_PORT=/tmp/t151-solo.port
+SOLO_PORT=/tmp/kngn-load-keeps-pattern-solo.port
 SOLO_OUT="$WORKDIR/solo-out"
 BEFORE="$WORKDIR/before.kngn"
 AFTER="$WORKDIR/after.kngn"
@@ -107,8 +107,8 @@ rm -f "$SOLO_PORT"
 # netsync: host-edited pattern → client SYNC → digest modular match
 # ---------------------------------------------------------------------------
 log "=== netsync E2E ==="
-HOST_PORT=/tmp/t151-host.port
-CLIENT_PORT=/tmp/t151-client.port
+HOST_PORT=/tmp/kngn-load-keeps-pattern-host.port
+CLIENT_PORT=/tmp/kngn-load-keeps-pattern-client.port
 HOST_OUT="$WORKDIR/host-out"
 CLIENT_OUT="$WORKDIR/client-out"
 

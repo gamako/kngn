@@ -261,7 +261,7 @@ use it directly.
 
 - **Existing callers need no changes**: appending to the `Event` union does not
   affect a switch that has an `else =>`. The exhaustive switches without an `else`
-  (the `toGuiEvent` family in the examples, `apps/patch`, and parts of
+  (the `toGuiEvent` family in the examples, `apps/noodle`, and parts of
   `apps/editor/apps/pixie`) each gain a one-line no-op branch — the same scope of change as when
   `char_input` was added.
 - **Backends implement independently**: macOS has done so (GameController). Linux and

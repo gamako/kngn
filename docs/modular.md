@@ -35,7 +35,7 @@ engine.
 - **The lo-fi effect DSP** (`src/dsp`): Bitcrush (reducing bits and sample rate),
   VinylNoise (crackle plus hiss) and WowFlutter (pitch wobble from a variable delay).
   The existing DelayLine, Reverb and softClip are also used from effect wrapper modules.
-- **apps/patch** (`run-patch`): `LofiPatch` in `lofi.zig` builds a self-generating patch
+- **apps/noodle** (`run-noodle`): `LofiPatch` in `lofi.zig` builds a self-generating patch
   once and runs `graph.processBlock` in real time, and `main.zig` provides the window,
   audio, harness probes and the `DrumMachine` and `BassMachine` GUI. `LofiPatch` is
   self-referential — the graph holds context pointers into each module — so it is
@@ -113,12 +113,12 @@ the `CommandLog` (the same shape as `recipe_save`). The response is
 
 ## The patch canvas
 
-`apps/patch` (`run-patch`) is a patch canvas for visually editing the dynamic graph
+`apps/noodle` (`run-noodle`) is a patch canvas for visually editing the dynamic graph
 engine (`DynGraph`). Nodes are drawn as rectangles with type-coloured ports (audio
 orange, cv blue, gate green) plus cables, and it supports pan, zoom, drag, live
 rewiring, adding from a palette, and the `DrumMachine` and `BassMachine` macros (folding
 and unfolding, the TR and 303 grids). UI layout state belongs to the GUI side and is not
-published (`group.Ledger`). The pure geometry lives in `canvas.zig` (`test-patch`).
+published (`group.Ledger`). The pure geometry lives in `canvas.zig` (`test-noodle`).
 
 ### Signal visualisation
 
@@ -140,22 +140,22 @@ published (`group.Ledger`). The pure geometry lives in `canvas.zig` (`test-patch
 - The effective canvas height is `fb_h - VIS_H`, applied consistently to clipping
   detection, hit testing and choosing a tap target. The harness's `viz` probe exposes
   the master rms and peak plus the port being tapped, its level and its write position
-  (used alongside the `patch` and `group` probes).
+  (used alongside the `noodle` and `group` probes).
 
 ## Commands
 
 ```bash
-zig build run-patch            # the integrated lo-fi generation plus the patch canvas (ESC quits)
+zig build run-noodle            # the integrated lo-fi generation plus the patch canvas (ESC quits)
 zig build test-modular         # libs/modular (topology, cycles, single connections, generated CV, synthesised drums, per-port tap). No display or audio needed
-zig build test-app-modular     # LofiPatch in apps/patch/lofi.zig (offline: not silent, finite, a deterministic crc)
-zig build test-patch           # apps/patch pure geometry (camera, hit testing, clipping, tap selection, mini scope geometry) plus the group ledger
+zig build test-app-modular     # LofiPatch in apps/noodle/lofi.zig (offline: not silent, finite, a deterministic crc)
+zig build test-noodle           # apps/noodle pure geometry (camera, hit testing, clipping, tap selection, mini scope geometry) plus the group ledger
 ```
 
 Checking acceptance headlessly (sound comes out on macOS hardware; the audio digest is
 taken live):
 
 ```bash
-KNGN_HARNESS_LISTEN= KNGN_HARNESS_PORT_FILE=/tmp/kngn.port zig build run-patch &     # start in the background
+KNGN_HARNESS_LISTEN= KNGN_HARNESS_PORT_FILE=/tmp/kngn.port zig build run-noodle &     # start in the background
 scripts/kngn ctl --port-file /tmp/kngn.port 'digest audio'                        # → check silent=0 and rms>0
 scripts/kngn ctl --port-file /tmp/kngn.port 'quit'
 ```
@@ -163,5 +163,5 @@ scripts/kngn ctl --port-file /tmp/kngn.port 'quit'
 > Determinism is guaranteed by "two renders produce the same crc" in
 > `test-app-modular` (no golden constant is placed that a change of synthesis
 > parameters would break). Producing sound on Linux depends on the environment (see
-> the prerequisites in `docs/audio-and-synth.md`), so `run-patch` is manual there,
+> the prerequisites in `docs/audio-and-synth.md`), so `run-noodle` is manual there,
 > while `test-modular` and `test-app-modular` are OS-independent and mandatory.

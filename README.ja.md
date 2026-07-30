@@ -260,7 +260,7 @@ apps  →  kit  →  libs  →  core  →  platform      （一方向依存。bu
 
 ```bash
 direnv allow                  # nix + direnv の場合（推奨）。zig 0.16.0 が PATH に乗る
-zig build run-pixie           # ピクセルエディタ。ほかに run / run-synth / run-patch / run-example_NN
+zig build run-pixie           # ピクセルエディタ。ほかに run / run-synth / run-noodle / run-example_NN
 zig build test                # 全テスト
 ```
 

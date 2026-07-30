@@ -15,7 +15,7 @@ fn asStepgrid(g: canvas.GridGeometry) stepgrid.Geometry {
     };
 }
 
-test "patch: box-local macro grid geometry round-trips through stepgrid hit-test" {
+test "noodle: box-local macro grid geometry round-trips through stepgrid hit-test" {
     const local_geometry = asStepgrid(canvas.gridGeometry(
         .{ .zoom = 1.0 },
         .{ .x = 0, .y = 0 },
@@ -44,7 +44,7 @@ test "patch: box-local macro grid geometry round-trips through stepgrid hit-test
     );
 }
 
-test "patch: generated three-lane grid hits every clap-row cell" {
+test "noodle: generated three-lane grid hits every clap-row cell" {
     const geometry = asStepgrid(canvas.gridGeometry(
         .{ .zoom = 1.0 },
         .{ .x = 40, .y = 330 },
@@ -70,7 +70,7 @@ test "patch: generated three-lane grid hits every clap-row cell" {
     try std.testing.expect(last.y + last.h <= box.pos.y + canvas.nodeSize(box).y);
 }
 
-test "patch: 1-row inline grid hits 16 cells as row 0; row 1 is out of range" {
+test "noodle: 1-row inline grid hits 16 cells as row 0; row 1 is out of range" {
     const box_pos = canvas.Vec2f{ .x = 160, .y = 470 };
     const geometry = asStepgrid(canvas.gridGeometry(.{ .zoom = 1.0 }, box_pos));
     const clickable_rows: u8 = 1; // drum standalone
@@ -95,7 +95,7 @@ test "patch: 1-row inline grid hits 16 cells as row 0; row 1 is out of range" {
     );
 }
 
-test "patch: 4-row inline grid hits all 16x4 cell centers" {
+test "noodle: 4-row inline grid hits all 16x4 cell centers" {
     const box_pos = canvas.Vec2f{ .x = 200, .y = 100 };
     const geometry = asStepgrid(canvas.gridGeometry(.{ .zoom = 1.0 }, box_pos));
 
@@ -115,7 +115,7 @@ test "patch: 4-row inline grid hits all 16x4 cell centers" {
     }
 }
 
-test "patch: bass clickable rows=3 excludes pitch row from hit-test" {
+test "noodle: bass clickable rows=3 excludes pitch row from hit-test" {
     const geometry = asStepgrid(canvas.gridGeometry(
         .{ .zoom = 1.0 },
         .{ .x = 0, .y = 0 },
@@ -141,7 +141,7 @@ test "patch: bass clickable rows=3 excludes pitch row from hit-test" {
     );
 }
 
-test "patch: zoom keeps world-to-screen cell centers on same row/step" {
+test "noodle: zoom keeps world-to-screen cell centers on same row/step" {
     const box_pos = canvas.Vec2f{ .x = 160, .y = 470 };
     const cam = canvas.Camera{ .pan = .{ .x = 0, .y = 0 }, .zoom = 2.0 };
     const geometry = asStepgrid(canvas.gridGeometry(cam, box_pos));
@@ -162,7 +162,7 @@ test "patch: zoom keeps world-to-screen cell centers on same row/step" {
     }
 }
 
-test "patch: pan+zoom leaves inter-cell gap and outside-grid as null" {
+test "noodle: pan+zoom leaves inter-cell gap and outside-grid as null" {
     const box_pos = canvas.Vec2f{ .x = 40, .y = 330 };
     const cam = canvas.Camera{ .pan = .{ .x = 25, .y = -10 }, .zoom = 1.5 };
     const geometry = asStepgrid(canvas.gridGeometry(cam, box_pos));
