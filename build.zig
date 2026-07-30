@@ -705,8 +705,18 @@ pub fn build(b: *std.Build) void {
     command_test_mod.addImport("command_types", shared_modules.command_types.mod);
     const command_test = b.addTest(.{ .root_module = command_test_mod });
     const run_command_test = b.addRunArtifact(command_test);
+    // command entry codec / CMDL snapshot (depends only on command.zig + command_types)
+    const command_io_test_mod = b.createModule(.{
+        .root_source_file = b.path("core/control/command_io.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    command_io_test_mod.addImport("command_types", shared_modules.command_types.mod);
+    const command_io_test = b.addTest(.{ .root_module = command_io_test_mod });
+    const run_command_io_test = b.addRunArtifact(command_io_test);
     const test_command_step = b.step("test-command", "Run command model unit tests (types / executor / undo-redo / no-op recorder)");
     test_command_step.dependOn(&run_command_test.step);
+    test_command_step.dependOn(&run_command_io_test.step);
 
     // menu Command type-only model and App.dispatchCommand adapter.
     const command_types_test_mod = b.createModule(.{
@@ -1330,6 +1340,18 @@ pub fn build(b: *std.Build) void {
     const core_document_test = b.addTest(.{ .root_module = core_document_mod });
     const run_core_document_test = b.addRunArtifact(core_document_test);
 
+    // UndoStack Op entry codec / UOPS snapshot (paint-internal types only; no serde/core).
+    const undo_io_test_mod = b.createModule(.{
+        .root_source_file = b.path("libs/paint/src/undo_io.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    undo_io_test_mod.addImport("png", shared_modules.png.mod);
+    undo_io_test_mod.addImport("pixelops", shared_modules.pixelops.mod);
+    undo_io_test_mod.addImport("font", shared_modules.font.mod); // via canvas.zig → text_render.zig
+    const undo_io_test = b.addTest(.{ .root_module = undo_io_test_mod });
+    const run_undo_io_test = b.addRunArtifact(undo_io_test);
+
     const canvas_input_core = b.createModule(.{
         .root_source_file = b.path("libs/paint/src/paint.zig"),
     });
@@ -1602,6 +1624,7 @@ pub fn build(b: *std.Build) void {
     test_core_step.dependOn(&run_core_path_test.step);
     test_core_step.dependOn(&run_core_path_editor_test.step);
     test_core_step.dependOn(&run_core_document_test.step);
+    test_core_step.dependOn(&run_undo_io_test.step);
     test_core_step.dependOn(&run_canvas_input_test.step);
     test_core_step.dependOn(&run_bezier_input_test.step);
     test_core_step.dependOn(&run_core_selection_test.step);

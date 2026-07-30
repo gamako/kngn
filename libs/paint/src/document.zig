@@ -228,7 +228,8 @@ fn freeCelSetSnapshotContainer(gpa: Allocator, snap: CelSetSnapshot) void {
     gpa.free(snap.fully_released);
 }
 
-fn freeOp(gpa: Allocator, op: *Op) void {
+/// Free all owned slices inside one Op. Public so persistence codecs can clean up on error.
+pub fn freeOp(gpa: Allocator, op: *Op) void {
     switch (op.*) {
         .paint => |p| {
             gpa.free(p.diffs);
@@ -256,6 +257,11 @@ fn freeOp(gpa: Allocator, op: *Op) void {
         },
         .layer_visible, .layer_opacity, .layer_rename, .layer_reorder, .layer_text_params, .layer_rasterize => {},
     }
+}
+
+/// Free nested CelSetSnapshot owned memory (slots + fully_released pixels).
+pub fn freeCelSetSnapshotOwned(gpa: Allocator, snap: CelSetSnapshot) void {
+    freeCelSetSnapshot(gpa, snap);
 }
 
 /// Undo/Redo stack. Each Op's owned slices are owned by gpa.
@@ -360,6 +366,90 @@ pub const UndoStack = struct {
         const preserved = self.next_handle;
         self.deinit(gpa);
         self.* = .{ .next_handle = preserved };
+    }
+
+    /// Read-only view of stack arrays (borrows; parallel lengths must match for a valid stack).
+    pub fn stateView(self: *const UndoStack) UndoStackView {
+        return .{
+            .undo = self.undo.items,
+            .redo = self.redo.items,
+            .handles = self.handles.items,
+            .owners = self.owners.items,
+            .next_handle = self.next_handle,
+        };
+    }
+
+    /// Validate parallel lengths and handle invariants without mutating the stack.
+    pub fn validateOwnedState(state: *const UndoStackOwned) error{InvalidUndoState}!void {
+        if (state.undo.items.len != state.handles.items.len) return error.InvalidUndoState;
+        if (state.undo.items.len != state.owners.items.len) return error.InvalidUndoState;
+        if (state.undo.items.len > max_history) return error.InvalidUndoState;
+        if (state.redo.items.len > max_history) return error.InvalidUndoState;
+        // 0 is reserved; maxInt would overflow on the next allocHandle (next_handle += 1).
+        if (state.next_handle == 0 or state.next_handle == std.math.maxInt(u64)) return error.InvalidUndoState;
+
+        var max_handle: u64 = 0;
+        for (state.handles.items, 0..) |h, i| {
+            if (h == 0) return error.InvalidUndoState;
+            var j: usize = 0;
+            while (j < i) : (j += 1) {
+                if (state.handles.items[j] == h) return error.InvalidUndoState;
+            }
+            if (h > max_handle) max_handle = h;
+        }
+        if (max_handle >= state.next_handle) return error.InvalidUndoState;
+    }
+
+    /// Replace stack contents from an owned state. Does **not** use `push` (preserves handles,
+    /// owners, redo, and `next_handle`). On validation failure the existing stack is unchanged
+    /// and `new_state` remains owned by the caller. On success this stack takes ownership of
+    /// `new_state`'s arrays and frees the previous contents.
+    pub fn restoreState(self: *UndoStack, gpa: Allocator, new_state: *UndoStackOwned) error{InvalidUndoState}!void {
+        try validateOwnedState(new_state);
+
+        // Swap: free old, take new lists.
+        freeStack(gpa, &self.undo);
+        freeStack(gpa, &self.redo);
+        self.handles.deinit(gpa);
+        self.owners.deinit(gpa);
+
+        self.undo = new_state.undo;
+        self.redo = new_state.redo;
+        self.handles = new_state.handles;
+        self.owners = new_state.owners;
+        self.next_handle = new_state.next_handle;
+
+        // Leave new_state empty so caller's deinit is a no-op.
+        new_state.* = .{};
+    }
+};
+
+/// Borrowed view of UndoStack contents for export/inspection.
+pub const UndoStackView = struct {
+    undo: []const Op,
+    redo: []const Op,
+    handles: []const u64,
+    owners: []const u8,
+    next_handle: u64,
+};
+
+/// Owned transfer object for `UndoStack.restoreState`. Codec decoders build this, then
+/// hand it off; on failure the codec frees it with `deinit`.
+pub const UndoStackOwned = struct {
+    undo: std.ArrayList(Op) = .empty,
+    redo: std.ArrayList(Op) = .empty,
+    handles: std.ArrayList(u64) = .empty,
+    owners: std.ArrayList(u8) = .empty,
+    next_handle: u64 = 1,
+
+    pub fn deinit(self: *UndoStackOwned, gpa: Allocator) void {
+        for (self.undo.items) |*op| freeOp(gpa, op);
+        for (self.redo.items) |*op| freeOp(gpa, op);
+        self.undo.deinit(gpa);
+        self.redo.deinit(gpa);
+        self.handles.deinit(gpa);
+        self.owners.deinit(gpa);
+        self.* = .{};
     }
 };
 
@@ -2370,4 +2460,141 @@ test "Document.resize: keeps multi-layer/frame/linked-cel refs / same size no-op
     try testing.expectEqual(@as(usize, 2), doc.frames.items.len);
     try testing.expectEqual(@as(u32, 2), doc.active_view.width);
     try testing.expectEqual(@as(usize, 2), doc.active_view.layers.items.len);
+}
+
+// ============================================================================
+// UndoStack state view / restore (no byte codec)
+// ============================================================================
+
+test "UndoStack state view preserves parallel array lengths" {
+    const gpa = testing.allocator;
+    var s: UndoStack = .{};
+    defer s.deinit(gpa);
+
+    s.push(gpa, testVisOp(0));
+    s.setOwner(1, 3);
+    s.push(gpa, testVisOp(1));
+    s.setOwner(2, 5);
+
+    const view = s.stateView();
+    try testing.expectEqual(view.undo.len, view.handles.len);
+    try testing.expectEqual(view.undo.len, view.owners.len);
+    try testing.expectEqual(@as(usize, 2), view.undo.len);
+    try testing.expectEqual(@as(u64, 1), view.handles[0]);
+    try testing.expectEqual(@as(u64, 2), view.handles[1]);
+    try testing.expectEqual(@as(u8, 3), view.owners[0]);
+    try testing.expectEqual(@as(u8, 5), view.owners[1]);
+    try testing.expectEqual(@as(u64, 3), view.next_handle);
+}
+
+test "UndoStack restore preserves handles and owners" {
+    const gpa = testing.allocator;
+    var s: UndoStack = .{};
+    defer s.deinit(gpa);
+    s.push(gpa, testVisOp(0));
+    s.setOwner(1, 9);
+
+    var owned: UndoStackOwned = .{};
+    // Build owned state matching handles/owners without push semantics.
+    try owned.undo.append(gpa, testVisOp(7));
+    try owned.undo.append(gpa, testVisOp(8));
+    try owned.handles.append(gpa, 10);
+    try owned.handles.append(gpa, 11);
+    try owned.owners.append(gpa, 1);
+    try owned.owners.append(gpa, 2);
+    try owned.redo.append(gpa, testVisOp(99));
+    owned.next_handle = 12;
+
+    try s.restoreState(gpa, &owned);
+    try testing.expectEqual(@as(usize, 2), s.undo.items.len);
+    try testing.expectEqual(@as(usize, 1), s.redo.items.len);
+    try testing.expectEqual(@as(u64, 10), s.handles.items[0]);
+    try testing.expectEqual(@as(u64, 11), s.handles.items[1]);
+    try testing.expectEqual(@as(u8, 1), s.owners.items[0]);
+    try testing.expectEqual(@as(u8, 2), s.owners.items[1]);
+    try testing.expectEqual(@as(u64, 12), s.next_handle);
+    // owned was emptied on success
+    try testing.expectEqual(@as(usize, 0), owned.undo.items.len);
+}
+
+test "UndoStack restore preserves next handle" {
+    const gpa = testing.allocator;
+    var s: UndoStack = .{};
+    defer s.deinit(gpa);
+
+    var owned: UndoStackOwned = .{};
+    try owned.undo.append(gpa, testVisOp(0));
+    try owned.handles.append(gpa, 50);
+    try owned.owners.append(gpa, 0);
+    owned.next_handle = 100;
+
+    try s.restoreState(gpa, &owned);
+    try testing.expectEqual(@as(u64, 100), s.next_handle);
+    s.push(gpa, testVisOp(1));
+    try testing.expectEqual(@as(?u64, 100), s.topHandle());
+    try testing.expectEqual(@as(u64, 101), s.next_handle);
+}
+
+test "UndoStack restore does not use push semantics" {
+    const gpa = testing.allocator;
+    var s: UndoStack = .{};
+    defer s.deinit(gpa);
+
+    // push would clear redo; restore must keep redo.
+    var owned: UndoStackOwned = .{};
+    try owned.undo.append(gpa, testVisOp(1));
+    try owned.handles.append(gpa, 1);
+    try owned.owners.append(gpa, 0);
+    try owned.redo.append(gpa, testVisOp(2));
+    try owned.redo.append(gpa, testVisOp(3));
+    owned.next_handle = 2;
+
+    try s.restoreState(gpa, &owned);
+    try testing.expectEqual(@as(usize, 1), s.undo.items.len);
+    try testing.expectEqual(@as(usize, 2), s.redo.items.len);
+    try testing.expectEqual(@as(u64, 1), s.handles.items[0]);
+}
+
+test "UndoStack restore keeps the original stack on invalid state" {
+    const gpa = testing.allocator;
+    var s: UndoStack = .{};
+    defer s.deinit(gpa);
+    s.push(gpa, testVisOp(0));
+    s.setOwner(1, 4);
+    const before_len = s.undo.items.len;
+    const before_handle = s.handles.items[0];
+    const before_owner = s.owners.items[0];
+    const before_next = s.next_handle;
+
+    // invalid: handles length mismatch
+    var bad: UndoStackOwned = .{};
+    defer bad.deinit(gpa);
+    try bad.undo.append(gpa, testVisOp(9));
+    // no handles
+    bad.next_handle = 10;
+    try testing.expectError(error.InvalidUndoState, s.restoreState(gpa, &bad));
+    try testing.expectEqual(before_len, s.undo.items.len);
+    try testing.expectEqual(before_handle, s.handles.items[0]);
+    try testing.expectEqual(before_owner, s.owners.items[0]);
+    try testing.expectEqual(before_next, s.next_handle);
+
+    // invalid: handle 0
+    var bad0: UndoStackOwned = .{};
+    defer bad0.deinit(gpa);
+    try bad0.undo.append(gpa, testVisOp(9));
+    try bad0.handles.append(gpa, 0);
+    try bad0.owners.append(gpa, 0);
+    bad0.next_handle = 1;
+    try testing.expectError(error.InvalidUndoState, s.restoreState(gpa, &bad0));
+    try testing.expectEqual(before_len, s.undo.items.len);
+
+    // invalid: next_handle <= max handle
+    var bad_nh: UndoStackOwned = .{};
+    defer bad_nh.deinit(gpa);
+    try bad_nh.undo.append(gpa, testVisOp(9));
+    try bad_nh.handles.append(gpa, 5);
+    try bad_nh.owners.append(gpa, 0);
+    bad_nh.next_handle = 5;
+    try testing.expectError(error.InvalidUndoState, s.restoreState(gpa, &bad_nh));
+    try testing.expectEqual(before_handle, s.handles.items[0]);
 }

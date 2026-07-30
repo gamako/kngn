@@ -155,6 +155,80 @@ pub const CommandLog = struct {
         if (self.filled == 0) return null;
         return self.recordAtMut(self.filled - 1);
     }
+
+    /// Copy ring state for persistence. `records[0..filled]` are oldest-to-newest; unused slots are undefined.
+    pub fn exportState(self: *const CommandLog) CommandLogState {
+        var state: CommandLogState = .{
+            .filled = self.filled,
+            .head = self.head,
+            .next_seq = self.next_seq,
+            .records = undefined,
+        };
+        var i: u32 = 0;
+        while (i < self.filled) : (i += 1) {
+            state.records[i] = self.recordAt(i).*;
+        }
+        return state;
+    }
+
+    /// Replace ring state from an exported snapshot. Physical placement follows `head`/`filled`.
+    pub fn restoreState(self: *CommandLog, state: CommandLogState) void {
+        self.* = .{
+            .filled = state.filled,
+            .head = state.head,
+            .next_seq = state.next_seq,
+        };
+        var i: u32 = 0;
+        while (i < state.filled) : (i += 1) {
+            const idx = (self.head + MAX_CMD_LOG - self.filled + i) % MAX_CMD_LOG;
+            self.records[idx] = state.records[i];
+        }
+    }
+};
+
+/// Portable view of `CommandLog` for export/restore (no allocation; unused ring slots omitted).
+pub const CommandLogState = struct {
+    /// Oldest-to-newest; only `records[0..filled]` are valid.
+    records: [MAX_CMD_LOG]CommandRecord = undefined,
+    filled: u32 = 0,
+    head: u32 = 0,
+    next_seq: u64 = 1,
+};
+
+/// Portable actor-epoch slot for persistence (mirrors internal `ActorEpochSlot`).
+pub const ActorEpochState = struct {
+    actor: ActorId,
+    epoch: u64 = 0,
+};
+
+/// Portable open/closed transaction slot for persistence (mirrors internal `TxSlot`).
+pub const TransactionSlotState = struct {
+    open: bool = false,
+    id: u64 = 0,
+    actor: ActorId = .system,
+    generation: u32 = 0,
+    label_len: u8 = 0,
+    label_buf: [MAX_TX_LABEL]u8 = undefined,
+    undoable_member_count: u16 = 0,
+
+    pub fn label(self: *const TransactionSlotState) []const u8 {
+        return self.label_buf[0..self.label_len];
+    }
+};
+
+/// Executor persistence state: actor epochs, transaction slots, and id counter only.
+/// Runtime pointers and dispatch-only fields are not included.
+pub const ExecutorState = struct {
+    actors: [MAX_ACTORS]ActorEpochState = undefined,
+    actor_count: u32 = 0,
+    transactions: [MAX_OPEN_TX]TransactionSlotState = [_]TransactionSlotState{.{}} ** MAX_OPEN_TX,
+    next_transaction_id: u64 = 1,
+};
+
+/// Combined log + executor persistence state for snapshot codecs.
+pub const PersistentState = struct {
+    log: CommandLogState = .{},
+    executor: ExecutorState = .{},
 };
 
 /// The metadata an issuer passes alongside a command that came from a redo, which stops the epoch from being bumped wrongly.
@@ -295,6 +369,64 @@ pub const Executor = struct {
 
     pub fn setWireSession(self: *Executor, on: bool) void {
         self.wire_session = on;
+    }
+
+    /// Copy actor epochs, transaction slots, and `next_transaction_id` for persistence.
+    /// Does not include dispatcher/adapter/log pointers or dispatch-only fields.
+    pub fn exportState(self: *const Executor) ExecutorState {
+        var state: ExecutorState = .{
+            .actor_count = self.actor_count,
+            .next_transaction_id = self.next_transaction_id,
+            .actors = undefined,
+            .transactions = undefined,
+        };
+        var i: u32 = 0;
+        while (i < self.actor_count) : (i += 1) {
+            state.actors[i] = .{
+                .actor = self.actor_table[i].actor,
+                .epoch = self.actor_table[i].epoch,
+            };
+        }
+        for (self.tx_table, 0..) |slot, ti| {
+            state.transactions[ti] = .{
+                .open = slot.open,
+                .id = slot.id,
+                .actor = slot.actor,
+                .generation = slot.generation,
+                .label_len = slot.label_len,
+                .label_buf = slot.label_buf,
+                .undoable_member_count = slot.undoable_member_count,
+            };
+        }
+        return state;
+    }
+
+    /// Restore actor epochs, transaction slots, and `next_transaction_id`.
+    /// Keeps dispatcher, adapter, log pointer, and `wire_session`. Clears dispatch-only state.
+    pub fn restoreState(self: *Executor, state: ExecutorState) void {
+        self.actor_count = state.actor_count;
+        var i: u32 = 0;
+        while (i < state.actor_count) : (i += 1) {
+            self.actor_table[i] = .{
+                .actor = state.actors[i].actor,
+                .epoch = state.actors[i].epoch,
+            };
+        }
+        for (state.transactions, 0..) |slot, ti| {
+            self.tx_table[ti] = .{
+                .open = slot.open,
+                .id = slot.id,
+                .actor = slot.actor,
+                .generation = slot.generation,
+                .label_len = slot.label_len,
+                .label_buf = slot.label_buf,
+                .undoable_member_count = slot.undoable_member_count,
+            };
+        }
+        self.next_transaction_id = state.next_transaction_id;
+        self.in_dispatch = false;
+        self.pending_undo_ref = null;
+        self.pending_set = false;
     }
 
     /// Called by the application while the dispatch callback runs. **pending is cleared at the start of a dispatch, consumed
@@ -1877,4 +2009,150 @@ test "App.dispatchCommand: an unregistered ID reaches neither the Executor nor t
     };
     var buf: [8]u8 = undefined;
     try testing.expectError(error.UnknownCommand, app.dispatchCommand(99, &buf));
+}
+
+// ============================================================================
+// persistence state transfer (export / restore; no byte codec)
+// ============================================================================
+
+test "persistent state export preserves command log order" {
+    var app: MockApp = undefined;
+    var log: CommandLog = undefined;
+    var exec: Executor = undefined;
+    wire(&app, &log, &exec);
+    var buf: [256]u8 = undefined;
+
+    _ = try exec1(&exec, .local_user, "a", &buf);
+    _ = try exec1(&exec, .local_agent, "b", &buf);
+    _ = try exec1(&exec, .local_user, "c", &buf);
+
+    const state = log.exportState();
+    try testing.expectEqual(@as(u32, 3), state.filled);
+    try testing.expectEqual(log.head, state.head);
+    try testing.expectEqual(log.next_seq, state.next_seq);
+    try testing.expectEqual(@as(u64, 1), state.records[0].seq);
+    try testing.expectEqual(@as(u64, 2), state.records[1].seq);
+    try testing.expectEqual(@as(u64, 3), state.records[2].seq);
+    try testing.expect(state.records[0].actor.eql(.local_user));
+    try testing.expect(state.records[1].actor.eql(.local_agent));
+    try testing.expectEqualStrings("a", state.records[0].name());
+    try testing.expectEqualStrings("c", state.records[2].name());
+
+    var log2: CommandLog = .{};
+    log2.restoreState(state);
+    try testing.expectEqual(state.filled, log2.filled);
+    try testing.expectEqual(state.head, log2.head);
+    try testing.expectEqual(state.next_seq, log2.next_seq);
+    try testing.expectEqual(@as(u64, 1), log2.recordAt(0).seq);
+    try testing.expectEqual(@as(u64, 3), log2.recordAt(2).seq);
+    try testing.expectEqualStrings("b", log2.recordAt(1).name());
+}
+
+test "persistent state export preserves actor epochs" {
+    var app: MockApp = undefined;
+    var log: CommandLog = undefined;
+    var exec: Executor = undefined;
+    wire(&app, &log, &exec);
+    var buf: [256]u8 = undefined;
+
+    _ = try exec1(&exec, .local_user, "a", &buf);
+    _ = try exec1(&exec, .{ .peer = 7 }, "b", &buf);
+    _ = try exec.undoOne(.local_user, &buf);
+    // undoable normal after undo bumps epoch again
+    _ = try exec1(&exec, .local_user, "c", &buf);
+
+    const state = exec.exportState();
+    try testing.expect(state.actor_count >= 2);
+
+    var found_user = false;
+    var found_peer = false;
+    var i: u32 = 0;
+    while (i < state.actor_count) : (i += 1) {
+        if (state.actors[i].actor.eql(.local_user)) {
+            found_user = true;
+            try testing.expect(state.actors[i].epoch >= 1);
+        }
+        if (state.actors[i].actor.eql(.{ .peer = 7 })) {
+            found_peer = true;
+            try testing.expectEqual(@as(u64, 1), state.actors[i].epoch);
+        }
+    }
+    try testing.expect(found_user);
+    try testing.expect(found_peer);
+
+    var app2: MockApp = undefined;
+    var log2: CommandLog = .{};
+    var exec2: Executor = Executor.init(.{ .ctx = &app2, .run = MockApp.run });
+    exec2.log = &log2;
+    exec2.adapter = .{ .ctx = &app2, .canUndo = MockApp.canUndo, .applyUndo = MockApp.applyUndo, .summarize = MockApp.summarize };
+    app2 = .{ .exec = &exec2 };
+    const keep_dispatcher = exec2.dispatcher;
+    exec2.restoreState(state);
+    try testing.expectEqual(keep_dispatcher.ctx, exec2.dispatcher.ctx);
+    try testing.expectEqual(state.actor_count, exec2.actor_count);
+    try testing.expectEqual(state.next_transaction_id, exec2.next_transaction_id);
+}
+
+test "persistent state export preserves open transactions" {
+    var app: MockApp = undefined;
+    var log: CommandLog = undefined;
+    var exec: Executor = undefined;
+    wire(&app, &log, &exec);
+    var buf: [256]u8 = undefined;
+
+    const tx = try exec.beginTransaction(.local_user, "macro");
+    _ = try exec.executeAction("m1", "arg1", .{ .actor = .local_user, .transaction = tx }, &buf);
+    _ = try exec.executeAction("m2", "", .{ .actor = .local_user, .transaction = tx }, &buf);
+    // leave open (no endTransaction)
+
+    const log_state = log.exportState();
+    const exec_state = exec.exportState();
+    try testing.expect(exec_state.transactions[tx.index].open);
+    try testing.expectEqualStrings("macro", exec_state.transactions[tx.index].label());
+    try testing.expectEqual(@as(u16, 2), exec_state.transactions[tx.index].undoable_member_count);
+    try testing.expectEqual(tx.generation, exec_state.transactions[tx.index].generation);
+
+    var app2: MockApp = undefined;
+    var log2: CommandLog = .{};
+    var exec2: Executor = Executor.init(.{ .ctx = &app2, .run = MockApp.run });
+    exec2.log = &log2;
+    exec2.adapter = .{ .ctx = &app2, .canUndo = MockApp.canUndo, .applyUndo = MockApp.applyUndo, .summarize = MockApp.summarize };
+    app2 = .{ .exec = &exec2 };
+    log2.restoreState(log_state);
+    exec2.restoreState(exec_state);
+
+    // continue the restored open transaction
+    const restored_tx = TransactionHandle{ .index = tx.index, .generation = tx.generation };
+    _ = try exec2.executeAction("m3", "", .{ .actor = .local_user, .transaction = restored_tx }, &buf);
+    try exec2.endTransaction(restored_tx, .local_user);
+    try testing.expectEqual(@as(u32, 3), log2.filled);
+    try testing.expect(!exec2.tx_table[tx.index].open);
+}
+
+test "persistent state restore clears dispatch-only state" {
+    var app: MockApp = undefined;
+    var log: CommandLog = undefined;
+    var exec: Executor = undefined;
+    wire(&app, &log, &exec);
+
+    exec.in_dispatch = true;
+    exec.pending_undo_ref = 42;
+    exec.pending_set = true;
+    exec.wire_session = true;
+    const keep_log = exec.log;
+    const keep_dispatcher = exec.dispatcher;
+    const keep_adapter = exec.adapter;
+    const keep_wire = exec.wire_session;
+
+    const state = exec.exportState();
+    exec.restoreState(state);
+
+    try testing.expect(!exec.in_dispatch);
+    try testing.expectEqual(@as(?UndoRef, null), exec.pending_undo_ref);
+    try testing.expect(!exec.pending_set);
+    try testing.expectEqual(keep_log, exec.log);
+    try testing.expectEqual(keep_dispatcher.ctx, exec.dispatcher.ctx);
+    try testing.expect(exec.adapter != null);
+    try testing.expectEqual(keep_adapter.?.ctx, exec.adapter.?.ctx);
+    try testing.expectEqual(keep_wire, exec.wire_session);
 }
