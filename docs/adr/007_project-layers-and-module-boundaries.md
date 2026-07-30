@@ -227,7 +227,11 @@ shells alone**, which makes the judgement simple (R6, R8).
   The harness keeps the module name `"harness"` to minimise churn; renaming it to
   `"control"` is decided when `control/` grows beyond one file.
 - The **versioning and semver** of `kit` is not settled here. It is decided by a
-  separate ADR when external shipping actually approaches.
+  separate ADR when external shipping actually approaches. **Settled by
+  ADR-020**: `kit` versions as a whole through `build.zig.zon`'s single
+  `.version` field (no per-module version), the current `0.0.0` means
+  semver's initial-development clause applies, and ADR-020 also states the
+  maturity-gate conditions a flux lib must meet before promotion into `kit`.
 - The `build_helpers` symlink workaround for standalone example builds — including
   the Windows limitation described in `AGENT.md` — is out of scope here. Moving to
   `kit` opens a path to removing it later, but it is untouched now.
@@ -278,3 +282,6 @@ shells alone**, which makes the judgement simple (R6, R8).
   `linkAppException`). `platform → pixelops` stays (core cannot link libs
   without an exception; needed for wasm present). The R1–R8 decisions themselves
   are unchanged.
+- 2026-07-30 The versioning open question above is closed by ADR-020, which
+  also states the maturity-gate conditions a flux lib must satisfy before
+  promotion into `kit`.
