@@ -1121,6 +1121,28 @@ const App = struct {
             }
         }.go;
         put(self, &n, .{
+            .id = CmdId.save_project,
+            .label = "Save Project",
+            .menu = .{ .title = "File", .order = 100 },
+            .shortcut = .{ .key = .S, .modifiers = accel_mod },
+        });
+        put(self, &n, .{
+            .id = CmdId.open_project,
+            .label = "Open Project",
+            .menu = .{ .title = "File", .order = 101 },
+            .shortcut = .{ .key = .O, .modifiers = accel_mod },
+        });
+        put(self, &n, .{ .id = 0, .kind = .separator, .menu = .{ .title = "File", .order = 102 } });
+        put(self, &n, .{
+            .id = CmdId.quit,
+            .label = "Quit",
+            .menu = .{ .title = "File", .order = 103 },
+        });
+        // View → History (Cmd/Ctrl+Shift+H. Separate from modifier-less H hide-all).
+        var hist_mod = accel_mod;
+        hist_mod.shift = true;
+        const hist_checked = if (self.findPanel("History")) |p| p.visible else false;
+        put(self, &n, .{
             .id = CmdId.undo,
             .label = "Undo",
             .menu = .{ .title = "Edit", .order = 100 },
@@ -1152,28 +1174,6 @@ const App = struct {
             .shortcut = .{ .key = .L, .modifiers = layout_sel_mod },
             .enabled = self.hasLayoutSelection(),
         });
-        put(self, &n, .{
-            .id = CmdId.save_project,
-            .label = "Save Project",
-            .menu = .{ .title = "File", .order = 100 },
-            .shortcut = .{ .key = .S, .modifiers = accel_mod },
-        });
-        put(self, &n, .{
-            .id = CmdId.open_project,
-            .label = "Open Project",
-            .menu = .{ .title = "File", .order = 101 },
-            .shortcut = .{ .key = .O, .modifiers = accel_mod },
-        });
-        put(self, &n, .{ .id = 0, .kind = .separator, .menu = .{ .title = "File", .order = 102 } });
-        put(self, &n, .{
-            .id = CmdId.quit,
-            .label = "Quit",
-            .menu = .{ .title = "File", .order = 103 },
-        });
-        // View → History (Cmd/Ctrl+Shift+H. Separate from modifier-less H hide-all).
-        var hist_mod = accel_mod;
-        hist_mod.shift = true;
-        const hist_checked = if (self.findPanel("History")) |p| p.visible else false;
         put(self, &n, .{
             .id = CmdId.toggle_history,
             .label = "History",
