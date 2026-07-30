@@ -860,8 +860,19 @@ const PM_REFILL_AT = 4;
 const PM_POOL_SIZE = 10;
 /** @type {ArrayBuffer[]} */
 let pmPool = [];
-/** Blocks currently held by the worklet ring (not yet returned). */
+/** Blocks posted to the worklet whose transferable has not come back yet. */
 let pmInFlight = 0;
+/**
+ * Ring depth the worklet last reported. The producer paces against
+ * `depth + in-flight`, not against in-flight alone: a transferable comes back as soon
+ * as the worklet has copied it, which says nothing about how much audio is still
+ * queued, so pacing on it renders far faster than real time and the ring drops the
+ * excess.
+ */
+let pmDepth = 0;
+/** AudioContext time at which `pmDepth` was last carried forward (seconds). */
+let pmLastPumpTime = 0;
+let pmLastDrops = 0;
 let pmSchedulerBound = false;
 
 function showAudioError(msg) {
@@ -940,10 +951,33 @@ function pmRenderAndSend(n) {
   }
 }
 
+/**
+ * Top the worklet ring back up to `PM_QUEUE_BLOCKS`. Called from the frame loop, so the
+ * pump rate follows the display while the amount follows playback.
+ *
+ * The worklet cannot announce consumption (`process` is real time and may not post), so
+ * the depth is carried forward on a clock: playback drains one block every
+ * `frames / sampleRate` seconds. Every `buffer-return` and every stats poll replaces the
+ * estimate with the ring's real count, which bounds the drift. Pacing on the returned
+ * transfer buffers instead would render far ahead of playback and the ring would drop
+ * the surplus; pacing on a stale depth would stall and starve it.
+ */
 function pmEnsureQueue() {
   if (audioTransport !== "worklet_postmessage" || !audioReady || !audioNode) return;
-  if (pmInFlight < PM_QUEUE_BLOCKS) {
-    pmRenderAndSend(PM_QUEUE_BLOCKS - pmInFlight);
+  const sr = (audioCtx && audioCtx.sampleRate) || 48000;
+  const now = (audioCtx && audioCtx.currentTime) || 0;
+  if (pmLastPumpTime > 0) {
+    const consumed = Math.floor(((now - pmLastPumpTime) * sr) / PM_BLOCK_FRAMES);
+    if (consumed > 0) {
+      pmDepth = Math.max(0, pmDepth - consumed);
+      pmLastPumpTime += (consumed * PM_BLOCK_FRAMES) / sr;
+    }
+  } else {
+    pmLastPumpTime = now;
+  }
+  const queued = pmDepth + pmInFlight;
+  if (queued < PM_QUEUE_BLOCKS) {
+    pmRenderAndSend(PM_QUEUE_BLOCKS - queued);
   }
 }
 
@@ -955,13 +989,38 @@ function pmOnWorkletMessage(data) {
   if (data.type === "buffer-return" && data.buffer) {
     if (pmPool.length < PM_POOL_SIZE) pmPool.push(data.buffer);
     pmInFlight = Math.max(0, pmInFlight - 1);
-    if (pmInFlight <= PM_REFILL_AT) {
+    if (typeof data.depth === "number") {
+      pmDepth = data.depth;
+      pmLastPumpTime = (audioCtx && audioCtx.currentTime) || 0;
+    }
+    if (typeof data.drops === "number" && data.drops > pmLastDrops) {
+      pmLastDrops = data.drops;
+      showAudioError(
+        "audio transport dropped a rendered block (ring full; count=" +
+          data.drops +
+          "). The producer is running ahead of playback.",
+      );
+    }
+    if (pmDepth + pmInFlight <= PM_REFILL_AT) {
       pmEnsureQueue();
     }
     return;
   }
   if (data.type === "stats") {
     // Worklet process() only increments counters; main observes them here (non-RT).
+    // The depth snapshot also re-syncs the producer if a buffer-return was missed.
+    if (typeof data.queueDepth === "number") {
+      pmDepth = data.queueDepth;
+      pmLastPumpTime = (audioCtx && audioCtx.currentTime) || 0;
+    }
+    if (typeof data.drops === "number" && data.drops > pmLastDrops) {
+      pmLastDrops = data.drops;
+      showAudioError(
+        "audio transport dropped a rendered block (ring full; count=" +
+          data.drops +
+          "). The producer is running ahead of playback.",
+      );
+    }
     if (typeof data.underruns === "number" && data.underruns > pmLastUnderruns) {
       pmLastUnderruns = data.underruns;
       const msg =
@@ -1162,6 +1221,9 @@ function preparePostMessageWorkletNode(channels) {
         pmPool.push(new ArrayBuffer(PM_BLOCK_FRAMES * PM_CHANNELS * 4));
       }
       pmInFlight = 0;
+      pmDepth = 0;
+      pmLastPumpTime = 0;
+      pmLastDrops = 0;
 
       audioNode = new AudioWorkletNode(audioCtx, "kngn-audio-processor", {
         numberOfInputs: 0,

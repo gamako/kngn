@@ -27,6 +27,11 @@ pub const Ring = struct {
     count: u32 = 0,
     underruns: u32 = 0,
     quantum_mismatches: u32 = 0,
+    /// Blocks the producer offered while the ring was full. A dropped block is rendered
+    /// audio that never reaches the output, so it is counted and reported rather than
+    /// absorbed: it is the signature of a producer pacing against something other than
+    /// the ring depth.
+    drops: u32 = 0,
     /// Samples already consumed from the current read block (for split quanta — unused when quantum is fixed 128).
     read_offset: u32 = 0,
 
@@ -38,7 +43,10 @@ pub const Ring = struct {
     /// Push one full block (exactly samples_per_block samples). Returns false if full.
     pub fn pushBlock(self: *Ring, block: []const f32) bool {
         std.debug.assert(block.len >= samples_per_block);
-        if (self.count >= max_blocks) return false;
+        if (self.count >= max_blocks) {
+            self.drops += 1;
+            return false;
+        }
         const base = self.write * samples_per_block;
         @memcpy(self.storage[base..][0..samples_per_block], block[0..samples_per_block]);
         self.write = (self.write + 1) % max_blocks;
@@ -93,6 +101,28 @@ test "queue capacity rejects overflow" {
     }
     try std.testing.expect(!ring.pushBlock(&block));
     try std.testing.expectEqual(max_blocks, ring.count);
+    try std.testing.expectEqual(@as(u32, 1), ring.drops);
+}
+
+test "a producer pacing on ring depth never drops a block" {
+    // The transport's contract: top the ring back up to capacity, where "how full" is
+    // the ring's own count. Pacing on anything else (for instance on how many transfer
+    // buffers have come back) renders faster than playback and the surplus is dropped.
+    var buf: [max_blocks * samples_per_block]f32 = undefined;
+    var ring = Ring.init(&buf);
+    var block: [samples_per_block]f32 = undefined;
+    @memset(&block, 0.5);
+    var out: [samples_per_block]f32 = undefined;
+
+    var tick: u32 = 0;
+    while (tick < 1000) : (tick += 1) {
+        while (ring.count < max_blocks) {
+            try std.testing.expect(ring.pushBlock(&block));
+        }
+        try std.testing.expectEqual(PullResult.ok, ring.pullInterleaved(frames_per_block, &out));
+    }
+    try std.testing.expectEqual(@as(u32, 0), ring.drops);
+    try std.testing.expectEqual(@as(u32, 0), ring.underruns);
 }
 
 test "non-128 quantum is bad_quantum and does not consume" {

@@ -57,6 +57,7 @@ class KngnAudioProcessor extends AudioWorkletProcessor {
     this._quantumMismatches = 0;
     this._renderErrors = 0;
     this._viewDetached = 0;
+    this._drops = 0;
 
     if (this._transport === "postmessage") {
       this._initPostMessage();
@@ -88,6 +89,7 @@ class KngnAudioProcessor extends AudioWorkletProcessor {
         underruns: this._underruns,
         quantumMismatches: this._quantumMismatches,
         renderErrors: this._renderErrors,
+        drops: this._drops,
         queueDepth: this._count,
       });
       return;
@@ -101,9 +103,18 @@ class KngnAudioProcessor extends AudioWorkletProcessor {
         for (let i = n; i < PM_SAMPLES; i++) this._ring[base + i] = 0;
         this._write = (this._write + 1) % PM_BLOCKS;
         this._count += 1;
+      } else {
+        // The ring is the authority on how much audio is buffered. Dropping a block
+        // discards rendered samples, which the listener hears as a mangled stream, so
+        // it is counted and surfaced rather than absorbed.
+        this._drops += 1;
       }
-      // Return transferable buffer to the main-thread pool (event path, not process).
-      this.port.postMessage({ type: "buffer-return", buffer: data.buffer }, [data.buffer]);
+      // Return the transferable to the main-thread pool (event path, not process) and
+      // report the depth the producer must pace against.
+      this.port.postMessage(
+        { type: "buffer-return", buffer: data.buffer, depth: this._count, drops: this._drops },
+        [data.buffer],
+      );
     }
   }
 
