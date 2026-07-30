@@ -1268,12 +1268,12 @@ const App = struct {
         return null;
     }
 
-    /// Append `.kngn` when the extension is missing (dialog return path; caller frees).
+    /// Append `.vprj` when the extension is missing (dialog return path; caller frees).
     fn ensureKngnExt(gpa: std.mem.Allocator, path: []const u8) ![]u8 {
-        if (path.len >= 5 and std.ascii.eqlIgnoreCase(path[path.len - 5 ..], ".kngn")) {
+        if (path.len >= 5 and std.ascii.eqlIgnoreCase(path[path.len - 5 ..], ".vprj")) {
             return gpa.dupe(u8, path);
         }
-        return std.fmt.allocPrint(gpa, "{s}.kngn", .{path});
+        return std.fmt.allocPrint(gpa, "{s}.vprj", .{path});
     }
 
     /// Run pending File ops at a safe point after framebuffer unlock (dialogs forbidden while locked).
@@ -1284,8 +1284,8 @@ const App = struct {
         switch (op) {
             .save_project => {
                 const maybe = platform.saveFileDialog(gpa, self.io, .{
-                    .default_name = "untitled.kngn",
-                    .allowed_ext = "kngn",
+                    .default_name = "untitled.vprj",
+                    .allowed_ext = "vprj",
                 }) catch return; // Ignore DialogFailed (headless) etc. and keep RT running
                 const path = maybe orelse return;
                 defer gpa.free(path);
@@ -1294,7 +1294,7 @@ const App = struct {
                 actionSaveProjectFile(self, final_path) catch {};
             },
             .open_project => {
-                const maybe = platform.openFileDialog(gpa, self.io, .{ .allowed_ext = "kngn" }) catch return;
+                const maybe = platform.openFileDialog(gpa, self.io, .{ .allowed_ext = "vprj" }) catch return;
                 const path = maybe orelse return;
                 defer gpa.free(path);
                 // Same path as actionLoadProject (args = path).
