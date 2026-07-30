@@ -11,7 +11,9 @@ const std = @import("std");
 pub const frames_per_block: u32 = 128;
 pub const channels: u32 = 2;
 pub const samples_per_block: u32 = frames_per_block * channels;
-pub const max_blocks: u32 = 8;
+/// Ring capacity. The producer chooses how much of it to keep filled (it starts low for
+/// latency and grows after an underrun), so this is the ceiling the transport allows.
+pub const max_blocks: u32 = 24;
 
 pub const PullResult = enum {
     ok,

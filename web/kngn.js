@@ -850,14 +850,19 @@ function bindResize() {
 /** @type {"none"|"worklet_shared"|"worklet_postmessage"} */
 let audioTransport = "none";
 
-// postMessage queue: 8 blocks of 128 frames × 2 ch. Prefill 8; refill when ≤4 remain.
-// Contract: main-thread render shares the rAF thread — heavy frames underrun audio;
-// increasing QUEUE_BLOCKS lowers underrun risk but raises latency (~2.67 ms/block @48 kHz).
+// postMessage queue: blocks of 128 frames × 2 ch (~2.67 ms per block at 48 kHz).
+// Contract: the render shares the thread that draws, so a frame that runs long starves
+// playback. Queue depth is therefore adaptive: it starts at the lowest useful latency
+// and grows only after an underrun proves this machine needs more headroom, up to the
+// ring capacity the worklet allocates. It never shrinks within a session — a machine
+// that stuttered once will stutter again, and silence is worse than latency here.
 const PM_BLOCK_FRAMES = 128;
 const PM_CHANNELS = 2;
-const PM_QUEUE_BLOCKS = 8;
-const PM_REFILL_AT = 4;
-const PM_POOL_SIZE = 10;
+const PM_MIN_QUEUE_BLOCKS = 8; // ~21 ms
+const PM_MAX_QUEUE_BLOCKS = 24; // ~64 ms; must not exceed PM_BLOCKS in kngn-worklet.js
+const PM_QUEUE_GROW_BLOCKS = 4;
+const PM_POOL_SIZE = PM_MAX_QUEUE_BLOCKS + 2;
+let pmTargetBlocks = PM_MIN_QUEUE_BLOCKS;
 /** @type {ArrayBuffer[]} */
 let pmPool = [];
 /** Blocks posted to the worklet whose transferable has not come back yet. */
@@ -976,8 +981,8 @@ function pmEnsureQueue() {
     pmLastPumpTime = now;
   }
   const queued = pmDepth + pmInFlight;
-  if (queued < PM_QUEUE_BLOCKS) {
-    pmRenderAndSend(PM_QUEUE_BLOCKS - queued);
+  if (queued < pmTargetBlocks) {
+    pmRenderAndSend(pmTargetBlocks - queued);
   }
 }
 
@@ -1001,9 +1006,7 @@ function pmOnWorkletMessage(data) {
           "). The producer is running ahead of playback.",
       );
     }
-    if (pmDepth + pmInFlight <= PM_REFILL_AT) {
-      pmEnsureQueue();
-    }
+    pmEnsureQueue();
     return;
   }
   if (data.type === "stats") {
@@ -1023,11 +1026,27 @@ function pmOnWorkletMessage(data) {
     }
     if (typeof data.underruns === "number" && data.underruns > pmLastUnderruns) {
       pmLastUnderruns = data.underruns;
-      const msg =
-        "audio transport underrun (postMessage queue empty; count=" +
-        data.underruns +
-        "). Heavy main-thread frames stall audio. Larger queue raises latency.";
-      showAudioError(msg);
+      if (pmTargetBlocks < PM_MAX_QUEUE_BLOCKS) {
+        // Buy headroom with latency: the drop-outs a listener hears cost more than the
+        // extra milliseconds, and the growth is reported rather than applied silently.
+        pmTargetBlocks = Math.min(PM_MAX_QUEUE_BLOCKS, pmTargetBlocks + PM_QUEUE_GROW_BLOCKS);
+        console.warn(
+          "kngn audio: underrun (count=" +
+            data.underruns +
+            "); queue depth raised to " +
+            pmTargetBlocks +
+            " blocks (~" +
+            Math.round((pmTargetBlocks * PM_BLOCK_FRAMES * 1000) / ((audioCtx && audioCtx.sampleRate) || 48000)) +
+            " ms)",
+        );
+        pmEnsureQueue();
+      } else {
+        showAudioError(
+          "audio transport underrun at maximum queue depth (count=" +
+            data.underruns +
+            "). This machine cannot keep the main thread free enough for main-thread audio.",
+        );
+      }
     }
     if (data.quantumMismatches > 0) {
       showAudioError(
@@ -1071,11 +1090,19 @@ function requestSharedViewRebuild() {
 function ensureWorkletStatsPoll() {
   if (pmStatsPollBound) return;
   pmStatsPollBound = true;
+  // 100 ms: fast enough that the queue grows within a few drop-outs, cheap enough that
+  // the request/response pair is noise next to the audio traffic itself.
+  const POLL_MS = 100;
   const tick = () => {
-    if (audioReady && audioNode) pollWorkletStats();
-    setTimeout(tick, 250);
+    if (audioReady && audioNode) {
+      pollWorkletStats();
+      // A timer pump as well as the frame loop: a frame that runs long is exactly when
+      // the queue needs topping up, and that is when rAF is not running.
+      pmEnsureQueue();
+    }
+    setTimeout(tick, POLL_MS);
   };
-  setTimeout(tick, 250);
+  setTimeout(tick, POLL_MS);
 }
 
 /**
@@ -1224,6 +1251,8 @@ function preparePostMessageWorkletNode(channels) {
       pmDepth = 0;
       pmLastPumpTime = 0;
       pmLastDrops = 0;
+      pmLastUnderruns = 0;
+      pmTargetBlocks = PM_MIN_QUEUE_BLOCKS;
 
       audioNode = new AudioWorkletNode(audioCtx, "kngn-audio-processor", {
         numberOfInputs: 0,

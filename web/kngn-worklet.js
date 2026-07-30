@@ -24,8 +24,10 @@
 
 const SENTINEL_MAGIC = 0x4B4E4153; // hex digits spell 'KNAS' — must match audio_web.zig
 
-// postMessage ring: 8 blocks × 128 frames × 2 channels (matches main-thread queue / cli/audio_pm_ring.zig).
-const PM_BLOCKS = 8;
+// postMessage ring capacity: 24 blocks × 128 frames × 2 channels (matches
+// cli/audio_pm_ring.zig). The producer keeps only as many blocks queued as it needs —
+// see the adaptive target in kngn.js — so the capacity is the ceiling, not the depth.
+const PM_BLOCKS = 24;
 const PM_FRAMES = 128;
 const PM_CHANNELS = 2;
 const PM_SAMPLES = PM_FRAMES * PM_CHANNELS;
