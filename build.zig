@@ -250,7 +250,9 @@ fn buildWasm(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.buil
 }
 
 /// Cross-compile wasm web artifacts from the native target into zig-out/web/.
-fn packageWebFromNative(b: *std.Build, optimize: std.builtin.OptimizeMode) void {
+/// When `install_all` is true, wasm/HTML/shared assets join the default install step
+/// (so `zig build -Dinstall-all=true` packages the web deploy bundle).
+fn packageWebFromNative(b: *std.Build, optimize: std.builtin.OptimizeMode, install_all: bool) void {
     const wasi_target = b.resolveTargetQuery(.{
         .cpu_arch = .wasm32,
         .os_tag = .wasi,
@@ -261,7 +263,7 @@ fn packageWebFromNative(b: *std.Build, optimize: std.builtin.OptimizeMode) void 
         .assets = defaultWasmWebAssets(b),
         .optimize = optimize,
         .linker = makeInternalWasmLinker(b),
-        .default_install = false,
+        .default_install = install_all,
         .create_package_step = true,
         .package_step_description = "Package wasm web deploy bundle to zig-out/web/ (pixie + synth + static assets)",
         .create_single_package_step = true,
@@ -270,6 +272,95 @@ fn packageWebFromNative(b: *std.Build, optimize: std.builtin.OptimizeMode) void 
     addBuildStep(b, "build-pixie-wasm", "Build Pixie wasm for web (wasm32-wasi)", apps[0].exe);
     addBuildStep(b, "build-synth-wasm", "Build Synth wasm for web (shared memory + AudioWorklet)", apps[1].exe);
     addBuildStep(b, "build-synth-postmessage-wasm", "Build Synth wasm for web (postMessage audio, no shared memory)", apps[2].exe);
+}
+
+/// Fail configuration when template vendored helpers drift from kngn/build_helpers/.
+/// Comparison is raw byte identity (no text normalization).
+/// Runs at build configuration time (not only when the `check-template-vendor` step is selected).
+fn assertTemplateVendoredHelpersIdentical(b: *std.Build) void {
+    const pairs = [_][2][]const u8{
+        .{ "build_helpers/consumer.zig", "template/build_helpers/consumer.zig" },
+        .{ "build_helpers/macos.zig", "template/build_helpers/macos.zig" },
+        .{ "build_helpers/swift.zig", "template/build_helpers/swift.zig" },
+    };
+    const io = b.graph.io;
+    for (pairs) |pair| {
+        const upstream_path = b.pathFromRoot(pair[0]);
+        const vendored_path = b.pathFromRoot(pair[1]);
+        const upstream = std.Io.Dir.cwd().readFileAlloc(io, upstream_path, b.allocator, .limited(16 * 1024 * 1024)) catch |err| {
+            std.log.err("check-template-vendor: failed to read {s}: {s}", .{ pair[0], @errorName(err) });
+            std.process.exit(1);
+        };
+        defer b.allocator.free(upstream);
+        const vendored = std.Io.Dir.cwd().readFileAlloc(io, vendored_path, b.allocator, .limited(16 * 1024 * 1024)) catch |err| {
+            std.log.err("check-template-vendor: failed to read {s}: {s}", .{ pair[1], @errorName(err) });
+            std.process.exit(1);
+        };
+        defer b.allocator.free(vendored);
+        if (!std.mem.eql(u8, upstream, vendored)) {
+            std.log.err(
+                "Vendored helper drift: refresh the external copy from kngn/build_helpers/. ({s} != {s})",
+                .{ pair[0], pair[1] },
+            );
+            std.process.exit(1);
+        }
+    }
+}
+
+/// Run a child `zig build` inside template/ with an isolated cache and prefix.
+/// `has_side_effects` forces the child build on every parent gate invocation.
+/// When the parent was invoked with an explicit `-Dplatform` / `-Doptimize` (or `--release`),
+/// those flags are forwarded; otherwise the child uses its own host defaults.
+/// Cross-compilation of the template is not a gate guarantee (no automatic target rewrite).
+fn addTemplateChildBuild(
+    b: *std.Build,
+    step_name: []const u8,
+    step_description: []const u8,
+    child_step: []const u8,
+    cache_subdir: []const u8,
+    explicit_platform: ?[]const u8,
+    explicit_optimize: ?[]const u8,
+) *std.Build.Step {
+    // Absolute paths so the child (cwd=template/) does not create template/.zig-cache.
+    // cache_root.path is often relative (".zig-cache"); resolve against the process cwd.
+    const child_cache = b.pathResolve(&.{
+        b.graph.cache.cwd,
+        b.cache_root.path orelse ".",
+        cache_subdir,
+        "cache",
+    });
+    const child_prefix = b.pathResolve(&.{
+        b.graph.cache.cwd,
+        b.cache_root.path orelse ".",
+        cache_subdir,
+        "prefix",
+    });
+
+    const run = b.addSystemCommand(&.{ b.graph.zig_exe, "build", child_step });
+    // Step name includes forwarded flags so --summary all shows which backend the child used.
+    run.setName(b.fmt("template zig build {s}{s}{s}", .{
+        child_step,
+        if (explicit_platform) |p| b.fmt(" -Dplatform={s}", .{p}) else "",
+        if (explicit_optimize) |o| b.fmt(" -Doptimize={s}", .{o}) else "",
+    }));
+    run.setCwd(b.path("template"));
+    run.has_side_effects = true;
+    run.addArgs(&.{
+        "--cache-dir",
+        child_cache,
+        "--prefix",
+        child_prefix,
+    });
+    if (explicit_platform) |p| {
+        run.addArg(b.fmt("-Dplatform={s}", .{p}));
+    }
+    if (explicit_optimize) |o| {
+        run.addArg(b.fmt("-Doptimize={s}", .{o}));
+    }
+
+    const step = b.step(step_name, step_description);
+    step.dependOn(&run.step);
+    return step;
 }
 
 pub fn build(b: *std.Build) void {
@@ -619,7 +710,65 @@ pub fn build(b: *std.Build) void {
 
     // ----- wasm web distribution package -----
     // Cross-compile from the native target into zig-out/web/. The web/ layout used in development is unchanged.
-    packageWebFromNative(b, wasm_optimize);
+    // With -Dinstall-all=true, wasm package joins the default install step.
+    packageWebFromNative(b, wasm_optimize, install_all);
+
+    // ----- external template gates -----
+    // Vendored helper byte identity: compared at configuration time below, so any root
+    // `zig build` fails on drift even when the named check-template-vendor step is not selected.
+    assertTemplateVendoredHelpersIdentical(b);
+    const check_template_vendor_step = b.step(
+        "check-template-vendor",
+        "Verify template/build_helpers copies are byte-identical to kngn/build_helpers",
+    );
+    // Named step is a documentation / dependency anchor; the check already ran above.
+
+    // Forward only caller-specified -Dplatform / -Doptimize (or --release) to the child.
+    const template_explicit_platform: ?[]const u8 = if (b.user_input_options.contains("platform"))
+        @tagName(platform_option)
+    else
+        null;
+    const template_explicit_optimize: ?[]const u8 = if (b.user_input_options.contains("optimize") or b.release_mode != .off)
+        @tagName(optimize)
+    else
+        null;
+
+    const check_template_step = addTemplateChildBuild(
+        b,
+        "check-template",
+        "Run template native gate (child zig build gate; no wasm)",
+        "gate",
+        "template-check-native",
+        template_explicit_platform,
+        template_explicit_optimize,
+    );
+    check_template_step.dependOn(check_template_vendor_step);
+
+    const check_template_web_step = addTemplateChildBuild(
+        b,
+        "check-template-web",
+        "Run template web gate (child zig build gate-web; package-web + single HTML)",
+        "gate-web",
+        "template-check-web",
+        template_explicit_platform,
+        template_explicit_optimize,
+    );
+    check_template_web_step.dependOn(check_template_vendor_step);
+    // Template web after template native (same parent invocation under install-all).
+    check_template_web_step.dependOn(check_template_step);
+
+    if (install_all) {
+        // Order: root package-web / package-web-single → check-template → check-template-web.
+        if (b.top_level_steps.get("package-web")) |package_web| {
+            check_template_step.dependOn(&package_web.step);
+        }
+        if (b.top_level_steps.get("package-web-single")) |package_web_single| {
+            check_template_step.dependOn(&package_web_single.step);
+        }
+        // Full gate: root wasm packages (via default_install) + template native + template web.
+        b.getInstallStep().dependOn(check_template_step);
+        b.getInstallStep().dependOn(check_template_web_step);
+    }
 
     // ========================================
     // platform native object archive lib (for external packages) — macOS only
@@ -2232,6 +2381,8 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(test_recipe_step);
     test_step.dependOn(test_gmath_step);
     test_step.dependOn(test_sound_step);
+    // Template native gate only (no wasm). Child zig build check inside template/.
+    test_step.dependOn(check_template_step);
 
     // ========================================
     // Micro-benchmarks. Pure-logic measurement (no display / audio device; OS-independent).

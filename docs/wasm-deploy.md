@@ -2,6 +2,37 @@
 
 How to gather the browser wasm artefacts into `zig-out/web/` and publish them to static hosting.
 
+## Target and single definition
+
+- **Target**: `wasm32-wasi` **reactor** (export-driven via `kngn_init` / `kngn_frame`; no wasi
+  command `_start` / `main` on the wasm root).
+- **Single definition site**: `WasmAppSpec` and `addWasmWebPackage` in
+  [`build_helpers/consumer.zig`](../build_helpers/consumer.zig). Root apps and external packages
+  (including [`template/`](../template/)) share that surface — do not re-copy pixie/synth linkers.
+- **External packages** pull shared glue and the packer with `dep.path("web/...")` and
+  `dep.path("cli/pack-single-html.zig")` (both are listed in `build.zig.zon` `.paths`).
+- **Authoring overview**: [`docs/app-authoring.md`](app-authoring.md).
+
+### `package-web` vs `package-web-single`
+
+| Step | Output | Typical use |
+|---|---|---|
+| `package-web` | Multi-file: `*.wasm` + HTML + shared `kngn.js` / worklet / headers | Deploy root for static hosts |
+| `package-web-single` | `*.single.html` with wasm + glue embedded (postMessage synth embeds worklet) | `file://` / single-file share |
+
+Both steps share the same wasm compile graph per app when requested together.
+
+### Audio selection (existing specs)
+
+| `WasmAudio` | Used by (in-tree) | Notes |
+|---|---|---|
+| `.none` | pixie; **template** | No AudioContext / worklet startup |
+| `.worklet_shared` | synth | SharedArrayBuffer; needs COOP/COEP |
+| `.worklet_postmessage` | synth postMessage variant / single HTML | Main-thread render; no isolation headers |
+
+Template intentionally stays on `.none` so the minimal external example does not require
+COOP/COEP or audio transport design.
+
 ## Artefacts
 
 Output of `zig build package-web` (`zig-out/web/`):
@@ -99,11 +130,18 @@ digest audio rms=0.0770 peak=0.2147 silent=0 frames=4096
 
 ## Build
 
-> **The wasm targets are not covered by `zig build -Dinstall-all=true` or by `zig build test`.**
-> A change can therefore break the wasm build without any of the usual gates noticing — which is
-> exactly what happened to `build-pixie-wasm` (the harness stub drifted behind the platform facade,
-> and `std.c.getenv` is unavailable without libc). **Run the two steps below whenever you touch
-> `core/control/`, the platform facade, `libs/appshell`, or anything a wasm root imports.**
+### Gate coverage
+
+| Command | Includes wasm? |
+|---|---|
+| `zig build test` | **No** (root unit tests + template **native** gate only) |
+| `zig build package-web` / `package-web-single` | **Yes** (root multi-file / single HTML) |
+| `zig build -Dinstall-all=true` | **Yes** — root wasm packages join the default install, plus template native and web gates |
+| `zig build check-template-web` | **Yes** (template child package only) |
+
+`zig build test` deliberately stays free of wasm compile time. Use `-Dinstall-all=true` or the
+explicit package steps when you touch `core/control/`, the platform facade, `libs/appshell`,
+or anything a wasm root imports.
 
 ### Optimize mode
 
@@ -227,12 +265,13 @@ curl -sf -o /dev/null -w "%{http_code}\n" http://127.0.0.1:8080/pixie.wasm
 
 Every response must be `200`.
 
-> **A fetch-path smoke and a passing `zig build package-web` are not enough.** Open
-> `http://127.0.0.1:8080/index.html` (pixie) in a browser and check both DevTools →
-> Console (no `App.init failed`, no uncaught error) and the canvas itself (a visible
-> UI, not a black screen). A regression here can compile clean and pass every fetch
-> check while still failing only inside the wasm runtime — see the note under
-> "Build" above.
+> **Pass criteria for browser validation are the static server access log, not only the
+> process exit code.** JS glue is not compiled by Zig, so a syntax or init failure can
+> still leave `zig build package-web` at exit 0. Serve the multi-file package, open the
+> HTML in a browser, and confirm the server log shows a **successful GET of the `.wasm`**
+> (HTTP 200), plus the HTML and JS. Also check DevTools → Console (no `App.init failed`)
+> and that the canvas is not a black screen. Single HTML embeds wasm, so a separate
+> external wasm GET is not required for that delivery form.
 
 ### Synth (COOP/COEP required)
 

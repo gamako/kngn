@@ -1,0 +1,34 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>kngn template (wasm)</title>
+  <style>
+    html, body {
+      margin: 0;
+      padding: 0;
+      width: 100%;
+      height: 100%;
+      overflow: hidden;
+      background: #1a1818;
+    }
+    canvas {
+      display: block;
+      width: 100vw;
+      height: 100vh;
+      background: #242020;
+      outline: none;
+      image-rendering: pixelated;
+      cursor: default;
+    }
+  </style>
+</head>
+<body data-wasm="template.wasm"
+      data-audio-transport="none"
+      data-shared="0">
+  <canvas id="kngn-canvas" width="320" height="240" tabindex="0"></canvas>
+  <!-- kngn:inline-module -->
+  <script type="module" src="./kngn.js"></script>
+</body>
+</html>

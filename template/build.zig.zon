@@ -1,0 +1,20 @@
+.{
+    .name = .template,
+    .version = "0.0.0",
+    .fingerprint = 0x97601f83cb6d4254,
+    .minimum_zig_version = "0.16.0",
+    .dependencies = .{
+        // In-tree: kngn package root is the parent directory.
+        // When copying this template next to a kngn checkout, change .path to "../kngn".
+        .kngn = .{
+            .path = "..",
+        },
+    },
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "src",
+        "web",
+        "build_helpers",
+    },
+}

@@ -85,6 +85,16 @@
         // reach these via dep.path("web/...") and dep.path("cli/pack-single-html.zig")).
         "web",
         "cli",
+        // Public module graph and umbrella: referenced via b.path("core/...") / b.path("kit/...").
+        // Required for zig-fetch consumers (path deps see the full tree without .paths).
+        "core",
+        "kit",
+        // Canonical external-app starting point (copy next to kngn and change .path once).
+        "template",
+        // Referenced from build.zig via b.path("bench/...") and b.path("tests/...");
+        // required for a fetched package to configure bench and gui-leak test steps.
+        "bench",
+        "tests",
         "LICENSE",
         // For example...
         //"README.md",
