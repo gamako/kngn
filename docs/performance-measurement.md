@@ -194,3 +194,169 @@ Two things this pins down:
 - **A cap that is not a divisor of the refresh still reaches its rate.** 24, 25 and 40Hz
   all land within 1.2% of target on a 60Hz display; what the warning is about is the
   *evenness* of display intervals (a 2-3 refresh pattern), not the average rate.
+## Measuring a wasm frame in the browser
+
+A native frame rate says nothing about the wasm build: the present path is different
+(a channel swizzle, a copy into an `ImageData`, an upload), and the browser schedules
+frames itself. The harness for splitting one browser frame into named sections lives in
+[experiments/wasm-frame-breakdown/](experiments/wasm-frame-breakdown/); its README is the
+how-to, including the temporary marks the measured build needs. This section is the
+procedure in outline and the data it produced.
+
+### The procedure
+
+Serve the packaged bundle together with a measurement page and drive a headless browser
+from a script, collecting each run's report over HTTP. Nothing connects to a debugging
+port, so it runs unattended:
+
+```bash
+zig build package-web
+python3 docs/experiments/wasm-frame-breakdown/run.py --out /tmp/breakdown.json
+python3 docs/experiments/wasm-frame-breakdown/analyze.py /tmp/breakdown.json
+```
+
+Three separate quantities, which must not be conflated:
+
+| Quantity | Meaning |
+|---|---|
+| rAF callback duration | synchronous work in the animation-frame callback |
+| rAF start-to-start | effective frame interval; includes scheduler wait, so it is not paint time |
+| in-frame sections | wall time between marks, accumulated over the run |
+
+Paint, raster and composite run **after** the callback returns and cannot be seen from
+inside it; a browser trace is required for those.
+
+What silently invalidates a run — an application that boots itself when its module loads
+(giving two instances), a whole-frame median compared against a sum of per-section means,
+a backgrounded headless window that stops issuing animation frames, a canvas larger than
+the window (the framebuffer follows the element's client box), and a CSS size that
+differs from the backing store — is enumerated in the harness README. Every report
+carries the size that actually reached wasm, the clock resolution, the instrument's own
+cost and the hash of the module it ran against; `analyze.py` refuses runs that fail those
+checks and refuses to pool two builds under one condition.
+
+### Where a frame goes
+
+Measured on aarch64-macos, headless Chromium 150, the pixel editor, `ReleaseSmall` with
+`simd128`, device pixel ratio 1. Median across 5 runs of 400 frames from **one build**;
+each value is a per-frame mean, in µs. Instrument overhead was 2.0 µs/frame (12 marks)
+and the clock resolution 5 µs, so sections in the single digits are aggregate estimates
+rather than measurements.
+
+| section | 320x240 | 780x600 | 1600x900 | 2560x1440 |
+|---|---:|---:|---:|---:|
+| events | 5.1 | 5.1 | 4.9 | 6.1 |
+| ui_build | 514.5 | 447.5 | 309.7 | 290.7 |
+| post_ui | 4.6 | 3.4 | 3.1 | 3.3 |
+| fb_clear | 9.7 | 43.8 | 95.8 | 246.4 |
+| canvas_composite | 0.5 | 0.4 | 0.3 | 0.3 |
+| canvas_blit | 48.8 | 271.4 | 260.0 | 235.5 |
+| overlays | 1.5 | 1.2 | 0.9 | 1.1 |
+| gui_render | 73.0 | 168.9 | 183.5 | 254.1 |
+| **swizzle** | **103.0** | **530.8** | **1161.2** | **2677.4** |
+| **js present** | **43.0** | **132.6** | **323.3** | **908.9** |
+| post_present | 0.2 | 0.3 | 0.2 | 0.2 |
+| residual | 17.6 | 17.4 | 20.7 | 26.5 |
+| **whole frame** | **817.5** | **1603.2** | **2361.7** | **4644.8** |
+
+The sections account for 98–99% of the callback at every size.
+
+**The BGRA→RGBA swizzle is the frame.** It is 58% of a 2560x1440 frame, and together with
+the host-side present the two of them are 77%. Everything the application actually draws —
+the UI tree, the clear, the canvas blit, the GUI rasterisation — is the remaining 23%.
+
+Splitting the host side (the `split` condition reimplements it so the two halves can be
+timed apart; `analyze.py` checks that its total still matches the untouched path):
+
+| size | copy into the ImageData | upload | total |
+|---|---:|---:|---:|
+| 320x240 | 11.2 | 25.0 | 36.1 |
+| 780x600 | 49.2 | 77.9 | 127.1 |
+| 1600x900 | 117.0 | 203.0 | 320.0 |
+| 2560x1440 | 406.0 | 493.9 | 899.9 |
+
+Skipping the copy while still uploading (a stale `ImageData`) saves rather more than the
+copy's own 406 µs, because it also changes the cache state the upload then reads; writing
+a few bytes instead of copying gives the same figure, which rules out a "contents
+unchanged" shortcut in the browser.
+
+### There is no fixed cost worth the name
+
+A straight-line fit of frame time against pixel count over the four sizes above puts the
+intercept at 917 µs — and the two extreme points alone put it at 736 µs, which is the
+first sign that the model is wrong. It is: **changing the canvas size changes the
+application's workload**, because the framebuffer is the logical size on this backend, so
+a bigger window lays out more UI. Intercept and slope are not independent and the
+intercept is not a fixed cost.
+
+Measured directly, the sections that do not scale with canvas pixels come to about 537 µs
+at 2560x1440, and two of them are the whole story: `ui_build` (291) and `canvas_blit`
+(236, which follows the document size and zoom rather than the window).
+
+`ui_build` behaves the opposite way to a pixel cost: 515 µs at 320x240 falling to 291 µs
+at 2560x1440, where it is the largest non-present section. Why building the UI tree costs
+*more* in a small window is not explained by these measurements.
+
+### Why `simd128` does not show up in the frame time
+
+Enabling `simd128` moves the whole frame by about 1%, and the reason is not that the
+feature is inert. Comparing two builds that differ only in that feature, at 2560x1440
+(the ratio column is *without* ÷ *with*, so above 1 means `simd128` helped):
+
+| section | with simd128 | without | ratio |
+|---|---:|---:|---:|
+| whole frame | 4669.1 | 4681.5 | 1.00 |
+| swizzle | 2697.9 | 2690.5 | 1.00 |
+| gui_render | 254.6 | 268.0 | 1.05 |
+| ui_build | 290.4 | 290.7 | 1.00 |
+| canvas_blit | 236.6 | 236.9 | 1.00 |
+| js present | 908.9 | 906.3 | 1.00 |
+
+The swizzle costs the same in both builds — and the disassembly below shows why: it
+contains no SIMD instruction in either, so there was nothing for the feature to change.
+`gui_render` does gain 5%, but it is 5.5% of the frame, so the gain is 0.3% of the frame —
+smaller than the spread between runs of one condition. That is the whole answer: the one
+section large enough to matter is the one that is not being vectorised.
+
+That the feature works is shown by the same comparison against a swizzle written in a
+form the backend does vectorise: 758.7 µs with `simd128` against 2610.1 µs without, a
+factor of 3.4, and 1.65x on the whole frame.
+
+It is not vectorised because of how the bytes are loaded, not because of the shuffle.
+Disassembling the shipped module, the swizzle loop is 16 `i32.load8_u` and 16 `i32.store8`
+per 16-byte block — no `v128.load`, no `i8x16.shuffle`. Compiling the same loop standalone
+for `wasm32` with `simd128` isolates the trigger:
+
+| formulation | codegen |
+|---|---|
+| `@shuffle` over `slice[i..][0..16].*` | 16 byte loads + 16 byte stores |
+| same `@shuffle`, bytes moved through a `*align(1) @Vector(16, u8)` | `v128.load` + `i8x16.shuffle` + `v128.store` |
+| same `@shuffle`, iterating a slice of `@Vector(16, u8)` | `v128.load` + `i8x16.shuffle` + `v128.store` |
+| the swap expressed over `@Vector(4, u32)` lanes | `v128.load` + shifts/masks + `v128.store` |
+
+`ReleaseFast` behaves the same as `ReleaseSmall`, so this is not an optimisation-level
+setting. Alignment is not the trigger either — `align(1)` vectorises. Nor does it hit
+every `@shuffle`: the alpha-broadcast mask the blend helpers use (`{3,3,3,3, 7,7,7,7, …}`)
+survives the array-deref form, while a byte permutation does not. The rule that holds
+across every case measured is: **on wasm, move the 16 bytes through a `@Vector(16, u8)`
+pointer, not through `slice[i..][0..16].*`; a byte-permuting `@shuffle` is scalarised in
+the second form.**
+
+The size of the prize, measured in the running application at 2560x1440 by switching the
+present path's staging write at runtime (one build, 5 runs each):
+
+| what the present writes | swizzle section | whole frame |
+|---|---:|---:|
+| the shipped swizzle | 2697.9 | 4669.1 |
+| same shuffle through a vector pointer | 758.7 | 2784.9 |
+| the swap over u32 lanes | 762.1 | 2789.1 |
+| `@memcpy` of the same bytes | 409.1 | 2421.7 |
+| nothing | 0.2 | 1902.1 |
+
+Every row here is a section median observed in this harness, not a clean isolated cost:
+changing what the present writes also changes the cache state the host-side present reads
+next, and the last two rows change it most. Even so the ranking is unambiguous — a
+vectorised channel swap lands within a factor of two of a plain copy of the same bytes,
+while the scalarised one costs about six times that copy. Fixing the load form is worth
+**1.9 ms per frame, a 1.7x whole-frame speedup** at this size, without changing the
+algorithm.

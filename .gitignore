@@ -18,3 +18,6 @@ libs/png/test-data/
 
 # wrangler local auth/deploy cache
 .wrangler/
+
+# python bytecode from the measurement scripts under docs/experiments/
+__pycache__/

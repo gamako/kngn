@@ -1,0 +1,234 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <title>wasm frame breakdown</title>
+  <style>
+    html, body { margin: 0; padding: 0; overflow: hidden; background: #1a1818; }
+    /* The CSS size is set from the query string so that it matches the backing store
+       exactly. A mismatch makes the browser resample on composite and pollutes the
+       numbers with work this page is not measuring. */
+    canvas { display: block; background: #242020; outline: none; image-rendering: pixelated; }
+  </style>
+</head>
+<body>
+  <canvas id="kngn-canvas" tabindex="0"></canvas>
+  <script type="module">
+    // Measurement page for the wasm frame breakdown. It boots the ordinary app module
+    // unmodified; everything below is observation set up *before* the module boots.
+    //
+    // Three things are measured, and they are not interchangeable:
+    //   1. rAF callback duration  — synchronous work only.
+    //   2. rAF start-to-start     — effective frame interval. It includes scheduler wait
+    //                               and browser-internal work, so it is NOT "paint time".
+    //   3. in-frame sections      — read out of the wasm accumulator block.
+
+    // The app module boots itself when it loads. Suppress that: this page must boot it
+    // after the observation below is installed, and exactly once.
+    globalThis.__kngnManualBoot = true;
+
+    const params = new URLSearchParams(location.search);
+    const num = (k, d) => { const v = parseFloat(params.get(k)); return Number.isFinite(v) ? v : d; };
+    const str = (k, d) => params.get(k) ?? d;
+
+    const W = num("w", 780);
+    const H = num("h", 600);
+    const FRAMES = num("frames", 400);
+    const WARMUP = num("warmup", 60);
+    // present: "real" (untouched kngn.js path) | "split" (equivalent path, timed in two halves)
+    //          | "stale" (skip the copy, still upload) | "touch" (write a few bytes, upload)
+    //          | "none" (skip both; the canvas stops updating — observer effect, see README)
+    const PRESENT = str("present", "real");
+    // swizzle: "real" | "memcpy" | "noop"  (selected at runtime inside the wasm backend)
+    const SWIZZLE = str("swizzle", "real");
+    const LABEL = str("label", "");
+    // Echoed back in the report so the runner matches a report to the run that
+    // produced it, instead of to whichever arrived next.
+    const TOKEN = str("token", "");
+    const CALIBRATE = num("calibrate", 20000);
+
+    const canvas = document.getElementById("kngn-canvas");
+    canvas.width = W;
+    canvas.height = H;
+    canvas.style.width = W + "px";
+    canvas.style.height = H + "px";
+
+    // ---- 1. rAF wrapper (must be installed before the module schedules its first frame) ----
+    const cbMs = [];
+    const gapMs = [];
+    let prevStart = 0;
+    const rawRaf = window.requestAnimationFrame.bind(window);
+    window.requestAnimationFrame = (fn) => rawRaf((ts) => {
+      const t0 = performance.now();
+      if (prevStart) gapMs.push(t0 - prevStart);
+      prevStart = t0;
+      fn(ts);
+      cbMs.push(performance.now() - t0);
+    });
+
+    // ---- 2. present wrapper (installed by intercepting the import object) ----
+    // The app's own present is: build a view over wasm memory, copy it into an ImageData,
+    // upload that ImageData. "split" reimplements exactly that so the copy and the upload
+    // can be timed apart; its total is compared against "real" to prove the reimplementation
+    // is faithful.
+    let setMs = 0, putMs = 0, presentCalls = 0;
+    let imageData = null, imageW = 0, imageH = 0, setupCalls = 0;
+    let ctx2d = null;
+    let memory = null;
+    let wasmExports = null;
+
+    const rawInstantiate = WebAssembly.instantiate.bind(WebAssembly);
+    WebAssembly.instantiate = async (mod, imports) => {
+      if (imports && imports.env && PRESENT !== "real") {
+        const realPresent = imports.env.kngn_present;
+        imports.env.kngn_present = (ptr, w, h) => {
+          presentCalls++;
+          if (PRESENT === "none") return;
+          if (!ctx2d) ctx2d = canvas.getContext("2d", { alpha: false });
+          const nbytes = (w * h * 4) >>> 0;
+          const view = new Uint8ClampedArray(memory.buffer, ptr, nbytes);
+          if (!imageData || imageW !== w || imageH !== h || imageData.data.length !== nbytes) {
+            // Counted separately: this is present cost that is not the copy or the upload.
+            setupCalls++;
+            imageData = ctx2d.createImageData(w, h);
+            imageW = w; imageH = h;
+            if (canvas.width !== w || canvas.height !== h) { canvas.width = w; canvas.height = h; }
+          }
+          const a = performance.now();
+          if (PRESENT === "split") {
+            imageData.data.set(view);
+          } else if (PRESENT === "touch") {
+            // Defeat a possible "same contents" optimisation without paying for a full copy.
+            imageData.data[0] = (imageData.data[0] + 1) & 0xff;
+          } // "stale": leave the ImageData untouched
+          const b = performance.now();
+          ctx2d.putImageData(imageData, 0, 0);
+          const c = performance.now();
+          setMs += b - a;
+          putMs += c - b;
+          void realPresent;
+        };
+      }
+      const inst = await rawInstantiate(mod, imports);
+      const instance = inst.instance || inst;
+      if (instance.exports) {
+        wasmExports = instance.exports;
+        if (instance.exports.memory) memory = instance.exports.memory;
+      }
+      return inst;
+    };
+
+    // ---- 3. resize watchdog ----
+    // The app sizes its framebuffer from the element's client box. If the box moves during
+    // a run, two conditions are not comparable, so any change after boot is recorded.
+    let resizeEvents = 0;
+    new ResizeObserver(() => { resizeEvents++; }).observe(canvas);
+
+    const median = (xs) => { const s = [...xs].sort((p, q) => p - q); return s.length ? s[s.length >> 1] : 0; };
+    const pct = (xs, p) => { const s = [...xs].sort((a, b) => a - b); return s.length ? s[Math.min(s.length - 1, Math.floor(s.length * p))] : 0; };
+    // The section accumulators divided by the frame count are means, so the whole-frame
+    // figure they must be reconciled against is also a mean. Comparing a sum of means to a
+    // median makes the residual negative on a right-skewed distribution.
+    const mean = (xs) => (xs.length ? xs.reduce((a, b) => a + b, 0) / xs.length : 0);
+
+    const SECTIONS = ["events", "ui_build", "post_ui", "fb_clear", "canvas_composite",
+                      "canvas_blit", "overlays", "gui_render", "swizzle", "js_present",
+                      "post_present"];
+
+    async function main() {
+      const mod = await import("./kngn.js");
+      await mod.boot({ wasm: "pixie.wasm", audioTransport: "none" });
+
+      const exp = wasmExports;
+      if (!exp || !exp.kngn_prof_block) {
+        report({ error: "profiler exports unavailable (build without the measurement patch?)",
+                 label: LABEL, token: TOKEN });
+        return;
+      }
+
+      // Instrument cost and effective clock resolution, measured on this machine, in this
+      // browser, right now. Any section below this resolution is not a number.
+      const clockResolutionMs = exp.kngn_prof_calibrate(CALIBRATE) * 1000;
+      const blockPtr = exp.kngn_prof_block();
+      const blockLen = exp.kngn_prof_len();
+      // The block layout is a contract with the measurement patch (see README). If the
+      // patch is rebuilt with a different section list, refuse rather than report
+      // plausible numbers against the wrong slots.
+      if (blockLen !== SECTIONS.length + 4) {
+        report({ error: `profiler block is ${blockLen} slots, expected ${SECTIONS.length + 4}`,
+                 label: LABEL, token: TOKEN });
+        return;
+      }
+      const readBlock = () => Array.from(new Float64Array(memory.buffer, blockPtr, blockLen));
+      const calib = readBlock();
+      const nowCostMs = (calib[SECTIONS.length + 3] * 1000) / CALIBRATE;
+
+      const SWIZZLE_MODE = { real: 0, memcpy: 1, noop: 2, u32: 3, vecptr: 4 };
+      if (SWIZZLE !== "real") exp.kngn_prof_set_swizzle_mode(SWIZZLE_MODE[SWIZZLE] ?? 0);
+
+      // Warm up, then zero everything so the measured window is steady state only.
+      await waitFrames(WARMUP);
+      exp.kngn_prof_reset();
+      setMs = 0; putMs = 0; presentCalls = 0; setupCalls = 0;
+      cbMs.length = 0; gapMs.length = 0;
+      const resizeAtStart = resizeEvents;
+      const ticksAtStart = hostTicks;
+
+      await waitFrames(FRAMES);
+      const hostFrames = hostTicks - ticksAtStart;
+
+      const blk = readBlock();
+      const frames = blk[SECTIONS.length];
+      const perFrame = (secondsTotal) => (secondsTotal * 1000) / frames;
+      const sections = {};
+      for (let i = 0; i < SECTIONS.length; i++) sections[SECTIONS[i]] = perFrame(blk[i]);
+      const sectionSum = Object.values(sections).reduce((a, b) => a + b, 0);
+      const marksPerFrame = exp.kngn_prof_marks() / frames;
+
+      report({
+        label: LABEL,
+        token: TOKEN,
+        conditions: { w: W, h: H, present: PRESENT, swizzle: SWIZZLE, frames: FRAMES, warmup: WARMUP },
+        // Proof the run measured the size it claims to have measured.
+        actual: { fb_w: blk[SECTIONS.length + 1], fb_h: blk[SECTIONS.length + 2],
+                  css_w: canvas.clientWidth, css_h: canvas.clientHeight,
+                  backing_w: canvas.width, backing_h: canvas.height,
+                  dpr: window.devicePixelRatio, resize_events: resizeEvents - resizeAtStart },
+        frames,
+        host_frames: hostFrames,
+        raf_callback_ms: { mean: mean(cbMs), median: median(cbMs), p95: pct(cbMs, 0.95), n: cbMs.length },
+        raf_interval_ms: { mean: mean(gapMs), median: median(gapMs), p95: pct(gapMs, 0.95), n: gapMs.length },
+        sections_ms: sections,
+        section_sum_ms: sectionSum,
+        residual_ms: mean(cbMs) - sectionSum,
+        js_present_split_ms: { set: setMs / frames, put: putMs / frames,
+                               calls: presentCalls, setup_calls: setupCalls },
+        instrument: { now_cost_ms: nowCostMs, clock_resolution_ms: clockResolutionMs,
+                      marks_per_frame: marksPerFrame,
+                      overhead_ms: nowCostMs * marksPerFrame },
+        env: { ua: navigator.userAgent, hw: navigator.hardwareConcurrency },
+      });
+    }
+
+    // Counts animation frames independently of the app, so that "frames the app ran" and
+    // "animation frames that elapsed" can be compared instead of assumed equal.
+    let hostTicks = 0;
+    function waitFrames(n) {
+      return new Promise((resolve) => {
+        let left = n;
+        const tick = () => { hostTicks++; if (--left <= 0) resolve(); else rawRaf(tick); };
+        rawRaf(tick);
+      });
+    }
+
+    function report(data) {
+      // Handed back over HTTP so a headless run needs no devtools connection.
+      fetch("/report", { method: "POST", body: JSON.stringify(data) })
+        .catch(() => {})
+        .finally(() => { document.title = "done"; });
+    }
+
+    main();
+  </script>
+</body>
+</html>

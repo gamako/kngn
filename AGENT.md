@@ -381,6 +381,12 @@ consumer. A loop that runs over every pixel each frame (or a comparable area):
    test that the SIMD version is bit-identical to a scalar reference** (the existing
    tests in `libs/pixelops` are the model). Do not write your own blend, div255 or clip
    hoisting — **use the shared implementation from `@import("pixelops")`**.
+   On wasm, load and store the vector through a `@Vector(16, u8)` pointer rather than
+   `slice[i..][0..16].*`: in the second form a byte-permuting `@shuffle` is emitted as 16
+   scalar byte loads and stores, in `ReleaseSmall` and `ReleaseFast` alike. Writing SIMD is
+   not the same as getting it — check the disassembly, and see
+   [docs/performance-measurement.md](docs/performance-measurement.md) for the measured
+   cost of getting this wrong.
 2. **No per-pixel division**: for `/255`, use the integer approximation `div255`,
    `(x + 1 + (x >> 8)) >> 8`. Do not use floating point per pixel either (except where
    the computation is inherently f32, such as anti-aliasing coverage).
