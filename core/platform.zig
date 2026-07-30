@@ -704,6 +704,14 @@ pub const Window = struct {
     }
 };
 
+/// Build-selected platform backend name as a static slice (do not free).
+/// Values: macOS `objc` / `swift` / `metal`, Linux `x11` / `wayland`, Windows `gdi` / `d3d11`, wasm `wasm`.
+/// Available before `init()`. Under `KNGN_HEADLESS=1` this still reports the build-selected backend;
+/// use the harness capabilities field `headless_active` to tell whether the null runtime is active.
+pub fn activeBackend() []const u8 {
+    return build_options.platform_backend;
+}
+
 pub fn init() Error!void {
     // The frame pacing learning state. Re-initialising the process must not carry a bad value over.
     pacer.reset();
@@ -713,6 +721,7 @@ pub fn init() Error!void {
     // harness.startTransport → copilot.startTransport (exclusivity is settled at parseConfig time, from which env vars are present).
     runtime_null = envHeadlessOne();
     harness.setHeadlessActive(runtime_null);
+    harness.setBackendName(build_options.platform_backend);
     harness.parseConfig();
     copilot.parseConfig();
     if (runtime_null) {
@@ -1212,6 +1221,35 @@ pub fn framePaceUntil(deadline_seconds: f64) void {
 // ============================================================================
 // unit tests for input normalisation and the snapshot contract (no display needed)
 // ============================================================================
+
+test "activeBackend returns a known build-selected backend name" {
+    // This facade test module is stamped with the OS default only (not a full backend matrix).
+    // Per-backend values are checked on hardware / the macOS three-backend run; here we only
+    // assert the value is in the canonical set so empty, "unknown", and wiring typos fail fast.
+    const known = [_][]const u8{ "objc", "swift", "metal", "x11", "wayland", "gdi", "d3d11", "wasm" };
+    const got = activeBackend();
+    var found = false;
+    for (known) |k| {
+        if (std.mem.eql(u8, got, k)) {
+            found = true;
+            break;
+        }
+    }
+    try std.testing.expect(found);
+}
+
+test "activeBackend matches harness capabilities backend after seeding" {
+    // Facade and observation plane stay aligned when platform seeds the harness (as init does).
+    const name = activeBackend();
+    harness.setBackendName(name);
+    defer harness.setBackendName(""); // empty → "unknown" default for later tests
+
+    var buf: [2048]u8 = undefined;
+    const payload = harness.capabilitiesPayload(&buf);
+    var expect_buf: [48]u8 = undefined;
+    const needle = try std.fmt.bufPrint(&expect_buf, "\"backend\":\"{s}\"", .{name});
+    try std.testing.expect(std.mem.indexOf(u8, payload, needle) != null);
+}
 
 test "normalizeEventWithScale floors the divide (scale=2 raw to logical)" {
     const raw_move: Event = .{ .mouse_move = .{

@@ -171,6 +171,14 @@ var pending_script_path: ?[]const u8 = null;
 var pending_listen_raw: ?[]const u8 = null; // The environment value, when present. Interpreting the port is startTransport's job
 var pending_manual_clock = false;
 var headless_active = false;
+/// Default when platform has not called `setBackendName` (unit tests, and before `platform.init`).
+const DEFAULT_BACKEND_NAME = "unknown";
+/// Longest known build-selected tags are 7 bytes (`wayland`, and the default `unknown`).
+/// Cap at 16 so the capabilities prefix always fits in `prefix_scratch` (96B) and in
+/// `content_limit` at `MIN_CAPABILITIES_BUF_LEN` (64B free for content).
+const MAX_BACKEND_NAME_LEN = 16;
+var backend_name_storage: [MAX_BACKEND_NAME_LEN]u8 = undefined;
+var backend_name: []const u8 = DEFAULT_BACKEND_NAME;
 
 // A measurement-only mode that skips the frame copy on each present (the KNGN_HARNESS_SKIP_FRAME_COPY variable).
 // The default is false, matching the old behaviour bit for bit. While it is on, the snapshot and digest of `fb`, `canvas` and
@@ -509,6 +517,20 @@ pub fn setHeadlessActive(active: bool) void {
 /// Used to decide whether the facade makes a Window a null backend, and to keep audio and midi off the native path.
 pub fn isHeadlessActive() bool {
     return headless_active;
+}
+
+/// Platform passes the build-selected backend name once during `platform.init()`.
+/// This function does not read build options; the facade supplies the value (same injection style as `setHeadlessActive`).
+/// The name is copied into a fixed buffer (max `MAX_BACKEND_NAME_LEN`). Empty strings, over-length
+/// names, and values that would break JSON framing fall back to `"unknown"`. Callers may free or
+/// mutate the input after this returns; the stored copy is independent.
+pub fn setBackendName(name: []const u8) void {
+    if (name.len == 0 or name.len > MAX_BACKEND_NAME_LEN or containsUnsafeJsonChar(name)) {
+        backend_name = DEFAULT_BACKEND_NAME;
+        return;
+    }
+    @memcpy(backend_name_storage[0..name.len], name);
+    backend_name = backend_name_storage[0..name.len];
 }
 
 /// Whether the synthetic capture source (a mic or a camera) is enabled.
@@ -1859,6 +1881,7 @@ fn appendActionEntry(buf: []u8, limit: usize, len: *usize, name: []const u8, des
 }
 
 /// Lists the registered probes (the seven built in, then the custom ones in registration order) and actions (in registration order) as one line of JSON.
+/// Top-level fields `backend` and `headless_active` always appear before `probes`, so they survive capacity truncation.
 /// The contract is that it **always returns valid JSON** (assuming `buf.len >= MIN_CAPABILITIES_BUF_LEN`). When an entry is
 /// left out because of the capacity, or because of an invalid character in name or ext, `"truncated":true` is appended at the end.
 fn formatCapabilitiesPayload(buf: []u8) []const u8 {
@@ -1870,7 +1893,14 @@ fn formatCapabilitiesPayload(buf: []u8) []const u8 {
     var len: usize = 0;
     var truncated = false;
 
-    _ = appendRaw(buf, content_limit, &len, "{\"probes\":[");
+    // Fixed schema prefix (backend + headless before probes). Longest default form is under content_limit at MIN_CAPABILITIES_BUF_LEN.
+    var prefix_scratch: [96]u8 = undefined;
+    const prefix = std.fmt.bufPrint(
+        &prefix_scratch,
+        "{{\"backend\":\"{s}\",\"headless_active\":{},\"probes\":[",
+        .{ backend_name, headless_active },
+    ) catch unreachable; // fixed shape; DEFAULT_BACKEND_NAME and bool fit in 96
+    std.debug.assert(appendRaw(buf, content_limit, &len, prefix));
     var first = true;
     probes_blk: {
         for (CAPABILITY_BUILTINS) |b| {
@@ -3135,6 +3165,7 @@ fn resetForTest() void {
     capture_synthetic_requested = false;
     skip_frame_copy = false;
     headless_active = false;
+    backend_name = DEFAULT_BACKEND_NAME;
     freerun_reading = false;
     freerun_acc.clearRetainingCapacity();
     test_poll_zero_count = 0;
@@ -4446,6 +4477,8 @@ test "capabilities: with no custom probe or action, the 7 built-in probes plus a
     defer parsed.deinit();
     const root = parsed.value.object;
     try testing.expectEqual(@as(?std.json.Value, null), root.get("truncated"));
+    try testing.expectEqualStrings("unknown", root.get("backend").?.string);
+    try testing.expect(!root.get("headless_active").?.bool);
     const probes_arr = root.get("probes").?.array.items;
     try testing.expectEqual(@as(usize, 7), probes_arr.len);
     const expected_names = [_][]const u8{ "fb", "audio", "stats", "capabilities", "capture", "gamepad", "midi" };
@@ -4455,6 +4488,131 @@ test "capabilities: with no custom probe or action, the 7 built-in probes plus a
         try testing.expect(entry.object.get("digest").?.bool);
     }
     try testing.expectEqual(@as(usize, 0), root.get("actions").?.array.items.len);
+}
+
+test "capabilities: backend and headless_active are always present and update after setters" {
+    resetForTest();
+    defer resetForTest();
+
+    // Initial state (no platform.init): fixed schema with defaults.
+    {
+        var parsed = try parseCapabilities(formatCapabilitiesPayload(&capabilities_buf));
+        defer parsed.deinit();
+        const root = parsed.value.object;
+        try testing.expectEqualStrings("unknown", root.get("backend").?.string);
+        try testing.expect(!root.get("headless_active").?.bool);
+        try testing.expect(root.get("probes") != null);
+        try testing.expect(root.get("actions") != null);
+    }
+
+    setBackendName("metal");
+    setHeadlessActive(true);
+    {
+        var parsed = try parseCapabilities(formatCapabilitiesPayload(&capabilities_buf));
+        defer parsed.deinit();
+        const root = parsed.value.object;
+        try testing.expectEqualStrings("metal", root.get("backend").?.string);
+        try testing.expect(root.get("headless_active").?.bool);
+    }
+
+    // Empty / JSON-unsafe names fall back to "unknown" (valid JSON contract).
+    {
+        setBackendName("");
+        var parsed = try parseCapabilities(formatCapabilitiesPayload(&capabilities_buf));
+        defer parsed.deinit();
+        try testing.expectEqualStrings("unknown", parsed.value.object.get("backend").?.string);
+    }
+    {
+        setBackendName("bad\"name");
+        var parsed = try parseCapabilities(formatCapabilitiesPayload(&capabilities_buf));
+        defer parsed.deinit();
+        try testing.expectEqualStrings("unknown", parsed.value.object.get("backend").?.string);
+    }
+
+    // Registry disabled (external_registry_enabled false; no custom entries) still has both fields.
+    external_registry_enabled = false;
+    setBackendName("d3d11");
+    setHeadlessActive(false);
+    {
+        var parsed = try parseCapabilities(formatCapabilitiesPayload(&capabilities_buf));
+        defer parsed.deinit();
+        const root = parsed.value.object;
+        try testing.expectEqualStrings("d3d11", root.get("backend").?.string);
+        try testing.expect(!root.get("headless_active").?.bool);
+    }
+
+    // At exactly MIN_CAPABILITIES_BUF_LEN, fields survive and JSON stays valid.
+    {
+        var small_buf: [MIN_CAPABILITIES_BUF_LEN]u8 = undefined;
+        setBackendName("unknown");
+        setHeadlessActive(false);
+        const payload = formatCapabilitiesPayload(&small_buf);
+        var parsed = try parseCapabilities(payload);
+        defer parsed.deinit();
+        const root = parsed.value.object;
+        try testing.expectEqualStrings("unknown", root.get("backend").?.string);
+        try testing.expect(!root.get("headless_active").?.bool);
+        try testing.expect(root.get("truncated").?.bool);
+    }
+
+    // Boundary sweep: every size from MIN still yields valid JSON with both fields.
+    {
+        setBackendName("metal");
+        setHeadlessActive(true);
+        var big_buf: [MIN_CAPABILITIES_BUF_LEN + 700]u8 = undefined;
+        var n: usize = MIN_CAPABILITIES_BUF_LEN;
+        while (n <= big_buf.len) : (n += 1) {
+            const payload = formatCapabilitiesPayload(big_buf[0..n]);
+            var parsed = parseCapabilities(payload) catch |err| {
+                std.debug.print("invalid JSON at buf len={d}: {s}\npayload={s}\n", .{ n, @errorName(err), payload });
+                return err;
+            };
+            defer parsed.deinit();
+            try testing.expectEqualStrings("metal", parsed.value.object.get("backend").?.string);
+            try testing.expect(parsed.value.object.get("headless_active").?.bool);
+        }
+    }
+}
+
+test "setBackendName: length cap, over-length fallback, and owned copy" {
+    resetForTest();
+    defer resetForTest();
+
+    // Exactly MAX_BACKEND_NAME_LEN safe bytes are accepted and survive MIN buffer formatting.
+    const at_max = "abcdefghijklmnop"; // 16
+    try testing.expectEqual(@as(usize, MAX_BACKEND_NAME_LEN), at_max.len);
+    setBackendName(at_max);
+    {
+        var small_buf: [MIN_CAPABILITIES_BUF_LEN]u8 = undefined;
+        const payload = formatCapabilitiesPayload(&small_buf);
+        var parsed = try parseCapabilities(payload);
+        defer parsed.deinit();
+        try testing.expectEqualStrings(at_max, parsed.value.object.get("backend").?.string);
+        try testing.expect(!parsed.value.object.get("headless_active").?.bool);
+        // Always valid JSON at MIN even with the longest accepted backend name.
+        try testing.expect(parsed.value.object.get("probes") != null);
+        try testing.expect(parsed.value.object.get("actions") != null);
+    }
+
+    // One byte over the cap falls back to "unknown" (no panic on format).
+    const over = "abcdefghijklmnopq"; // 17
+    try testing.expect(over.len > MAX_BACKEND_NAME_LEN);
+    setBackendName(over);
+    {
+        var parsed = try parseCapabilities(formatCapabilitiesPayload(&capabilities_buf));
+        defer parsed.deinit();
+        try testing.expectEqualStrings("unknown", parsed.value.object.get("backend").?.string);
+    }
+
+    // Caller may mutate the source after set; the stored copy is independent.
+    var mutable_src = "metal".*;
+    setBackendName(&mutable_src);
+    @memset(&mutable_src, 'x');
+    {
+        var parsed = try parseCapabilities(formatCapabilitiesPayload(&capabilities_buf));
+        defer parsed.deinit();
+        try testing.expectEqualStrings("metal", parsed.value.object.get("backend").?.string);
+    }
 }
 
 test "capabilities: a custom probe and action appear with their field values, in registration order" {
@@ -4562,6 +4720,8 @@ test "capabilities: even a buf of exactly MIN_CAPABILITIES_BUF_LEN gives valid J
     defer parsed.deinit();
     const root = parsed.value.object;
     try testing.expect(root.get("truncated").?.bool);
+    try testing.expectEqualStrings("unknown", root.get("backend").?.string);
+    try testing.expect(!root.get("headless_active").?.bool);
     try testing.expectEqual(@as(usize, 0), root.get("probes").?.array.items.len);
     try testing.expectEqual(@as(usize, 0), root.get("actions").?.array.items.len);
 }

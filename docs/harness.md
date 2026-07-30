@@ -57,7 +57,7 @@ snapshot stats /tmp/s.json # save stats as JSON (default stats_<n>.json)
 digest fb                  # fb <w>x<h> crc=<hex> top=[#RRGGBB:NN%,...]
 digest audio               # audio rms=<f> peak=<f> f0=<Hz> silent=<0|1> frames=<n> band_low/mid/high=<0..1> centroid=<Hz> onsets=<n> lufs=<f>
 digest stats               # {"frame":..,"virtual_fps":60.0,"mouse_move_merge_count":..,"mouse_scroll_merge_count":..,"event_drop_count":..,"modal_blocked_injections":..} (one line of JSON)
-digest capabilities        # {"probes":[{"name":..,"ext":..,"snapshot":bool,"digest":bool,"desc":..(,"args":[...])},...],"actions":[{"name":..,"desc":..(,"args":[...])},...]}
+digest capabilities        # {"backend":"metal","headless_active":false,"probes":[{"name":..,"ext":..,"snapshot":bool,"digest":bool,"desc":..(,"args":[...])},...],"actions":[{"name":..,"desc":..(,"args":[...])},...]}
 snapshot capabilities /tmp/c.json # save capabilities as JSON (default capabilities_<n>.json)
 action <name> [args...]    # run a high-level operation the app registered (the write counterpart to a probe's read)
 expect fb crc=8702DD71     # expect <probe> <key><op><value>  (op ∈ = != > <). Compared against top-level k=v in the digest payload
@@ -87,16 +87,26 @@ injection warnings" below). Existing keys are unchanged; this key is additive.
 
 ### capabilities (the introspection probe)
 
-`digest capabilities` and `snapshot capabilities [path]` (ext=json) list the
-registered probes and actions as one line of JSON: the seven built-ins
-(`fb`, `audio`, `stats`, `capabilities` itself, `capture`, `gamepad`, `midi`, each
-with a fixed description), then custom probes in registration order, then actions in
-registration order. Each probe entry carries `name`, `ext`, `snapshot` (bool),
-`digest` (bool) and `desc`; each action entry carries `name` and `desc`. `args` can
-be added **by adding a field only** (below). **The invariant that the framework does
-not interpret content is preserved**: it transcribes the registry's metadata, never
-calls a callback, and does not even validate the vocabulary of `kind`. It runs only
-on an event or a connection (not per frame, not per sample) and is not a hot path.
+`digest capabilities` and `snapshot capabilities [path]` (ext=json) emit one line of
+JSON with a fixed top-level schema. **`backend` and `headless_active` always appear
+first** (before `probes`), so they remain present even when the listing is truncated:
+
+- **`backend`**: the build-selected backend name platform passed in at init
+  (`objc` / `swift` / `metal` / `x11` / `wayland` / `gdi` / `d3d11` / `wasm`). When
+  platform has not set it (unit tests), the value is `"unknown"`.
+- **`headless_active`**: `true` when `KNGN_HEADLESS=1` selected the null runtime;
+  `false` when the native platform backend is running. Together with `backend`, this
+  distinguishes e.g. a d3d11 build under null runtime from a real d3d11 session.
+
+Then the listing: the seven built-ins (`fb`, `audio`, `stats`, `capabilities` itself,
+`capture`, `gamepad`, `midi`, each with a fixed description), then custom probes in
+registration order, then actions in registration order. Each probe entry carries
+`name`, `ext`, `snapshot` (bool), `digest` (bool) and `desc`; each action entry
+carries `name` and `desc`. `args` can be added **by adding a field only** (below).
+**The invariant that the framework does not interpret content is preserved**: it
+transcribes the registry's metadata, never calls a callback, and does not even
+validate the vocabulary of `kind`. It runs only on an event or a connection (not per
+frame, not per sample) and is not a hot path.
 
 - **Argument signatures**: `registerAction` and `registerProbe` accept
   `args: ?[]const ArgSpec = null` (optional, backward compatible), where

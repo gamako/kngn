@@ -885,7 +885,9 @@ test "copilot: 6 the response formats for digest, snapshot and the unknown (capa
     var cs: ConnState = undefined;
     // digest: custom, capabilities, a built-in that is not exposed, and an unknown one
     try testing.expectEqualStrings("cp_probe value=9\n", handleRequest(&cs, "digest cp_probe"));
-    try testing.expect(std.mem.startsWith(u8, handleRequest(&cs, "digest capabilities"), "capabilities {\"probes\":["));
+    const caps = handleRequest(&cs, "digest capabilities");
+    try testing.expect(std.mem.startsWith(u8, caps, "capabilities {"));
+    try testing.expect(std.mem.indexOf(u8, caps, "\"probes\":[") != null);
     try testing.expectEqualStrings("error: probe not available via copilot (custom probes + capabilities only)\n", handleRequest(&cs, "digest fb"));
     try testing.expectEqualStrings("error: unknown probe\n", handleRequest(&cs, "digest nosuch"));
 

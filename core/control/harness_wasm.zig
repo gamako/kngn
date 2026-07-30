@@ -61,6 +61,8 @@ pub fn isHeadlessActive() bool {
 
 pub fn setHeadlessActive(_: bool) void {}
 
+pub fn setBackendName(_: []const u8) void {}
+
 pub fn isCaptureSyntheticActive() bool {
     return false;
 }

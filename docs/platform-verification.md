@@ -27,6 +27,45 @@ A mismatch (asking for `-Dplatform=objc` on Linux) is a clear build error. The s
 types (`KeyCode`, `Event` and so on) have `core/platform_types.zig` as their single
 source.
 
+### Confirming the selected backend from the application
+
+External projects import the umbrella module (`@import("kit")`) and read the
+build-selected backend name at runtime:
+
+```zig
+const kit = @import("kit");
+const backend = kit.platform.activeBackend(); // e.g. "metal", "x11", "d3d11"
+```
+
+`activeBackend()` returns a static slice of the build option (`build_options.platform_backend`).
+Do not free it. It is available before `platform.init()`. Typical uses:
+
+```zig
+// Snippet for code that already has `const kit = @import("kit");` and a
+// `kit.platform.Window` bound as `window` (for example after createWindow).
+const std = @import("std");
+
+// Assert the build graph picked the backend the e2e script expects.
+std.debug.assert(std.mem.eql(u8, kit.platform.activeBackend(), "d3d11"));
+
+// Surface it in the window title (author-facing diagnostics only).
+var title_buf: [64]u8 = undefined;
+const title = try std.fmt.bufPrintZ(&title_buf, "demo ({s})", .{kit.platform.activeBackend()});
+window.setTitle(title);
+
+// Or in a HUD string with the same value.
+```
+
+Under `KNGN_HEADLESS=1` the null runtime is used, but `activeBackend()` still reports the
+**build-selected** backend (so a gdi vs d3d11 build remains distinguishable). To tell whether
+the native renderer is actually running, combine it with the harness capabilities fields
+`backend` and `headless_active` (`digest capabilities`; see [harness.md](harness.md)):
+
+```text
+{"backend":"metal","headless_active":false,...}  # native metal runtime
+{"backend":"metal","headless_active":true,...}   # metal build, null runtime
+```
+
 ## Building and verifying on Linux (x86_64)
 
 `flake.nix` provides two systems, `aarch64-darwin` and `x86_64-linux`. The Linux
@@ -146,3 +185,62 @@ repository works on Windows, because `build.zig` references real paths and never
 through a symlink. To build a sample standalone on Windows, either check out again with
 developer mode on and `core.symlinks=true` to restore real symlinks, or change
 `build.zig` to remove the symlink dependency of `build_helpers` (neither is done today).
+
+### Confirming the selected backend
+
+On a Windows desktop session, the same checks as in
+[Confirming the selected backend from the application](#confirming-the-selected-backend-from-the-application)
+apply. Build each backend into a separate prefix so stale artifacts cannot mask a miss,
+then assert via `digest capabilities` (not a temporary window-title patch):
+
+```powershell
+# Build each backend to its own prefix (do not reuse %errorlevel% — use $LASTEXITCODE).
+Remove-Item -Recurse -Force out-gdi,out-d3d11 -ErrorAction SilentlyContinue
+zig build -Dplatform=gdi -p out-gdi
+if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+zig build -Dplatform=d3d11 -p out-d3d11
+if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+# Replay script (two lines): digest capabilities / quit
+$env:KNGN_HARNESS_SCRIPT = "backend-capabilities.txt"
+& .\out-gdi\bin\kngn_demo.exe *> out-gdi-harness.log
+& .\out-d3d11\bin\kngn_demo_d3d11.exe *> out-d3d11-harness.log
+# Expect: "backend":"gdi","headless_active":false  and  "backend":"d3d11","headless_active":false
+```
+
+`kit.platform.activeBackend()` returns the build-selected name (`"gdi"` or `"d3d11"`) for
+in-process asserts or a HUD. Under `KNGN_HEADLESS=1`, pair it with
+`"headless_active":true` from capabilities so a null-runtime run is not mistaken for a
+native GDI/D3D11 session.
+
+### RDP keyboard input and physical keys
+
+Remote Desktop's default **Unicode keyboard mode** does not deliver physical key events
+for character keys. Mouse input was observed to work normally. `WM_CHAR` still arrives in
+both Unicode and scancode modes, so the text-input path stays alive; only the physical
+`KeyCode` path is affected.
+
+| RDP mode | Observed raw values | Result |
+|---|---|---|
+| Unicode/default | `vk=0xE7 sc=0x00 ext=0 keycode=-1` | `VK_PACKET` (Unicode character injection); physical key unknown |
+| Scancode | `vk=0x10 sc=0x2A keycode=340` | left Shift translated normally |
+
+`VK_PACKET` is Unicode character injection, not a physical key. A scancode of `0` has no
+physical key identity. The Windows backend's `keyFromMessage` prefers the scancode, and
+`vkToKeyCode` deliberately does **not** synthesise letter keys from the virtual-key code.
+That is an intentional contract, not a bug to paper over:
+
+- Reporting a non-physical source as a physical key would invent identity the OS did not
+  provide.
+- Synthesising letters from VK would make Windows alone layout-dependent and break the
+  shared physical-position contract with X11 and Wayland.
+
+Therefore **no code change** is made for this; verification of physical keys on RDP must
+switch the RDP client to **scancode mode**. The same missing-physical-key behaviour can
+appear with the on-screen keyboard and with `SendInput`-style automation that injects
+Unicode rather than scancodes.
+
+**Diagnostics**: a Windows GUI-subsystem binary has no usable stderr, and an SSH session
+typically lands in session 0 where the desktop window is not visible. In practice the only
+reliable on-box check was to print the raw `vk` / `sc` / `keycode` values into the window
+title and read them by eye on the interactive desktop session.
