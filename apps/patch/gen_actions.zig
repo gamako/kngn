@@ -341,6 +341,9 @@ pub const PATCH_NETWORK_POLICIES = [_]PolicyEntry{
     .{ .name = "move_node", .policy = .relay },
     .{ .name = "add_macro", .policy = .relay },
     .{ .name = "remove_macro", .policy = .relay },
+    .{ .name = "auto_layout", .policy = .relay },
+    .{ .name = "auto_layout_selected", .policy = .relay },
+    .{ .name = "move_layout", .policy = .relay },
     .{ .name = "save_graph", .policy = .local_only },
     .{ .name = "load_graph", .policy = .reject_when_synced },
     .{ .name = "set_param", .policy = .relay },
@@ -1129,10 +1132,10 @@ test "pattern_state: parseBool01Tok bad value is UnknownBool" {
 
 test "policy table: relay / reject_when_synced / local_only buckets" {
     const relays = [_][]const u8{
-        "add_node",  "remove_node",    "connect",   "disconnect", "move_node",   "add_macro", "remove_macro",
-        "set_param", "set_mute",       "set_lock",  "set_evolve", "toggle_step", "set_pitch", "seed",
-        "pattern",   "phrase_capture", "chain_set", "song_row",   "song_len",    "song_loop", "song_play",
-        "song_goto",
+        "add_node",    "remove_node",          "connect",     "disconnect", "move_node",      "add_macro", "remove_macro",
+        "auto_layout", "auto_layout_selected", "move_layout", "set_param",  "set_mute",       "set_lock",  "set_evolve",
+        "toggle_step", "set_pitch",            "seed",        "pattern",    "phrase_capture", "chain_set", "song_row",
+        "song_len",    "song_loop",            "song_play",   "song_goto",
     };
     for (relays) |name| {
         try testing.expectEqual(NetworkPolicyTag.relay, policyOf(name).?);

@@ -2038,6 +2038,17 @@ pub fn build(b: *std.Build) void {
     const test_patch_step = b.step("test-patch", "Run apps/patch canvas + group logic tests");
     test_patch_step.dependOn(&run_patch_tests.step);
 
+    // apps/patch layout target-list wire format (std only; encode/decode + args budget).
+    const patch_layout_wire_test = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("apps/patch/layout_wire.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    const run_patch_layout_wire_test = b.addRunArtifact(patch_layout_wire_test);
+    test_patch_step.dependOn(&run_patch_layout_wire_test.step);
+
     // apps/patch action pure parser. std only; no App/kit/modular; no imports.
     const patch_actions_test = b.addTest(.{
         .root_module = b.createModule(.{

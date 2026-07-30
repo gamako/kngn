@@ -155,6 +155,50 @@ pub const MoveNodeSnap = struct {
     y: f32,
 };
 
+/// One layout target's before-position for multi-target undo (auto_layout / selected / move_layout).
+/// `target` is a stable node id, or `GROUP_TARGET_TAG | group.identity` for a group box
+/// (not the slot GroupId — identities are never reused after free).
+/// Fixed 16 bytes so the dynamic payload is dense; the undo union holds only LayoutRef.
+pub const LayoutTargetSnap = struct {
+    target: u64 = 0,
+    x: f32 = 0,
+    y: f32 = 0,
+};
+
+/// High bit of LayoutTargetSnap.target marks a group identity (low 63 bits = Group.identity).
+/// Real stable node ids must not set this bit (asserted when encoding).
+pub const GROUP_TARGET_TAG: u64 = 1 << 63;
+
+/// Union payload for a multi-target layout undo: points at a dynamic block on PatchUndoStore.
+/// Fixed 16 bytes; coordinates live in a per-slot heap block sized to the changed target count.
+pub const LayoutRef = struct {
+    generation: u64 = 0,
+    slot: u8 = 0,
+    count: u16 = 0,
+    _pad: u32 = 0,
+};
+
+pub fn encodeRealLayoutTarget(id: u64) u64 {
+    std.debug.assert((id & GROUP_TARGET_TAG) == 0);
+    return id;
+}
+
+/// `identity` is `Group.identity` (never the slot GroupId).
+pub fn encodeGroupLayoutTarget(identity: u64) u64 {
+    std.debug.assert(identity != 0);
+    std.debug.assert((identity & GROUP_TARGET_TAG) == 0);
+    return GROUP_TARGET_TAG | identity;
+}
+
+pub fn isGroupLayoutTarget(target: u64) bool {
+    return (target & GROUP_TARGET_TAG) != 0;
+}
+
+/// Low 63 bits: node id, or group.identity when the group tag is set.
+pub fn layoutTargetId(target: u64) u64 {
+    return target & ~GROUP_TARGET_TAG;
+}
+
 pub const ConnectSnap = struct {
     new_edge: EdgeSnap = .{},
     /// edges detached from dst input before connect (0 or 1 typically)
@@ -210,6 +254,8 @@ pub const PatchUndoPayload = union(enum) {
     move_node: MoveNodeSnap,
     add_macro: AddMacroSnap,
     remove_macro: RemoveMacroSnap,
+    /// Multi-target layout before-positions (block lives on PatchUndoStore.layout_blocks).
+    layout: LayoutRef,
 };
 
 pub const PatchUndoEntry = struct {
@@ -217,8 +263,17 @@ pub const PatchUndoEntry = struct {
     payload: PatchUndoPayload = .{ .pattern = .{} },
 };
 
+/// Per-ring-slot descriptor for a dynamic layout snapshot block (not the coordinates themselves).
+const LayoutBlockDescriptor = struct {
+    ptr: ?[*]LayoutTargetSnap = null,
+    count: u16 = 0,
+    capacity: u16 = 0,
+};
+
 pub const PatchUndoStore = struct {
     entries: [MAX_UNDO]PatchUndoEntry = [_]PatchUndoEntry{.{}} ** MAX_UNDO,
+    /// Parallel to entries: heap block for `.layout` payloads. Freed on overwrite / destroy.
+    layout_blocks: [MAX_UNDO]LayoutBlockDescriptor = [_]LayoutBlockDescriptor{.{}} ** MAX_UNDO,
     next_gen: u64 = 1,
     allocator: std.mem.Allocator = undefined,
 
@@ -229,18 +284,79 @@ pub const PatchUndoStore = struct {
     }
 
     pub fn destroy(self: *PatchUndoStore) void {
+        var i: usize = 0;
+        while (i < MAX_UNDO) : (i += 1) {
+            self.freeLayoutSlot(i);
+        }
         const allocator = self.allocator;
         allocator.destroy(self);
     }
 
-    /// Push payload, return UndoRef (= gen). Overwrites oldest ring slot.
-    pub fn push(self: *PatchUndoStore, payload: PatchUndoPayload) u64 {
+    fn freeLayoutSlot(self: *PatchUndoStore, slot: usize) void {
+        const b = &self.layout_blocks[slot];
+        if (b.ptr) |p| {
+            self.allocator.free(p[0..b.capacity]);
+        }
+        b.* = .{};
+    }
+
+    fn allocGenSlot(self: *PatchUndoStore) struct { gen: u64, slot: usize } {
         const gen = self.next_gen;
         self.next_gen += 1;
         if (self.next_gen == 0) self.next_gen = 1; // skip 0
         const slot: usize = @intCast(gen % MAX_UNDO);
-        self.entries[slot] = .{ .gen = gen, .payload = payload };
-        return gen;
+        return .{ .gen = gen, .slot = slot };
+    }
+
+    /// Push payload, return UndoRef (= gen). Overwrites oldest ring slot.
+    /// Clears any layout block previously owned by that slot.
+    pub fn push(self: *PatchUndoStore, payload: PatchUndoPayload) u64 {
+        // Layout payloads must use pushLayout so the dynamic block is owned correctly.
+        std.debug.assert(payload != .layout);
+        const gs = self.allocGenSlot();
+        self.freeLayoutSlot(gs.slot);
+        self.entries[gs.slot] = .{ .gen = gs.gen, .payload = payload };
+        return gs.gen;
+    }
+
+    /// Push a multi-target layout before-snapshot. Allocates a block sized to `snaps.len`.
+    /// On OutOfMemory the store is unchanged (caller must not apply the coordinate change).
+    /// `snaps.len == 0` is rejected (no undo entry for a no-op layout).
+    pub fn pushLayout(self: *PatchUndoStore, snaps: []const LayoutTargetSnap) error{ OutOfMemory, Empty }!u64 {
+        if (snaps.len == 0) return error.Empty;
+        if (snaps.len > std.math.maxInt(u16)) return error.OutOfMemory;
+
+        // Allocate first so a failure leaves the ring untouched.
+        const copy = try self.allocator.alloc(LayoutTargetSnap, snaps.len);
+        errdefer self.allocator.free(copy);
+        @memcpy(copy, snaps);
+
+        const gs = self.allocGenSlot();
+        self.freeLayoutSlot(gs.slot);
+        self.layout_blocks[gs.slot] = .{
+            .ptr = copy.ptr,
+            .count = @intCast(snaps.len),
+            .capacity = @intCast(snaps.len),
+        };
+        const lref = LayoutRef{
+            .generation = gs.gen,
+            .slot = @intCast(gs.slot),
+            .count = @intCast(snaps.len),
+        };
+        self.entries[gs.slot] = .{ .gen = gs.gen, .payload = .{ .layout = lref } };
+        return gs.gen;
+    }
+
+    /// Resolve the dynamic before-positions for a layout ref (null if stale / mismatch).
+    pub fn layoutSnaps(self: *const PatchUndoStore, ref: LayoutRef) ?[]const LayoutTargetSnap {
+        if (ref.slot >= MAX_UNDO or ref.count == 0) return null;
+        const e = &self.entries[ref.slot];
+        if (e.gen != ref.generation) return null;
+        if (e.payload != .layout) return null;
+        if (e.payload.layout.generation != ref.generation or e.payload.layout.count != ref.count) return null;
+        const b = self.layout_blocks[ref.slot];
+        if (b.ptr == null or b.count != ref.count) return null;
+        return b.ptr.?[0..b.count];
     }
 
     pub fn get(self: *const PatchUndoStore, ref: u64) ?*const PatchUndoEntry {
@@ -317,12 +433,31 @@ pub fn canUndoPayload(payload: PatchUndoPayload, presence: NodePresence) bool {
             return true;
         },
         .move_node => |s| return presence.exists(presence.ctx, s.id),
+        .layout => |r| {
+            // Detailed restorable check needs the dynamic block (see PatchUndoStore.canUndoLayout).
+            return r.count > 0 and r.generation != 0;
+        },
         .param => |s| {
             if (s.mode == 1) return presence.exists(presence.ctx, s.node_id);
             return true;
         },
         .pattern, .song, .seed, .mute => return true,
     }
+}
+
+/// Whether a layout undo can restore at least one still-present target.
+/// Missing real nodes / freed group identities are skipped at apply time (no stale write).
+/// `groupIdentityLive(ctx, identity)` must resolve Group.identity (not slot id).
+pub fn canUndoLayout(self: *const PatchUndoStore, ref: LayoutRef, presence: NodePresence, groupIdentityLive: *const fn (*anyopaque, u64) bool) bool {
+    const snaps = self.layoutSnaps(ref) orelse return false;
+    for (snaps) |s| {
+        if (isGroupLayoutTarget(s.target)) {
+            if (groupIdentityLive(presence.ctx, layoutTargetId(s.target))) return true;
+        } else if (presence.exists(presence.ctx, s.target)) {
+            return true;
+        }
+    }
+    return false;
 }
 
 /// group.MacroKind → u8 tag (stored in AddMacroSnap/RemoveMacroSnap's kind).
@@ -370,6 +505,19 @@ test "entry size and capacity bounds" {
     // The scale at which the whole store landing on the App stack would collide with Windows' default 1MB
     try std.testing.expect(@sizeOf(PatchUndoStore) > 512 * 1024);
     try std.testing.expect(@sizeOf(PatchUndoStore) < 2 * 1024 * 1024);
+}
+
+test "layout snap and ref are 16 bytes; layout union arm is LayoutRef only" {
+    try std.testing.expectEqual(@as(usize, 16), @sizeOf(LayoutTargetSnap));
+    try std.testing.expectEqual(@as(usize, 16), @sizeOf(LayoutRef));
+    // Pin the union arm itself: layout holds only LayoutRef (not a MAX_MODULES-sized array).
+    try std.testing.expectEqual(@as(usize, 16), @sizeOf(@FieldType(PatchUndoPayload, "layout")));
+    // Fixed store region excludes dynamic layout payload bytes.
+    const fixed_entries = @sizeOf([MAX_UNDO]PatchUndoEntry);
+    const fixed_blocks = @sizeOf([MAX_UNDO]LayoutBlockDescriptor);
+    try std.testing.expect(fixed_entries + fixed_blocks < 2 * 1024 * 1024);
+    // Default display upper bound (48 modules + 8 groups) stays under the args budget.
+    try std.testing.expect(@sizeOf(LayoutTargetSnap) * 56 < 4096);
 }
 
 test "PatchUndoStore create destroy on heap" {
@@ -545,4 +693,121 @@ test "ParamSnap setName truncates to MAX_UNDO_NAME" {
     var q = ParamSnap{};
     q.setName("cutoff");
     try std.testing.expectEqualStrings("cutoff", q.name());
+}
+
+test "layout target encode: real vs group identity tag" {
+    const real = encodeRealLayoutTarget(0x12);
+    try std.testing.expect(!isGroupLayoutTarget(real));
+    try std.testing.expectEqual(@as(u64, 0x12), layoutTargetId(real));
+    // Group wire/undo key is Group.identity (never the slot GroupId).
+    const g = encodeGroupLayoutTarget(3);
+    try std.testing.expect(isGroupLayoutTarget(g));
+    try std.testing.expectEqual(@as(u64, 3), layoutTargetId(g));
+    try std.testing.expect((g & GROUP_TARGET_TAG) != 0);
+}
+
+test "pushLayout stores only changed targets and overwrites free old block" {
+    const store = try PatchUndoStore.create(std.testing.allocator);
+    defer store.destroy();
+
+    const snaps1 = [_]LayoutTargetSnap{
+        .{ .target = encodeRealLayoutTarget(1), .x = 10, .y = 20 },
+        .{ .target = encodeGroupLayoutTarget(2), .x = 30, .y = 40 },
+    };
+    const ref1 = try store.pushLayout(&snaps1);
+    try std.testing.expect(store.valid(ref1));
+    const got1 = store.layoutSnaps(store.get(ref1).?.payload.layout).?;
+    try std.testing.expectEqual(@as(usize, 2), got1.len);
+    try std.testing.expectEqual(@as(f32, 10), got1[0].x);
+    try std.testing.expectEqual(@as(f32, 40), got1[1].y);
+
+    // Empty is rejected (no undo entry for zero-change layout).
+    try std.testing.expectError(error.Empty, store.pushLayout(&.{}));
+
+    // Fill the ring past slot of ref1 so it is overwritten and the block freed.
+    var i: usize = 0;
+    while (i < MAX_UNDO) : (i += 1) {
+        _ = try store.pushLayout(&[_]LayoutTargetSnap{.{ .target = encodeRealLayoutTarget(@intCast(i + 3)), .x = 0, .y = 0 }});
+    }
+    try std.testing.expect(!store.valid(ref1));
+    try std.testing.expect(store.layoutSnaps(.{ .generation = ref1, .slot = @intCast(ref1 % MAX_UNDO), .count = 2 }) == null);
+}
+
+test "pushLayout then non-layout push frees layout block" {
+    const store = try PatchUndoStore.create(std.testing.allocator);
+    defer store.destroy();
+    const ref = try store.pushLayout(&[_]LayoutTargetSnap{.{ .target = encodeRealLayoutTarget(7), .x = 1, .y = 2 }});
+    try std.testing.expect(store.layoutSnaps(store.get(ref).?.payload.layout) != null);
+    // Same slot will eventually be reused; push MAX_UNDO regular entries to force overwrite of ref's slot.
+    var i: usize = 0;
+    while (i < MAX_UNDO) : (i += 1) {
+        _ = store.push(.{ .pattern = .{} });
+    }
+    try std.testing.expect(!store.valid(ref));
+}
+
+test "canUndoLayout requires at least one live target (identity-keyed groups)" {
+    const store = try PatchUndoStore.create(std.testing.allocator);
+    defer store.destroy();
+    const snaps = [_]LayoutTargetSnap{
+        .{ .target = encodeRealLayoutTarget(1), .x = 0, .y = 0 },
+        .{ .target = encodeGroupLayoutTarget(2), .x = 0, .y = 0 }, // identity=2
+    };
+    const ref = try store.pushLayout(&snaps);
+    const lref = store.get(ref).?.payload.layout;
+
+    var alive = AliveSet{ .ids = &[_]u64{1}, .free = 8 };
+    const presence = NodePresence{ .ctx = &alive, .exists = AliveSet.exists, .free_handles = alive.free };
+    const groupLive = struct {
+        fn go(ctx: *anyopaque, identity: u64) bool {
+            _ = ctx;
+            return identity == 2;
+        }
+    }.go;
+    try std.testing.expect(canUndoLayout(store, lref, presence, groupLive));
+
+    alive.ids = &[_]u64{}; // no real nodes
+    // Freed identity (slot may be reused with a different identity) → not live.
+    const groupNone = struct {
+        fn go(_: *anyopaque, _: u64) bool {
+            return false;
+        }
+    }.go;
+    try std.testing.expect(!canUndoLayout(store, lref, presence, groupNone));
+}
+
+test "canUndoLayout rejects stale group identity after slot reuse" {
+    const store = try PatchUndoStore.create(std.testing.allocator);
+    defer store.destroy();
+    // Old entry keyed by identity 1; after free+realloc the live group has identity 2.
+    const snaps = [_]LayoutTargetSnap{
+        .{ .target = encodeGroupLayoutTarget(1), .x = 10, .y = 20 },
+    };
+    const ref = try store.pushLayout(&snaps);
+    const lref = store.get(ref).?.payload.layout;
+    var alive = AliveSet{ .ids = &[_]u64{}, .free = 8 };
+    const presence = NodePresence{ .ctx = &alive, .exists = AliveSet.exists, .free_handles = alive.free };
+    const onlyNew = struct {
+        fn go(_: *anyopaque, identity: u64) bool {
+            return identity == 2; // new group in same slot
+        }
+    }.go;
+    try std.testing.expect(!canUndoLayout(store, lref, presence, onlyNew));
+}
+
+test "pushLayout OOM leaves store unchanged" {
+    var fail_once = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
+    const store = try PatchUndoStore.create(std.testing.allocator);
+    defer {
+        store.allocator = std.testing.allocator;
+        store.destroy();
+    }
+    store.allocator = fail_once.allocator();
+    const snaps = [_]LayoutTargetSnap{
+        .{ .target = encodeRealLayoutTarget(1), .x = 1, .y = 2 },
+    };
+    try std.testing.expectError(error.OutOfMemory, store.pushLayout(&snaps));
+    // No entry was reserved (next_gen still 1, slot empty).
+    try std.testing.expectEqual(@as(u64, 1), store.next_gen);
+    try std.testing.expect(store.get(1) == null);
 }

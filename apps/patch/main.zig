@@ -47,6 +47,8 @@ const inspector = @import("inspector.zig");
 const param_view = @import("param_view.zig");
 const group = @import("group.zig");
 const layout_mod = @import("layout.zig");
+const layout_wire = @import("layout_wire.zig");
+const menu_sig = @import("menu_sig.zig");
 const macro = @import("macro.zig");
 const actions = @import("actions.zig");
 const gen_actions = @import("gen_actions.zig");
@@ -251,13 +253,25 @@ const Item = union(enum) {
     group: group.GroupId, // Selection of a collapsed-box or expanded-frame header
 };
 
+/// Max frozen drag targets (real nodes + collapsed group boxes). Sized with MAX_MODULES.
+const MAX_DRAG_TARGETS: usize = MAX_MODULES + group.MAX_GROUPS;
+
+/// One target frozen at drag start (gesture does not re-read selection mid-drag).
+const DragTarget = struct {
+    handle: Handle,
+    start_pos: Vec2f,
+};
+
 const Drag = union(enum) {
     none,
     pan: struct { start_pan: Vec2f, start_mouse: Vec2f },
-    node: struct { handle: Handle, grab_offset: Vec2f }, // node.pos = mouseWorld + grab_offset (always a real handle)
+    /// Real-node grab. `start_pos` is the pre-drag position of the grabbed handle (undo before).
+    /// Multi-target set lives on App.drag_targets[0..drag_target_count] (frozen at mouse down).
+    node: struct { handle: Handle, grab_offset: Vec2f, start_pos: Vec2f },
     // Collapsed-box drag: update ledger.groups[gid].pos and translate member layout slots by the same
     // delta (never index a synthetic handle into app.layout[h]). Expanded-frame headers are not draggable = selection only.
-    group: struct { gid: group.GroupId, grab_offset: Vec2f },
+    /// Group grab. Multi-target set on App.drag_targets (same freeze rules as `.node`).
+    group: struct { gid: group.GroupId, grab_offset: Vec2f, start_pos: Vec2f },
     // Connection pending (ghost cable from origin port to cursor). detach!=null means a drag-off from a connected
     // input; disconnect is deferred until commit (mouse_up) so one gesture = at most one publish and a failed/
     // invalid drop does not break the existing connection. origin may be synthetic for display/highlight (when
@@ -319,7 +333,11 @@ const CmdId = struct {
     pub const undo: platform.CommandId = 4;
     pub const redo: platform.CommandId = 5;
     pub const toggle_history: platform.CommandId = 6;
+    pub const auto_layout: platform.CommandId = 7;
+    pub const auto_layout_selected: platform.CommandId = 8;
 };
+
+const MenuStateSignature = menu_sig.MenuStateSignature;
 
 // Local-only meta ring for History display (ops that do not enter CommandLog).
 const MAX_META_EVENTS: usize = 64;
@@ -508,6 +526,9 @@ const App = struct {
     /// When a group is selected, filled by member selection; when a node is selected, matches the selected node.
     inspector_target: ?Handle = null,
     drag: Drag = .none,
+    /// Targets frozen at drag start for `.node` / `.group` (linear scan on mouse move; no allocation).
+    drag_targets: [MAX_DRAG_TARGETS]DragTarget = undefined,
+    drag_target_count: u16 = 0,
     fb_w: u32 = WIN_W,
     fb_h: u32 = WIN_H,
     // PanelHost owns the outer shape / open / visible of History(left) / Inspector(right).
@@ -610,6 +631,9 @@ const App = struct {
     menu_command_count: usize = 0,
     menu_bar_state: gui.MenuBarState = .{},
     native_menu_active: bool = false,
+    /// Last native-menu signature. `updateMenu` only when this differs after rebuild.
+    menu_sig: MenuStateSignature = .{},
+    menu_sig_valid: bool = false,
     pending_menu_op: ?MenuFileOp = null,
     menu_last_op: ?MenuFileOp = null,
     running: bool = true,
@@ -1073,6 +1097,16 @@ const App = struct {
     }
 
     // ── File menu ──────────────────────────────────────────────────────────
+    /// True when multi-selection or a single node/group is selected (port/cable do not count).
+    fn hasLayoutSelection(self: *const App) bool {
+        if (!selection.empty(&self.multi_selected)) return true;
+        if (self.selected) |it| switch (it) {
+            .node, .group => return true,
+            .port, .cable => return false,
+        };
+        return false;
+    }
+
     fn rebuildMenuCommands(self: *App) void {
         const accel_mod: platform.ModifierFlags = if (builtin.os.tag == .macos)
             .{ .cmd = true }
@@ -1101,6 +1135,22 @@ const App = struct {
             .menu = .{ .title = "Edit", .order = 101 },
             .shortcut = .{ .key = .Z, .modifiers = redo_mod },
             .execution_policy = .redo,
+        });
+        // Edit → Auto Layout / Auto Layout Selected (immediately after Redo).
+        put(self, &n, .{
+            .id = CmdId.auto_layout,
+            .label = "Auto Layout",
+            .menu = .{ .title = "Edit", .order = 102 },
+            .shortcut = .{ .key = .L, .modifiers = accel_mod },
+        });
+        var layout_sel_mod = accel_mod;
+        layout_sel_mod.shift = true;
+        put(self, &n, .{
+            .id = CmdId.auto_layout_selected,
+            .label = "Auto Layout Selected",
+            .menu = .{ .title = "Edit", .order = 103 },
+            .shortcut = .{ .key = .L, .modifiers = layout_sel_mod },
+            .enabled = self.hasLayoutSelection(),
         });
         put(self, &n, .{
             .id = CmdId.save_project,
@@ -1138,6 +1188,34 @@ const App = struct {
         return self.menu_commands[0..self.menu_command_count];
     }
 
+    /// Fixed-size signature of non-separator enabled/checked bits + item count.
+    fn computeMenuSignature(self: *const App) MenuStateSignature {
+        var flags: [MENU_CMD_CAP]menu_sig.ItemState = undefined;
+        var n: usize = 0;
+        for (self.menu_commands[0..self.menu_command_count]) |cmd| {
+            if (cmd.kind == .separator) continue;
+            if (n >= flags.len) break;
+            flags[n] = .{ .enabled = cmd.enabled, .checked = cmd.checked };
+            n += 1;
+        }
+        return menu_sig.signatureOf(flags[0..n]);
+    }
+
+    /// Call after rebuildMenuCommands. First time (or structure change) uses registerMenu;
+    /// later frames call updateMenu only when the signature changes. Never every frame.
+    fn syncNativeMenu(self: *App, win: *platform.Window) void {
+        if (!self.native_menu_active) return;
+        const cmds = self.menuCommandsSlice();
+        const sig = self.computeMenuSignature();
+        switch (menu_sig.syncKind(self.menu_sig_valid, self.menu_sig, sig)) {
+            .none => return,
+            .register => win.registerMenu(cmds),
+            .update => win.updateMenu(cmds),
+        }
+        self.menu_sig = sig;
+        self.menu_sig_valid = true;
+    }
+
     fn findMenuCommand(self: *const App, id: platform.CommandId) ?platform.Command {
         if (id == 0) return null;
         for (self.menu_commands[0..self.menu_command_count]) |cmd| {
@@ -1153,6 +1231,8 @@ const App = struct {
         switch (id) {
             CmdId.undo => doUndo(self),
             CmdId.redo => doRedo(self),
+            CmdId.auto_layout => routeLayoutAction(self, "auto_layout"),
+            CmdId.auto_layout_selected => routeLayoutAction(self, "auto_layout_selected"),
             CmdId.save_project => {
                 self.pending_menu_op = .save_project;
                 self.menu_last_op = .save_project;
@@ -1170,7 +1250,8 @@ const App = struct {
         }
     }
 
-    /// Shortcut matching for the GUI-fallback environment (when native menu is on, keyEquivalent owns it).
+    /// Shortcut matching for GUI-fallback and harness inject.
+    /// When the native menu is active, OS keyEquivalent may also emit menu_command for real keys.
     fn matchMenuShortcut(self: *const App, k: platform.KeyEvent) ?platform.CommandId {
         const accel = k.modifiers.cmd or k.modifiers.ctrl;
         for (self.menu_commands[0..self.menu_command_count]) |cmd| {
@@ -2220,16 +2301,9 @@ fn onMouseUp(app: *App) void {
             routeDisconnect(app, d.dst_handle, d.dst_in);
         }
     } else if (app.drag == .node) {
-        const nd = app.drag.node;
-        const pos = app.layout[nd.handle];
-        if (nodeIdOf(app, nd.handle)) |id| {
-            var args_buf: [128]u8 = undefined;
-            const args = std.fmt.bufPrint(&args_buf, "#{d} {d} {d}", .{ id.raw(), pos.x, pos.y }) catch {
-                app.drag = .none;
-                return;
-            };
-            routeUiAction(app, "move_node", args);
-        }
+        commitNodeOrGroupDrag(app);
+    } else if (app.drag == .group) {
+        commitNodeOrGroupDrag(app);
     } else if (app.drag == .rect_select) {
         // Confirm rect select: put handles whose display-node bbox (from buildNodes) positively intersects into the set.
         const rs = app.drag.rect_select;
@@ -2244,6 +2318,133 @@ fn onMouseUp(app: *App) void {
         }
     }
     app.drag = .none;
+    app.drag_target_count = 0;
+}
+
+/// Current world position of a drag target handle (real layout[] or group.pos).
+fn dragTargetCurrentPos(app: *const App, h: Handle) ?Vec2f {
+    if (group.groupIdFromHandle(h)) |gid| {
+        if (gid >= group.MAX_GROUPS or !app.ledger.groups[gid].active) return null;
+        return app.ledger.groups[gid].pos;
+    }
+    if (h >= MAX_MODULES or !app.dyn.slotActive(h)) return null;
+    return app.layout[h];
+}
+
+/// Restore every frozen drag target to its start_pos (preview cancel / pre-route restore).
+fn restoreDragTargetsToStart(app: *App) void {
+    var i: u16 = 0;
+    while (i < app.drag_target_count) : (i += 1) {
+        const t = app.drag_targets[i];
+        if (group.groupIdFromHandle(t.handle)) |gid| {
+            if (gid < group.MAX_GROUPS and app.ledger.groups[gid].active) {
+                app.ledger.setPosAndTranslateMembers(gid, t.start_pos, app.layout[0..]);
+            }
+        } else if (t.handle < MAX_MODULES) {
+            app.layout[t.handle] = t.start_pos;
+        }
+    }
+}
+
+/// Apply the same absolute delta from each target's start_pos (no accumulation; no allocation).
+fn applyDragTargetsDelta(app: *App, delta: Vec2f) void {
+    var i: u16 = 0;
+    while (i < app.drag_target_count) : (i += 1) {
+        const t = app.drag_targets[i];
+        const new_pos = t.start_pos.add(delta);
+        if (group.groupIdFromHandle(t.handle)) |gid| {
+            if (gid < group.MAX_GROUPS and app.ledger.groups[gid].active) {
+                app.ledger.setPosAndTranslateMembers(gid, new_pos, app.layout[0..]);
+            }
+        } else if (t.handle < MAX_MODULES) {
+            app.layout[t.handle] = new_pos;
+        }
+    }
+}
+
+/// Freeze drag targets at mouse-down. If grab is in multi_selected, freeze that set; otherwise just grab.
+fn freezeDragTargets(app: *App, grab_handle: Handle) void {
+    app.drag_target_count = 0;
+    const use_multi = !selection.empty(&app.multi_selected) and selection.contains(&app.multi_selected, grab_handle);
+    if (use_multi) {
+        var h: Handle = 0;
+        while (h < selection.CAP) : (h += 1) {
+            if (!selection.contains(&app.multi_selected, h)) continue;
+            const start = dragTargetCurrentPos(app, h) orelse continue;
+            if (app.drag_target_count >= MAX_DRAG_TARGETS) break;
+            app.drag_targets[app.drag_target_count] = .{ .handle = h, .start_pos = start };
+            app.drag_target_count += 1;
+        }
+    }
+    if (app.drag_target_count == 0) {
+        const start = dragTargetCurrentPos(app, grab_handle) orelse return;
+        app.drag_targets[0] = .{ .handle = grab_handle, .start_pos = start };
+        app.drag_target_count = 1;
+    }
+}
+
+/// Commit a node/group drag: single real node → `move_node`; multi/group → `move_layout`.
+/// Restores start positions before route so the action's before-snapshot is correct (preview already wrote finals).
+fn commitNodeOrGroupDrag(app: *App) void {
+    if (app.drag_target_count == 0) return;
+
+    // Single real node → existing move_node (explicit restore of start_pos for undo before).
+    if (app.drag_target_count == 1) {
+        const t = app.drag_targets[0];
+        if (group.groupIdFromHandle(t.handle) == null) {
+            const final_pos = app.layout[t.handle];
+            if (final_pos.x == t.start_pos.x and final_pos.y == t.start_pos.y) return;
+            const id = nodeIdOf(app, t.handle) orelse return;
+            // Restore before so actionMoveNode snapshots start_pos, not the preview endpoint.
+            app.layout[t.handle] = t.start_pos;
+            var args_buf: [128]u8 = undefined;
+            const args = std.fmt.bufPrint(&args_buf, "#{d} {d} {d}", .{ id.raw(), final_pos.x, final_pos.y }) catch {
+                app.layout[t.handle] = final_pos;
+                return;
+            };
+            routeUiAction(app, "move_node", args);
+            return;
+        }
+    }
+
+    // Multi and/or group: one move_layout with final positions of changed targets only.
+    // Group boxes are keyed by stable identity; members are always included as absolute reals.
+    var finals: [MAX_DRAG_TARGETS]layout_wire.LayoutTarget = undefined;
+    var n_final: usize = 0;
+    var i: u16 = 0;
+    while (i < app.drag_target_count) : (i += 1) {
+        const t = app.drag_targets[i];
+        const cur = dragTargetCurrentPos(app, t.handle) orelse continue;
+        if (cur.x == t.start_pos.x and cur.y == t.start_pos.y) continue;
+        if (n_final >= finals.len) break;
+        if (group.groupIdFromHandle(t.handle)) |gid| {
+            const identity = app.ledger.groups[gid].identity;
+            if (identity == 0) continue;
+            finals[n_final] = .{ .kind = .group, .id = identity, .x = cur.x, .y = cur.y };
+            n_final += 1;
+            // Absolute member finals so undo/apply never depend on collapsed state.
+            appendGroupMemberWireTargets(app, gid, &finals, &n_final);
+        } else {
+            const id = nodeIdOf(app, t.handle) orelse continue;
+            finals[n_final] = .{ .kind = .real, .id = id.raw(), .x = cur.x, .y = cur.y };
+            n_final += 1;
+        }
+    }
+    if (n_final == 0) return;
+
+    var payload_buf: [layout_wire.MAX_CMD_ARGS]u8 = undefined;
+    const payload = layout_wire.encodeTargetsForAction(payload_buf[0..], "move_layout", finals[0..n_final]) catch |err| {
+        // Whole-gesture reject: restore preview to before, no PROPOSE/route.
+        restoreDragTargetsToStart(app);
+        if (err == error.ArgsTooLong or err == error.TooLong) {
+            rejectLayoutArgsTooLong(app);
+        }
+        return;
+    };
+
+    // Restore start so actionApplyLayoutTargets records correct before-snaps, then apply finals via action.
+    restoreDragTargetsToStart(app);
+    routeUiAction(app, "move_layout", payload);
 }
 
 /// Fully pre-validate a connection, then commit in one publish. A drag-off's old connection (detach) is handled in the same commit,
@@ -2374,16 +2575,24 @@ fn onMouseDown(app: *App, modifiers: platform.ModifierFlags) void {
             }
             app.drag = .none;
         } else if (group.groupIdFromHandle(h)) |gid| {
-            // Collapsed-box body drag: update ledger.groups[gid].pos and translate member layout slots
-            // by the same delta (never index a synthetic handle into app.layout[h]).
-            selection.clear(&app.multi_selected);
+            // Collapsed-box body drag. If the grab is already multi-selected, freeze the multi set;
+            // otherwise clear multi and drag this group alone.
+            const gh = group.handleOfGroup(gid);
+            if (selection.empty(&app.multi_selected) or !selection.contains(&app.multi_selected, gh)) {
+                selection.clear(&app.multi_selected);
+            }
             app.selected = .{ .group = gid };
-            app.drag = .{ .group = .{ .gid = gid, .grab_offset = app.ledger.groups[gid].pos.sub(mw) } };
+            const gpos = app.ledger.groups[gid].pos;
+            freezeDragTargets(app, gh);
+            app.drag = .{ .group = .{ .gid = gid, .grab_offset = gpos.sub(mw), .start_pos = gpos } };
         } else {
-            selection.clear(&app.multi_selected);
+            if (selection.empty(&app.multi_selected) or !selection.contains(&app.multi_selected, h)) {
+                selection.clear(&app.multi_selected);
+            }
             app.selected = .{ .node = h };
             const npos = app.layout[h];
-            app.drag = .{ .node = .{ .handle = h, .grab_offset = npos.sub(mw) } };
+            freezeDragTargets(app, h);
+            app.drag = .{ .node = .{ .handle = h, .grab_offset = npos.sub(mw), .start_pos = npos } };
         }
     } else if (hitGroupHeader(app, mw)) |gid| {
         // Click on an expanded-frame header body: selection only (not draggable). Shift/Cmd toggles.
@@ -2767,13 +2976,17 @@ fn onMouseMove(app: *App) void {
             app.camera.pan = p.start_pan.add(local.sub(p.start_mouse));
         },
         .node => |nd| {
+            // Preview only: absolute start+delta for every frozen target (no alloc / no undo / no wire).
             const mw = app.mouseWorld();
-            app.layout[nd.handle] = mw.add(nd.grab_offset);
+            const primary_final = mw.add(nd.grab_offset);
+            const delta = primary_final.sub(nd.start_pos);
+            applyDragTargetsDelta(app, delta);
         },
         .group => |gd| {
             const mw = app.mouseWorld();
-            const new_pos = mw.add(gd.grab_offset);
-            app.ledger.setPosAndTranslateMembers(gd.gid, new_pos, app.layout[0..]);
+            const primary_final = mw.add(gd.grab_offset);
+            const delta = primary_final.sub(gd.start_pos);
+            applyDragTargetsDelta(app, delta);
         },
         .cable => {}, // pending is drawn every frame from app.mouse (no state update)
         .rect_select => {}, // Rect is drawn by drawFrame from mouseWorld (no state update)
@@ -3171,7 +3384,7 @@ pub fn main(init: std.process.Init) !void {
     app.rebuildMenuCommands();
     if (window.nativeMenuAvailable()) {
         app.native_menu_active = true;
-        window.registerMenu(app.menuCommandsSlice());
+        app.syncNativeMenu(&window);
     }
     defer if (app.native_menu_active) window.destroyMenu();
 
@@ -3312,17 +3525,17 @@ pub fn main(init: std.process.Init) !void {
             }
 
             app.rebuildMenuCommands();
+            app.syncNativeMenu(&window);
 
             while (window.nextEvent()) |ev| {
                 switch (ev) {
                     .quit => app.running = false,
                     .key_down => |k| {
-                        // GUI fallback: menu shortcuts (Cmd/Ctrl+S/O). Native: the OS owns them.
-                        if (!app.native_menu_active) {
-                            if (app.matchMenuShortcut(k)) |cmd_id| {
-                                app.dispatchCommand(cmd_id);
-                                continue;
-                            }
+                        // Menu shortcuts (GUI fallback + harness inject). Native OS keyEquivalent
+                        // may also deliver menu_command for real keyboard events.
+                        if (app.matchMenuShortcut(k)) |cmd_id| {
+                            app.dispatchCommand(cmd_id);
+                            continue;
                         }
                         switch (k.key) {
                             .ESCAPE => {
@@ -4017,15 +4230,25 @@ fn patchNodeExists(ctx: *anyopaque, id: u64) bool {
     return handleOfNodeId(app, NodeId.fromRaw(id)) != null;
 }
 
+/// True when a Group.identity is still live (not slot id — identities are never reused after free).
+fn patchGroupIdentityLive(ctx: *anyopaque, identity: u64) bool {
+    const app: *App = @ptrCast(@alignCast(ctx));
+    return app.ledger.groupIdOfIdentity(identity) != null;
+}
+
 fn patchCanUndo(ctx: *anyopaque, rec: *const platform.command.CommandRecord) bool {
     const app: *App = @ptrCast(@alignCast(ctx));
     const ref = rec.undo_ref orelse return false;
     const entry = app.undo_store.get(ref) orelse return false;
-    return patch_undo.canUndoPayload(entry.payload, .{
+    const presence = patch_undo.NodePresence{
         .ctx = app,
         .exists = patchNodeExists,
         .free_handles = app.dyn.freeHandleCount(),
-    });
+    };
+    if (entry.payload == .layout) {
+        return patch_undo.canUndoLayout(app.undo_store, entry.payload.layout, presence, patchGroupIdentityLive);
+    }
+    return patch_undo.canUndoPayload(entry.payload, presence);
 }
 
 fn patchSummarize(ctx: *anyopaque, rec: *const platform.command.CommandRecord, buf: []u8) []const u8 {
@@ -4099,12 +4322,33 @@ fn patchApplyUndo(ctx: *anyopaque, rec: *const platform.command.CommandRecord) v
             const h = handleOfNodeId(app, NodeId.fromRaw(s.id)) orelse return;
             app.layout[h] = .{ .x = s.x, .y = s.y };
         },
+        .layout => |r| {
+            applyUndoLayout(app, r);
+        },
         .add_macro => |s| {
             applyUndoAddMacro(app, s);
         },
         .remove_macro => |s| {
             applyUndoRemoveMacro(app, s);
         },
+    }
+}
+
+/// Restore before-positions from a multi-target layout undo. Skips targets that no longer exist.
+/// Group boxes are keyed by stable identity; members are absolute real-node positions (collapse-independent).
+fn applyUndoLayout(app: *App, ref: patch_undo.LayoutRef) void {
+    const snaps = app.undo_store.layoutSnaps(ref) orelse return;
+    for (snaps) |s| {
+        if (patch_undo.isGroupLayoutTarget(s.target)) {
+            const identity = patch_undo.layoutTargetId(s.target);
+            const gid = app.ledger.groupIdOfIdentity(identity) orelse continue;
+            // Absolute group.pos only — members restore as separate real snaps (no collapse-dependent translate).
+            app.ledger.groups[gid].pos = .{ .x = s.x, .y = s.y };
+        } else {
+            const h = handleOfNodeId(app, NodeId.fromRaw(s.target)) orelse continue;
+            if (!app.dyn.slotActive(h)) continue;
+            app.layout[h] = .{ .x = s.x, .y = s.y };
+        }
     }
 }
 
@@ -5192,6 +5436,15 @@ fn registerPatchActions(app: *App) void {
         .canonicalize = canonicalizeMoveNode,
     });
     platform.registerAction(.{
+        .name = "move_layout",
+        .ctx = app,
+        .run = recordedGraphAction("move_layout"),
+        .network_policy = patchPolicy("move_layout"),
+        .canonicalize = canonicalizeMoveLayout,
+        .args = &.{.{ .name = "targets", .kind = "string", .desc = "canonical target list of final positions" }},
+        .desc = "apply final positions for one or more layout targets (drag commit)",
+    });
+    platform.registerAction(.{
         .name = "add_macro",
         .ctx = app,
         .run = recordedGraphAction("add_macro"),
@@ -5219,22 +5472,24 @@ fn registerPatchActions(app: *App) void {
         .network_policy = patchPolicy("load_graph"),
         .desc = "load graph/Ledger/GENR from KNGN (or legacy PTCG); reject while synced",
     });
-    // Full re-layout of the display graph (local_only; no args; no undo/history)
+    // Full re-layout of the display graph. Empty args expand to a canonical target-list payload (.relay).
     platform.registerAction(.{
         .name = "auto_layout",
         .ctx = app,
-        .run = actionAutoLayout,
-        .network_policy = .local_only,
-        .args = &.{},
+        .run = recordedGraphAction("auto_layout"),
+        .network_policy = patchPolicy("auto_layout"),
+        .canonicalize = canonicalizeAutoLayout,
+        .args = &.{.{ .name = "targets", .kind = "string", .optional = true, .desc = "canonical target list; empty = compute on origin peer" }},
         .desc = "Sugiyama layered layout of display graph (real nodes + collapsed boxes)",
     });
-    // Topology-ignoring grid of selected display nodes only (local_only; no args)
+    // Topology-ignoring grid of selected display nodes only. Selection is taken on the origin peer.
     platform.registerAction(.{
         .name = "auto_layout_selected",
         .ctx = app,
-        .run = actionAutoLayoutSelected,
-        .network_policy = .local_only,
-        .args = &.{},
+        .run = recordedGraphAction("auto_layout_selected"),
+        .network_policy = patchPolicy("auto_layout_selected"),
+        .canonicalize = canonicalizeAutoLayoutSelected,
+        .args = &.{.{ .name = "targets", .kind = "string", .optional = true, .desc = "canonical target list; empty = compute on origin peer" }},
         .desc = "simple grid pack of selected display nodes (topology ignored)",
     });
 }
@@ -5299,14 +5554,6 @@ fn runAutoLayout(app: *App) void {
     );
 }
 
-/// `auto_layout`: thin wrapper around runAutoLayout. No camera fit / undo.
-fn actionAutoLayout(ctx: *anyopaque, args: []const u8, buf: []u8) anyerror![]const u8 {
-    _ = args;
-    _ = buf;
-    runAutoLayout(actionApp(ctx));
-    return "ok";
-}
-
 /// Prefer multi_selected; if empty, take App.selected .node/.group as a single target.
 /// Write only handles that exist in the display nodes into out; return the count (.port/.cable/null → 0).
 fn collectSelectedLayoutTargets(app: *const App, nodes: []const NodeGeom, out: []Handle) usize {
@@ -5359,12 +5606,373 @@ fn runAutoLayoutSelected(app: *App) anyerror!void {
     );
 }
 
-/// `auto_layout_selected`: thin wrapper around runAutoLayoutSelected.
-fn actionAutoLayoutSelected(ctx: *anyopaque, args: []const u8, buf: []u8) anyerror![]const u8 {
-    _ = args;
-    _ = buf;
-    try runAutoLayoutSelected(actionApp(ctx));
+// ── Layout wire: snapshot / encode / apply / UI entry ──────────────────────
+
+const LayoutPosSnap = struct {
+    layout: [MAX_MODULES]Vec2f,
+    group_pos: [group.MAX_GROUPS]Vec2f,
+};
+
+fn snapshotLayoutPositions(app: *const App) LayoutPosSnap {
+    var snap: LayoutPosSnap = undefined;
+    @memcpy(snap.layout[0..], app.layout[0..]);
+    var gi: usize = 0;
+    while (gi < group.MAX_GROUPS) : (gi += 1) {
+        snap.group_pos[gi] = app.ledger.groups[gi].pos;
+    }
+    return snap;
+}
+
+fn restoreLayoutPositions(app: *App, snap: *const LayoutPosSnap) void {
+    @memcpy(app.layout[0..], snap.layout[0..]);
+    var gi: usize = 0;
+    while (gi < group.MAX_GROUPS) : (gi += 1) {
+        app.ledger.groups[gi].pos = snap.group_pos[gi];
+    }
+}
+
+/// Reject a layout action before route/propose: History meta + structured error detail. No mutation.
+fn rejectLayoutArgsTooLong(app: *App) void {
+    platform.setActionErrorDetail("layout_args_too_long", "reduce the number of layout targets");
+    app.pushMetaEvent("Move cancelled: selection is too large");
+}
+
+/// Encode one display node handle as a wire target (stable node id or group.identity + current pos).
+fn displayHandleToWireTarget(app: *const App, h: Handle) ?layout_wire.LayoutTarget {
+    if (group.groupIdFromHandle(h)) |gid| {
+        if (gid >= group.MAX_GROUPS or !app.ledger.groups[gid].active) return null;
+        const identity = app.ledger.groups[gid].identity;
+        if (identity == 0) return null;
+        const pos = app.ledger.groups[gid].pos;
+        return .{ .kind = .group, .id = identity, .x = pos.x, .y = pos.y };
+    }
+    if (h >= MAX_MODULES or !app.dyn.slotActive(h)) return null;
+    const id = nodeIdOf(app, h) orelse return null;
+    const pos = app.layout[h];
+    return .{ .kind = .real, .id = id.raw(), .x = pos.x, .y = pos.y };
+}
+
+/// Append absolute member positions for a group (collapse-independent undo/apply).
+fn appendGroupMemberWireTargets(app: *const App, gid: group.GroupId, out: []layout_wire.LayoutTarget, n: *usize) void {
+    if (gid >= group.MAX_GROUPS or !app.ledger.groups[gid].active) return;
+    var h: Handle = 0;
+    while (h < MAX_MODULES) : (h += 1) {
+        if (app.ledger.group_of[h] != gid) continue;
+        if (!app.dyn.slotActive(h)) continue;
+        const id = nodeIdOf(app, h) orelse continue;
+        if (n.* >= out.len) return;
+        out[n.*] = .{ .kind = .real, .id = id.raw(), .x = app.layout[h].x, .y = app.layout[h].y };
+        n.* += 1;
+    }
+}
+
+/// Collect wire targets for every current display node, expanding collapsed-group members to absolute reals.
+fn collectAllDisplayWireTargets(app: *const App, out: []layout_wire.LayoutTarget) usize {
+    var node_buf: [MAX_MODULES + group.MAX_GROUPS]NodeGeom = undefined;
+    const n_nodes = app.buildNodes(&node_buf);
+    var n: usize = 0;
+    for (node_buf[0..n_nodes]) |ng| {
+        if (n >= out.len) break;
+        out[n] = displayHandleToWireTarget(app, ng.handle) orelse continue;
+        n += 1;
+        if (group.groupIdFromHandle(ng.handle)) |gid| {
+            appendGroupMemberWireTargets(app, gid, out, &n);
+        }
+    }
+    return n;
+}
+
+/// Collect wire targets for the selected display set (post-layout), expanding group members.
+fn collectSelectedWireTargets(app: *const App, out: []layout_wire.LayoutTarget) usize {
+    var node_buf: [MAX_MODULES + group.MAX_GROUPS]NodeGeom = undefined;
+    const n_nodes = app.buildNodes(&node_buf);
+    var handles: [MAX_MODULES + group.MAX_GROUPS]Handle = undefined;
+    const n_h = collectSelectedLayoutTargets(app, node_buf[0..n_nodes], handles[0..]);
+    var n: usize = 0;
+    for (handles[0..n_h]) |h| {
+        if (n >= out.len) break;
+        out[n] = displayHandleToWireTarget(app, h) orelse continue;
+        n += 1;
+        if (group.groupIdFromHandle(h)) |gid| {
+            appendGroupMemberWireTargets(app, gid, out, &n);
+        }
+    }
+    return n;
+}
+
+/// Compute layout on this peer, encode final positions, restore local state, return payload in `scratch`.
+/// Empty target set → empty slice (caller treats as no-op). Over budget → ArgsTooLong after restore.
+fn buildAutoLayoutPayload(app: *App, scratch: []u8) layout_wire.WireError![]const u8 {
+    const before = snapshotLayoutPositions(app);
+    runAutoLayout(app);
+    var targets: [MAX_MODULES + group.MAX_GROUPS]layout_wire.LayoutTarget = undefined;
+    const n = collectAllDisplayWireTargets(app, targets[0..]);
+    restoreLayoutPositions(app, &before);
+    if (n == 0) return scratch[0..0];
+    return layout_wire.encodeTargetsForAction(scratch, "auto_layout", targets[0..n]) catch |err| {
+        if (err == error.ArgsTooLong or err == error.TooLong) return error.ArgsTooLong;
+        return err;
+    };
+}
+
+/// Compute selected-grid layout on this peer, encode finals, restore, return payload.
+fn buildAutoLayoutSelectedPayload(app: *App, scratch: []u8) anyerror![]const u8 {
+    var node_buf: [MAX_MODULES + group.MAX_GROUPS]NodeGeom = undefined;
+    const n_nodes = app.buildNodes(&node_buf);
+    var handles: [MAX_MODULES + group.MAX_GROUPS]Handle = undefined;
+    const n_h = collectSelectedLayoutTargets(app, node_buf[0..n_nodes], handles[0..]);
+    if (n_h == 0) {
+        platform.setActionErrorDetail("empty_selection", "select one or more display nodes");
+        return error.EmptySelection;
+    }
+    if (n_h == 1) {
+        // Single target is a successful no-op; encode the current position so peers stay aligned.
+        var one: [1]layout_wire.LayoutTarget = undefined;
+        one[0] = displayHandleToWireTarget(app, handles[0]) orelse return scratch[0..0];
+        return layout_wire.encodeTargetsForAction(scratch, "auto_layout_selected", one[0..]) catch |err| {
+            if (err == error.ArgsTooLong or err == error.TooLong) return error.ArgsTooLong;
+            return err;
+        };
+    }
+    const before = snapshotLayoutPositions(app);
+    layout_mod.applySelectedGrid(
+        node_buf[0..n_nodes],
+        handles[0..n_h],
+        app.layout[0..],
+        &app.ledger,
+    );
+    var targets: [MAX_MODULES + group.MAX_GROUPS]layout_wire.LayoutTarget = undefined;
+    const n = collectSelectedWireTargets(app, targets[0..]);
+    restoreLayoutPositions(app, &before);
+    if (n == 0) return scratch[0..0];
+    return layout_wire.encodeTargetsForAction(scratch, "auto_layout_selected", targets[0..n]) catch |err| {
+        if (err == error.ArgsTooLong or err == error.TooLong) return error.ArgsTooLong;
+        return err;
+    };
+}
+
+/// Resolve current world position of a wire target (for before-snapshot / change detection).
+/// Group targets use Group.identity in `t.id` (not slot GroupId).
+fn currentLayoutTargetPos(app: *const App, t: layout_wire.LayoutTarget) ?Vec2f {
+    switch (t.kind) {
+        .real => {
+            const h = handleOfNodeId(app, NodeId.fromRaw(t.id)) orelse return null;
+            if (!app.dyn.slotActive(h)) return null;
+            return app.layout[h];
+        },
+        .group => {
+            const gid = app.ledger.groupIdOfIdentity(t.id) orelse return null;
+            return app.ledger.groups[gid].pos;
+        },
+    }
+}
+
+fn layoutWireTargetKey(t: layout_wire.LayoutTarget) u64 {
+    return switch (t.kind) {
+        .real => patch_undo.encodeRealLayoutTarget(t.id),
+        // t.id is already Group.identity on the wire.
+        .group => patch_undo.encodeGroupLayoutTarget(t.id),
+    };
+}
+
+/// Apply a canonical target-list payload (no layout recompute). Missing targets are skipped.
+/// Group boxes set `groups[gid].pos` only; members must appear as absolute real targets
+/// (collapse-independent — never uses setPosAndTranslateMembers on the apply path).
+fn applyLayoutTargetList(app: *App, targets: []const layout_wire.LayoutTarget) void {
+    for (targets) |t| {
+        switch (t.kind) {
+            .real => {
+                const h = handleOfNodeId(app, NodeId.fromRaw(t.id)) orelse continue;
+                if (!app.dyn.slotActive(h)) continue;
+                app.layout[h] = .{ .x = t.x, .y = t.y };
+            },
+            .group => {
+                const gid = app.ledger.groupIdOfIdentity(t.id) orelse continue;
+                app.ledger.groups[gid].pos = .{ .x = t.x, .y = t.y };
+            },
+        }
+    }
+}
+
+/// Apply canonical layout args: snapshot befores of changed targets, pushLayout, mutate, noteUndo.
+/// Allocation failure leaves coordinates unchanged.
+fn applyCanonicalLayoutArgs(app: *App, comptime action_name: []const u8, args: []const u8) anyerror![]const u8 {
+    layout_wire.validateArgs(action_name, args) catch |err| {
+        if (err == error.ArgsTooLong) {
+            platform.setActionErrorDetail("layout_args_too_long", "reduce the number of layout targets");
+            return error.ArgsTooLong;
+        }
+        return err;
+    };
+    var finals: [MAX_MODULES + group.MAX_GROUPS]layout_wire.LayoutTarget = undefined;
+    const n = try layout_wire.parseTargets(args, finals[0..]);
+
+    var before_snaps: [MAX_MODULES + group.MAX_GROUPS]patch_undo.LayoutTargetSnap = undefined;
+    var n_before: usize = 0;
+    for (finals[0..n]) |t| {
+        const cur = currentLayoutTargetPos(app, t) orelse continue;
+        if (cur.x == t.x and cur.y == t.y) continue;
+        if (n_before >= before_snaps.len) break;
+        before_snaps[n_before] = .{
+            .target = layoutWireTargetKey(t),
+            .x = cur.x,
+            .y = cur.y,
+        };
+        n_before += 1;
+    }
+
+    if (n_before == 0) {
+        applyLayoutTargetList(app, finals[0..n]);
+        return "ok";
+    }
+
+    // Allocate undo block before mutating so a failure leaves coordinates unchanged.
+    const undo_ref = app.undo_store.pushLayout(before_snaps[0..n_before]) catch |err| {
+        if (err == error.OutOfMemory) {
+            platform.setActionErrorDetail("layout_undo_oom", "layout undo snapshot allocation failed");
+            return error.OutOfMemory;
+        }
+        return err;
+    };
+    applyLayoutTargetList(app, finals[0..n]);
+    app.cmd_exec.noteUndo(undo_ref);
     return "ok";
+}
+
+/// Shared body for `auto_layout` / `auto_layout_selected` / `move_layout`.
+/// Empty args: auto_layout / selected expand on this peer (same contract as canonicalize);
+/// move_layout rejects empty. Direct Executor and registry paths share this body.
+fn actionApplyLayoutTargetsNamed(comptime action_name: []const u8) *const fn (*anyopaque, []const u8, []u8) anyerror![]const u8 {
+    return &struct {
+        fn run(ctx: *anyopaque, args: []const u8, buf: []u8) anyerror![]const u8 {
+            const app = actionApp(ctx);
+            const trimmed = std.mem.trim(u8, args, " \t");
+            if (trimmed.len == 0) {
+                if (comptime std.mem.eql(u8, action_name, "move_layout")) {
+                    platform.setActionErrorDetail("empty_layout", "move_layout requires a target list");
+                    return error.Empty;
+                }
+                // Expand empty → canonical payload, then apply (covers direct Executor / copilot paths).
+                var scratch: [layout_wire.MAX_CMD_ARGS]u8 = undefined;
+                const payload = if (comptime std.mem.eql(u8, action_name, "auto_layout_selected"))
+                    buildAutoLayoutSelectedPayload(app, &scratch) catch |err| {
+                        if (err == error.ArgsTooLong) {
+                            rejectLayoutArgsTooLong(app);
+                            return error.ArgsTooLong;
+                        }
+                        return err;
+                    }
+                else
+                    buildAutoLayoutPayload(app, &scratch) catch |err| {
+                        if (err == error.ArgsTooLong) {
+                            rejectLayoutArgsTooLong(app);
+                            return error.ArgsTooLong;
+                        }
+                        return err;
+                    };
+                if (payload.len == 0) return "ok";
+                // Copy payload out of scratch if needed — applyCanonical reads args only.
+                // payload is a slice of scratch; safe for the duration of this call.
+                return applyCanonicalLayoutArgs(app, action_name, payload);
+            }
+            _ = buf;
+            return applyCanonicalLayoutArgs(app, action_name, trimmed);
+        }
+    }.run;
+}
+
+const actionApplyLayoutTargets = actionApplyLayoutTargetsNamed("auto_layout");
+const actionApplyLayoutSelected = actionApplyLayoutTargetsNamed("auto_layout_selected");
+const actionApplyMoveLayout = actionApplyLayoutTargetsNamed("move_layout");
+
+fn canonicalizeAutoLayout(ctx: *anyopaque, args: []const u8, scratch: []u8) anyerror![]const u8 {
+    const app: *App = @ptrCast(@alignCast(ctx));
+    const trimmed = std.mem.trim(u8, args, " \t");
+    if (trimmed.len > 0) {
+        layout_wire.validateArgs("auto_layout", trimmed) catch |err| {
+            if (err == error.ArgsTooLong) {
+                rejectLayoutArgsTooLong(app);
+                return error.ArgsTooLong;
+            }
+            return err;
+        };
+        return trimmed;
+    }
+    return buildAutoLayoutPayload(app, scratch) catch |err| {
+        if (err == error.ArgsTooLong) {
+            rejectLayoutArgsTooLong(app);
+            return error.ArgsTooLong;
+        }
+        return err;
+    };
+}
+
+fn canonicalizeAutoLayoutSelected(ctx: *anyopaque, args: []const u8, scratch: []u8) anyerror![]const u8 {
+    const app: *App = @ptrCast(@alignCast(ctx));
+    const trimmed = std.mem.trim(u8, args, " \t");
+    if (trimmed.len > 0) {
+        layout_wire.validateArgs("auto_layout_selected", trimmed) catch |err| {
+            if (err == error.ArgsTooLong) {
+                rejectLayoutArgsTooLong(app);
+                return error.ArgsTooLong;
+            }
+            return err;
+        };
+        return trimmed;
+    }
+    return buildAutoLayoutSelectedPayload(app, scratch) catch |err| {
+        if (err == error.ArgsTooLong) {
+            rejectLayoutArgsTooLong(app);
+            return error.ArgsTooLong;
+        }
+        return err;
+    };
+}
+
+/// `move_layout` always carries a canonical target list (drag commit). Empty args are rejected.
+fn canonicalizeMoveLayout(ctx: *anyopaque, args: []const u8, scratch: []u8) anyerror![]const u8 {
+    _ = scratch;
+    const app: *App = @ptrCast(@alignCast(ctx));
+    const trimmed = std.mem.trim(u8, args, " \t");
+    if (trimmed.len == 0) {
+        platform.setActionErrorDetail("empty_layout", "move_layout requires a target list");
+        return error.Empty;
+    }
+    layout_wire.validateArgs("move_layout", trimmed) catch |err| {
+        if (err == error.ArgsTooLong) {
+            rejectLayoutArgsTooLong(app);
+            return error.ArgsTooLong;
+        }
+        return err;
+    };
+    return trimmed;
+}
+
+/// Menu / shortcut entry: expand empty args to a canonical payload, then route through routeUiActionInto.
+/// Over-budget targets are rejected wholesale (no route, no PROPOSE).
+fn routeLayoutAction(app: *App, comptime name: []const u8) void {
+    var scratch: [layout_wire.MAX_CMD_ARGS]u8 = undefined;
+    const payload = blk: {
+        if (comptime std.mem.eql(u8, name, "auto_layout")) {
+            break :blk buildAutoLayoutPayload(app, &scratch) catch |err| {
+                if (err == error.ArgsTooLong) rejectLayoutArgsTooLong(app);
+                return;
+            };
+        } else if (comptime std.mem.eql(u8, name, "auto_layout_selected")) {
+            break :blk buildAutoLayoutSelectedPayload(app, &scratch) catch |err| {
+                if (err == error.ArgsTooLong) {
+                    rejectLayoutArgsTooLong(app);
+                } else if (err == error.EmptySelection) {
+                    // error detail already set
+                }
+                return;
+            };
+        } else {
+            @compileError("routeLayoutAction: unsupported name");
+        }
+    };
+    if (payload.len == 0) return;
+    routeUiAction(app, name, payload);
 }
 
 fn toPlatformPolicy(tag: gen_actions.NetworkPolicyTag) platform.NetworkPolicy {
@@ -7016,6 +7624,9 @@ const MODULAR_ACTIONS = [_]ActionEntry{
     .{ .name = "move_node", .run = actionMoveNode },
     .{ .name = "add_macro", .run = actionAddMacro },
     .{ .name = "remove_macro", .run = actionRemoveMacro },
+    .{ .name = "auto_layout", .run = actionApplyLayoutTargets },
+    .{ .name = "auto_layout_selected", .run = actionApplyLayoutSelected },
+    .{ .name = "move_layout", .run = actionApplyMoveLayout },
 };
 
 fn dispatchModularAction(ctx: *anyopaque, name: []const u8, args: []const u8, buf: []u8) anyerror![]const u8 {

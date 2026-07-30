@@ -73,6 +73,9 @@ pub const Group = struct {
     /// A generated macro states its display lane count explicitly (generated drum=3 / bass=4). UI-local only.
     grid_rows: u8 = 0,
     pos: Vec2f = .{ .x = 0, .y = 0 },
+    /// Monotonic stable identity for wire/undo (never reused when a slot is recycled). 0 = inactive/unset.
+    /// Distinct from the slot `GroupId`; layout payloads key groups by this value.
+    identity: u64 = 0,
     exposed_in: [MAX_EXPOSED]ExposedPort = [_]ExposedPort{.{}} ** MAX_EXPOSED,
     n_in: u8 = 0,
     exposed_out: [MAX_EXPOSED]ExposedPort = [_]ExposedPort{.{}} ** MAX_EXPOSED,
@@ -137,29 +140,43 @@ pub const Ledger = struct {
     groups: [MAX_GROUPS]Group = [_]Group{.{}} ** MAX_GROUPS,
     /// A real handle (< GROUP_HANDLE_BASE) maps to its owning GroupId. Synthetic handles are not indexed.
     group_of: [GROUP_HANDLE_BASE]?GroupId = [_]?GroupId{null} ** GROUP_HANDLE_BASE,
+    /// Next unused group.identity (starts at 1; 0 reserved for inactive). Never reused after free.
+    next_identity: u64 = 1,
 
     // ------------------------------------------------------------------
     // Lifecycle (event-time only)
     // ------------------------------------------------------------------
 
-    /// Allocates a free group slot (null if none is available).
+    /// Allocates a free group slot (null if none is available). Assigns a fresh stable identity.
     pub fn alloc(self: *Ledger) ?GroupId {
         for (&self.groups, 0..) |*g, i| {
             if (!g.active) {
-                g.* = .{ .active = true };
+                const id = self.next_identity;
+                self.next_identity += 1;
+                if (self.next_identity == 0) self.next_identity = 1; // skip 0 forever
+                g.* = .{ .active = true, .identity = id };
                 return @intCast(i);
             }
         }
         return null;
     }
 
-    /// Frees a group and clears group_of for its members.
+    /// Frees a group and clears group_of for its members. Identity is discarded (never reissued).
     pub fn free(self: *Ledger, gid: GroupId) void {
         if (gid >= MAX_GROUPS or !self.groups[gid].active) return;
         for (&self.group_of) |*go| {
             if (go.* != null and go.*.? == gid) go.* = null;
         }
         self.groups[gid] = .{};
+    }
+
+    /// Resolve stable identity → active slot (null if freed or unknown).
+    pub fn groupIdOfIdentity(self: *const Ledger, identity: u64) ?GroupId {
+        if (identity == 0) return null;
+        for (self.groups, 0..) |g, i| {
+            if (g.active and g.identity == identity) return @intCast(i);
+        }
+        return null;
     }
 
     /// Registers real handle h as a member of group gid. If h is a synthetic handle (>= GROUP_HANDLE_BASE)
@@ -742,6 +759,57 @@ test "group: resolvePort passes through real refs and resolves synthetic refs, r
     try testing.expectEqual(@as(?PortRef, null), s.l.resolvePort(.{ .handle = handleOfGroup(1), .is_input = true, .index = 0 }));
 }
 
+test "group: identity is monotonic and never reused after free" {
+    var ledger: Ledger = .{};
+    const a = ledger.alloc() orelse unreachable;
+    const id_a = ledger.groups[a].identity;
+    try testing.expect(id_a != 0);
+    try testing.expectEqual(a, ledger.groupIdOfIdentity(id_a).?);
+    ledger.free(a);
+    try testing.expect(ledger.groupIdOfIdentity(id_a) == null);
+    const b = ledger.alloc() orelse unreachable;
+    // Same slot may be recycled, but identity must not.
+    try testing.expectEqual(a, b);
+    try testing.expect(ledger.groups[b].identity != id_a);
+    try testing.expectEqual(b, ledger.groupIdOfIdentity(ledger.groups[b].identity).?);
+}
+
+test "group: absolute member restore after expand (collapse-independent undo model)" {
+    // Reproduces the failure mode of collapse-dependent setPosAndTranslateMembers on undo:
+    // move while collapsed → expand → undo must restore member absolute coords, not re-translate.
+    var layout_arr = [_]Vec2f{.{ .x = 0, .y = 0 }} ** GROUP_HANDLE_BASE;
+    layout_arr[3] = .{ .x = 130, .y = 250 };
+    layout_arr[7] = .{ .x = 290, .y = 205 };
+    const before3 = layout_arr[3];
+    const before7 = layout_arr[7];
+    const before_g = Vec2f{ .x = 100, .y = 200 };
+
+    var ledger: Ledger = .{};
+    const gid = ledger.alloc() orelse unreachable;
+    ledger.groups[gid].collapsed = true;
+    ledger.groups[gid].kind = .drum_machine;
+    ledger.groups[gid].pos = before_g;
+    ledger.assign(3, gid);
+    ledger.assign(7, gid);
+
+    // Preview/apply while collapsed translates members.
+    ledger.setPosAndTranslateMembers(gid, .{ .x = 180, .y = 140 }, layout_arr[0..]);
+    try testing.expect(layout_arr[3].x != before3.x);
+
+    // Expand (UI toggle) — members stay where translate left them.
+    ledger.groups[gid].collapsed = false;
+
+    // Collapse-dependent undo would call setPosAndTranslateMembers back to before_g and
+    // skip members because expanded → BUG. Absolute restore:
+    ledger.groups[gid].pos = before_g;
+    layout_arr[3] = before3;
+    layout_arr[7] = before7;
+    try testing.expectApproxEqAbs(before3.x, layout_arr[3].x, 1e-4);
+    try testing.expectApproxEqAbs(before3.y, layout_arr[3].y, 1e-4);
+    try testing.expectApproxEqAbs(before7.x, layout_arr[7].x, 1e-4);
+    try testing.expectApproxEqAbs(before_g.x, ledger.groups[gid].pos.x, 1e-4);
+}
+
 test "group: manual collapsed-box move keeps members aligned after expansion" {
     var layout_arr = [_]Vec2f{.{ .x = 0, .y = 0 }} ** GROUP_HANDLE_BASE;
     layout_arr[3] = .{ .x = 130, .y = 250 };
@@ -753,6 +821,7 @@ test "group: manual collapsed-box move keeps members aligned after expansion" {
         .collapsed = true,
         .kind = .drum_machine,
         .pos = .{ .x = 100, .y = 200 },
+        .identity = 99,
     };
     ledger.assign(3, 1);
     ledger.assign(7, 1);

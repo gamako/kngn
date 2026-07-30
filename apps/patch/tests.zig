@@ -7,6 +7,7 @@ comptime {
     _ = @import("canvas.zig");
     _ = @import("group.zig");
     _ = @import("layout.zig");
+    _ = @import("menu_sig.zig");
     _ = @import("grid_test.zig");
     _ = @import("param_view.zig");
     _ = @import("undo.zig");

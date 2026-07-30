@@ -172,18 +172,42 @@ const PTRN_SIZE: usize = 33;
 const SEED_SIZE: usize = 20;
 const SONG_SIZE: usize = 1890;
 const GENR_SIZE: usize = GenRole.count * 2;
-// LEDG: group_of[GROUP_HANDLE_BASE]u8 + groups[MAX_GROUPS] * (16 header + 8*13*2 exposed)
-// At the default N=48, this is 48 + 8*224 = 1840. N is configurable via -Dmax-modules.
-const LEDG_GROUP_SIZE: usize = 224;
-const LEDG_SIZE: usize = group.GROUP_HANDLE_BASE + group.MAX_GROUPS * LEDG_GROUP_SIZE;
+// LEDG: group_of[GROUP_HANDLE_BASE]u8 + groups[MAX_GROUPS] * (header + 8*13*2 exposed).
+//
+// **Write format (v2)**: header includes Group.identity (u64 LE). This is what packLedger emits.
+// **Legacy read format (v1)**: 16B header without identity. The reader accepts both sizes and
+// assigns fresh monotonic identities on v1 load (same rule as Ledger.alloc). N via -Dmax-modules.
+const LEDG_EXPOSED_BYTES: usize = group.MAX_EXPOSED * 13 * 2;
+/// Current write format: common 16B fields + identity u64.
+const LEDG_GROUP_HEADER_V2: usize = 24;
+const LEDG_GROUP_SIZE_V2: usize = LEDG_GROUP_HEADER_V2 + LEDG_EXPOSED_BYTES;
+const LEDG_SIZE_V2: usize = group.GROUP_HANDLE_BASE + group.MAX_GROUPS * LEDG_GROUP_SIZE_V2;
+/// Legacy read-only format (pre-identity). Never written by the current packer.
+const LEDG_GROUP_HEADER_V1: usize = 16;
+const LEDG_GROUP_SIZE_V1: usize = LEDG_GROUP_HEADER_V1 + LEDG_EXPOSED_BYTES;
+const LEDG_SIZE_V1: usize = group.GROUP_HANDLE_BASE + group.MAX_GROUPS * LEDG_GROUP_SIZE_V1;
+
+// Aliases for the write path (call sites keep using LEDG_SIZE / LEDG_GROUP_HEADER).
+const LEDG_GROUP_HEADER: usize = LEDG_GROUP_HEADER_V2;
+const LEDG_GROUP_SIZE: usize = LEDG_GROUP_SIZE_V2;
+const LEDG_SIZE: usize = LEDG_SIZE_V2;
 
 comptime {
     if (GenRole.count != 30) @compileError("GENR role count changed; update schema or tests");
-    // Self-consistency of the formula, plus a fixed known size at the default N=48 (only the formula applies when N varies).
-    if (LEDG_SIZE != group.GROUP_HANDLE_BASE + group.MAX_GROUPS * LEDG_GROUP_SIZE)
-        @compileError("LEDG size formula mismatch");
-    if (group.GROUP_HANDLE_BASE == 48 and LEDG_SIZE != 1840)
-        @compileError("LEDG size mismatch for default N=48");
+    // Self-consistency of the size formulas (N-independent shape).
+    if (LEDG_SIZE_V2 != group.GROUP_HANDLE_BASE + group.MAX_GROUPS * LEDG_GROUP_SIZE_V2)
+        @compileError("LEDG v2 size formula mismatch");
+    if (LEDG_SIZE_V1 != group.GROUP_HANDLE_BASE + group.MAX_GROUPS * LEDG_GROUP_SIZE_V1)
+        @compileError("LEDG v1 size formula mismatch");
+    if (LEDG_GROUP_SIZE_V2 != 232)
+        @compileError("LEDG v2 per-group size mismatch (write format)");
+    if (LEDG_GROUP_SIZE_V1 != 224)
+        @compileError("LEDG v1 per-group size mismatch (legacy read format)");
+    // Fixed known sizes at default N=48.
+    if (group.GROUP_HANDLE_BASE == 48 and LEDG_SIZE_V2 != 1904)
+        @compileError("LEDG v2 size mismatch for default N=48");
+    if (group.GROUP_HANDLE_BASE == 48 and LEDG_SIZE_V1 != 1840)
+        @compileError("LEDG v1 size mismatch for default N=48");
 }
 
 // -- scalar Params packer --
@@ -540,7 +564,8 @@ fn packLedger(ledger: *const group.Ledger, out: *[LEDG_SIZE]u8) void {
         out[off + 13] = g.n_out;
         out[off + 14] = g.template_n_in;
         out[off + 15] = g.template_n_out;
-        off += 16;
+        std.mem.writeInt(u64, out[off + 16 ..][0..8], g.identity, .little);
+        off += LEDG_GROUP_HEADER;
         for (g.exposed_in) |ep| {
             var buf: [13]u8 = undefined;
             packExposed(ep, &buf);
@@ -557,8 +582,17 @@ fn packLedger(ledger: *const group.Ledger, out: *[LEDG_SIZE]u8) void {
     std.debug.assert(off == LEDG_SIZE);
 }
 
+/// Unpack LEDG payload. Accepts **v2** (write format, with identity) and **v1** (legacy, no identity).
+/// On v1, active groups receive fresh monotonic identities (same rule as `Ledger.alloc`).
 fn unpackLedger(bytes: []const u8) error{ CorruptLedger, NonFiniteField }!group.Ledger {
-    if (bytes.len != LEDG_SIZE) return error.CorruptLedger;
+    const has_identity: bool = if (bytes.len == LEDG_SIZE_V2)
+        true
+    else if (bytes.len == LEDG_SIZE_V1)
+        false
+    else
+        return error.CorruptLedger;
+    const group_header: usize = if (has_identity) LEDG_GROUP_HEADER_V2 else LEDG_GROUP_HEADER_V1;
+
     var ledger: group.Ledger = .{};
     var off: usize = 0;
     for (&ledger.group_of) |*go| {
@@ -572,6 +606,7 @@ fn unpackLedger(bytes: []const u8) error{ CorruptLedger, NonFiniteField }!group.
             return error.CorruptLedger;
         }
     }
+    var max_identity: u64 = 0;
     for (&ledger.groups) |*g| {
         g.active = try readBool01(bytes[off]);
         g.kind = try macroKindFromU8(bytes[off + 1]);
@@ -585,9 +620,21 @@ fn unpackLedger(bytes: []const u8) error{ CorruptLedger, NonFiniteField }!group.
         g.n_out = bytes[off + 13];
         g.template_n_in = bytes[off + 14];
         g.template_n_out = bytes[off + 15];
+        if (has_identity) {
+            g.identity = std.mem.readInt(u64, bytes[off + 16 ..][0..8], .little);
+            if (g.active) {
+                if (g.identity == 0) return error.CorruptLedger;
+                if (g.identity > max_identity) max_identity = g.identity;
+            } else {
+                g.identity = 0;
+            }
+        } else {
+            // v1: identities assigned after the loop (monotonic, collision-free within the file).
+            g.identity = 0;
+        }
         if (g.n_in > group.MAX_EXPOSED or g.n_out > group.MAX_EXPOSED) return error.CorruptLedger;
         if (g.template_n_in > g.n_in or g.template_n_out > g.n_out) return error.CorruptLedger;
-        off += 16;
+        off += group_header;
         for (&g.exposed_in) |*ep| {
             ep.* = try unpackExposed(bytes[off..][0..13]);
             off += 13;
@@ -611,6 +658,22 @@ fn unpackLedger(bytes: []const u8) error{ CorruptLedger, NonFiniteField }!group.
             }
         }
     }
+    std.debug.assert(off == bytes.len);
+
+    if (has_identity) {
+        ledger.next_identity = max_identity + 1;
+        if (ledger.next_identity == 0) ledger.next_identity = 1;
+    } else {
+        // Same allocation rule as Ledger.alloc: start at 1, never 0, no reuse within this ledger.
+        var next: u64 = 1;
+        for (&ledger.groups) |*g| {
+            if (!g.active) continue;
+            g.identity = next;
+            next += 1;
+            if (next == 0) next = 1;
+        }
+        ledger.next_identity = next;
+    }
     // The group referenced by group_of must be active
     for (ledger.group_of) |gid_opt| {
         if (gid_opt) |gid| {
@@ -618,6 +681,42 @@ fn unpackLedger(bytes: []const u8) error{ CorruptLedger, NonFiniteField }!group.
         }
     }
     return ledger;
+}
+
+/// Pack legacy v1 LEDG (no identity field). Used only by fixed fixtures / migration tests.
+/// The production writer always uses packLedger (v2).
+fn packLedgerV1(ledger: *const group.Ledger, out: *[LEDG_SIZE_V1]u8) void {
+    var off: usize = 0;
+    for (ledger.group_of) |gid_opt| {
+        out[off] = if (gid_opt) |gid| gid else 0xff;
+        off += 1;
+    }
+    for (ledger.groups) |g| {
+        out[off] = @intFromBool(g.active);
+        out[off + 1] = @intFromEnum(g.kind);
+        out[off + 2] = @intFromBool(g.collapsed);
+        out[off + 3] = g.grid_rows;
+        std.mem.writeInt(u32, out[off + 4 ..][0..4], @bitCast(g.pos.x), .little);
+        std.mem.writeInt(u32, out[off + 8 ..][0..4], @bitCast(g.pos.y), .little);
+        out[off + 12] = g.n_in;
+        out[off + 13] = g.n_out;
+        out[off + 14] = g.template_n_in;
+        out[off + 15] = g.template_n_out;
+        off += LEDG_GROUP_HEADER_V1;
+        for (g.exposed_in) |ep| {
+            var buf: [13]u8 = undefined;
+            packExposed(ep, &buf);
+            @memcpy(out[off..][0..13], &buf);
+            off += 13;
+        }
+        for (g.exposed_out) |ep| {
+            var buf: [13]u8 = undefined;
+            packExposed(ep, &buf);
+            @memcpy(out[off..][0..13], &buf);
+            off += 13;
+        }
+    }
+    std.debug.assert(off == LEDG_SIZE_V1);
 }
 
 /// Remaps the Ledger using an old-handle -> new-handle mapping (slots, order, and coordinates are left unchanged).
@@ -1650,6 +1749,114 @@ test "ModuleKind ordinal stability: sidechain=25, slew..=logic=26..30" {
     try testing.expectEqual(@as(u8, 28), @intFromEnum(graph_io.ModuleKind.comparator));
     try testing.expectEqual(@as(u8, 29), @intFromEnum(graph_io.ModuleKind.ring_mod));
     try testing.expectEqual(@as(u8, 30), @intFromEnum(graph_io.ModuleKind.logic));
+}
+
+// ── LEDG v1/v2 size fixtures (fixed-format regression) ───────────────────────
+
+/// Build a deterministic ledger with one active drum group (slot from alloc).
+fn fixtureLedgerOneGroup() group.Ledger {
+    var ledger: group.Ledger = .{};
+    const gid = ledger.alloc().?;
+    ledger.assign(0, gid);
+    ledger.groups[gid].kind = .drum_machine;
+    ledger.groups[gid].collapsed = true;
+    ledger.groups[gid].pos = .{ .x = 40, .y = 50 };
+    ledger.groups[gid].n_out = 1;
+    ledger.groups[gid].template_n_out = 1;
+    ledger.groups[gid].exposed_out[0] = .{ .member = 0, .port = 0, .is_input = false, .label_len = 3 };
+    @memcpy(ledger.groups[gid].exposed_out[0].label[0..3], "out");
+    return ledger;
+}
+
+test "LEDG size constants: v1 legacy and v2 write formulas hold for any MAX_MODULES" {
+    // Pin the per-group sizes (N-independent) and the full-chunk formulas.
+    try testing.expectEqual(@as(usize, 16), LEDG_GROUP_HEADER_V1);
+    try testing.expectEqual(@as(usize, 24), LEDG_GROUP_HEADER_V2);
+    try testing.expectEqual(@as(usize, 224), LEDG_GROUP_SIZE_V1);
+    try testing.expectEqual(@as(usize, 232), LEDG_GROUP_SIZE_V2);
+    try testing.expectEqual(group.GROUP_HANDLE_BASE + group.MAX_GROUPS * LEDG_GROUP_SIZE_V1, LEDG_SIZE_V1);
+    try testing.expectEqual(group.GROUP_HANDLE_BASE + group.MAX_GROUPS * LEDG_GROUP_SIZE_V2, LEDG_SIZE_V2);
+    // Write path aliases the v2 constants.
+    try testing.expectEqual(LEDG_SIZE_V2, LEDG_SIZE);
+    try testing.expectEqual(LEDG_GROUP_SIZE_V2, LEDG_GROUP_SIZE);
+}
+
+test "LEDG v1 fixture: legacy size loads and assigns fresh identities" {
+    var src = fixtureLedgerOneGroup();
+    // Wipe identities to simulate a pre-identity on-disk image (v1 pack ignores them).
+    const gid0: group.GroupId = 0;
+    try testing.expect(src.groups[gid0].active);
+    const saved_id = src.groups[gid0].identity;
+    try testing.expect(saved_id != 0);
+    src.groups[gid0].identity = 0;
+    src.next_identity = 1;
+
+    var v1: [LEDG_SIZE_V1]u8 = undefined;
+    packLedgerV1(&src, &v1);
+    try testing.expectEqual(LEDG_SIZE_V1, v1.len);
+
+    const got = try unpackLedger(&v1);
+    try testing.expect(got.groups[gid0].active);
+    try testing.expectEqual(group.MacroKind.drum_machine, got.groups[gid0].kind);
+    try testing.expect(got.groups[gid0].collapsed);
+    try testing.expectApproxEqAbs(@as(f32, 40), got.groups[gid0].pos.x, 1e-5);
+    try testing.expectApproxEqAbs(@as(f32, 50), got.groups[gid0].pos.y, 1e-5);
+    try testing.expectEqual(@as(u8, 1), got.groups[gid0].n_out);
+    try testing.expectEqual(@as(Handle, 0), got.groups[gid0].exposed_out[0].member);
+    try testing.expectEqual(@as(?group.GroupId, gid0), got.group_of[0]);
+    // Fresh identity assigned on v1 load (monotonic from 1).
+    try testing.expectEqual(@as(u64, 1), got.groups[gid0].identity);
+    try testing.expectEqual(@as(u64, 2), got.next_identity);
+    try testing.expectEqual(gid0, got.groupIdOfIdentity(1).?);
+}
+
+test "LEDG v2 fixture: identity is preserved on pack/unpack" {
+    var src = fixtureLedgerOneGroup();
+    const gid0: group.GroupId = 0;
+    // Force a non-default identity so we are not just seeing alloc's first id.
+    src.groups[gid0].identity = 0xA11CE;
+    src.next_identity = 0xA11CE + 1;
+
+    var v2: [LEDG_SIZE_V2]u8 = undefined;
+    packLedger(&src, &v2);
+    try testing.expectEqual(LEDG_SIZE_V2, v2.len);
+
+    const got = try unpackLedger(&v2);
+    try testing.expectEqual(@as(u64, 0xA11CE), got.groups[gid0].identity);
+    try testing.expectEqual(@as(u64, 0xA11CE + 1), got.next_identity);
+    try testing.expectEqual(gid0, got.groupIdOfIdentity(0xA11CE).?);
+    try testing.expectApproxEqAbs(@as(f32, 40), got.groups[gid0].pos.x, 1e-5);
+    try testing.expectEqual(@as(?group.GroupId, gid0), got.group_of[0]);
+}
+
+test "LEDG v1→v2 migration: re-save after legacy load writes identity-bearing size" {
+    var src = fixtureLedgerOneGroup();
+    src.groups[0].identity = 0;
+    src.next_identity = 1;
+
+    var v1: [LEDG_SIZE_V1]u8 = undefined;
+    packLedgerV1(&src, &v1);
+
+    const loaded = try unpackLedger(&v1);
+    try testing.expectEqual(@as(u64, 1), loaded.groups[0].identity);
+
+    var v2: [LEDG_SIZE_V2]u8 = undefined;
+    packLedger(&loaded, &v2);
+    try testing.expectEqual(LEDG_SIZE_V2, v2.len);
+    try testing.expect(v2.len != LEDG_SIZE_V1);
+
+    const again = try unpackLedger(&v2);
+    try testing.expectEqual(@as(u64, 1), again.groups[0].identity);
+    try testing.expectEqual(loaded.groups[0].pos.x, again.groups[0].pos.x);
+    try testing.expectEqual(loaded.groups[0].pos.y, again.groups[0].pos.y);
+    try testing.expectEqual(loaded.groups[0].kind, again.groups[0].kind);
+    try testing.expectEqual(loaded.group_of[0], again.group_of[0]);
+}
+
+test "LEDG wrong size is rejected" {
+    var bad: [100]u8 = undefined;
+    @memset(&bad, 0);
+    try testing.expectError(error.CorruptLedger, unpackLedger(&bad));
 }
 
 test "KNGN file I/O: save→load round-trip" {
