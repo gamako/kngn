@@ -5,7 +5,7 @@ set -u
 
 SCRIPT_DIR=$(cd "$(dirname "$0")" && pwd)
 ROOT=$(cd "$SCRIPT_DIR/../.." && pwd)
-KNGN_ROOT="${KNGN_ROOT:-/Users/gamako/gamako/project/zig/video-proto/kngn}"
+KNGN_ROOT="${KNGN_ROOT:-$ROOT}"
 OUT=$(mktemp -d)
 trap 'rm -rf "$OUT"' EXIT
 

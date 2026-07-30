@@ -4,17 +4,19 @@ set -euo pipefail
 
 SCRIPT_DIR=$(cd "$(dirname "$0")" && pwd)
 ROOT=$(cd "$SCRIPT_DIR/../.." && pwd)
-KNGN_ROOT="${KNGN_ROOT:-/Users/gamako/gamako/project/zig/video-proto/kngn}"
+KNGN_ROOT="${KNGN_ROOT:-$ROOT}"
 E2E_WIDTH="${E2E_WIDTH:-1024}"
 E2E_HEIGHT="${E2E_HEIGHT:-768}"
 E2E_TIMEOUT_SEC="${E2E_TIMEOUT_SEC:-60}"
 KNGN="$ROOT/scripts/kngn"
 
+cd "$ROOT"
+
 log() { echo "$@"; }
 
 # ── Replay ──────────────────────────────────────────────────
-REPLAY_OUT=$(mktemp -d /tmp/t147-replay.XXXXXX)
-REPLAY_PORT=/tmp/t147-replay.port
+REPLAY_OUT=$(mktemp -d /tmp/panel-host-replay.XXXXXX)
+REPLAY_PORT=/tmp/panel-host-replay.port
 rm -f "$REPLAY_PORT"
 mkdir -p "$REPLAY_OUT"
 log "[e2e] === replay === out=$REPLAY_OUT"
@@ -31,8 +33,8 @@ log "[e2e] replay snapshots:"
 ls -1 "$REPLAY_OUT"/*.png 2>/dev/null || true
 
 # ── Live ────────────────────────────────────────────────────
-LIVE_OUT=$(mktemp -d /tmp/t147-live.XXXXXX)
-PORT_FILE=/tmp/t147-live.port
+LIVE_OUT=$(mktemp -d /tmp/panel-host-live.XXXXXX)
+PORT_FILE=/tmp/panel-host-live.port
 rm -f "$PORT_FILE"
 LOG="$LIVE_OUT/e2e.log"
 : >"$LOG"
@@ -57,8 +59,6 @@ cleanup() {
   fi
 }
 trap cleanup EXIT
-
-cd "$ROOT"
 
 KNGN_GUI_WIDTH="$E2E_WIDTH" \
 KNGN_GUI_HEIGHT="$E2E_HEIGHT" \
@@ -139,40 +139,40 @@ expect_state "right_visible=1"
 expect_state "center_w>400"
 drive "snapshot fb" >>"$LOG" 2>&1
 # copy with stable name for orchestrator
-cp -f "$(ls -1t "$LIVE_OUT"/fb-*.png 2>/dev/null | head -1)" /tmp/t147-live-initial.png 2>/dev/null || \
-  cp -f "$(ls -1t "$LIVE_OUT"/*.png 2>/dev/null | head -1)" /tmp/t147-live-initial.png
-log "[e2e] scenario 1 PASS → /tmp/t147-live-initial.png"
+cp -f "$(ls -1t "$LIVE_OUT"/fb-*.png 2>/dev/null | head -1)" /tmp/panel-host-live-initial.png 2>/dev/null || \
+  cp -f "$(ls -1t "$LIVE_OUT"/*.png 2>/dev/null | head -1)" /tmp/panel-host-live-initial.png
+log "[e2e] scenario 1 PASS → /tmp/panel-host-live-initial.png"
 
 log "[e2e] === scenario 2: toggle_slot right ==="
 drive "action toggle_slot right; step 2" >>"$LOG" 2>&1
 expect_state "right_visible=0"
 expect_state "center_w>500"
 drive "snapshot fb" >>"$LOG" 2>&1
-cp -f "$(ls -1t "$LIVE_OUT"/*.png | head -1)" /tmp/t147-live-right-hidden.png
-log "[e2e] scenario 2 PASS → /tmp/t147-live-right-hidden.png"
+cp -f "$(ls -1t "$LIVE_OUT"/*.png | head -1)" /tmp/panel-host-live-right-hidden.png
+log "[e2e] scenario 2 PASS → /tmp/panel-host-live-right-hidden.png"
 
 log "[e2e] === scenario 3: toggle_panel inspector ==="
 # Restore right, then hide inspector
 drive "action toggle_slot right; step 2; action toggle_panel Inspector; step 2" >>"$LOG" 2>&1
 expect_state "inspector_visible=0"
 drive "snapshot fb" >>"$LOG" 2>&1
-cp -f "$(ls -1t "$LIVE_OUT"/*.png | head -1)" /tmp/t147-live-panel-hidden.png
-log "[e2e] scenario 3 PASS → /tmp/t147-live-panel-hidden.png"
+cp -f "$(ls -1t "$LIVE_OUT"/*.png | head -1)" /tmp/panel-host-live-panel-hidden.png
+log "[e2e] scenario 3 PASS → /tmp/panel-host-live-panel-hidden.png"
 
 log "[e2e] === scenario 4: set_extent right 320 ==="
 drive "action toggle_panel Inspector; step 1; action set_extent right 320; step 2" >>"$LOG" 2>&1
 expect_state "right_extent=320"
 drive "snapshot fb" >>"$LOG" 2>&1
-cp -f "$(ls -1t "$LIVE_OUT"/*.png | head -1)" /tmp/t147-live-resized.png
-log "[e2e] scenario 4 PASS → /tmp/t147-live-resized.png"
+cp -f "$(ls -1t "$LIVE_OUT"/*.png | head -1)" /tmp/panel-host-live-resized.png
+log "[e2e] scenario 4 PASS → /tmp/panel-host-live-resized.png"
 
 log "[e2e] === scenario 5: save/reset/restore ==="
 drive "action save_state; action reset_state; step 2; action restore_state; step 2" >>"$LOG" 2>&1
 expect_state "restored=1"
 expect_state "right_extent=320"
 drive "snapshot fb" >>"$LOG" 2>&1
-cp -f "$(ls -1t "$LIVE_OUT"/*.png | head -1)" /tmp/t147-live-restored.png
-log "[e2e] scenario 5 PASS → /tmp/t147-live-restored.png"
+cp -f "$(ls -1t "$LIVE_OUT"/*.png | head -1)" /tmp/panel-host-live-restored.png
+log "[e2e] scenario 5 PASS → /tmp/panel-host-live-restored.png"
 
 log "[e2e] === scenario 6: splitter drag ==="
 LAYOUT=$(digest_layout)
@@ -190,8 +190,8 @@ if [[ -z "$AFTER" || "$AFTER" -le "$BEFORE" ]]; then
 fi
 expect_state "right_extent>$BEFORE"
 drive "snapshot fb" >>"$LOG" 2>&1
-cp -f "$(ls -1t "$LIVE_OUT"/*.png | head -1)" /tmp/t147-live-splitter.png
-log "[e2e] scenario 6 PASS → /tmp/t147-live-splitter.png"
+cp -f "$(ls -1t "$LIVE_OUT"/*.png | head -1)" /tmp/panel-host-live-splitter.png
+log "[e2e] scenario 6 PASS → /tmp/panel-host-live-splitter.png"
 
 log "[e2e] quit"
 drive "quit" >>"$LOG" 2>&1 || true

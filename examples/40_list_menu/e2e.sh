@@ -5,7 +5,7 @@ set -euo pipefail
 
 SCRIPT_DIR=$(cd "$(dirname "$0")" && pwd)
 ROOT=$(cd "$SCRIPT_DIR/../.." && pwd)
-KNGN_ROOT="${KNGN_ROOT:-/Users/gamako/gamako/project/zig/video-proto/kngn}"
+KNGN_ROOT="${KNGN_ROOT:-$ROOT}"
 E2E_PORT="${E2E_PORT:-9230}"
 E2E_WIDTH="${E2E_WIDTH:-1024}"
 E2E_HEIGHT="${E2E_HEIGHT:-768}"
