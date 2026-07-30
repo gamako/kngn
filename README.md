@@ -25,7 +25,7 @@ output with no display attached. It runs on macOS, Linux and Windows, and **the 
 environment and build and initial state and input produce the same pixels**. One headless
 verification cycle of the bundled pixel editor takes 0.1 seconds.
 
-**pixie is a 2.6 MB single binary** · **zero Zig package dependencies** · **Zig 0.16** ·
+**pixie is about a 2.5 MB single binary (ReleaseFast, stripped)** · **zero Zig package dependencies** · **Zig 0.16** ·
 macOS (objc/swift/metal) / Linux (x11/wayland) / Windows (gdi/d3d11)
 
 The base is nothing but the primitives for opening a native window and writing pixels
@@ -94,18 +94,22 @@ it permits, through `registerProbe` and `registerAction`. What comes back in exc
 not a DOM tree but one line in units of meaning the application defined itself.
 
 **Being a thin layer is not a claim about speed.** For steady-state drawing Chromium can
-well be faster. The thing to compare is not frame rate but **the agent's verification
-loop**, and four things bear on it: **startup** (no extra renderer process, no V8
-initialisation, no DOM construction), **memory and distribution size**, **jitter**, and
-**the number of concepts an agent has to hold**.
+well be faster. What matters for an agent is the verification loop. Treat these as
+**separate concerns**, not one blended score:
 
-Of those, the ones that came out as numbers are distribution size, the duration of a
-verification cycle, and peak RSS. Measured on the bundled pixel editor pixie (layers,
-selection, bezier, undo, PNG in and out):
+| Concern | What it is |
+|---|---|
+| **Startup / cycle time** | Time to launch, act, observe, exit (measured) |
+| **Memory / distribution size** | Peak RSS and shipped binary or wasm size (measured) |
+| **Jitter** | Contract on the real-time path (not a single bench number) |
+| **Authoring complexity** | How many concepts an agent must hold (qualitative) |
 
-- **A 2.6 MB single-file binary.** No additional runtime
-- **102 ms per cycle** — starting up, drawing, writing out a 780×600 PNG, and exiting.
-  Build once and you can run ten input variations per second
+Measured on the bundled pixel editor pixie (layers, selection, bezier, undo, PNG in and
+out) — **runtime verification**, not recompile:
+
+- **About 2.50 MB native binary** (ReleaseFast, stripped, Metal). No additional runtime
+- **~0.1 s per input/verification cycle** — start, draw, write a 780×600 PNG, exit
+  (about 102 ms warm). Ten input variations per second once the binary is built
 - Peak RSS 34.4 MB
 
 > MacBook Pro (Apple M1 Max, 10-core, 64 GB) / macOS 26.5 / ReleaseFast / Metal backend.
@@ -114,24 +118,30 @@ selection, bezier, undo, PNG in and out):
 > misses. **The numbers depend on window size and saved state** — a restored large window
 > grows both the PNG and the RSS. In headless mode `KNGN_HEADLESS=1` skips backend
 > initialisation altogether, so **time and RSS barely depend on the backend** (objc gives
-> 102 ms and 34.3 MB too; only the binary differs, at 2.4 MB).
+> 102 ms and 34.3 MB too).
+
+**Code-change iteration is slower than input variation.** After editing Zig sources,
+expect roughly **5–20 seconds** for a focused rebuild on a typical machine — not the
+0.1 s verification cycle above. Do not treat those two times as the same number.
+
+**Wasm package sizes** (ReleaseSmall default for `package-web`, aarch64-macos host): about
+**1.1 MB** pixie wasm, about **426 KB** synth wasm. Native and wasm artefacts are not
+interchangeable; see [`docs/wasm-deploy.md`](docs/wasm-deploy.md).
 
 **Jitter** is a matter of contract rather than a measurement. There is no tracing GC in
 the Zig runtime, and the real-time audio callback carries a contract that forbids
 allocation, locks, IO and panics ([docs/audio-and-synth.md](docs/audio-and-synth.md)).
 Keeping that contract, though, is the application's responsibility.
 
-**The fourth item — the number of concepts — is probably the one that matters most.**
-Putting a single window on screen with Electron means holding three languages
-(JS, HTML, CSS), the main/renderer process split, the boundary between the Node and
-browser APIs, a bundler configuration, CSP and preload, and an npm dependency tree, all
-at once. Writing an application on KNGN touches one language and a set of primitives that
-fits on one screen. (The repository does contain Objective-C, Swift and Metal for macOS
-internally, but an application author never touches them.) Hello world is two files,
-`build.zig` and `main.zig`, with no configuration file and no manifest. Zig package
-dependencies are zero. **The development contract for an agent is collected into one
-file, [`AGENT.md`](AGENT.md), of 34 KB** — the detail of each subsystem lives in
-[`docs/`](docs/) and in source comments.
+**Authoring complexity** is separate from the performance table. Putting a single window
+on screen with Electron means holding three languages (JS, HTML, CSS), the main/renderer
+process split, the boundary between the Node and browser APIs, a bundler configuration,
+CSP and preload, and an npm dependency tree, all at once. Writing an application on KNGN
+touches one language and a set of primitives that fits on one screen. (The repository
+does contain Objective-C, Swift and Metal for macOS internally, but an application author
+never touches them.) The external starting point is [`template/`](template/) plus
+[`docs/app-authoring.md`](docs/app-authoring.md). Zig package dependencies are zero.
+Contributor detail lives in [`AGENT.md`](AGENT.md) and the rest of [`docs/`](docs/).
 
 There is a catch in this comparison, though. **An LLM holds orders of magnitude more
 training data on JS, HTML and CSS than on Zig, and Zig is at a disadvantage.** Fewer
@@ -153,76 +163,103 @@ distribution size and headless determinism, not compositing throughput.
 
 ## Hello, window
 
+External apps use `Runtime(App)` from `kit` (native and wasm share the same shape). Full
+source: [`template/src/main.zig`](template/src/main.zig).
+
 ```zig
-const platform = @import("platform");
+const std = @import("std");
+const kit = @import("kit");
+const platform = kit.platform;
+const app_runtime = kit.app_runtime;
 
-pub fn main() !void {
-    try platform.init();
-    defer platform.shutdown();
+const App = struct {
+    pub const window = .{ .w = 320, .h = 240, .title = "hello" };
+    gpa: std.mem.Allocator,
+    color: u32 = 0xFF2E3440, // 0xAARRGGBB
 
-    var window = try platform.Window.create(800, 600, "hello");
-    defer window.destroy();
-
-    main_loop: while (window.pollEvents()) {
-        while (window.nextEvent()) |ev| switch (ev) {
-            .quit => break :main_loop,
+    pub fn init(gpa: std.mem.Allocator, io: std.Io) !*App {
+        _ = io;
+        const app = try gpa.create(App);
+        app.* = .{ .gpa = gpa };
+        return app;
+    }
+    pub fn deinit(self: *App) void {
+        self.gpa.destroy(self);
+    }
+    pub fn frame(self: *App, win: *platform.Window, now: f64) !bool {
+        _ = now;
+        var running = true;
+        while (win.nextEvent()) |ev| switch (ev) {
+            .quit => running = false,
             else => {},
         };
-
-        if (window.lockFramebuffer()) |fb| {
+        if (win.lockFramebuffer()) |fb| {
             defer fb.unlock();
-            @memset(fb.pixels, 0xFF2E3440); // BGRA (0xAARRGGBB)
-            window.present();
+            kit.pixelops.fill32(fb.pixels, self.color); // never @memset for full-frame fills
+            win.present();
         }
-
-        platform.frameDelay(16_666_666);
+        return running;
     }
+};
+
+const Rt = app_runtime.Runtime(App);
+pub fn main(init: std.process.Init) !void {
+    try Rt.runNative(init);
 }
 ```
 
-That is everything an application touches — `init` and `shutdown`, `Window.create` and
-`destroy`, `pollEvents` and `nextEvent`, `lockFramebuffer` and `unlock` and `present`, and
-`getTime` and `frameDelay` for time. The framebuffer is a bare `[]u32` with no drawing
-abstraction in between. `lockFramebuffer()` returning `null` means "no slot was available
-for this frame"; it is not an error, and usually the next frame has one.
+`window` / `init` / `frame` / `deinit` are the contract. The runtime owns the native pull
+loop and wasm exports. The framebuffer is still a bare `[]u32`;
+`lockFramebuffer()` returning `null` means no slot this frame, not a fatal error.
 
 ## Building your own app
 
 ### Having an AI build it
 
-Two things: **have Zig 0.16.0 available**, and **have the agent read
-[`AGENT.md`](AGENT.md)**. The layer structure, the API contracts, the build commands and
-how to use the harness are all in there.
+**Have Zig 0.16 available**, then point the agent at the **external authoring path**:
+
+1. Read [`docs/app-authoring.md`](docs/app-authoring.md) and [`docs/harness.md`](docs/harness.md)
+2. Copy [`template/`](template/) next to a kngn checkout (if the template lives inside the
+   package tree, only change `.kngn.path` to `"../kngn"`)
+3. Import only `kit`; do not invent a second scaffold
 
 ```
 Build me a desktop app using KNGN (https://github.com/gamako/kngn).
-Read AGENT.md and docs/harness.md first, and import only kit.
-Once it is implemented, run it headlessly with KNGN_HEADLESS=1 and KNGN_HARNESS_SCRIPT,
-take a PNG with snapshot fb, look at it yourself, and report only after you have checked.
+Read docs/app-authoring.md and docs/harness.md first.
+Start from template/ (copy it next to kngn and change .path to "../kngn" if needed).
+Import only kit. Once implemented, run headlessly with KNGN_HEADLESS=1 and
+KNGN_HARNESS_SCRIPT, take a PNG with snapshot fb, look at it yourself, and report
+only after you have checked.
 ```
 
 The last line is the point. With it, the agent finds a broken layout itself and comes
 back having fixed it. Without it, the agent reads its own code and tells you it is done.
+Contributor-only depth (layer checks, performance rules) is in [`AGENT.md`](AGENT.md).
 
 ### Writing it yourself
 
-An external project imports only `kit`. The working example is
-[tictactoe](https://github.com/gamako/tictactoe).
+**Constraints for external consumers:**
+
+- Public Zig import surface is **`kit` only**
+- Native linking requires vendored **`build_helpers/{consumer,macos,swift}.zig`**, kept
+  **byte-identical** to `kngn/build_helpers/` (do not copy internal `platform.zig`)
+- Platforms: macOS (`objc` / `swift` / `metal`), Linux (`x11` / `wayland`), Windows
+  (`gdi` / `d3d11`). On macOS the consumer links a `platform_native_*` archive plus
+  frameworks / Swift runtime via `setupConsumerExe`
+
+Canonical wiring: [`template/`](template/). A smaller game sample:
+[tictactoe](https://github.com/gamako/tictactoe). Longer notes:
+[`docs/app-authoring.md`](docs/app-authoring.md) and [`docs/build.md`](docs/build.md).
 
 ```zig
-// build.zig.zon
+// build.zig.zon — in-tree template uses .path = ".."; sibling copy uses "../kngn"
 .dependencies = .{
     .kngn = .{ .path = "../kngn" },   // or zig fetch --save <url>
 },
 ```
 
-Vendor `build_helpers/consumer.zig` from this repository (plus `macos.zig` and
-`swift.zig` when targeting macOS) into your project so the consumer executable can
-apply links that do not travel through `linkLibrary`. That is the supported surface;
-do not copy the full internal `platform.zig`.
-
 ```zig
-// build.zig
+// build.zig (excerpt — full file is template/build.zig)
 const helpers = @import("build_helpers/consumer.zig");
 const macos = @import("build_helpers/macos.zig");
 
@@ -318,12 +355,14 @@ probe, and the MCP server are in [`docs/harness.md`](docs/harness.md).
 ```bash
 direnv allow                  # with nix plus direnv (recommended); zig 0.16.0 lands on PATH
 zig build run-pixie           # the pixel editor. Also run / run-synth / run-noodle / run-example_NN
-zig build test                # every test
+zig build test                # unit tests + template native gate (no wasm)
+zig build -Dinstall-all=true  # all backends + root wasm packages + template native/web gates
 ```
 
 Setting up without nix (the per-OS prerequisites), switching backends, cross-compiling and
 running individual tests are in [`docs/build.md`](docs/build.md). A Windows target is the
-one that cross-builds from any host.
+one that cross-builds from any host. Wasm deploy details:
+[`docs/wasm-deploy.md`](docs/wasm-deploy.md).
 
 ## Status
 

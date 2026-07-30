@@ -153,6 +153,7 @@ up. The macOS one is.
 
 ## Consuming this from another project
 
-See "Building your own app" in [`../README.md`](../README.md), and
-[tictactoe](https://github.com/gamako/tictactoe) for a working example of a
-`.path` dependency.
+[app-authoring.md](app-authoring.md) is the guide for that: the published surface, the
+four wiring routes, and how to take `template/` out of the tree as a starting point.
+[tictactoe](https://github.com/gamako/tictactoe) is a second worked example of a `.path`
+dependency.

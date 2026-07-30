@@ -1,5 +1,10 @@
 # KNGN
 
+> **Who this file is for.** This is the contract for changing this repository, so it is
+> addressed to contributors. If you are writing your own application against `kit`, read
+> [docs/app-authoring.md](docs/app-authoring.md) instead — it covers the published surface
+> without the rules that only apply to changes landing here.
+
 A cross-platform environment for prototyping video and graphics. An application layer
 written in Zig sits on a low-level API layer implemented per platform (macOS:
 Objective-C / Swift / Metal; Linux: X11 / Wayland; Windows: GDI / D3D11).
