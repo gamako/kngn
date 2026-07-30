@@ -73,6 +73,11 @@ const MAX_MODULES = modular.dyn.MAX_MODULES;
 const MAX_OUT = modular.signal.MAX_OUT;
 const MAX_IN = modular.signal.MAX_IN;
 const MAX_EDGES = MAX_MODULES * MAX_IN;
+comptime {
+    // layout.zig mirrors the port count to size its edge scratch without importing the graph layer.
+    // This assertion is the single place where both constants are visible, so a change to either fails to compile.
+    std.debug.assert(layout_mod.MAX_IN_PORTS == MAX_IN);
+}
 // Per-port tap constants (modular is the single source).
 const TAP_SLOTS = modular.graph_core.TAP_SLOTS;
 const TAP_RING = modular.graph_core.TAP_RING;

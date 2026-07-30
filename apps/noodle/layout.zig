@@ -9,6 +9,7 @@
 //! Pure Zig with no platform / gui / modular imports (only canvas / group). Unit-testable via test-noodle.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const canvas = @import("canvas.zig");
 const group = @import("group.zig");
 
@@ -27,6 +28,10 @@ pub const ROW_GAP: f32 = 24;
 pub const EXPANDED_HEADER_MARGIN: f32 = 10;
 
 const MAX_NODES: usize = group.GROUP_HANDLE_BASE + group.MAX_GROUPS;
+/// Input ports per node, mirrored from the graph layer so this file needs no import of it.
+/// The mirror is pinned by a comptime assertion at the call site that owns both constants.
+pub const MAX_IN_PORTS: usize = 8;
+const MAX_EDGES: usize = group.GROUP_HANDLE_BASE * MAX_IN_PORTS;
 
 /// Repositions only the selected display nodes into a simple, topology-agnostic grid.
 ///
@@ -179,6 +184,7 @@ pub fn apply(
     @memset(ranks[0..nodes.len], 0);
 
     computeRanks(nodes, edges, order_keys, ranks[0..nodes.len]);
+    rightPackSources(nodes, edges, order_keys, ranks[0..nodes.len]);
     placeByRank(nodes, edges, order_keys, ranks[0..nodes.len], origin_y);
     writeBack(nodes, layout, ledger);
     repositionExpandedHeaders(nodes, layout, ledger);
@@ -233,7 +239,102 @@ const SortByOrderKey = struct {
     }
 };
 
-/// Fixes coordinates in ascending rank order. Within the same rank, nodes are sorted by average source center-Y, falling back to order key when unavailable.
+/// Stable display-node order: order_key, then handle, then original index.
+const StableKeyCtx = struct {
+    order_keys: []const u32,
+    nodes: []const NodeGeom,
+    fn less(ctx: StableKeyCtx, a: u16, b: u16) bool {
+        const ka = ctx.order_keys[a];
+        const kb = ctx.order_keys[b];
+        if (ka != kb) return ka < kb;
+        const ha = ctx.nodes[a].handle;
+        const hb = ctx.nodes[b].handle;
+        if (ha != hb) return ha < hb;
+        return a < b;
+    }
+};
+
+/// Builds handle -> display-node index. Handles outside the table are treated as missing.
+fn fillHandleToIdx(nodes: []const NodeGeom, handle_to_idx: []?u16) void {
+    @memset(handle_to_idx, null);
+    for (nodes, 0..) |ng, i| {
+        if (ng.handle < handle_to_idx.len) handle_to_idx[ng.handle] = @intCast(i);
+    }
+}
+
+/// Right-packs sources (display nodes with no forward inbound edge) to min(rank[successor]) - 1.
+/// One pass reaches a fixed point: every forward successor has a forward inbound edge, so it is never a source.
+fn rightPackSources(
+    nodes: []const NodeGeom,
+    edges: []const Edge,
+    order_keys: []const u32,
+    ranks: []u32,
+) void {
+    const n = nodes.len;
+    var handle_to_idx: [group.GROUP_HANDLE_BASE + group.MAX_GROUPS]?u16 =
+        [_]?u16{null} ** (group.GROUP_HANDLE_BASE + group.MAX_GROUPS);
+    fillHandleToIdx(nodes, handle_to_idx[0..]);
+
+    var has_fwd_in: [MAX_NODES]bool = undefined;
+    @memset(has_fwd_in[0..n], false);
+    for (edges) |e| {
+        const si_opt = if (e.src_handle < handle_to_idx.len) handle_to_idx[e.src_handle] else null;
+        const di_opt = if (e.dst_handle < handle_to_idx.len) handle_to_idx[e.dst_handle] else null;
+        const si = si_opt orelse continue;
+        const di = di_opt orelse continue;
+        if (order_keys[si] >= order_keys[di]) continue;
+        has_fwd_in[di] = true;
+    }
+
+    var order_idx: [MAX_NODES]u16 = undefined;
+    var i: usize = 0;
+    while (i < n) : (i += 1) order_idx[i] = @intCast(i);
+    std.mem.sort(u16, order_idx[0..n], StableKeyCtx{ .order_keys = order_keys, .nodes = nodes }, StableKeyCtx.less);
+
+    for (order_idx[0..n]) |ni| {
+        if (has_fwd_in[ni]) continue;
+        const cand = sourcePackCandidate(nodes, edges, order_keys, handle_to_idx[0..], ranks, ni) orelse continue;
+        if (cand > ranks[ni]) ranks[ni] = cand;
+    }
+
+    // A second dry pass must not change any source rank because every forward successor is non-source.
+    if (builtin.mode == .Debug) {
+        for (order_idx[0..n]) |ni| {
+            if (has_fwd_in[ni]) continue;
+            const cand = sourcePackCandidate(nodes, edges, order_keys, handle_to_idx[0..], ranks, ni) orelse continue;
+            std.debug.assert(cand <= ranks[ni]);
+        }
+    }
+}
+
+fn sourcePackCandidate(
+    nodes: []const NodeGeom,
+    edges: []const Edge,
+    order_keys: []const u32,
+    handle_to_idx: []const ?u16,
+    ranks: []const u32,
+    ni: usize,
+) ?u32 {
+    const src_h = nodes[ni].handle;
+    const src_key = order_keys[ni];
+    var min_succ: ?u32 = null;
+    for (edges) |e| {
+        if (e.src_handle != src_h) continue;
+        const di_opt = if (e.dst_handle < handle_to_idx.len) handle_to_idx[e.dst_handle] else null;
+        const di = di_opt orelse continue;
+        if (src_key >= order_keys[di]) continue;
+        min_succ = if (min_succ) |m| @min(m, ranks[di]) else ranks[di];
+    }
+    const ms = min_succ orelse return null;
+    if (ms == 0) return 0;
+    return ms - 1;
+}
+
+const max_barycenter_rounds: u32 = 4;
+
+/// Places nodes by rank. Initial order is stable keys; then up to four bidirectional barycenter rounds
+/// (upstream→downstream, then downstream→upstream) reduce crossings, with early exit on a stable order.
+/// Complexity: O(rounds × nodes × edges) with rounds ≤ 4, because each barycenter evaluation rescans the full edge list per node (event-time only).
 fn placeByRank(
     nodes: []NodeGeom,
     edges: []const Edge,
@@ -247,17 +348,286 @@ fn placeByRank(
 
     var handle_to_idx: [group.GROUP_HANDLE_BASE + group.MAX_GROUPS]?u16 =
         [_]?u16{null} ** (group.GROUP_HANDLE_BASE + group.MAX_GROUPS);
+    fillHandleToIdx(nodes, handle_to_idx[0..]);
+
+    // members[rank_begin[r] .. rank_begin[r]+rank_len[r]] holds node indices for rank r.
+    var members: [MAX_NODES]u16 = undefined;
+    var rank_begin: [MAX_NODES]usize = undefined;
+    var rank_len: [MAX_NODES]usize = undefined;
+    @memset(rank_len[0 .. max_rank + 1], 0);
+
     var i: usize = 0;
     while (i < n) : (i += 1) {
-        const h = nodes[i].handle;
-        if (h < handle_to_idx.len) handle_to_idx[h] = @intCast(i);
+        rank_len[ranks[i]] += 1;
     }
+    var acc: usize = 0;
+    var r: u32 = 0;
+    while (r <= max_rank) : (r += 1) {
+        rank_begin[r] = acc;
+        acc += rank_len[r];
+    }
+    var fill_at: [MAX_NODES]usize = undefined;
+    @memcpy(fill_at[0 .. max_rank + 1], rank_begin[0 .. max_rank + 1]);
+    i = 0;
+    while (i < n) : (i += 1) {
+        const rr = ranks[i];
+        members[fill_at[rr]] = @intCast(i);
+        fill_at[rr] += 1;
+    }
+
+    const stable = StableKeyCtx{ .order_keys = order_keys, .nodes = nodes };
+    r = 0;
+    while (r <= max_rank) : (r += 1) {
+        const bn = rank_len[r];
+        if (bn == 0) continue;
+        const slice = members[rank_begin[r] .. rank_begin[r] + bn];
+        std.mem.sort(u16, slice, stable, StableKeyCtx.less);
+        stackRankColumn(nodes, slice, r, origin_y);
+    }
+
+    var prev_order: [MAX_NODES]u16 = undefined;
+    var round: u32 = 0;
+    while (round < max_barycenter_rounds) : (round += 1) {
+        @memcpy(prev_order[0..n], members[0..n]);
+
+        // Upstream → downstream: rank 1 .. max_rank
+        r = 1;
+        while (r <= max_rank) : (r += 1) {
+            reorderRankBucket(nodes, edges, order_keys, handle_to_idx[0..], members[0..], rank_begin[0..], rank_len[0..], r, origin_y, .inbound);
+        }
+        // Downstream → upstream: max_rank .. 0
+        r = max_rank + 1;
+        while (r > 0) {
+            r -= 1;
+            reorderRankBucket(nodes, edges, order_keys, handle_to_idx[0..], members[0..], rank_begin[0..], rank_len[0..], r, origin_y, .outbound);
+        }
+
+        if (std.mem.eql(u16, prev_order[0..n], members[0..n])) break;
+    }
+}
+
+const BaryRefKind = enum { inbound, outbound };
+
+fn reorderRankBucket(
+    nodes: []NodeGeom,
+    edges: []const Edge,
+    order_keys: []const u32,
+    handle_to_idx: []const ?u16,
+    members: []u16,
+    rank_begin: []const usize,
+    rank_len: []const usize,
+    rank_r: u32,
+    origin_y: f32,
+    kind: BaryRefKind,
+) void {
+    const bn = rank_len[rank_r];
+    if (bn == 0) return;
+    const slice = members[rank_begin[rank_r] .. rank_begin[rank_r] + bn];
+
+    var sort_y: [MAX_NODES]f32 = undefined;
+    var has_ref: [MAX_NODES]bool = undefined;
+    for (slice) |ni| {
+        const avg: ?f32 = switch (kind) {
+            .inbound => averageSourceCenterY(nodes, edges, order_keys, handle_to_idx, ni),
+            .outbound => averageDestCenterY(nodes, edges, order_keys, handle_to_idx, ni),
+        };
+        has_ref[ni] = avg != null;
+        sort_y[ni] = avg orelse 0;
+    }
+
+    const ctx = RankSortCtx{
+        .order_keys = order_keys,
+        .nodes = nodes,
+        .sort_y = sort_y[0..nodes.len],
+        .has_ref = has_ref[0..nodes.len],
+    };
+    std.mem.sort(u16, slice, ctx, RankSortCtx.less);
+    stackRankColumn(nodes, slice, rank_r, origin_y);
+}
+
+fn stackRankColumn(nodes: []NodeGeom, bucket: []const u16, rank_r: u32, origin_y: f32) void {
+    var prev_y: f32 = origin_y;
+    var prev_h: f32 = 0;
+    for (bucket, 0..) |ni, bi| {
+        const sz = canvas.nodeSize(nodes[ni]);
+        const y: f32 = if (bi == 0) origin_y else prev_y + @max(prev_h, sz.y) + ROW_GAP;
+        nodes[ni].pos = .{
+            .x = ORIGIN_X + @as(f32, @floatFromInt(rank_r)) * (canvas.NODE_W + COL_GAP),
+            .y = y,
+        };
+        prev_y = y;
+        prev_h = sz.y;
+    }
+}
+
+const RankSortCtx = struct {
+    order_keys: []const u32,
+    nodes: []const NodeGeom,
+    sort_y: []const f32,
+    has_ref: []const bool,
+
+    fn less(ctx: RankSortCtx, a: u16, b: u16) bool {
+        // Both referenced: barycenter ascending. Otherwise fall back to stable keys.
+        const a_has = ctx.has_ref[a];
+        const b_has = ctx.has_ref[b];
+        if (a_has and b_has) {
+            if (ctx.sort_y[a] != ctx.sort_y[b]) return ctx.sort_y[a] < ctx.sort_y[b];
+        }
+        const ka = ctx.order_keys[a];
+        const kb = ctx.order_keys[b];
+        if (ka != kb) return ka < kb;
+        const ha = ctx.nodes[a].handle;
+        const hb = ctx.nodes[b].handle;
+        if (ha != hb) return ha < hb;
+        return a < b;
+    }
+};
+
+const U16Asc = struct {
+    fn less(_: void, a: u16, b: u16) bool {
+        return a < b;
+    }
+};
+
+/// Average center-Y of forward inbound sources. Neighbors are sorted so the f32 sum order is edge-input independent.
+fn averageSourceCenterY(
+    nodes: []const NodeGeom,
+    edges: []const Edge,
+    order_keys: []const u32,
+    handle_to_idx: []const ?u16,
+    dst_i: usize,
+) ?f32 {
+    const dst_h = nodes[dst_i].handle;
+    const dst_key = order_keys[dst_i];
+    var neigh: [MAX_NODES]u16 = undefined;
+    var nn: usize = 0;
+    for (edges) |e| {
+        if (e.dst_handle != dst_h) continue;
+        const si_opt = if (e.src_handle < handle_to_idx.len) handle_to_idx[e.src_handle] else null;
+        const si = si_opt orelse continue;
+        if (order_keys[si] >= dst_key) continue;
+        neigh[nn] = @intCast(si);
+        nn += 1;
+    }
+    if (nn == 0) return null;
+    std.mem.sort(u16, neigh[0..nn], {}, U16Asc.less);
+    var sum: f32 = 0;
+    for (neigh[0..nn]) |si| {
+        const src = nodes[si];
+        const sz = canvas.nodeSize(src);
+        sum += src.pos.y + sz.y * 0.5;
+    }
+    return sum / @as(f32, @floatFromInt(nn));
+}
+
+/// Average center-Y of forward outbound destinations. Neighbors are sorted for edge-input-independent sums.
+fn averageDestCenterY(
+    nodes: []const NodeGeom,
+    edges: []const Edge,
+    order_keys: []const u32,
+    handle_to_idx: []const ?u16,
+    src_i: usize,
+) ?f32 {
+    const src_h = nodes[src_i].handle;
+    const src_key = order_keys[src_i];
+    var neigh: [MAX_NODES]u16 = undefined;
+    var nn: usize = 0;
+    for (edges) |e| {
+        if (e.src_handle != src_h) continue;
+        const di_opt = if (e.dst_handle < handle_to_idx.len) handle_to_idx[e.dst_handle] else null;
+        const di = di_opt orelse continue;
+        if (src_key >= order_keys[di]) continue;
+        neigh[nn] = @intCast(di);
+        nn += 1;
+    }
+    if (nn == 0) return null;
+    std.mem.sort(u16, neigh[0..nn], {}, U16Asc.less);
+    var sum: f32 = 0;
+    for (neigh[0..nn]) |di| {
+        const dst = nodes[di];
+        const sz = canvas.nodeSize(dst);
+        sum += dst.pos.y + sz.y * 0.5;
+    }
+    return sum / @as(f32, @floatFromInt(nn));
+}
+
+/// Counts crossings among forward edges that span the same adjacent-rank boundary
+/// (rank[dst] == rank[src] + 1, and both edges leave the same source rank).
+/// Feedback edges and edge pairs that share a source or destination are excluded.
+/// Panics if the adjacent-forward edge count exceeds MAX_EDGES (measurement failure; no silent drop).
+fn countForwardCrossings(
+    nodes: []const NodeGeom,
+    edges: []const Edge,
+    order_keys: []const u32,
+    ranks: []const u32,
+) u32 {
+    var handle_to_idx: [group.GROUP_HANDLE_BASE + group.MAX_GROUPS]?u16 =
+        [_]?u16{null} ** (group.GROUP_HANDLE_BASE + group.MAX_GROUPS);
+    fillHandleToIdx(nodes, handle_to_idx[0..]);
+
+    // Collect adjacent-rank forward edges as (src_i, dst_i). Sized to the graph edge cap.
+    var srcs: [MAX_EDGES]u16 = undefined;
+    var dsts: [MAX_EDGES]u16 = undefined;
+    var en: usize = 0;
+    for (edges) |e| {
+        const si_opt = if (e.src_handle < handle_to_idx.len) handle_to_idx[e.src_handle] else null;
+        const di_opt = if (e.dst_handle < handle_to_idx.len) handle_to_idx[e.dst_handle] else null;
+        const si = si_opt orelse continue;
+        const di = di_opt orelse continue;
+        if (order_keys[si] >= order_keys[di]) continue;
+        if (ranks[di] != ranks[si] + 1) continue;
+        if (en >= MAX_EDGES) {
+            @panic("countForwardCrossings: adjacent forward edge count exceeds MAX_EDGES");
+        }
+        srcs[en] = @intCast(si);
+        dsts[en] = @intCast(di);
+        en += 1;
+    }
+
+    var crossings: u32 = 0;
+    var i: usize = 0;
+    while (i < en) : (i += 1) {
+        var j: usize = i + 1;
+        while (j < en) : (j += 1) {
+            // Same rank boundary only (e.g. both 0→1); do not pair 0→1 with 1→2.
+            if (ranks[srcs[i]] != ranks[srcs[j]]) continue;
+            if (srcs[i] == srcs[j] or dsts[i] == dsts[j]) continue;
+            const cy_s1 = centerY(nodes[srcs[i]]);
+            const cy_s2 = centerY(nodes[srcs[j]]);
+            const cy_d1 = centerY(nodes[dsts[i]]);
+            const cy_d2 = centerY(nodes[dsts[j]]);
+            if ((cy_s1 - cy_s2) * (cy_d1 - cy_d2) < 0) crossings += 1;
+        }
+    }
+    return crossings;
+}
+
+fn centerY(ng: NodeGeom) f32 {
+    const sz = canvas.nodeSize(ng);
+    return ng.pos.y + sz.y * 0.5;
+}
+
+/// Test-only reference layout, intentionally independent of the production algorithm. It exists so the crossing comparison has a fixed baseline; do not synchronise it with the production code.
+fn placeByRankSingleSweepBaseline(
+    nodes: []NodeGeom,
+    edges: []const Edge,
+    order_keys: []const u32,
+    ranks: []const u32,
+    origin_y: f32,
+) void {
+    const n = nodes.len;
+    var max_rank: u32 = 0;
+    for (ranks[0..n]) |r| max_rank = @max(max_rank, r);
+
+    var handle_to_idx: [group.GROUP_HANDLE_BASE + group.MAX_GROUPS]?u16 =
+        [_]?u16{null} ** (group.GROUP_HANDLE_BASE + group.MAX_GROUPS);
+    fillHandleToIdx(nodes, handle_to_idx[0..]);
 
     var bucket: [MAX_NODES]u16 = undefined;
     var rank_r: u32 = 0;
     while (rank_r <= max_rank) : (rank_r += 1) {
         var bn: usize = 0;
-        i = 0;
+        var i: usize = 0;
         while (i < n) : (i += 1) {
             if (ranks[i] == rank_r) {
                 bucket[bn] = @intCast(i);
@@ -266,57 +636,38 @@ fn placeByRank(
         }
         if (bn == 0) continue;
 
-        // The sort key used within the same rank
         var sort_y: [MAX_NODES]f32 = undefined;
         var has_src: [MAX_NODES]bool = undefined;
         var bi: usize = 0;
         while (bi < bn) : (bi += 1) {
             const ni = bucket[bi];
-            const avg = averageSourceCenterY(nodes, edges, order_keys, handle_to_idx[0..], ni);
+            // Accumulates source center-Y in raw edge-array order (independent of production neighbor sorting).
+            const avg = averageSourceCenterYBaseline(nodes, edges, order_keys, handle_to_idx[0..], ni);
             has_src[ni] = avg != null;
             sort_y[ni] = avg orelse 0;
         }
 
-        const ctx = RankSortCtx{
+        const ctx = BaselineRankSortCtx{
             .order_keys = order_keys,
             .sort_y = sort_y[0..n],
             .has_src = has_src[0..n],
         };
-        std.mem.sort(u16, bucket[0..bn], ctx, RankSortCtx.less);
-
-        // Vertical stacking (each rank column starts at the caller's origin_y)
-        var prev_y: f32 = origin_y;
-        var prev_h: f32 = 0;
-        bi = 0;
-        while (bi < bn) : (bi += 1) {
-            const ni = bucket[bi];
-            const sz = canvas.nodeSize(nodes[ni]);
-            const y: f32 = if (bi == 0) origin_y else prev_y + @max(prev_h, sz.y) + ROW_GAP;
-            nodes[ni].pos = .{
-                .x = ORIGIN_X + @as(f32, @floatFromInt(rank_r)) * (canvas.NODE_W + COL_GAP),
-                .y = y,
-            };
-            prev_y = y;
-            prev_h = sz.y;
-        }
+        std.mem.sort(u16, bucket[0..bn], ctx, BaselineRankSortCtx.less);
+        stackRankColumn(nodes, bucket[0..bn], rank_r, origin_y);
     }
 }
 
-const RankSortCtx = struct {
+const BaselineRankSortCtx = struct {
     order_keys: []const u32,
     sort_y: []const f32,
     has_src: []const bool,
 
-    fn less(ctx: RankSortCtx, a: u16, b: u16) bool {
-        // Between two nodes that both have inbound edges: sorted by ascending average_source_y. If only one has inbound edges, it comes first (order is preferred over a y comparison).
-        // If neither has inbound edges: order key. The secondary key is always order key.
+    fn less(ctx: BaselineRankSortCtx, a: u16, b: u16) bool {
         const a_has = ctx.has_src[a];
         const b_has = ctx.has_src[b];
         if (a_has and b_has) {
             if (ctx.sort_y[a] != ctx.sort_y[b]) return ctx.sort_y[a] < ctx.sort_y[b];
-        } else if (a_has != b_has) {
-            // When one side falls back to order key, the comparison switches to order key for determinism.
-        }
+        } else if (a_has != b_has) {}
         const ka = ctx.order_keys[a];
         const kb = ctx.order_keys[b];
         if (ka != kb) return ka < kb;
@@ -324,8 +675,7 @@ const RankSortCtx = struct {
     }
 };
 
-/// The average center-Y of the rects connected via forward inbound edges. null if there are no inbound edges (falls back to order key).
-fn averageSourceCenterY(
+fn averageSourceCenterYBaseline(
     nodes: []const NodeGeom,
     edges: []const Edge,
     order_keys: []const u32,
@@ -340,8 +690,7 @@ fn averageSourceCenterY(
         if (e.dst_handle != dst_h) continue;
         const si_opt = if (e.src_handle < handle_to_idx.len) handle_to_idx[e.src_handle] else null;
         const si = si_opt orelse continue;
-        const src_key = order_keys[si];
-        if (src_key >= dst_key) continue; // Feedback edges are also excluded from the sort reference
+        if (order_keys[si] >= dst_key) continue;
         const src = nodes[si];
         const sz = canvas.nodeSize(src);
         sum += src.pos.y + sz.y * 0.5;
@@ -349,6 +698,32 @@ fn averageSourceCenterY(
     }
     if (count == 0) return null;
     return sum / @as(f32, @floatFromInt(count));
+}
+
+fn applyBaselineLayout(
+    nodes: []NodeGeom,
+    edges: []const Edge,
+    order_keys: []const u32,
+    origin_y: f32,
+    ranks_out: []u32,
+) void {
+    @memset(ranks_out[0..nodes.len], 0);
+    computeRanks(nodes, edges, order_keys, ranks_out[0..nodes.len]);
+    placeByRankSingleSweepBaseline(nodes, edges, order_keys, ranks_out[0..nodes.len], origin_y);
+}
+
+fn applyAndCountCrossings(
+    nodes: []NodeGeom,
+    edges: []const Edge,
+    order_keys: []const u32,
+    origin_y: f32,
+) u32 {
+    var ranks: [MAX_NODES]u32 = undefined;
+    @memset(ranks[0..nodes.len], 0);
+    computeRanks(nodes, edges, order_keys, ranks[0..nodes.len]);
+    rightPackSources(nodes, edges, order_keys, ranks[0..nodes.len]);
+    placeByRank(nodes, edges, order_keys, ranks[0..nodes.len], origin_y);
+    return countForwardCrossings(nodes, edges, order_keys, ranks[0..nodes.len]);
 }
 
 /// A real node writes to layout[handle]; a synthetic handle writes to groups[gid].pos
@@ -730,6 +1105,238 @@ test "layout: caller origin_y is used as rank0 top Y" {
     try testing.expectApproxEqAbs(caller_origin_y, nodes[1].pos.y, 1e-4);
     try testing.expect(nodes[0].pos.y >= caller_origin_y);
     try testing.expect(nodes[1].pos.y >= caller_origin_y);
+}
+
+test "layout: source nodes pack before their nearest successor" {
+    // Chain A->B->C (ranks 0,1,2) plus source S->C. S has no forward inbound, so packs to rank 1.
+    // Order keys must keep every forward edge as src_key < dst_key (S's key is between A and B).
+    var nodes = [_]NodeGeom{
+        .{ .handle = 0, .pos = .{ .x = 0, .y = 0 }, .n_in = 0, .n_out = 1 }, // A
+        .{ .handle = 1, .pos = .{ .x = 0, .y = 0 }, .n_in = 1, .n_out = 1 }, // B
+        .{ .handle = 2, .pos = .{ .x = 0, .y = 0 }, .n_in = 2, .n_out = 0 }, // C
+        .{ .handle = 3, .pos = .{ .x = 0, .y = 0 }, .n_in = 0, .n_out = 1 }, // S
+    };
+    const keys = [_]u32{ 0, 2, 3, 1 }; // A=0, B=2, C=3, S=1
+    const edges = [_]Edge{
+        .{ .src_handle = 0, .src_out = 0, .dst_handle = 1, .dst_in = 0 },
+        .{ .src_handle = 1, .src_out = 0, .dst_handle = 2, .dst_in = 0 },
+        .{ .src_handle = 3, .src_out = 0, .dst_handle = 2, .dst_in = 1 },
+    };
+    var layout_arr = [_]Vec2f{.{ .x = 0, .y = 0 }} ** group.GROUP_HANDLE_BASE;
+    var ledger: group.Ledger = .{};
+    apply(&nodes, &edges, &keys, &layout_arr, &ledger, ORIGIN_Y);
+
+    const rank_x = struct {
+        fn x(rank: u32) f32 {
+            return ORIGIN_X + @as(f32, @floatFromInt(rank)) * (canvas.NODE_W + COL_GAP);
+        }
+    }.x;
+    try testing.expectApproxEqAbs(rank_x(0), nodes[0].pos.x, 1e-4); // A
+    try testing.expectApproxEqAbs(rank_x(1), nodes[1].pos.x, 1e-4); // B
+    try testing.expectApproxEqAbs(rank_x(2), nodes[2].pos.x, 1e-4); // C
+    try testing.expectApproxEqAbs(rank_x(1), nodes[3].pos.x, 1e-4); // S packed beside B
+    try testing.expect(nodes[3].pos.x < nodes[2].pos.x);
+}
+
+test "layout: source with multiple successors uses nearest rank" {
+    // A->B->C->D (ranks 0..3). Source S feeds C (rank 2) and D (rank 3); nearest is 2, so pack to 1.
+    var nodes = [_]NodeGeom{
+        .{ .handle = 0, .pos = .{ .x = 0, .y = 0 }, .n_in = 0, .n_out = 1 },
+        .{ .handle = 1, .pos = .{ .x = 0, .y = 0 }, .n_in = 1, .n_out = 1 },
+        .{ .handle = 2, .pos = .{ .x = 0, .y = 0 }, .n_in = 2, .n_out = 1 },
+        .{ .handle = 3, .pos = .{ .x = 0, .y = 0 }, .n_in = 2, .n_out = 0 },
+        .{ .handle = 4, .pos = .{ .x = 0, .y = 0 }, .n_in = 0, .n_out = 2 }, // S
+    };
+    // A=0, S=1, B=2, C=3, D=4 so S->* edges are forward (src_key < dst_key).
+    const keys = [_]u32{ 0, 2, 3, 4, 1 };
+    const edges = [_]Edge{
+        .{ .src_handle = 0, .src_out = 0, .dst_handle = 1, .dst_in = 0 },
+        .{ .src_handle = 1, .src_out = 0, .dst_handle = 2, .dst_in = 0 },
+        .{ .src_handle = 2, .src_out = 0, .dst_handle = 3, .dst_in = 0 },
+        .{ .src_handle = 4, .src_out = 0, .dst_handle = 2, .dst_in = 1 },
+        .{ .src_handle = 4, .src_out = 1, .dst_handle = 3, .dst_in = 1 },
+    };
+    var layout_arr = [_]Vec2f{.{ .x = 0, .y = 0 }} ** group.GROUP_HANDLE_BASE;
+    var ledger: group.Ledger = .{};
+    apply(&nodes, &edges, &keys, &layout_arr, &ledger, ORIGIN_Y);
+
+    const x1 = ORIGIN_X + 1 * (canvas.NODE_W + COL_GAP);
+    try testing.expectApproxEqAbs(x1, nodes[4].pos.x, 1e-4);
+    try testing.expect(nodes[4].pos.x < nodes[2].pos.x);
+    try testing.expect(nodes[4].pos.x < nodes[3].pos.x);
+}
+
+test "layout: repeated barycenter reduces crossings" {
+    // 4×3 bipartite fixture: a single forward barycenter leaves residual crossings that
+    // reverse+forward rounds reduce by reordering the source layer.
+    // L0 handles 0..3, L1 handles 4..6. Single rank boundary (0→1) only.
+    // Uniform port counts so node heights match and barycenter order tracks index order.
+    const template = [_]NodeGeom{
+        .{ .handle = 0, .pos = .{ .x = 0, .y = 0 }, .n_in = 1, .n_out = 3 },
+        .{ .handle = 1, .pos = .{ .x = 0, .y = 0 }, .n_in = 1, .n_out = 3 },
+        .{ .handle = 2, .pos = .{ .x = 0, .y = 0 }, .n_in = 1, .n_out = 3 },
+        .{ .handle = 3, .pos = .{ .x = 0, .y = 0 }, .n_in = 1, .n_out = 3 },
+        .{ .handle = 4, .pos = .{ .x = 0, .y = 0 }, .n_in = 3, .n_out = 1 },
+        .{ .handle = 5, .pos = .{ .x = 0, .y = 0 }, .n_in = 3, .n_out = 1 },
+        .{ .handle = 6, .pos = .{ .x = 0, .y = 0 }, .n_in = 3, .n_out = 1 },
+    };
+    const keys = [_]u32{ 0, 1, 2, 3, 4, 5, 6 };
+    const edges = [_]Edge{
+        .{ .src_handle = 0, .src_out = 0, .dst_handle = 4, .dst_in = 0 },
+        .{ .src_handle = 0, .src_out = 1, .dst_handle = 5, .dst_in = 0 },
+        .{ .src_handle = 1, .src_out = 0, .dst_handle = 5, .dst_in = 1 },
+        .{ .src_handle = 1, .src_out = 1, .dst_handle = 6, .dst_in = 0 },
+        .{ .src_handle = 2, .src_out = 0, .dst_handle = 4, .dst_in = 1 },
+        .{ .src_handle = 2, .src_out = 1, .dst_handle = 6, .dst_in = 1 },
+        .{ .src_handle = 3, .src_out = 0, .dst_handle = 4, .dst_in = 2 },
+        .{ .src_handle = 3, .src_out = 1, .dst_handle = 5, .dst_in = 2 },
+        .{ .src_handle = 3, .src_out = 2, .dst_handle = 6, .dst_in = 2 },
+    };
+
+    var base_nodes = template;
+    var base_ranks: [7]u32 = undefined;
+    applyBaselineLayout(&base_nodes, &edges, &keys, ORIGIN_Y, &base_ranks);
+    const before = countForwardCrossings(&base_nodes, &edges, &keys, &base_ranks);
+
+    var after_nodes = template;
+    const after = applyAndCountCrossings(&after_nodes, &edges, &keys, ORIGIN_Y);
+    try testing.expect(after < before);
+}
+
+test "layout: general crossing fixtures do not get worse" {
+    // Fixture 1: branch-join A->B,A->C,B->D,C->D
+    {
+        const template = [_]NodeGeom{
+            .{ .handle = 0, .pos = .{ .x = 0, .y = 0 }, .n_in = 0, .n_out = 2 },
+            .{ .handle = 1, .pos = .{ .x = 0, .y = 0 }, .n_in = 1, .n_out = 1 },
+            .{ .handle = 2, .pos = .{ .x = 0, .y = 0 }, .n_in = 1, .n_out = 1 },
+            .{ .handle = 3, .pos = .{ .x = 0, .y = 0 }, .n_in = 2, .n_out = 0 },
+        };
+        const keys = [_]u32{ 0, 1, 2, 3 };
+        const edges = [_]Edge{
+            .{ .src_handle = 0, .src_out = 0, .dst_handle = 1, .dst_in = 0 },
+            .{ .src_handle = 0, .src_out = 1, .dst_handle = 2, .dst_in = 0 },
+            .{ .src_handle = 1, .src_out = 0, .dst_handle = 3, .dst_in = 0 },
+            .{ .src_handle = 2, .src_out = 0, .dst_handle = 3, .dst_in = 1 },
+        };
+        var base_nodes = template;
+        var base_ranks: [4]u32 = undefined;
+        applyBaselineLayout(&base_nodes, &edges, &keys, ORIGIN_Y, &base_ranks);
+        const before = countForwardCrossings(&base_nodes, &edges, &keys, &base_ranks);
+        var after_nodes = template;
+        const after = applyAndCountCrossings(&after_nodes, &edges, &keys, ORIGIN_Y);
+        try testing.expect(after <= before);
+    }
+    // Fixture 2: crossed 2-layer a->d, b->c
+    {
+        const template = [_]NodeGeom{
+            .{ .handle = 0, .pos = .{ .x = 0, .y = 0 }, .n_in = 0, .n_out = 1 },
+            .{ .handle = 1, .pos = .{ .x = 0, .y = 0 }, .n_in = 0, .n_out = 1 },
+            .{ .handle = 2, .pos = .{ .x = 0, .y = 0 }, .n_in = 1, .n_out = 0 },
+            .{ .handle = 3, .pos = .{ .x = 0, .y = 0 }, .n_in = 1, .n_out = 0 },
+        };
+        const keys = [_]u32{ 0, 1, 2, 3 };
+        const edges = [_]Edge{
+            .{ .src_handle = 0, .src_out = 0, .dst_handle = 3, .dst_in = 0 },
+            .{ .src_handle = 1, .src_out = 0, .dst_handle = 2, .dst_in = 0 },
+        };
+        var base_nodes = template;
+        var base_ranks: [4]u32 = undefined;
+        applyBaselineLayout(&base_nodes, &edges, &keys, ORIGIN_Y, &base_ranks);
+        const before = countForwardCrossings(&base_nodes, &edges, &keys, &base_ranks);
+        var after_nodes = template;
+        const after = applyAndCountCrossings(&after_nodes, &edges, &keys, ORIGIN_Y);
+        try testing.expect(after <= before);
+    }
+}
+
+test "layout: repeated barycenter reaches a stable order" {
+    var nodes = [_]NodeGeom{
+        .{ .handle = 0, .pos = .{ .x = 0, .y = 0 }, .n_in = 0, .n_out = 2 },
+        .{ .handle = 1, .pos = .{ .x = 0, .y = 0 }, .n_in = 1, .n_out = 1 },
+        .{ .handle = 2, .pos = .{ .x = 0, .y = 0 }, .n_in = 1, .n_out = 1 },
+        .{ .handle = 3, .pos = .{ .x = 0, .y = 0 }, .n_in = 2, .n_out = 0 },
+    };
+    const keys = [_]u32{ 0, 1, 2, 3 };
+    const edges = [_]Edge{
+        .{ .src_handle = 0, .src_out = 0, .dst_handle = 1, .dst_in = 0 },
+        .{ .src_handle = 0, .src_out = 1, .dst_handle = 2, .dst_in = 0 },
+        .{ .src_handle = 1, .src_out = 0, .dst_handle = 3, .dst_in = 0 },
+        .{ .src_handle = 2, .src_out = 0, .dst_handle = 3, .dst_in = 1 },
+    };
+    var layout_arr = [_]Vec2f{.{ .x = 0, .y = 0 }} ** group.GROUP_HANDLE_BASE;
+    var ledger: group.Ledger = .{};
+    apply(&nodes, &edges, &keys, &layout_arr, &ledger, ORIGIN_Y);
+    const first = nodes;
+
+    // Re-apply on the already-placed positions must yield the same coordinates (stable order).
+    apply(&nodes, &edges, &keys, &layout_arr, &ledger, ORIGIN_Y);
+    for (first, nodes) |a, b| {
+        try testing.expectApproxEqAbs(a.pos.x, b.pos.x, 1e-4);
+        try testing.expectApproxEqAbs(a.pos.y, b.pos.y, 1e-4);
+    }
+}
+
+test "layout: repeated barycenter is deterministic under edge permutation" {
+    var nodes_a = [_]NodeGeom{
+        .{ .handle = 0, .pos = .{ .x = 0, .y = 0 }, .n_in = 0, .n_out = 2 },
+        .{ .handle = 1, .pos = .{ .x = 0, .y = 0 }, .n_in = 0, .n_out = 1 },
+        .{ .handle = 2, .pos = .{ .x = 0, .y = 0 }, .n_in = 1, .n_out = 1 },
+        .{ .handle = 3, .pos = .{ .x = 0, .y = 0 }, .n_in = 1, .n_out = 1 },
+        .{ .handle = 4, .pos = .{ .x = 0, .y = 0 }, .n_in = 2, .n_out = 0 },
+    };
+    var nodes_b = nodes_a;
+    const keys = [_]u32{ 0, 1, 2, 3, 4 };
+    const edges_a = [_]Edge{
+        .{ .src_handle = 0, .src_out = 0, .dst_handle = 2, .dst_in = 0 },
+        .{ .src_handle = 0, .src_out = 1, .dst_handle = 3, .dst_in = 0 },
+        .{ .src_handle = 1, .src_out = 0, .dst_handle = 3, .dst_in = 1 },
+        .{ .src_handle = 2, .src_out = 0, .dst_handle = 4, .dst_in = 0 },
+        .{ .src_handle = 3, .src_out = 0, .dst_handle = 4, .dst_in = 1 },
+    };
+    const edges_b = [_]Edge{
+        edges_a[4],
+        edges_a[2],
+        edges_a[0],
+        edges_a[3],
+        edges_a[1],
+    };
+    var la = [_]Vec2f{.{ .x = 0, .y = 0 }} ** group.GROUP_HANDLE_BASE;
+    var lb = la;
+    var ledger_a: group.Ledger = .{};
+    var ledger_b: group.Ledger = .{};
+    apply(&nodes_a, &edges_a, &keys, &la, &ledger_a, ORIGIN_Y);
+    apply(&nodes_b, &edges_b, &keys, &lb, &ledger_b, ORIGIN_Y);
+    for (nodes_a, nodes_b) |a, b| {
+        try testing.expectApproxEqAbs(a.pos.x, b.pos.x, 1e-4);
+        try testing.expectApproxEqAbs(a.pos.y, b.pos.y, 1e-4);
+    }
+}
+
+test "layout: layout result is deterministic" {
+    var nodes_a = [_]NodeGeom{
+        .{ .handle = 0, .pos = .{ .x = 9, .y = 9 }, .n_in = 0, .n_out = 1 },
+        .{ .handle = 1, .pos = .{ .x = 8, .y = 8 }, .n_in = 1, .n_out = 1 },
+        .{ .handle = 2, .pos = .{ .x = 7, .y = 7 }, .n_in = 1, .n_out = 0 },
+        .{ .handle = 3, .pos = .{ .x = 6, .y = 6 }, .n_in = 0, .n_out = 1 },
+    };
+    var nodes_b = nodes_a;
+    const keys = [_]u32{ 0, 1, 2, 3 };
+    const edges = [_]Edge{
+        .{ .src_handle = 0, .src_out = 0, .dst_handle = 1, .dst_in = 0 },
+        .{ .src_handle = 1, .src_out = 0, .dst_handle = 2, .dst_in = 0 },
+        .{ .src_handle = 3, .src_out = 0, .dst_handle = 2, .dst_in = 1 },
+    };
+    var la = [_]Vec2f{.{ .x = 0, .y = 0 }} ** group.GROUP_HANDLE_BASE;
+    var lb = la;
+    var ledger_a: group.Ledger = .{};
+    var ledger_b: group.Ledger = .{};
+    apply(&nodes_a, &edges, &keys, &la, &ledger_a, ORIGIN_Y);
+    apply(&nodes_b, &edges, &keys, &lb, &ledger_b, ORIGIN_Y);
+    for (nodes_a, nodes_b) |a, b| {
+        try testing.expectApproxEqAbs(a.pos.x, b.pos.x, 1e-4);
+        try testing.expectApproxEqAbs(a.pos.y, b.pos.y, 1e-4);
+    }
 }
 
 // ============================================================================
