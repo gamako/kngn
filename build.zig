@@ -2905,17 +2905,26 @@ const SharedModules = struct {
     /// (X11/Wayland). Must match the backend the consumer executable links against.
     fn init(b: *std.Build, is_wasm: bool, wasm_shared: bool, enable_gamepad: bool, max_modules: usize, max_modules_mod: *std.Build.Module, target: std.Build.ResolvedTarget, platform_backend: platform.PlatformType) SharedModules {
         // External public module (addModule). Available via dep.module("platform") and via kit.
-        // Facade. Carries link_libc + include path for @cImport("platform.h"), plus backend-specific
-        // system libs/headers needed for @cImport (see platform.configurePublicPlatformModule).
+        // Facade. On a native target it carries link_libc plus the include path for
+        // @cImport("platform.h"), and the backend-specific system libs/headers @cImport needs
+        // (see platform.configurePublicPlatformModule).
         // target is set so linkSystemLibrary can resolve pkg-config for the selected OS.
         //
         // When is_wasm, use createModule so the internal wasm package graph does not overwrite
         // the native public modules registered for external consumers (dep.module("platform")).
+        //
+        // The wasm settings mirror platform.createPlatformModule (the internal path): no libc
+        // (wasi preview1 plus a hand-written JS shim), no platform.h include path (the wasm
+        // backend has no @cImport), and single_threaded following wasm_shared. Pulling in
+        // wasi-libc here would link crt1, which exports `_start` and imports args_get /
+        // args_sizes_get / proc_exit — names the browser shim does not provide, so the module
+        // fails before instantiation.
         const platform_mod: TaggedModule = .{ .layer = .core, .name = "platform", .mod = if (is_wasm)
             b.createModule(.{
                 .root_source_file = b.path("core/platform.zig"),
                 .target = target,
-                .link_libc = true,
+                .link_libc = false,
+                .single_threaded = !wasm_shared,
             })
         else
             b.addModule("platform", .{
@@ -2923,7 +2932,7 @@ const SharedModules = struct {
                 .target = target,
                 .link_libc = true,
             }) };
-        platform_mod.mod.addIncludePath(b.path("platform"));
+        if (!is_wasm) platform_mod.mod.addIncludePath(b.path("platform"));
         platform.configurePublicPlatformModule(b, platform_mod.mod, platform_backend);
         // build_options (gamepad/menu opt-in + platform_backend): the facade for external consumers
         // (tictactoe etc.; dep.module("platform") / dep.module("kit")) roots at core/platform.zig,
