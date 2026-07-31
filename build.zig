@@ -2959,48 +2959,38 @@ const SharedModules = struct {
     /// `build_options.platform_backend` and used to attach `@cImport`-required system libs
     /// (X11/Wayland). Must match the backend the consumer executable links against.
     fn init(b: *std.Build, is_wasm: bool, wasm_shared: bool, enable_gamepad: bool, max_modules: usize, max_modules_mod: *std.Build.Module, target: std.Build.ResolvedTarget, platform_backend: platform.PlatformType) SharedModules {
-        // External public module (addModule). Available via dep.module("platform") and via kit.
-        // Facade. On a native target it carries link_libc plus the include path for
-        // @cImport("platform.h"), and the backend-specific system libs/headers @cImport needs
-        // (see platform.configurePublicPlatformModule).
-        // target is set so linkSystemLibrary can resolve pkg-config for the selected OS.
+        // External public module. Available via dep.module("platform") and via kit.
+        //
+        // Its shape — libc, the platform.h include path, the backend's @cImport system libs
+        // and headers, single_threaded — comes from the same helpers the module inside this
+        // repository uses, so the two cannot drift apart. What differs is registration and
+        // wiring: this one is published under a name, and its imports go through the
+        // layer-checked link() below rather than a bare addImport.
         //
         // When is_wasm, use createModule so the internal wasm package graph does not overwrite
-        // the native public modules registered for external consumers (dep.module("platform")).
-        //
-        // The wasm settings mirror platform.createPlatformModule (the internal path): no libc
-        // (wasi preview1 plus a hand-written JS shim), no platform.h include path (the wasm
-        // backend has no @cImport), and single_threaded following wasm_shared. Pulling in
-        // wasi-libc here would link crt1, which exports `_start` and imports args_get /
-        // args_sizes_get / proc_exit — names the browser shim does not provide, so the module
-        // fails before instantiation.
+        // the native public modules registered for external consumers; the caller re-registers
+        // the name afterwards.
+        const platform_options = platform.platformModuleOptions(
+            target,
+            b.path("core/platform.zig"),
+            platform_backend,
+            wasm_shared,
+        );
         const platform_mod: TaggedModule = .{ .layer = .core, .name = "platform", .mod = if (is_wasm)
-            b.createModule(.{
-                .root_source_file = b.path("core/platform.zig"),
-                .target = target,
-                .link_libc = false,
-                .single_threaded = !wasm_shared,
-            })
+            b.createModule(platform_options)
         else
-            b.addModule("platform", .{
-                .root_source_file = b.path("core/platform.zig"),
-                .target = target,
-                .link_libc = true,
-            }) };
-        if (!is_wasm) platform_mod.mod.addIncludePath(b.path("platform"));
-        platform.configurePublicPlatformModule(b, platform_mod.mod, platform_backend);
+            b.addModule("platform", platform_options) };
+        platform.configurePlatformModule(b, platform_mod.mod, b.path("platform"), platform_backend);
         // build_options (gamepad/menu opt-in + platform_backend): the facade for external consumers
         // (tictactoe etc.; dep.module("platform") / dep.module("kit")) roots at core/platform.zig,
         // so the same named import is required. enable_gamepad opts in with `-Denable_gamepad=true`
         // (default false = safe side). platform_backend must match the consumer's chosen backend
-        // so OS dispatchers do not @compileError.
-        {
-            const opts = b.addOptions();
-            opts.addOption(bool, "enable_gamepad", enable_gamepad);
-            opts.addOption(bool, "enable_menu", false);
-            opts.addOption([]const u8, "platform_backend", platform.backendName(platform_backend));
-            platform_mod.mod.addOptions("build_options", opts);
-        }
+        // so OS dispatchers do not @compileError. Native menus are an in-repository feature and
+        // stay off for a consumer.
+        platform.addPlatformBuildOptions(b, platform_mod.mod, platform_backend, .{
+            .enable_gamepad = enable_gamepad,
+            .enable_menu = false,
+        });
 
         // External public module. dep.module("png").
         const png: TaggedModule = .{ .layer = .lib, .name = "png", .mod = if (is_wasm)

@@ -47,14 +47,59 @@ pub fn audioSupported(os: std.Target.Os.Tag) bool {
     return os == .macos or os == .linux or os == .windows;
 }
 
-/// Attach `@cImport`-required system libraries and include paths to a public platform module.
+/// The build settings a `core/platform.zig` module needs, whichever path creates it.
+///
+/// Two paths do create one — `createPlatformModule` below for executables inside this
+/// repository, and `build.zig` for the module external consumers receive as
+/// `dep.module("platform")` — because they differ in how the module is registered and in
+/// whether their imports go through the layer check of ADR-007. What must *not* differ is
+/// the shape of the module itself, so it is decided here and nowhere else.
+///
+/// `wasm_shared` says whether the wasm target runs with shared memory, and it is a parameter
+/// because the two paths decide it from different things: `createPlatformModule` reads the
+/// target's atomics feature, while the published module takes the value its caller supplies.
+///
+/// Runs at build-graph configuration time only (not per-frame / RT).
+pub fn platformModuleOptions(
+    target: std.Build.ResolvedTarget,
+    platform_source: std.Build.LazyPath,
+    backend: PlatformType,
+    wasm_shared: bool,
+) std.Build.Module.CreateOptions {
+    const is_wasm = backend == .wasm;
+    return .{
+        .root_source_file = platform_source,
+        // linkSystemLibrary needs a module with a known target, so it is set explicitly
+        // (an imported module usually inherits from its importer, but the x11 link call
+        // needs the target beforehand).
+        .target = target,
+        // Wasm reaches the host through wasi preview1 plus a hand-written JS shim. Linking
+        // libc there pulls in crt1, whose `_start` export the browser glue cannot satisfy.
+        .link_libc = !is_wasm,
+        .single_threaded = if (is_wasm) !wasm_shared else null,
+    };
+}
+
+/// Attach what the backend's `@cImport` needs: the `platform.h` include path on a native
+/// target, plus backend-specific system libraries and generated headers.
 ///
 /// Modules carry what `@cImport` needs to compile; executable-only requirements
 /// (macOS native archive / frameworks / Swift runtime, Wayland private `.c`,
 /// Windows system libs + subsystem) stay on `setupConsumerExe`.
 ///
+/// Like `platformModuleOptions`, this is the single place that decides these, for the
+/// module inside this repository and the published one alike.
+///
 /// Runs at build-graph configuration time only (not per-frame / RT).
-pub fn configurePublicPlatformModule(b: *std.Build, mod: *std.Build.Module, backend: PlatformType) void {
+pub fn configurePlatformModule(
+    b: *std.Build,
+    mod: *std.Build.Module,
+    platform_include_root: std.Build.LazyPath,
+    backend: PlatformType,
+) void {
+    // The macOS backends `@cImport("platform.h")`. Wasm has no `@cImport` at all, and on
+    // Linux and Windows the path is simply unused.
+    if (backend != .wasm) mod.addIncludePath(platform_include_root);
     switch (backend) {
         .x11 => {
             // platform_linux_x11.zig `@cImport`s Xlib/XShm; linkSystemLibrary also
@@ -78,11 +123,32 @@ pub fn configurePublicPlatformModule(b: *std.Build, mod: *std.Build.Module, back
     }
 }
 
-/// Create the platform module (`core/platform.zig`).
+/// Stamp the platform module's `build_options`: the backend name plus the opt-in flags the
+/// facade and the macOS backend read at comptime.
 ///
-/// macOS backends `@cImport` `platform.h`, so `link_libc = true` and the
-/// platform/ include path are applied together (Linux backends do not pull in platform.h,
-/// so the include path is a harmless dead path there).
+/// Only the flags that reach the module belong here. `enable_audio` and `enable_midi` are
+/// executable-side link decisions and deliberately absent.
+///
+/// Runs at build-graph configuration time only (not per-frame / RT).
+pub fn addPlatformBuildOptions(
+    b: *std.Build,
+    mod: *std.Build.Module,
+    backend: PlatformType,
+    features: PlatformFeatures,
+) void {
+    const opts = b.addOptions();
+    opts.addOption([]const u8, "platform_backend", backendName(backend));
+    opts.addOption(bool, "enable_gamepad", features.enable_gamepad);
+    opts.addOption(bool, "enable_menu", features.enable_menu);
+    mod.addOptions("build_options", opts);
+}
+
+/// Create the platform module (`core/platform.zig`) for an executable inside this repository.
+///
+/// The module's shape comes from `platformModuleOptions`, `configurePlatformModule` and
+/// `addPlatformBuildOptions`; only the creation and the imports are decided here, because
+/// the published module registers itself differently and routes its imports through the
+/// layer check in `build.zig`.
 ///
 /// `backend` is passed as `build_options.platform_backend` ("x11"/"wayland"/"objc"…) into the
 /// platform module; `core/platform_linux.zig` and friends use it to pick x11/wayland.
@@ -112,47 +178,21 @@ pub fn createPlatformModule(
     /// The harness synthetic gamepad path always runs regardless of this value.
     features: PlatformFeatures,
 ) *std.Build.Module {
-    // linkSystemLibrary needs a module with a known target, so set target explicitly
-    // (import modules usually inherit from the importer, but the x11 link call needs it beforehand).
-    const is_wasm = backend == .wasm;
-    // wasm shared audio: multi-thread when the target has atomics (real atomic ops).
-    const wasm_shared = is_wasm and target.result.cpu.has(.wasm, .atomics);
-    const mod = b.createModule(.{
-        .root_source_file = platform_source,
-        .target = target,
-        .link_libc = !is_wasm, // wasm (wasi) uses wasi preview1 + a hand-written JS shim. No libc.
-        .single_threaded = if (is_wasm) !wasm_shared else null,
-    });
-    if (!is_wasm) mod.addIncludePath(platform_include_root);
+    const mod = b.createModule(platformModuleOptions(
+        target,
+        platform_source,
+        backend,
+        // Shared wasm memory is read off the target here: an app that wants it selects a
+        // target carrying the atomics feature. The published module's caller decides it
+        // differently, which is why the two agree on the mapping and not on this value.
+        backend == .wasm and target.result.cpu.has(.wasm, .atomics),
+    ));
+    configurePlatformModule(b, mod, platform_include_root, backend);
     // platform.zig + backends `@import("platform_types")`; the facade `@import("harness")`.
     mod.addImport("platform_types", types_mod);
     mod.addImport("command_types", command_types_mod);
     mod.addImport("harness", harness_mod);
-
-    const opts = b.addOptions();
-    opts.addOption([]const u8, "platform_backend", backendName(backend));
-    opts.addOption(bool, "enable_gamepad", features.enable_gamepad);
-    opts.addOption(bool, "enable_menu", features.enable_menu);
-    mod.addOptions("build_options", opts);
-
-    // Linux x11: platform_linux_x11.zig `@cImport(<X11/Xlib.h>)` / `<X11/extensions/XShm.h>`.
-    // linkSystemLibrary("X11"/"Xext") on the platform module both (a) resolves `@cImport` headers
-    // (via pkg-config Cflags) and (b) propagates the libs to the exe.
-    if (backend == .x11) {
-        mod.linkSystemLibrary("X11", .{});
-        mod.linkSystemLibrary("Xext", .{});
-    } else if (backend == .wayland) {
-        // Wayland backend: platform_linux_wayland.zig
-        // `@cImport(<wayland-client.h>, <xkbcommon/xkbcommon.h>, "xdg-shell-client-protocol.h")`.
-        // Linking wayland-client/xkbcommon both (a) resolves `@cImport` headers (pkg-config Cflags) and
-        // (b) propagates the libs to the exe. xdg-shell-client-protocol.h is a wayland-scanner
-        // product, so add its generated-header dir to the include path.
-        mod.linkSystemLibrary("wayland-client", .{});
-        mod.linkSystemLibrary("wayland-cursor", .{}); // system cursor (wl_cursor_theme / @cInclude <wayland-cursor.h>)
-        mod.linkSystemLibrary("xkbcommon", .{});
-        mod.addIncludePath(consumer.generateXdgShellClientHeaderDir(b));
-        mod.addIncludePath(consumer.generateXdgDecorationClientHeaderDir(b)); // SSD/CSD decoration
-    }
+    addPlatformBuildOptions(b, mod, backend, features);
 
     return mod;
 }
