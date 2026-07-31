@@ -107,8 +107,28 @@ pixie/synth linker internals.
 - Spec: `WasmAppSpec` + `addWasmWebPackage`
 - App source + wasm root (`wasm_root_import_name` must match the root's `@import`)
 - Shared glue from the kngn package: `dep.path("web/...")`, packer
-  `dep.path("cli/pack-single-html.zig")`
+  `dep.path("cli/pack-single-html.zig")`, export checker
+  `dep.path("cli/check-wasm-exports.zig")`
 - Steps: `package-web` (multi-file) and `package-web-single` (embedded wasm + glue)
+- Both steps run an **export check** on the artefact: a browser wasm module must export
+  neither `_start` nor `_initialize`, because those are the entry symbols of wasi-libc's
+  startup objects and the browser glue's WASI shim cannot satisfy what they import. The
+  checker source is a required field, so a build cannot skip it by staying silent:
+
+  ```zig
+  // Through addWasmWebPackage (the usual path): one field in the assets struct.
+  .assets = .{
+      // ...
+      .packer = dep.path("cli/pack-single-html.zig"),
+      .export_check = dep.path("cli/check-wasm-exports.zig"),
+  },
+
+  // Calling addWasmApp directly: build the host checker yourself and pass it in.
+  const export_check_exe = helpers.makeWasmExportCheckExe(b, dep.path("cli/check-wasm-exports.zig"));
+  _ = helpers.addWasmApp(b, optimize, &spec, null, .{
+      .export_check_exe = export_check_exe,
+  });
+  ```
 - Template uses `audio = .none`. Shared / postMessage transports follow existing root
   specs; see [`docs/wasm-deploy.md`](wasm-deploy.md)
 

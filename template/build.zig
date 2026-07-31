@@ -132,6 +132,7 @@ pub fn build(b: *std.Build) void {
             .netlify = dep.path("web/deploy/netlify.toml"),
             .serve_script = dep.path("web/deploy/serve-coop-coep.py"),
             .packer = dep.path("cli/pack-single-html.zig"),
+            .export_check = dep.path("cli/check-wasm-exports.zig"),
         },
         .optimize = wasm_optimize,
         .linker = null,

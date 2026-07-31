@@ -9,9 +9,25 @@ How to gather the browser wasm artefacts into `zig-out/web/` and publish them to
 - **Single definition site**: `WasmAppSpec` and `addWasmWebPackage` in
   [`build_helpers/consumer.zig`](../build_helpers/consumer.zig). Root apps and external packages
   (including [`template/`](../template/)) share that surface — do not re-copy pixie/synth linkers.
-- **External packages** pull shared glue and the packer with `dep.path("web/...")` and
-  `dep.path("cli/pack-single-html.zig")` (both are listed in `build.zig.zon` `.paths`).
+- **External packages** pull shared glue, the packer and the export checker with
+  `dep.path("web/...")`, `dep.path("cli/pack-single-html.zig")` and
+  `dep.path("cli/check-wasm-exports.zig")` (all listed in `build.zig.zon` `.paths`).
 - **Authoring overview**: [`docs/app-authoring.md`](app-authoring.md).
+
+### The export check
+
+Every artefact that a package step ships is read by
+[`cli/check-wasm-exports.zig`](../cli/check-wasm-exports.zig), which fails the build if the
+module exports `_start` or `_initialize`. Those are the entry symbols of wasi-libc's startup
+objects, so either one means libc reached the wasm module graph; the WASI shim in
+[`web/kngn.js`](../web/kngn.js) does not implement what those objects import, and the module
+then fails before instantiation. A successful compile and link cannot see this, which is why
+the check reads the export section of the artefact itself.
+
+The check is attached to what **ships** an artefact, not to what compiles one:
+`package-web` and `package-web-single` both depend on it (the single-HTML bundle embeds the
+wasm without passing through the multi-file install, so it carries its own edge), and so does
+any gate that includes them. The compile-only `build-*` steps are outside it.
 
 ### `package-web` vs `package-web-single`
 

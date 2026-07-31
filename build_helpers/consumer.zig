@@ -341,6 +341,10 @@ pub const WasmAppBuild = struct {
     html_install: *std.Build.Step.InstallFile,
     /// Set when single-HTML packing is configured for this app.
     single_html_install: ?*std.Build.Step.InstallFile = null,
+    /// Reads the compiled wasm and fails the build if it exports `_start` or `_initialize`.
+    /// Every step that ships this artefact — the multi-file install and the single-HTML pack
+    /// alike — depends on this run, because each is reachable without the other.
+    export_check: *std.Build.Step.Run,
 };
 
 /// Per-app install edges for the web package step.
@@ -391,11 +395,19 @@ pub const WasmWebAssets = struct {
     serve_script: std.Build.LazyPath,
     /// Host packer source (`cli/pack-single-html.zig`). Required when any app has `single_html`.
     packer: ?std.Build.LazyPath = null,
+    /// Host export-checker source (`cli/check-wasm-exports.zig`). Not optional: a wasm
+    /// artefact that reaches a browser is always subject to the check, and a default of
+    /// "no checker" would let a build opt out of it by saying nothing.
+    export_check: std.Build.LazyPath,
 };
 
 pub const AddWasmAppOptions = struct {
     /// When true, fold the wasm and HTML install steps into `zig build` (the install step).
     default_install: bool = true,
+    /// Host executable built from `cli/check-wasm-exports.zig` (see `makeWasmExportCheckExe`).
+    /// One instance can serve every app in a package. Not optional, for the reason given on
+    /// `WasmWebAssets.export_check`.
+    export_check_exe: *std.Build.Step.Compile,
 };
 
 pub const AddWasmWebPackageOptions = struct {
@@ -525,9 +537,19 @@ pub fn addWasmApp(
         });
     }
 
+    // Gate the artefact before anything ships it. A compile and link that succeed say
+    // nothing about whether libc reached the module graph; only the export table does.
+    const export_check = b.addRunArtifact(opts.export_check_exe);
+    export_check.setName(b.fmt("check-wasm-exports {s}", .{spec.name}));
+    export_check.addArg("--wasm");
+    export_check.addFileArg(exe.getEmittedBin());
+    export_check.addArg("--out");
+    _ = export_check.addOutputFileArg(b.fmt("{s}.wasm-exports-ok", .{spec.name}));
+
     const wasm_install = b.addInstallArtifact(exe, .{
         .dest_dir = .{ .override = .{ .custom = "web" } },
     });
+    wasm_install.step.dependOn(&export_check.step);
     if (opts.default_install) b.getInstallStep().dependOn(&wasm_install.step);
 
     const html_install = b.addInstallFile(spec.html_source, spec.html_install_path);
@@ -538,7 +560,20 @@ pub fn addWasmApp(
         .install = wasm_install,
         .html_install = html_install,
         .single_html_install = null,
+        .export_check = export_check,
     };
+}
+
+/// Host executable for the export check (not installed). Shared across apps in one package call.
+pub fn makeWasmExportCheckExe(b: *std.Build, source: std.Build.LazyPath) *std.Build.Step.Compile {
+    return b.addExecutable(.{
+        .name = "check-wasm-exports",
+        .root_module = b.createModule(.{
+            .root_source_file = source,
+            .target = b.graph.host,
+            .optimize = .ReleaseSafe,
+        }),
+    });
 }
 
 /// Host packer executable (not installed). Shared across apps in one package call.
@@ -585,6 +620,9 @@ fn addSingleHtmlPack(
 
     const install_path = b.fmt("web/{s}.single.html", .{single_base});
     const install = b.addInstallFile(out, install_path);
+    // The single-HTML bundle embeds the wasm without going through the multi-file install,
+    // so it needs its own edge to the export check rather than inheriting one.
+    install.step.dependOn(&app.export_check.step);
     if (default_install) b.getInstallStep().dependOn(&install.step);
     return install;
 }
@@ -608,10 +646,12 @@ pub fn addWasmWebPackage(b: *std.Build, options: AddWasmWebPackageOptions) []Was
         makePackerExe(b, options.assets.packer.?)
     else
         null;
+    const export_check_exe = makeWasmExportCheckExe(b, options.assets.export_check);
 
     for (options.apps, 0..) |*spec, i| {
         apps[i] = addWasmApp(b, options.optimize, spec, options.linker, .{
             .default_install = options.default_install,
+            .export_check_exe = export_check_exe,
         });
         if (spec.single_html) {
             apps[i].single_html_install = addSingleHtmlPack(

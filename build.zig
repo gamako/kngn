@@ -96,6 +96,7 @@ fn defaultWasmWebAssets(b: *std.Build) platform.WasmWebAssets {
         .netlify = b.path("web/deploy/netlify.toml"),
         .serve_script = b.path("web/deploy/serve-coop-coep.py"),
         .packer = b.path("cli/pack-single-html.zig"),
+        .export_check = b.path("cli/check-wasm-exports.zig"),
     };
 }
 
@@ -2333,8 +2334,24 @@ pub fn build(b: *std.Build) void {
     test_pack_single_html_step.dependOn(&run_pack_single_html_test.step);
     test_pack_single_html_step.dependOn(&run_audio_pm_ring_test.step);
 
+    // Wasm export-section walker. The host graph is pinned explicitly: this tool only ever
+    // runs on the build machine, so it must stay runnable under an explicit -Dtarget.
+    const check_wasm_exports_test_mod = b.createModule(.{
+        .root_source_file = b.path("cli/check-wasm-exports.zig"),
+        .target = b.graph.host,
+        .optimize = optimize,
+    });
+    const check_wasm_exports_test = b.addTest(.{ .root_module = check_wasm_exports_test_mod });
+    const run_check_wasm_exports_test = b.addRunArtifact(check_wasm_exports_test);
+    const test_check_wasm_exports_step = b.step(
+        "test-check-wasm-exports",
+        "Run wasm export-section checker unit tests (host-only)",
+    );
+    test_check_wasm_exports_step.dependOn(&run_check_wasm_exports_test.step);
+
     const test_step = b.step("test", "Run all unit/integration tests");
     test_step.dependOn(test_pack_single_html_step);
+    test_step.dependOn(test_check_wasm_exports_step);
     test_step.dependOn(test_frame_pacing_step);
     test_step.dependOn(test_png_roundtrip_step);
     test_step.dependOn(test_core_step);
