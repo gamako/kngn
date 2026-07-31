@@ -196,6 +196,8 @@ kngn/
 │   ├── editor/apps/pixie/ # the pixel editor (pen, eraser, layers, selection, bezier, the DB16 palette, undo, PNG)
 │   ├── synth/         # playing the synth from the PC keyboard (run-synth)
 │   └── noodle/        # the modular patch canvas: lo-fi generation plus live rewiring (run-noodle)
+├── gates/             # builds that exercise the published surface from outside (not examples)
+│   └── consumer/      # links kit.audio / kit.midi through setupConsumerExe (zig build check-consumer)
 └── docs/              # documentation (see the index above)
 ```
 
@@ -477,8 +479,14 @@ zig build -Dinstall-all=true
 # zig build -Dmax-modules=96 build-noodle
 # zig build -Dmax-modules=96 test-modular test-app-modular test-noodle
 
-# Run every test (the aggregate; it bundles every test-*)
+# Run every test (the aggregate; it bundles every test-*, the template native gate and the
+# external consumer gate)
 zig build test
+
+# The gates that build against the published surface from outside
+zig build check-consumer      # link kit.audio / kit.midi the way an external package does (gates/consumer/)
+zig build check-template      # build template/ as an external package
+zig build check-vendor        # vendored build_helpers copies are byte-identical (check-template-vendor is an alias)
 
 # Individual tests (all included in the aggregate)
 zig build test-core             # libs/paint (undo, tools, Document and the .pix round trip) plus the editor's input state machine

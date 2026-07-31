@@ -85,7 +85,8 @@ Full-pixel fills use `kit.pixelops.fill32` (never `@memset` on the framebuffer).
   ```
 
   `kit.sound`, `kit.synth` and `kit.dsp` are pure DSP over buffers you already own, so they
-  need neither flag.
+  need neither flag. [`gates/consumer/`](../gates/consumer/) builds exactly this wiring on
+  every change, so the flags stay working; it is a gate, not a starting point.
 
 Do not restate the full `build.zig` here — copy and read [`template/build.zig`](../template/build.zig).
 Backend matrix and host packages: [`docs/build.md`](build.md).
@@ -153,8 +154,9 @@ pixie/synth linker internals.
 | `zig build check` (in template) | semantic analysis only, no binary — the step an editor runs on save |
 | `zig build gate` (in template) | native compile + unit tests (no wasm) |
 | `zig build gate-web` (in template) | multi-file + single HTML packages |
-| `zig build test` (kngn root) | root unit tests + template native gate |
-| `zig build -Dinstall-all=true` (kngn root) | native installs + root wasm packages + template native/web gates |
+| `zig build test` (kngn root) | root unit tests + template native gate + consumer gate |
+| `zig build check-consumer` (kngn root) | `kit.audio` / `kit.midi` linked through `setupConsumerExe` |
+| `zig build -Dinstall-all=true` (kngn root) | native installs + root wasm packages + template native/web gates + consumer gate |
 
 **Gate coverage (host, not cross-compile).** Root template gates validate a build for the
 **host OS** (or the backend selected by an explicit `-Dplatform` / `-Doptimize` on that

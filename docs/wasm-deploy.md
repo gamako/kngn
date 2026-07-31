@@ -150,9 +150,9 @@ digest audio rms=0.0770 peak=0.2147 silent=0 frames=4096
 
 | Command | Includes wasm? |
 |---|---|
-| `zig build test` | **No** (root unit tests + template **native** gate only) |
+| `zig build test` | **No** (root unit tests plus the template **native** and consumer gates only) |
 | `zig build package-web` / `package-web-single` | **Yes** (root multi-file / single HTML) |
-| `zig build -Dinstall-all=true` | **Yes** — root wasm packages join the default install, plus template native and web gates |
+| `zig build -Dinstall-all=true` | **Yes** — root wasm packages join the default install, plus the template native and web gates and the consumer gate |
 | `zig build check-template-web` | **Yes** (template child package only) |
 
 `zig build test` deliberately stays free of wasm compile time. Use `-Dinstall-all=true` or the

@@ -157,3 +157,15 @@ up. The macOS one is.
 four wiring routes, and how to take `template/` out of the tree as a starting point.
 [tictactoe](https://github.com/gamako/tictactoe) is a second worked example of a `.path`
 dependency.
+
+Two steps build against that surface the way an outside package does, and both run under
+`zig build test` and `zig build -Dinstall-all=true`:
+
+| Step | What it builds |
+|---|---|
+| `check-template` | `template/` as an external package (`check-template-web` adds the wasm bundles) |
+| `check-consumer` | [`gates/consumer/`](../gates/consumer/), which links `kit.audio` and `kit.midi` through `setupConsumerExe` |
+
+`gates/consumer/` is **not** a starting point to copy — its README says why it exists and
+what has to stay true of it. `check-vendor` holds every vendored copy of `build_helpers/`
+byte-identical to the original (`check-template-vendor` is an alias for it).

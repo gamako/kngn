@@ -355,8 +355,8 @@ probe, and the MCP server are in [`docs/harness.md`](docs/harness.md).
 ```bash
 direnv allow                  # with nix plus direnv (recommended); zig 0.16.0 lands on PATH
 zig build run-pixie           # the pixel editor. Also run / run-synth / run-noodle / run-example_NN
-zig build test                # unit tests + template native gate (no wasm)
-zig build -Dinstall-all=true  # all backends + root wasm packages + template native/web gates
+zig build test                # unit tests + template native gate + external consumer gate (no wasm)
+zig build -Dinstall-all=true  # all backends + root wasm packages + template native/web + consumer gates
 ```
 
 Setting up without nix (the per-OS prerequisites), switching backends, cross-compiling and

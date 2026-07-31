@@ -91,6 +91,9 @@
         "kit",
         // Canonical external-app starting point (copy next to kngn and change .path once).
         "template",
+        // Gates that build against the published surface the way an outside package does.
+        // build() wires them as child builds, so a fetched package needs them present.
+        "gates",
         // Referenced from build.zig via b.path("bench/...") and b.path("tests/...");
         // required for a fetched package to configure bench and gui-leak test steps.
         "bench",

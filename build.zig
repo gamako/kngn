@@ -275,32 +275,39 @@ fn packageWebFromNative(b: *std.Build, optimize: std.builtin.OptimizeMode, insta
     addBuildStep(b, "build-synth-postmessage-wasm", "Build Synth wasm for web (postMessage audio, no shared memory)", apps[2].exe);
 }
 
-/// Fail configuration when template vendored helpers drift from kngn/build_helpers/.
+/// Fail configuration when a vendored copy of build_helpers/ drifts from the original.
 /// Comparison is raw byte identity (no text normalization).
-/// Runs at build configuration time (not only when the `check-template-vendor` step is selected).
-fn assertTemplateVendoredHelpersIdentical(b: *std.Build) void {
+/// Runs at build configuration time (not only when the `check-vendor` step is selected).
+///
+/// Two directories vendor these helpers, and for opposite reasons: `template/` because a
+/// user copies it and has to get a self-contained tree, `gates/consumer/` because a symlink
+/// does not survive a Windows checkout and that gate has to build there most of all.
+fn assertVendoredHelpersIdentical(b: *std.Build) void {
     const pairs = [_][2][]const u8{
         .{ "build_helpers/consumer.zig", "template/build_helpers/consumer.zig" },
         .{ "build_helpers/macos.zig", "template/build_helpers/macos.zig" },
         .{ "build_helpers/swift.zig", "template/build_helpers/swift.zig" },
+        .{ "build_helpers/consumer.zig", "gates/consumer/build_helpers/consumer.zig" },
+        .{ "build_helpers/macos.zig", "gates/consumer/build_helpers/macos.zig" },
+        .{ "build_helpers/swift.zig", "gates/consumer/build_helpers/swift.zig" },
     };
     const io = b.graph.io;
     for (pairs) |pair| {
         const upstream_path = b.pathFromRoot(pair[0]);
         const vendored_path = b.pathFromRoot(pair[1]);
         const upstream = std.Io.Dir.cwd().readFileAlloc(io, upstream_path, b.allocator, .limited(16 * 1024 * 1024)) catch |err| {
-            std.log.err("check-template-vendor: failed to read {s}: {s}", .{ pair[0], @errorName(err) });
+            std.log.err("check-vendor: failed to read {s}: {s}", .{ pair[0], @errorName(err) });
             std.process.exit(1);
         };
         defer b.allocator.free(upstream);
         const vendored = std.Io.Dir.cwd().readFileAlloc(io, vendored_path, b.allocator, .limited(16 * 1024 * 1024)) catch |err| {
-            std.log.err("check-template-vendor: failed to read {s}: {s}", .{ pair[1], @errorName(err) });
+            std.log.err("check-vendor: failed to read {s}: {s}", .{ pair[1], @errorName(err) });
             std.process.exit(1);
         };
         defer b.allocator.free(vendored);
         if (!std.mem.eql(u8, upstream, vendored)) {
             std.log.err(
-                "Vendored helper drift: refresh the external copy from kngn/build_helpers/. ({s} != {s})",
+                "Vendored helper drift: refresh the copy from build_helpers/. ({s} != {s})",
                 .{ pair[0], pair[1] },
             );
             std.process.exit(1);
@@ -313,8 +320,9 @@ fn assertTemplateVendoredHelpersIdentical(b: *std.Build) void {
 /// When the parent was invoked with an explicit `-Dplatform` / `-Doptimize` (or `--release`),
 /// those flags are forwarded; otherwise the child uses its own host defaults.
 /// Cross-compilation of the template is not a gate guarantee (no automatic target rewrite).
-fn addTemplateChildBuild(
+fn addChildBuild(
     b: *std.Build,
+    child_dir: []const u8,
     step_name: []const u8,
     step_description: []const u8,
     child_step: []const u8,
@@ -322,7 +330,8 @@ fn addTemplateChildBuild(
     explicit_platform: ?[]const u8,
     explicit_optimize: ?[]const u8,
 ) *std.Build.Step {
-    // Absolute paths so the child (cwd=template/) does not create template/.zig-cache.
+    // Absolute paths so the child (cwd=child_dir) does not create a cache inside it.
+    // Each child gets its own cache_subdir, so their build graphs never share state.
     // cache_root.path is often relative (".zig-cache"); resolve against the process cwd.
     const child_cache = b.pathResolve(&.{
         b.graph.cache.cwd,
@@ -339,12 +348,13 @@ fn addTemplateChildBuild(
 
     const run = b.addSystemCommand(&.{ b.graph.zig_exe, "build", child_step });
     // Step name includes forwarded flags so --summary all shows which backend the child used.
-    run.setName(b.fmt("template zig build {s}{s}{s}", .{
+    run.setName(b.fmt("{s} zig build {s}{s}{s}", .{
+        child_dir,
         child_step,
         if (explicit_platform) |p| b.fmt(" -Dplatform={s}", .{p}) else "",
         if (explicit_optimize) |o| b.fmt(" -Doptimize={s}", .{o}) else "",
     }));
-    run.setCwd(b.path("template"));
+    run.setCwd(b.path(child_dir));
     run.has_side_effects = true;
     run.addArgs(&.{
         "--cache-dir",
@@ -714,49 +724,73 @@ pub fn build(b: *std.Build) void {
     // With -Dinstall-all=true, wasm package joins the default install step.
     packageWebFromNative(b, wasm_optimize, install_all);
 
-    // ----- external template gates -----
+    // ----- external-consumer gates -----
     // Vendored helper byte identity: compared at configuration time below, so any root
-    // `zig build` fails on drift even when the named check-template-vendor step is not selected.
-    assertTemplateVendoredHelpersIdentical(b);
-    const check_template_vendor_step = b.step(
-        "check-template-vendor",
-        "Verify template/build_helpers copies are byte-identical to kngn/build_helpers",
+    // `zig build` fails on drift even when the named check-vendor step is not selected.
+    assertVendoredHelpersIdentical(b);
+    const check_vendor_step = b.step(
+        "check-vendor",
+        "Verify vendored build_helpers copies are byte-identical to kngn/build_helpers",
     );
     // Named step is a documentation / dependency anchor; the check already ran above.
+    // The older name stays as a one-way alias: a step name is a command-line interface.
+    const check_template_vendor_step = b.step(
+        "check-template-vendor",
+        "Alias for check-vendor",
+    );
+    check_template_vendor_step.dependOn(check_vendor_step);
 
     // Forward only caller-specified -Dplatform / -Doptimize (or --release) to the child.
-    const template_explicit_platform: ?[]const u8 = if (b.user_input_options.contains("platform"))
+    const child_explicit_platform: ?[]const u8 = if (b.user_input_options.contains("platform"))
         @tagName(platform_option)
     else
         null;
-    const template_explicit_optimize: ?[]const u8 = if (b.user_input_options.contains("optimize") or b.release_mode != .off)
+    const child_explicit_optimize: ?[]const u8 = if (b.user_input_options.contains("optimize") or b.release_mode != .off)
         @tagName(optimize)
     else
         null;
 
-    const check_template_step = addTemplateChildBuild(
+    const check_template_step = addChildBuild(
         b,
+        "template",
         "check-template",
         "Run template native gate (child zig build gate; no wasm)",
         "gate",
         "template-check-native",
-        template_explicit_platform,
-        template_explicit_optimize,
+        child_explicit_platform,
+        child_explicit_optimize,
     );
-    check_template_step.dependOn(check_template_vendor_step);
+    check_template_step.dependOn(check_vendor_step);
 
-    const check_template_web_step = addTemplateChildBuild(
+    const check_template_web_step = addChildBuild(
         b,
+        "template",
         "check-template-web",
         "Run template web gate (child zig build gate-web; package-web + single HTML)",
         "gate-web",
         "template-check-web",
-        template_explicit_platform,
-        template_explicit_optimize,
+        child_explicit_platform,
+        child_explicit_optimize,
     );
-    check_template_web_step.dependOn(check_template_vendor_step);
+    check_template_web_step.dependOn(check_vendor_step);
     // Template web after template native (same parent invocation under install-all).
     check_template_web_step.dependOn(check_template_step);
+
+    // The consumer gate links the kit capabilities that resolve on the executable side
+    // (audio, midi). Nothing else in the tree reaches them through the external path, so
+    // without this a broken setupConsumerExe surfaces only in someone else's project.
+    // It shares nothing with the template gates and needs no ordering against them.
+    const check_consumer_step = addChildBuild(
+        b,
+        "gates/consumer",
+        "check-consumer",
+        "Link kit.audio and kit.midi through the external consumer path (child zig build gate)",
+        "gate",
+        "consumer-check",
+        child_explicit_platform,
+        child_explicit_optimize,
+    );
+    check_consumer_step.dependOn(check_vendor_step);
 
     if (install_all) {
         // Order: root package-web / package-web-single → check-template → check-template-web.
@@ -766,9 +800,11 @@ pub fn build(b: *std.Build) void {
         if (b.top_level_steps.get("package-web-single")) |package_web_single| {
             check_template_step.dependOn(&package_web_single.step);
         }
-        // Full gate: root wasm packages (via default_install) + template native + template web.
+        // Full gate: root wasm packages (via default_install) + template native + template web
+        // + the external consumer link gate.
         b.getInstallStep().dependOn(check_template_step);
         b.getInstallStep().dependOn(check_template_web_step);
+        b.getInstallStep().dependOn(check_consumer_step);
     }
 
     // ========================================
@@ -2398,8 +2434,10 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(test_recipe_step);
     test_step.dependOn(test_gmath_step);
     test_step.dependOn(test_sound_step);
-    // Template native gate only (no wasm). Child zig build check inside template/.
+    // The external gates, native only (no wasm): child builds inside template/ and
+    // gates/consumer/. Their wasm counterpart stays on -Dinstall-all=true.
     test_step.dependOn(check_template_step);
+    test_step.dependOn(check_consumer_step);
 
     // ========================================
     // Micro-benchmarks. Pure-logic measurement (no display / audio device; OS-independent).

@@ -1,0 +1,19 @@
+.{
+    .name = .consumer_gate,
+    .version = "0.0.0",
+    .fingerprint = 0xb4c56324db8dddea,
+    .minimum_zig_version = "0.16.0",
+    .dependencies = .{
+        // In-tree: the kngn package root is two levels up. This gate is not a starting
+        // point to copy — see README.md — so the path is never meant to change.
+        .kngn = .{
+            .path = "../..",
+        },
+    },
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "src",
+        "build_helpers",
+    },
+}
