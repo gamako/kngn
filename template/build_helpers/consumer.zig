@@ -89,6 +89,14 @@ pub fn linkAudioBackend(mod: *std.Build.Module, target_os: std.Target.Os.Tag) vo
         // WASAPI goes through COM: CoCreateInstance / CoInitializeEx / CoTaskMemFree live in
         // ole32. IAudioClient and friends arrive through COM, so nothing else is linked
         // directly (the Event API is in kernel32, which is automatic).
+        //
+        // `core/audio_windows.zig` declares those four as `extern "ole32"`, which carries the
+        // library on the declaration, so today an executable links ole32 whether or not this
+        // line runs. It stays because the list describes what the audio layer needs, not what
+        // the current declaration style happens to make implicit: a symbol declared plain
+        // `extern` — as the Linux backend declares its ALSA entry points — would need it. The
+        // consequence for the consumer gate is that Windows cannot reproduce the missing
+        // library failure that Linux and macOS can.
         .windows => mod.linkSystemLibrary("ole32", .{}),
         else => {},
     }
