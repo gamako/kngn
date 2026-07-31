@@ -33,8 +33,8 @@ deviation recorded under Consequences exists.
 
 | Capability | How an executable opts in |
 |---|---|
-| Audio output | `linkAudioBackend(exe, os)` at the executable's build site (macOS: AudioToolbox and CoreAudio, plus the capture frameworks — see the deviation noted under Consequences; Linux: the `alsa` pkg-config name; Windows: `ole32`) |
-| MIDI | `linkMidiBackend(exe, os)` (macOS: CoreMIDI and CoreFoundation; every other system uses the null backend and needs nothing) |
+| Audio output | `linkAudioBackend(module, os)` at the executable's build site (macOS: AudioToolbox and CoreAudio, plus the capture frameworks — see the deviation noted under Consequences; Linux: the `alsa` pkg-config name; Windows: `ole32`) |
+| MIDI | `linkMidiBackend(module, os)` (macOS: CoreMIDI and CoreFoundation; every other system uses the null backend and needs nothing) |
 | Gamepad | `enable_gamepad` — `-DKNGN_ENABLE_GAMEPAD` to the native sources plus the GameController framework. The one user-facing option, `-Denable_gamepad=true`, covers the published external module and the native archive; internal executables opt in per backend, independently of it |
 | Native menu | `enable_menu` — `-DKNGN_ENABLE_MENU` plus compiling the shared `platform/macos/platform_macos_menu.m` translation unit |
 

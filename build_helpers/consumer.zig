@@ -31,12 +31,83 @@ pub const PlatformType = enum {
     wasm,
 };
 
-/// Opt-in feature flags for the macOS platform layer (gamepad / menu).
-/// Bundled into an options struct so more bools can be added without growing the parameter list.
+/// Per-executable capabilities, bundled into a struct so more can be added without growing
+/// the parameter list. Each one is opt-in, and each one decides what an executable links
+/// (ADR-013).
+///
+/// `enable_gamepad` and `enable_menu` reach further than linking: they are also baked into
+/// the platform module as `build_options` and into the macOS backend compile as
+/// `-DKNGN_ENABLE_*`. `enable_audio` and `enable_midi` do neither — they only add the
+/// executable-side system libraries that `kit.audio` and `kit.midi` resolve against, and
+/// `setupExecutableForPlatform` ignores them (executables inside this repository call
+/// `linkAudioBackend` / `linkMidiBackend` directly).
 pub const PlatformFeatures = struct {
     enable_gamepad: bool = false,
     enable_menu: bool = false,
+    /// Link what `kit.audio` needs. Set this when the executable uses audio output or
+    /// microphone capture.
+    enable_audio: bool = false,
+    /// Link what `kit.midi` needs. Set this when the executable uses MIDI input.
+    enable_midi: bool = false,
 };
+
+/// Link the system libraries `core/audio.zig` resolves against, for one module.
+///
+/// The audio layer reaches the OS through `extern fn` rather than `@cImport`, so nothing is
+/// linked when the module is built; it has to happen where the executable is assembled.
+///
+/// Takes a module rather than an executable so a bare `addTest` can use it too; callers
+/// holding an executable pass `exe.root_module`.
+///
+/// **Does not set search paths.** On macOS the `-F` / `-L` pair must already be on the
+/// module — `setupConsumerExe` and `setupExecutableForPlatform` both arrange that, and a
+/// bare test has to do it itself.
+///
+/// The macOS list also carries the capture frameworks (microphone AUHAL input, camera
+/// AVFoundation). `kit` does not re-export the capture camera, so an external consumer
+/// does not need them, but linking them is harmless and keeps one list instead of two.
+///
+/// An OS with no audio backend links nothing: `core/audio.zig` reports it at compile time,
+/// and that message names the API, which a panic here would only pre-empt. (Wasm is not
+/// such an OS — it has a backend that needs no system library.)
+pub fn linkAudioBackend(mod: *std.Build.Module, target_os: std.Target.Os.Tag) void {
+    switch (target_os) {
+        .macos => {
+            mod.linkFramework("AudioToolbox", .{});
+            mod.linkFramework("CoreAudio", .{});
+            mod.linkFramework("AVFoundation", .{});
+            mod.linkFramework("CoreMedia", .{});
+            mod.linkFramework("CoreVideo", .{});
+            mod.linkFramework("Foundation", .{});
+            mod.linkSystemLibrary("objc", .{});
+        },
+        // "alsa" is the pkg-config name (from alsa-lib-dev), and it resolves both `-lasound`
+        // and the library path. Naming the library "asound" directly finds no .pc file, and
+        // zig then searches only the `-L` paths that are already present (X11 and such),
+        // which do not hold libasound.so.
+        .linux => mod.linkSystemLibrary("alsa", .{}),
+        // WASAPI goes through COM: CoCreateInstance / CoInitializeEx / CoTaskMemFree live in
+        // ole32. IAudioClient and friends arrive through COM, so nothing else is linked
+        // directly (the Event API is in kernel32, which is automatic).
+        .windows => mod.linkSystemLibrary("ole32", .{}),
+        else => {},
+    }
+}
+
+/// Link the system libraries `core/midi.zig` resolves against, for one module.
+/// The same contract as `linkAudioBackend`, and for the same reason: `extern fn` rather than
+/// `@cImport`, a module rather than an executable, and search paths are the caller's job.
+///
+/// macOS only. Every other OS uses the null backend, which needs no system library.
+pub fn linkMidiBackend(mod: *std.Build.Module, target_os: std.Target.Os.Tag) void {
+    switch (target_os) {
+        .macos => {
+            mod.linkFramework("CoreMIDI", .{});
+            mod.linkFramework("CoreFoundation", .{});
+        },
+        else => {},
+    }
+}
 
 /// Default backend for the OS (used when `-Dplatform` is omitted).
 pub fn defaultBackend(os: std.Target.Os.Tag) PlatformType {
@@ -250,6 +321,12 @@ pub fn setupConsumerExe(
         .gdi, .d3d11 => linkWindowsExe(exe, backend),
         .wasm => {},
     }
+    // L1 capabilities beyond the platform layer. `kit` re-exports audio and midi, and both
+    // resolve against system libraries on the executable side, so an external consumer that
+    // uses them has no other way to get them linked.
+    const target_os = exe.rootModuleTarget().os.tag;
+    if (features.enable_audio) linkAudioBackend(exe.root_module, target_os);
+    if (features.enable_midi) linkMidiBackend(exe.root_module, target_os);
 }
 
 // ============================================================================

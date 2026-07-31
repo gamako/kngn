@@ -72,6 +72,20 @@ Full-pixel fills use `kit.pixelops.fill32` (never `@memset` on the framebuffer).
   Windows subsystem/libs
 - Pass the **same** backend to `b.dependency(... .platform = backend)` and
   `setupConsumerExe`
+- Capabilities beyond the platform layer are opt-in through the `PlatformFeatures` argument
+  of `setupConsumerExe`, and each one adds what that capability links. Using `kit.audio` or
+  `kit.midi` without asking for them leaves their system symbols undefined at link time —
+  `snd_pcm_*` on Linux, `AudioComponent*` / `MIDIClient*` on macOS:
+
+  ```zig
+  helpers.setupConsumerExe(b, exe, dep, backend, sdk_paths, .{
+      .enable_audio = true, // kit.audio (output or microphone capture)
+      .enable_midi = true,  // kit.midi
+  });
+  ```
+
+  `kit.sound`, `kit.synth` and `kit.dsp` are pure DSP over buffers you already own, so they
+  need neither flag.
 
 Do not restate the full `build.zig` here — copy and read [`template/build.zig`](../template/build.zig).
 Backend matrix and host packages: [`docs/build.md`](build.md).

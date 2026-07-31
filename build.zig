@@ -1199,7 +1199,7 @@ pub fn build(b: *std.Build) void {
     audio_capture_test_mod.addImport("harness", shared_modules.harness.mod);
     audio_capture_test_mod.addImport("capture_types", shared_modules.capture_types.mod);
     audio_capture_test_mod.addImport("objc_runtime", shared_modules.objc_runtime.mod); // macOS: audio_macos.zig references via named import
-    if (target.result.os.tag == .linux) audio_capture_test_mod.linkSystemLibrary("alsa", .{});
+    if (target.result.os.tag == .linux) platform.linkAudioBackend(audio_capture_test_mod, .linux);
     const audio_capture_test = b.addTest(.{ .root_module = audio_capture_test_mod });
     // On macOS mic capture (AUHAL input) uses AudioToolbox/CoreAudio + permission-check
     // AVFoundation (ObjC), so frameworks are linked explicitly (other OSes stay on audio_capture_stub.zig
@@ -1296,7 +1296,7 @@ pub fn build(b: *std.Build) void {
             .link_libc = true,
         });
         audio_linux_capture_test_mod.addImport("capture_types", shared_modules.capture_types.mod);
-        audio_linux_capture_test_mod.linkSystemLibrary("alsa", .{});
+        platform.linkAudioBackend(audio_linux_capture_test_mod, .linux);
         const audio_linux_capture_test = b.addTest(.{ .root_module = audio_linux_capture_test_mod });
         test_capture_types_step.dependOn(&b.addRunArtifact(audio_linux_capture_test).step);
     }
@@ -3102,7 +3102,7 @@ const SharedModules = struct {
 
         // audio (L1 audio output): independent of the platform backend. No @cImport, so
         // an ordinary createModule is enough (audio system libs are linked per-OS on the exe side:
-        // macOS=AudioToolbox / Linux=asound / Windows=ole32(WASAPI); see linkAudioBackend).
+        // macOS=AudioToolbox / Linux=alsa / Windows=ole32(WASAPI); see linkAudioBackend).
         const audio: TaggedModule = .{ .layer = .core, .name = "audio", .mod = b.createModule(.{
             .root_source_file = b.path("core/audio.zig"),
         }) };
@@ -3336,7 +3336,7 @@ fn addExampleExe(
     if (needs.needs_audio) {
         exe.root_module.addImport("audio", common.audio.mod);
         // L1 audio-output system libraries (only on needs_audio exes; per OS).
-        linkAudioBackend(exe, target.result.os.tag);
+        platform.linkAudioBackend(exe.root_module, target.result.os.tag);
     }
     // gamepad is a backend-independent lib depending only on platform_types. Direct-addImport from
     // common (SharedModules) (matches the existing examples convention of not using kit).
@@ -3344,7 +3344,7 @@ fn addExampleExe(
     if (needs.needs_midi) {
         exe.root_module.addImport("midi", common.midi.mod);
         // CoreMIDI and other system frameworks are opt-in linked only on needs_midi exes (same shape as audio).
-        linkMidiBackend(exe, target.result.os.tag);
+        platform.linkMidiBackend(exe.root_module, target.result.os.tag);
     }
     if (needs.needs_gmath) exe.root_module.addImport("gmath", common.gmath.mod);
     if (needs.needs_sound) exe.root_module.addImport("sound", common.sound.mod);
@@ -3444,9 +3444,9 @@ fn addNoodleExe(
     // pixelops is re-exported via kit (kit.pixelops); no direct apps → pixelops link.
     linkAppException(root, common.synth, "apps/noodle/lofi.zig uses the generative layer directly (SampleTap / AtomicF32)");
     linkAppException(root, common.dsp, "apps/noodle/lofi.zig uses the generative layer directly (FFT band energy checks)");
-    linkAudioBackend(exe, target.result.os.tag); // macOS=AudioToolbox / Linux=asound / Windows=ole32
+    platform.linkAudioBackend(exe.root_module, target.result.os.tag); // macOS=AudioToolbox / Linux=alsa / Windows=ole32
     // Opt-in link so run-noodle can use kit.midi (CoreMIDI).
-    linkMidiBackend(exe, target.result.os.tag);
+    platform.linkMidiBackend(exe.root_module, target.result.os.tag);
 
     // Gamepad opt-in off. Native menu opt-in on.
     platform.setupExecutableForPlatform(b, exe, platform_type, optimize, platform_root, sdk_paths, .{ .enable_menu = true });
@@ -3482,7 +3482,7 @@ fn addSynthExe(
     link(root, common.spectrogram);
     link(root, common.scope);
     link(root, common.serde); // patch_io.zig (versioned-container serialization of voice/FX params)
-    linkAudioBackend(exe, target.result.os.tag); // L1 audio output (macOS=AudioToolbox / Linux=asound / Windows=ole32)
+    platform.linkAudioBackend(exe.root_module, target.result.os.tag); // L1 audio output (macOS=AudioToolbox / Linux=alsa / Windows=ole32)
 
     // Gamepad opt-in off (this app does not use gamepad; keeps existing exes unchanged).
     platform.setupExecutableForPlatform(b, exe, platform_type, optimize, platform_root, sdk_paths, .{});
@@ -3526,64 +3526,11 @@ fn addCaptureDemoExe(
     exe.root_module.addImport("spectrogram", common.spectrogram.mod);
     exe.root_module.addImport("scope", common.scope.mod);
     exe.root_module.addImport("synth", common.synth.mod); // SampleTap (lock-free mic-capture-callback → main-thread visualization handoff)
-    linkAudioBackend(exe, target.result.os.tag); // macOS: AudioToolbox/CoreAudio + capture AVFoundation/CoreMedia/CoreVideo/Foundation/objc
+    platform.linkAudioBackend(exe.root_module, target.result.os.tag); // macOS: AudioToolbox/CoreAudio + capture AVFoundation/CoreMedia/CoreVideo/Foundation/objc
 
     // Gamepad opt-in off (this app does not use gamepad; keeps existing exes unchanged).
     platform.setupExecutableForPlatform(b, exe, platform_type, optimize, platform_root, sdk_paths, .{});
     return exe;
-}
-
-// ============================================================
-// Helper: link L1-output system libraries per OS onto exes that use audio.
-// The audio module uses extern fn without @cImport, so linking is done on the exe side
-// (macOS=AudioToolbox framework / Linux=ALSA libasound). libc is already enabled by backend setup.
-//
-// On Linux pass the pkg-config name "alsa" (provided by alsa-lib-dev). That resolves both
-// `-lasound` and the lib path. Passing the library name "asound" directly finds no .pc, and
-// zig only searches existing -L paths (X11 etc.), so it cannot find libasound.so (confirmed on a real Linux build).
-// ============================================================
-fn linkAudioBackend(exe: *std.Build.Step.Compile, target_os: std.Target.Os.Tag) void {
-    switch (target_os) {
-        // Also link capture frameworks (mic AUHAL input / camera AVFoundation).
-        // Every caller also calls `platform.setupExecutableForPlatform` in the same function,
-        // which sets the `-F <sdk>/System/Library/Frameworks` / `-L <sdk>/usr/lib` search paths
-        // (`addMacOSSDKSearchPaths` in `build_helpers/macos.zig`), so here
-        // `linkFramework`/`linkSystemLibrary` calls alone are enough (build-graph construction order does not
-        // affect link-time resolution). Also linked so future apps that consume capture
-        // and pass through this helper do not fail from missing frameworks.
-        // Preventive addition (no exe currently uses these frameworks — harmless).
-        .macos => {
-            exe.root_module.linkFramework("AudioToolbox", .{});
-            exe.root_module.linkFramework("CoreAudio", .{});
-            exe.root_module.linkFramework("AVFoundation", .{});
-            exe.root_module.linkFramework("CoreMedia", .{});
-            exe.root_module.linkFramework("CoreVideo", .{});
-            exe.root_module.linkFramework("Foundation", .{});
-            exe.root_module.linkSystemLibrary("objc", .{});
-        },
-        .linux => exe.root_module.linkSystemLibrary("alsa", .{}),
-        // WASAPI goes through COM. CoCreateInstance/CoInitializeEx/CoTaskMemFree live in ole32
-        // (IAudioClient etc. are obtained via COM so no direct link; Event API is kernel32=auto-linked).
-        .windows => exe.root_module.linkSystemLibrary("ole32", .{}),
-        else => @panic("audio backend is only available on macOS / Linux / Windows"),
-    }
-}
-
-// ============================================================
-// Helper: link CoreMIDI etc. per OS onto exes that use MIDI.
-// The midi module uses extern fn without @cImport, so linking is done on the exe side.
-// Same opt-in placement as audio's linkAudioBackend. Called only for needs_midi examples.
-// Assumes setupExecutableForPlatform has attached the SDK framework search paths.
-// ============================================================
-fn linkMidiBackend(exe: *std.Build.Step.Compile, target_os: std.Target.Os.Tag) void {
-    switch (target_os) {
-        .macos => {
-            exe.root_module.linkFramework("CoreMIDI", .{});
-            exe.root_module.linkFramework("CoreFoundation", .{});
-        },
-        // macOS only. Other OSes use the null backend and need no framework.
-        else => {},
-    }
 }
 
 // For test-midi (bare addTest): explicitly set SDK framework/library search paths and link CoreMIDI.
@@ -3591,8 +3538,7 @@ fn linkMidiBackend(exe: *std.Build.Step.Compile, target_os: std.Target.Os.Tag) v
 fn linkMidiMacFrameworks(b: *std.Build, mod: *std.Build.Module, sdk_paths: macos.MacOSSDKPaths) void {
     mod.addSystemFrameworkPath(.{ .cwd_relative = b.fmt("{s}/System/Library/Frameworks", .{sdk_paths.sdk_path}) });
     mod.addLibraryPath(.{ .cwd_relative = b.fmt("{s}/usr/lib", .{sdk_paths.sdk_path}) });
-    mod.linkFramework("CoreMIDI", .{});
-    mod.linkFramework("CoreFoundation", .{});
+    platform.linkMidiBackend(mod, .macos);
 }
 
 // ============================================================
@@ -3605,13 +3551,7 @@ fn linkMidiMacFrameworks(b: *std.Build, mod: *std.Build.Module, sdk_paths: macos
 fn linkCaptureMacFrameworks(b: *std.Build, mod: *std.Build.Module, sdk_paths: macos.MacOSSDKPaths) void {
     mod.addSystemFrameworkPath(.{ .cwd_relative = b.fmt("{s}/System/Library/Frameworks", .{sdk_paths.sdk_path}) });
     mod.addLibraryPath(.{ .cwd_relative = b.fmt("{s}/usr/lib", .{sdk_paths.sdk_path}) });
-    mod.linkFramework("AudioToolbox", .{});
-    mod.linkFramework("CoreAudio", .{});
-    mod.linkFramework("AVFoundation", .{});
-    mod.linkFramework("CoreMedia", .{});
-    mod.linkFramework("CoreVideo", .{});
-    mod.linkFramework("Foundation", .{});
-    mod.linkSystemLibrary("objc", .{});
+    platform.linkAudioBackend(mod, .macos);
 }
 
 // ============================================================

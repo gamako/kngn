@@ -20,6 +20,8 @@ pub const assertBackendForOs = consumer.assertBackendForOs;
 pub const backendName = consumer.backendName;
 pub const resolveBackend = consumer.resolveBackend;
 pub const setupConsumerExe = consumer.setupConsumerExe;
+pub const linkAudioBackend = consumer.linkAudioBackend;
+pub const linkMidiBackend = consumer.linkMidiBackend;
 
 // Wasm app + web package surface (single implementation in consumer.zig).
 pub const WasmAudio = consumer.WasmAudio;
@@ -36,6 +38,7 @@ pub const AddWasmWebPackageOptions = consumer.AddWasmWebPackageOptions;
 pub const validateWasmAppSpec = consumer.validateWasmAppSpec;
 pub const addWasmApp = consumer.addWasmApp;
 pub const addWasmWebPackage = consumer.addWasmWebPackage;
+pub const makeWasmExportCheckExe = consumer.makeWasmExportCheckExe;
 
 /// Whether an L1 audio-output backend is implemented for the OS (macOS=AudioToolbox / Linux=ALSA / Windows=WASAPI).
 /// Used by both top-level build.zig and standalone as the gate for audio-required targets (synth / example_15)
@@ -295,31 +298,6 @@ pub const KitLibs = struct {
     /// null: buildStandalone creates its own.
     pixelops: ?*std.Build.Module = null,
 };
-
-/// Link L1 output system libraries per OS onto a standalone exe that uses audio
-/// (same policy as top build.zig's linkAudioBackend).
-///
-/// The macOS branch also links capture frameworks (mic AUHAL input / camera AVFoundation),
-/// matching top-level build.zig `linkAudioBackend` as a preventive add.
-/// `setupExecutableForPlatform` in the same loop (see call order in
-/// `buildStandalone` below) sets the -F/-L search paths, so only framework/library names
-/// are needed here (build-graph construction order does not affect link-time resolve).
-fn linkAudioForStandalone(exe: *std.Build.Step.Compile, target_os: std.Target.Os.Tag) void {
-    switch (target_os) {
-        .macos => {
-            exe.root_module.linkFramework("AudioToolbox", .{});
-            exe.root_module.linkFramework("CoreAudio", .{});
-            exe.root_module.linkFramework("AVFoundation", .{});
-            exe.root_module.linkFramework("CoreMedia", .{});
-            exe.root_module.linkFramework("CoreVideo", .{});
-            exe.root_module.linkFramework("Foundation", .{});
-            exe.root_module.linkSystemLibrary("objc", .{});
-        },
-        .linux => exe.root_module.linkSystemLibrary("alsa", .{}),
-        .windows => exe.root_module.linkSystemLibrary("ole32", .{}), // WASAPI goes through COM (CoCreateInstance etc. in ole32)
-        else => {}, // else: no audio backend. Do not link; leave it to the facade compileError at compile time
-    }
-}
 
 /// Create one exe per implemented backend for the target OS, plus install / `run-<backend>` /
 /// `run` (default). Resolve the SDK only for macOS backends (Linux needs no xcrun).
@@ -581,7 +559,9 @@ pub fn buildStandalone(
             .enable_gamepad = spec.link_gamepad,
             .enable_menu = spec.link_menu,
         });
-        if (spec.link_audio) linkAudioForStandalone(exe, target_os);
+        // setupExecutableForPlatform runs in the same loop and sets the -F/-L search
+        // paths the shared helper expects to find already in place.
+        if (spec.link_audio) consumer.linkAudioBackend(exe.root_module, target_os);
 
         if (be == platform_option) default_exe = exe;
         addStandaloneRunStep(b, b.fmt("run-{s}", .{backendName(be)}), b.fmt("Run the {s} version", .{backendName(be)}), exe);
