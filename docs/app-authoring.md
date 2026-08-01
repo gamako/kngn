@@ -77,6 +77,9 @@ pub fn main(init: std.process.Init) !void {
 Wasm: a root with **no `main`** that only calls `enableWasmRuntime()` (see
 `template/src/wasm_root.zig`). Exports (`kngn_init` / `kngn_frame`) come from the runtime.
 
+The framebuffer's pixel format is canonical BGRA: each `u32` in `fb.pixels` is `0xAARRGGBB`
+(little-endian memory order `[B,G,R,A]`), the same format on every backend including wasm.
+
 Full-pixel fills use `kit.pixelops.fill32` (never `@memset` on the framebuffer).
 
 ## 4. Native build

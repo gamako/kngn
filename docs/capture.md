@@ -119,7 +119,8 @@ pub const CaptureError = error{
 The callback is bound by the real-time contract — no malloc, locking, IO or panic —
 exactly as audio output is; see [audio-and-synth.md](audio-and-synth.md).
 
-**Camera** frames are always normalised to canonical BGRA (`u32` `0xAARRGGBB`), the same
+**Camera** frames are always normalised to canonical BGRA (`u32` `0xAARRGGBB`, memory
+`[B,G,R,A]`), the same
 representation as the framebuffer of `core/platform.zig`, so a frame can be fed straight
 to the existing sprite and canvas paths. Converting from a native format (YUY2, NV12)
 is the backend's responsibility. `PixelFormat` stays an enum with the single variant

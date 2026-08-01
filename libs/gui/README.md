@@ -9,7 +9,7 @@ Immediate-mode GUI library for KNGN. Standalone and platform-independent;
 |---|---|
 | `src/gui.zig` | Public API root |
 | `src/geom.zig` | Rect / Vec2 / RenderTarget |
-| `src/color.zig` | Color (straight alpha, canonical BGRA 0xAARRGGBB) |
+| `src/color.zig` | Color (straight alpha, canonical BGRA 0xAARRGGBB, memory [B,G,R,A]) |
 | `src/draw.zig` | DrawList (draw cmds with clip baked in) |
 | `src/font.zig` | BitmapFont (fixed-width ASCII, comptime BDF parser) |
 | `src/render.zig` | Software renderer: DrawList → pixel buffer |

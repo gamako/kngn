@@ -99,7 +99,7 @@ const canvas = &doc.active_view;
 var recorder = try paint.StrokeRecorder.init(gpa, w, h);
 defer recorder.deinit(gpa);
 
-var pen: paint.Pen = .{ .color = 0xFFFF0000 }; // canonical BGRA 0xAARRGGBB (red)
+var pen: paint.Pen = .{ .color = 0xFFFF0000 }; // canonical BGRA 0xAARRGGBB (memory [B,G,R,A]) (red)
 const tool = pen.tool();
 
 _ = tool.onEvent(canvas, &recorder, gpa, .{ .down = .{ .x = 0, .y = 0 } });

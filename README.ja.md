@@ -157,7 +157,7 @@ pub fn main() !void {
 
         if (window.lockFramebuffer()) |fb| {
             defer fb.unlock();
-            @memset(fb.pixels, 0xFF2E3440); // BGRA (0xAARRGGBB)
+            @memset(fb.pixels, 0xFF2E3440); // BGRA (0xAARRGGBB, memory [B,G,R,A])
             window.present();
         }
 
