@@ -8,6 +8,7 @@
 //!   - the event queue, the button tracking and the last mouse coordinates (`Core`)
 //!   - the canonical BGRA CPU framebuffer `backing: []u32` (which both backends read at present time)
 //!   - the file dialogs (comdlg32)
+//!   - the system cursor shape (a window property, asserted from WM_SETCURSOR)
 //!
 //! What is backend specific (the presentation resources, the lock and present that produce a
 //! `Framebuffer`, the resource lifecycle) stays in each backend's file. `Core` is stored in GWLP_USERDATA and fetched as a `*Core` from the WndProc.
@@ -161,6 +162,7 @@ const GWLP_USERDATA: c_int = -21;
 const GWL_STYLE: c_int = -16; // the window style (read and written for the fullscreen transition)
 const SWP_FRAMECHANGED: UINT = 0x0020; // recompute the frame after a style change
 const IDC_ARROW: usize = 32512;
+const IDC_CROSS: usize = 32515; // the crosshair (CursorShape.crosshair)
 
 const WM_DESTROY: UINT = 0x0002;
 const WM_CLOSE: UINT = 0x0010;
@@ -183,6 +185,8 @@ const WM_MBUTTONUP: UINT = 0x0208;
 const WM_MOUSEWHEEL: UINT = 0x020A;
 const WM_MOUSEHWHEEL: UINT = 0x020E;
 const WM_DPICHANGED: UINT = 0x02E0; // a per-monitor DPI change (mostly on a PMv2 window)
+const WM_SETCURSOR: UINT = 0x0020; // "decide the cursor shape now"; LOWORD(lparam) is the hit-test result
+const HTCLIENT: usize = 1; // the hit-test value for the client area (the only region this backend owns)
 
 const KF_REPEAT_BIT: usize = 0x40000000; // lParam bit 30: it was already down (a repeat)
 const KF_EXTENDED_BIT: usize = 0x01000000; // lParam bit 24: an extended key (right Ctrl/Alt, the keypad Enter and so on)
@@ -286,7 +290,12 @@ extern "user32" fn GetClientRect(hWnd: HWND, lpRect: *RECT) callconv(.winapi) BO
 extern "user32" fn GetSystemMetrics(nIndex: c_int) callconv(.winapi) c_int; // the size of the primary monitor
 extern "user32" fn SetWindowLongPtrW(hWnd: HWND, nIndex: c_int, dwNewLong: LONG_PTR) callconv(.winapi) LONG_PTR;
 extern "user32" fn GetWindowLongPtrW(hWnd: HWND, nIndex: c_int) callconv(.winapi) LONG_PTR;
-extern "user32" fn LoadCursorW(hInstance: ?HINSTANCE, lpCursorName: LPCWSTR) callconv(.winapi) ?HCURSOR;
+// lpCursorName is either a pointer to a name or a MAKEINTRESOURCE id — a small integer that user32
+// tells apart by its high bits and never dereferences. An id such as IDC_CROSS is odd, so it cannot be
+// spelled as an LPCWSTR (`[*:0]const u16` demands 2-byte alignment); the parameter is opaque instead.
+extern "user32" fn LoadCursorW(hInstance: ?HINSTANCE, lpCursorName: ?*const anyopaque) callconv(.winapi) ?HCURSOR;
+extern "user32" fn SetCursor(hCursor: ?HCURSOR) callconv(.winapi) ?HCURSOR; // null hides the cursor
+extern "user32" fn WindowFromPoint(Point: POINT) callconv(.winapi) ?HWND;
 extern "user32" fn ScreenToClient(hWnd: HWND, lpPoint: *POINT) callconv(.winapi) BOOL;
 extern "user32" fn GetKeyState(nVirtKey: c_int) callconv(.winapi) i16; // the current modifier state (the high bit means held)
 extern "user32" fn SetCapture(hWnd: HWND) callconv(.winapi) ?HWND;
@@ -400,6 +409,28 @@ var g_class_registered: bool = false;
 var g_qpc_freq: f64 = 1.0;
 /// The thread's DPI awareness as of platform.init() (creating a `.logical` window keeps it).
 var g_startup_dpi_awareness: DPI_AWARENESS_CONTEXT = null;
+/// The system cursors, loaded on first use and shared by every window.
+/// `LoadCursorW(null, IDC_*)` hands back a *shared* cursor: it is owned by the system, must not be
+/// passed to DestroyCursor, and returns the same handle every time — so caching it only saves the
+/// user32 call that WM_SETCURSOR would otherwise make on each pointer move.
+var g_cursor_arrow: ?HCURSOR = null;
+var g_cursor_cross: ?HCURSOR = null;
+
+/// The handle for a shape. `.hidden` is null, which is what SetCursor takes to mean "no cursor".
+/// A failed load is also null, degrading to a hidden cursor rather than to a wrong one.
+fn cursorHandleFor(shape: types.CursorShape) ?HCURSOR {
+    return switch (shape) {
+        .default => blk: {
+            if (g_cursor_arrow == null) g_cursor_arrow = LoadCursorW(null, @ptrFromInt(IDC_ARROW));
+            break :blk g_cursor_arrow;
+        },
+        .crosshair => blk: {
+            if (g_cursor_cross == null) g_cursor_cross = LoadCursorW(null, @ptrFromInt(IDC_CROSS));
+            break :blk g_cursor_cross;
+        },
+        .hidden => null,
+    };
+}
 
 pub fn init() Error!void {
     if (g_class_registered) return;
@@ -417,7 +448,9 @@ pub fn init() Error!void {
     wc.style = CS_HREDRAW | CS_VREDRAW;
     wc.lpfnWndProc = &wndProc;
     wc.hInstance = g_hinstance.?;
-    wc.hCursor = LoadCursorW(null, @ptrFromInt(IDC_ARROW));
+    // The class cursor is the fallback used before GWLP_USERDATA holds a Core (the messages a window
+    // gets while it is still being created). Once it does, the WM_SETCURSOR handler decides instead.
+    wc.hCursor = cursorHandleFor(.default);
     wc.hbrBackground = null; // Do not erase the background (present's blit covers the whole area, and erasing would flicker)
     wc.lpszClassName = class_name;
     if (RegisterClassExW(&wc) == 0) return error.InitFailed;
@@ -499,6 +532,11 @@ pub const Core = struct {
     // The live-resize redraw. null while nothing is registered; destroy clears it.
     redraw_ctx: *anyopaque = undefined,
     redraw_fn: ?*const fn (ctx: *anyopaque) void = null,
+
+    // The cursor shape the client area asserts. Win32 has no owner for the cursor: DefWindowProc puts
+    // the window class's cursor back on every WM_SETCURSOR, so this field is what the WM_SETCURSOR
+    // handler re-asserts each time the pointer moves over the client area.
+    cursor_shape: types.CursorShape = .default,
 
     // A transparent window. When true, present uses UpdateLayeredWindow (compositing the premultiplied BGRA
     // backing with per-pixel alpha) rather than StretchDIBits.
@@ -1083,6 +1121,34 @@ pub const Core = struct {
         _ = on;
     }
 
+    /// Set the cursor shape for the client area. Both Windows backends route here, because the cursor is
+    /// a window property and has nothing to do with the drawing method.
+    ///
+    /// Two halves, because Win32 keeps no per-window cursor: this records the shape (which the
+    /// WM_SETCURSOR handler re-asserts on every pointer move over the client area), and, when the pointer
+    /// is already inside the client area, applies it at once so the change shows without waiting for the
+    /// pointer to move. It is deliberately *not* applied when the pointer is elsewhere: SetCursor is global,
+    /// so doing that would repaint the cursor over another window until that window asserts its own.
+    ///
+    /// Hot path declaration: event time only (a tool change, a key press). The performance rules do not apply.
+    pub fn setCursor(self: *Core, shape: types.CursorShape) void {
+        self.cursor_shape = shape;
+        if (self.cursorInClientArea()) _ = SetCursor(cursorHandleFor(shape));
+    }
+
+    /// Whether the pointer is over this window's client area right now, the window on top at that point.
+    /// A failed query answers false, which only costs the immediate apply above (the next WM_SETCURSOR still lands).
+    fn cursorInClientArea(self: *Core) bool {
+        var pt: POINT = undefined;
+        if (GetCursorPos(&pt) == 0) return false;
+        const top = WindowFromPoint(pt) orelse return false;
+        if (top != self.hwnd) return false; // another window covers the pointer
+        if (ScreenToClient(self.hwnd, &pt) == 0) return false;
+        var rc: RECT = undefined;
+        if (GetClientRect(self.hwnd, &rc) == 0) return false;
+        return pt.x >= rc.left and pt.x < rc.right and pt.y >= rc.top and pt.y < rc.bottom;
+    }
+
     /// Pop up the quit menu. Choosing "Quit" pushes a quit. Hot path declaration: event time only.
     pub fn showQuitMenu(self: *Core) void {
         const menu = CreatePopupMenu() orelse return;
@@ -1257,6 +1323,17 @@ fn wndProc(hwnd: HWND, msg: UINT, wparam: WPARAM, lparam: LPARAM) callconv(.wina
                 _ = SetWindowPos(core.hwnd, null, sx, sy, sw, sh, SWP_NOZORDER | SWP_NOACTIVATE);
             }
             return 0;
+        },
+        WM_SETCURSOR => {
+            // The cursor is re-decided on every pointer move, so the shape has to be asserted here rather
+            // than owned: returning TRUE stops DefWindowProc from putting the window class's cursor back.
+            // Only the client area belongs to the application; the frame, the title bar and the sizing
+            // borders go to DefWindowProc so that the system's resize and move cursors keep working.
+            if ((@as(usize, @bitCast(lparam)) & 0xFFFF) == HTCLIENT) {
+                _ = SetCursor(cursorHandleFor(core.cursor_shape));
+                return 1; // TRUE: handled
+            }
+            return DefWindowProcW(hwnd, msg, wparam, lparam);
         },
         WM_KEYDOWN, WM_SYSKEYDOWN => {
             handleKeyDown(core, wparam, lparam);

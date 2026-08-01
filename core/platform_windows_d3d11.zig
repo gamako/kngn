@@ -522,11 +522,10 @@ pub const Window = struct {
         _ = d3d.swap_chain.lpVtbl.Present(d3d.swap_chain, 1, 0);
     }
 
-    /// Set the cursor shape. The Windows backends do not implement cursor shapes, so this is a no-op
-    /// stub (it exists so that the facade's contract compiles).
+    /// Set the cursor shape. Delegated to Core: the cursor is a window property, independent of the
+    /// drawing method, so both Windows backends share one implementation.
     pub fn setCursor(self: Window, shape: types.CursorShape) void {
-        _ = self;
-        _ = shape;
+        self.core.setCursor(shape);
     }
 
     pub fn setTitle(self: Window, title: [:0]const u8) void {
