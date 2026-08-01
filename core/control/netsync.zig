@@ -1656,6 +1656,12 @@ pub fn initHost(port: u16) void {
     }
     peers_mutex.unlock(io_val);
 
+    // A connection left over from an earlier session (a fail-soft clears `started` while its reader
+    // is still alive) would otherwise disable this host from that reader's cleanup. Reaching here
+    // means no session is up, so no acceptor is running and these slots are ours alone.
+    reapSlot(&client_slot);
+    for (&slots) |*s| reapSlot(s);
+
     stop_flag.store(false, .seq_cst);
     defaultClientLabel();
     inbound.clear(io_val);
@@ -1705,6 +1711,11 @@ pub fn initClientAs(addr: net.IpAddress, kind: ActorKind, label: []const u8) voi
         return;
     }
     peers_mutex.unlock(io_val);
+
+    // `started` is false while a previous connection is still being torn down: a fail-soft clears it
+    // from the reader thread before that reader has finished with the slot. Reap first, or the
+    // assignment below would hand this slot's new fd to a reader that is about to close it.
+    reapSlot(&client_slot);
 
     stop_flag.store(false, .seq_cst);
     setClientIdentity(kind, label);
@@ -2566,9 +2577,11 @@ pub fn clientSend(kind: u8, payload: []const u8) bool {
 pub fn shutdown() void {
     if (!io_inited) return;
 
+    // A fail-soft clears `role` and `started` from the reader thread while that reader and its
+    // writer are still alive and still own an open fd, so neither flag can decide whether there is
+    // anything to tear down. `anyConnLingersLocked` is what keeps such a connection reachable.
     peers_mutex.lockUncancelable(io_val);
-    const do_work = started or role != .disabled or have_server;
-    const cur_role = role;
+    const do_work = started or role != .disabled or have_server or anyConnLingersLocked();
     peers_mutex.unlock(io_val);
     if (!do_work) return;
 
@@ -2592,19 +2605,19 @@ pub fn shutdown() void {
         have_server = false;
     }
 
-    if (cur_role == .host) {
-        peers_mutex.lockUncancelable(io_val);
-        for (&slots) |*s| {
-            if (s.state != .empty) requestCloseSlotLocked(s);
-        }
-        peers_mutex.unlock(io_val);
-        for (&slots) |*s| {
-            joinSlot(s);
-        }
-    } else if (cur_role == .client) {
-        requestCloseSlot(&client_slot);
-        joinSlot(&client_slot);
+    // Reap every slot regardless of the current role. A host session can carry a lingering client
+    // connection from an earlier client session (and the reverse), and leaving either behind lets a
+    // stale reader run its cleanup against a slot that a later connection has already taken over.
+    peers_mutex.lockUncancelable(io_val);
+    for (&slots) |*s| {
+        if (s.state != .empty) requestCloseSlotLocked(s);
     }
+    if (client_slot.state != .empty) requestCloseSlotLocked(&client_slot);
+    peers_mutex.unlock(io_val);
+    for (&slots) |*s| {
+        joinSlot(s);
+    }
+    joinSlot(&client_slot);
 
     inbound.clear(io_val);
     presence_inbound.clear(io_val);
@@ -2635,6 +2648,28 @@ fn requestCloseSlot(s: *ConnSlot) void {
     requestCloseSlotLocked(s);
 }
 
+/// True while any slot still holds a connection or an unjoined thread. Requires `peers_mutex`.
+fn anyConnLingersLocked() bool {
+    if (slotLingersLocked(&client_slot)) return true;
+    for (&slots) |*s| {
+        if (slotLingersLocked(s)) return true;
+    }
+    return false;
+}
+
+fn slotLingersLocked(s: *const ConnSlot) bool {
+    return s.state != .empty or s.socket_open or s.reader_thread != null or s.writer_thread != null;
+}
+
+/// Closes a slot's connection and joins its threads so the slot can be handed to a new connection.
+/// Every path that re-initialises a slot goes through this first: a slot must never be overwritten
+/// while a thread still holds a pointer to it, or that thread's cleanup would act on the fd of the
+/// connection that took its place.
+fn reapSlot(s: *ConnSlot) void {
+    requestCloseSlot(s);
+    joinSlot(s);
+}
+
 /// If the slot was reused during an export, say, this avoids closing the new connection by mistake.
 fn requestCloseSlotIfGeneration(s: *ConnSlot, peer_id: u32, generation: u32) void {
     peers_mutex.lockUncancelable(io_val);
@@ -2655,13 +2690,21 @@ fn requestCloseSlotLocked(s: *ConnSlot) void {
     // The close happens after the writer is joined, exactly once, under peers_mutex and after inspecting socket_open
     // (in cleanupAfterReader, the spawn-failure path, and joinSlot). Closing from another thread would turn a blocking
     // send or recv into EBADF, which is an unreachable panic in Zig's std.
+    // The same invariant is what forbids re-initialising a slot before `reapSlot`: a reader that has
+    // not been joined yet still reaches the slot through its pointer and would close the fd of
+    // whichever connection now sits there.
     if (s.socket_open) {
         s.stream.shutdown(io_val, .both) catch {};
     }
 }
 
+/// Joins whatever threads the slot still owns and returns it to `.empty`.
+/// A thread handle is cleared only here and by the acceptor's reuse path, never by the thread
+/// itself, so `reader_thread == null` means "no reader is running against this slot". Each handle
+/// is read under `peers_mutex` and joined outside it; the reader is joined first, which is what
+/// makes the writer handle unambiguous (a reader's cleanup joins the writer and clears its handle
+/// before the reader exits, so at most one joiner ever sees a given writer).
 fn joinSlot(s: *ConnSlot) void {
-    // A Thread handle is joined outside the mutex (which can race with cleanup, but if the handle is still there it is joined).
     const reader_t = blk: {
         peers_mutex.lockUncancelable(io_val);
         defer peers_mutex.unlock(io_val);
@@ -2743,10 +2786,17 @@ fn acceptorMain() void {
             break;
         }
 
+        // A slot reaches `.empty` at the end of its previous reader's cleanup, after which that
+        // reader touches nothing — but its handle is still unjoined. Take the handles out of the
+        // slot before overwriting it and join them below, so no thread is ever left behind.
+        var stale_reader: ?std.Thread = null;
+        var stale_writer: ?std.Thread = null;
         peers_mutex.lockUncancelable(io_val);
         const slot_opt = blk: {
             for (&slots, 0..) |*s, i| {
                 if (s.state == .empty) {
+                    stale_reader = s.reader_thread;
+                    stale_writer = s.writer_thread;
                     // The generation was already incremented when it last became empty. It is preserved across a reuse.
                     const gen = s.generation;
                     s.* = .{
@@ -2764,6 +2814,8 @@ fn acceptorMain() void {
             break :blk null;
         };
         peers_mutex.unlock(io_val);
+        if (stale_reader) |t| t.join();
+        if (stale_writer) |t| t.join();
 
         if (slot_opt == null) {
             std.debug.print("[netsync] the peer slots are full (MAX_PEERS={d}); disconnecting\n", .{MAX_PEERS});
@@ -2776,6 +2828,7 @@ fn acceptorMain() void {
             std.debug.print("[netsync] failed to spawn the writer — releasing the slot\n", .{});
             peers_mutex.lockUncancelable(io_val);
             stream.close(io_val);
+            slot.socket_open = false;
             slot.state = .empty;
             peers_mutex.unlock(io_val);
             continue;
@@ -2927,10 +2980,32 @@ fn readerMain(slot: *ConnSlot) void {
     }
 }
 
+/// Test-only hook. A reader's teardown is the moment at which a slot changes hands, and the window
+/// in which a stale reader could reach a slot that has already been taken over is normally too
+/// short to drive from a test. With the gate held, a reader parks at the start of its cleanup, so a
+/// test can put the module into that state deliberately and assert on it. It is compiled out of any
+/// non-test build, where the teardown path carries no extra branch at all.
+const cleanup_gate_enabled = builtin.is_test;
+var reader_cleanup_gate: std.atomic.Value(bool) = .init(false);
+var reader_cleanup_parked: std.atomic.Value(u32) = .init(0);
+
+fn waitReaderCleanupGate() void {
+    if (!reader_cleanup_gate.load(.acquire)) return;
+    _ = reader_cleanup_parked.fetchAdd(1, .acq_rel);
+    while (reader_cleanup_gate.load(.acquire)) {
+        std.Io.sleep(io_val, .fromMilliseconds(1), .awake) catch {};
+    }
+    _ = reader_cleanup_parked.fetchSub(1, .acq_rel);
+}
+
 /// When a reader finishes: wake the writer and join it, and only then close the fd and return the slot to empty.
 /// The order: outbound.close → shutdown → join the writer → stream.close (once) → reset the slot.
 /// When a peer leaves on the host side, a PEER_INFO LEFT is distributed to the remaining clients.
+/// Once the slot is back to `.empty` this function touches nothing else, which is what lets the
+/// acceptor hand the slot to a new connection while this reader is still on its way out.
+/// Runs once per connection teardown, on the reader thread — never on a frame or real-time path.
 fn cleanupAfterReader(slot: *ConnSlot) void {
+    if (comptime cleanup_gate_enabled) waitReaderCleanupGate();
     const was_client = slot.is_client_conn;
 
     // stash the peer metadata for the leave distribution (before the slot becomes empty)
@@ -2982,7 +3057,9 @@ fn cleanupAfterReader(slot: *ConnSlot) void {
     slot.generation +%= 1;
     slot.peer_id = 0;
     slot.label_len = 0;
-    slot.reader_thread = null;
+    // `reader_thread` deliberately stays: a reader never clears its own handle, so that
+    // `reader_thread == null` keeps meaning "no reader is running against this slot". The joiner
+    // (joinSlot, or the acceptor when it reuses the slot) clears it.
 
     // A LEFT to the remaining active clients (the leaving slot is already empty). The outbound lock order: peers_mutex → outbound.
     if (do_leave_broadcast and role == .host) {
@@ -6629,4 +6706,145 @@ test "netsync: the router's ephemeral branch on a host and on a client" {
     const r = try action_registry.routeLocalAction("presence_point", "1 2", &buf);
     try testing.expect(std.mem.indexOf(u8, r, "ok:") != null or std.mem.indexOf(u8, r, "peer=") != null);
     try testing.expectEqual(@as(u64, 0), wireSeq());
+}
+
+// ----------------------------------------------------------------------------
+// Slot handover: a connection must never inherit a slot that another thread still holds
+// ----------------------------------------------------------------------------
+
+/// Accepts one connection and holds it open without answering, so that the client under test stays
+/// blocked in its reader. `stop` releases it.
+const SilentHost = struct {
+    srv: net.Server,
+    accepted: std.atomic.Value(bool) = .init(false),
+    stop: std.atomic.Value(bool) = .init(false),
+    thread: ?std.Thread = null,
+
+    fn start(self: *SilentHost) !void {
+        self.thread = try std.Thread.spawn(.{}, run, .{self});
+    }
+
+    fn run(self: *SilentHost) void {
+        const stream = self.srv.accept(io_val) catch return;
+        defer stream.close(io_val);
+        self.accepted.store(true, .release);
+        while (!self.stop.load(.acquire)) sleepMs(5);
+    }
+
+    fn shutdownAndJoin(self: *SilentHost) void {
+        self.stop.store(true, .release);
+        if (self.thread) |t| t.join();
+        self.thread = null;
+    }
+
+    fn port(self: *SilentHost) u16 {
+        return self.srv.socket.address.getPort();
+    }
+};
+
+fn waitClientSocketOpen(timeout_ms: u64) !void {
+    var waited: u64 = 0;
+    while (true) {
+        peers_mutex.lockUncancelable(io_val);
+        const open = client_slot.socket_open;
+        peers_mutex.unlock(io_val);
+        if (open) return;
+        if (waited >= timeout_ms) return error.Timeout;
+        sleepMs(5);
+        waited += 5;
+    }
+}
+
+fn waitReadersParked(n: u32, timeout_ms: u64) !void {
+    var waited: u64 = 0;
+    while (reader_cleanup_parked.load(.acquire) < n) {
+        if (waited >= timeout_ms) return error.Timeout;
+        sleepMs(5);
+        waited += 5;
+    }
+}
+
+/// Releases the cleanup gate after a delay, from a thread, so the main thread can meanwhile enter a
+/// call that is expected to wait for the parked reader.
+const GateReleaser = struct {
+    fn run(delay_ms: u64) void {
+        sleepMs(delay_ms);
+        reader_cleanup_gate.store(false, .release);
+    }
+};
+
+test "netsync: a reconnect waits for the previous connection's reader before taking the slot" {
+    resetForTest();
+    defer resetForTest();
+    defer reader_cleanup_gate.store(false, .release);
+    ensureIo();
+
+    const any = net.IpAddress{ .ip4 = net.Ip4Address.loopback(0) };
+    var host_a: SilentHost = .{ .srv = try any.listen(io_val, .{ .reuse_address = true }) };
+    defer host_a.srv.deinit(io_val);
+    var host_b: SilentHost = .{ .srv = try any.listen(io_val, .{ .reuse_address = true }) };
+    defer host_b.srv.deinit(io_val);
+    const addr_a = net.IpAddress{ .ip4 = net.Ip4Address.loopback(host_a.port()) };
+    const addr_b = net.IpAddress{ .ip4 = net.Ip4Address.loopback(host_b.port()) };
+    try host_a.start();
+    defer host_a.shutdownAndJoin();
+    try host_b.start();
+    defer host_b.shutdownAndJoin();
+
+    // Park the first connection's reader inside its cleanup, so it is provably still holding the
+    // slot when the reconnect below runs.
+    reader_cleanup_gate.store(true, .release);
+    initClientAs(addr_a, .human, "first");
+    try waitClientSocketOpen(2000);
+    failSoftDisableClient();
+    try waitReadersParked(1, 2000);
+
+    const releaser = try std.Thread.spawn(.{}, GateReleaser.run, .{150});
+    defer releaser.join();
+
+    // A fail-soft has already cleared `started`, so this call is not refused. It must still not take
+    // the slot from the parked reader: that reader would then close this connection's fd.
+    initClientAs(addr_b, .human, "second");
+
+    // Give the parked reader time to run to completion whatever it was going to do.
+    sleepMs(300);
+
+    peers_mutex.lockUncancelable(io_val);
+    const open = client_slot.socket_open;
+    const state = client_slot.state;
+    const still_started = started;
+    peers_mutex.unlock(io_val);
+    try testing.expect(open);
+    try testing.expect(state != .empty);
+    try testing.expect(still_started);
+    try testing.expect(host_b.accepted.load(.acquire));
+}
+
+test "netsync: a host started after a client fail-soft is not disabled by the previous reader" {
+    resetForTest();
+    defer resetForTest();
+    defer reader_cleanup_gate.store(false, .release);
+    ensureIo();
+
+    const any = net.IpAddress{ .ip4 = net.Ip4Address.loopback(0) };
+    var host_a: SilentHost = .{ .srv = try any.listen(io_val, .{ .reuse_address = true }) };
+    defer host_a.srv.deinit(io_val);
+    const addr_a = net.IpAddress{ .ip4 = net.Ip4Address.loopback(host_a.port()) };
+    try host_a.start();
+    defer host_a.shutdownAndJoin();
+
+    reader_cleanup_gate.store(true, .release);
+    initClientAs(addr_a, .human, "first");
+    try waitClientSocketOpen(2000);
+    failSoftDisableClient();
+    try waitReadersParked(1, 2000);
+
+    const releaser = try std.Thread.spawn(.{}, GateReleaser.run, .{150});
+    defer releaser.join();
+
+    initHost(0);
+    sleepMs(300);
+
+    try testing.expect(isHost());
+    try testing.expect(isEnabled());
 }
