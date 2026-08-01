@@ -140,18 +140,28 @@ class KngnAudioProcessor extends AudioWorkletProcessor {
       if (!opts.module || !opts.memory) {
         throw new Error("kngn-worklet: missing module/memory");
       }
+      // This instance only ever runs `kngn_audio_render`, so every host function outside the
+      // audio path is a no-op here. The ones below are named because their return value matters;
+      // the rest are filled in from the module's own import list, so that adding a host function
+      // on the main-thread side cannot silently make this instantiation fail.
+      const env = {
+        memory: opts.memory,
+        kngn_now: () => currentTime,
+        kngn_present: () => {},
+        kngn_log: () => {},
+        kngn_set_cursor: () => {},
+        kngn_audio_open: () => 0,
+        kngn_audio_start: () => {},
+        kngn_audio_stop: () => {},
+        kngn_audio_close: () => {},
+      };
+      for (const imp of WebAssembly.Module.imports(opts.module)) {
+        if (imp.module !== "env" || imp.kind !== "function") continue;
+        if (imp.name in env) continue;
+        env[imp.name] = () => 0;
+      }
       const imports = {
-        env: {
-          memory: opts.memory,
-          kngn_now: () => currentTime,
-          kngn_present: () => {},
-          kngn_log: () => {},
-          kngn_set_cursor: () => {},
-          kngn_audio_open: () => 0,
-          kngn_audio_start: () => {},
-          kngn_audio_stop: () => {},
-          kngn_audio_close: () => {},
-        },
+        env,
         wasi_snapshot_preview1: makeWasiStub(),
       };
 
