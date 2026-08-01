@@ -149,6 +149,20 @@ pub fn resolveIsolationTempRoot(
     return posix_fallback;
 }
 
+/// This process's id, which keeps unattended processes running at the same time on separate
+/// isolated roots.
+///
+/// `std.c.getpid` declares the libc call, and its `pid_t` is a `HANDLE` on Windows, so that
+/// OS reads the id out of the process block instead. Neither value is unique for all time —
+/// an id becomes available again once a process exits — but the root only has to separate
+/// processes that overlap, and its name carries a nonce as well.
+fn processId() u32 {
+    return switch (builtin.os.tag) {
+        .windows => std.os.windows.GetCurrentProcessId(),
+        else => @intCast(std.c.getpid()),
+    };
+}
+
 fn isolatedRoot(io: std.Io) ![]const u8 {
     if (isolated_root_ready) return isolated_root_storage[0..isolated_root_len];
 
@@ -167,7 +181,7 @@ fn isolatedRoot(io: std.Io) ![]const u8 {
         "/tmp",
     ) orelse return error.TempDirNotFound;
 
-    const pid: u32 = @intCast(std.c.getpid());
+    const pid = processId();
     const ts = std.Io.Clock.now(.awake, io);
     const nonce: u32 = @truncate(@as(u64, @intCast(ts.nanoseconds)));
     const root = try std.fmt.bufPrint(&isolated_root_storage, "{s}/kngn-appdata-{d}-{x}", .{ tmp, pid, nonce });
