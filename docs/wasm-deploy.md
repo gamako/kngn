@@ -87,23 +87,29 @@ large viewport cannot allocate an unbounded framebuffer.
 
 ## Artefacts
 
-Output of `zig build package-web` (`zig-out/web/`):
+Output of `zig build package-web` (`zig-out/web/`), measured directly (`*.single.html` is
+**not** part of this output — see the `package-web-single` table right after):
 
 | File | Role | COOP/COEP |
 |----------|------|-----------|
 | `index.html` | Pixie entry | not required |
 | `pixie.wasm` | Pixie wasm | not required |
-| `pixie.single.html` | Pixie single-file package | not required |
 | `synth.html` | Synth (shared audio) | **required** |
 | `synth.wasm` | Synth wasm (shared memory) | **required** |
 | `synth-postmessage.html` | Synth (postMessage audio) | not required |
 | `synth_postmessage.wasm` | Synth wasm (non-shared) | not required |
-| `synth.single.html` | Synth single-file (postMessage audio) | not required |
 | `kngn.js` | Shared JS glue | — |
 | `kngn-worklet.js` | AudioWorklet (shared + postMessage) | — |
 | `_headers` | Cloudflare Pages | shared synth header rules |
 | `netlify.toml` | Netlify (may be copied to the repo root) | shared synth header rules |
 | `serve-coop-coep.py` | Local COOP/COEP check | development |
+
+Output of `zig build package-web-single` (`zig-out/web/`), also measured directly:
+
+| File | Role | COOP/COEP |
+|----------|------|-----------|
+| `pixie.single.html` | Pixie single-file package | not required |
+| `synth.single.html` | Synth single-file (postMessage audio) | not required |
 
 ### HTML / JS fetch paths
 
