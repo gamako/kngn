@@ -18,5 +18,7 @@ pub fn build(b: *std.Build) void {
         .platform_source = .{ .cwd_relative = PROJECT_ROOT ++ "/core/platform.zig" },
         .platform_include = .{ .cwd_relative = PROJECT_ROOT ++ "/platform" },
         .platform_root = b.path(PROJECT_ROOT ++ "/platform"),
+        // The one feature this demo needs. Text input is off: it reads keys, never characters.
+        .platform_features = .{ .enable_fullscreen = true, .enable_text_input = false },
     });
 }

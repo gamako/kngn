@@ -1,6 +1,8 @@
 #import <Cocoa/Cocoa.h>
 #import <QuartzCore/QuartzCore.h>
+#if defined(KNGN_ENABLE_DIALOG)
 #import <UniformTypeIdentifiers/UniformTypeIdentifiers.h>
+#endif
 #if defined(KNGN_ENABLE_GAMEPAD)
 #import <GameController/GameController.h>
 #endif
@@ -62,12 +64,14 @@ struct PlatformWindow {
     EventQueue event_queue;
     __strong id quit_delegate;
     bool quit_requested;
+#if defined(KNGN_ENABLE_FULLSCREEN)
     // Fullscreen (platform_set_fullscreen / platform_is_fullscreen / platform_get_restore_geometry).
     // The window delegate keeps these up to date across both user-started and program-started transitions.
     bool fs_desired;      // the state most recently asked for (applied when a transition in flight ends)
     bool fs_transition;   // a transition is in flight (between will- and did-)
     bool fs_restore_held; // the snapshot below is the geometry to persist (held for the whole fullscreen period)
     PlatformWindowGeometry fs_restore;
+#endif
 };
 
 // Read the geometry a window would report through platform_get_window_geometry.
@@ -97,6 +101,7 @@ static bool queue_mark_none(EventQueue* q, EventQueueToken token);
     return NO;
 }
 
+#if defined(KNGN_ENABLE_FULLSCREEN)
 // The fullscreen transition, whoever started it (platform_set_fullscreen, the green button, or
 // Cmd+Ctrl+F). Entering snapshots the geometry to persist; that snapshot is held until the exit
 // transition has finished, so it also covers the exit animation, during which the window still
@@ -137,10 +142,13 @@ static bool queue_mark_none(EventQueue* q, EventQueueToken token);
     window->fs_restore_held = false;
     if (window->fs_desired) platform_set_fullscreen(window, true);
 }
+#endif // KNGN_ENABLE_FULLSCREEN
 @end
 
 static bool g_key_trace_enabled = false;
+#if defined(KNGN_ENABLE_TEXT_INPUT)
 static bool g_ime_trace_enabled = false;
+#endif
 
 static void key_trace(const char* fmt, ...) {
     if (!g_key_trace_enabled) return;
@@ -152,6 +160,7 @@ static void key_trace(const char* fmt, ...) {
     va_end(args);
 }
 
+#if defined(KNGN_ENABLE_TEXT_INPUT)
 // Diagnostics: a trace of IME and document access as it happens (off by default; KNGN_IME_TRACE=1 enables it).
 static void ime_trace(const char* fmt, ...) {
     if (!g_ime_trace_enabled) return;
@@ -182,6 +191,7 @@ static void ime_preview_utf8(const char* s, char* out, size_t cap) {
     memcpy(out, s, n);
     out[n] = '\0';
 }
+#endif // KNGN_ENABLE_TEXT_INPUT
 
 // ========================================
 // Gamepad input (ADR-009)
@@ -415,6 +425,7 @@ static PlatformMouseButton button_from_event(NSEvent* event) {
 // The CALayer-optimised implementation
 // ========================================
 
+#if defined(KNGN_ENABLE_TEXT_INPUT)
 // The fixed buffer for an IME composition (the preedit, as UTF-8)
 #define COMPOSITION_UTF8_CAP 1024
 
@@ -435,9 +446,14 @@ static size_t utf8SafePrefixLen(const char* s, size_t len, size_t cap) {
     }
     return i;
 }
+#endif // KNGN_ENABLE_TEXT_INPUT
 
 // A custom NSView: fast CALayer-based drawing plus NSTextInputClient (the IME)
+#if defined(KNGN_ENABLE_TEXT_INPUT)
 @interface FramebufferView : NSView <NSTextInputClient, NSDraggingDestination> {
+#else
+@interface FramebufferView : NSView <NSDraggingDestination> {
+#endif
     int width;   // the framebuffer pixel width (equal to the logical one under .logical)
     int height;  // framebuffer pixel height
     int logicalWidth;
@@ -476,15 +492,18 @@ static size_t utf8SafePrefixLen(const char* s, size_t len, size_t cap) {
     PlatformWindow* platformWindow;  // an unowned raw pointer, set to NULL on destroy
     NSTrackingArea* trackingArea;
 
+#if defined(KNGN_ENABLE_CURSOR)
     // for cursor control
     PlatformCursorShape currentCursorShape;  // the most recently requested shape (PLATFORM_CURSOR_DEFAULT by default)
     BOOL cursorHiddenByThisView;             // whether this view owns the [NSCursor hide] (the API is a global reference count, so it must not be called twice)
     BOOL mouseInsideView;                    // whether the mouse is inside the view right now (set and hide are held back while it is outside)
+#endif
 
     // live-resize redraw, distinct from FrameCallback. NULL while nothing is registered.
     PlatformRedrawCallback redrawCallback;
     void* redrawUserdata;
 
+#if defined(KNGN_ENABLE_TEXT_INPUT)
     // The IME composition state. The text comes from the snapshot API, a change from PLATFORM_EVENT_COMPOSITION.
     NSMutableString* markedText;
     NSRange imeSelectedRange; // the selection within markedText (in UTF-16 units)
@@ -507,12 +526,15 @@ static size_t utf8SafePrefixLen(const char* s, size_t len, size_t cap) {
     BOOL docAccessEnabled;
     BOOL hasPendingReplacement;
     NSRange pendingReplacement;
+#endif // KNGN_ENABLE_TEXT_INPUT
 
+#if defined(KNGN_ENABLE_MASCOT)
     // Transparent windows, click-through and interactive dragging
     BOOL transparentMode;      // YES makes the CGImage premultiplied alpha and honours the framebuffer alpha
     BOOL clickThrough;         // YES lets a click over a transparent pixel fall through to what is behind (per pixel)
     BOOL clickThroughState;    // the ignoresMouseEvents value set most recently (cached so it is only reapplied when it changes)
     NSEvent* lastMouseDownEvent; // the most recent left-button mouse-down (retained for beginDrag; consumed one-shot)
+#endif
 }
 - (id)initWithFrame:(NSRect)frame width:(int)w height:(int)h
            callback:(FrameCallback)cb userdata:(void*)ud
@@ -532,24 +554,30 @@ static size_t utf8SafePrefixLen(const char* s, size_t len, size_t cap) {
 // Called on destroy. Invalidates the view's back-reference.
 - (void)clearPlatformWindow;
 
+#if defined(KNGN_ENABLE_CURSOR)
 // Set the cursor shape. Called from platform_set_cursor.
 - (void)setCursorShape:(PlatformCursorShape)shape;
+#endif
 
 // Register the live-resize redraw callback. cb==NULL unregisters.
 - (void)setRedrawCallback:(PlatformRedrawCallback)cb userdata:(void*)ud;
 
+#if defined(KNGN_ENABLE_TEXT_INPUT)
 // the composition snapshot (called from platform_get_composition_snapshot)
 - (uint32_t)copyCompositionSnapshot:(char*)buf cap:(uint32_t)cap meta:(PlatformCompositionMeta*)meta;
 - (void)setCompositionRectPixelsX:(int32_t)x y:(int32_t)y w:(int32_t)w h:(int32_t)h;
 
 // IME document access. callbacks==NULL unregisters.
 - (void)setTextInputDocumentAccess:(const PlatformTextInputDocumentCallbacks*)callbacks userdata:(void*)ud;
+#endif
 
+#if defined(KNGN_ENABLE_MASCOT)
 // transparent window support
 - (void)setTransparentMode:(BOOL)on;
 - (void)setClickThrough:(BOOL)on;
 - (void)refreshClickThrough;
 - (NSEvent *)takeLastMouseDownEvent;
+#endif
 
 // scale latch and metrics
 // fillMetrics:forQuery: YES = the current query (the pending scale), NO = the latched snapshot (after a lock)
@@ -599,11 +627,14 @@ static size_t utf8SafePrefixLen(const char* s, size_t len, size_t cap) {
         userdata = ud;
         platformWindow = pw;
         trackingArea = nil;
+#if defined(KNGN_ENABLE_CURSOR)
         currentCursorShape = PLATFORM_CURSOR_DEFAULT;
         cursorHiddenByThisView = NO;
         mouseInsideView = NO;
+#endif
         redrawCallback = NULL;
         redrawUserdata = NULL;
+#if defined(KNGN_ENABLE_TEXT_INPUT)
         markedText = [[NSMutableString alloc] init];
         imeSelectedRange = NSMakeRange(0, 0);
         imeControlled = NO;   // uncontrolled: everything goes through the IME, as before
@@ -619,10 +650,13 @@ static size_t utf8SafePrefixLen(const char* s, size_t len, size_t cap) {
         docAccessEnabled = NO;
         hasPendingReplacement = NO;
         pendingReplacement = NSMakeRange(NSNotFound, 0);
+#endif // KNGN_ENABLE_TEXT_INPUT
+#if defined(KNGN_ENABLE_MASCOT)
         transparentMode = NO;   // opaque by default (bit-identical to the previous behaviour)
         clickThrough = NO;
         clickThroughState = NO; // matching the initial ignoresMouseEvents=NO
         lastMouseDownEvent = nil;
+#endif
 
         // Allocate the double buffer (page alignment is preferable)
         // .logical: logical_w * logical_h, as before. Only .physical uses the physical size.
@@ -755,9 +789,14 @@ static size_t utf8SafePrefixLen(const char* s, size_t len, size_t cap) {
 
         // Create the CGImage (needed every frame)
         // In transparent mode, premultiplied alpha honours the framebuffer alpha; by default alpha is skipped, as before.
+        // Without the mascot opt-in no window can be transparent, so alpha is always skipped.
+#if defined(KNGN_ENABLE_MASCOT)
         CGBitmapInfo bitmapInfo = (transparentMode
             ? (kCGImageAlphaPremultipliedFirst | kCGBitmapByteOrder32Little)
             : (kCGImageAlphaNoneSkipFirst | kCGBitmapByteOrder32Little)); // canonical BGRA: memory [B,G,R,A] = u32 0xAARRGGBB
+#else
+        CGBitmapInfo bitmapInfo = kCGImageAlphaNoneSkipFirst | kCGBitmapByteOrder32Little; // canonical BGRA: memory [B,G,R,A] = u32 0xAARRGGBB
+#endif
         CGImageRef image = CGImageCreate(
             width,
             height,
@@ -778,8 +817,10 @@ static size_t utf8SafePrefixLen(const char* s, size_t len, size_t cap) {
         // Release the CGImage
         CGImageRelease(image);
 
+#if defined(KNGN_ENABLE_MASCOT)
         // Update click-through on the callback and display-link path too (returns immediately while disabled)
         [self refreshClickThrough];
+#endif
 
         CFAbsoluteTime renderEnd = CFAbsoluteTimeGetCurrent();
 
@@ -807,13 +848,17 @@ static size_t utf8SafePrefixLen(const char* s, size_t len, size_t cap) {
 - (void)dealloc {
     [self stopDisplayLink];
 
+#if defined(KNGN_ENABLE_CURSOR)
     // Being destroyed while the cursor is hidden would leave the OS cursor gone for good.
     if (cursorHiddenByThisView) {
         [NSCursor unhide];
         cursorHiddenByThisView = NO;
     }
+#endif
 
+#if defined(KNGN_ENABLE_TEXT_INPUT)
     markedText = nil;
+#endif
 
     // Release the CG objects
     if (provider0) CGDataProviderRelease(provider0);
@@ -848,9 +893,13 @@ static size_t utf8SafePrefixLen(const char* s, size_t len, size_t cap) {
     CGDataProviderRef provider = (displayBuffer == buffer0) ? provider0 : provider1;
 
     // Create the CGImage (in transparent mode, premultiplied alpha honours the alpha)
+#if defined(KNGN_ENABLE_MASCOT)
     CGBitmapInfo bitmapInfo = (transparentMode
         ? (kCGImageAlphaPremultipliedFirst | kCGBitmapByteOrder32Little)
         : (kCGImageAlphaNoneSkipFirst | kCGBitmapByteOrder32Little)); // canonical BGRA: memory [B,G,R,A] = u32 0xAARRGGBB
+#else
+    CGBitmapInfo bitmapInfo = kCGImageAlphaNoneSkipFirst | kCGBitmapByteOrder32Little; // canonical BGRA: memory [B,G,R,A] = u32 0xAARRGGBB
+#endif
     CGImageRef image = CGImageCreate(
         width,
         height,
@@ -871,13 +920,21 @@ static size_t utf8SafePrefixLen(const char* s, size_t len, size_t cap) {
     // Release the CGImage
     CGImageRelease(image);
 
+#if defined(KNGN_ENABLE_MASCOT)
     // Update the cursor-position test for click-through (returns immediately while clickThrough is off)
     [self refreshClickThrough];
+#endif
 }
 
 - (BOOL)isOpaque {
+#if defined(KNGN_ENABLE_MASCOT)
     return transparentMode ? NO : YES; // transparent mode is not opaque
+#else
+    return YES; // without the mascot opt-in a window is always opaque
+#endif
 }
+
+#if defined(KNGN_ENABLE_MASCOT)
 
 // Per-pixel click-through. Returning nil from NSView.hitTest does not let the event through to another
 // application behind (that is the window-level ignoresMouseEvents). So on every present the alpha under
@@ -937,6 +994,8 @@ static size_t utf8SafePrefixLen(const char* s, size_t len, size_t cap) {
     lastMouseDownEvent = nil;
     return ev;
 }
+
+#endif // KNGN_ENABLE_MASCOT
 
 // ========================================
 // Resizing
@@ -1129,6 +1188,8 @@ static size_t utf8SafePrefixLen(const char* s, size_t len, size_t cap) {
 - (BOOL)acceptsFirstResponder {
     return YES;
 }
+
+#if defined(KNGN_ENABLE_TEXT_INPUT)
 
 - (uint32_t)copyCompositionSnapshot:(char*)buf cap:(uint32_t)cap meta:(PlatformCompositionMeta*)meta {
     // latest-wins: always the current preedit. event.revision only detects a missed update (an older revision cannot be read).
@@ -1564,6 +1625,8 @@ static size_t utf8SafePrefixLen(const char* s, size_t len, size_t cap) {
     [self.inputContext invalidateCharacterCoordinates];
 }
 
+#endif // KNGN_ENABLE_TEXT_INPUT
+
 // ========================================
 // Mouse events
 // ========================================
@@ -1602,8 +1665,9 @@ static size_t utf8SafePrefixLen(const char* s, size_t len, size_t cap) {
 }
 
 // ========================================
-// Cursor control
+// Cursor control (KNGN_ENABLE_CURSOR)
 // ========================================
+#if defined(KNGN_ENABLE_CURSOR)
 //
 // The policy: NSCursor hide/unhide is a process-wide reference-counted API, so cursorHiddenByThisView
 // tracks strictly whether this view currently owns the hide (hide only on a false→true transition,
@@ -1673,6 +1737,8 @@ static size_t utf8SafePrefixLen(const char* s, size_t len, size_t cap) {
     [self applyCursorShapeIfInside];
 }
 
+#endif // KNGN_ENABLE_CURSOR
+
 // Shared: enqueue mouse_down / mouse_up / mouse_move (including a move with a button held)
 - (void)enqueueMouseEvent:(PlatformEventType)type withButton:(PlatformMouseButton)btn from:(NSEvent*)event {
     if (!platformWindow) return;
@@ -1726,11 +1792,15 @@ static size_t utf8SafePrefixLen(const char* s, size_t len, size_t cap) {
 
 // mouseDown / mouseUp / mouseDragged: the left button
 - (void)mouseDown:(NSEvent *)event {
+#if defined(KNGN_ENABLE_MASCOT)
     lastMouseDownEvent = event; // keep the most recent left down for beginDrag (ARC strong)
+#endif
     [self enqueueMouseEvent:PLATFORM_EVENT_MOUSE_DOWN withButton:button_from_event(event) from:event];
 }
 - (void)mouseUp:(NSEvent *)event {
+#if defined(KNGN_ENABLE_MASCOT)
     lastMouseDownEvent = nil; // discard the stale event on up (once a drag has started it is already consumed)
+#endif
     [self enqueueMouseEvent:PLATFORM_EVENT_MOUSE_UP withButton:button_from_event(event) from:event];
 }
 - (void)mouseDragged:(NSEvent *)event {
@@ -1913,20 +1983,24 @@ static PlatformKeyCode mapKeyCodeToPlatform(unsigned short keyCode) {
 bool platform_init(void) {
     const char* trace = getenv("KNGN_KEY_TRACE");
     g_key_trace_enabled = trace && strcmp(trace, "1") == 0;
+#if defined(KNGN_ENABLE_TEXT_INPUT)
     const char* ime = getenv("KNGN_IME_TRACE");
     g_ime_trace_enabled = ime && strcmp(ime, "1") == 0;
+#endif
     return true;
 }
 
 // A borderless window cannot become key or main by default. NSWindow is subclassed to answer YES
 // to canBecomeKeyWindow/canBecomeMainWindow, so that input, the IME first responder and
 // performWindowDragWithEvent: work. It is used only for a transparent or borderless window.
+#if defined(KNGN_ENABLE_MASCOT)
 @interface MascotWindow : NSWindow
 @end
 @implementation MascotWindow
 - (BOOL)canBecomeKeyWindow { return YES; }
 - (BOOL)canBecomeMainWindow { return YES; }
 @end
+#endif
 
 // Create a window (the existing API; no opts = opaque with a title, as before)
 PlatformWindow* platform_create_window(int width, int height, const char* title,
@@ -1942,12 +2016,19 @@ PlatformWindow* platform_create_window_ex(int width, int height, const char* tit
     BOOL transparent = NO, borderless = NO, has_position = NO, physical = NO, not_resizable = NO;
     int pos_x = 0, pos_y = 0;
     if (opts) {
-        const uint32_t known = PLATFORM_WINDOW_TRANSPARENT | PLATFORM_WINDOW_BORDERLESS |
-                               PLATFORM_WINDOW_POSITION | PLATFORM_WINDOW_FRAMEBUFFER_PHYSICAL |
-                               PLATFORM_WINDOW_NOT_RESIZABLE;
+        // Without the mascot opt-in TRANSPARENT and BORDERLESS are not known flags, so asking for
+        // one fails the same way an unknown flag does rather than yielding an ordinary window.
+        const uint32_t known = PLATFORM_WINDOW_POSITION | PLATFORM_WINDOW_FRAMEBUFFER_PHYSICAL |
+                               PLATFORM_WINDOW_NOT_RESIZABLE
+#if defined(KNGN_ENABLE_MASCOT)
+                               | PLATFORM_WINDOW_TRANSPARENT | PLATFORM_WINDOW_BORDERLESS
+#endif
+                               ;
         if ((opts->flags & ~known) != 0 || opts->reserved != 0) return NULL;
+#if defined(KNGN_ENABLE_MASCOT)
         transparent = (opts->flags & PLATFORM_WINDOW_TRANSPARENT) != 0;
         borderless = (opts->flags & PLATFORM_WINDOW_BORDERLESS) != 0;
+#endif
         physical = (opts->flags & PLATFORM_WINDOW_FRAMEBUFFER_PHYSICAL) != 0;
         not_resizable = (opts->flags & PLATFORM_WINDOW_NOT_RESIZABLE) != 0;
         if ((opts->flags & PLATFORM_WINDOW_POSITION) != 0) {
@@ -1964,10 +2045,12 @@ PlatformWindow* platform_create_window_ex(int width, int height, const char* tit
     memset(&platformWindow->event_queue, 0, sizeof(EventQueue));
     platformWindow->quit_delegate = nil;
     platformWindow->quit_requested = false;
+#if defined(KNGN_ENABLE_FULLSCREEN)
     platformWindow->fs_desired = false;
     platformWindow->fs_transition = false;
     platformWindow->fs_restore_held = false;
     memset(&platformWindow->fs_restore, 0, sizeof(PlatformWindowGeometry));
+#endif
 
     @autoreleasepool {
         // Get the NSApplication
@@ -1989,7 +2072,11 @@ PlatformWindow* platform_create_window_ex(int width, int height, const char* tit
         }
 
         // borderless uses the subclass that can become the key window (transparent on its own works with a plain NSWindow)
+#if defined(KNGN_ENABLE_MASCOT)
         Class windowClass = borderless ? [MascotWindow class] : [NSWindow class];
+#else
+        Class windowClass = [NSWindow class];
+#endif
         platformWindow->window = [[windowClass alloc] initWithContentRect:frame
                                                                styleMask:styleMask
                                                                  backing:NSBackingStoreBuffered
@@ -2025,9 +2112,11 @@ PlatformWindow* platform_create_window_ex(int width, int height, const char* tit
         quitDelegate.platformWindow = platformWindow;
         platformWindow->quit_delegate = quitDelegate;
         [platformWindow->window setDelegate:quitDelegate];
+#if defined(KNGN_ENABLE_MASCOT)
         if (transparent) {
             [platformWindow->view setTransparentMode:YES]; // Make the CGImage premultiplied alpha
         }
+#endif
         [platformWindow->window setContentView:platformWindow->view];
         // Call updateTrackingAreas after setContentView (the view's bounds are settled by then, so the tracking area is built correctly)
         [platformWindow->view updateTrackingAreas];
@@ -2095,6 +2184,8 @@ void platform_set_title(PlatformWindow* platformWindow, const char* title) {
 // toggleFullScreen: is a toggle, not a set, so the request is compared against the current state
 // and a request arriving while a transition is in flight is only recorded — the delegate applies it
 // when that transition finishes. Asking for the state the window is already in does nothing.
+#if defined(KNGN_ENABLE_FULLSCREEN)
+
 void platform_set_fullscreen(PlatformWindow* window, bool enable) {
     if (!window) return;
     @autoreleasepool {
@@ -2133,9 +2224,12 @@ void platform_get_restore_geometry(PlatformWindow* window, PlatformWindowGeometr
     window_geometry(window, out);
 }
 
+#endif // KNGN_ENABLE_FULLSCREEN
+
 // ========================================
-// The C ABI implementation of transparent / borderless windows plus drag-to-move
+// The C ABI implementation of transparent / borderless windows plus drag-to-move (KNGN_ENABLE_MASCOT)
 // ========================================
+#if defined(KNGN_ENABLE_MASCOT)
 
 // Start the OS's interactive window move using the most recent left mouse-down.
 void platform_begin_window_drag(PlatformWindow* window) {
@@ -2202,6 +2296,8 @@ void platform_show_quit_menu(PlatformWindow* window) {
         }
     }
 }
+
+#endif // KNGN_ENABLE_MASCOT
 
 // The main loop
 void platform_run(PlatformWindow* platformWindow) {
@@ -2297,6 +2393,7 @@ bool platform_poll_events(PlatformWindow* platformWindow) {
                 EventQueueToken token = queue_push(&platformWindow->event_queue, &platform_event);
                 key_trace("key_%s push=%d slot=%d gen=%u key=%d mods=0x%X", event.type == NSEventTypeKeyDown ? "down" : "up", token.valid, token.index, token.generation, platform_event.payload.keyboard.key, platform_event.payload.keyboard.modifiers);
 
+#if defined(KNGN_ENABLE_TEXT_INPUT)
                 // keyDown: push the physical key_down and then go on to the IME / inputContext path.
                 // insertText: is the only source of char_input; the event.characters are never read directly
                 // (which would double the input and bypass the IME). sendEvent is not called (the beep is absorbed by doCommandBySelector).
@@ -2317,6 +2414,7 @@ bool platform_poll_events(PlatformWindow* platformWindow) {
                     const BOOL tombstone = token.valid && hasInputContext && routeToIme && !commandModified && (hadMarked || hasMarked) && queue_mark_none(&platformWindow->event_queue, token);
                     key_trace("handleEvent bool=%d marked=%d->%d route=%d tombstone=%d", handled, hadMarked, hasMarked, routeToIme, tombstone);
                 }
+#endif // KNGN_ENABLE_TEXT_INPUT
 
                 // The key event has been handled, so it is not passed on to the system (which prevents the beep)
                 continue;
@@ -2407,6 +2505,7 @@ void platform_present(PlatformWindow* platformWindow) {
     }
 }
 
+#if defined(KNGN_ENABLE_CURSOR)
 // Set the cursor shape. An unknown value falls back to PLATFORM_CURSOR_DEFAULT.
 void platform_set_cursor(PlatformWindow* platformWindow, int shape) {
     if (!platformWindow) return;
@@ -2422,6 +2521,7 @@ void platform_set_cursor(PlatformWindow* platformWindow, int shape) {
         [platformWindow->view setCursorShape:s];
     }
 }
+#endif // KNGN_ENABLE_CURSOR
 
 // Register the live-resize redraw callback. cb==NULL unregisters.
 void platform_set_redraw_callback(PlatformWindow* platformWindow, PlatformRedrawCallback cb, void* userdata) {
@@ -2430,6 +2530,8 @@ void platform_set_redraw_callback(PlatformWindow* platformWindow, PlatformRedraw
         [platformWindow->view setRedrawCallback:cb userdata:userdata];
     }
 }
+
+#if defined(KNGN_ENABLE_TEXT_INPUT)
 
 // The IME composition preedit snapshot
 uint32_t platform_get_composition_snapshot(PlatformWindow* window, char* buf, uint32_t cap, PlatformCompositionMeta* meta) {
@@ -2463,6 +2565,8 @@ void platform_set_text_input_document_access(
     if (!window || !window->view) return;
     [window->view setTextInputDocumentAccess:callbacks userdata:userdata];
 }
+
+#endif // KNGN_ENABLE_TEXT_INPUT
 
 // Take a snapshot of the event queue counters
 void platform_get_event_stats(PlatformWindow* window, PlatformEventStats* out) {
@@ -2558,12 +2662,14 @@ bool platform_get_gamepad_state(PlatformWindow* window, int index, PlatformGamep
 #endif // KNGN_ENABLE_GAMEPAD
 
 // ========================================
-// File selection dialogs
+// File selection dialogs (KNGN_ENABLE_DIALOG)
 // ========================================
 // The extension filter uses allowedContentTypes (UTType), which is macOS 11 and later only
 // (allowedFileTypes was deprecated in macOS 12). It links the UniformTypeIdentifiers framework.
 // When UTType is nil for an unknown extension, this falls back to no filter (everything allowed).
 // fileSystemRepresentation is valid only while the autorelease pool lives, so it is strdup'd on the spot.
+
+#if defined(KNGN_ENABLE_DIALOG)
 
 char* platform_save_file_dialog(const PlatformSaveDialogOptions* opts) {
     @autoreleasepool {
@@ -2612,6 +2718,8 @@ char* platform_open_file_dialog(const PlatformOpenDialogOptions* opts) {
 void platform_free_path(char* path) {
     if (path) free(path);
 }
+
+#endif // KNGN_ENABLE_DIALOG
 
 // ========================================
 // The OS text clipboard

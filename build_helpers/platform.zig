@@ -148,11 +148,31 @@ pub fn addPlatformBuildOptions(
     backend: PlatformType,
     features: PlatformFeatures,
 ) void {
+    mod.addOptions("build_options", platformBuildOptions(b, backend, features));
+}
+
+/// The `build_options` the platform module reads, as a standalone `Options` step.
+///
+/// Split out so that a bare `addTest` rooted at a backend file can stamp exactly the same
+/// set. Hand-writing the option list there means a flag added here is missing there, and the
+/// test stops compiling for a reason that has nothing to do with the test.
+///
+/// Runs at build-graph configuration time only (not per-frame / RT).
+pub fn platformBuildOptions(
+    b: *std.Build,
+    backend: PlatformType,
+    features: PlatformFeatures,
+) *std.Build.Step.Options {
     const opts = b.addOptions();
     opts.addOption([]const u8, "platform_backend", backendName(backend));
     opts.addOption(bool, "enable_gamepad", features.enable_gamepad);
     opts.addOption(bool, "enable_menu", features.enable_menu);
-    mod.addOptions("build_options", opts);
+    opts.addOption(bool, "enable_dialog", features.enable_dialog);
+    opts.addOption(bool, "enable_cursor", features.enable_cursor);
+    opts.addOption(bool, "enable_mascot", features.enable_mascot);
+    opts.addOption(bool, "enable_fullscreen", features.enable_fullscreen);
+    opts.addOption(bool, "enable_text_input", features.enable_text_input);
+    return opts;
 }
 
 /// Create the platform module (`core/platform.zig`) for an executable inside this repository.
@@ -184,10 +204,10 @@ pub fn createPlatformModule(
     /// harness module (core/control/harness.zig). platform.zig (facade) `@import("harness")`.
     /// Pass the **same instance** as the audio module so module-level state (audio tap, …) is shared.
     harness_mod: *std.Build.Module,
-    /// Opt-in features (gamepad / menu). Baked into the platform module as `build_options.enable_gamepad` / `enable_menu`.
-    /// gamepad: read by the facade's `Window.getGamepadState`.
-    /// menu: read by the comptime gate on C-symbol refs in `platform_macos.zig`.
-    /// The harness synthetic gamepad path always runs regardless of this value.
+    /// The opt-in features, baked into the platform module as `build_options.enable_*`.
+    /// gamepad is read by the facade's `Window.getGamepadState`; the rest are read by the
+    /// comptime gates on C-symbol references in `platform_macos.zig`.
+    /// The harness paths (synthetic gamepad, injected characters) run regardless of these.
     features: PlatformFeatures,
 ) *std.Build.Module {
     const mod = b.createModule(platformModuleOptions(target, platform_source, backend));
@@ -209,8 +229,9 @@ pub fn createPlatformModule(
 ///
 /// Each example's build.zig only needs this one call for all platform setup.
 ///
-/// `features`: macOS-backend opt-in (gamepad=GameController / menu=NSMenu).
-/// Only true flags pass `-DKNGN_ENABLE_*` into the .o compile. Ignored on Linux/Windows backends.
+/// `features`: the macOS backend opt-ins. Only the enabled ones pass `-DKNGN_ENABLE_*` into
+/// the .o compile, and the same value has to reach `createPlatformModule`, or the module's
+/// `build_options` and the object file disagree. Ignored on Linux/Windows backends.
 pub fn setupExecutableForPlatform(
     b: *std.Build,
     exe: *std.Build.Step.Compile,
@@ -292,6 +313,10 @@ pub const StandaloneSpec = struct {
     /// `build_options.enable_menu` + shared `platform_macos_menu.m` (`-DKNGN_ENABLE_MENU`).
     /// Default false. Only pixie opts in.
     link_menu: bool = false,
+    /// The remaining macOS backend features (dialog, cursor, mascot, fullscreen, text input).
+    /// `link_gamepad` and `link_menu` are folded into this before use, so a caller may set
+    /// either form; `platformFeatures` below is the single place the two meet.
+    platform_features: PlatformFeatures = .{},
     /// png module (libs/png). **If the caller builds png and passes png-dependent modules (sprite/core, …) in `extra`,
     /// pass that same png here too.** If harness (platform→harness→png) and the extra side each get a png module,
     /// you hit "file exists in modules 'png' and 'png0'"; share one instance.
@@ -305,6 +330,17 @@ pub const StandaloneSpec = struct {
     /// (gamepad depends only on platform_types, so the caller need not supply it).
     kit_libs: ?KitLibs = null,
 };
+
+/// The one feature set a standalone build uses, for the platform module and for the macOS
+/// object file alike. Deriving both from this call is what keeps them in step: a module whose
+/// `build_options` say a feature is on, linked against an object compiled without it, fails at
+/// link time with an undefined symbol.
+fn platformFeatures(spec: StandaloneSpec) PlatformFeatures {
+    var features = spec.platform_features;
+    if (spec.link_gamepad) features.enable_gamepad = true;
+    if (spec.link_menu) features.enable_menu = true;
+    return features;
+}
 
 /// Stable lib modules needed to wire kit for standalone (the caller-supplied slice of the ADR-007 initial kit set).
 pub const KitLibs = struct {
@@ -580,6 +616,8 @@ pub fn buildStandalone(
         break :blk am;
     } else null;
 
+    const features = platformFeatures(spec);
+
     for (implementedBackends(target_os)) |be| {
         const platform_mod = createPlatformModule(
             b,
@@ -590,7 +628,7 @@ pub fn buildStandalone(
             types_mod,
             command_types_mod,
             harness_mod,
-            .{ .enable_gamepad = spec.link_gamepad, .enable_menu = spec.link_menu },
+            features,
         );
 
         const root = b.createModule(.{
@@ -714,10 +752,7 @@ pub fn buildStandalone(
         opts.addOption([]const u8, "platform_name", backendName(be));
         exe.root_module.addOptions("build_options", opts);
 
-        setupExecutableForPlatform(b, exe, be, optimize, spec.platform_root, sdk_paths, .{
-            .enable_gamepad = spec.link_gamepad,
-            .enable_menu = spec.link_menu,
-        });
+        setupExecutableForPlatform(b, exe, be, optimize, spec.platform_root, sdk_paths, features);
         // setupExecutableForPlatform runs in the same loop and sets the -F/-L search
         // paths the shared helper expects to find already in place.
         if (spec.link_audio) consumer.linkAudioBackend(exe.root_module, target_os);
@@ -751,9 +786,9 @@ pub const PlatformCompileResult = struct {
 /// `platform_root` is a LazyPath to the `platform/` directory.
 /// Parent project: `b.path("platform")`; examples:
 /// `b.path("../../platform")`.
-/// `features`: only true flags pass `-DKNGN_ENABLE_*` into the .o compile (gamepad/menu opt-in).
-/// When enable_menu=true, also compile shared `platform_macos_menu.m` and return it.
-/// .m/.swift sources gate on `#if defined(KNGN_ENABLE_GAMEPAD)` / `#if defined(KNGN_ENABLE_MENU)`.
+/// `features`: only the enabled ones pass `-DKNGN_ENABLE_*` into the .o compile (see
+/// `addFeatureDefines`). When enable_menu=true, also compile the shared
+/// `platform_macos_menu.m` and return it.
 pub fn compilePlatformLayer(
     b: *std.Build,
     platform_type: PlatformType,
@@ -769,6 +804,33 @@ pub fn compilePlatformLayer(
         // setupExecutableForPlatform's macOS branch, so this arm is unreachable.
         .x11, .wayland, .gdi, .d3d11, .wasm => unreachable,
     };
+}
+
+/// Pass `-DKNGN_ENABLE_*` for each enabled feature to a macOS backend compile.
+///
+/// Only the enabled ones are passed, so `.m` and `.swift` gate on
+/// `#if defined(KNGN_ENABLE_X)` (clang) / `#if KNGN_ENABLE_X` (swiftc) alike.
+///
+/// Call it **before** `-import-objc-header` on a swiftc command: that flag takes the next
+/// token as the bridging-header path and would otherwise swallow a define as a path.
+///
+/// Runs at build-graph configuration time only (not per-frame / RT).
+fn addFeatureDefines(compile_cmd: *std.Build.Step.Run, features: PlatformFeatures) void {
+    // Gamepad: the GameController backend (the framework link is on the executable).
+    if (features.enable_gamepad) compile_cmd.addArg("-DKNGN_ENABLE_GAMEPAD");
+    // Native menu: the bridge plus the poll-loop consumption. The NSMenu body itself lives in
+    // the shared translation unit added by makeCompileResult.
+    if (features.enable_menu) compile_cmd.addArg("-DKNGN_ENABLE_MENU");
+    // Native save/open panels.
+    if (features.enable_dialog) compile_cmd.addArg("-DKNGN_ENABLE_DIALOG");
+    // System cursor shapes.
+    if (features.enable_cursor) compile_cmd.addArg("-DKNGN_ENABLE_CURSOR");
+    // Transparent / borderless / always-on-top / click-through windows and the quit menu.
+    if (features.enable_mascot) compile_cmd.addArg("-DKNGN_ENABLE_MASCOT");
+    // Fullscreen transition, live state and restore geometry.
+    if (features.enable_fullscreen) compile_cmd.addArg("-DKNGN_ENABLE_FULLSCREEN");
+    // NSTextInputClient: character input, IME composition and document access.
+    if (features.enable_text_input) compile_cmd.addArg("-DKNGN_ENABLE_TEXT_INPUT");
 }
 
 fn objcOptFlag(optimize: std.builtin.OptimizeMode) []const u8 {
@@ -841,11 +903,7 @@ fn buildObjC(
         "objective-c",
     });
     compile_cmd.addPrefixedDirectoryArg("-I", platform_root);
-    // Gamepad opt-in. Enables `#if defined(KNGN_ENABLE_GAMEPAD)` in platform_macos.m.
-    if (features.enable_gamepad) compile_cmd.addArg("-DKNGN_ENABLE_GAMEPAD");
-    // Native menu opt-in. `-DKNGN_ENABLE_MENU` for bridge + poll consumption.
-    // NSMenu body lives in shared platform_macos_menu.m (added by makeCompileResult).
-    if (features.enable_menu) compile_cmd.addArg("-DKNGN_ENABLE_MENU");
+    addFeatureDefines(compile_cmd, features);
     compile_cmd.addArgs(&.{
         "-fobjc-arc",
         objcOptFlag(optimize),
@@ -881,12 +939,7 @@ fn buildSwift(
         "-framework",
         "QuartzCore",
     });
-    // Gamepad opt-in. Enables `#if KNGN_ENABLE_GAMEPAD` in shared platform_macos_shared.swift.
-    // `-import-objc-header` takes the next token as the bridging-header path, so place the define before it
-    // (otherwise `-import-objc-header` would consume `-DKNGN_ENABLE_GAMEPAD` as a path).
-    if (features.enable_gamepad) compile_cmd.addArg("-DKNGN_ENABLE_GAMEPAD");
-    // Native menu opt-in. Bridge + poll consumption; body is shared menu.m.
-    if (features.enable_menu) compile_cmd.addArg("-DKNGN_ENABLE_MENU");
+    addFeatureDefines(compile_cmd, features);
     compile_cmd.addArg("-import-objc-header");
     compile_cmd.addFileArg(platform_root.path(b, "platform.h"));
     compile_cmd.addArgs(&.{ "-c", "-o" });
@@ -923,11 +976,7 @@ fn buildMetal(
         "-framework",
         "MetalKit",
     });
-    // Gamepad opt-in. Enables `#if KNGN_ENABLE_GAMEPAD` in shared platform_macos_shared.swift.
-    // `-import-objc-header` takes the next token as the bridging-header path, so place the define before it.
-    if (features.enable_gamepad) compile_cmd.addArg("-DKNGN_ENABLE_GAMEPAD");
-    // Native menu opt-in. Bridge + poll consumption; body is shared menu.m.
-    if (features.enable_menu) compile_cmd.addArg("-DKNGN_ENABLE_MENU");
+    addFeatureDefines(compile_cmd, features);
     compile_cmd.addArg("-import-objc-header");
     compile_cmd.addFileArg(platform_root.path(b, "platform.h"));
     compile_cmd.addArgs(&.{ "-c", "-o" });

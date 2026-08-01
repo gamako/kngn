@@ -215,8 +215,10 @@ class MetalRenderer: NSObject, MTKViewDelegate {
             if submitFrame(view: view, slotIndex: currentSlotIndex) {
                 currentSlotIndex = (currentSlotIndex + 1) % slotCount
             }
+#if KNGN_ENABLE_MASCOT
             // Update click-through on the callback path too (symmetrical with objc and swift; returns immediately while disabled)
             (view as? MetalFramebufferView)?.refreshClickThrough()
+#endif
         }
         // Neither of the above (callback=nil and not manual) does nothing.
         // In manual mode isPaused=true, so no empty draw arrives from the display link.
@@ -382,8 +384,15 @@ class MetalRenderer: NSObject, MTKViewDelegate {
     }
 }
 
+#if KNGN_ENABLE_TEXT_INPUT
+// NSTextInputClient conformance is declared in an extension rather than in the inheritance
+// clause, because the methods that satisfy it are compiled only with the text input opt-in and
+// Swift cannot make an inheritance clause conditional.
+extension MetalFramebufferView: NSTextInputClient {}
+#endif
+
 // A custom MTKView plus NSTextInputClient (the IME)
-class MetalFramebufferView: MTKView, NSTextInputClient, PlatformBackendView {
+class MetalFramebufferView: MTKView, PlatformBackendView {
     private var metalRenderer: MetalRenderer?
 
     // logical and framebuffer sizes kept apart, plus the scale latch (the same shape as objc's Framebuffer)
@@ -399,34 +408,46 @@ class MetalFramebufferView: MTKView, NSTextInputClient, PlatformBackendView {
 
     // For mouse events. Setting the back-reference propagates it to imeState as well.
     weak var platformWindow: PlatformWindowHandle? {
-        didSet { imeState.platformWindow = platformWindow }
+        didSet {
+#if KNGN_ENABLE_TEXT_INPUT
+            imeState.platformWindow = platformWindow
+#endif
+        }
     }
     private var customTrackingArea: NSTrackingArea?
 
+#if KNGN_ENABLE_TEXT_INPUT
     // The IME state is gathered into the shared PlatformIMEState; NSTextInputClient and the custom IME methods forward to it.
     let imeState = PlatformIMEState()
+#endif
 
+#if KNGN_ENABLE_CURSOR
     // for cursor control
     private var currentCursorShape: PlatformCursorShape = PLATFORM_CURSOR_DEFAULT  // the most recently requested shape
     private var cursorHiddenByThisView: Bool = false  // whether this view owns the [NSCursor hide] (the API is a global reference count, so it must not be called twice)
     private var mouseInsideView: Bool = false         // whether the mouse is inside the view right now (set and hide are held back while it is outside)
+#endif
 
     // Live-resize redraw. A separate field from the FrameCallback used by CADisplayLink.
     private var redrawCallback: PlatformRedrawCallback?
     private var redrawUserdata: UnsafeMutableRawPointer?
 
+#if KNGN_ENABLE_MASCOT
     // Transparent windows, click-through and interactive dragging
     private var transparentMode: Bool = false
     private var clickThrough: Bool = false
     private var clickThroughState: Bool = false // the ignoresMouseEvents value set most recently (only reapplied when it changes)
     private var lastMouseDownEvent: NSEvent?
+#endif
 
     override init(frame: CGRect, device: MTLDevice?) {
         let metalDevice = device ?? MTLCreateSystemDefaultDevice()
         super.init(frame: frame, device: metalDevice)
 
+#if KNGN_ENABLE_TEXT_INPUT
         // Hand the host view to the IME state (the framebuffer size is updated in setupRenderer)
         imeState.hostView = self
+#endif
 
         // The delegate is set later
         // OS file drag and drop (file URLs only, following the objc backend)
@@ -451,8 +472,10 @@ class MetalFramebufferView: MTKView, NSTextInputClient, PlatformBackendView {
         guard let renderer = metalRenderer else { return nil }
         // Draw manually
         renderer.presentManual(view: self)
+#if KNGN_ENABLE_MASCOT
         // Update the cursor-position test for click-through (returns immediately while clickThrough is off)
         refreshClickThrough()
+#endif
         // Return the CPU buffer of the current slot after the present (submit has already advanced it)
         return renderer.getCurrentBuffer()
     }
@@ -468,6 +491,7 @@ class MetalFramebufferView: MTKView, NSTextInputClient, PlatformBackendView {
     }
 
     // MARK: - NSTextInputClient forwarding (delegated to the shared PlatformIMEState)
+#if KNGN_ENABLE_TEXT_INPUT
 
     func copyCompositionSnapshot(buf: UnsafeMutablePointer<CChar>?, cap: UInt32, meta: UnsafeMutablePointer<PlatformCompositionMeta>?) -> UInt32 {
         return imeState.copyCompositionSnapshot(buf: buf, cap: cap, meta: meta)
@@ -505,6 +529,7 @@ class MetalFramebufferView: MTKView, NSTextInputClient, PlatformBackendView {
         return imeState.firstRect(forCharacterRange: range, actualRange: actualRange)
     }
     override func doCommand(by selector: Selector) { imeState.doCommand(by: selector) }
+#endif // KNGN_ENABLE_TEXT_INPUT
 
     override var acceptsFirstResponder: Bool { true }
 
@@ -531,11 +556,13 @@ class MetalFramebufferView: MTKView, NSTextInputClient, PlatformBackendView {
     }
 
     deinit {
+#if KNGN_ENABLE_CURSOR
         // Being destroyed while the cursor is hidden would leave the OS cursor gone for good.
         if cursorHiddenByThisView {
             NSCursor.unhide()
             cursorHiddenByThisView = false
         }
+#endif
     }
 
     func setupRenderer(width w: Int, height h: Int, callback: FrameCallback?, userdata: UnsafeMutableRawPointer?, physical: Bool) {
@@ -567,7 +594,9 @@ class MetalFramebufferView: MTKView, NSTextInputClient, PlatformBackendView {
         metalRenderer = renderer
         self.delegate = renderer
         // Apply the framebuffer size used to convert the IME firstRect from pixels into bounds
+#if KNGN_ENABLE_TEXT_INPUT
         imeState.updateFramebufferSize(width: fw, height: fh)
+#endif
         NSLog("[\(IMPLEMENTATION_TYPE)] Framebuffer metrics: logical=\(logicalWidth)x\(logicalHeight) fb=\(fw)x\(fh) scale=\(String(format: "%.2f", Double(scale))) physical=\(physical ? 1 : 0)")
     }
 
@@ -621,7 +650,9 @@ class MetalFramebufferView: MTKView, NSTextInputClient, PlatformBackendView {
                 return
             }
             platformWindow?.currentFramebuffer = renderer.getCurrentBuffer()
+#if KNGN_ENABLE_TEXT_INPUT
             imeState.updateFramebufferSize(width: renderer.getWidth(), height: renderer.getHeight())
+#endif
         }
         logicalWidth = lw
         logicalHeight = lh
@@ -686,7 +717,9 @@ class MetalFramebufferView: MTKView, NSTextInputClient, PlatformBackendView {
             logicalWidth = renderer.getWidth()
             logicalHeight = renderer.getHeight()
             platformWindow?.currentFramebuffer = renderer.getCurrentBuffer()
+#if KNGN_ENABLE_TEXT_INPUT
             imeState.updateFramebufferSize(width: renderer.getWidth(), height: renderer.getHeight())
+#endif
             if let cb = redrawCallback {
                 cb(redrawUserdata)
             }
@@ -724,7 +757,7 @@ class MetalFramebufferView: MTKView, NSTextInputClient, PlatformBackendView {
     }
 
     // ========================================
-    // Cursor control
+    // Cursor control (KNGN_ENABLE_CURSOR)
     // ========================================
     //
     // The policy: NSCursor.hide/unhide is a process-wide reference-counted API, so cursorHiddenByThisView
@@ -732,6 +765,7 @@ class MetalFramebufferView: MTKView, NSTextInputClient, PlatformBackendView {
     // unhide only on true→false). On top of that, set and hide are really applied only while
     // mouseInsideView is true; a setCursor arriving while the mouse is outside merely stores the shape.
 
+#if KNGN_ENABLE_CURSOR
     // Return the NSCursor matching currentCursorShape (PLATFORM_CURSOR_HIDDEN is not handled here).
     // An unsupported shape falls back to the arrow.
     private func nsCursor(for shape: PlatformCursorShape) -> NSCursor {
@@ -787,6 +821,7 @@ class MetalFramebufferView: MTKView, NSTextInputClient, PlatformBackendView {
         mouseInsideView = true
         applyCursorShapeIfInside()
     }
+#endif // KNGN_ENABLE_CURSOR
 
     private func enqueueMouseEvent(type: PlatformEventType, button: PlatformMouseButton, from event: NSEvent) {
         guard let handle = platformWindow else { return }
@@ -831,8 +866,13 @@ class MetalFramebufferView: MTKView, NSTextInputClient, PlatformBackendView {
 
     // Transparent mode (isOpaque), click-through (a per-pixel hitTest), and the event kept for beginDrag.
     override var isOpaque: Bool {
+#if KNGN_ENABLE_MASCOT
         return !transparentMode
+#else
+        return true // without the mascot opt-in a window is always opaque
+#endif
     }
+#if KNGN_ENABLE_MASCOT
     // Per-pixel click-through. On every present the alpha under the current cursor position toggles
     // `window.ignoresMouseEvents` (NSView.hitTest alone would not let it through to an application behind).
     // The alpha is read from the renderer's most recently displayed slot. Hot path declaration: once per present, but only one pixel sample.
@@ -875,13 +915,18 @@ class MetalFramebufferView: MTKView, NSTextInputClient, PlatformBackendView {
         lastMouseDownEvent = nil
         return ev
     }
+#endif // KNGN_ENABLE_MASCOT
 
     override func mouseDown(with event: NSEvent) {
+#if KNGN_ENABLE_MASCOT
         lastMouseDownEvent = event // kept for beginDrag
+#endif
         enqueueMouseEvent(type: PLATFORM_EVENT_MOUSE_DOWN, button: buttonFromEvent(event), from: event)
     }
     override func mouseUp(with event: NSEvent) {
+#if KNGN_ENABLE_MASCOT
         lastMouseDownEvent = nil // discard the stale event on up
+#endif
         enqueueMouseEvent(type: PLATFORM_EVENT_MOUSE_UP, button: buttonFromEvent(event), from: event)
     }
     override func mouseDragged(with event: NSEvent) {
@@ -937,12 +982,16 @@ func makePlatformBackendView(
     let metalView = MetalFramebufferView(frame: frame, device: metalDevice)
     metalView.framebufferOnly = false
     metalView.enableSetNeedsDisplay = false
+#if KNGN_ENABLE_MASCOT
     // Metal transparency (the drawable's alpha is kept and CAMetalLayer composites what is behind)
     if transparent {
         metalView.setTransparentMode(true) // the isOpaque override returns false
         metalView.layer?.isOpaque = false
         metalView.clearColor = MTLClearColorMake(0, 0, 0, 0) // a transparent clear
     }
+#else
+    _ = transparent // no window can be transparent without the mascot opt-in
+#endif
     // On the manual drawing path (callback=nil, the Zig facade's lockFramebuffer→present path) the
     // display link is stopped and present() drives one frame at a time through view.draw(). The callback
     // path (symmetrical with objc and swift, and unused) keeps isPaused=false and is display-link driven.

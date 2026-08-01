@@ -144,5 +144,8 @@ pub fn build(b: *std.Build) void {
             .{ .name = "pixelops", .module = pixelops },
         },
         .link_menu = true, // pixie standalone also opts into the native menu
+        // The same feature set the root build gives pixie: file panels, a crosshair over the
+        // canvas, and fullscreen (the window geometry it persists is `restoreGeometry`).
+        .platform_features = .{ .enable_dialog = true, .enable_cursor = true, .enable_fullscreen = true },
     });
 }

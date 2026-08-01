@@ -1,5 +1,7 @@
 import Cocoa
+#if KNGN_ENABLE_DIALOG
 import UniformTypeIdentifiers
+#endif
 #if KNGN_ENABLE_GAMEPAD
 import GameController
 #endif
@@ -26,8 +28,10 @@ import GameController
 
 let EVENT_QUEUE_SIZE = 256
 let keyTraceEnabled = ProcessInfo.processInfo.environment["KNGN_KEY_TRACE"] == "1"
+#if KNGN_ENABLE_TEXT_INPUT
 // Diagnostics: a trace of IME and document access as it happens (off by default; KNGN_IME_TRACE=1 enables it).
 let imeTraceEnabled = ProcessInfo.processInfo.environment["KNGN_IME_TRACE"] == "1"
+#endif
 
 func keyTrace(_ message: String) {
     guard keyTraceEnabled else { return }
@@ -35,6 +39,7 @@ func keyTrace(_ message: String) {
     FileHandle.standardError.write(line)
 }
 
+#if KNGN_ENABLE_TEXT_INPUT
 func imeTrace(_ message: String) {
     guard imeTraceEnabled else { return }
     let line = Data("[ime-trace] \(message)\n".utf8)
@@ -52,6 +57,7 @@ func imePreview(_ s: String, limit: Int = 20) -> String {
     if s.count <= limit { return s }
     return String(s.prefix(limit)) + "…"
 }
+#endif // KNGN_ENABLE_TEXT_INPUT
 
 struct EventQueueToken {
     let index: Int
@@ -372,14 +378,21 @@ protocol PlatformBackendView: AnyObject {
         height: Int
     ) -> UnsafeMutablePointer<UInt32>?
     var implementationType: String { get }
+#if KNGN_ENABLE_CURSOR
     func setCursorShape(_ shape: PlatformCursorShape)
+#endif
+#if KNGN_ENABLE_MASCOT
     func setClickThrough(_ enabled: Bool)
     func takeLastMouseDownEvent() -> NSEvent?
+#endif
     func setRedrawCallback(_ cb: PlatformRedrawCallback?, userdata: UnsafeMutableRawPointer?)
     var platformWindow: PlatformWindowHandle? { get set }
     func prepareForDestroy()
+#if KNGN_ENABLE_MASCOT
     func setTransparentMode(_ enabled: Bool)
+#endif
     func startPresentation()
+#if KNGN_ENABLE_TEXT_INPUT
     // The IME surface (used by the shared C ABI and by poll_events)
     func copyCompositionSnapshot(buf: UnsafeMutablePointer<CChar>?, cap: UInt32, meta: UnsafeMutablePointer<PlatformCompositionMeta>?) -> UInt32
     func setCompositionRectPixels(x: Int32, y: Int32, w: Int32, h: Int32)
@@ -387,6 +400,7 @@ protocol PlatformBackendView: AnyObject {
     func setTextInputDocumentAccess(callbacks: UnsafePointer<PlatformTextInputDocumentCallbacks>?, userdata: UnsafeMutableRawPointer?)
     func hasMarkedText() -> Bool
     func imeRouteEnabled() -> Bool
+#endif
     // The scale latch and metrics (the same shape as objc's fillMetrics / applyLatched / nativeEventScale)
     // forQuery=true: the current negotiated value (the pending scale), for contentScale() and input normalisation before a lock.
     // forQuery=false: the latched snapshot (buffer, scale and epoch all belong to the same frame), for lock_ex.
@@ -405,12 +419,14 @@ final class PlatformWindowHandle: NSObject {
     let event_queue: EventQueue  // The name event_queue is kept (gamepad and existing code refer to it)
     var quitRequested: Bool = false
     var quitDelegate: QuitWindowDelegate?
+#if KNGN_ENABLE_FULLSCREEN
     // Fullscreen (platform_set_fullscreen / platform_is_fullscreen / platform_get_restore_geometry).
     // The window delegate keeps these up to date across both user-started and program-started transitions.
     var fsDesired: Bool = false      // the state most recently asked for (applied when a transition in flight ends)
     var fsTransition: Bool = false   // a transition is in flight (between will- and did-)
     var fsRestoreHeld: Bool = false  // fsRestore is the geometry to persist (held for the whole fullscreen period)
     var fsRestore = PlatformWindowGeometry()
+#endif
 
     init(window: NSWindow, backendView: any PlatformBackendView) {
         self.window = window
@@ -442,6 +458,7 @@ final class QuitWindowDelegate: NSObject, NSWindowDelegate {
         return false
     }
 
+#if KNGN_ENABLE_FULLSCREEN
     // The fullscreen transition, whoever started it (platform_set_fullscreen, the green button, or
     // Cmd+Ctrl+F). Entering snapshots the geometry to persist; that snapshot is held until the exit
     // transition has finished, so it also covers the exit animation, during which the window still
@@ -482,6 +499,7 @@ final class QuitWindowDelegate: NSObject, NSWindowDelegate {
             platform_set_fullscreen(platformWindow: Unmanaged.passUnretained(handle).toOpaque(), enable: true)
         }
     }
+#endif // KNGN_ENABLE_FULLSCREEN
 }
 
 // ========================================
@@ -621,8 +639,9 @@ func platform_menu_enqueue_command(_ window: UnsafeMutableRawPointer?, _ command
 #endif // KNGN_ENABLE_MENU
 
 // ========================================
-// The IME state, shared by both backends
+// The IME state, shared by both backends (KNGN_ENABLE_TEXT_INPUT)
 // ========================================
+#if KNGN_ENABLE_TEXT_INPUT
 //
 // The NSTextInputClient logic and the composition and document-access state are gathered into PlatformIMEState.
 // Each backend's view holds `let imeState = PlatformIMEState()` and forwards the NSTextInputClient
@@ -1082,6 +1101,8 @@ final class PlatformIMEState {
     }
 }
 
+#endif // KNGN_ENABLE_TEXT_INPUT
+
 // ========================================
 // The shared file drop helper
 // ========================================
@@ -1103,6 +1124,7 @@ func enqueueFileDropIfValid(handle: PlatformWindowHandle, url: URL) -> Bool {
     return true
 }
 
+#if KNGN_ENABLE_MASCOT
 // A borderless window cannot become key or main by default. A subclass answers true to
 // canBecomeKey/Main, so that input, the IME first responder and performWindowDragWithEvent: work.
 class MascotWindow: NSWindow {
@@ -1115,6 +1137,7 @@ class QuitMenuTarget: NSObject {
     var quitChosen = false
     @objc func onQuit(_ sender: Any?) { quitChosen = true }
 }
+#endif // KNGN_ENABLE_MASCOT
 
 // ========================================
 // Exported as C-compatible functions (@_cdecl)
@@ -1141,10 +1164,18 @@ func platform_create_window_ex(width: Int32, height: Int32, title: UnsafePointer
     var position: (x: Int32, y: Int32)? = nil
     if let opts = opts {
         let flags = opts.pointee.flags
+        // Without the mascot opt-in TRANSPARENT and BORDERLESS are not known flags, so asking for
+        // one fails the same way an unknown flag does rather than yielding an ordinary window.
+#if KNGN_ENABLE_MASCOT
         let known = UInt32(PLATFORM_WINDOW_TRANSPARENT) | UInt32(PLATFORM_WINDOW_BORDERLESS) | UInt32(PLATFORM_WINDOW_POSITION) | UInt32(PLATFORM_WINDOW_FRAMEBUFFER_PHYSICAL) | UInt32(PLATFORM_WINDOW_NOT_RESIZABLE)
+#else
+        let known = UInt32(PLATFORM_WINDOW_POSITION) | UInt32(PLATFORM_WINDOW_FRAMEBUFFER_PHYSICAL) | UInt32(PLATFORM_WINDOW_NOT_RESIZABLE)
+#endif
         if (flags & ~known) != 0 || opts.pointee.reserved != 0 { return nil }
+#if KNGN_ENABLE_MASCOT
         transparent = (flags & UInt32(PLATFORM_WINDOW_TRANSPARENT)) != 0
         borderless = (flags & UInt32(PLATFORM_WINDOW_BORDERLESS)) != 0
+#endif
         physical = (flags & UInt32(PLATFORM_WINDOW_FRAMEBUFFER_PHYSICAL)) != 0
         notResizable = (flags & UInt32(PLATFORM_WINDOW_NOT_RESIZABLE)) != 0
         if (flags & UInt32(PLATFORM_WINDOW_POSITION)) != 0 {
@@ -1173,9 +1204,13 @@ private func createWindowImpl(width: Int32, height: Int32, title: UnsafePointer<
             : [.titled, .closable, .miniaturizable, .resizable])
 
     // borderless uses the subclass that can become the key window (transparent on its own works with a plain NSWindow)
+#if KNGN_ENABLE_MASCOT
     let window: NSWindow = borderless
         ? MascotWindow(contentRect: frame, styleMask: styleMask, backing: .buffered, defer: false)
         : NSWindow(contentRect: frame, styleMask: styleMask, backing: .buffered, defer: false)
+#else
+    let window = NSWindow(contentRect: frame, styleMask: styleMask, backing: .buffered, defer: false)
+#endif
     // Disable window tabbing (so the drawing area stays full height regardless of saved defaults or a system setting)
     window.tabbingMode = .disallowed
 
@@ -1185,6 +1220,7 @@ private func createWindowImpl(width: Int32, height: Int32, title: UnsafePointer<
     // Required in order to receive a hover mouseMoved
     window.acceptsMouseMovedEvents = true
 
+#if KNGN_ENABLE_MASCOT
     // Configure the transparent window (the desktop shows through)
     if transparent {
         window.isOpaque = false
@@ -1195,6 +1231,7 @@ private func createWindowImpl(width: Int32, height: Int32, title: UnsafePointer<
         window.hasShadow = false
         window.isMovable = true
     }
+#endif
 
     // Create the backend-specific view (CALayer or Metal). View-level settings such as transparency and physical mode are made inside the factory.
     guard let backendView = makePlatformBackendView(
@@ -1272,7 +1309,9 @@ func platform_set_title(platformWindow: UnsafeMutableRawPointer?, title: UnsafeP
     handle.window.title = String(cString: title)
 }
 
-// The C ABI implementation of transparent / borderless windows plus drag-to-move
+// The C ABI implementation of transparent / borderless windows plus drag-to-move (KNGN_ENABLE_MASCOT)
+#if KNGN_ENABLE_MASCOT
+
 @_cdecl("platform_begin_window_drag")
 func platform_begin_window_drag(platformWindow: UnsafeMutableRawPointer?) -> Void {
     guard let platformWindow = platformWindow else { return }
@@ -1322,6 +1361,10 @@ func platform_show_quit_menu(platformWindow: UnsafeMutableRawPointer?) -> Void {
     }
 }
 
+#endif // KNGN_ENABLE_MASCOT
+
+#if KNGN_ENABLE_FULLSCREEN
+
 // Ask the window to enter or leave fullscreen (the same toggleFullScreen(nil) transition as the
 // green button). toggleFullScreen is a toggle, not a set, so the request is compared against the
 // current state, and a request arriving while a transition is in flight is only recorded — the
@@ -1361,6 +1404,8 @@ func platform_get_restore_geometry(platformWindow: UnsafeMutableRawPointer?, out
     let handle = Unmanaged<PlatformWindowHandle>.fromOpaque(platformWindow).takeUnretainedValue()
     out.pointee = handle.fsRestoreHeld ? handle.fsRestore : windowGeometry(handle)
 }
+
+#endif // KNGN_ENABLE_FULLSCREEN
 
 @_cdecl("platform_run")
 func platform_run(platformWindow: UnsafeMutableRawPointer?) -> Void {
@@ -1447,6 +1492,7 @@ func platform_poll_events(platformWindow: UnsafeMutableRawPointer?) -> Bool {
             let token = handle.event_queue.push(platform_event)
             keyTrace("key_\(event.type == .keyDown ? "down" : "up") push=\(token != nil) key=\(platform_event.payload.keyboard.key) mods=0x\(String(platform_event.payload.keyboard.modifiers, radix: 16))")
 
+#if KNGN_ENABLE_TEXT_INPUT
             // keyDown: push the physical key_down and then go on to the IME / inputContext path.
             // insertText is the only source of char_input; the event.characters are never read directly.
             if event.type == .keyDown {
@@ -1465,6 +1511,7 @@ func platform_poll_events(platformWindow: UnsafeMutableRawPointer?) -> Bool {
                 let tombstone = routeToIme && hasInputContext && !commandModified && (hadMarked || hasMarked) && token.map { handle.event_queue.markNone($0) } == true
                 keyTrace("handleEvent bool=\(handled) marked=\(hadMarked)->\(hasMarked) route=\(routeToIme) tombstone=\(tombstone)")
             }
+#endif // KNGN_ENABLE_TEXT_INPUT
 
             // The key event has been handled, so it is not passed on to the system (which prevents the beep)
             continue
@@ -1485,6 +1532,8 @@ func platform_poll_events(platformWindow: UnsafeMutableRawPointer?) -> Bool {
 
     return true
 }
+
+#if KNGN_ENABLE_TEXT_INPUT
 
 // The IME composition preedit snapshot
 @_cdecl("platform_get_composition_snapshot")
@@ -1530,6 +1579,8 @@ func platform_set_text_input_document_access(
     let handle = Unmanaged<PlatformWindowHandle>.fromOpaque(platformWindow).takeUnretainedValue()
     handle.backendView.setTextInputDocumentAccess(callbacks: callbacks, userdata: userdata)
 }
+
+#endif // KNGN_ENABLE_TEXT_INPUT
 
 // Take a snapshot of the event queue counters
 @_cdecl("platform_get_event_stats")
@@ -1626,6 +1677,7 @@ func platform_present(platformWindow: UnsafeMutableRawPointer?) -> Void {
 }
 
 // Set the cursor shape. An unknown value falls back to PLATFORM_CURSOR_DEFAULT.
+#if KNGN_ENABLE_CURSOR
 @_cdecl("platform_set_cursor")
 func platform_set_cursor(platformWindow: UnsafeMutableRawPointer?, shape: Int32) -> Void {
     guard let platformWindow = platformWindow else { return }
@@ -1639,6 +1691,7 @@ func platform_set_cursor(platformWindow: UnsafeMutableRawPointer?, shape: Int32)
     }
     handle.backendView.setCursorShape(s)
 }
+#endif // KNGN_ENABLE_CURSOR
 
 // Register the live-resize redraw callback. cb==nil unregisters.
 @_cdecl("platform_set_redraw_callback")
@@ -1728,8 +1781,9 @@ func platform_get_gamepad_state(window: UnsafeMutableRawPointer?, index: Int32, 
 #endif // KNGN_ENABLE_GAMEPAD
 
 // ========================================
-// File selection dialogs
+// File selection dialogs (KNGN_ENABLE_DIALOG)
 // ========================================
+#if KNGN_ENABLE_DIALOG
 // The extension filter uses allowedContentTypes (UTType), which is macOS 11 and later only
 // (allowedFileTypes was deprecated in macOS 12). When UTType is nil for an unknown extension, it falls back to no filter (everything allowed).
 // The ptr of withUnsafeFileSystemRepresentation is Optional. It is strdup'd only once it is known to be non-null.
@@ -1774,6 +1828,8 @@ func platform_open_file_dialog(opts: UnsafePointer<PlatformOpenDialogOptions>?) 
 func platform_free_path(path: UnsafeMutablePointer<CChar>?) -> Void {
     if let path = path { free(path) }
 }
+
+#endif // KNGN_ENABLE_DIALOG
 
 // ========================================
 // The OS text clipboard

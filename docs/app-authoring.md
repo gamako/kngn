@@ -114,8 +114,17 @@ Full-pixel fills use `kit.pixelops.fill32` (never `@memset` on the framebuffer).
   ```
 
   `kit.sound`, `kit.synth` and `kit.dsp` are pure DSP over buffers you already own, so they
-  need neither flag. [`gates/consumer/`](../gates/consumer/) builds exactly this wiring on
-  every change, so the flags stay working; it is a gate, not a starting point.
+  need neither flag.
+
+  The other fields of `PlatformFeatures` — file panels, cursor shapes, mascot windows,
+  fullscreen, text input — are **not** yours to choose. They decide what goes into the macOS
+  backend object file, and you link a prebuilt archive with all of them already enabled, so
+  passing `false` turns nothing off. Only `enable_audio` and `enable_midi` mean anything from
+  outside this repository (see
+  [ADR-013](adr/013_per-executable-capability-linking.md)).
+
+  [`gates/consumer/`](../gates/consumer/) builds exactly this wiring on every change, so the
+  flags stay working; it is a gate, not a starting point.
 
 Do not restate the full `build.zig` here — copy and read [`template/build.zig`](../template/build.zig).
 Backend matrix and host packages: [`docs/build.md`](build.md).

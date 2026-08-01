@@ -35,20 +35,83 @@ pub const PlatformType = enum {
 /// the parameter list. Each one is opt-in, and each one decides what an executable links
 /// (ADR-013).
 ///
-/// `enable_gamepad` and `enable_menu` reach further than linking: they are also baked into
-/// the platform module as `build_options` and into the macOS backend compile as
-/// `-DKNGN_ENABLE_*`. `enable_audio` and `enable_midi` do neither — they only add the
-/// executable-side system libraries that `kit.audio` and `kit.midi` resolve against, and
-/// `setupExecutableForPlatform` ignores them (executables inside this repository call
-/// `linkAudioBackend` / `linkMidiBackend` directly).
+/// Every flag but `enable_audio` and `enable_midi` reaches further than linking: it is also
+/// baked into the platform module as `build_options` and into the macOS backend compile as
+/// `-DKNGN_ENABLE_*`, so the disabled feature's code is absent from the object file and the
+/// macOS backend refuses its API at compile time. `enable_audio` and `enable_midi` do
+/// neither — they only add the executable-side system libraries that `kit.audio` and
+/// `kit.midi` resolve against, and `setupExecutableForPlatform` ignores them (executables
+/// inside this repository call `linkAudioBackend` / `linkMidiBackend` directly).
+///
+/// **These flags only reach an executable that compiles the macOS backend itself.** An
+/// external consumer links a prebuilt native archive and receives the published platform
+/// module, and both are built here with every one of these features enabled, so passing a
+/// `false` from outside this repository turns nothing off. Only `enable_audio` and
+/// `enable_midi` are meaningful to an external consumer.
 pub const PlatformFeatures = struct {
     enable_gamepad: bool = false,
     enable_menu: bool = false,
+    /// Native save/open file panels (`saveFileDialog` / `openFileDialog`). While off, both
+    /// report `error.DialogUnavailable`.
+    enable_dialog: bool = false,
+    /// System cursor shapes (`setCursor`). While off, the call is a no-op and the window
+    /// keeps the default arrow.
+    enable_cursor: bool = false,
+    /// Transparent, borderless, always-on-top, click-through windows and the pop-up quit
+    /// menu — what a desktop mascot needs. While off, `beginDrag`, `setAlwaysOnTop`,
+    /// `setClickThrough`, `showQuitMenu` and `setDockVisible` are no-ops, and asking for a
+    /// transparent or borderless window fails with `error.Unsupported`.
+    enable_mascot: bool = false,
+    /// Fullscreen: the transition, the live state and the geometry to persist. While off,
+    /// creating a fullscreen window fails with `error.Unsupported`, `setFullscreen` is a
+    /// no-op, `isFullscreen` is always false, and `restoreGeometry` reports a zero geometry
+    /// (the window's pre-fullscreen geometry is not tracked, so there is nothing to restore).
+    enable_fullscreen: bool = false,
+    /// The macOS native text input machinery: `NSTextInputClient`, IME composition, and
+    /// document access for reconversion.
+    ///
+    /// **Defaults to true, unlike every other flag here.** On macOS `keyDown` is handed to
+    /// `interpretKeyEvents:`, which makes `insertText:` the only source of `char_input`, so
+    /// turning this off removes character input as well as the IME. Almost every executable
+    /// consumes `char_input`, so this is opt-*out*: set it false only for an executable that
+    /// handles no characters at all. See `docs/adr/013_per-executable-capability-linking.md`.
+    ///
+    /// It gates the OS path only. The harness synthesises `char_input` and
+    /// `composition_changed` without the OS, and keeps doing so either way.
+    enable_text_input: bool = true,
     /// Link what `kit.audio` needs. Set this when the executable uses audio output or
     /// microphone capture.
     enable_audio: bool = false,
     /// Link what `kit.midi` needs. Set this when the executable uses MIDI input.
     enable_midi: bool = false,
+
+    /// The subset that decides the shape of the platform module and of the macOS object
+    /// file. Two feature sets differing only in `enable_audio` / `enable_midi` share one
+    /// module, because those two are executable-side link decisions and reach neither.
+    pub fn moduleKey(self: PlatformFeatures) PlatformFeatures {
+        var key = self;
+        key.enable_audio = false;
+        key.enable_midi = false;
+        return key;
+    }
+
+    /// Every feature enabled — what the published platform module and the published native
+    /// archive are built with, so that an external consumer keeps the whole surface.
+    /// `enable_gamepad` stays a parameter because it also decides a framework link the
+    /// consumer's executable has to make, and it reaches the consumer as `-Denable_gamepad`.
+    pub fn published(enable_gamepad: bool) PlatformFeatures {
+        return .{
+            .enable_gamepad = enable_gamepad,
+            // The menu needs its own translation unit archived alongside, which the published
+            // archive does not carry, so it stays off outside this repository.
+            .enable_menu = false,
+            .enable_dialog = true,
+            .enable_cursor = true,
+            .enable_mascot = true,
+            .enable_fullscreen = true,
+            .enable_text_input = true,
+        };
+    }
 };
 
 /// Link the system libraries `core/audio.zig` resolves against, for one module.

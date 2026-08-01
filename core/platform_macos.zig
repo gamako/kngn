@@ -20,11 +20,45 @@ const c = @cImport({
 // backend alone, whose symbol the native implementations (objc/swift/metal) provide under the same name.
 extern fn platform_cancel_quit(window: *c.PlatformWindow) void;
 
+/// Whether a macOS native backend (objc/swift/metal) supplies this build's object file. The
+/// optional features below live in that object file, so every gate is conjoined with it.
+const macos_native_backend = std.mem.eql(u8, build_options.platform_backend, "objc") or
+    std.mem.eql(u8, build_options.platform_backend, "swift") or
+    std.mem.eql(u8, build_options.platform_backend, "metal");
+
 /// The menu C symbols are referenced only with enable_menu and a macOS native backend
 /// (objc/swift/metal), which structurally prevents an undefined symbol in an executable without them.
-const menu_c_abi = build_options.enable_menu and (std.mem.eql(u8, build_options.platform_backend, "objc") or
-    std.mem.eql(u8, build_options.platform_backend, "swift") or
-    std.mem.eql(u8, build_options.platform_backend, "metal"));
+const menu_c_abi = build_options.enable_menu and macos_native_backend;
+
+// ============================================================================
+// The optional feature gates (ADR-013)
+// ============================================================================
+//
+// Each of these mirrors a `-DKNGN_ENABLE_*` the executable's object file was compiled with.
+// The native side omits the feature's implementation, so referring to one of its C symbols
+// here would be an undefined symbol at link time; every entry point below therefore leaves
+// through `if (comptime !<gate>) return <neutral result>;` before it can reach one. A
+// comptime-false condition is resolved during analysis, so the call that follows is never
+// emitted and the symbol is never referenced.
+//
+// The gates sit in this backend rather than in the OS-dispatching facade
+// (`core/platform.zig`) on purpose: they describe what the macOS object file contains, and
+// putting them in the facade would switch the Linux and Windows backends off along with it.
+//
+// The neutral results are the contract an executable that did not opt in sees. They are
+// stated on each function.
+
+/// Native save/open panels.
+const dialog_enabled = build_options.enable_dialog and macos_native_backend;
+
+/// System cursor shapes.
+const cursor_enabled = build_options.enable_cursor and macos_native_backend;
+
+/// Transparent / borderless / always-on-top / click-through windows and the pop-up quit menu.
+const mascot_enabled = build_options.enable_mascot and macos_native_backend;
+
+/// The fullscreen transition, the live state, and the geometry to persist.
+const fullscreen_enabled = build_options.enable_fullscreen and macos_native_backend;
 
 const MenuC = if (menu_c_abi) struct {
     extern fn platform_menu_available() bool;
@@ -47,9 +81,10 @@ const ClipboardC = if (clipboard_c_abi) struct {
     extern fn platform_get_clipboard_text(out: [*]u8, cap: u32, out_len: *u32) bool;
 } else struct {};
 
-/// The text input focus control C symbol is implemented by all three macOS backends (objc/swift/metal).
-/// A unit test references no C symbol (which prevents an undefined symbol at link time).
-const text_input_c_abi = !builtin.is_test;
+/// The text input C symbols exist only with enable_text_input, which all three macOS backends
+/// (objc/swift/metal) honour. A unit test references no C symbol (which prevents an undefined
+/// symbol at link time).
+const text_input_c_abi = build_options.enable_text_input and macos_native_backend and !builtin.is_test;
 
 const TextInputC = if (text_input_c_abi) struct {
     extern fn platform_set_text_input_active(window: ?*c.PlatformWindow, active: bool) void;
@@ -111,7 +146,9 @@ pub fn displayRefreshHz() ?f64 {
 
 /// Show or hide the Dock icon and the menu bar (application-wide, not per window).
 /// visible=false selects accessory (behaving like a background app). Initialisation and event time only.
+/// Without the mascot opt-in this is a no-op and the application keeps its Dock icon.
 pub fn setDockVisible(visible: bool) void {
+    if (comptime !mascot_enabled) return;
     c.platform_set_dock_visible(visible);
 }
 
@@ -428,8 +465,18 @@ pub const Window = struct {
     /// instant before the transition, which is asynchronous; the real size becomes the screen
     /// resolution and the framebuffer follows through the existing frame-size path, so an
     /// application follows `fb.width`/`fb.height` (ADR-019 R3).
+    ///
+    /// Two of the options are opt-in features (ADR-013), and asking for one this build does
+    /// not carry is `error.Unsupported` rather than a silently ordinary window: transparency
+    /// and borderlessness need the mascot opt-in, and fullscreen needs the fullscreen opt-in.
     /// Hot path declaration: initialisation only (a single window creation).
     pub fn createWithOptions(width: u32, height: u32, title: [:0]const u8, opts: types.WindowOptions) Error!Window {
+        if (comptime !mascot_enabled) {
+            if (opts.transparent or opts.borderless) return error.Unsupported;
+        }
+        if (comptime !fullscreen_enabled) {
+            if (opts.fullscreen) return error.Unsupported;
+        }
         var flags: u32 = 0;
         if (opts.transparent) flags |= c.PLATFORM_WINDOW_TRANSPARENT;
         if (opts.borderless) flags |= c.PLATFORM_WINDOW_BORDERLESS;
@@ -449,7 +496,9 @@ pub const Window = struct {
             null,
             &copts,
         ) orelse return error.WindowCreationFailed;
-        if (opts.fullscreen) c.platform_set_fullscreen(w, true);
+        if (comptime fullscreen_enabled) {
+            if (opts.fullscreen) c.platform_set_fullscreen(w, true);
+        }
         return .{ .handle = w };
     }
 
@@ -459,22 +508,29 @@ pub const Window = struct {
     }
 
     /// Start the OS's interactive window move from the most recent pointer press. Event time only.
+    /// A no-op without the mascot opt-in.
     pub fn beginDrag(self: Window) void {
+        if (comptime !mascot_enabled) return;
         c.platform_begin_window_drag(self.handle);
     }
 
-    /// Set always-on-top. Event time only.
+    /// Set always-on-top. Event time only. A no-op without the mascot opt-in.
     pub fn setAlwaysOnTop(self: Window, on: bool) void {
+        if (comptime !mascot_enabled) return;
         c.platform_set_always_on_top(self.handle, on);
     }
 
     /// Set per-pixel click-through, letting a click over a transparent pixel fall through to what is behind.
+    /// A no-op without the mascot opt-in.
     pub fn setClickThrough(self: Window, on: bool) void {
+        if (comptime !mascot_enabled) return;
         c.platform_set_click_through(self.handle, on);
     }
 
     /// Pop up a quit menu (choosing it pushes quit onto the window's event queue).
+    /// A no-op without the mascot opt-in.
     pub fn showQuitMenu(self: Window) void {
+        if (comptime !mascot_enabled) return;
         c.platform_show_quit_menu(self.handle);
     }
 
@@ -527,7 +583,9 @@ pub const Window = struct {
 
     /// Write the IME composition preedit text into buf. When it is empty, text has length 0.
     /// latest-wins: always the current state. event.revision only detects a missed update; an older revision cannot be read.
+    /// Without the text input opt-in there is never a composition, so the snapshot is empty.
     pub fn getCompositionSnapshot(self: Window, buf: []u8) CompositionSnapshot {
+        if (comptime !text_input_c_abi) return .{ .text = buf[0..0], .revision = 0, .cursor = 0 };
         var meta: c.PlatformCompositionMeta = .{
             .revision = 0,
             .cursor = 0,
@@ -548,7 +606,9 @@ pub const Window = struct {
     }
 
     /// Supply the caret rect the IME candidate window is anchored to, in framebuffer pixels (event time only).
+    /// A no-op without the text input opt-in.
     pub fn setCompositionRect(self: Window, x: i32, y: i32, w: i32, h: i32) void {
+        if (comptime !text_input_c_abi) return;
         c.platform_set_composition_rect(self.handle, x, y, w, h);
     }
 
@@ -637,7 +697,9 @@ pub const Window = struct {
     }
 
     /// Set the cursor shape. Expected to be called at event time only (so the performance rules do not apply).
+    /// A no-op without the cursor opt-in, leaving the window with the default arrow.
     pub fn setCursor(self: Window, shape: CursorShape) void {
+        if (comptime !cursor_enabled) return;
         c.platform_set_cursor(self.handle, @intFromEnum(shape));
     }
 
@@ -724,22 +786,32 @@ pub fn getGeometry(win: Window) types.WindowGeometry {
 
 /// Whether the window is fullscreen right now, including a fullscreen the user started with the
 /// window button or Cmd+Ctrl+F (ADR-019 R10). The native side reads the window's style mask.
+/// Without the fullscreen opt-in the state is not tracked and this is always false.
 /// Hot path declaration: event time only.
 pub fn isFullscreen(win: Window) bool {
+    if (comptime !fullscreen_enabled) return false;
     return c.platform_is_fullscreen(win.handle);
 }
 
 /// Ask the window to enter or leave fullscreen. The transition is asynchronous, so the result is
 /// observed through `isFullscreen`, not from this call (ADR-019 R10).
+/// A no-op without the fullscreen opt-in.
 /// Hot path declaration: event time only.
 pub fn setFullscreen(win: Window, enable: bool) void {
+    if (comptime !fullscreen_enabled) return;
     c.platform_set_fullscreen(win.handle, enable);
 }
 
 /// The geometry an application should persist. The native side holds the snapshot taken when the
 /// window entered fullscreen, because only it observes a transition the user starts.
+///
+/// Without the fullscreen opt-in the pre-fullscreen geometry is not tracked, and this reports
+/// a zero size with no position — "there is nothing to restore". Reporting the live geometry
+/// instead would let a persistence layer save the screen size of a window the user had put
+/// fullscreen with the green button, and reopen at that size.
 /// Hot path declaration: window shutdown and event time only.
 pub fn restoreGeometry(win: Window) types.WindowGeometry {
+    if (comptime !fullscreen_enabled) return .{ .position = null, .size = .{ .width = 0, .height = 0 } };
     var geo: c.PlatformWindowGeometry = .{
         .x = 0,
         .y = 0,
@@ -880,8 +952,9 @@ fn getMetrics(win: Window) ?c.PlatformFramebufferMetrics {
 // The return value is a slice owned by gpa (the caller frees it with gpa.free). A cancel gives null,
 // and a failed allocation gives error.OutOfMemory.
 
-/// Let the user choose where to save.
+/// Let the user choose where to save. `error.DialogUnavailable` without the dialog opt-in.
 pub fn saveFileDialog(gpa: std.mem.Allocator, io: std.Io, opts: SaveDialogOptions) (DialogError || std.mem.Allocator.Error)!?[]u8 {
+    if (comptime !dialog_enabled) return error.DialogUnavailable;
     _ = io; // macOS uses a native panel (io is unused). It is taken because the signature is shared by every OS.
     var c_opts: c.PlatformSaveDialogOptions = .{
         .default_name = if (opts.default_name) |s| s.ptr else null,
@@ -892,7 +965,9 @@ pub fn saveFileDialog(gpa: std.mem.Allocator, io: std.Io, opts: SaveDialogOption
 }
 
 /// Let the user choose a file to open (a single selection, files only).
+/// `error.DialogUnavailable` without the dialog opt-in.
 pub fn openFileDialog(gpa: std.mem.Allocator, io: std.Io, opts: OpenDialogOptions) (DialogError || std.mem.Allocator.Error)!?[]u8 {
+    if (comptime !dialog_enabled) return error.DialogUnavailable;
     _ = io; // macOS uses a native panel (io is unused). It is taken because the signature is shared by every OS.
     var c_opts: c.PlatformOpenDialogOptions = .{
         .allowed_ext = if (opts.allowed_ext) |s| s.ptr else null,

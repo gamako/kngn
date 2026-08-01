@@ -126,7 +126,7 @@ fn makeInternalWasmLinker(b: *std.Build, wasm_harness: bool) platform.WasmLinker
 
             if (std.mem.eql(u8, link_ctx.spec.name, "pixie")) {
                 const root = TaggedModule{ .mod = link_ctx.app_module, .layer = .app, .name = "pixie" };
-                link(root, pm.kit);
+                link(root, pm.base().kit);
                 link(root, shared.paint);
                 // pixelops is re-exported via kit (kit.pixelops); no direct apps → pixelops link.
             } else if (std.mem.eql(u8, link_ctx.spec.name, "synth") or
@@ -135,7 +135,7 @@ fn makeInternalWasmLinker(b: *std.Build, wasm_harness: bool) platform.WasmLinker
                 // Shared and postMessage synth share the same app module graph; only the
                 // wasm memory / audio transport differ (see WasmAppSpec.audio).
                 const root = TaggedModule{ .mod = link_ctx.app_module, .layer = .app, .name = "synth" };
-                link(root, pm.kit);
+                link(root, pm.base().kit);
                 link(root, shared.spectrogram);
                 link(root, shared.scope);
                 link(root, shared.serde);
@@ -642,12 +642,12 @@ pub fn build(b: *std.Build) void {
             .{ .name = "example_15", .path = "examples/15_audio_tone/main.zig", .needs_sprite = false, .needs_fps_counter = false, .needs_fixed_timestep = false, .needs_text = false, .needs_gui = false, .needs_png = false, .needs_font = false, .needs_audio = true, .needs_gamepad = false, .needs_gmath = false, .needs_sound = false },
             .{ .name = "example_16", .path = "examples/16_gui_scroll/main.zig", .needs_sprite = false, .needs_fps_counter = false, .needs_fixed_timestep = false, .needs_text = false, .needs_gui = true, .needs_png = false, .needs_font = false, .needs_audio = false, .needs_gamepad = false, .needs_gmath = false, .needs_sound = false },
             .{ .name = "example_17", .path = "examples/17_gui_toggles/main.zig", .needs_sprite = false, .needs_fps_counter = false, .needs_fixed_timestep = false, .needs_text = false, .needs_gui = true, .needs_png = false, .needs_font = false, .needs_audio = false, .needs_gamepad = false, .needs_gmath = false, .needs_sound = false },
-            .{ .name = "example_18", .path = "examples/18_cursor/main.zig", .needs_sprite = false, .needs_fps_counter = false, .needs_fixed_timestep = false, .needs_text = false, .needs_gui = false, .needs_png = false, .needs_font = false, .needs_audio = false, .needs_gamepad = false, .needs_gmath = false, .needs_sound = false },
+            .{ .name = "example_18", .path = "examples/18_cursor/main.zig", .needs_sprite = false, .needs_fps_counter = false, .needs_fixed_timestep = false, .needs_text = false, .needs_gui = false, .needs_png = false, .needs_font = false, .needs_audio = false, .needs_gamepad = false, .needs_gmath = false, .needs_sound = false, .platform_features = exe_features.cursor },
             .{ .name = "example_19", .path = "examples/19_color_emoji/main.zig", .needs_sprite = false, .needs_fps_counter = false, .needs_fixed_timestep = false, .needs_text = false, .needs_gui = false, .needs_png = false, .needs_font = true, .needs_audio = false, .needs_gamepad = false, .needs_gmath = false, .needs_sound = false },
             .{ .name = "example_21", .path = "examples/21_char_input/main.zig", .needs_sprite = false, .needs_fps_counter = false, .needs_fixed_timestep = false, .needs_text = false, .needs_gui = false, .needs_png = false, .needs_font = true, .needs_audio = false, .needs_gamepad = false, .needs_gmath = false, .needs_sound = false },
             .{ .name = "example_22", .path = "examples/22_gamepad/main.zig", .needs_sprite = false, .needs_fps_counter = false, .needs_fixed_timestep = false, .needs_text = false, .needs_gui = false, .needs_png = false, .needs_font = false, .needs_audio = false, .needs_gamepad = true, .needs_gmath = false, .needs_sound = false },
-            .{ .name = "example_23", .path = "examples/23_fullscreen/main.zig", .needs_sprite = false, .needs_fps_counter = false, .needs_fixed_timestep = false, .needs_text = false, .needs_gui = false, .needs_png = false, .needs_font = false, .needs_audio = false, .needs_gamepad = false, .needs_gmath = false, .needs_sound = false },
-            .{ .name = "example_24", .path = "examples/24_desktop_mascot/main.zig", .needs_sprite = false, .needs_fps_counter = false, .needs_fixed_timestep = false, .needs_text = false, .needs_gui = false, .needs_png = true, .needs_font = false, .needs_audio = false, .needs_gamepad = false, .needs_gmath = false, .needs_sound = false },
+            .{ .name = "example_23", .path = "examples/23_fullscreen/main.zig", .needs_sprite = false, .needs_fps_counter = false, .needs_fixed_timestep = false, .needs_text = false, .needs_gui = false, .needs_png = false, .needs_font = false, .needs_audio = false, .needs_gamepad = false, .needs_gmath = false, .needs_sound = false, .platform_features = exe_features.fullscreen },
+            .{ .name = "example_24", .path = "examples/24_desktop_mascot/main.zig", .needs_sprite = false, .needs_fps_counter = false, .needs_fixed_timestep = false, .needs_text = false, .needs_gui = false, .needs_png = true, .needs_font = false, .needs_audio = false, .needs_gamepad = false, .needs_gmath = false, .needs_sound = false, .platform_features = exe_features.mascot },
             .{ .name = "example_25", .path = "examples/25_collision_demo/main.zig", .needs_sprite = false, .needs_fps_counter = false, .needs_fixed_timestep = false, .needs_text = false, .needs_gui = false, .needs_png = false, .needs_font = false, .needs_audio = false, .needs_gamepad = false, .needs_gmath = true, .needs_sound = false },
             .{ .name = "example_26", .path = "examples/26_appshell_demo/main.zig", .needs_sprite = false, .needs_fps_counter = false, .needs_fixed_timestep = false, .needs_text = false, .needs_gui = true, .needs_png = false, .needs_font = true, .needs_paint = true, .needs_audio = false, .needs_gamepad = false, .needs_gmath = false, .needs_sound = false },
             .{ .name = "example_27", .path = "examples/27_selectable_label/main.zig", .needs_sprite = false, .needs_fps_counter = false, .needs_fixed_timestep = false, .needs_text = false, .needs_gui = true, .needs_png = false, .needs_font = true, .needs_audio = false, .needs_gamepad = false, .needs_gmath = false, .needs_sound = false },
@@ -682,6 +682,7 @@ pub fn build(b: *std.Build) void {
                 .needs_midi = std.mem.eql(u8, example.name, "example_29"),
                 .needs_gmath = example.needs_gmath,
                 .needs_sound = example.needs_sound,
+                .platform_features = if (@hasField(@TypeOf(example), "platform_features")) example.platform_features else exe_features.base,
                 .needs_kit = std.mem.eql(u8, example.name, "example_31") or std.mem.eql(u8, example.name, "example_32") or std.mem.eql(u8, example.name, "example_33") or std.mem.eql(u8, example.name, "example_34") or std.mem.eql(u8, example.name, "example_36") or std.mem.eql(u8, example.name, "example_38") or std.mem.startsWith(u8, example.name, "example_26"),
             };
             // audio examples: audio-capable OSes only (macOS/Linux/Windows). All other examples: every OS.
@@ -1025,10 +1026,14 @@ pub fn build(b: *std.Build) void {
         platform_macos_test_mod.addIncludePath(platform_root);
         platform_macos_test_mod.addImport("platform_types", shared_modules.types.mod);
         platform_macos_test_mod.addImport("command_types", shared_modules.command_types.mod);
-        const macos_opts = b.addOptions();
-        macos_opts.addOption([]const u8, "platform_backend", platform.backendName(platform.defaultBackend(target_os)));
-        macos_opts.addOption(bool, "enable_menu", false);
-        platform_macos_test_mod.addOptions("build_options", macos_opts);
+        // The same option set the production module gets, so a flag added to
+        // `platformBuildOptions` cannot go missing here and break this test for an unrelated
+        // reason. The values are the defaults: this test links no C symbol at all.
+        platform_macos_test_mod.addOptions("build_options", platform.platformBuildOptions(
+            b,
+            platform.defaultBackend(target_os),
+            .{},
+        ));
         const platform_macos_test = b.addTest(.{ .root_module = platform_macos_test_mod });
         test_platform_facade_step.dependOn(&b.addRunArtifact(platform_macos_test).step);
     }
@@ -1738,7 +1743,7 @@ pub fn build(b: *std.Build) void {
     blit_test_mod.addImport("paint", blit_core);
     // blit.zig uses kit.pixelops (same instance as shared_modules.pixelops).
     const blit_pm = makePlatformModules(b, target, default_be, &shared_modules);
-    blit_test_mod.addImport("kit", blit_pm.kit.mod);
+    blit_test_mod.addImport("kit", blit_pm.base().kit.mod);
     const blit_test = b.addTest(.{ .root_module = blit_test_mod });
     const run_blit_test = b.addRunArtifact(blit_test);
 
@@ -1757,7 +1762,7 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
     grid_overlay_test_mod.addImport("paint", grid_overlay_core);
-    grid_overlay_test_mod.addImport("kit", blit_pm.kit.mod);
+    grid_overlay_test_mod.addImport("kit", blit_pm.base().kit.mod);
     const grid_overlay_test = b.addTest(.{ .root_module = grid_overlay_test_mod });
     const run_grid_overlay_test = b.addRunArtifact(grid_overlay_test);
 
@@ -1776,7 +1781,7 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
     loupe_overlay_test_mod.addImport("paint", loupe_overlay_core);
-    loupe_overlay_test_mod.addImport("kit", blit_pm.kit.mod);
+    loupe_overlay_test_mod.addImport("kit", blit_pm.base().kit.mod);
     const loupe_overlay_test = b.addTest(.{ .root_module = loupe_overlay_test_mod });
     const run_loupe_overlay_test = b.addRunArtifact(loupe_overlay_test);
 
@@ -1883,7 +1888,7 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
-    history_summary_mod.addImport("kit", history_summary_pm.kit.mod);
+    history_summary_mod.addImport("kit", history_summary_pm.base().kit.mod);
     const history_summary_test = b.addTest(.{ .root_module = history_summary_mod });
     const run_history_summary_test = b.addRunArtifact(history_summary_test);
     const test_history_summary_step = b.step("test-history-summary", "Run history_summary schema unit tests");
@@ -1891,7 +1896,7 @@ pub fn build(b: *std.Build) void {
 
     // History persistence: composing command/undo codecs onto the journal store.
     // Needs kit (command types, the journal store) and paint (Op codec, UndoStack).
-    const history_persist_pm = makePlatformModules(b, target, default_be, &shared_modules, false);
+    const history_persist_pm = makePlatformModules(b, target, default_be, &shared_modules);
     const history_persist_paint = b.createModule(.{
         .root_source_file = b.path("libs/paint/src/paint.zig"),
     });
@@ -1904,7 +1909,7 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
-    history_persist_mod.addImport("kit", history_persist_pm.kit.mod);
+    history_persist_mod.addImport("kit", history_persist_pm.base().kit.mod);
     history_persist_mod.addImport("paint", history_persist_paint);
     const history_persist_test = b.addTest(.{ .root_module = history_persist_mod });
     const run_history_persist_test = b.addRunArtifact(history_persist_test);
@@ -2796,7 +2801,7 @@ pub fn build(b: *std.Build) void {
     bench_blit_mod.addImport("paint", bench_blit_core);
     // blit.zig uses kit.pixelops (same path as the app). Kit is wired via makePlatformModules.
     const bench_blit_pm = makePlatformModules(b, target, default_be, &shared_modules);
-    bench_blit_mod.addImport("kit", bench_blit_pm.kit.mod);
+    bench_blit_mod.addImport("kit", bench_blit_pm.base().kit.mod);
     const bench_blit_root = b.createModule(.{
         .root_source_file = b.path("bench/blit.zig"),
         .target = target,
@@ -2887,14 +2892,81 @@ fn artifactName(b: *std.Build, base: []const u8, be: platform.PlatformType, defa
 // Build per-backend platform / keyboard modules
 // (platform module gets build_options.platform_backend)
 // ============================================================
+/// The macOS backend feature sets the executables built here use (ADR-013).
+///
+/// A feature set is not a per-feature switch but a statement about one executable: what it
+/// asks the platform layer for, and — just as deliberately — what it does not. Both halves
+/// matter, which is why a demo that handles no characters turns `enable_text_input` off
+/// rather than leaving the default in place.
+///
+/// Every set listed in `all` gets its own {platform, app_runtime, kit} trio, because the
+/// modules carry the flags as `build_options`. Adding an executable with a set that is not
+/// here stops the build with a message from `PlatformModules.variant`, so the list can never
+/// silently fall behind.
+const exe_features = struct {
+    /// Nothing optional. Most examples, the main program, synth.
+    const base: platform.PlatformFeatures = .{};
+    /// GameController input (examples 22 and 34).
+    const gamepad: platform.PlatformFeatures = .{ .enable_gamepad = true };
+    /// System cursor shapes (example 18).
+    const cursor: platform.PlatformFeatures = .{ .enable_cursor = true };
+    /// A fullscreen window and nothing else — example 23 reads keys, never characters.
+    const fullscreen: platform.PlatformFeatures = .{ .enable_fullscreen = true, .enable_text_input = false };
+    /// A transparent, borderless, click-through window — example 24 takes no text either.
+    const mascot: platform.PlatformFeatures = .{ .enable_mascot = true, .enable_text_input = false };
+    /// The pixel editor: a native menu bar, file panels, a crosshair over the canvas, and
+    /// fullscreen (it persists `restoreGeometry`).
+    const editor: platform.PlatformFeatures = .{
+        .enable_menu = true,
+        .enable_dialog = true,
+        .enable_cursor = true,
+        .enable_fullscreen = true,
+    };
+    /// The patch canvas: a native menu bar and file panels.
+    const patch: platform.PlatformFeatures = .{ .enable_menu = true, .enable_dialog = true };
+
+    const all = [_]platform.PlatformFeatures{ base, gamepad, cursor, fullscreen, mascot, editor, patch };
+};
+
+/// One feature set's modules. `platform`, `app_runtime` and `kit` all carry the set, so they
+/// come as a trio and an executable takes all three from the same one.
+const PlatformVariant = struct {
+    features: platform.PlatformFeatures,
+    platform_mod: TaggedModule,
+    app_runtime: TaggedModule,
+    kit: TaggedModule,
+};
+
 const PlatformModules = struct {
-    platform: TaggedModule, // opt-in off (default; main/synth/modular/patch/most examples)
-    platform_gamepad: TaggedModule, // gamepad opt-in (examples/22_gamepad / 34_action_map)
-    platform_menu: TaggedModule, // for menu opt-in (shared by pixie/patch)
+    /// One entry per `exe_features.all`, in that order.
+    variants: []const PlatformVariant,
     keyboard: *std.Build.Module, // legacy src/ (examples only; outside layer management)
-    kit: TaggedModule, // wire the platform (opt-in off) side
-    kit_gamepad: TaggedModule, // wire the platform_gamepad side (example_34)
-    kit_menu: TaggedModule, // for menu opt-in (shared by pixie/patch)
+
+    /// The trio built for `features`.
+    ///
+    /// The lookup ignores `enable_audio` and `enable_midi` (`moduleKey`): those two are
+    /// executable-side link decisions that reach no module, so folding them into the key
+    /// would build duplicate modules for identical graphs.
+    ///
+    /// An unlisted set is a build-configuration error rather than a fallback, because the
+    /// quiet alternative — handing back the default trio — links an object file compiled
+    /// with the feature against a module that says it is off, and the failure surfaces much
+    /// later as an undefined symbol.
+    fn variant(self: *const PlatformModules, features: platform.PlatformFeatures) PlatformVariant {
+        const key = features.moduleKey();
+        for (self.variants) |v| {
+            if (std.meta.eql(v.features, key)) return v;
+        }
+        std.debug.panic(
+            "no platform module variant for this feature set; add it to exe_features.all: {any}",
+            .{key},
+        );
+    }
+
+    /// The trio with nothing optional enabled.
+    fn base(self: *const PlatformModules) PlatformVariant {
+        return self.variant(exe_features.base);
+    }
 };
 
 fn wireKitImports(kit: TaggedModule, platform_mod: TaggedModule, common: *const SharedModules, app_runtime: TaggedModule) void {
@@ -2919,8 +2991,16 @@ fn wireKitImports(kit: TaggedModule, platform_mod: TaggedModule, common: *const 
     link(kit, app_runtime);
 }
 
-fn makePlatformModules(b: *std.Build, target: std.Build.ResolvedTarget, backend: platform.PlatformType, common: *const SharedModules) PlatformModules {
-    // opt-in-off edition (default). main/synth/modular/patch/most examples use this.
+/// Build the {platform, app_runtime, kit} trio for one feature set, for one backend.
+///
+/// Runs at build-graph configuration time only (not per-frame / RT).
+fn makePlatformVariant(
+    b: *std.Build,
+    target: std.Build.ResolvedTarget,
+    backend: platform.PlatformType,
+    common: *const SharedModules,
+    features: platform.PlatformFeatures,
+) PlatformVariant {
     const platform_mod: TaggedModule = .{ .layer = .core, .name = "platform", .mod = platform.createPlatformModule(
         b,
         target,
@@ -2930,41 +3010,11 @@ fn makePlatformModules(b: *std.Build, target: std.Build.ResolvedTarget, backend:
         common.types.mod,
         common.command_types.mod,
         common.harness.mod,
-        .{},
+        features,
     ) };
-    // Gamepad opt-in-on edition. examples/22_gamepad only.
-    const platform_gamepad_mod: TaggedModule = .{ .layer = .core, .name = "platform", .mod = platform.createPlatformModule(
-        b,
-        target,
-        b.path("core/platform.zig"),
-        b.path("platform"),
-        backend,
-        common.types.mod,
-        common.command_types.mod,
-        common.harness.mod,
-        .{ .enable_gamepad = true },
-    ) };
-    // Native menu opt-in-on edition (shared across macOS objc/swift/metal; shared by pixie/patch).
-    // Separate Module because build_options differ.
-    const platform_menu_mod: TaggedModule = .{ .layer = .core, .name = "platform", .mod = platform.createPlatformModule(
-        b,
-        target,
-        b.path("core/platform.zig"),
-        b.path("platform"),
-        backend,
-        common.types.mod,
-        common.command_types.mod,
-        common.harness.mod,
-        .{ .enable_menu = true },
-    ) };
-    // keyboard borrows KeyCode type defs from platform_types (opt-in-off types are enough;
-    // depends on type-only core only, not the platform facade).
-    const keyboard_mod = b.createModule(.{
-        .root_source_file = b.path("libs/gfx/src/keyboard.zig"),
-    });
-    keyboard_mod.addImport("platform_types", common.types.mod);
 
-    // app_runtime: frame-driven runtime. Depends on platform, so one per backend and per opt-in.
+    // app_runtime: the frame-driven runtime. It depends on platform, so it follows the
+    // feature set as well as the backend.
     const app_runtime: TaggedModule = .{ .layer = .core, .name = "app_runtime", .mod = b.createModule(.{
         .root_source_file = b.path("core/app_runtime.zig"),
         .target = target,
@@ -2973,56 +3023,42 @@ fn makePlatformModules(b: *std.Build, target: std.Build.ResolvedTarget, backend:
     link(app_runtime, platform_mod);
     app_runtime.mod.addImport("build_options", common.max_modules_mod);
 
-    const app_runtime_gamepad: TaggedModule = .{ .layer = .core, .name = "app_runtime", .mod = b.createModule(.{
-        .root_source_file = b.path("core/app_runtime.zig"),
-        .target = target,
-        .single_threaded = if (backend == .wasm) platform.wasm_single_threaded else null,
-    }) };
-    link(app_runtime_gamepad, platform_gamepad_mod);
-    app_runtime_gamepad.mod.addImport("build_options", common.max_modules_mod);
-
-    const app_runtime_menu: TaggedModule = .{ .layer = .core, .name = "app_runtime", .mod = b.createModule(.{
-        .root_source_file = b.path("core/app_runtime.zig"),
-        .target = target,
-        .single_threaded = if (backend == .wasm) platform.wasm_single_threaded else null,
-    }) };
-    link(app_runtime_menu, platform_menu_mod);
-    app_runtime_menu.mod.addImport("build_options", common.max_modules_mod);
-
     // kit umbrella (per backend; ADR-007 R4). Keep 1:1 with pub imports in kit/kit.zig.
     const kit: TaggedModule = .{ .layer = .kit, .name = "kit", .mod = b.createModule(.{
         .root_source_file = b.path("kit/kit.zig"),
     }) };
     wireKitImports(kit, platform_mod, common, app_runtime);
 
-    // gamepad opt-in kit (example_34; platform_gamepad and ActionMap share the same opt-in)
-    const kit_gamepad: TaggedModule = .{ .layer = .kit, .name = "kit", .mod = b.createModule(.{
-        .root_source_file = b.path("kit/kit.zig"),
-    }) };
-    wireKitImports(kit_gamepad, platform_gamepad_mod, common, app_runtime_gamepad);
-
-    // menu opt-in kit (wires enable_menu=true platform; shared by pixie/patch)
-    const kit_menu: TaggedModule = .{ .layer = .kit, .name = "kit", .mod = b.createModule(.{
-        .root_source_file = b.path("kit/kit.zig"),
-    }) };
-    wireKitImports(kit_menu, platform_menu_mod, common, app_runtime_menu);
-
     // BGRA→RGBA SIMD swizzle for wasm present (platform_wasm → pixelops).
     // ADR-007 core→lib exception via linkCoreException (bare addImport is not allowed).
     if (backend == .wasm) {
         linkCoreException(platform_mod, common.pixelops, "BGRA→RGBA SIMD swizzle for wasm present");
-        linkCoreException(platform_gamepad_mod, common.pixelops, "BGRA→RGBA SIMD swizzle for wasm present");
-        linkCoreException(platform_menu_mod, common.pixelops, "BGRA→RGBA SIMD swizzle for wasm present");
     }
 
     return .{
-        .platform = platform_mod,
-        .platform_gamepad = platform_gamepad_mod,
-        .platform_menu = platform_menu_mod,
-        .keyboard = keyboard_mod,
+        .features = features.moduleKey(),
+        .platform_mod = platform_mod,
+        .app_runtime = app_runtime,
         .kit = kit,
-        .kit_gamepad = kit_gamepad,
-        .kit_menu = kit_menu,
+    };
+}
+
+fn makePlatformModules(b: *std.Build, target: std.Build.ResolvedTarget, backend: platform.PlatformType, common: *const SharedModules) PlatformModules {
+    const variants = b.allocator.alloc(PlatformVariant, exe_features.all.len) catch @panic("OOM");
+    for (exe_features.all, 0..) |features, i| {
+        variants[i] = makePlatformVariant(b, target, backend, common, features);
+    }
+
+    // keyboard borrows KeyCode type defs from platform_types (feature flags do not reach it;
+    // it depends on type-only core only, not the platform facade).
+    const keyboard_mod = b.createModule(.{
+        .root_source_file = b.path("libs/gfx/src/keyboard.zig"),
+    });
+    keyboard_mod.addImport("platform_types", common.types.mod);
+
+    return .{
+        .variants = variants,
+        .keyboard = keyboard_mod,
     };
 }
 
@@ -3048,9 +3084,9 @@ fn addMainExe(
         }),
     });
     // src/main.zig is not under apps/, so it is outside R5 (kit-only); same legacy wiring as examples.
-    exe.root_module.addImport("platform", pm.platform.mod);
-    // Gamepad opt-in off (main does not use gamepad; keeps existing exes unchanged).
-    platform.setupExecutableForPlatform(b, exe, platform_type, optimize, platform_root, sdk_paths, .{});
+    exe.root_module.addImport("platform", pm.base().platform_mod.mod);
+    // Nothing optional: the main program uses the core primitives only.
+    platform.setupExecutableForPlatform(b, exe, platform_type, optimize, platform_root, sdk_paths, exe_features.base);
     return exe;
 }
 
@@ -3133,10 +3169,12 @@ const SharedModules = struct {
         // (default false = safe side). platform_backend must match the consumer's chosen backend
         // so OS dispatchers do not @compileError. Native menus are an in-repository feature and
         // stay off for a consumer.
-        platform.addPlatformBuildOptions(b, platform_mod.mod, platform_backend, .{
-            .enable_gamepad = enable_gamepad,
-            .enable_menu = false,
-        });
+        // The published module carries every optional macOS feature (`published`), because a
+        // consumer links a prebuilt archive it cannot recompile and cannot influence this
+        // module's build_options: a flag turned off here would delete the feature for them
+        // with no way to get it back. Per-executable gating is for executables built in this
+        // repository, which compile their own object file.
+        platform.addPlatformBuildOptions(b, platform_mod.mod, platform_backend, platform.PlatformFeatures.published(enable_gamepad));
 
         // External public module. dep.module("png").
         const png: TaggedModule = .{ .layer = .lib, .name = "png", .mod = if (is_wasm)
@@ -3465,7 +3503,17 @@ const ExampleNeeds = struct {
     needs_gmath: bool, // true only for examples/25_collision_demo
     needs_sound: bool, // true only for examples/30_sound_demo
     needs_kit: bool = false, // example_31/32/33/34/36/38 / example_26
+    /// The macOS backend feature set (`exe_features`). `needs_gamepad` folds into it in
+    /// `exampleFeatures`, so an example states its gamepad need once.
+    platform_features: platform.PlatformFeatures = exe_features.base,
 };
+
+/// The one feature set an example's platform module, kit module and object file all use.
+fn exampleFeatures(needs: ExampleNeeds) platform.PlatformFeatures {
+    var features = needs.platform_features;
+    if (needs.needs_gamepad) features.enable_gamepad = true;
+    return features;
+}
 
 // ============================================================
 // Helper: set up an example exe for one backend
@@ -3497,7 +3545,8 @@ fn addExampleExe(
     // Gamepad opt-in: only needs_gamepad examples (22 / 34) use the
     // opt-in-enabled platform module (GameController framework link + enable gamepad code in .m/.swift).
     // Other examples use the default opt-in-disabled side (existing exes unchanged).
-    exe.root_module.addImport("platform", if (needs.needs_gamepad) pm.platform_gamepad.mod else pm.platform.mod);
+    const variant = pm.variant(exampleFeatures(needs));
+    exe.root_module.addImport("platform", variant.platform_mod.mod);
     exe.root_module.addImport("keyboard", pm.keyboard);
     if (needs.needs_sprite) exe.root_module.addImport("sprite", common.sprite);
     if (needs.needs_fps_counter) exe.root_module.addImport("fps_counter", common.fps_counter);
@@ -3527,7 +3576,7 @@ fn addExampleExe(
     if (needs.needs_sound) exe.root_module.addImport("sound", common.sound.mod);
     if (needs.needs_kit) {
         // needs_gamepad kit examples use kit_gamepad wired to platform_gamepad.
-        exe.root_module.addImport("kit", if (needs.needs_gamepad) pm.kit_gamepad.mod else pm.kit.mod);
+        exe.root_module.addImport("kit", variant.kit.mod);
     }
     if (std.mem.startsWith(u8, name, "example_26")) {
         exe.root_module.addImport("appshell", common.appshell.mod);
@@ -3540,9 +3589,9 @@ fn addExampleExe(
     opts.addOption([]const u8, "platform_name", platform.backendName(platform_type));
     exe.root_module.addOptions("build_options", opts);
 
-    // Gamepad opt-in: only needs.needs_gamepad exes get GameController framework
-    // link + .m/.swift gamepad code enabled (aligned with the addImport choice above).
-    platform.setupExecutableForPlatform(b, exe, platform_type, optimize, platform_root, sdk_paths, .{ .enable_gamepad = needs.needs_gamepad });
+    // The same feature set that chose the modules above also compiles the macOS object file,
+    // so the two cannot drift apart.
+    platform.setupExecutableForPlatform(b, exe, platform_type, optimize, platform_root, sdk_paths, variant.features);
     return exe;
 }
 
@@ -3572,11 +3621,11 @@ fn addPixieExe(
     // Native menu opt-in: kit_menu (enable_menu=true) + shared menu.m (-DKNGN_ENABLE_MENU).
     // Shared across macOS objc/swift/metal. Do not change the enable_menu default of false.
     const root = appRoot(exe, "pixie");
-    link(root, pm.kit_menu);
+    link(root, pm.variant(exe_features.editor).kit);
     link(root, common.paint);
     // pixelops is re-exported via kit (kit.pixelops); no direct apps → pixelops link.
 
-    platform.setupExecutableForPlatform(b, exe, platform_type, optimize, platform_root, sdk_paths, .{ .enable_menu = true });
+    platform.setupExecutableForPlatform(b, exe, platform_type, optimize, platform_root, sdk_paths, exe_features.editor);
     return exe;
 }
 
@@ -3613,7 +3662,7 @@ fn addNoodleExe(
     // Share the same Module instance as modular (avoid a second options.zig root).
     exe.root_module.addImport("build_options", common.max_modules_mod);
     const root = appRoot(exe, "patch");
-    link(root, pm.kit_menu);
+    link(root, pm.variant(exe_features.patch).kit);
     link(root, common.modular); // Dynamic graph engine (dsp-only dependency; also referenced by macro.zig)
     link(root, common.spectrogram); // Signal visualization (master scope/spectrogram/level meter)
     link(root, common.scope);
@@ -3625,8 +3674,7 @@ fn addNoodleExe(
     // Opt-in link so run-noodle can use kit.midi (CoreMIDI).
     platform.linkMidiBackend(exe.root_module, target.result.os.tag);
 
-    // Gamepad opt-in off. Native menu opt-in on.
-    platform.setupExecutableForPlatform(b, exe, platform_type, optimize, platform_root, sdk_paths, .{ .enable_menu = true });
+    platform.setupExecutableForPlatform(b, exe, platform_type, optimize, platform_root, sdk_paths, exe_features.patch);
     return exe;
 }
 
@@ -3655,14 +3703,14 @@ fn addSynthExe(
     // apps are kit-only consumers (R5). platform/audio/synth/dsp/gui via kit.*.
     // Direct-import only viz (libs/viz; in flux, not in kit) + serde (serialize: patch_io.zig direct-imports it).
     const root = appRoot(exe, "synth");
-    link(root, pm.kit);
+    link(root, pm.base().kit);
     link(root, common.spectrogram);
     link(root, common.scope);
     link(root, common.serde); // patch_io.zig (versioned-container serialization of voice/FX params)
     platform.linkAudioBackend(exe.root_module, target.result.os.tag); // L1 audio output (macOS=AudioToolbox / Linux=alsa / Windows=ole32)
 
-    // Gamepad opt-in off (this app does not use gamepad; keeps existing exes unchanged).
-    platform.setupExecutableForPlatform(b, exe, platform_type, optimize, platform_root, sdk_paths, .{});
+    // Nothing optional: this app plays from the PC keyboard.
+    platform.setupExecutableForPlatform(b, exe, platform_type, optimize, platform_root, sdk_paths, exe_features.base);
     return exe;
 }
 
@@ -3695,7 +3743,7 @@ fn addCaptureDemoExe(
             .optimize = optimize,
         }),
     });
-    exe.root_module.addImport("platform", pm.platform.mod);
+    exe.root_module.addImport("platform", pm.base().platform_mod.mod);
     exe.root_module.addImport("harness", common.harness.mod); // for isCaptureSyntheticActive()
     exe.root_module.addImport("camera", common.camera.mod); // Real camera capture (macOS implementation / stub elsewhere)
     exe.root_module.addImport("audio", common.audio.mod); // Real mic capture extension (via audio.zig)
@@ -3705,8 +3753,8 @@ fn addCaptureDemoExe(
     exe.root_module.addImport("synth", common.synth.mod); // SampleTap (lock-free mic-capture-callback → main-thread visualization handoff)
     platform.linkAudioBackend(exe.root_module, target.result.os.tag); // macOS: AudioToolbox/CoreAudio + capture AVFoundation/CoreMedia/CoreVideo/Foundation/objc
 
-    // Gamepad opt-in off (this app does not use gamepad; keeps existing exes unchanged).
-    platform.setupExecutableForPlatform(b, exe, platform_type, optimize, platform_root, sdk_paths, .{});
+    // Nothing optional: capture rides on the audio helper, not on a platform feature flag.
+    platform.setupExecutableForPlatform(b, exe, platform_type, optimize, platform_root, sdk_paths, exe_features.base);
     return exe;
 }
 
@@ -3788,9 +3836,10 @@ fn addPlatformNativeLib(
     // Same boolean as build_options.enable_gamepad on the SharedModules public "platform".
     // The archive is .o only and does not include the GameController framework (consumer exe links it).
     // When enable_gamepad=true, -DKNGN_ENABLE_GAMEPAD is passed to .m/.swift and the real backend is enabled.
-    const compiled = platform.compilePlatformLayer(b, platform_type, optimize, platform_root, .{
-        .enable_gamepad = enable_gamepad,
-    });
+    // The same feature set as the published platform module (`PlatformFeatures.published`):
+    // the archive is what an external consumer links, and a feature missing from it while the
+    // module says it is on becomes an undefined symbol in the consumer's executable.
+    const compiled = platform.compilePlatformLayer(b, platform_type, optimize, platform_root, platform.PlatformFeatures.published(enable_gamepad));
 
     const lib_mod = b.createModule(.{
         .root_source_file = b.path("core/platform_native_stub.zig"),

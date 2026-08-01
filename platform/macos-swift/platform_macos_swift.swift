@@ -11,8 +11,15 @@ import QuartzCore
 // factory. The C ABI, the event queue, the IME state and the window creation skeleton are in platform_macos_shared.swift.
 let IMPLEMENTATION_TYPE = "CALayer Optimized (Swift)"
 
+#if KNGN_ENABLE_TEXT_INPUT
+// NSTextInputClient conformance is declared in an extension rather than in the inheritance
+// clause, because the methods that satisfy it are compiled only with the text input opt-in and
+// Swift cannot make an inheritance clause conditional.
+extension FramebufferView: NSTextInputClient {}
+#endif
+
 // A custom NSView: fast CALayer-based drawing plus NSTextInputClient (the IME)
-class FramebufferView: NSView, NSTextInputClient, PlatformBackendView {
+class FramebufferView: NSView, PlatformBackendView {
     var width: Int   // the framebuffer pixel width (equal to the logical one under .logical)
     var height: Int  // framebuffer pixel height
     private var logicalWidth: Int
@@ -51,27 +58,37 @@ class FramebufferView: NSView, NSTextInputClient, PlatformBackendView {
 
     // For mouse events. Setting the back-reference propagates it to imeState as well.
     weak var platformWindow: PlatformWindowHandle? {
-        didSet { imeState.platformWindow = platformWindow }
+        didSet {
+#if KNGN_ENABLE_TEXT_INPUT
+            imeState.platformWindow = platformWindow
+#endif
+        }
     }
     private var trackingArea: NSTrackingArea?
 
+#if KNGN_ENABLE_TEXT_INPUT
     // The IME state is gathered into the shared PlatformIMEState; NSTextInputClient and the custom IME methods forward to it.
     let imeState = PlatformIMEState()
+#endif
 
+#if KNGN_ENABLE_CURSOR
     // for cursor control
     private var currentCursorShape: PlatformCursorShape = PLATFORM_CURSOR_DEFAULT  // the most recently requested shape
     private var cursorHiddenByThisView: Bool = false  // whether this view owns the [NSCursor hide] (the API is a global reference count, so it must not be called twice)
     private var mouseInsideView: Bool = false         // whether the mouse is inside the view right now (set and hide are held back while it is outside)
+#endif
 
     // Live-resize redraw. A separate field from the FrameCallback used by CADisplayLink.
     private var redrawCallback: PlatformRedrawCallback?
     private var redrawUserdata: UnsafeMutableRawPointer?
 
+#if KNGN_ENABLE_MASCOT
     // Transparent windows, click-through and interactive dragging
     private var transparentMode: Bool = false  // true makes the CGImage premultiplied alpha and honours the framebuffer alpha
     private var clickThrough: Bool = false     // true lets a click over a transparent pixel fall through to what is behind (per pixel)
     private var clickThroughState: Bool = false // the ignoresMouseEvents value set most recently (only reapplied when it changes)
     private var lastMouseDownEvent: NSEvent?    // the most recent left-button mouse-down (for beginDrag; consumed one-shot)
+#endif
 
     init(frame: NSRect, width w: Int, height h: Int, callback: FrameCallback?, userdata: UnsafeMutableRawPointer?, physical: Bool) {
         self.physicalMode = physical
@@ -138,9 +155,11 @@ class FramebufferView: NSView, NSTextInputClient, PlatformBackendView {
 
         super.init(frame: frame)
 
+#if KNGN_ENABLE_TEXT_INPUT
         // Hand the host view and the framebuffer size to the IME state (firstRect converts with them)
         imeState.hostView = self
         imeState.updateFramebufferSize(width: fw, height: fh)
+#endif
 
         // Make it a layer-backed view
         self.wantsLayer = true
@@ -188,6 +207,7 @@ class FramebufferView: NSView, NSTextInputClient, PlatformBackendView {
     }
 
     // MARK: - NSTextInputClient forwarding (delegated to the shared PlatformIMEState)
+#if KNGN_ENABLE_TEXT_INPUT
 
     func copyCompositionSnapshot(buf: UnsafeMutablePointer<CChar>?, cap: UInt32, meta: UnsafeMutablePointer<PlatformCompositionMeta>?) -> UInt32 {
         return imeState.copyCompositionSnapshot(buf: buf, cap: cap, meta: meta)
@@ -225,6 +245,7 @@ class FramebufferView: NSView, NSTextInputClient, PlatformBackendView {
         return imeState.firstRect(forCharacterRange: range, actualRange: actualRange)
     }
     override func doCommand(by selector: Selector) { imeState.doCommand(by: selector) }
+#endif // KNGN_ENABLE_TEXT_INPUT
 
     override var acceptsFirstResponder: Bool { true }
 
@@ -284,8 +305,13 @@ class FramebufferView: NSView, NSTextInputClient, PlatformBackendView {
     private func makeDisplayImage() -> CGImage? {
         guard let provider = (displayBuffer == buffer0) ? provider0 : provider1 else { return nil }
         // In transparent mode, premultiplied alpha honours the framebuffer alpha; by default alpha is skipped, as before.
+        // Without the mascot opt-in no window can be transparent, so alpha is always skipped.
+#if KNGN_ENABLE_MASCOT
         let alphaInfo = transparentMode ? CGImageAlphaInfo.premultipliedFirst.rawValue
                                         : CGImageAlphaInfo.noneSkipFirst.rawValue
+#else
+        let alphaInfo = CGImageAlphaInfo.noneSkipFirst.rawValue
+#endif
         return CGImage(
             width: width,
             height: height,
@@ -322,8 +348,10 @@ class FramebufferView: NSView, NSTextInputClient, PlatformBackendView {
                 contentLayer.contents = cgImage
             }
 
+#if KNGN_ENABLE_MASCOT
             // Update click-through on the callback and display-link path too (returns immediately while disabled)
             refreshClickThrough()
+#endif
 
             let renderEnd = CFAbsoluteTimeGetCurrent()
 
@@ -358,14 +386,21 @@ class FramebufferView: NSView, NSTextInputClient, PlatformBackendView {
             contentLayer.contents = cgImage
         }
 
+#if KNGN_ENABLE_MASCOT
         // Update the cursor-position test for click-through (returns immediately while clickThrough is off)
         refreshClickThrough()
+#endif
     }
 
     override var isOpaque: Bool {
+#if KNGN_ENABLE_MASCOT
         return !transparentMode // transparent mode is not opaque
+#else
+        return true // without the mascot opt-in a window is always opaque
+#endif
     }
 
+#if KNGN_ENABLE_MASCOT
     // Per-pixel click-through. Returning nil from NSView.hitTest does not let it through to an application behind
     // (that is the window-level ignoresMouseEvents). On every present the alpha under the current cursor position
     // toggles `window.ignoresMouseEvents` (over a transparent pixel it falls through, over the artwork the window gets it).
@@ -413,6 +448,7 @@ class FramebufferView: NSView, NSTextInputClient, PlatformBackendView {
         lastMouseDownEvent = nil // consumed as it is taken (never reused, in case the mouse-up never arrives)
         return ev
     }
+#endif // KNGN_ENABLE_MASCOT
 
     // ========================================
     // Mouse events
@@ -439,7 +475,7 @@ class FramebufferView: NSView, NSTextInputClient, PlatformBackendView {
     }
 
     // ========================================
-    // Cursor control
+    // Cursor control (KNGN_ENABLE_CURSOR)
     // ========================================
     //
     // The policy: NSCursor.hide/unhide is a process-wide reference-counted API, so cursorHiddenByThisView
@@ -447,6 +483,7 @@ class FramebufferView: NSView, NSTextInputClient, PlatformBackendView {
     // unhide only on true→false). On top of that, set and hide are really applied only while
     // mouseInsideView is true; a setCursor arriving while the mouse is outside merely stores the shape.
 
+#if KNGN_ENABLE_CURSOR
     // Return the NSCursor matching currentCursorShape (PLATFORM_CURSOR_HIDDEN is not handled here).
     // An unsupported shape falls back to the arrow.
     private func nsCursor(for shape: PlatformCursorShape) -> NSCursor {
@@ -502,6 +539,7 @@ class FramebufferView: NSView, NSTextInputClient, PlatformBackendView {
         mouseInsideView = true
         applyCursorShapeIfInside()
     }
+#endif // KNGN_ENABLE_CURSOR
 
     private func enqueueMouseEvent(type: PlatformEventType, button: PlatformMouseButton, from event: NSEvent) {
         guard let handle = platformWindow else { return }
@@ -545,11 +583,15 @@ class FramebufferView: NSView, NSTextInputClient, PlatformBackendView {
     }
 
     override func mouseDown(with event: NSEvent) {
+#if KNGN_ENABLE_MASCOT
         lastMouseDownEvent = event // keep the most recent left down for beginDrag
+#endif
         enqueueMouseEvent(type: PLATFORM_EVENT_MOUSE_DOWN, button: buttonFromEvent(event), from: event)
     }
     override func mouseUp(with event: NSEvent) {
+#if KNGN_ENABLE_MASCOT
         lastMouseDownEvent = nil // discard the stale event on up
+#endif
         enqueueMouseEvent(type: PLATFORM_EVENT_MOUSE_UP, button: buttonFromEvent(event), from: event)
     }
     override func mouseDragged(with event: NSEvent) {
@@ -681,7 +723,9 @@ class FramebufferView: NSView, NSTextInputClient, PlatformBackendView {
                 return
             }
             platformWindow?.currentFramebuffer = currentBuffer
+#if KNGN_ENABLE_TEXT_INPUT
             imeState.updateFramebufferSize(width: width, height: height)
+#endif
         }
         // only on success are the logical size, the latched scale and the epoch committed together
         logicalWidth = lw
@@ -749,7 +793,9 @@ class FramebufferView: NSView, NSTextInputClient, PlatformBackendView {
         if resizeBuffersTo(width: Int(newSize.width), height: Int(newSize.height)) {
             // Point the handle at the new write buffer after reallocation (so the next lock and present use the right one).
             platformWindow?.currentFramebuffer = currentBuffer
+#if KNGN_ENABLE_TEXT_INPUT
             imeState.updateFramebufferSize(width: width, height: height)
+#endif
             if let cb = redrawCallback {
                 cb(redrawUserdata)
             }
@@ -765,11 +811,13 @@ class FramebufferView: NSView, NSTextInputClient, PlatformBackendView {
     deinit {
         stopDisplayLink()
 
+#if KNGN_ENABLE_CURSOR
         // Being destroyed while the cursor is hidden would leave the OS cursor gone for good.
         if cursorHiddenByThisView {
             NSCursor.unhide()
             cursorHiddenByThisView = false
         }
+#endif
 
         // Since a no-copy provider refers to the buffer, the release order is
         // contents → provider → buffer (which prevents a stored property being released automatically
@@ -804,8 +852,12 @@ func makePlatformBackendView(
         userdata: userdata,
         physical: physical
     )
+#if KNGN_ENABLE_MASCOT
     if transparent {
         view.setTransparentMode(true) // Make the CGImage premultiplied alpha
     }
+#else
+    _ = transparent // no window can be transparent without the mascot opt-in
+#endif
     return view
 }

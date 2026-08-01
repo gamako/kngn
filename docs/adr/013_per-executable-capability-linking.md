@@ -2,12 +2,16 @@
 
 - Status: Accepted
 - Date: 2026-07-27
+- Revised: 2026-08-02 — five more macOS backend capabilities (dialog, cursor,
+  mascot, fullscreen, text input), the one default that is not `false`, and what a
+  consumer outside this repository receives
 
 ## Context
 
 This repository builds one library tree and many executables from it: a main
 program, three applications, and forty-odd examples. Optional platform features —
-audio output, gamepads, native menus, MIDI — may pull in system dependencies:
+audio output, gamepads, native menus, MIDI, file panels, cursor shapes,
+transparent windows, fullscreen, text input — may pull in system dependencies:
 frameworks on macOS, `libasound` on Linux, `ole32` on Windows. Not all of them do;
 a native menu needs no framework beyond the AppKit that every window already
 links, and it turns out to be the instructive case.
@@ -27,7 +31,7 @@ tell what would break.
 
 **A capability is off by default, and only an executable that uses it links it.**
 
-Four capabilities are gated this way today. Microphone and camera capture are
+Nine capabilities are gated this way today. Microphone and camera capture are
 **not** separately gated: they ride on the audio helper, which is precisely why the
 deviation recorded under Consequences exists.
 
@@ -37,13 +41,60 @@ deviation recorded under Consequences exists.
 | MIDI | `linkMidiBackend(module, os)` (macOS: CoreMIDI and CoreFoundation; every other system uses the null backend and needs nothing) |
 | Gamepad | `enable_gamepad` — `-DKNGN_ENABLE_GAMEPAD` to the native sources plus the GameController framework. The one user-facing option, `-Denable_gamepad=true`, covers the published external module and the native archive; internal executables opt in per backend, independently of it |
 | Native menu | `enable_menu` — `-DKNGN_ENABLE_MENU` plus compiling the shared `platform/macos/platform_macos_menu.m` translation unit |
+| File panels | `enable_dialog` — `-DKNGN_ENABLE_DIALOG`; drops NSSavePanel/NSOpenPanel and the UniformTypeIdentifiers import |
+| Cursor shapes | `enable_cursor` — `-DKNGN_ENABLE_CURSOR`; drops the NSCursor hide/shape ownership machinery in the view |
+| Mascot windows | `enable_mascot` — `-DKNGN_ENABLE_MASCOT`; drops transparency, borderlessness, per-pixel click-through, interactive drag, the Dock policy switch and the pop-up quit menu |
+| Fullscreen | `enable_fullscreen` — `-DKNGN_ENABLE_FULLSCREEN`; drops the transition, the live state and the `NSWindowDelegate` notifications that track the geometry to restore |
+| Text input | `enable_text_input` — `-DKNGN_ENABLE_TEXT_INPUT`; drops `NSTextInputClient`, the composition state and document access. **The one capability that defaults to true** — see below |
 
 Audio and MIDI are opted into by *calling* a helper, so their default is
-structural: an executable that does not call it does not get them. Gamepad and
-menu are booleans, and both default to `false` — the side that cannot break a
-target. Only `enable_gamepad` is exposed as a `-D` build option, because only it
-has to reach a consumer outside this repository; `enable_menu` is set per
-executable inside `build.zig` and is deliberately not a global switch.
+structural: an executable that does not call it does not get them. The rest are
+booleans on `PlatformFeatures`, and all but one default to `false` — the side that
+cannot break a target. Only `enable_gamepad` is exposed as a `-D` build option,
+because only it has to reach a consumer outside this repository; the others are set
+per executable inside `build.zig` and are deliberately not global switches.
+
+### The one default that is `true`, and why
+
+`enable_text_input` defaults to **true**, against the rule above. It is not a leaf
+capability: on macOS `keyDown` is handed to `interpretKeyEvents:`, which makes
+`NSTextInputClient`'s `insertText:` the *only* source of `char_input`. Turning the
+capability off therefore removes ordinary character input as well as the IME, and
+almost every executable here consumes `char_input` — every GUI example with a text
+field, the editor, the patch canvas. A `false` default would have silently deleted
+character input from all of them and left the build green.
+
+So this one capability is opt-*out*: an executable states `enable_text_input =
+false` when it handles no characters at all, which two demos do (the fullscreen
+demo and the desktop mascot both read keys and never characters). Stating it is the
+point — a feature set in `build.zig` says what an executable asks for *and* what it
+does not, and the second half is what makes the opt-out visible at the build site
+rather than implied by a default.
+
+Splitting the capability in two — keep character input, make IME composition
+opt-in — was considered and rejected: `insertText:` is the character source, so
+the `NSTextInputClient` conformance and its method set have to stay either way, and
+the split would buy little while doubling the combinations to verify.
+
+### What a consumer outside this repository receives
+
+**Every one of these macOS capabilities is enabled in the published surface.** The
+platform module a consumer gets as `dep.module("platform")` and the prebuilt native
+archive it links (`platform_native_objc` / `_swift` / `_metal`) are both built with
+`PlatformFeatures.published(...)`, which turns them all on.
+
+The reason is that a consumer can influence neither. It cannot recompile the
+archive, and the module's `build_options` are stamped here, so a `false` default
+carried outside would delete a feature from every consumer with no way to get it
+back — and the `PlatformFeatures` a consumer passes to `setupConsumerExe` decides
+only what its own executable *links*, not what the prebuilt object contains. Native
+menus are the exception in the other direction and stay off outside, because their
+NSMenu body is a separate translation unit the published archive does not carry.
+
+Per-executable gating is therefore a property of executables built **inside** this
+repository, which compile the macOS backend themselves. `-Denable_gamepad` remains
+the one flag that crosses the boundary, because it also decides a framework link
+the consumer's executable has to make.
 
 ### Why the decision sits in the build, and why the source is gated too
 
@@ -134,6 +185,30 @@ the backend, so the table holds for the other backends too. To reproduce:
 | `synth_objc` | — | linked | — | — |
 | `patch_objc` | — | linked | linked | present |
 
+The five capabilities added later add no framework of their own — panels, cursors,
+transparency, fullscreen and text input all come from AppKit, which every window
+links already — so for them the only observable is the absence of the symbol, as
+with the menu. Measured with
+`nm -U zig-out/bin/<exe> | grep ' _platform_<name>$'`:
+
+| Executable | dialog | cursor | mascot | fullscreen | text input |
+|---|---|---|---|---|---|
+| `example_01` (a window only) | — | — | — | — | present |
+| `example_18` (cursor shapes) | — | present | — | — | present |
+| `example_23` (fullscreen) | — | — | — | present | — |
+| `example_24` (desktop mascot) | — | — | present | — | — |
+| `pixie` (editor) | present | present | — | present | present |
+
+The symbols counted per column are `platform_save_file_dialog` /
+`platform_open_file_dialog` / `platform_free_path`; `platform_set_cursor`;
+`platform_begin_window_drag` / `platform_set_always_on_top` /
+`platform_set_click_through` / `platform_set_dock_visible` /
+`platform_show_quit_menu`; `platform_set_fullscreen` / `platform_is_fullscreen` /
+`platform_get_restore_geometry`; and `platform_get_composition_snapshot` /
+`platform_set_composition_rect` / `platform_set_text_input_active` /
+`platform_set_text_input_document_access`. Each group is present or absent as a
+whole.
+
 **The observable differs per capability, and that is informative rather than an
 inconsistency.** Gamepad, audio and MIDI each omit a system framework, so
 `otool -L` shows the difference. A native menu needs no extra framework — NSMenu
@@ -165,6 +240,34 @@ example's standalone `build.zig` as well as the root one. Anyone weighing a new
 capability should price that in; the mechanism is cheap to *use* and not cheap to
 *extend*.
 
+**A feature set, not a set of switches.** Every combination of flags is a distinct
+platform module, because the flags are baked in as `build_options`, and the module
+comes as a trio with `app_runtime` and `kit`. Naming a module variant per flag would
+multiply; instead `build.zig` enumerates the feature sets its executables actually
+use and looks one up by value, and an executable passes that single value to both
+the module lookup and the object-file compile. Two literals stated separately is
+exactly how the module and the object drift apart, and the failure is an undefined
+symbol far from the cause. A feature set that is not enumerated stops build
+configuration with a message naming it, rather than falling back to the default
+trio.
+
+**Turning a capability off changes behaviour, and the neutral result is part of the
+contract.** A disabled capability is not an error at the call site: `setCursor`,
+`beginDrag`, `setAlwaysOnTop`, `setClickThrough`, `showQuitMenu`, `setDockVisible`,
+`setFullscreen`, `setCompositionRect` and `setTextInputActive` become no-ops;
+`isFullscreen` is always false; `restoreGeometry` reports a zero geometry —
+"nothing to restore", chosen over the live geometry so that a persistence layer
+cannot save a screen-sized window the user had put fullscreen with the green
+button; the file panels report `error.DialogUnavailable`; and asking to create a
+transparent, borderless or fullscreen window is `error.Unsupported` rather than an
+ordinary window, so a missing opt-in fails loudly at the one point where it can.
+
+**The harness is not gated.** `enable_text_input` describes what the macOS object
+file contains. The harness synthesises `char_input` and `composition_changed`
+without going through the OS at all (ADR-007 R3), and keeps doing so in a build
+that has the capability off. Headless verification therefore says nothing about
+whether real text input works — that needs hardware.
+
 **Default-off means a new capability is invisible until wired up.** An executable
 that should have gained a feature but was not given the option compiles and runs,
 simply without the feature. There is a deliberate runtime counterpart for the
@@ -191,7 +294,7 @@ capture is the natural place to remove it.
 independent opt-in modules so that only the applications linking them pay for
 them, generalising "the audio backend is linked only into executables that use
 audio" to every heavy lib. This ADR does not restate that decision — it records the
-layer below it: the **build-level mechanism** that implements R7 for these four
+layer below it: the **build-level mechanism** that implements R7 for these
 capabilities, the native source gating that R7 says nothing about, why the linker
 cannot substitute for it, the measured effect, and the one exception.
 
