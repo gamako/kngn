@@ -36,7 +36,7 @@ const SectionMeta = struct {
 };
 
 const SECTIONS = [_]SectionMeta{
-    .{ .name = "overview", .detail = "three axes: widget / state / context", .widgets = 0, .missing = 13 },
+    .{ .name = "overview", .detail = "three axes: widget / state / context", .widgets = 0, .missing = MISSING.len },
     .{ .name = "basic", .detail = "button / label", .widgets = 2, .missing = 0 },
     .{ .name = "text", .detail = "selectableLabel / textInputId", .widgets = 2, .missing = 0 },
     .{ .name = "values", .detail = "slider / checkbox / toggle / radio", .widgets = 4, .missing = 0 },
@@ -44,7 +44,7 @@ const SECTIONS = [_]SectionMeta{
     .{ .name = "layout", .detail = "splitter / scrollArea / iconButton / tooltip / collapsible", .widgets = 5, .missing = 0 },
     .{ .name = "menus", .detail = "popup/contextMenu / menuBar", .widgets = 2, .missing = 0 },
     .{ .name = "stepgrid", .detail = "stepgrid.widgetRow", .widgets = 1, .missing = 0 },
-    .{ .name = "missing", .detail = "APG / ImGui gaps (placeholder only)", .widgets = 13, .missing = 13 },
+    .{ .name = "missing", .detail = "APG / ImGui gaps (placeholder only)", .widgets = MISSING.len, .missing = MISSING.len },
 };
 
 /// For overview display: total widgets across demo sections (excluding overview/missing).
@@ -96,21 +96,30 @@ const STEPGRID_MATRIX = [_]MatrixRow{
     .{ .name = "stepgrid", .cells = .{ "ok", "demo", "demo", "N/A", "part", "ok", "N/A", "N/A", "ok" } },
 };
 
-const MissingEntry = struct { name: []const u8, target: []const u8 };
+// Widgets with no libs/gui API at all (contrast with the demo sections above, each of which
+// exercises a real, implemented widget). `category` names the follow-up bucket from the
+// capability matrix's own crosswalk (docs/plans/PLAN_gui_capability_matrix.md §5), not a
+// task-tracker id: this array is the one place in the repo the matrix's "unsupported" column
+// is restated as a live count, so it must be updated in the same change that lands a new
+// widget API (see that document's §5 correction note, which flagged this array as the second
+// place the same staleness can hide).
+const MissingEntry = struct { name: []const u8, category: []const u8 };
 const MISSING = [_]MissingEntry{
-    .{ .name = "Alert / Message Dialog", .target = "121.2" },
-    .{ .name = "Breadcrumb", .target = "121.3" },
-    .{ .name = "Carousel", .target = "Phase 2" },
-    .{ .name = "Combobox", .target = "121.3 / 121.4" },
-    .{ .name = "Dialog (Modal)", .target = "121.3" },
-    .{ .name = "Disclosure", .target = "121.3" },
-    .{ .name = "Listbox", .target = "121.4" },
-    .{ .name = "Meter", .target = "121.3" },
-    .{ .name = "Spinbutton", .target = "121.3" },
-    .{ .name = "Table", .target = "121.4" },
-    .{ .name = "Tabs", .target = "121.3" },
-    .{ .name = "Tree View", .target = "121.4" },
-    .{ .name = "Treegrid", .target = "Phase 2" },
+    // A coordinated multi-section expand/collapse group: distinct from `beginCollapsible`, which
+    // is one flat, independent expand/collapse header (used, for example, by panel_host and by
+    // this gallery's own layout section) with no cross-section coordination.
+    .{ .name = "Accordion", .category = "settings shell" },
+    .{ .name = "Alert / Message Dialog", .category = "torture suite" },
+    .{ .name = "Breadcrumb", .category = "settings shell" },
+    .{ .name = "Carousel", .category = "deferred" },
+    .{ .name = "Combobox", .category = "settings shell" },
+    .{ .name = "Dialog (Modal)", .category = "settings shell" },
+    .{ .name = "Disclosure", .category = "settings shell" },
+    .{ .name = "Meter", .category = "settings shell" },
+    .{ .name = "Spinbutton", .category = "settings shell" },
+    .{ .name = "Table", .category = "list+menu shell" },
+    .{ .name = "Tree View", .category = "list+menu shell" },
+    .{ .name = "Treegrid", .category = "deferred" },
 };
 
 const Ids = struct {
@@ -501,7 +510,7 @@ fn renderMissing(ctx: *gui.Context) void {
         ctx.beginBox(.{ .height = .{ .fixed = 54 }, .bg = gui.Color.rgba(0x30, 0x24, 0x2C, 0xFF), .padding = .{ 6, 6, 6, 6 } });
         ctx.label(item.name);
         ctx.labelEx("NOT IMPLEMENTED", gui.Color.rgba(0xFF, 0xB0, 0x80, 0xFF));
-        ctx.labelEx(item.target, ctx.style.text_subtle);
+        ctx.labelEx(item.category, ctx.style.text_subtle);
         ctx.endBox();
     }
     ctx.endBox();

@@ -1,12 +1,12 @@
 # gallery replay
 # 1024x640 / Debug / gui.default_font / section=overview initially
-# expect values baked from a 2026-07-17 headless replay (digest gallery).
+# expect values baked from a 2026-08-02 headless replay (digest gallery).
 step 2
 digest gallery
 expect gallery section=overview
 expect gallery index=0
 expect gallery widgets=0
-expect gallery missing=13
+expect gallery missing=12
 expect gallery schema=v0
 snapshot fb
 
@@ -46,7 +46,9 @@ digest gallery
 expect gallery section=text
 expect gallery widgets=2
 snapshot fb
-inject mouse_move 96 112
+# y=150 (not basic's 112): the "Disabled" checkbox demo (added by the disabled-scope work)
+# is now the first widget in this section, pushing textInputId down one row.
+inject mouse_move 96 150
 inject mouse_down left
 inject mouse_up left
 step 1
@@ -155,7 +157,7 @@ step 1
 digest gallery
 expect gallery section=missing
 expect gallery index=8
-expect gallery widgets=13
-expect gallery missing=13
+expect gallery widgets=12
+expect gallery missing=12
 snapshot fb
 quit

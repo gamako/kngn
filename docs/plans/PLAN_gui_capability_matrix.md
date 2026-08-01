@@ -67,10 +67,10 @@ round this matrix's own maintainer ran just before these two shells, and Tooltip
 (predating this document; `ctx.tooltip` has its own hover-delay/clamp/leave test suite). None of the
 three landing updated this file, so the three rows above, and the corresponding three entries this
 document's §9 used to list as unsupported, were stale until this pass. `examples/35_gui_gallery`'s own
-`MISSING` array is a second, separate place the same kind of staleness can hide (it still lists
-"Listbox"/"Tabs" and target-task ids for since-finished work) — flagged here rather than silently
-fixed, since reconciling the gallery's own demo array is a larger, separate pass this correction does
-not attempt.
+`MISSING` array was a second, separate place the same kind of staleness hid — a later pass (see §18)
+reconciled it against this section and dropped its numeric task-target column, but the array itself
+remains a second place that must be updated in the same change as this document whenever a widget
+lands or a gap closes; nothing technical ties the two together.
 
 ## 6. Current libs/gui API inventory
 
@@ -113,7 +113,7 @@ Use only Id-bearing variants that actually exist in libs/gui, and avoid collisio
 | scrollArea | ✓ | demo | demo | N/A | N/A | N/A | ✓ | ✓ | N/A |
 | popup / contextMenu | ✓ | ✓ | ✓ | N/A | ✓ item | N/A | N/A | N/A | ✓ |
 | menuBar | ✓ | demo | demo | N/A | ✓ command | N/A | N/A | N/A | ✓ |
-| stepgrid | ✓ | demo | demo | N/A | partial (editable=false) | ✓ | N/A | N/A | ✓ |
+| stepgrid | ✓ | demo | demo | N/A | ✓ | ✓ | N/A | N/A | ✓ |
 
 ## 9. Unsupported-widget empty sections
 
@@ -142,20 +142,18 @@ order, never hit-tests, and releases any focus/hover/active it held before becom
 representative widgets (button/checkbox/toggle/radio/slider/textInputId) also draw with
 `Style.disabledColor`.
 
-Two widgets remain outside this scope by construction, because each hand-assembles its own hit-test instead
-of calling `behaviorFromCache`, and neither consults `ctx.isDisabled()`:
+Two widgets used to remain outside this scope by construction, because each hand-assembles its own
+hit-test instead of calling `behaviorFromCache`. Both now consult `ctx.isDisabled()` directly (via the
+shared `Context.clearDisabledInteraction` helper `behaviorFromCache` itself uses), closing the gap without
+adding a new widget:
 
-- `gui.stepgrid.widgetRow` (calls `buttonBehavior` directly). §16.1 (the tracker/session grid shell) hits
-  this directly: wrapping a `stepgrid.widgetRow` call in `beginDisabled`/`endDisabled` has no effect, so the
-  example substitutes the widget's own `editable=false` option, which suppresses clicks but draws no
-  grayed-out look.
-- `gui.beginListboxRow` (calls `buttonBehavior` directly, by its own doc comment, to keep the roving-tab-stop
-  rule from being defeated by `behaviorFromCache`'s unconditional `registerFocusable`). Not exercised by any
-  reproduction bench so far (no shell has disabled an individual list row), so this is a documentation-level
-  finding rather than an example-pinned one.
-
-Closing either gap means changing that widget's own hit-test path to check `isDisabled()`, not adding a new
-widget.
+- `gui.stepgrid.widgetRow` skips the per-cell hit-test and draws with `Style.disabledColor` while disabled.
+  §16.1 (the tracker/session grid shell) is the evidence: the shell no longer needs the widget's own
+  `editable` option to work around this, and now wraps the whole muted row (grid plus its volume/pan
+  sliders) in one `beginDisabled`/`endDisabled` scope.
+- `gui.beginListboxRow` skips the hit-test and registerFocusable call while disabled, and greys its
+  selected-row background. Still not exercised by any reproduction bench (no shell disables an individual
+  list row), so this remains a documentation-level fix rather than an example-pinned one.
 
 ### Focused / semantic
 
@@ -305,13 +303,13 @@ right-click track context menu: Mute / Solo / Clear Pattern, checked marks refle
 staying open across toggles). It does not exercise `openPopupStacked`/`popupMenuStacked` — only one popup
 is ever open here, so the list+menu shell (§15) remains the evidence for simultaneous popups.
 
-### 16.1 New cross-cutting gap: stepgrid does not consult the disabled scope
+### 16.1 Resolved: stepgrid now consults the disabled scope
 
-See §10 "Disabled" for the full writeup. In short: `gui.stepgrid.widgetRow` hand-assembles its own hit-test
-(`buttonBehavior`, not `behaviorFromCache`) and never checks `ctx.isDisabled()`, so wrapping a step-grid row
-in `beginDisabled`/`endDisabled` changes nothing about it. The shell works around this with the widget's own
-`editable` option (`editable = !track.muted`), which suppresses the click but draws no greyed-out look —
-counted as a hack below, not as a widget the shell chose to skip.
+See §10 "Disabled" for the full writeup. `gui.stepgrid.widgetRow` now checks `ctx.isDisabled()` the same way
+`behaviorFromCache`-backed widgets do, so wrapping a step-grid row in `beginDisabled`/`endDisabled` rejects
+its clicks and greys its cells. The shell no longer needs the widget's own `editable` option as a
+workaround — the muted row (grid plus its volume/pan sliders) shares one `beginDisabled`/`endDisabled`
+scope.
 
 ### 16.2 custom / hack counts (example side)
 
@@ -319,7 +317,6 @@ counted as a hack below, not as a widget the shell chose to skip.
 |---|---:|---|
 | track row hit-test + right-click context-menu glue | 1 | `hitTestTrack` + `getNodeCachedRect`; the right press is not forwarded to gui so it cannot dismiss the popup it just opened (same shape as §15.2's row/context glue) |
 | keyboard up/down nav | 1 | `gui.pollListNav` result applied by hand: move `selected_track`, `claimFocus` onto the new row |
-| stepgrid disabled non-compliance workaround | 1 | `editable = !track.muted` substitutes for a real disabled look (§16.1) |
 | custom draw | 0 | No `ctx.custom` / direct DrawList / custom rasterizer beyond `stepgrid`'s own library-side draw |
 
 ### 16.3 Scorecard
@@ -327,13 +324,13 @@ counted as a hack below, not as a widget the shell chose to skip.
 | Axis | Score | Note |
 |---|---:|---|
 | Structure | 5 | 640×360 / 1024×768 / 1440×900 all lay out without overflow, once the detail column and slider `track_w` were sized against the widest form-row content at each width tier (§16.4) |
-| Interaction | 5 | All 5 scenarios harness-automated: pattern tab switch, track select (mouse) + Up/Down (keyboard), step-grid toggle, mute → Volume drag rejected (disabled) → context-menu checked toggle → unmute → the same drag now changes Volume |
-| Information | 4 | Selection / mute / solo / checked / disabled are all visualized; the one gap is the step grid itself not visually reflecting "disabled" (§16.1) |
-| Ergonomics | 3 | 3 hacks (§16.2), 0 custom draw |
+| Interaction | 5 | All 5 scenarios harness-automated: pattern tab switch, track select (mouse) + Up/Down (keyboard), step-grid toggle, mute → grid + Volume drag both rejected (disabled) → context-menu checked toggle → unmute → both now respond again |
+| Information | 5 | Selection / mute / solo / checked / disabled are all visualized, the step grid included (§16.1) |
+| Ergonomics | 4 | 2 hacks (§16.2), 0 custom draw |
 
-Missing (priority): 1) stepgrid disabled non-compliance (§16.1, also §10) 2) no dedicated Grid/Table APG
-widget — the step grid is still `stepgrid` plus a hand-wrapped row box, not a general grid/table widget
-3) `openPopupStacked`/`popupMenuStacked` not exercised here (single popup only; see §15 for that evidence).
+Missing (priority): 1) no dedicated Grid/Table APG widget — the step grid is still `stepgrid` plus a
+hand-wrapped row box, not a general grid/table widget 2) `openPopupStacked`/`popupMenuStacked` not
+exercised here (single popup only; see §15 for that evidence).
 
 ### 16.4 Size checks
 
@@ -422,3 +419,35 @@ which are about tabular *display*, not keyboard/gamepad *navigation* over one).
 Launch 640×360 / 1024×768 / 1440×900 as separate processes and visually inspect path-omitted `snapshot fb`.
 Grid `slot` size, detail-panel width and padding all key off `screen_w` from the first draft (learned from
 §16.4), and no overflow was observed at any of the three sizes.
+
+## 18. Gallery MISSING-array reconciliation
+
+§5's 2026-08-02 correction flagged `examples/35_gui_gallery`'s own `MISSING` array as a second place the
+same "a widget landed, this document did not get updated" staleness hides. This section closes that gap
+for the set of widgets current at the time of this pass, and records the rule that keeps it closed.
+
+**What changed:** `MISSING` dropped `Listbox` and `Tabs` (both implemented; §5/§9 already reflected this)
+and gained `Accordion` (§9's 12-item list already carried it; the gallery array never had — an
+independent staleness in the other direction, not introduced by this pass). Net count: 13 → 12, matching
+§9 exactly. Each entry's second field changed from a numeric task-target string (e.g. `"121.3"`) to the
+follow-up category name from §5's own crosswalk (`"settings shell"`, `"deferred"`, and so on) — a
+task-tracker id has no meaning to a reader of this public repository, per the comment and documentation
+policy's rule 3 (`kngn/AGENT.md`), and unlike a source comment this field is drawn straight onto screen
+as a user-visible string, so it is not exempt from that rule.
+
+**Why this keeps drifting:** the array duplicates §9's list by hand, in a different file, in a different
+form (Zig struct literals versus a comma-separated sentence). Nothing catches the two falling out of sync
+except a human noticing. Two counter-measures, one mechanical and one procedural:
+
+- Mechanical (done here): `examples/35_gui_gallery/main.zig`'s `SECTIONS` table used to hardcode the
+  missing-widget count twice more (the `overview` and `missing` entries' `.missing`/`.widgets` fields),
+  a *third* place the same number could drift from `MISSING.len`. Both now read `MISSING.len` directly,
+  so within this one file the count has a single source; the E2E script's `expect gallery missing=N` /
+  `widgets=N` lines still hardcode the number (the harness digest protocol has no comptime access to the
+  array) and had to be updated by hand alongside this change.
+- Procedural (not mechanical — no lint enforces it): §12's update rules already say "when libs/gui gains
+  an API, update §6, §8, gallery sections, and the E2E probe in the same change" for the *implemented*
+  side. The matching rule for the *unimplemented* side is: when a widget's status changes in §5/§9 (a gap
+  opens or closes), update `examples/35_gui_gallery`'s `MISSING` array and its two E2E `missing=`/`widgets=`
+  assertions in the same change. This document and the gallery's array are not the same source, so keeping
+  them in sync is a discipline, not a guarantee — as this section itself is evidence of.
