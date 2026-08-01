@@ -1761,6 +1761,25 @@ pub fn build(b: *std.Build) void {
     const grid_overlay_test = b.addTest(.{ .root_module = grid_overlay_test_mod });
     const run_grid_overlay_test = b.addRunArtifact(grid_overlay_test);
 
+    // pixie loupe_overlay (magnifier overlay + doc-bounds intersection helper). Named-import core,
+    // same shape as grid_overlay/blit (needs kit for gui.Context/gui.Rect/gui.Color).
+    const loupe_overlay_core = b.createModule(.{
+        .root_source_file = b.path("libs/paint/src/paint.zig"),
+    });
+    loupe_overlay_core.addImport("png", shared_modules.png.mod);
+    loupe_overlay_core.addImport("pixelops", shared_modules.pixelops.mod);
+    loupe_overlay_core.addImport("serde", shared_modules.serde.mod);
+    loupe_overlay_core.addImport("font", shared_modules.font.mod);
+    const loupe_overlay_test_mod = b.createModule(.{
+        .root_source_file = b.path("apps/editor/apps/pixie/loupe_overlay.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    loupe_overlay_test_mod.addImport("paint", loupe_overlay_core);
+    loupe_overlay_test_mod.addImport("kit", blit_pm.kit.mod);
+    const loupe_overlay_test = b.addTest(.{ .root_module = loupe_overlay_test_mod });
+    const run_loupe_overlay_test = b.addRunArtifact(loupe_overlay_test);
+
     // pixie zoom. rational Zoom + coordinate transforms. Named-import paint.
     const zoom_core = b.createModule(.{
         .root_source_file = b.path("libs/paint/src/paint.zig"),
@@ -1932,6 +1951,7 @@ pub fn build(b: *std.Build) void {
     test_core_step.dependOn(&run_palette_test.step);
     test_core_step.dependOn(&run_blit_test.step);
     test_core_step.dependOn(&run_grid_overlay_test.step);
+    test_core_step.dependOn(&run_loupe_overlay_test.step);
     test_core_step.dependOn(&run_zoom_test.step);
     test_core_step.dependOn(&run_minimap_test.step);
     test_core_step.dependOn(&run_onion_skin_test.step);

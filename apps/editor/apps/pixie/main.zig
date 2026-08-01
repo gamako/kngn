@@ -35,6 +35,7 @@ const palette_mod = @import("palette.zig");
 const bezier_input = @import("bezier_input.zig");
 const bezier_overlay = @import("bezier_overlay.zig");
 const grid_overlay = @import("grid_overlay.zig");
+const loupe_overlay = @import("loupe_overlay.zig");
 const selection_input = @import("selection_input.zig");
 const selection_overlay = @import("selection_overlay.zig");
 const shape_input = @import("shape_input.zig");
@@ -640,6 +641,14 @@ const App = struct {
     onion_scratch: []u32 = &.{},
     /// Pixel grid overlay. Display-only (view state; not routed through netsync).
     grid_enabled: bool = false,
+    /// Loupe (magnifier) overlay. Display-only (view state; not routed through netsync).
+    loupe_enabled: bool = false,
+    /// Per-frame transient: the composite buffer this frame actually blitted to the canvas
+    /// (post onion-skin blend when onion is active). Set once in the draw section below; the
+    /// loupe overlay reads it later the same frame so the magnifier matches exactly what was
+    /// drawn, without re-rasterizing a bezier/move preview a second time. Empty before the first
+    /// frame that reaches the draw section.
+    loupe_source_composite: []const u32 = &.{},
     /// Brush-parameter UI state (bridges Slider *i32/*f32 vs Brush u32/u8).
     brush_size_i32: i32 = 8,
     brush_opacity_i32: i32 = 255,
@@ -4250,6 +4259,15 @@ fn actionSetGrid(ctx: *anyopaque, args: []const u8, buf: []u8) anyerror![]const 
     return "ok";
 }
 
+/// `action set_loupe <0|1>`. View-only (a per-peer canvas overlay; no undo entry, no netsync relay).
+fn actionSetLoupe(ctx: *anyopaque, args: []const u8, buf: []u8) anyerror![]const u8 {
+    _ = buf;
+    const app = actionApp(ctx);
+    try app.checkEditingAllowed();
+    app.loupe_enabled = try actions.parseLoupe(args);
+    return "ok";
+}
+
 /// Drive a canvas-coordinate point list as down→move×N→up (same Tool path as existing canvas_input).
 /// Accepts a leading `[tool=|color=|size=|opacity=|hardness=|tolerance=]` k=v prefix; latches the
 /// explicit parameters **temporarily and restores App state after** (so redo cannot clobber the
@@ -4681,6 +4699,7 @@ const PIXIE_ACTIONS = [_]ActionEntry{
     .{ .name = "set_pixel_perfect", .run = actionSetPixelPerfect },
     // Append-only at the end (parallelism constraint)
     .{ .name = "set_grid", .run = actionSetGrid },
+    .{ .name = "set_loupe", .run = actionSetLoupe },
 };
 
 /// `App.cmd_exec` Dispatcher: name→handler dispatch + noteUndo wiring.
@@ -4922,6 +4941,9 @@ const pixie_args_set_pixel_perfect: @FieldType(platform.Action, "args") = &.{
     .{ .name = "on", .kind = "bool", .desc = "0|1" },
 };
 const pixie_args_set_grid: @FieldType(platform.Action, "args") = &.{
+    .{ .name = "on", .kind = "bool", .desc = "0|1" },
+};
+const pixie_args_set_loupe: @FieldType(platform.Action, "args") = &.{
     .{ .name = "on", .kind = "bool", .desc = "0|1" },
 };
 const pixie_args_stroke: @FieldType(platform.Action, "args") = &.{
@@ -5199,6 +5221,8 @@ fn registerActions(app: *App) void {
     platform.registerAction(.{ .name = "panel_toggle", .ctx = app, .run = actionPanelToggle, .network_policy = .local_only, .desc = "toggle panel visibility", .args = pixie_args_panel_toggle });
     // pixel grid overlay toggle (view only, no undo; a per-peer canvas overlay, not document state)
     platform.registerAction(.{ .name = "set_grid", .ctx = app, .run = recordedAction("set_grid", .record), .network_policy = .local_only, .desc = "toggle the pixel grid overlay 0|1 (view only, no undo)", .args = pixie_args_set_grid });
+    // loupe (magnifier) overlay toggle (view only, no undo; a per-peer canvas overlay, not document state)
+    platform.registerAction(.{ .name = "set_loupe", .ctx = app, .run = recordedAction("set_loupe", .record), .network_policy = .local_only, .desc = "toggle the loupe magnifier overlay 0|1 (view only, no undo)", .args = pixie_args_set_loupe });
 }
 
 fn netsyncExport(ctx: *anyopaque, allocator: std.mem.Allocator) anyerror![]u8 {
@@ -6332,6 +6356,10 @@ fn panelBuildToolOptions(ctx: *gui.Context, user_data: *anyopaque) anyerror!void
     if (ctx.toggle("Grid", &grid_on)) {
         app.grid_enabled = grid_on;
     }
+    var loupe_on = app.loupe_enabled;
+    if (ctx.toggle("Loupe", &loupe_on)) {
+        app.loupe_enabled = loupe_on;
+    }
     if (app.active_kind == .brush or app.active_kind == .bezier) {
         _ = ctx.sliderI32Id(0xB0_0001, "Size", &app.brush_size_i32, .{ .min = 1, .max = 64, .track_w = 90 });
         _ = ctx.sliderI32Id(0xB0_0002, "Opac", &app.brush_opacity_i32, .{ .min = 0, .max = 255, .track_w = 90 });
@@ -7446,6 +7474,7 @@ fn appFrameInner(self: *App, win: *platform.Window) !void {
                     core.onion_skin.build(&self.doc, base_composite, self.doc.selected_frame, cnt, self.onion_buf, self.onion_scratch);
                     break :blk self.onion_buf;
                 } else base_composite;
+                self.loupe_source_composite = display_composite;
                 blit.blitCanvasZoomPhysical(fb.pixels, phys_w, phys_h, display_composite, cw, ch, rect, zoom, area, content_scale);
                 // Minimap (right after canvas blit; below other overlays)
                 drawMinimapOverlay(self, fb.pixels, phys_w, phys_h, area, content_scale);
@@ -7505,6 +7534,16 @@ fn appFrameInner(self: *App, win: *platform.Window) !void {
                     };
                 }
             }
+        }
+        // Loupe (magnifier), topmost tool overlay (drawn after cursor/brush-ring so it sits above
+        // them; only the layer context-menu popup below draws on top of it). Both hover_screen and
+        // hover_cell are null outside the canvas and during any busy state (pan/stroke/drag), so
+        // this is automatically hidden then, with no extra gating needed.
+        if (self.loupe_enabled) {
+            if (self.hover_screen) |hs| if (self.hover_cell) |hc| if (self.last_area) |area| {
+                const clip_area: gui.Rect = .{ .x = area.x, .y = area.y, .w = @intCast(area.w), .h = @intCast(area.h) };
+                loupe_overlay.draw(&self.ctx, hs, hc, self.loupe_source_composite, self.doc.width, self.doc.height, clip_area);
+            };
         }
         // Layer right-click context menu. popup.zig's post-endFrame contract
         // + calling after other overlays (bezier/selection/cursor) puts it on top.
