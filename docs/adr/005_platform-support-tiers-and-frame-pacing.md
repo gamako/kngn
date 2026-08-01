@@ -130,16 +130,27 @@ wiring.
    `wl_surface.frame` callback; D3D11 `fifo` = DXGI `Present(1, 0)` plus frame
    latency management; Metal `fifo` = display sync, drawable pacing and an inflight
    semaphore.
-5. **Resize contract**: once resize is supported, the `Framebuffer.width/height`
-   returned by a successful `lockFramebuffer()` is **authoritative for that frame's
-   buffer dimensions**. The caller checks `fb.width/height` every frame for the
-   drawable size. **GUI layout uses logical size** (`fb.logical_size` or
-   `window.logicalSize()`), not `fb.width/height`, under `.physical` mode — see
-   [ADR-011](011_high-dpi-coordinates-and-fb-modes.md) R2. After a resize the old
-   framebuffer pointer is invalid. The backend recreates the swap chain, `wl_buffer`
-   or Metal texture at a frame boundary and never returns a stale pointer to the
-   caller. (D3D11 implements this today through `resizeSwapChain` / `ResizeBuffers`, and the
-   X11 and Wayland backends track size changes; device-lost recovery remains follow-up work.)
+5. **Resize contract**: the `Framebuffer.width/height` returned by a successful
+   `lockFramebuffer()` is **authoritative for that frame's buffer dimensions**. The
+   caller checks `fb.width/height` every frame for the drawable size. **GUI layout uses
+   logical size** (`fb.logical_size` or `window.logicalSize()`), not `fb.width/height`,
+   under `.physical` mode — see [ADR-011](011_high-dpi-coordinates-and-fb-modes.md) R2.
+   After a resize the old framebuffer pointer is invalid. The backend recreates the swap
+   chain, `wl_buffer` or Metal texture at a frame boundary and never returns a stale
+   pointer to the caller. (D3D11 implements this through `resizeSwapChain` /
+   `ResizeBuffers`, and the X11 and Wayland backends track size changes; device-lost
+   recovery remains follow-up work.)
+
+   **What the caller owes in return.** A size change is committed at exactly one point —
+   the `lockFramebuffer()` boundary — and that is what lets the backend guarantee the
+   above. Two obligations follow, and a caller that breaks either can be handed a freed
+   buffer:
+   - `fb.pixels` is valid until the next `lockFramebuffer()` and is never cached across
+     frames.
+   - The event pump is not run while a `Framebuffer` is held. `pollEvents()` between a
+     lock and its `present()` is out, and so is anything that pumps on the caller's
+     behalf — which is why an application that pumps while holding a lock cannot register
+     a live-resize redraw callback (`core/platform.zig`).
 
 ## Wait/skip policy, and beginFrame / waitFrame
 
@@ -440,3 +451,4 @@ The cache lives in `core/platform.zig` (same main-thread ownership as the pacer)
 | 1.3 | 2026-07-27 | Status / tier table / D3D11 section / Follow-up ①–③ updated to match the implemented D3D11 backend and the documented best-effort non-guarantees. Follow-up ④ and the decision itself are unchanged. |
 | 1.4 | 2026-07-27 | Resize contract wording distinguishes buffer dimensions (`fb.width/height`) from GUI layout size (`logical_size` / `logicalSize()`), citing [ADR-011](011_high-dpi-coordinates-and-fb-modes.md). The decision itself is unchanged. |
 | 1.5 | 2026-07-29 | Caller-side target period: display-refresh follow, `-Dframe-cap`, 64ms EWMA hold with period/4 utilisation (remaining/4 only when the period is unknown), XRandR via DynLib, and known multi-monitor / judder / input-latency limits. |
+| 1.6 | 2026-08-02 | Resize contract states what the caller owes: `fb.pixels` is not cached across frames, and the event pump is not run while a `Framebuffer` is held — the obligations the single lock-boundary commit point rests on. The conditional "once resize is supported" is dropped, resize being implemented on every backend. The decision itself is unchanged. |

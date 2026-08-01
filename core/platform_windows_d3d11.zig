@@ -306,7 +306,17 @@ const D3DState = struct {
     back_buffer: ?*ID3D11Texture2D,
     width: u32, // The current size of the swap chain and upload_tex (compared against core's size to detect a resize)
     height: u32,
+    // Holding off a failed resize. A resize that fails is normally persistent (a lost device), and every
+    // attempt allocates and frees a GPU texture, so a failure is retried after a delay rather than on the
+    // next frame. retry_w/retry_h name the target the delay belongs to: a different target is a different
+    // attempt and starts immediately.
+    retry_hold: u32 = 0,
+    retry_w: u32 = 0,
+    retry_h: u32 = 0,
 };
+
+/// How many frames a failed resize waits before it is tried again (about a second at 60 Hz).
+const resize_retry_hold_frames: u32 = 60;
 
 pub const Window = struct {
     core: *common.Core,
@@ -384,7 +394,8 @@ pub const Window = struct {
         const context = devices.context;
         errdefer _ = context.lpVtbl.Release(context);
 
-        // The swap chain backbuffer (DISCARD with a fixed size, so taking it at create time is enough; resize support is follow-up work).
+        // The swap chain backbuffer. The swap effect is DISCARD, so index 0 is the one to take, and it stays
+        // valid until the size changes — after which resizeSwapChain takes it again at the new size.
         var back_buffer_opt: ?*ID3D11Texture2D = null;
         const hr_bb = swap_chain.lpVtbl.GetBuffer(swap_chain, 0, &IID_ID3D11Texture2D, @ptrCast(&back_buffer_opt));
         if (hr_bb < 0) return error.WindowCreationFailed;
@@ -554,6 +565,17 @@ pub const Window = struct {
 /// d3d.width/height are updated only on success (on failure they stay put and the next present retries).
 /// Recovering from a lost device (a failed GetBuffer) is follow-up work for this backend (see the list at the top of the file).
 fn resizeSwapChain(d3d: *D3DState, w: u32, h: u32) void {
+    // 0) A previous attempt at this same target is held off for a while, so that a persistent failure does
+    //    not allocate and free a GPU texture on every frame. Any other target clears the hold at once.
+    if (w != d3d.retry_w or h != d3d.retry_h) {
+        d3d.retry_w = w;
+        d3d.retry_h = h;
+        d3d.retry_hold = 0;
+    } else if (d3d.retry_hold > 0) {
+        d3d.retry_hold -= 1;
+        return;
+    }
+
     // 1) Allocate the new upload texture first (a failure here has not yet broken any existing resource).
     var tex_desc = std.mem.zeroes(D3D11_TEXTURE2D_DESC);
     tex_desc.Width = w;
@@ -567,29 +589,47 @@ fn resizeSwapChain(d3d: *D3DState, w: u32, h: u32) void {
     tex_desc.CPUAccessFlags = 0;
     tex_desc.MiscFlags = 0;
     var new_tex_opt: ?*ID3D11Texture2D = null;
-    if (d3d.device.lpVtbl.CreateTexture2D(d3d.device, &tex_desc, null, &new_tex_opt) < 0) return;
-    const new_tex = new_tex_opt orelse return;
+    if (d3d.device.lpVtbl.CreateTexture2D(d3d.device, &tex_desc, null, &new_tex_opt) < 0) {
+        // Not documented to leave the out parameter null on failure, so release anything it did produce.
+        if (new_tex_opt) |t| _ = t.lpVtbl.Release(t);
+        d3d.retry_hold = resize_retry_hold_frames;
+        return;
+    }
+    const new_tex = new_tex_opt orelse {
+        d3d.retry_hold = resize_retry_hold_frames;
+        return;
+    };
 
     // 2) ResizeBuffers is called only once every reference to the backbuffer has been let go (an outstanding
     //    reference makes it fail). It is set to null right after the release, so no failure path below keeps a released pointer (which prevents a double Release).
+    //    ClearState and Flush are not needed beforehand: this backbuffer is only ever the destination of a
+    //    CopyResource and is never bound as a render target or a shader resource, so no view holds it.
     if (d3d.back_buffer) |bb| _ = bb.lpVtbl.Release(bb);
     d3d.back_buffer = null;
     const hr_rb = d3d.swap_chain.lpVtbl.ResizeBuffers(d3d.swap_chain, 0, w, h, 0, 0); // 0 = leave BufferCount and Format as they are
 
     // 3) Take the backbuffer again (index 0, since the swap effect is DISCARD). On failure back_buffer stays null.
+    //    A failing HRESULT is not documented to leave the out parameter null, so the reference it may have
+    //    produced is released rather than kept: it belongs to no size that present can use.
     var bb_opt: ?*ID3D11Texture2D = null;
-    _ = d3d.swap_chain.lpVtbl.GetBuffer(d3d.swap_chain, 0, &IID_ID3D11Texture2D, @ptrCast(&bb_opt));
+    const hr_bb = d3d.swap_chain.lpVtbl.GetBuffer(d3d.swap_chain, 0, &IID_ID3D11Texture2D, @ptrCast(&bb_opt));
+    if (hr_bb < 0) {
+        if (bb_opt) |bb| _ = bb.lpVtbl.Release(bb);
+        bb_opt = null;
+    }
     d3d.back_buffer = bb_opt;
     if (bb_opt == null) {
-        // Taking it again failed (the equivalent of a lost device; very rare). Drop new_tex, leave the size, and let the next present retry.
+        // Taking it again failed (the equivalent of a lost device; very rare). Drop new_tex, leave the size, and let a later present retry.
         // back_buffer is null, so present skips and destroy does not Release twice.
         _ = new_tex.lpVtbl.Release(new_tex);
+        d3d.retry_hold = resize_retry_hold_frames;
         return;
     }
 
     if (hr_rb < 0) {
-        // ResizeBuffers failed (the backbuffer has been taken again at the old size). Drop new_tex, leave the size, and retry.
+        // ResizeBuffers failed (the backbuffer has been taken again at the old size). Drop new_tex, leave the size, and retry later.
         _ = new_tex.lpVtbl.Release(new_tex);
+        d3d.retry_hold = resize_retry_hold_frames;
         return;
     }
 
@@ -598,6 +638,7 @@ fn resizeSwapChain(d3d: *D3DState, w: u32, h: u32) void {
     d3d.upload_tex = new_tex;
     d3d.width = w;
     d3d.height = h;
+    d3d.retry_hold = 0;
 }
 
 /// QueryInterface the device for IDXGIDevice1 and try SetMaximumFrameLatency(1) (best-effort).
