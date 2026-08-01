@@ -186,6 +186,48 @@ through a symlink. To build a sample standalone on Windows, either check out aga
 developer mode on and `core.symlinks=true` to restore real symlinks, or change
 `build.zig` to remove the symlink dependency of `build_helpers` (neither is done today).
 
+### Running the test suite
+
+On macOS and Linux `zig build test` is the primary pass/fail signal. On Windows three
+obstacles stand between it and a usable answer, so run it like this:
+
+```powershell
+zig build test --summary all -j1 *> test.log
+```
+
+**Bound the job count with `-j1`.** At the default job count the aggregate reports
+`test runner failed to respond for 1m...` against steps picked seemingly at random —
+between 1 and 12 of them per run, on 6 of 6 measured runs — including steps that open no
+file and no socket (`test-pixelops`, `test-dsp`). Every step that reports it passes when
+run on its own, so the report is about scheduling, not about the test. `-j1` removes them
+completely: 4 of 4 measured runs reported 258/263 steps and about 3300 tests with no
+timeout at all. `-j8` narrows the window without closing it — 3 of 5 measured runs still
+reported one. Serialising the suite costs less than it sounds: with a warm cache, a `-j1`
+aggregate took between 2m43s and 4m21s on a 28-core machine.
+
+**Redirect the output to a file when the shell is an SSH session.** When a step fails, the
+build runner writes that step's whole captured stderr to its own stderr in one call.
+`std.Io.File.stderr()` declares the inherited handle blocking, but the pipe an SSH session
+supplies is opened for asynchronous I/O, so a write that large answers `STATUS_PENDING`
+and the runner dies inside `std.Io.Threaded` on `.PENDING => unreachable`. The build
+summary is lost, and the only surviving message is the unrelated-looking
+`error: unable to read results of configure phase`. Redirecting to a file gives an
+ordinary synchronous handle, and the same command then prints its whole summary.
+
+**Expect the netsync connect tests to fail.** `test-netsync` and `test-harness` both
+contain `netsync: after a shutdown the connection is refused`, which asserts that
+connecting to a closed port yields `error.ConnectionRefused`. Zig 0.16's Windows connect
+path maps every status other than success, cancellation and resource exhaustion to
+`error.Unexpected` (the log reads `error.Unexpected NTSTATUS=0xc0000236`, which *is*
+`CONNECTION_REFUSED`), so `error.ConnectionRefused` cannot be produced there and the
+assertion fails in both binaries. The same gap disables the client's start-up retry in
+`core/control/netsync.zig`, which treats `error.ConnectionRefused` and `error.Timeout` as
+retryable: on Windows a client started before its host fails soft at once instead of
+retrying for a few seconds. A third netsync test,
+`netsync: the router's five policy branches on a host`, fails intermittently from the same
+cause. So the expected Windows result is `258/263 steps succeeded (2 failed)` with two or
+three failing tests, all of them in netsync; anything outside that is a regression.
+
 ### Confirming the selected backend
 
 On a Windows desktop session, the same checks as in
