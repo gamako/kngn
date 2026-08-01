@@ -600,6 +600,14 @@ const OutboundQueue = struct {
         defer self.mutex.unlock(io);
         return self.closed;
     }
+
+    /// The number of entries still queued. `count` belongs to this queue's own mutex, so an
+    /// observer holding only `peers_mutex` would be reading it unsynchronised; go through here.
+    fn len(self: *OutboundQueue, io: Io) usize {
+        self.mutex.lockUncancelable(io);
+        defer self.mutex.unlock(io);
+        return self.count;
+    }
 };
 
 /// The inbound queue for PRESENCE only (separate from the COMMIT queue; when full it drops rather than disconnecting).
@@ -3191,7 +3199,7 @@ fn waitSlotsEmpty(timeout_ms: u64) !void {
         peers_mutex.lockUncancelable(io_val);
         var all_empty = true;
         for (&slots) |*s| {
-            if (s.state != .empty or s.outbound.count != 0) {
+            if (s.state != .empty or s.outbound.len(io_val) != 0) {
                 all_empty = false;
                 break;
             }
@@ -3201,6 +3209,42 @@ fn waitSlotsEmpty(timeout_ms: u64) !void {
         if (waited >= timeout_ms) return error.Timeout;
         sleepMs(10);
         waited += 10;
+    }
+}
+
+/// Checks the outbound queue of a host slot that a fresh connection has just been given.
+///
+/// The queue is deliberately **not** required to be empty. `handleHello` enqueues the new
+/// connection's own HELLO and the host PEER_INFO while still holding `peers_mutex`, and it
+/// makes the slot `.active` — the thing `peerCount()` reports — in the same critical section.
+/// So by the time a test observes the peer, those two frames are already queued, and whether
+/// the writer thread has drained them is a scheduling question, not an invariant.
+///
+/// What is invariant is that nothing survived the reuse: the queue is open again, it holds no
+/// more than the two handshake frames, and it holds no big entry at all. The fresh connection
+/// has been handed no large frame yet (the SYNC follows a `pump`), so a big entry could only
+/// be an unsent leftover of the previous connection.
+///
+/// The bound of two frames — the HELLO and the host PEER_INFO — assumes the newcomer is the only
+/// peer, which is what a test reusing a slot after waiting for every slot to empty gives. With
+/// another peer already active, `handleHello` sends that peer's PEER_INFO too and the bound grows.
+///
+/// Takes the queue's mutex; callers may hold `peers_mutex`, which is the order the rest of the
+/// module locks in (`peers_mutex` first, never the reverse).
+fn expectFreshSlotOutbound(q: *OutboundQueue) !void {
+    q.mutex.lockUncancelable(io_val);
+    defer q.mutex.unlock(io_val);
+    try testing.expect(!q.closed);
+    try testing.expect(q.count <= 2);
+    var i: usize = 0;
+    while (i < q.count) : (i += 1) {
+        const entry = &q.slots[(q.head + i) % OUTBOUND_CAP];
+        switch (entry.*) {
+            .big_frame => return error.LeftoverBigEntry,
+            .inline_frame => |f| try testing.expect(
+                f.kind == @intFromEnum(FrameKind.hello) or f.kind == @intFromEnum(FrameKind.peer_info),
+            ),
+        }
     }
 }
 
@@ -5312,8 +5356,11 @@ test "netsync: reusing a slot leaves behind no unsent big entry from the previou
 
     stream.close(io_val);
     // .empty, not just "no longer .active": slot 0 has to be free for the reconnect below to reuse it.
+    // Reaching it also settles the previous connection's queue: teardown resets it, which frees the
+    // unsent big entry and reopens the queue this test closed above.
     try waitSlotsEmpty(5000);
     try testing.expectEqual(@as(usize, 0), peerCount());
+    try testing.expect(!slots[0].outbound.isClosed(io_val));
 
     var stream2 = try rawHelloConnect(addr, "reuse2");
     defer stream2.close(io_val);
@@ -5323,7 +5370,9 @@ test "netsync: reusing a slot leaves behind no unsent big entry from the previou
     defer peers_mutex.unlock(io_val);
     try testing.expect(slots[0].state == .active or slots[0].state == .hello_pending);
     try testing.expect(slots[0].generation != gen0);
-    try testing.expectEqual(@as(usize, 0), slots[0].outbound.count);
+    // The reused queue carries the new handshake and nothing of the old connection. An emptiness
+    // check would instead be a race against the writer thread; see expectFreshSlotOutbound.
+    try expectFreshSlotOutbound(&slots[0].outbound);
 }
 
 test "netsync: freeing an unsent big entry during a shutdown, and joining the writer" {
