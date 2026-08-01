@@ -661,6 +661,15 @@ const App = struct {
     grid_enabled: bool = false,
     /// Loupe (magnifier) overlay. Display-only (view state; not routed through netsync).
     loupe_enabled: bool = false,
+    /// Coarse grid overlay: an independent toggle from `grid_enabled`, visible at any zoom (not
+    /// only above 4x) at a user-chosen spacing. Display-only (view state; not routed through
+    /// netsync), same as `grid_enabled`/`loupe_enabled` — it does not persist across a restart.
+    coarse_grid_enabled: bool = false,
+    /// Coarse grid spacing, canvas px (`grid_overlay.drawCoarse`'s `spacing_canvas_px`). Unlike
+    /// the toggle above, this is a user *setting* rather than transient view state, so it persists
+    /// in `preferences` (key `"grid.coarse_spacing"`) — loaded once at startup and updated on
+    /// change; see `setCoarseGridSpacing`.
+    coarse_grid_spacing: i32 = 16,
     /// Per-frame transient: the composite buffer this frame actually blitted to the canvas
     /// (post onion-skin blend when onion is active). Set once in the draw section below; the
     /// loupe overlay reads it later the same frame so the magnifier matches exactly what was
@@ -2464,6 +2473,20 @@ const App = struct {
     /// Set pixel-perfect (shared by UI / action set_pixel_perfect).
     fn doSetPixelPerfect(self: *App, on: bool) void {
         self.pixel_perfect = on;
+    }
+
+    /// Set the coarse grid spacing (shared by the Tool Options slider / action set_grid_spacing).
+    /// Updates the in-memory `preferences` too (`setI64` only touches the hashmap — no disk I/O,
+    /// so this is safe to call every frame a slider drag changes the value). The disk write itself
+    /// is not triggered here: it rides along on the existing `onWindowShutdown` -> `persistPanels`
+    /// -> `preferences.save` flush that already runs unconditionally on every clean shutdown
+    /// (native quit or the harness `quit` command alike), rather than adding a second save call
+    /// site that would otherwise fire synchronously on every drag frame.
+    fn setCoarseGridSpacing(self: *App, spacing: i32) void {
+        self.coarse_grid_spacing = spacing;
+        self.preferences.setI64("grid.coarse_spacing", spacing) catch |err| {
+            std.log.err("pixie: preferences set failed: {s}", .{@errorName(err)});
+        };
     }
 
     /// UI toggle for symmetry (during netsync: routeAction; solo: do* directly).
@@ -4308,6 +4331,27 @@ fn actionSetLoupe(ctx: *anyopaque, args: []const u8, buf: []u8) anyerror![]const
     return "ok";
 }
 
+/// `action set_coarse_grid <0|1>`. View-only, same classification as `set_grid`/`set_loupe`
+/// (a per-peer canvas overlay; no undo entry, no netsync relay). Unlike `grid_enabled`, this
+/// toggle does not persist across a restart — only the spacing does (see `setCoarseGridSpacing`).
+fn actionSetCoarseGrid(ctx: *anyopaque, args: []const u8, buf: []u8) anyerror![]const u8 {
+    _ = buf;
+    const app = actionApp(ctx);
+    try app.checkEditingAllowed();
+    app.coarse_grid_enabled = try actions.parseCoarseGrid(args);
+    return "ok";
+}
+
+/// `action set_grid_spacing <N>`. View-only (same classification as `set_grid`), but the spacing
+/// itself is a persisted preference (see `setCoarseGridSpacing`), unlike the toggles.
+fn actionSetGridSpacing(ctx: *anyopaque, args: []const u8, buf: []u8) anyerror![]const u8 {
+    _ = buf;
+    const app = actionApp(ctx);
+    try app.checkEditingAllowed();
+    app.setCoarseGridSpacing(try actions.parseGridSpacing(args));
+    return "ok";
+}
+
 /// Drive a canvas-coordinate point list as down→move×N→up (same Tool path as existing canvas_input).
 /// Accepts a leading `[tool=|color=|size=|opacity=|hardness=|tolerance=]` k=v prefix; latches the
 /// explicit parameters **temporarily and restores App state after** (so redo cannot clobber the
@@ -4740,6 +4784,9 @@ const PIXIE_ACTIONS = [_]ActionEntry{
     // Append-only at the end (parallelism constraint)
     .{ .name = "set_grid", .run = actionSetGrid },
     .{ .name = "set_loupe", .run = actionSetLoupe },
+    // Append-only at the end (parallelism constraint)
+    .{ .name = "set_coarse_grid", .run = actionSetCoarseGrid },
+    .{ .name = "set_grid_spacing", .run = actionSetGridSpacing },
 };
 
 /// `App.cmd_exec` Dispatcher: name→handler dispatch + noteUndo wiring.
@@ -4985,6 +5032,12 @@ const pixie_args_set_grid: @FieldType(platform.Action, "args") = &.{
 };
 const pixie_args_set_loupe: @FieldType(platform.Action, "args") = &.{
     .{ .name = "on", .kind = "bool", .desc = "0|1" },
+};
+const pixie_args_set_coarse_grid: @FieldType(platform.Action, "args") = &.{
+    .{ .name = "on", .kind = "bool", .desc = "0|1" },
+};
+const pixie_args_set_grid_spacing: @FieldType(platform.Action, "args") = &.{
+    .{ .name = "n", .kind = "int", .min = @floatFromInt(actions.MIN_GRID_SPACING), .max = @floatFromInt(actions.MAX_GRID_SPACING), .desc = "coarse-grid spacing, canvas px" },
 };
 const pixie_args_stroke: @FieldType(platform.Action, "args") = &.{
     .{ .name = "layer", .kind = "string", .pattern = "#<id>|<index>", .optional = true, .desc = "defaults to selected; canonical wire uses #<id>" },
@@ -5276,6 +5329,10 @@ fn registerActions(app: *App) void {
     platform.registerAction(.{ .name = "set_grid", .ctx = app, .run = recordedAction("set_grid", .record), .network_policy = .local_only, .desc = "toggle the pixel grid overlay 0|1 (view only, no undo)", .args = pixie_args_set_grid });
     // loupe (magnifier) overlay toggle (view only, no undo; a per-peer canvas overlay, not document state)
     platform.registerAction(.{ .name = "set_loupe", .ctx = app, .run = recordedAction("set_loupe", .record), .network_policy = .local_only, .desc = "toggle the loupe magnifier overlay 0|1 (view only, no undo)", .args = pixie_args_set_loupe });
+    // coarse grid overlay toggle (view only, no undo; a per-peer canvas overlay, not document state)
+    platform.registerAction(.{ .name = "set_coarse_grid", .ctx = app, .run = recordedAction("set_coarse_grid", .record), .network_policy = .local_only, .desc = "toggle the coarse grid overlay 0|1 (view only, no undo)", .args = pixie_args_set_coarse_grid });
+    // coarse grid spacing (view only, no undo; the spacing value itself persists in Preferences)
+    platform.registerAction(.{ .name = "set_grid_spacing", .ctx = app, .run = recordedAction("set_grid_spacing", .record), .network_policy = .local_only, .desc = "set the coarse grid spacing in canvas px (view only, no undo)", .args = pixie_args_set_grid_spacing });
     // project save (bypass executor, not recorded in CommandLog, local_only): writes .pix without quitting, symmetric with open_project
     platform.registerAction(.{ .name = "save_project", .ctx = app, .run = actionSaveProject, .network_policy = .local_only, .desc = "save .pix project to path (does not quit; alternative to request_close+confirm_save)", .args = pixie_args_path });
 }
@@ -6462,6 +6519,20 @@ fn panelBuildToolOptions(ctx: *gui.Context, user_data: *anyopaque) anyerror!void
     if (ctx.toggle("Loupe", &loupe_on)) {
         app.loupe_enabled = loupe_on;
     }
+    var coarse_grid_on = app.coarse_grid_enabled;
+    if (ctx.toggle("Coarse Grid", &coarse_grid_on)) {
+        app.coarse_grid_enabled = coarse_grid_on;
+    }
+    if (app.coarse_grid_enabled) {
+        var spacing = app.coarse_grid_spacing;
+        if (ctx.sliderI32Id(0xB0_0004, "Spacing", &spacing, .{
+            .min = @intCast(actions.MIN_GRID_SPACING),
+            .max = @intCast(actions.MAX_GRID_SPACING),
+            .track_w = 160,
+        })) {
+            app.setCoarseGridSpacing(spacing);
+        }
+    }
     if (app.active_kind == .brush or app.active_kind == .bezier) {
         _ = ctx.sliderI32Id(0xB0_0001, "Size", &app.brush_size_i32, .{ .min = 1, .max = 64, .track_w = 90 });
         _ = ctx.sliderI32Id(0xB0_0002, "Opac", &app.brush_opacity_i32, .{ .min = 0, .max = 255, .track_w = 90 });
@@ -7106,6 +7177,14 @@ fn appInit(gpa: std.mem.Allocator, io: std.Io) !*App {
         _ = self.preferences.load(io, data_dir, "preferences.ash") catch |err| {
             std.log.err("pixie: preferences load failed: {s}", .{@errorName(err)});
         };
+        // A missing/corrupt/out-of-range value falls back to the field's own default (16) rather
+        // than a clamp toward one edge of the range, so a stale or hand-edited preferences.ash
+        // cannot silently pin the spacing at 1 or 4096.
+        if (self.preferences.getI64("grid.coarse_spacing")) |v| {
+            if (v >= actions.MIN_GRID_SPACING and v <= actions.MAX_GRID_SPACING) {
+                self.coarse_grid_spacing = @intCast(v);
+            }
+        }
     }
 
     self.panel_host = try gui.PanelHost.init(self.panels[0..], .{
@@ -7591,18 +7670,21 @@ fn appFrameInner(self: *App, win: *platform.Window) !void {
                 drawMinimapOverlay(self, fb.pixels, phys_w, phys_h, area, content_scale);
             }
         }
-        // Pixel grid overlay (view-only; draw_list-based, so it paints on top of the raw-pixel
-        // canvas/minimap regardless of call order relative to those, same as every other overlay below).
-        // The minimap sits inside this same clip_area, so its rect is carved out of the grid lines
-        // (see grid_overlay.zig's doc comment) rather than relying on draw order to keep it clear.
-        if (self.grid_enabled) {
+        // Pixel grid overlays — fine (1px, zoom>=4x only) and coarse (user-chosen spacing, any
+        // zoom) — are independent toggles sharing one clip_area/minimap_rect computation (view-only;
+        // draw_list-based, so they paint on top of the raw-pixel canvas/minimap regardless of call
+        // order relative to those, same as every other overlay below). The minimap sits inside this
+        // same clip_area, so its rect is carved out of both grids' lines (see grid_overlay.zig's doc
+        // comment) rather than relying on draw order to keep it clear.
+        if (self.grid_enabled or self.coarse_grid_enabled) {
             if (canvas_rect) |rect| if (self.last_area) |area| {
                 const clip_area: gui.Rect = .{ .x = area.x, .y = area.y, .w = @intCast(area.w), .h = @intCast(area.h) };
                 const minimap_rect: ?gui.Rect = if (currentMinimapRect(self, area)) |mm|
                     .{ .x = mm.x, .y = mm.y, .w = @intCast(mm.w), .h = @intCast(mm.h) }
                 else
                     null;
-                grid_overlay.draw(&self.ctx, rect, self.view_zoom, clip_area, minimap_rect);
+                if (self.grid_enabled) grid_overlay.draw(&self.ctx, rect, self.view_zoom, clip_area, minimap_rect);
+                if (self.coarse_grid_enabled) grid_overlay.drawCoarse(&self.ctx, rect, self.view_zoom, clip_area, self.coarse_grid_spacing, minimap_rect);
             };
         }
         // presence overlay (right after canvas blit; below bezier/selection)

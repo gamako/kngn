@@ -699,6 +699,37 @@ pub fn parseLoupe(args: []const u8) ParseError!bool {
     return on;
 }
 
+/// `set_coarse_grid <0|1>`
+pub fn parseCoarseGrid(args: []const u8) ParseError!bool {
+    var it = tokenize(args);
+    const tok = it.next() orelse return error.Empty;
+    const on = if (std.mem.eql(u8, tok, "0"))
+        false
+    else if (std.mem.eql(u8, tok, "1"))
+        true
+    else
+        return error.UnknownBool;
+    try expectExhausted(&it);
+    return on;
+}
+
+/// The coarse grid's spacing range, shared by the UI slider, this parser, and the persisted
+/// preferences clamp (one range, so a value valid in one place is valid everywhere): at least one
+/// canvas pixel, and capped at the largest canvas edge (a wider spacing could never mark a tile
+/// boundary inside any document this editor can hold).
+pub const MIN_GRID_SPACING: u32 = 1;
+pub const MAX_GRID_SPACING: u32 = MAX_CANVAS_EDGE;
+
+/// `set_grid_spacing <N>` (N is MIN_GRID_SPACING..=MAX_GRID_SPACING, in canvas pixels).
+pub fn parseGridSpacing(args: []const u8) ParseError!i32 {
+    var it = tokenize(args);
+    const tok = it.next() orelse return error.Empty;
+    const n = std.fmt.parseUnsigned(u32, tok, 10) catch return error.InvalidNumber;
+    if (n < MIN_GRID_SPACING or n > MAX_GRID_SPACING) return error.ValueOutOfRange;
+    try expectExhausted(&it);
+    return @intCast(n);
+}
+
 /// Canonical shape args (for UI recording / redo).
 pub fn formatCanonicalShape(buf: []u8, a: ShapeArgs) error{TooLong}![]const u8 {
     if (a.fill) {
@@ -1391,6 +1422,20 @@ test "parseSymmetry / parsePixelPerfect" {
     try testing.expectEqual(true, try parsePixelPerfect("1"));
     try testing.expectEqual(false, try parsePixelPerfect("0"));
     try testing.expectError(error.UnknownBool, parsePixelPerfect("yes"));
+}
+
+test "parseCoarseGrid / parseGridSpacing" {
+    try testing.expectEqual(true, try parseCoarseGrid("1"));
+    try testing.expectEqual(false, try parseCoarseGrid("0"));
+    try testing.expectError(error.UnknownBool, parseCoarseGrid("on"));
+
+    try testing.expectEqual(@as(i32, 16), try parseGridSpacing("16"));
+    try testing.expectEqual(@as(i32, 1), try parseGridSpacing(std.fmt.comptimePrint("{d}", .{MIN_GRID_SPACING})));
+    try testing.expectEqual(@as(i32, @intCast(MAX_GRID_SPACING)), try parseGridSpacing(std.fmt.comptimePrint("{d}", .{MAX_GRID_SPACING})));
+    try testing.expectError(error.ValueOutOfRange, parseGridSpacing("0"));
+    try testing.expectError(error.ValueOutOfRange, parseGridSpacing(std.fmt.comptimePrint("{d}", .{MAX_GRID_SPACING + 1})));
+    try testing.expectError(error.InvalidNumber, parseGridSpacing("sixteen"));
+    try testing.expectError(error.TooManyTokens, parseGridSpacing("16 32"));
 }
 
 test "formatCanonicalShape round-trip" {
