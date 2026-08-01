@@ -118,7 +118,7 @@ pub const CommandLog = struct {
     filled: u32 = 0,
     /// The ring position written to next.
     head: u32 = 0,
-    /// The local seq issued next.
+    /// The local seq issued next. It is monotonic and never reused; appends are rejected once it is exhausted.
     next_seq: u64 = 1,
 
     pub fn append(self: *CommandLog, rec: CommandRecord) void {
@@ -154,6 +154,11 @@ pub const CommandLog = struct {
     pub fn latest(self: *CommandLog) ?*CommandRecord {
         if (self.filled == 0) return null;
         return self.recordAtMut(self.filled - 1);
+    }
+
+    /// Whether `count` more local records can be appended without exhausting `next_seq`.
+    pub fn hasSeqCapacity(self: *const CommandLog, count: u64) bool {
+        return std.math.maxInt(u64) - self.next_seq >= count;
     }
 
     /// Copy ring state for persistence. `records[0..filled]` are oldest-to-newest; unused slots are undefined.
@@ -558,10 +563,12 @@ pub const Executor = struct {
         var seq: u64 = undefined;
         switch (spec.source) {
             .local => {
+                if (!log.hasSeqCapacity(1)) return error.SeqExhausted;
                 seq = log.next_seq;
                 log.next_seq += 1;
             },
             .remote_commit => |rc| {
+                if (rc.seq == std.math.maxInt(u64)) return error.RemoteSeqExhausted;
                 seq = rc.seq;
                 if (rc.seq + 1 > log.next_seq) log.next_seq = rc.seq + 1;
             },
@@ -629,11 +636,16 @@ pub const Executor = struct {
         if (opts.transaction) |h| try self.checkTransactionHandle(h, opts.actor);
         if (!self.actorCapacityOk(opts.actor)) return error.TooManyActors;
         switch (opts.source) {
-            .local => {},
+            .local => {
+                if (self.log) |log| {
+                    if (!log.hasSeqCapacity(1)) return error.SeqExhausted;
+                }
+            },
             .remote_commit => |rc| {
                 // With no log (a no-op recorder) there is no next_seq to compare against, so the check cannot be made at all.
                 if (self.log) |log| {
                     if (rc.seq < log.next_seq) return error.StaleRemoteSeq;
+                    if (rc.seq == std.math.maxInt(u64)) return error.RemoteSeqExhausted;
                 }
             },
         }
@@ -776,6 +788,9 @@ pub const Executor = struct {
     }
 
     fn performUndoBundle(self: *Executor, log: *CommandLog, adapter: CommandAdapter, actor: ActorId, members: []const CommandRecord, buf: []u8) !UndoOutcome {
+        if (!log.hasSeqCapacity(@intCast(members.len))) {
+            return .{ .happened = false, .message = writeMsg(buf, "no candidate: seq exhausted") };
+        }
         const revert_tx_id = self.allocTransactionId() orelse
             return .{ .happened = false, .message = writeMsg(buf, "no candidate: transaction id exhausted") };
 
@@ -833,6 +848,7 @@ pub const Executor = struct {
     pub fn applyWireRevert(self: *Executor, target_seq: u64, new_seq: u64) !void {
         const log = self.log orelse return error.NoLog;
         const adapter = self.adapter orelse return error.NoAdapter;
+        if (new_seq == std.math.maxInt(u64)) return error.RemoteSeqExhausted;
         const rec = log.findBySeq(target_seq) orelse return error.UnknownSeq;
         if (rec.kind != .normal) return error.NotUndoable;
         if (!rec.undoable) return error.NotUndoable;
@@ -919,6 +935,9 @@ pub const Executor = struct {
     fn performRedoBundle(self: *Executor, log: *CommandLog, actor: ActorId, members_in: []CommandRecord, buf: []u8) !RedoOutcome {
         sortByTargetSeqAsc(members_in); // re-run in the original execution order (ascending target_seq)
 
+        if (!log.hasSeqCapacity(@intCast(members_in.len))) {
+            return .{ .happened = false, .message = writeMsg(buf, "no candidate: seq exhausted") };
+        }
         const new_tx_id = self.allocTransactionId() orelse
             return .{ .happened = false, .message = writeMsg(buf, "no candidate: transaction id exhausted") };
 
@@ -1423,6 +1442,144 @@ test "10: remote_commit adopts the seq, advances next_seq, rejects a duplicate, 
         .source = .{ .remote_commit = .{ .seq = 20, .pending_local_meta = .{ .redo_of = 10 } } },
     }, &buf);
     try testing.expectEqual(before_epoch, exec.currentEpoch(.{ .peer = 1 }));
+}
+
+test "10a: a local seq exhaustion rejects executeAction and recordExecuted before mutation" {
+    var app: MockApp = undefined;
+    var log: CommandLog = undefined;
+    var exec: Executor = undefined;
+    wire(&app, &log, &exec);
+    var buf: [256]u8 = undefined;
+
+    log.next_seq = std.math.maxInt(u64);
+    try testing.expectError(error.SeqExhausted, exec.executeAction("blocked", "", .{ .actor = .local_user }, &buf));
+    try testing.expectEqual(@as(u64, 0), app.run_count);
+    try testing.expectEqual(@as(u64, 0), log.filled);
+
+    try testing.expectError(error.SeqExhausted, exec.recordExecuted("blocked", "", .{ .actor = .local_user }, null, &buf));
+    try testing.expectEqual(@as(u64, 0), log.filled);
+}
+
+test "10b: a maximum remote seq is rejected before dispatch or recording" {
+    var app: MockApp = undefined;
+    var log: CommandLog = undefined;
+    var exec: Executor = undefined;
+    wire(&app, &log, &exec);
+    var buf: [256]u8 = undefined;
+
+    try testing.expectError(error.RemoteSeqExhausted, exec.executeAction("blocked", "", .{
+        .actor = .{ .peer = 1 },
+        .source = .{ .remote_commit = .{ .seq = std.math.maxInt(u64) } },
+    }, &buf));
+    try testing.expectEqual(@as(u64, 0), app.run_count);
+    try testing.expectEqual(@as(u64, 1), log.next_seq);
+    try testing.expectEqual(@as(u64, 0), log.filled);
+}
+
+test "10c: a remote commit can reach the seq ceiling, after which local execution is rejected" {
+    var app: MockApp = undefined;
+    var log: CommandLog = undefined;
+    var exec: Executor = undefined;
+    wire(&app, &log, &exec);
+    var buf: [256]u8 = undefined;
+
+    _ = try exec.executeAction("remote", "", .{
+        .actor = .{ .peer = 1 },
+        .source = .{ .remote_commit = .{ .seq = std.math.maxInt(u64) - 1 } },
+    }, &buf);
+    try testing.expectEqual(std.math.maxInt(u64), log.next_seq);
+
+    const run_count_before = app.run_count;
+    try testing.expectError(error.SeqExhausted, exec.executeAction("blocked", "", .{ .actor = .local_user }, &buf));
+    try testing.expectEqual(run_count_before, app.run_count);
+    try testing.expectEqual(std.math.maxInt(u64), log.next_seq);
+}
+
+test "10d: seq exhaustion prevents undo from applying or marking its target" {
+    var app: MockApp = undefined;
+    var log: CommandLog = undefined;
+    var exec: Executor = undefined;
+    wire(&app, &log, &exec);
+    var buf: [256]u8 = undefined;
+
+    _ = try exec1(&exec, .local_user, "undoable", &buf);
+    const target = log.findBySeq(1).?;
+    const ref = target.undo_ref.?;
+    log.next_seq = std.math.maxInt(u64);
+
+    const result = try exec.undoOne(.local_user, &buf);
+    try testing.expect(!result.happened);
+    try testing.expect(!target.reverted);
+    try testing.expect(app.valid[ref]);
+    try testing.expectEqual(@as(u32, 1), log.filled);
+}
+
+test "10e: seq exhaustion prevents redo from dispatching or consuming its candidate" {
+    var app: MockApp = undefined;
+    var log: CommandLog = undefined;
+    var exec: Executor = undefined;
+    wire(&app, &log, &exec);
+    var buf: [256]u8 = undefined;
+
+    _ = try exec1(&exec, .local_user, "redoable", &buf);
+    _ = try exec.undoOne(.local_user, &buf);
+    const run_count_before = app.run_count;
+    const revert = log.findBySeq(2).?;
+    log.next_seq = std.math.maxInt(u64);
+
+    const result = try exec.redoOne(.local_user, &buf);
+    try testing.expect(!result.happened);
+    try testing.expectEqual(run_count_before, app.run_count);
+    try testing.expect(!revert.redo_consumed);
+}
+
+test "10f: a maximum wire revert seq is rejected before inverse application" {
+    var app: MockApp = undefined;
+    var log: CommandLog = undefined;
+    var exec: Executor = undefined;
+    wire(&app, &log, &exec);
+    var buf: [256]u8 = undefined;
+
+    _ = try exec.executeAction("remote", "", .{
+        .actor = .{ .peer = 1 },
+        .source = .{ .remote_commit = .{ .seq = 1 } },
+    }, &buf);
+    const target = log.findBySeq(1).?;
+    const ref = target.undo_ref.?;
+    const filled_before = log.filled;
+
+    try testing.expectError(error.RemoteSeqExhausted, exec.applyWireRevert(1, std.math.maxInt(u64)));
+    try testing.expectEqual(filled_before, log.filled);
+    try testing.expect(!target.reverted);
+    try testing.expect(app.valid[ref]);
+}
+
+test "10g: a bundle short of the seq ceiling by one is rejected whole, not partially applied" {
+    var app: MockApp = undefined;
+    var log: CommandLog = undefined;
+    var exec: Executor = undefined;
+    wire(&app, &log, &exec);
+    var buf: [256]u8 = undefined;
+
+    const tx = try exec.beginTransaction(.local_user, "macro");
+    _ = try exec.executeAction("m1", "", .{ .actor = .local_user, .transaction = tx }, &buf);
+    _ = try exec.executeAction("m2", "", .{ .actor = .local_user, .transaction = tx }, &buf);
+    try exec.endTransaction(tx, .local_user);
+
+    const seq_m1 = log.next_seq - 2;
+    const seq_m2 = log.next_seq - 1;
+    const ref_m1 = log.findBySeq(seq_m1).?.undo_ref.?;
+    const ref_m2 = log.findBySeq(seq_m2).?.undo_ref.?;
+
+    // Only one more seq of headroom remains, but the bundle needs two (one revert record per member).
+    log.next_seq = std.math.maxInt(u64) - 1;
+
+    const u = try exec.undoOne(.local_user, &buf);
+    try testing.expect(!u.happened);
+    try testing.expect(!log.findBySeq(seq_m1).?.reverted);
+    try testing.expect(!log.findBySeq(seq_m2).?.reverted);
+    try testing.expect(app.valid[ref_m1]);
+    try testing.expect(app.valid[ref_m2]);
 }
 
 test "11: preflight's input constraints apply identically for every record_policy (dry_run, no_record, a no-op recorder)" {
