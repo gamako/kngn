@@ -188,30 +188,43 @@ pub fn hitTest(geometry: Geometry, point_x: f32, point_y: f32, row_count: u8) ?G
 
 /// Append 16 cells to the current Flex parent; return the clicked cell.
 /// Cell IDs are explicit `id_base + step`; pass values that won't collide with caller label/button IDs.
+///
+/// Inside a `ctx.beginDisabled()`/`endDisabled()` scope, every cell rejects the click (regardless
+/// of `options.editable`) and draws with `Style.disabledColor`, the same contract ordinary
+/// widgets follow (see `Context.isDisabled`'s doc comment). `options.editable` is a separate,
+/// narrower lever that only suppresses the click while still drawing the cell at full color —
+/// use it for "read-only but not conceptually disabled" displays; use the disabled scope when
+/// the row should also look disabled.
 pub fn widgetRow(ctx: *Context, options: WidgetOptions) ?GridCell {
     std.debug.assert(options.cell_size > 0);
+    const disabled = ctx.isDisabled();
     var clicked: ?GridCell = null;
     var step: u8 = 0;
     while (step < STEP_COUNT) : (step += 1) {
         const id = options.id_base + step;
-        const result = if (ctx.getNodeCachedRect(id)) |cached|
+        const result = if (disabled) blk: {
+            ctx.clearDisabledInteraction(id);
+            break :blk context_mod.ButtonResult{};
+        } else if (ctx.getNodeCachedRect(id)) |cached|
             context_mod.buttonBehavior(ctx, id, cached.rect, cached.clip)
         else
             context_mod.ButtonResult{};
         if (options.editable and result.clicked) clicked = .{ .row = 0, .step = step };
 
-        const color = if (options.pitch) |pitch|
+        const style = ctx.style;
+        const color_raw = if (options.pitch) |pitch|
             pitchCellsColor(pitch, step)
         else if (options.mask) |mask|
             if (bitSet(mask, step)) options.on_color else offColor(step, options.off_color, options.off_beat_color)
         else
             offColor(step, options.off_color, options.off_beat_color);
+        const color = if (disabled) style.disabledColor(color_raw) else color_raw;
         // Same opaque path as colorSwatchId: box bg + style border (align clickable-cell look with other widgets)
-        const style = ctx.style;
+        const border_color = if (disabled) style.disabledColor(style.border) else style.border;
         const border: ?layout_mod.Border = if (style.swatch_border <= 0)
             null
         else
-            .{ .color = style.border, .thickness = @intCast(style.swatch_border) };
+            .{ .color = border_color, .thickness = @intCast(style.swatch_border) };
         ctx.beginBox(.{
             .id = id,
             .width = .{ .fixed = options.cell_size },

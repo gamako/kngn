@@ -439,6 +439,26 @@ pub const Context = struct {
         return self.disabled_depth > 0;
     }
 
+    /// If `id` currently holds the focus, hover, or press lock, release it immediately (called
+    /// when a widget is submitted disabled). A disabled widget cannot act on Space/Enter or a
+    /// drag in progress, so leaving any of these pointed at it would be a ghost: a focus ring
+    /// with nothing to activate, a hover tint with nothing to press, an active lock a release
+    /// could never resolve. Called at submit time, before this frame's `emitNode` draws the
+    /// ring, so disabling a focused widget never draws a stray ring in the same frame.
+    ///
+    /// Public so every compound widget that hand-assembles its own hit-test instead of routing
+    /// through the standard cache-based helper (stepgrid, Listbox row) can release stale state
+    /// the same way the standard helper does, not by reimplementing this.
+    pub fn clearDisabledInteraction(self: *Context, id: Id) void {
+        if (self.state.focused_id == id) {
+            self.state.focused_id = 0;
+            self.state.focus_visible = false;
+        }
+        if (self.state.active_id == id) self.state.active_id = 0;
+        if (self.state.hot_id == id) self.state.hot_id = 0;
+        if (self.state.next_hot_id == id) self.state.next_hot_id = 0;
+    }
+
     /// Claim keyboard focus when a widget sees mouse down. Per-ID selection state
     /// lives in a separate store, so switching focus does not clear the selection.
     ///

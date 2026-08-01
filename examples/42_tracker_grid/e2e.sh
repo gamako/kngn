@@ -258,6 +258,26 @@ drive "inject mouse_move 5 5; step 1; inject mouse_down left; step 1; inject mou
 digest_state >/dev/null
 expect_state "popup=none"
 
+# Step grid: clicking the muted track's own row must not toggle its mask either (the same
+# beginDisabled scope as the Volume/Pan pair below now covers the grid row too --
+# stepgrid.widgetRow consults ctx.isDisabled() instead of relying on the widget's own
+# editable=false, which used to reject the click but never grey the row).
+STATE=$(digest_state)
+MASK_BEFORE=$(parse_kv step_t0 "$STATE")
+LAYOUT=$(digest_layout)
+read -r sx sy sw sh <<<"$(layout_rect cell_t0_s4 "$LAYOUT")"
+read -r cx cy <<<"$(rect_center "$sx" "$sy" "$sw" "$sh")"
+click_xy "$cx" "$cy"
+drive "step 2" >>"$LOG" 2>&1
+STATE=$(digest_state)
+MASK_AFTER=$(parse_kv step_t0 "$STATE")
+if [[ "$MASK_BEFORE" != "$MASK_AFTER" ]]; then
+  log "[e2e] FAIL: step_t0 mask changed while muted ($MASK_BEFORE -> $MASK_AFTER)"
+  exit 1
+fi
+log "[e2e] ok step_t0 mask unchanged while muted ($MASK_BEFORE)"
+drive "snapshot fb" >>"$LOG" 2>&1
+
 # Volume drag while muted: expect no change (beginDisabled rejects the drag). Start the press
 # exactly on the current knob position (frac = VOL0, min=0 max=1) -- clicking elsewhere on the
 # track never starts a drag in the first place, disabled or not, so that alone would not

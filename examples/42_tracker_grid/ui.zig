@@ -268,19 +268,18 @@ pub fn buildUi(app: *App) void {
             .align_cross = .center,
             .bg = if (selected) gui.Color.rgba(0x30, 0x38, 0x48, 0xFF) else null,
         });
-        // `gui.stepgrid.widgetRow` calls `buttonBehavior` directly rather than
-        // `behaviorFromCache`, so it never consults `ctx.isDisabled()` (unlike tabId/buttonId/
-        // sliderF32Id below). `editable` is the only lever this widget exposes for "do not let
-        // this row's clicks change anything" — it suppresses the edit but draws no grayed-out
-        // look, so a muted track's grid row visually looks identical whether or not it can be
-        // edited. Recorded as a cross-cutting gap in the capability matrix.
-        if (gui.stepgrid.widgetRow(ctx, .{
+        // A muted track's grid row goes through the same disabled scope as its volume/pan
+        // controls below (stepgrid.widgetRow consults ctx.isDisabled()), so muting greys out
+        // and locks the row consistently across the whole track, not just its sliders.
+        if (t.muted) ctx.beginDisabled();
+        const clicked_cell = gui.stepgrid.widgetRow(ctx, .{
             .id_base = Ids.step_row_base + @as(gui.Id, @intCast(i * STEP_COUNT)),
             .mask = app.patterns[app.active_pattern][i],
             .on_color = t.color,
             .cell_size = cell,
-            .editable = !t.muted,
-        })) |clicked| {
+        });
+        if (t.muted) ctx.endDisabled();
+        if (clicked_cell) |clicked| {
             app.patterns[app.active_pattern][i] ^= @as(u16, 1) << @as(u4, @intCast(clicked.step));
         }
         ctx.endBox();
@@ -308,9 +307,9 @@ pub fn buildUi(app: *App) void {
     }
     ctx.endBox();
 
-    // Muting a track disables editing its own level controls (a synthetic but genuine use of
-    // the shared disabled scope: unlike the grid row above, sliderF32Id does consult
-    // `ctx.isDisabled()`, so this pair is greyed out and rejects drag/focus/arrow-key input).
+    // Muting a track disables editing its own level controls (a second, independent use of
+    // the shared disabled scope from the grid row above): sliderF32Id consults
+    // `ctx.isDisabled()`, so this pair is greyed out and rejects drag/focus/arrow-key input.
     // Mute/Solo themselves stay outside the scope, since undoing a mute must always work.
     if (track.muted) ctx.beginDisabled();
     ctx.beginFormRow(.{ .description = "Level: 0 to 1." });

@@ -338,22 +338,6 @@ fn keyboardActivated(ctx: *const Context, id: Id) bool {
         ctx.input.pressedPlain(input_mod.key.enter, 0, all);
 }
 
-/// If `id` currently holds the focus, hover, or press lock, release it immediately (called when a
-/// widget is submitted disabled). A disabled widget cannot act on Space/Enter or a drag in
-/// progress, so leaving any of these pointed at it would be a ghost: a focus ring with nothing to
-/// activate, a hover tint with nothing to press, an active lock a release could never resolve.
-/// Runs at submit time, before this frame's `emitNode` draws the ring, so disabling a focused
-/// widget and disabling it never draws a stray ring in the same frame.
-fn clearDisabledInteraction(ctx: *Context, id: Id) void {
-    if (ctx.state.focused_id == id) {
-        ctx.state.focused_id = 0;
-        ctx.state.focus_visible = false;
-    }
-    if (ctx.state.active_id == id) ctx.state.active_id = 0;
-    if (ctx.state.hot_id == id) ctx.state.hot_id = 0;
-    if (ctx.state.next_hot_id == id) ctx.state.next_hot_id = 0;
-}
-
 /// Shared pointer + keyboard behaviour for every widget that behaves like a button.
 ///
 /// Beyond the hit-test it does three things that make the widget a keyboard citizen: it enters the
@@ -367,7 +351,7 @@ fn clearDisabledInteraction(ctx: *Context, id: Id) void {
 /// own `Style.disabledColor` draw path) — only interaction is rejected.
 fn behaviorFromCache(ctx: *Context, id: Id) ButtonResult {
     if (ctx.isDisabled()) {
-        clearDisabledInteraction(ctx, id);
+        ctx.clearDisabledInteraction(id);
         ctx.noteLastInteractive(id, .{ .x = 0, .y = 0, .w = 0, .h = 0 }, false);
         return .{};
     }
@@ -539,7 +523,7 @@ pub fn textInputId(
         // Same reasoning as `behaviorFromCache`'s disabled path: no Tab entry, and release
         // whatever this id held from before it became disabled so a stale focus cannot come back
         // through the press-acquire block below (that block does not itself check `focused`).
-        clearDisabledInteraction(ctx, id);
+        ctx.clearDisabledInteraction(id);
     } else {
         // A text field is a control, so Tab reaches it alongside the buttons and checkboxes. It keeps
         // its own handling of the keys it cares about; Tab is not one of them.
@@ -1082,7 +1066,7 @@ fn sliderCore(ctx: *Context, id: Id, label: []const u8, cur: f64, spec: SliderSp
     if (disabled) {
         // No Tab entry, no drag, no arrow-key nudge — release whatever this id held from before
         // it became disabled (same reasoning as `behaviorFromCache`'s disabled path).
-        clearDisabledInteraction(ctx, id);
+        ctx.clearDisabledInteraction(id);
     } else {
         ctx.registerFocusable(id);
 
@@ -2104,25 +2088,35 @@ pub const ListboxRowResult = struct {
 /// costs Tab exactly one stop — whichever row is currently selected — never one per row.
 pub fn beginListboxRow(ctx: *Context, id: Id, selected: bool, opts: ListboxRowOpts) ListboxRowResult {
     std.debug.assert(id != 0);
-    if (selected) ctx.registerFocusable(id);
+    const disabled = ctx.isDisabled();
 
     // Same synchronous hit-test contract as behaviorFromCache, hand-assembled instead of
     // reusing it: behaviorFromCache registers focusable unconditionally, which would defeat
-    // the roving-tab-stop rule above.
+    // the roving-tab-stop rule above. The disabled branch mirrors behaviorFromCache's disabled
+    // path instead: no Tab entry, no hit-test, release whatever this id held from before it
+    // became disabled.
     var btn: ButtonResult = .{};
-    if (ctx.rect_cache.get(id)) |cached| {
-        btn = context_mod.buttonBehavior(ctx, id, cached.rect, cached.clip);
-        if (btn.held) _ = ctx.claimFocus(id);
-        ctx.noteLastInteractive(id, cached.rect, btn.hovered);
-    } else {
+    if (disabled) {
+        ctx.clearDisabledInteraction(id);
         ctx.noteLastInteractive(id, .{ .x = 0, .y = 0, .w = 0, .h = 0 }, false);
+    } else {
+        if (selected) ctx.registerFocusable(id);
+        if (ctx.rect_cache.get(id)) |cached| {
+            btn = context_mod.buttonBehavior(ctx, id, cached.rect, cached.clip);
+            if (btn.held) _ = ctx.claimFocus(id);
+            ctx.noteLastInteractive(id, cached.rect, btn.hovered);
+        } else {
+            ctx.noteLastInteractive(id, .{ .x = 0, .y = 0, .w = 0, .h = 0 }, false);
+        }
     }
-    const activated = btn.clicked or keyboardActivated(ctx, id);
+    const activated = !disabled and (btn.clicked or keyboardActivated(ctx, id));
 
     const style = ctx.style;
     const hot = ctx.state.hot_id == id;
-    // held > hover > selected > normal — the same priority buttonId uses.
-    const bg = if (btn.held)
+    // disabled > held > hover > selected > normal — the same priority buttonId uses.
+    const bg = if (disabled)
+        (if (selected) style.disabledColor(style.button_bg_selected) else opts.idle_bg)
+    else if (btn.held)
         style.bg_active
     else if (hot)
         style.bg_hover
