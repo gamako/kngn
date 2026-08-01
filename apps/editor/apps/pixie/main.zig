@@ -197,6 +197,12 @@ const SIZE_DIALOG_CANCEL_ID: gui.Id = SIZE_DIALOG_ID_BASE + 4;
 const STATUS_BAR_ID_BASE: gui.Id = 0xA451_0000;
 const STATUS_CURSOR_ID: gui.Id = STATUS_BAR_ID_BASE + 1;
 const STATUS_ZOOM_ID: gui.Id = STATUS_BAR_ID_BASE + 2;
+/// The zoom slider's track (sliderI32Id's explicit ID names its track node, not the whole
+/// [label][track][value] row it draws). A separate box from STATUS_ZOOM_ID: this one is a real
+/// interactive widget built every frame in buildUi, while STATUS_ZOOM_ID stays a layout
+/// placeholder repainted post-hoc by drawStatusBarLive (repainting this box too would erase the
+/// slider's own drawing).
+const STATUS_ZOOM_SLIDER_ID: gui.Id = STATUS_BAR_ID_BASE + 3;
 const STATUS_BAR_BG = gui.Color.rgba(0x28, 0x28, 0x30, 0xFF);
 
 const MENU_CMD_CAP = 40;
@@ -863,6 +869,16 @@ const App = struct {
         self.view_zoom = z;
         self.cam_cx = @as(f32, @floatFromInt(self.doc.width)) / 2.0;
         self.cam_cy = @as(f32, @floatFromInt(self.doc.height)) / 2.0;
+    }
+
+    /// Change zoom keeping the current view center fixed (no camera jump): cam_cx/cam_cy are
+    /// exactly what `zoomAround` computes when its focus point is the view center itself (the
+    /// `(fxf - c.sx)` and `(fyf - c.sy)` terms both vanish), so this is that same math with no
+    /// screen-position input required. For a control not anchored to a screen position (the zoom
+    /// slider) — unlike `setZoomCentered`, which recenters on the *document* center instead.
+    fn zoomInPlace(self: *App, z: Zoom) void {
+        if (z.eql(self.view_zoom)) return;
+        self.view_zoom = z;
     }
 
     /// Change zoom with screen focus (fx,fy) as the fixed point (scroll / +/-).
@@ -3507,6 +3523,18 @@ fn canvasDigest(ctx: *anyopaque, buf: []u8) []const u8 {
             len += vp.len;
         }
     }
+    // Zoom slider track rect (additive; independent of last_area — it exists once buildUi has run
+    // at least once). `zoom_slider_track_*` names the TRACK node specifically (sliderI32Id's
+    // explicit ID names its track, not the [label][track][value] row it draws), so a replay script
+    // can compute the on-screen knob position (see zoomSliderDigestFields) to drag it.
+    {
+        const zs = zoomSliderDigestFields(app);
+        const zs_part = std.fmt.bufPrint(buf[len..], "{s}", .{zs}) catch {
+            truncated = true;
+            return actions.finishDigestWithTrunc(buf, len, truncated);
+        };
+        len += zs_part.len;
+    }
     for (app.canvas.layers.items, 0..) |layer, idx| {
         var nonzero: usize = 0;
         for (layer.pixels) |p| {
@@ -5423,6 +5451,21 @@ fn minimapDigestFields(app: *App, area: core.Rect) []const u8 {
     }) catch " minimap=on minimap_rect=none visible_rect=none viewport_rect=none";
 }
 
+/// Zoom-slider track rect for `digest canvas` (a replay script's way to compute where to click the
+/// knob — see STATUS_ZOOM_SLIDER_ID's doc comment for why this is the track, not the whole
+/// [label][track][value] row). `zoom_slider_track=none` before buildUi has run once (the very
+/// first frame; `getNodeRect` reads the previous frame's cached layout, same contract as
+/// drawStatusBarLive's STATUS_ZOOM_ID lookup).
+fn zoomSliderDigestFields(app: *App) []const u8 {
+    // Static buffer (digest is sync, single-call). Part of the 1024 budget.
+    const Buf = struct {
+        var bytes: [96]u8 = undefined;
+    };
+    const r = app.ctx.getNodeRect(STATUS_ZOOM_SLIDER_ID) orelse
+        return " zoom_slider_track=none";
+    return std.fmt.bufPrint(&Buf.bytes, " zoom_slider_track={d},{d},{d},{d}", .{ r.x, r.y, r.w, r.h }) catch " zoom_slider_track=none";
+}
+
 /// Current-frame minimap placement (only when display conditions hold).
 fn currentMinimapRect(app: *const App, area: core.Rect) ?core.Rect {
     const cw = app.doc.width;
@@ -6463,6 +6506,15 @@ fn buildUi(ctx: *gui.Context, app: *App, canvas_rect: ?core.Rect) !void {
         .height = .{ .fixed = ink_h },
     });
     ctx.endBox();
+    // Zoom slider: read view_zoom fresh every frame (one-frame-stale only relative to a wheel/key
+    // zoom this same frame, same as every other model-bound slider here e.g. brush size — the
+    // model write for those happens in updateViewport, after this buildUi call). Only ever
+    // produces an integer zoom (1..32); shrink stages (1/2..1/4) show as 1 and stay reachable only
+    // via wheel/keys, matching the "snap to integer stages" contract.
+    var zoom_i32: i32 = app.view_zoom.toInteger() orelse 1;
+    if (ctx.sliderI32Id(STATUS_ZOOM_SLIDER_ID, "Zoom", &zoom_i32, .{ .min = 1, .max = @intCast(Zoom.max_integer), .track_w = 80 })) {
+        app.zoomInPlace(Zoom.fromInteger(zoom_i32));
+    }
     ctx.labelEx(
         try std.fmt.allocPrint(arena, "layer: {d}/{d}", .{ app.canvas.selected_layer + 1, app.canvas.layers.items.len }),
         ctx.style.text_subtle,
