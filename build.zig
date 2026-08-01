@@ -1742,6 +1742,25 @@ pub fn build(b: *std.Build) void {
     const blit_test = b.addTest(.{ .root_module = blit_test_mod });
     const run_blit_test = b.addRunArtifact(blit_test);
 
+    // pixie grid_overlay (pixel grid overlay + visible-range helper). Named-import core, same shape
+    // as blit (needs kit for gui.Context/gui.Rect).
+    const grid_overlay_core = b.createModule(.{
+        .root_source_file = b.path("libs/paint/src/paint.zig"),
+    });
+    grid_overlay_core.addImport("png", shared_modules.png.mod);
+    grid_overlay_core.addImport("pixelops", shared_modules.pixelops.mod);
+    grid_overlay_core.addImport("serde", shared_modules.serde.mod);
+    grid_overlay_core.addImport("font", shared_modules.font.mod);
+    const grid_overlay_test_mod = b.createModule(.{
+        .root_source_file = b.path("apps/editor/apps/pixie/grid_overlay.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    grid_overlay_test_mod.addImport("paint", grid_overlay_core);
+    grid_overlay_test_mod.addImport("kit", blit_pm.kit.mod);
+    const grid_overlay_test = b.addTest(.{ .root_module = grid_overlay_test_mod });
+    const run_grid_overlay_test = b.addRunArtifact(grid_overlay_test);
+
     // pixie zoom. rational Zoom + coordinate transforms. Named-import paint.
     const zoom_core = b.createModule(.{
         .root_source_file = b.path("libs/paint/src/paint.zig"),
@@ -1912,6 +1931,7 @@ pub fn build(b: *std.Build) void {
     test_core_step.dependOn(&run_eyedropper_input_test.step);
     test_core_step.dependOn(&run_palette_test.step);
     test_core_step.dependOn(&run_blit_test.step);
+    test_core_step.dependOn(&run_grid_overlay_test.step);
     test_core_step.dependOn(&run_zoom_test.step);
     test_core_step.dependOn(&run_minimap_test.step);
     test_core_step.dependOn(&run_onion_skin_test.step);

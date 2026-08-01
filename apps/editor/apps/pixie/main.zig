@@ -34,6 +34,7 @@ const ScreenTransform = kit.gfx.ScreenTransform;
 const palette_mod = @import("palette.zig");
 const bezier_input = @import("bezier_input.zig");
 const bezier_overlay = @import("bezier_overlay.zig");
+const grid_overlay = @import("grid_overlay.zig");
 const selection_input = @import("selection_input.zig");
 const selection_overlay = @import("selection_overlay.zig");
 const shape_input = @import("shape_input.zig");
@@ -637,6 +638,8 @@ const App = struct {
     onion_count: u32 = 1,
     onion_buf: []u32 = &.{},
     onion_scratch: []u32 = &.{},
+    /// Pixel grid overlay. Display-only (view state; not routed through netsync).
+    grid_enabled: bool = false,
     /// Brush-parameter UI state (bridges Slider *i32/*f32 vs Brush u32/u8).
     brush_size_i32: i32 = 8,
     brush_opacity_i32: i32 = 255,
@@ -4238,6 +4241,15 @@ fn actionSetPixelPerfect(ctx: *anyopaque, args: []const u8, buf: []u8) anyerror!
     return "ok";
 }
 
+/// `action set_grid <0|1>`. View-only (a per-peer canvas overlay; no undo entry, no netsync relay).
+fn actionSetGrid(ctx: *anyopaque, args: []const u8, buf: []u8) anyerror![]const u8 {
+    _ = buf;
+    const app = actionApp(ctx);
+    try app.checkEditingAllowed();
+    app.grid_enabled = try actions.parseGrid(args);
+    return "ok";
+}
+
 /// Drive a canvas-coordinate point list as down→move×N→up (same Tool path as existing canvas_input).
 /// Accepts a leading `[tool=|color=|size=|opacity=|hardness=|tolerance=]` k=v prefix; latches the
 /// explicit parameters **temporarily and restores App state after** (so redo cannot clobber the
@@ -4667,6 +4679,8 @@ const PIXIE_ACTIONS = [_]ActionEntry{
     .{ .name = "shape", .run = actionShape },
     .{ .name = "set_symmetry", .run = actionSetSymmetry },
     .{ .name = "set_pixel_perfect", .run = actionSetPixelPerfect },
+    // Append-only at the end (parallelism constraint)
+    .{ .name = "set_grid", .run = actionSetGrid },
 };
 
 /// `App.cmd_exec` Dispatcher: name→handler dispatch + noteUndo wiring.
@@ -4905,6 +4919,9 @@ const pixie_args_set_symmetry: @FieldType(platform.Action, "args") = &.{
     .{ .name = "mode", .kind = "enum", .values = &.{ "off", "v", "h", "quad" } },
 };
 const pixie_args_set_pixel_perfect: @FieldType(platform.Action, "args") = &.{
+    .{ .name = "on", .kind = "bool", .desc = "0|1" },
+};
+const pixie_args_set_grid: @FieldType(platform.Action, "args") = &.{
     .{ .name = "on", .kind = "bool", .desc = "0|1" },
 };
 const pixie_args_stroke: @FieldType(platform.Action, "args") = &.{
@@ -5180,6 +5197,8 @@ fn registerActions(app: *App) void {
     platform.registerAction(.{ .name = "presence_suggest", .ctx = app, .run = actionPresenceSuggest, .network_policy = .ephemeral, .desc = "assist suggestion marker", .args = pixie_args_presence_suggest });
     // panel visibility toggle (UI state only; not undoable)
     platform.registerAction(.{ .name = "panel_toggle", .ctx = app, .run = actionPanelToggle, .network_policy = .local_only, .desc = "toggle panel visibility", .args = pixie_args_panel_toggle });
+    // pixel grid overlay toggle (view only, no undo; a per-peer canvas overlay, not document state)
+    platform.registerAction(.{ .name = "set_grid", .ctx = app, .run = recordedAction("set_grid", .record), .network_policy = .local_only, .desc = "toggle the pixel grid overlay 0|1 (view only, no undo)", .args = pixie_args_set_grid });
 }
 
 fn netsyncExport(ctx: *anyopaque, allocator: std.mem.Allocator) anyerror![]u8 {
@@ -6309,6 +6328,10 @@ fn panelBuildToolOptions(ctx: *gui.Context, user_data: *anyopaque) anyerror!void
     if (ctx.toggle("Pixel Perfect", &pp_on)) {
         app.uiSetPixelPerfect(pp_on);
     }
+    var grid_on = app.grid_enabled;
+    if (ctx.toggle("Grid", &grid_on)) {
+        app.grid_enabled = grid_on;
+    }
     if (app.active_kind == .brush or app.active_kind == .bezier) {
         _ = ctx.sliderI32Id(0xB0_0001, "Size", &app.brush_size_i32, .{ .min = 1, .max = 64, .track_w = 90 });
         _ = ctx.sliderI32Id(0xB0_0002, "Opac", &app.brush_opacity_i32, .{ .min = 0, .max = 255, .track_w = 90 });
@@ -7427,6 +7450,14 @@ fn appFrameInner(self: *App, win: *platform.Window) !void {
                 // Minimap (right after canvas blit; below other overlays)
                 drawMinimapOverlay(self, fb.pixels, phys_w, phys_h, area, content_scale);
             }
+        }
+        // Pixel grid overlay (view-only; draw_list-based, so it paints on top of the raw-pixel
+        // canvas/minimap regardless of call order relative to those, same as every other overlay below).
+        if (self.grid_enabled) {
+            if (canvas_rect) |rect| if (self.last_area) |area| {
+                const clip_area: gui.Rect = .{ .x = area.x, .y = area.y, .w = @intCast(area.w), .h = @intCast(area.h) };
+                grid_overlay.draw(&self.ctx, rect, self.view_zoom, clip_area);
+            };
         }
         // presence overlay (right after canvas blit; below bezier/selection)
         drawPresenceOverlay(self, canvas_rect);

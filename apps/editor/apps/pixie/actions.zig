@@ -671,6 +671,20 @@ pub fn parsePixelPerfect(args: []const u8) ParseError!bool {
     return on;
 }
 
+/// `set_grid <0|1>`
+pub fn parseGrid(args: []const u8) ParseError!bool {
+    var it = tokenize(args);
+    const tok = it.next() orelse return error.Empty;
+    const on = if (std.mem.eql(u8, tok, "0"))
+        false
+    else if (std.mem.eql(u8, tok, "1"))
+        true
+    else
+        return error.UnknownBool;
+    try expectExhausted(&it);
+    return on;
+}
+
 /// Canonical shape args (for UI recording / redo).
 pub fn formatCanonicalShape(buf: []u8, a: ShapeArgs) error{TooLong}![]const u8 {
     if (a.fill) {
