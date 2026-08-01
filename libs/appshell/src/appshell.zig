@@ -10,6 +10,7 @@ pub const recent_files = @import("recent_files.zig");
 pub const document_host = @import("document_host.zig");
 pub const file_safety = @import("file_safety.zig");
 pub const autosave = @import("autosave.zig");
+pub const history_journal = @import("history_journal.zig");
 
 // Explicit refs so submodule test decls are collected by test-appshell.
 test {
@@ -20,4 +21,5 @@ test {
     _ = document_host;
     _ = file_safety;
     _ = autosave;
+    _ = history_journal;
 }

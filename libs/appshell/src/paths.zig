@@ -55,6 +55,32 @@ pub fn openAutosaveDir(io: std.Io, app_data_dir: std.Io.Dir) !std.Io.Dir {
     return app_data_dir.openDir(io, "autosave", .{ .iterate = true });
 }
 
+/// Create and open the history-journal directory inside the application-data directory.
+///
+/// Opened with `.iterate = true` for the same reason as `openAutosaveDir`: the directory
+/// sweep that enforces the global history budget iterates it.
+pub fn openHistoryDir(io: std.Io, app_data_dir: std.Io.Dir) !std.Io.Dir {
+    app_data_dir.createDirPath(io, "history") catch |err| switch (err) {
+        error.PathAlreadyExists => {},
+        else => return err,
+    };
+    return app_data_dir.openDir(io, "history", .{ .iterate = true });
+}
+
+/// From a document path, build a filename-safe stable history-journal name.
+///
+/// Only documents that have a path get a journal: an unsaved document has nothing to bind
+/// a journal to, so this returns null for it rather than inventing a shared name that two
+/// untitled documents would fight over. The journal header stores the full path, so a hash
+/// collision is detected on open rather than silently mixing two documents.
+pub fn historyFileName(io: std.Io, allocator: std.mem.Allocator, path: ?[]const u8) !?[]u8 {
+    const value = path orelse return null;
+    const normalized = try normalizePath(io, allocator, value);
+    defer allocator.free(normalized);
+    const hash = std.hash.Wyhash.hash(0, normalized);
+    return try std.fmt.allocPrint(allocator, "{x:0>16}.hjr", .{hash});
+}
+
 /// From a document path, build a filename-safe stable autosave ID.
 ///
 /// Relative paths are normalized against cwd before hashing. The original path itself is stored in the
@@ -248,6 +274,22 @@ test "override path is created and opened" {
     });
     var dir = try openAppDataDir(std.testing.io, std.testing.allocator, "ignored", path);
     dir.close(std.testing.io);
+}
+
+test "history directory and journal names use tmpDir and stable IDs" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var history_dir = try openHistoryDir(std.testing.io, tmp.dir);
+    defer history_dir.close(std.testing.io);
+
+    const named_a = (try historyFileName(std.testing.io, std.testing.allocator, "a/../document.pix")).?;
+    defer std.testing.allocator.free(named_a);
+    const named_b = (try historyFileName(std.testing.io, std.testing.allocator, "document.pix")).?;
+    defer std.testing.allocator.free(named_b);
+    try std.testing.expectEqualStrings(named_a, named_b);
+    try std.testing.expect(std.mem.endsWith(u8, named_a, ".hjr"));
+    // An unsaved document has no journal name at all.
+    try std.testing.expect(try historyFileName(std.testing.io, std.testing.allocator, null) == null);
 }
 
 test "autosave directory and names use tmpDir and stable IDs" {

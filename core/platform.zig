@@ -994,6 +994,8 @@ pub const routeAction = harness.action_registry.routeLocalAction;
 // `kit.platform.command` (since command is std-only, this adds no dependency under the layer rules).
 // ============================================================================
 pub const command = harness.command;
+/// The codec that turns a CommandLog and Executor into bytes and back.
+pub const command_io = harness.command_io;
 /// The adapter contract connecting an application's `dispatchCommand(id)` to the Executor and the router.
 pub const command_adapter = harness.command;
 

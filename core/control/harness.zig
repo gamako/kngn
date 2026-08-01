@@ -6574,3 +6574,7 @@ pub const copilot = if (is_wasm) @import("copilot_wasm.zig") else @import("copil
 // The namespace re-export of the command model. As with copilot, this shares the one
 // instance of the types (so the facade reaches it as `@import("harness").command`; command.zig is std only).
 pub const command = @import("command.zig");
+
+// The entry and snapshot codec for the command model. Re-exported here for the same
+// reason as `command` itself: one instance of the types, reachable through the facade.
+pub const command_io = @import("command_io.zig");

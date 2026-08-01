@@ -14,6 +14,7 @@ pub const GamepadState = types.GamepadState;
 pub const CompositionSnapshot = types.CompositionSnapshot;
 
 pub const command = @import("command.zig");
+pub const command_io = @import("command_io.zig");
 pub const action_registry = @import("action_registry.zig");
 
 pub const DIGEST_BUF_LEN = 1024;
