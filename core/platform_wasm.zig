@@ -4,7 +4,11 @@
 //! The framebuffer is allocated with wasm_allocator, and present hands it to `kngn_present` after a
 //! BGRA→RGBA swizzle (pixelops SIMD). JS pushes input onto the queue with `kngn_push_*`, and Zig drains it in nextEvent.
 //!
-//! Hot path declaration: the all-pixel swizzle in present runs every frame. Input and init happen at event time and at initialisation only.
+//! Hot path declaration: the all-pixel swizzle in `present` runs every frame; under `.physical` its
+//! pixel count is `devicePixelRatio^2` larger than `.logical`'s (see `bench-swizzle`). `kngn_resize`
+//! itself only latches pending values (event time), and `applyPendingResize`'s reallocation and
+//! `scale_epoch` bookkeeping run at the `lockFramebuffer` frame boundary, not per pixel. Everything
+//! else (input, init) happens at event time or at initialisation only.
 //!
 //! **Framebuffer size contract**: there is no OS window here, so the size this backend uses is
 //! always the canvas's live CSS box (in CSS px), delivered by `kngn_resize` from a
@@ -17,15 +21,39 @@
 //! moment the page's CSS does give the canvas an explicit box, that box is what `kngn_resize`
 //! reports instead, continuously, from the very next delivery on.
 //!
-//! **DPR**: `WindowOptions.fb_mode` is accepted (see `createWithOptions`) but has no effect —
-//! there is no `.physical` framebuffer here yet. `content_scale` is always `1.0` and the size
-//! this backend allocates is always the canvas's CSS-pixel box, never multiplied by
-//! `devicePixelRatio`. A HiDPI display gets the browser's own bitmap upscale of the canvas
-//! instead of a native-resolution present. Adding real DPR support would need a `kngn_resize`
-//! ABI change (an extra scale argument), a `devicePixelRatio`-change watcher (a display or zoom
-//! change can happen mid-session, unlike the OS-queried scale native reads once), and wiring
-//! `fb_mode` through this file's `ensureFramebuffer`/`lockFramebuffer`/`present` — a self-contained
-//! follow-on, not a small addition to the size contract above.
+//! **DPR**: `WindowOptions.fb_mode` picks `.logical` (a framebuffer in CSS pixels, `content_scale`
+//! applied only at the drawing edge) or `.physical` (a framebuffer of `logical × devicePixelRatio`
+//! physical pixels, `contentsScale`-equivalent crispness). `content_scale` reports the real
+//! `devicePixelRatio` under either mode (mirroring x11's `effectiveContentScale`, which is
+//! independent of `fb_mode` too); only the framebuffer's own size depends on the mode. The initial
+//! ratio is queried synchronously from JS at window creation (`kngn_device_pixel_ratio`), so the
+//! first frame already has the real value and does not read as a runtime change. A JS
+//! `matchMedia`-based watcher (`web/kngn.js`'s `bindDprWatcher`) re-reports the current CSS box and
+//! ratio together through `kngn_resize` (see its ABI below) whenever the ratio changes mid-session
+//! (a display move or a browser zoom) — unlike the OS scale native reads once, the web's ratio can
+//! change at any point in a run. `Window.logicalSize()` / `framebufferSize()` / `contentScale()`
+//! mirror the other backends' shape; `getGeometry()` returns the logical size, never physical
+//! pixels (the same rule x11 and Windows state, so that a saved geometry fed back as
+//! `WindowOptions.size` on the next run is read the way it was written).
+//!
+//! **`kngn_resize(w, h, dpr)`**: both the `ResizeObserver` and the DPR watcher call this single
+//! function, each re-reading the *other* quantity too (a DPR-only change still carries the current
+//! CSS box, and vice versa), so the pair never applies half of a stale combination. The pending
+//! values are latched at the next `lockFramebuffer` (`applyPendingResize`, never mid-frame): if
+//! either the logical size or the ratio actually differs from what is committed, the framebuffer
+//! (re)allocates at the size `fb_mode` calls for, and `scale_epoch` advances **only when the ratio
+//! itself changed** (a size-only resize under `.physical` reallocates without moving the epoch,
+//! matching docs/adr/011_high-dpi-coordinates-and-fb-modes.md R2's "incremented on every scale
+//! change"). A failed allocation, or a `.physical` target size that overflows `u32`, leaves the old
+//! framebuffer and the pending values in place for the next attempt (the same two-phase-commit
+//! shape `ensureFramebuffer` already had for a plain resize).
+//!
+//! Mouse and wheel coordinates from JS are raw physical (CSS × `devicePixelRatio`), regardless of
+//! `fb_mode` — the same "backend enqueues raw physical, the facade normalises with the
+//! frame-latched scale" contract every other backend follows (ADR-011 R2). Deriving them from the
+//! canvas bitmap's own width instead (`canvas.width / rect.width`) would silently divide `.logical`
+//! coordinates in half whenever the real ratio is not 1, because a `.logical` canvas's bitmap does
+//! not grow with `devicePixelRatio` the way a `.physical` one does.
 //!
 //! [320, 8192] is the clamp on each resize dimension (`clampResizeDim`), applied uniformly at
 //! window creation (including a declared `App.window` outside that range) and at every later
@@ -53,6 +81,8 @@ const DialogError = types.DialogError;
 const SaveDialogOptions = types.SaveDialogOptions;
 const OpenDialogOptions = types.OpenDialogOptions;
 const CursorShape = types.CursorShape;
+const FramebufferMode = types.FramebufferMode;
+const WindowSize = types.WindowSize;
 
 // ============================================================================
 // The JS import table (env)
@@ -62,6 +92,8 @@ extern "env" fn kngn_now() f64;
 extern "env" fn kngn_present(ptr: [*]const u8, w: u32, h: u32) void;
 extern "env" fn kngn_log(ptr: [*]const u8, len: u32) void;
 extern "env" fn kngn_set_cursor(shape: c_int) void;
+/// The current `window.devicePixelRatio`, queried once at window creation (synchronous; no round trip needed).
+extern "env" fn kngn_device_pixel_ratio() f32;
 /// Fire the browser file picker (allowed_ext is a hint and may be empty). Both Zig and JS guard against firing it twice.
 extern "env" fn kngn_request_open(ext_ptr: [*]const u8, ext_len: u32) void;
 /// `navigator.clipboard.writeText` (text/plain).
@@ -254,11 +286,27 @@ export fn kngn_push_scroll(x: i32, y: i32, dx: f32, dy: f32, mods: u32) void {
 
 var pixels_buf: []u32 = &.{};
 var rgba_buf: []u8 = &.{};
+/// The framebuffer's own pixel dimensions: equal to logical_w/h under `.logical`, and
+/// `round(logical × content_scale)` under `.physical`.
 var fb_w: u32 = 0;
 var fb_h: u32 = 0;
-/// 0 = nothing pending. kngn_resize sets it, and the top of the next lockFramebuffer applies it (at a frame boundary).
+/// The window's mode, fixed for its lifetime (set once in `createWithOptions`, like every other backend).
+var fb_mode: FramebufferMode = .logical;
+/// The logical (CSS-pixel) size and the content scale most recently committed by `applyPendingResize`
+/// (or by `createWithOptions` for the first frame). These, together with `scale_epoch`, are what
+/// `lockFramebuffer`'s snapshot reports.
+var logical_w: u32 = 0;
+var logical_h: u32 = 0;
+var content_scale: f32 = 1.0;
+var scale_epoch: u64 = 0;
+/// 0 = nothing pending. kngn_resize sets these (and pending_scale) together, and the top of the
+/// next lockFramebuffer applies them (at a frame boundary).
 var pending_w: u32 = 0;
 var pending_h: u32 = 0;
+/// The devicePixelRatio most recently reported by kngn_resize (or queried at creation). Unlike
+/// pending_w/h this is not reset to a sentinel after being applied: it always holds the latest
+/// known ratio, and applyPendingResize compares it against the committed content_scale directly.
+var pending_scale: f32 = 1.0;
 const default_gpa: std.mem.Allocator = if (builtin.cpu.arch.isWasm())
     std.heap.wasm_allocator
 else
@@ -278,18 +326,79 @@ fn clampResizeDim(w: u32, h: u32) struct { w: u32, h: u32 } {
     };
 }
 
-/// Called from the JS ResizeObserver. It keeps the value pending, rather than swapping the buffer mid-frame.
-export fn kngn_resize(w: u32, h: u32) void {
+/// A non-positive or non-finite ratio is corrected to 1.0 (mirrors x11's effectiveContentScale;
+/// independent of fb_mode — the real ratio is reported under `.logical` too).
+fn effectiveContentScale(raw_scale: f32) f32 {
+    return if (raw_scale > 0 and std.math.isFinite(raw_scale)) raw_scale else 1.0;
+}
+
+/// logical_px * scale, rounded, as a checked u32: an overflow (an implausible ratio) is reported
+/// rather than silently clamped, because clamping a `.physical` framebuffer to some fallback size
+/// would break its "the framebuffer is exactly logical × ratio" contract.
+fn physicalDimChecked(logical_px: u32, scale: f32) Error!u32 {
+    const s: f64 = if (scale > 0 and std.math.isFinite(scale)) scale else 1.0;
+    const v: f64 = @round(@as(f64, @floatFromInt(logical_px)) * s);
+    if (!std.math.isFinite(v) or v < 1.0) return error.WindowCreationFailed;
+    if (v > @as(f64, @floatFromInt(std.math.maxInt(u32)))) return error.WindowCreationFailed;
+    return @intFromFloat(v);
+}
+
+/// The framebuffer size that goes with a logical size under fb_mode: itself under `.logical`,
+/// `round(logical * scale)` per dimension under `.physical`.
+fn effectiveFramebufferSize(mode: FramebufferMode, logical: WindowSize, scale: f32) Error!WindowSize {
+    if (mode == .logical) return logical;
+    return .{
+        .width = try physicalDimChecked(logical.width, scale),
+        .height = try physicalDimChecked(logical.height, scale),
+    };
+}
+
+/// A hook for a unit test to simulate the browser already reporting a non-1.0 ratio from the very
+/// first frame (queryInitialDevicePixelRatio reads it instead of calling the extern, which no native
+/// test binary can resolve). Production code never sets it; the wasm build always takes the real query.
+var test_initial_dpr_override: ?f32 = null;
+
+/// The devicePixelRatio at window creation, queried synchronously (no round trip: the browser already
+/// knows it before boot() runs). Committing this directly — rather than through the pending/epoch
+/// path — means the very first frame already has the real ratio without scale_epoch reading as 1,
+/// which would misreport a plain "first is 2.0" as a runtime *change* from some earlier value.
+fn queryInitialDevicePixelRatio() f32 {
+    if (builtin.is_test) return test_initial_dpr_override orelse 1.0;
+    return kngn_device_pixel_ratio();
+}
+
+/// Called from JS: the ResizeObserver reports a size change (re-reading the current ratio), and the
+/// DPR watcher reports a ratio change (re-reading the current CSS box) — the same function either way,
+/// so the pending pair never mixes half of a stale size with half of a stale ratio. Kept pending
+/// rather than swapping the buffer mid-frame.
+export fn kngn_resize(w: u32, h: u32, dpr: f32) void {
     const c = clampResizeDim(w, h);
     pending_w = c.w;
     pending_h = c.h;
+    pending_scale = dpr;
 }
 
-/// On failure it returns with the pending value still held (the old framebuffer is untouched, thanks to
-/// the two-phase allocation, so drawing continues at the old size and the next lockFramebuffer retries).
+/// On failure (an allocation failure, or a `.physical` target size overflowing u32) it returns with
+/// the pending values still held (the old framebuffer and the old committed logical/scale are
+/// untouched, thanks to the two-phase commit, so drawing continues at the old snapshot and the next
+/// lockFramebuffer retries). scale_epoch advances only when the committed ratio itself changes — a
+/// size-only resize reallocates without moving it (ADR-011 R2: "incremented on every scale change").
 fn applyPendingResize() void {
     if (pending_w == 0 or pending_h == 0) return;
-    ensureFramebuffer(pending_w, pending_h) catch return;
+    const new_scale = effectiveContentScale(pending_scale);
+    const new_logical: WindowSize = .{ .width = pending_w, .height = pending_h };
+    if (new_logical.width == logical_w and new_logical.height == logical_h and new_scale == content_scale) {
+        // Nothing actually changed since the last commit (e.g. a DPR renotify at the same ratio).
+        pending_w = 0;
+        pending_h = 0;
+        return;
+    }
+    const target = effectiveFramebufferSize(fb_mode, new_logical, new_scale) catch return;
+    ensureFramebuffer(target.width, target.height) catch return;
+    logical_w = new_logical.width;
+    logical_h = new_logical.height;
+    if (new_scale != content_scale) scale_epoch +%= 1;
+    content_scale = new_scale;
     pending_w = 0;
     pending_h = 0;
 }
@@ -337,16 +446,28 @@ pub const Window = struct {
         // A canvas cannot stop its viewport from changing (the page's layout owns the size), so
         // resizable is a no-op here; the CSS box of the canvas is the author's lever instead.
         _ = opts.resizable;
-        // `.physical` is accepted but has no effect: wasm has no DPR switch yet, so every
-        // window behaves as `.logical` and `content_scale` stays 1.0 (see `lockFramebuffer`).
-        _ = opts.fb_mode;
+        fb_mode = opts.fb_mode;
         const requested_w = if (opts.size) |s| s.width else width;
         const requested_h = if (opts.size) |s| s.height else height;
         // The same [320, 8192] clamp `kngn_resize` applies (`clampResizeDim`), so a declared
         // size outside that range does not create a framebuffer that the very next resize
-        // report immediately replaces with a different, clamped one.
+        // report immediately replaces with a different, clamped one. The clamp is on the
+        // logical (CSS) size only (ADR-011); a `.physical` window's own framebuffer can exceed it.
         const clamped = clampResizeDim(requested_w, requested_h);
-        try ensureFramebuffer(clamped.w, clamped.h);
+        // Queried synchronously, so frame one already has the real ratio (see queryInitialDevicePixelRatio).
+        const initial_scale = effectiveContentScale(queryInitialDevicePixelRatio());
+        const logical: WindowSize = .{ .width = clamped.w, .height = clamped.h };
+        const target = try effectiveFramebufferSize(fb_mode, logical, initial_scale);
+        try ensureFramebuffer(target.width, target.height);
+        logical_w = logical.width;
+        logical_h = logical.height;
+        content_scale = initial_scale;
+        // Mirrors the just-committed value, so a same-ratio kngn_resize renotify right after
+        // creation is not mistaken for a runtime change (scale_epoch stays 0 until it truly moves).
+        pending_scale = initial_scale;
+        scale_epoch = 0;
+        pending_w = 0;
+        pending_h = 0;
         return .{ .width = fb_w, .height = fb_h };
     }
 
@@ -382,16 +503,30 @@ pub const Window = struct {
     pub fn lockFramebuffer(_: Window) ?Framebuffer {
         applyPendingResize();
         if (pixels_buf.len == 0) return null;
-        const size: types.WindowSize = .{ .width = fb_w, .height = fb_h };
         return .{
             .pixels = pixels_buf,
             .width = fb_w,
             .height = fb_h,
-            .logical_size = size,
-            .framebuffer_size = size,
-            .content_scale = 1.0,
-            .scale_epoch = 0,
+            .logical_size = .{ .width = logical_w, .height = logical_h },
+            .framebuffer_size = .{ .width = fb_w, .height = fb_h },
+            .content_scale = content_scale,
+            .scale_epoch = scale_epoch,
         };
+    }
+
+    /// The currently negotiated logical (CSS-pixel) size. Drawing within a frame uses the Framebuffer snapshot.
+    pub fn logicalSize(_: Window) WindowSize {
+        return .{ .width = logical_w, .height = logical_h };
+    }
+
+    /// The currently negotiated framebuffer size (physical pixels; equal to the logical one under `.logical`).
+    pub fn framebufferSize(_: Window) WindowSize {
+        return .{ .width = fb_w, .height = fb_h };
+    }
+
+    /// The currently negotiated content scale (the real devicePixelRatio, whether `.logical` or `.physical`).
+    pub fn contentScale(_: Window) f32 {
+        return content_scale;
     }
 
     pub fn present(_: Window) void {
@@ -431,13 +566,16 @@ pub const Window = struct {
     }
 };
 
-/// The current window geometry. wasm has no position, and the size is the current framebuffer's.
+/// The current window geometry. wasm has no position. The size is logical (CSS pixels), never
+/// physical: a value read back through here can end up saved and fed into the next run's
+/// `WindowOptions.size`, which is read as logical, so returning physical pixels here would make a
+/// `.physical` window grow without bound across runs (the same reasoning x11 and Windows state).
 /// Module level (the facade's `@hasDecl` contract).
 pub fn getGeometry(win: Window) types.WindowGeometry {
     _ = win;
     return .{
         .position = null,
-        .size = .{ .width = fb_w, .height = fb_h },
+        .size = .{ .width = logical_w, .height = logical_h },
     };
 }
 
@@ -681,8 +819,15 @@ fn testResetFramebufferState() void {
     }
     fb_w = 0;
     fb_h = 0;
+    fb_mode = .logical;
+    logical_w = 0;
+    logical_h = 0;
+    content_scale = 1.0;
+    scale_epoch = 0;
     pending_w = 0;
     pending_h = 0;
+    pending_scale = 1.0;
+    test_initial_dpr_override = null;
 }
 
 test "kngn_resize: lockFramebuffer applies the new size" {
@@ -692,7 +837,7 @@ test "kngn_resize: lockFramebuffer applies the new size" {
     var win = try Window.createWithOptions(320, 240, "t", .{});
     defer win.destroy();
 
-    kngn_resize(640, 480);
+    kngn_resize(640, 480, 1.0);
     const fb = win.lockFramebuffer() orelse unreachable;
     try std.testing.expectEqual(@as(u32, 640), fb.width);
     try std.testing.expectEqual(@as(u32, 480), fb.height);
@@ -703,9 +848,9 @@ test "kngn_resize: with several calls, the last value wins" {
     testResetFramebufferState();
     defer testResetFramebufferState();
 
-    kngn_resize(400, 300);
-    kngn_resize(500, 400);
-    kngn_resize(640, 480);
+    kngn_resize(400, 300, 1.0);
+    kngn_resize(500, 400, 1.0);
+    kngn_resize(640, 480, 1.0);
     try std.testing.expectEqual(@as(u32, 640), pending_w);
     try std.testing.expectEqual(@as(u32, 480), pending_h);
 }
@@ -714,11 +859,11 @@ test "kngn_resize: clamped to a minimum of 320x240 and a maximum of 8192" {
     testResetFramebufferState();
     defer testResetFramebufferState();
 
-    kngn_resize(10, 10);
+    kngn_resize(10, 10, 1.0);
     try std.testing.expectEqual(@as(u32, 320), pending_w);
     try std.testing.expectEqual(@as(u32, 240), pending_h);
 
-    kngn_resize(10000, 10000);
+    kngn_resize(10000, 10000, 1.0);
     try std.testing.expectEqual(@as(u32, 8192), pending_w);
     try std.testing.expectEqual(@as(u32, 8192), pending_h);
 }
@@ -734,7 +879,7 @@ test "kngn_resize: on an OOM the old framebuffer survives and the pending value 
     var failing = std.testing.FailingAllocator.init(default_gpa, .{ .fail_index = 0 });
     gpa = failing.allocator();
 
-    kngn_resize(640, 480);
+    kngn_resize(640, 480, 1.0);
     const fb = win.lockFramebuffer() orelse unreachable; // drawing continues on the old framebuffer
     try std.testing.expectEqual(@as(u32, 320), fb.width);
     try std.testing.expectEqual(@as(u32, 240), fb.height);
@@ -757,7 +902,7 @@ test "kngn_resize: the framebuffer keeps its old size while the pending value is
     defer win.destroy();
 
     _ = win.lockFramebuffer() orelse unreachable;
-    kngn_resize(640, 480);
+    kngn_resize(640, 480, 1.0);
     try std.testing.expectEqual(@as(u32, 320), fb_w);
     try std.testing.expectEqual(@as(u32, 240), fb_h);
     try std.testing.expectEqual(@as(usize, 320 * 240), pixels_buf.len);
@@ -765,6 +910,144 @@ test "kngn_resize: the framebuffer keeps its old size while the pending value is
     const fb2 = win.lockFramebuffer() orelse unreachable;
     try std.testing.expectEqual(@as(u32, 640), fb2.width);
     try std.testing.expectEqual(@as(u32, 480), fb2.height);
+}
+
+// ---- DPR / fb_mode (ADR-011) ----
+
+test "createWithOptions: the initial devicePixelRatio is committed without bumping scale_epoch" {
+    testResetFramebufferState();
+    defer testResetFramebufferState();
+    test_initial_dpr_override = 2.0;
+
+    var win = try Window.createWithOptions(320, 240, "t", .{ .fb_mode = .physical });
+    defer win.destroy();
+
+    try std.testing.expectEqual(@as(f32, 2.0), win.contentScale());
+    try std.testing.expectEqual(@as(u64, 0), scale_epoch);
+    // A same-ratio renotify right after creation must not read as a change either.
+    kngn_resize(320, 240, 2.0);
+    _ = win.lockFramebuffer() orelse unreachable;
+    try std.testing.expectEqual(@as(u64, 0), scale_epoch);
+}
+
+test ".physical: 800x600 at a 1.5 ratio rounds the framebuffer to 1200x900" {
+    testResetFramebufferState();
+    defer testResetFramebufferState();
+
+    var win = try Window.createWithOptions(320, 240, "t", .{ .fb_mode = .physical });
+    defer win.destroy();
+
+    kngn_resize(800, 600, 1.5);
+    const fb = win.lockFramebuffer() orelse unreachable;
+    try std.testing.expectEqual(@as(u32, 1200), fb.width);
+    try std.testing.expectEqual(@as(u32, 900), fb.height);
+    try std.testing.expectEqual(@as(u32, 800), fb.logical_size.width);
+    try std.testing.expectEqual(@as(u32, 600), fb.logical_size.height);
+    try std.testing.expectEqual(@as(f32, 1.5), fb.content_scale);
+    try std.testing.expectEqual(@as(u64, 1), fb.scale_epoch);
+}
+
+test ".logical: a devicePixelRatio change leaves the framebuffer size unchanged and only bumps scale_epoch" {
+    testResetFramebufferState();
+    defer testResetFramebufferState();
+
+    var win = try Window.createWithOptions(320, 240, "t", .{}); // fb_mode defaults to .logical
+    defer win.destroy();
+
+    kngn_resize(320, 240, 2.0); // same CSS box, a new ratio
+    const fb = win.lockFramebuffer() orelse unreachable;
+    try std.testing.expectEqual(@as(u32, 320), fb.width);
+    try std.testing.expectEqual(@as(u32, 240), fb.height);
+    try std.testing.expectEqual(@as(f32, 2.0), fb.content_scale);
+    try std.testing.expectEqual(@as(u64, 1), fb.scale_epoch);
+}
+
+test ".physical: a size-only resize reallocates without moving scale_epoch" {
+    testResetFramebufferState();
+    defer testResetFramebufferState();
+
+    var win = try Window.createWithOptions(320, 240, "t", .{ .fb_mode = .physical });
+    defer win.destroy();
+
+    kngn_resize(400, 300, 1.0); // the ratio is unchanged from creation (1.0)
+    const fb = win.lockFramebuffer() orelse unreachable;
+    try std.testing.expectEqual(@as(u32, 400), fb.width);
+    try std.testing.expectEqual(@as(u32, 300), fb.height);
+    try std.testing.expectEqual(@as(u64, 0), fb.scale_epoch);
+}
+
+test "kngn_resize: a pending ratio change is held until lockFramebuffer, then size/scale/epoch update together" {
+    testResetFramebufferState();
+    defer testResetFramebufferState();
+
+    var win = try Window.createWithOptions(320, 240, "t", .{ .fb_mode = .physical });
+    defer win.destroy();
+
+    kngn_resize(320, 240, 2.0);
+    // Nothing has been applied yet: the old (scale 1.0) snapshot still holds.
+    try std.testing.expectEqual(@as(u32, 320), fb_w);
+    try std.testing.expectEqual(@as(f32, 1.0), content_scale);
+    try std.testing.expectEqual(@as(u64, 0), scale_epoch);
+
+    const fb = win.lockFramebuffer() orelse unreachable;
+    try std.testing.expectEqual(@as(u32, 640), fb.width);
+    try std.testing.expectEqual(@as(u32, 480), fb.height);
+    try std.testing.expectEqual(@as(f32, 2.0), fb.content_scale);
+    try std.testing.expectEqual(@as(u64, 1), fb.scale_epoch);
+}
+
+test "kngn_resize: on an OOM during a ratio-only change, the old snapshot and epoch survive for a retry" {
+    testResetFramebufferState();
+    defer testResetFramebufferState();
+
+    var win = try Window.createWithOptions(320, 240, "t", .{ .fb_mode = .physical });
+    defer win.destroy();
+
+    var failing = std.testing.FailingAllocator.init(default_gpa, .{ .fail_index = 0 });
+    gpa = failing.allocator();
+
+    kngn_resize(320, 240, 2.0); // same CSS box, a bigger physical target (640x480), which the failing allocator refuses
+    const fb = win.lockFramebuffer() orelse unreachable;
+    try std.testing.expectEqual(@as(u32, 320), fb.width);
+    try std.testing.expectEqual(@as(f32, 1.0), fb.content_scale);
+    try std.testing.expectEqual(@as(u64, 0), fb.scale_epoch);
+    try std.testing.expectEqual(@as(u32, 320), pending_w); // kept for a retry
+
+    gpa = default_gpa;
+    const fb2 = win.lockFramebuffer() orelse unreachable;
+    try std.testing.expectEqual(@as(u32, 640), fb2.width);
+    try std.testing.expectEqual(@as(f32, 2.0), fb2.content_scale);
+    try std.testing.expectEqual(@as(u64, 1), fb2.scale_epoch);
+}
+
+test "getGeometry: always the logical size, never physical pixels" {
+    testResetFramebufferState();
+    defer testResetFramebufferState();
+
+    var win = try Window.createWithOptions(320, 240, "t", .{ .fb_mode = .physical });
+    defer win.destroy();
+
+    kngn_resize(320, 240, 2.0);
+    _ = win.lockFramebuffer() orelse unreachable; // commits a 640x480 physical framebuffer
+
+    const geo = getGeometry(win);
+    try std.testing.expectEqual(@as(u32, 320), geo.size.width);
+    try std.testing.expectEqual(@as(u32, 240), geo.size.height);
+}
+
+test "physicalDimChecked: an implausible ratio fails rather than silently clamping" {
+    try std.testing.expectError(error.WindowCreationFailed, physicalDimChecked(8192, 1.0e30));
+}
+
+test "createWithOptions: a physical target that overflows u32 fails window creation" {
+    testResetFramebufferState();
+    defer testResetFramebufferState();
+    test_initial_dpr_override = 1.0e30;
+
+    try std.testing.expectError(
+        error.WindowCreationFailed,
+        Window.createWithOptions(8192, 8192, "t", .{ .fb_mode = .physical }),
+    );
 }
 
 // ---- the open dialog state machine, the picked path, and the clipboard pending state ----

@@ -1,6 +1,6 @@
 // KNGN wasm JS glue (audio + file/clipboard)
 // import table:
-//   env: kngn_now / kngn_present / kngn_log / kngn_set_cursor
+//   env: kngn_now / kngn_present / kngn_log / kngn_set_cursor / kngn_device_pixel_ratio
 //        + kngn_audio_open / kngn_audio_start / kngn_audio_stop / kngn_audio_close (audio app)
 //        + kngn_request_open / kngn_clipboard_write / kngn_request_paste (file dialog / clipboard)
 //   wasi_snapshot_preview1: hand-written shim + in-memory FS (path_open/fd_read/write/seek/close)
@@ -16,6 +16,13 @@
 //   - App frame time is always env.kngn_now (performance.now based, seconds)
 //   - WASI clock_time_get is for stdlib internals only. monotonic is also performance.now based
 // DOM → kngn_push_* (KeyCode conversion is a Zig-side table. JS only identifies code strings and calls exports)
+//
+// DPR (ADR-011 R1/R2):
+//   - kngn_resize(w, h, dpr) carries the canvas's CSS box and devicePixelRatio together. Both
+//     bindResize()'s ResizeObserver and bindDprWatcher()'s matchMedia watcher call it, each
+//     re-reading the other quantity too, so it never applies half of a stale combination.
+//   - Mouse/wheel coordinates are raw physical (CSS × devicePixelRatio) regardless of fb_mode; the
+//     Zig facade divides by the frame-latched content_scale to recover logical points.
 //
 // File I/O:
 //   - open: <input type=file> → register bytes at virtual path `pick/<name>` → kngn_file_picked
@@ -796,13 +803,22 @@ function buttonIndex(e) {
   return -1;
 }
 
-/** clientX/Y → canvas logical px (HiDPI / CSS scale) */
-function canvasLogicalXY(e) {
+/**
+ * clientX/Y (CSS px) → raw physical event coordinates: CSS × devicePixelRatio, independent of
+ * fb_mode. The Zig facade (core/platform.zig) divides this by the frame-latched content_scale to
+ * recover logical points, mirroring every native backend's "the backend enqueues raw physical, the
+ * facade normalises" contract (docs/adr/011_high-dpi-coordinates-and-fb-modes.md R2).
+ *
+ * Deriving the ratio from the canvas bitmap instead (`canvas.width / rect.width`) would silently
+ * halve `.logical` coordinates whenever the real ratio is not 1: a `.logical` canvas's bitmap stays
+ * at the CSS size (content_scale still reports the real ratio, only the framebuffer does not scale
+ * with it), so that ratio would read as 1 while the facade still divides by the real one.
+ */
+function canvasRawPhysicalXY(e) {
   const rect = canvas.getBoundingClientRect();
-  const scaleX = canvas.width / rect.width;
-  const scaleY = canvas.height / rect.height;
-  const x = Math.round((e.clientX - rect.left) * scaleX);
-  const y = Math.round((e.clientY - rect.top) * scaleY);
+  const dpr = window.devicePixelRatio || 1;
+  const x = Math.round((e.clientX - rect.left) * dpr);
+  const y = Math.round((e.clientY - rect.top) * dpr);
   return { x, y };
 }
 
@@ -865,13 +881,19 @@ function primeDeclaredWindowSize() {
   }
 }
 
-/** Notify wasm of the container's logical px (no DPR). Applied at the frame boundary via pending. */
+/**
+ * Notify wasm of the container's logical (CSS) px and the current devicePixelRatio together.
+ * Applied at the frame boundary via pending (kngn_resize never swaps the buffer mid-frame). Both
+ * bindResize()'s ResizeObserver and bindDprWatcher()'s matchMedia watcher call this same function,
+ * so a size-only or a ratio-only change always carries the other quantity's current value too.
+ */
 function reportCanvasSize() {
   if (!instance) return;
   const w = Math.round(canvas.clientWidth);
   const h = Math.round(canvas.clientHeight);
+  const dpr = window.devicePixelRatio || 1;
   if (w > 0 && h > 0) {
-    instance.exports.kngn_resize(w, h);
+    instance.exports.kngn_resize(w, h, dpr);
   }
 }
 
@@ -879,6 +901,26 @@ function bindResize() {
   const ro = new ResizeObserver(() => reportCanvasSize());
   ro.observe(canvas);
   reportCanvasSize();
+}
+
+/**
+ * Watch for a devicePixelRatio change (moving the window to a display with a different scale
+ * factor, or a browser zoom) with the standard self-resubscribing matchMedia idiom: a
+ * `(resolution: Xdppx)` query only ever fires once it stops matching X exactly, so each firing
+ * rebuilds the query around the new ratio before listening again.
+ */
+function bindDprWatcher() {
+  let mql = null;
+  function onChange() {
+    reportCanvasSize(); // re-reads the CSS box too, so size and ratio never apply half-stale
+    subscribe();
+  }
+  function subscribe() {
+    const dpr = window.devicePixelRatio || 1;
+    mql = window.matchMedia(`(resolution: ${dpr}dppx)`);
+    mql.addEventListener("change", onChange, { once: true });
+  }
+  subscribe();
 }
 
 // ---- audio env imports ----
@@ -1569,6 +1611,9 @@ function makeImportObject() {
       kngn_set_cursor(shape) {
         canvas.style.cursor = CURSOR_CSS[shape] || "default";
       },
+      kngn_device_pixel_ratio() {
+        return window.devicePixelRatio || 1;
+      },
       kngn_audio_open: envAudioOpen,
       kngn_audio_start: envAudioStart,
       kngn_audio_stop: envAudioStop,
@@ -1599,25 +1644,28 @@ function bindInput() {
   });
 
   canvas.addEventListener("mousemove", (e) => {
-    const { x, y } = canvasLogicalXY(e);
+    const { x, y } = canvasRawPhysicalXY(e);
     instance.exports.kngn_push_mouse(0, x, y, -1, buttonsFromEvent(e), modsFromEvent(e));
   });
   canvas.addEventListener("mousedown", (e) => {
     canvas.focus();
-    const { x, y } = canvasLogicalXY(e);
+    const { x, y } = canvasRawPhysicalXY(e);
     instance.exports.kngn_push_mouse(1, x, y, buttonIndex(e), buttonsFromEvent(e), modsFromEvent(e));
   });
   canvas.addEventListener("mouseup", (e) => {
-    const { x, y } = canvasLogicalXY(e);
+    const { x, y } = canvasRawPhysicalXY(e);
     instance.exports.kngn_push_mouse(2, x, y, buttonIndex(e), buttonsFromEvent(e), modsFromEvent(e));
   });
   canvas.addEventListener(
     "wheel",
     (e) => {
       e.preventDefault(); // Suppress page scroll
-      const { x, y } = canvasLogicalXY(e);
-      // DOM wheel is positive downward → flip dy to match the pixie/gui convention
-      instance.exports.kngn_push_scroll(x, y, -e.deltaX, -e.deltaY, modsFromEvent(e));
+      const { x, y } = canvasRawPhysicalXY(e);
+      const dpr = window.devicePixelRatio || 1;
+      // DOM wheel is positive downward → flip dy to match the pixie/gui convention. The delta is
+      // scaled into raw physical units too, for the same reason the position is (the facade divides
+      // both x/y and dx/dy by the frame-latched content_scale).
+      instance.exports.kngn_push_scroll(x, y, -e.deltaX * dpr, -e.deltaY * dpr, modsFromEvent(e));
     },
     { passive: false },
   );
@@ -1748,6 +1796,7 @@ export async function boot(opts = {}) {
   primeDeclaredWindowSize();
   bindInput();
   bindResize();
+  bindDprWatcher();
   instance.exports.kngn_init();
   // kngn_init may grow SharedArrayBuffer memory and detach the worklet's prebuilt view.
   requestSharedViewRebuild();

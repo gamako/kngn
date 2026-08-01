@@ -72,11 +72,30 @@ initial framebuffer matches `App.window`, clamped to the range below — the sam
 point `zig build run` gives a native app. `template/web/template.html` gives its canvas
 neither for exactly this reason, so it stays at `App.window`'s size (320x240) by default.
 
-**DPR does not apply.** `WindowOptions.fb_mode` is accepted on wasm but has no effect: every
-window behaves as `.logical`, `content_scale` is always `1.0`, and the framebuffer this
-backend allocates is always the canvas's CSS-pixel box, never multiplied by
-`devicePixelRatio`. A HiDPI display gets the browser's own bitmap upscale of the canvas —
-softer than a native `.physical` window's actual higher-resolution present.
+**DPR (`WindowOptions.fb_mode`)**: `content_scale` always reports the real
+`devicePixelRatio`, under either mode (mirroring the native backends' `effectiveContentScale`,
+which is independent of `fb_mode` too). Only the framebuffer's own size depends on the mode:
+
+| Mode | Framebuffer size | Appearance |
+|---|---|---|
+| `.logical` (default) | The canvas's CSS-pixel box, unchanged | The browser's own bitmap upscale on HiDPI (soft, like today) |
+| `.physical` | `round(CSS box × devicePixelRatio)` | A native-resolution present, as crisp as a native `.physical` window |
+
+The initial ratio is queried synchronously from JS at window creation
+(`kngn_device_pixel_ratio`), so the first frame already draws at the real ratio. A
+`matchMedia`-based watcher in `web/kngn.js` (`bindDprWatcher`) re-reports the current CSS box
+and ratio together through `kngn_resize` whenever the ratio changes mid-session (moving the
+window to a display with a different scale factor, or a browser zoom) — unlike the OS scale a
+native backend reads once, the web's ratio can change at any point in a run.
+`kngn_resize(w, h, dpr)` carries both quantities together for exactly this reason: whichever
+watcher fires, it re-reads the other quantity too, so a size-only or a ratio-only change never
+applies half of a stale combination. `scale_epoch` advances only when the ratio itself changes,
+not on an ordinary resize (docs/adr/011_high-dpi-coordinates-and-fb-modes.md R2).
+
+Under `.physical`, `present`'s per-frame BGRA→RGBA swizzle runs over `devicePixelRatio²` more
+pixels than `.logical` does at the same CSS box — the same cost a native `.physical` window
+pays for the same crispness (see `zig build bench-swizzle` and
+[docs/performance-measurement.md](performance-measurement.md)).
 
 **Clamping**: each resize dimension is clamped to `[320, 8192]` (`core/platform_wasm.zig`'s
 `clampResizeDim`), applied uniformly both at window creation (including a declared
