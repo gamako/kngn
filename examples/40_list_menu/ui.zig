@@ -122,7 +122,6 @@ pub const App = struct {
 
     popup_kind: PopupKind = .none,
     context_row: i32 = -1,
-    filter_reopen_count: u32 = 0,
 
     menu_title: ?[]const u8 = null,
     last_context_action: ContextAction = .none,
@@ -150,8 +149,8 @@ pub const App = struct {
     },
     menu_popup_outer: gui.Rect = .{ .x = 0, .y = 0, .w = 0, .h = 0 },
 
-    // filter labels (stable for the frame of popupMenu)
-    filter_labels: [3][32]u8 = undefined,
+    // filter items (checked reflects filter_mask; label text is the plain filter name, stable
+    // across frames, so no per-frame formatting buffer is needed).
     filter_items: [3]gui.PopupItem = undefined,
     context_items: [3]gui.PopupItem = .{
         .{ .label = "Open", .enabled = true },
@@ -326,16 +325,19 @@ pub fn selectRow(app: *App, index: i32, source: ActiveSource) void {
     app.active_source = source;
 }
 
+/// The "primary" open popup for display purposes (menu bar takes priority in the readout, but
+/// `popupCount` below is what actually distinguishes "just the menu" from "menu plus a stacked
+/// context menu held open at once" -- see the context popup's own `openPopupStacked` wiring).
 pub fn currentPopupKind(app: *const App) PopupKind {
     const ctx = app.ctx;
     if (ctx.isPopupOpen(gui.MENU_BAR_POPUP_ID)) return .menu;
-    if (ctx.isPopupOpen(Ids.context_popup)) return .context;
+    if (ctx.isPopupOpenStacked(Ids.context_popup)) return .context;
     if (ctx.isPopupOpen(Ids.filter_popup)) return .filter;
     return .none;
 }
 
 pub fn popupCount(app: *const App) u32 {
-    return if (app.ctx.hasOpenPopup()) 1 else 0;
+    return @intCast(app.ctx.openPopupCount());
 }
 
 fn kindColor(kind: RowKind) gui.Color {
@@ -353,10 +355,11 @@ fn buildFilterItems(app: *App) void {
         .{ .bit = 0x04, .name = "Closed" },
     };
     for (specs, 0..) |s, i| {
-        const on = (app.filter_mask & s.bit) != 0;
-        const tag = if (on) "[on]" else "[off]";
-        const written = std.fmt.bufPrint(&app.filter_labels[i], "{s} {s}", .{ tag, s.name }) catch s.name;
-        app.filter_items[i] = .{ .label = written, .enabled = true };
+        app.filter_items[i] = .{
+            .label = s.name,
+            .enabled = true,
+            .checked = (app.filter_mask & s.bit) != 0,
+        };
     }
 }
 
@@ -393,7 +396,9 @@ pub fn applyOpenRequests(app: *App) void {
     }
     if (app.context_open_request) {
         app.context_open_request = false;
-        app.ctx.openPopup(Ids.context_popup, app.context_open_pos);
+        // Stacked, not the classic slot: a right-click context menu coexists with an already-open
+        // menu-bar dropdown instead of replacing it (see handleOverlays' popupMenuStacked call).
+        app.ctx.openPopupStacked(Ids.context_popup, app.context_open_pos);
     }
 }
 
@@ -558,21 +563,27 @@ pub fn buildUi(app: *App) void {
     ctx.endBox();
 }
 
+/// Recomputes the geometry a popup's `id` is actually drawn at, for probe/e2e coordinate
+/// reporting. Reads position through `ctx.popupPos` (classic slot or stacked, whichever `id` is
+/// open through) rather than `ctx.popup_state` directly, since that field alone no longer
+/// identifies every open popup once a caller uses `openPopupStacked` (see context_popup below).
 fn updatePopupGeo(
     ctx: *gui.Context,
+    id: gui.Id,
     items: []const gui.PopupItem,
     outer: *gui.Rect,
     item_rects: []gui.Rect,
 ) void {
-    const state = ctx.popup_state orelse {
+    const pos = ctx.popupPos(id) orelse {
         outer.* = .{ .x = 0, .y = 0, .w = 0, .h = 0 };
         for (item_rects) |*r| r.* = .{ .x = 0, .y = 0, .w = 0, .h = 0 };
         return;
     };
-    var max_w: i32 = 0;
-    for (items) |it| max_w = @max(max_w, @as(i32, @intCast(ctx.font.measure(it.label))));
+    // Same content-width formula the popup itself draws at (measure + check-mark reserve),
+    // so a checked filter item does not throw this rect off from the real one.
+    const content_w = gui.popupContentWidth(ctx.font, items);
     const style = ctx.style;
-    const geo = gui.layoutPopup(state.pos, items.len, max_w, style.popup_item_h, style.popup_padding, ctx.screen_w, ctx.screen_h);
+    const geo = gui.layoutPopup(pos, items.len, content_w, style.popup_item_h, style.popup_padding, ctx.screen_w, ctx.screen_h);
     outer.* = geo.outer;
     var i: usize = 0;
     while (i < item_rects.len and i < items.len) : (i += 1) {
@@ -590,20 +601,20 @@ pub fn handleOverlays(app: *App) void {
     if (menu_res.selected) |cid| dispatchMenuCommand(app, cid);
     app.menu_title = app.menu.open_title;
 
-    // Context open after menuBarPopup so we can observe 1-popup replacement:
-    // Keep open_title and may swap only popup_state to context.
+    // Context open after menuBarPopup: stacked, so an already-open menu-bar dropdown (handled
+    // just above) stays open at the same time as the context menu, rather than being replaced.
     if (app.context_open_request) {
         app.context_open_request = false;
-        ctx.openPopup(Ids.context_popup, app.context_open_pos);
+        ctx.openPopupStacked(Ids.context_popup, app.context_open_pos);
     }
 
     // Context menu (if open for our id)
-    const ctx_res = ctx.popupMenu(Ids.context_popup, &app.context_items);
+    const ctx_res = ctx.popupMenuStacked(Ids.context_popup, &app.context_items, .{});
     if (ctx_res.selected) |idx| {
         dispatchContextAction(app, idx);
     }
-    if (ctx.isPopupOpen(Ids.context_popup)) {
-        updatePopupGeo(ctx, &app.context_items, &app.context_outer, app.context_item_rects[0..]);
+    if (ctx.isPopupOpenStacked(Ids.context_popup)) {
+        updatePopupGeo(ctx, Ids.context_popup, &app.context_items, &app.context_outer, app.context_item_rects[0..]);
     } else if (!ctx_res.open) {
         // keep last rects briefly; clear outer if closed without selection this path
         if (ctx_res.selected != null or ctx_res.dismissed) {
@@ -611,24 +622,27 @@ pub fn handleOverlays(app: *App) void {
         }
     }
 
-    // Filter popup
+    // Filter popup: a persistent, checkbox-backed multi-select (PopupItem.checked plus
+    // keep_open_on_select) instead of a close-then-reopen hack. Toggling one filter rebuilds the
+    // checked marks and the popup simply never closes on its own.
     if (ctx.isPopupOpen(Ids.filter_popup) or app.filter_open_request) {
         buildFilterItems(app);
     }
-    const filter_res = ctx.popupMenu(Ids.filter_popup, &app.filter_items);
+    const filter_res = ctx.popupMenuEx(Ids.filter_popup, &app.filter_items, .{ .keep_open_on_select = true });
     if (filter_res.selected) |idx| {
         const bits = [_]u8{ 0x01, 0x02, 0x04 };
         if (idx < bits.len) {
             app.filter_mask ^= bits[idx];
             recomputeVisible(app);
-            app.filter_reopen_count +%= 1;
-            app.filter_open_request = true; // reopen next frame (custom multi-select)
+            buildFilterItems(app); // refresh the checked marks for the frame the popup redraws in
         }
     }
     if (ctx.isPopupOpen(Ids.filter_popup)) {
-        updatePopupGeo(ctx, &app.filter_items, &app.filter_outer, app.filter_item_rects[0..]);
-    } else if (filter_res.selected != null or filter_res.dismissed) {
-        if (!app.filter_open_request) app.filter_outer = .{ .x = 0, .y = 0, .w = 0, .h = 0 };
+        updatePopupGeo(ctx, Ids.filter_popup, &app.filter_items, &app.filter_outer, app.filter_item_rects[0..]);
+    } else if (filter_res.dismissed) {
+        // `keep_open_on_select` means a selection never lands here (the popup stays open); only
+        // an outside click (dismissed) closes it, and that is the one case that clears the rect.
+        app.filter_outer = .{ .x = 0, .y = 0, .w = 0, .h = 0 };
     }
 
     // Menu popup geometry when open
@@ -647,7 +661,7 @@ pub fn handleOverlays(app: *App) void {
             }
             if (item_n > 0) {
                 var dummy: [8]gui.Rect = [_]gui.Rect{.{ .x = 0, .y = 0, .w = 0, .h = 0 }} ** 8;
-                updatePopupGeo(ctx, items[0..item_n], &app.menu_popup_outer, dummy[0..]);
+                updatePopupGeo(ctx, gui.MENU_BAR_POPUP_ID, items[0..item_n], &app.menu_popup_outer, dummy[0..]);
             }
         }
     } else {
@@ -703,10 +717,9 @@ pub fn stateDigest(ctx_ptr: *anyopaque, buf: []u8) []const u8 {
         @tagName(app.popup_kind),
         popupCount(app),
     });
-    appendFmt(buf, &off, " menu={s} context_row={d} filter_reopen_count={d}", .{
+    appendFmt(buf, &off, " menu={s} context_row={d}", .{
         menu_s,
         app.context_row,
-        app.filter_reopen_count,
     });
     appendFmt(buf, &off, " last_context_action={s} last_menu_command={s} ellipsis_used={d}", .{
         @tagName(app.last_context_action),
@@ -735,7 +748,7 @@ pub fn layoutDigest(ctx_ptr: *anyopaque, buf: []u8) []const u8 {
     rectCsv(app, Ids.row_base + 20, "row20", buf, &off);
     rectCsv(app, Ids.row_base + 50, "long_row", buf, &off);
 
-    if (app.ctx.isPopupOpen(Ids.context_popup)) {
+    if (app.ctx.isPopupOpenStacked(Ids.context_popup)) {
         rectCsvRaw(app.context_outer, "context", buf, &off);
         rectCsvRaw(app.context_item_rects[0], "context_item0", buf, &off);
         rectCsvRaw(app.context_item_rects[1], "context_item1", buf, &off);

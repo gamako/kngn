@@ -73,8 +73,10 @@ pub const Style = style_mod.Style;
 pub const PerIdState = state_mod.PerIdState;
 // Popup / context menu. Implementation and doc comments live in popup.zig.
 pub const PopupState = popup_mod.PopupState;
+pub const PopupStack = popup_mod.PopupStack;
 pub const PopupItem = popup_mod.PopupItem;
 pub const PopupResult = popup_mod.PopupResult;
+pub const PopupMenuOpts = popup_mod.PopupMenuOpts;
 pub const stepgrid = stepgrid_mod;
 
 /// Entry in the rect cache.
@@ -148,10 +150,16 @@ pub const Context = struct {
     wheel_remaining_seeded: bool = false,
     /// Shared widget style. Caller may rewrite directly (no push/pop).
     style: Style,
-    /// Popup / context-menu open state. MVP allows only one at a time.
-    /// null = closed. When non-null, buttonBehavior suppresses hover/active on background widgets
-    /// (modal absorption; see buttonBehavior's doc comment / popup.zig).
+    /// Popup / context-menu open state. The classic mechanism (openPopup/closePopup/popupMenu)
+    /// allows only one of these open at a time. null = closed. When non-null, buttonBehavior
+    /// suppresses hover/active on background widgets (modal absorption; see buttonBehavior's doc
+    /// comment / popup.zig).
     popup_state: ?PopupState = null,
+    /// Additional popups open through `openPopupStacked`, independent of `popup_state` above —
+    /// see `PopupStack`'s doc comment in popup.zig for why this exists (a menu-bar dropdown and a
+    /// context menu held open at once). Empty for every caller that never uses the stacked API,
+    /// so it changes nothing for existing code.
+    popup_stack: PopupStack = .{},
     // ── tooltip. No PerIdStateStore; at most one candidate at a time.
     // Across frames: hover tracking (id / start time / rect). Frame-local fields reset in beginFrame.
     /// Widget id under continuous hover (0 = not tracking).
@@ -172,6 +180,10 @@ pub const Context = struct {
     /// Frame-local IME composition (preedit) state. Cleared in beginFrame;
     /// the app sets it every frame via setComposition before widget calls.
     composition: input_mod.CompositionState = .{},
+    /// Nesting depth of `beginDisabled`/`endDisabled` (0 = not disabled). A scope, not a per-call
+    /// option, because several widgets (checkbox/toggle/radio/textInputId) take no options struct
+    /// today; wrapping a group of widgets is also the common case ("disable this whole section").
+    disabled_depth: u32 = 0,
 
     // ── Widget layer. Implementations live in widgets.zig (aliases for method syntax) ──
     pub const button = widgets.button;
@@ -233,6 +245,15 @@ pub const Context = struct {
     pub const hasOpenPopup = popup_mod.hasOpenPopup;
     pub const isPopupOpen = popup_mod.isPopupOpen;
     pub const popupMenu = popup_mod.popupMenu;
+    pub const popupMenuEx = popup_mod.popupMenuEx;
+    // Stacked popups (coexist with the classic slot above; see PopupStack in popup.zig).
+    pub const openPopupStacked = popup_mod.openPopupStacked;
+    pub const closePopupStacked = popup_mod.closePopupStacked;
+    pub const isPopupOpenStacked = popup_mod.isPopupOpenStacked;
+    pub const isPopupOpenAny = popup_mod.isPopupOpenAny;
+    pub const openPopupCount = popup_mod.openPopupCount;
+    pub const popupMenuStacked = popup_mod.popupMenuStacked;
+    pub const popupPos = popup_mod.popupPos;
 
     pub fn init(gpa: Allocator, font: Font) Context {
         return .{
@@ -313,6 +334,9 @@ pub const Context = struct {
 
     pub fn endFrame(self: *Context) void {
         std.debug.assert(self.frame_active);
+        // Every beginDisabled needs a matching endDisabled within the same frame (immediate-mode
+        // begin/end nesting rule, the same contract beginCollapsible's body depth follows).
+        std.debug.assert(self.disabled_depth == 0);
         const root = self.layout_root.?;
         // Detect beginBox / endBox mismatches
         std.debug.assert(self.layout_current == root);
@@ -385,11 +409,34 @@ pub const Context = struct {
     /// (keeps "while modal absorption is active, wantsMouse() is effectively true". App canvas
     /// input gates can use this to suppress background input).
     pub fn wantsMouse(self: *const Context) bool {
-        return self.state.active_id != 0 or self.state.this_frame_hovered_any or self.popup_state != null;
+        return self.state.active_id != 0 or self.state.this_frame_hovered_any or
+            self.popup_state != null or self.popup_stack.len != 0;
     }
 
     pub fn wantsKeyboard(self: *const Context) bool {
         return self.state.focused_id != 0;
+    }
+
+    /// Enter a disabled scope: every ordinary widget built before the matching `endDisabled`
+    /// rejects pointer and keyboard input and draws with `Style.disabledColor`. Nestable (a
+    /// disabled section inside an already-disabled one stays disabled through the inner
+    /// `endDisabled`). Popup/menu items keep their own, unrelated `enabled` field — this scope is
+    /// for ordinary widgets outside a popup (see popup.zig).
+    pub fn beginDisabled(self: *Context) void {
+        std.debug.assert(self.frame_active);
+        self.disabled_depth += 1;
+    }
+
+    /// Leave a disabled scope opened by `beginDisabled`.
+    pub fn endDisabled(self: *Context) void {
+        std.debug.assert(self.frame_active);
+        std.debug.assert(self.disabled_depth > 0);
+        self.disabled_depth -= 1;
+    }
+
+    /// Whether a widget built right now is inside a `beginDisabled`/`endDisabled` scope.
+    pub fn isDisabled(self: *const Context) bool {
+        return self.disabled_depth > 0;
     }
 
     /// Claim keyboard focus when a widget sees mouse down. Per-ID selection state
@@ -435,7 +482,7 @@ pub const Context = struct {
     /// frame because `focus_order` keeps its capacity.
     pub fn registerFocusable(self: *Context, id: Id) void {
         std.debug.assert(self.frame_active);
-        if (id == 0 or self.popup_state != null) return;
+        if (id == 0 or self.popup_state != null or self.popup_stack.len != 0) return;
         self.focus_order.append(self.gpa, id) catch @panic("Context.registerFocusable: OOM");
     }
 
@@ -723,7 +770,7 @@ pub const Context = struct {
         // updateRectCache has already asserted that only one node per frame does.
         // A ring behind an open popup would point at a widget the popup has taken input away from,
         // so none is drawn while one is open.
-        if (self.popup_state == null and self.state.focus_visible and
+        if (self.popup_state == null and self.popup_stack.len == 0 and self.state.focus_visible and
             node.cfg.id != 0 and node.cfg.id == self.state.focused_id)
         {
             self.draw_list.rectOutline(node.rect, self.style.focus_ring, self.style.focus_ring_thickness) catch
@@ -760,13 +807,14 @@ pub fn pointHitsVisible(rect: Rect, clip: Rect, p: Vec2) bool {
 /// Contract that keeps TextInput range select, slider, and ScrollArea thumb drags working.
 pub fn buttonBehavior(ctx: *Context, id: Id, rect: Rect, clip: Rect) ButtonResult {
     std.debug.assert(ctx.frame_active);
-    // Modal absorption: while a popup is open, background widgets get no hover/hot/active
-    // at all. popup.openPopup() always resets active_id/hot_id/next_hot_id to 0 on open, so
-    // there is no special case for "already-active widgets"; this guard alone blocks new acquires,
-    // and active_id cannot become non-zero while a popup is open.
+    // Modal absorption: while a popup is open (the classic slot or a stacked one — see
+    // popup.zig's PopupStack), background widgets get no hover/hot/active at all.
+    // popup.openPopup()/openPopupStacked() always reset active_id/hot_id/next_hot_id to 0 on
+    // open, so there is no special case for "already-active widgets"; this guard alone blocks
+    // new acquires, and active_id cannot become non-zero while a popup is open.
     // The popup itself uses manual hit-test (hitTestItem in popup.zig) and does not go through
     // buttonBehavior, so this guard does not affect it.
-    if (ctx.popup_state != null) return .{};
+    if (ctx.popup_state != null or ctx.popup_stack.len != 0) return .{};
 
     const mp = ctx.input.mouse_pos;
     const hovered_now = pointHitsVisible(rect, clip, mp);

@@ -205,8 +205,9 @@ click_xy "$cx" "$cy"
 drive "step 2" >>"$LOG" 2>&1
 digest_state >/dev/null
 expect_state "filter_mask=6"
+# popup=filter after the click (not "none") is the persistence check itself: keep_open_on_select
+# means selecting a filter item never closes the popup, unlike an ordinary popupMenu.
 expect_state "popup=filter"
-expect_state "filter_reopen_count>0"
 LAYOUT=$(digest_layout)
 read -r ix iy iw ih <<<"$(layout_rect filter_item1 "$LAYOUT")"
 read -r cx cy <<<"$(rect_center "$ix" "$iy" "$iw" "$ih")"
@@ -309,8 +310,8 @@ drive "inject mouse_move 5 5; step 1; inject mouse_down left; step 1; inject mou
 expect_state "filter_mask=7"
 log "[e2e] scenario 6 PASS"
 
-# ── Scenario 7: menu + popup simultaneous constraint ──
-log "[e2e] === scenario 7: menu/popup simultaneous constraint ==="
+# ── Scenario 7: menu + context menu held open at once ──
+log "[e2e] === scenario 7: menu and context menu simultaneous ==="
 LAYOUT=$(digest_layout)
 read -r fx fy fw fh <<<"$(layout_rect file "$LAYOUT")"
 read -r cx cy <<<"$(rect_center "$fx" "$fy" "$fw" "$fh")"
@@ -336,22 +337,29 @@ right_click_xy "$cx" "$cy"
 drive "step 1" >>"$LOG" 2>&1
 STATE1=$(digest_state)
 log "[e2e] scenario7 after right-click: $STATE1"
-# Baked observation (2026-07-18): while menuBar keeps open_title=File it re-acquires the popup, so
-# after right-click still popup=menu / menu=File / popup_count=1. context is not held at the same time.
-expect_state "popup_count=1"
+# The context menu opens through openPopupStacked, a side channel independent of the menu-bar
+# dropdown's classic slot, so both are open at once: popup_count=2 (currentPopupKind still
+# reports "menu" as the primary readout; popup_count is what shows the second one).
+expect_state "popup_count=2"
 expect_state "menu=File"
 expect_state "popup=menu"
-drive "step 1" >>"$LOG" 2>&1
-STATE2=$(digest_state)
-log "[e2e] scenario7 next frame: $STATE2"
-expect_state "popup=menu"
-# dismiss
-drive "inject mouse_move 5 5; step 1; inject mouse_down left; step 1; inject mouse_up left; step 2" >>"$LOG" 2>&1
+drive "snapshot fb" >>"$LOG" 2>&1
+# Clicking the context-menu item selects it, and -- because the click lands outside the
+# menu-bar dropdown's own rect -- also dismisses that dropdown as an "outside click" for it
+# (each open popup's dismissal is evaluated against its own geometry independently; see
+# popupMenuStacked's doc comment). Both close; this does not undo the popup_count=2 proof above.
+LAYOUT=$(digest_layout)
+read -r ix iy iw ih <<<"$(layout_rect context_item0 "$LAYOUT")"
+read -r cx cy <<<"$(rect_center "$ix" "$iy" "$iw" "$ih")"
+click_xy "$cx" "$cy"
+drive "step 2" >>"$LOG" 2>&1
 digest_state >/dev/null
+expect_state "last_context_action=open"
 expect_state "popup=none"
+expect_state "popup_count=0"
 expect_state "menu=none"
 drive "snapshot fb" >>"$LOG" 2>&1
-log "[e2e] scenario 7 PASS (baked popup1=menu popup2=menu; Missing: simultaneous menu+context)"
+log "[e2e] scenario 7 PASS (menu and context menu held open at once; popup_count=2)"
 
 log "[e2e] quit"
 drive "quit" >>"$LOG" 2>&1 || true

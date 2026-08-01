@@ -167,12 +167,26 @@ pub const Shortcut = @import("command_types").Shortcut;
 // Usual call site is as Context methods (ctx.openPopup / ctx.closePopup / ctx.hasOpenPopup / ctx.isPopupOpen /
 // ctx.popupMenu), same shape as other widgets.
 pub const PopupState = @import("popup.zig").PopupState;
+pub const PopupStack = @import("popup.zig").PopupStack;
+pub const max_stacked_popups = @import("popup.zig").max_stacked_popups;
 pub const PopupItem = @import("popup.zig").PopupItem;
 pub const PopupResult = @import("popup.zig").PopupResult;
+pub const PopupMenuOpts = @import("popup.zig").PopupMenuOpts;
 pub const PopupGeometry = @import("popup.zig").PopupGeometry;
 pub const layoutPopup = @import("popup.zig").layoutPopup;
 pub const itemRect = @import("popup.zig").itemRect;
 pub const hitTestItem = @import("popup.zig").hitTestItem;
+pub const measurePopupContentWidth = @import("popup.zig").measurePopupContentWidth;
+pub const popupContentWidth = @import("popup.zig").popupContentWidth;
+// Stacked popups (coexist with the classic slot; see PopupStack's doc comment in popup.zig).
+pub const openPopupStacked = @import("popup.zig").openPopupStacked;
+pub const closePopupStacked = @import("popup.zig").closePopupStacked;
+pub const isPopupOpenStacked = @import("popup.zig").isPopupOpenStacked;
+pub const isPopupOpenAny = @import("popup.zig").isPopupOpenAny;
+pub const openPopupCount = @import("popup.zig").openPopupCount;
+pub const popupMenuStacked = @import("popup.zig").popupMenuStacked;
+pub const popupMenuEx = @import("popup.zig").popupMenuEx;
+pub const popupPos = @import("popup.zig").popupPos;
 
 // Menu bar / dropdown built from Command definitions.
 // gui does not execute Command; it only returns the selected CommandId (owned by the app's dispatchCommand).

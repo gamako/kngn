@@ -34,11 +34,65 @@ pub const Rect = geom.Rect;
 pub const Vec2 = geom.Vec2;
 pub const Id = id_mod.Id;
 
-/// Popup open/close state held by Context. MVP allows only one open at a time.
+/// Popup open/close state held by Context. The classic mechanism (`openPopup` / `closePopup` /
+/// `popupMenu` / `isPopupOpen` / `hasOpenPopup`) allows only one of these open at a time, exactly
+/// as before; `PopupStack` below is a separate, additive side channel for a second (or third)
+/// popup that needs to coexist with it (see `PopupStack`'s doc comment).
 pub const PopupState = struct {
     id: Id,
     /// Requested open position (top-left, before clamp).
     pos: Vec2,
+};
+
+/// How many popups `PopupStack` can hold open at once, beyond the classic single slot above.
+/// Small and fixed: this side channel exists for a handful of coexisting overlays (a menu-bar
+/// dropdown plus a context menu), not an open-ended stack of nested menus.
+pub const max_stacked_popups: usize = 4;
+
+/// A small fixed-capacity set of concurrently open popups, keyed by id, independent of the
+/// classic single `PopupState` slot.
+///
+/// Motivation: the classic mechanism can only ever have one popup open (opening a second one
+/// through `openPopup` silently replaces the first — see the list+menu shell's e2e scenario 7,
+/// which pins this exact gap as "Missing: simultaneous menu+context"). A caller that wants a
+/// menu-bar dropdown to stay open while a right-click context menu is also open uses
+/// `openPopupStacked`/`popupMenuStacked` for the second one instead, leaving the classic
+/// mechanism (and every existing caller of it) completely unchanged.
+///
+/// Not a LIFO stack in the push/pop sense — entries are looked up by id, and z-order (which one
+/// draws on top) follows the caller's own call order for `popupMenuStacked`, the same rule the
+/// ordinary layout tree already follows for draw order.
+pub const PopupStack = struct {
+    items: [max_stacked_popups]PopupState = undefined,
+    len: usize = 0,
+
+    fn indexOf(self: *const PopupStack, id: Id) ?usize {
+        var i: usize = 0;
+        while (i < self.len) : (i += 1) {
+            if (self.items[i].id == id) return i;
+        }
+        return null;
+    }
+
+    /// Open `id` at `pos`, or move it if already open. Silently drops the open when the stack is
+    /// already at `max_stacked_popups` (an MVP cap, not expected to bite in the handful-of-overlays
+    /// use case this exists for).
+    fn open(self: *PopupStack, id: Id, pos: Vec2) void {
+        if (self.indexOf(id)) |i| {
+            self.items[i].pos = pos;
+            return;
+        }
+        if (self.len >= max_stacked_popups) return;
+        self.items[self.len] = .{ .id = id, .pos = pos };
+        self.len += 1;
+    }
+
+    fn close(self: *PopupStack, id: Id) void {
+        const i = self.indexOf(id) orelse return;
+        var j = i;
+        while (j + 1 < self.len) : (j += 1) self.items[j] = self.items[j + 1];
+        self.len -= 1;
+    }
 };
 
 /// Menu item. label is the label string (popupMenu dupes it onto the arena, so later
@@ -46,6 +100,10 @@ pub const PopupState = struct {
 pub const PopupItem = struct {
     label: []const u8,
     enabled: bool = true,
+    /// Draws a filled check mark to the left of the label (see `draw`'s `check_mark_w`).
+    /// Display only; toggling it in response to a selection is the caller's job, typically
+    /// paired with `PopupMenuOpts.keep_open_on_select` for a persistent multi-select popup.
+    checked: bool = false,
 };
 
 /// Return value of popupMenu().
@@ -71,7 +129,8 @@ pub const PopupGeometry = struct {
     item_h: i32,
 };
 
-/// Natural content width of item labels (max measure). Requested outer width is `content_w + pad*2`.
+/// Natural content width of item labels (max measure). Requested outer width is `content_w + pad*2`,
+/// widened by `checkMarkReserve` when any item is checked.
 /// Use an i64 intermediate so extremely long labels do not trap on i32 conversion.
 /// Do not remeasure in the draw loop (popupMenu calls this once).
 pub fn measurePopupContentWidth(font: anytype, items: []const PopupItem) i32 {
@@ -81,6 +140,33 @@ pub fn measurePopupContentWidth(font: anytype, items: []const PopupItem) i32 {
         max_w = @max(max_w, mw);
     }
     return std.math.cast(i32, max_w) orelse std.math.maxInt(i32);
+}
+
+/// Width of the check-mark glyph plus the gap to the label (see `draw`). Reserved in front of
+/// `content_w` only when at least one item is checked, so an all-unchecked item list keeps
+/// today's exact layout (bit-identical outer geometry).
+const check_mark_w: i32 = 8;
+const check_mark_gap: i32 = 6;
+
+fn anyChecked(items: []const PopupItem) bool {
+    for (items) |it| {
+        if (it.checked) return true;
+    }
+    return false;
+}
+
+/// `content_w` widened by the check-mark reserve when `items` has at least one checked entry.
+fn checkMarkReserve(items: []const PopupItem) i32 {
+    return if (anyChecked(items)) check_mark_w + check_mark_gap else 0;
+}
+
+/// The outer content width `popupMenu`/`popupMenuEx`/`popupMenuStacked` actually lay `items` out
+/// at: `measurePopupContentWidth` plus the check-mark reserve. A caller that recomputes popup
+/// geometry itself (a probe reporting item rects for a harness, say) uses this instead of
+/// `measurePopupContentWidth` alone, so its own `layoutPopup` call agrees with what the popup
+/// actually draws whenever the item list includes a checked entry.
+pub fn popupContentWidth(font: anytype, items: []const PopupItem) i32 {
+    return measurePopupContentWidth(font, items) + checkMarkReserve(items);
 }
 
 /// Compute the menu outer frame for requested position pos and clamp it inside the screen rect.
@@ -195,47 +281,100 @@ pub fn closePopup(ctx: *Context) void {
     ctx.popup_state = null;
 }
 
-/// Whether any popup is open.
+/// Whether any popup is open — the classic slot, a stacked one (`openPopupStacked`), or both.
 pub fn hasOpenPopup(ctx: *const Context) bool {
-    return ctx.popup_state != null;
+    return ctx.popup_state != null or ctx.popup_stack.len != 0;
 }
 
-/// Whether the popup with id is open.
+/// Whether the popup with id is open (classic slot only; use `isPopupOpenStacked` for the
+/// stacked side channel, or `isPopupOpenAny` to check both).
 pub fn isPopupOpen(ctx: *const Context, id: Id) bool {
     return if (ctx.popup_state) |s| s.id == id else false;
 }
 
-/// If the popup for id is open, draw + hit-test and return the result.
-/// If not open, do nothing and return `.{}` (open=false) — safe to call unconditionally every frame
-/// (immediate-mode style).
-///
-/// **Contract: call after ctx.endFrame()** (to draw on top; same "manual draw into draw_list
-/// after endFrame" overlay rule as selection_overlay.zig).
-pub fn popupMenu(ctx: *Context, id: Id, items: []const PopupItem) PopupResult {
-    std.debug.assert(!ctx.frame_active);
-    const state = ctx.popup_state orelse return .{};
-    if (state.id != id) return .{};
+/// Whether `id` is open through `openPopupStacked`. Independent of the classic slot: a popup
+/// opened with `openPopup` never shows up here, and vice versa.
+pub fn isPopupOpenStacked(ctx: *const Context, id: Id) bool {
+    return ctx.popup_stack.indexOf(id) != null;
+}
 
+/// Whether `id` is open through either mechanism.
+pub fn isPopupOpenAny(ctx: *const Context, id: Id) bool {
+    return isPopupOpen(ctx, id) or isPopupOpenStacked(ctx, id);
+}
+
+/// Total number of currently open popups across both mechanisms (0, 1, or more when a stacked
+/// popup coexists with the classic one). Useful for a probe/digest that wants to assert "more
+/// than one popup is open at once" (see `popupMenuStacked`'s doc comment).
+pub fn openPopupCount(ctx: *const Context) usize {
+    return (if (ctx.popup_state != null) @as(usize, 1) else 0) + ctx.popup_stack.len;
+}
+
+/// Open (or move) a popup that can coexist with the classic slot and with other stacked popups —
+/// see `PopupStack`'s doc comment for the motivation. Same active/hot reset as `openPopup`,
+/// since either kind being open already means background widgets are modally blocked.
+pub fn openPopupStacked(ctx: *Context, id: Id, pos: Vec2) void {
+    ctx.popup_stack.open(id, pos);
+    ctx.state.active_id = 0;
+    ctx.state.hot_id = 0;
+    ctx.state.next_hot_id = 0;
+}
+
+/// Close a popup opened with `openPopupStacked`. Does not touch the classic slot.
+pub fn closePopupStacked(ctx: *Context, id: Id) void {
+    ctx.popup_stack.close(id);
+}
+
+/// Position of an open popup, classic or stacked (null if `id` is not open through either).
+pub fn popupPos(ctx: *const Context, id: Id) ?Vec2 {
+    if (ctx.popup_state) |s| {
+        if (s.id == id) return s.pos;
+    }
+    if (ctx.popup_stack.indexOf(id)) |i| return ctx.popup_stack.items[i].pos;
+    return null;
+}
+
+/// Optional behavior for `popupMenuEx` / `popupMenuStacked`.
+pub const PopupMenuOpts = struct {
+    /// When true, clicking an enabled item does not close the popup: the caller applies the
+    /// selection (e.g. flips `PopupItem.checked` on its own item list) and the popup stays open
+    /// for further clicks, a persistent multi-select-style popup. Default false reproduces
+    /// `popupMenu`'s original close-on-select contract exactly.
+    keep_open_on_select: bool = false,
+};
+
+/// Shared measure + layout + hit-test + draw for one popup instance sitting at `pos` with
+/// `items`. Does not know or care which of the two open/close mechanisms is in play — the caller
+/// (`popupMenuEx` / `popupMenuStacked`) decides what "open" and "close" mean for its own slot.
+///
+/// `dismissed_outside` covers both "no items" (closed defensively, same as before) and "a press
+/// landed outside this popup's own geometry". The latter is evaluated against this popup alone:
+/// with two popups open at once (see `PopupStack`), a press inside a different one still counts
+/// as outside *this* one and closes it — the same "any interaction elsewhere dismisses me" rule
+/// a single open popup already followed, just applied per popup rather than globally.
+const PopupInteraction = struct {
+    open: bool = false,
+    selected: ?usize = null,
+    dismissed_outside: bool = false,
+};
+
+fn runPopup(ctx: *Context, items: []const PopupItem, pos: Vec2) PopupInteraction {
     // Empty items can happen from caller bugs or real use (e.g. the target was deleted), so
     // close defensively instead of panicking.
-    if (items.len == 0) {
-        closePopup(ctx);
-        return .{ .dismissed = true };
-    }
+    if (items.len == 0) return .{ .dismissed_outside = true };
 
     // Measure item width once here (no remeasure in draw). At natural size
-    // outer.w = max_measure + pad*2; layoutPopup clips to screen when over the viewport.
-    const content_w = measurePopupContentWidth(ctx.font, items);
+    // outer.w = max_measure + check-mark reserve + pad*2; layoutPopup clips to screen when over the viewport.
+    const content_w = popupContentWidth(ctx.font, items);
     const style = ctx.style;
-    const geo = layoutPopup(state.pos, items.len, content_w, style.popup_item_h, style.popup_padding, ctx.screen_w, ctx.screen_h);
+    const geo = layoutPopup(pos, items.len, content_w, style.popup_item_h, style.popup_padding, ctx.screen_w, ctx.screen_h);
 
     const in = &ctx.input;
 
     // Outside click (any button press edge whose press position is outside outer) → close.
     const any_pressed = in.mouse_pressed.left or in.mouse_pressed.right or in.mouse_pressed.middle;
     if (any_pressed and !geo.outer.contains(in.mouse_pressed_pos)) {
-        closePopup(ctx);
-        return .{ .dismissed = true };
+        return .{ .dismissed_outside = true };
     }
 
     const hovered_idx = hitTestItem(geo, items.len, in.mouse_pos);
@@ -247,12 +386,57 @@ pub fn popupMenu(ctx: *Context, id: Id, items: []const PopupItem) PopupResult {
     }
 
     draw(ctx, geo, items, hovered_idx);
+    return .{ .open = true, .selected = clicked_idx };
+}
 
-    if (clicked_idx) |idx| {
+/// If the popup for id is open, draw + hit-test and return the result.
+/// If not open, do nothing and return `.{}` (open=false) — safe to call unconditionally every frame
+/// (immediate-mode style).
+///
+/// **Contract: call after ctx.endFrame()** (to draw on top; same "manual draw into draw_list
+/// after endFrame" overlay rule as selection_overlay.zig).
+pub fn popupMenu(ctx: *Context, id: Id, items: []const PopupItem) PopupResult {
+    return popupMenuEx(ctx, id, items, .{});
+}
+
+/// `popupMenu` with `PopupMenuOpts` (a persistent, checked-item popup passes
+/// `.{ .keep_open_on_select = true }`; `popupMenu` itself is `popupMenuEx(ctx, id, items, .{})`).
+pub fn popupMenuEx(ctx: *Context, id: Id, items: []const PopupItem, opts: PopupMenuOpts) PopupResult {
+    std.debug.assert(!ctx.frame_active);
+    const state = ctx.popup_state orelse return .{};
+    if (state.id != id) return .{};
+
+    const r = runPopup(ctx, items, state.pos);
+    if (r.dismissed_outside) {
         closePopup(ctx);
-        return .{ .selected = idx };
+        return .{ .dismissed = true };
     }
-    return .{ .open = true };
+    if (r.selected) |idx| {
+        if (!opts.keep_open_on_select) closePopup(ctx);
+        return .{ .selected = idx, .open = opts.keep_open_on_select };
+    }
+    return .{ .open = r.open };
+}
+
+/// Same contract as `popupMenuEx`, but against a popup opened with `openPopupStacked` instead of
+/// the classic slot — see `PopupStack`'s doc comment. Draw order across several stacked popups
+/// follows call order (call the one that should appear on top last), the same rule the ordinary
+/// layout tree already follows.
+pub fn popupMenuStacked(ctx: *Context, id: Id, items: []const PopupItem, opts: PopupMenuOpts) PopupResult {
+    std.debug.assert(!ctx.frame_active);
+    const idx = ctx.popup_stack.indexOf(id) orelse return .{};
+    const pos = ctx.popup_stack.items[idx].pos;
+
+    const r = runPopup(ctx, items, pos);
+    if (r.dismissed_outside) {
+        closePopupStacked(ctx, id);
+        return .{ .dismissed = true };
+    }
+    if (r.selected) |sel| {
+        if (!opts.keep_open_on_select) closePopupStacked(ctx, id);
+        return .{ .selected = sel, .open = opts.keep_open_on_select };
+    }
+    return .{ .open = r.open };
 }
 
 fn draw(ctx: *Context, geo: PopupGeometry, items: []const PopupItem, hovered_idx: ?usize) void {
@@ -269,6 +453,9 @@ fn draw(ctx: *Context, geo: PopupGeometry, items: []const PopupItem, hovered_idx
 
     // Text height is logical ink (ascent+descent). item_h / hit-test / outer frame keep style.
     const text_h = font_mod.fontInkHeight(ctx.font);
+    // Reserved once for the whole list (measurePopupContentWidth + checkMarkReserve sized outer
+    // the same way), not per item: an all-unchecked list keeps text_x == r.x + 4 exactly.
+    const indent = checkMarkReserve(items);
     for (items, 0..) |it, i| {
         const r = itemRect(geo, i);
         // Skip items fully outside outer (trailing rows hidden by viewport shrink).
@@ -280,11 +467,16 @@ fn draw(ctx: *Context, geo: PopupGeometry, items: []const PopupItem, hovered_idx
         const text_col = if (it.enabled) style.text else style.text_subtle;
         // Vertical center uses natural item_h (keeps row appearance even when partially clipped)
         const text_y = font_mod.centeredTextY(r.y, geo.item_h, text_h);
+        if (it.checked) {
+            const mark_y = font_mod.centeredTextY(r.y, geo.item_h, check_mark_w);
+            dl.rectFilled(.{ .x = r.x + 4, .y = mark_y, .w = @intCast(check_mark_w), .h = @intCast(check_mark_w) }, text_col) catch
+                @panic("popupMenu: OOM");
+        }
         // Same contract as ctx.labelEx (dupe onto the arena). popupMenu is called after endFrame, but
         // the arena stays valid until the next beginFrame (see Context.beginFrame reset timing),
         // so a caller temporary buffer is safe.
         const dup = ctx.allocator().dupe(u8, it.label) catch @panic("popupMenu: OOM");
-        dl.textEx(.{ .x = r.x + 4, .y = text_y }, dup, text_col, null) catch @panic("popupMenu: OOM");
+        dl.textEx(.{ .x = r.x + 4 + indent, .y = text_y }, dup, text_col, null) catch @panic("popupMenu: OOM");
     }
 }
 
@@ -668,6 +860,29 @@ test "Modal absorption: while a popup is open, background buttonBehavior gets no
     ctx.endFrame();
 }
 
+test "Modal absorption: a stacked-only popup (no classic slot open) also suppresses background buttonBehavior" {
+    var ctx = testCtx();
+    defer ctx.deinit();
+    const btn_rect = geom.Rect{ .x = 0, .y = 0, .w = 100, .h = 50 };
+    const full_clip = geom.Rect{ .x = 0, .y = 0, .w = 800, .h = 600 };
+
+    ctx.beginFrame(800, 600);
+    ctx.pushEvent(.{ .mouse_move = .{ .x = 10, .y = 10, .modifiers = 0 } });
+    ctx.openPopupStacked(99, .{ .x = 200, .y = 200 }); // classic popup_state stays null throughout
+    try std.testing.expect(ctx.popup_state == null);
+    const r = context_mod.buttonBehavior(&ctx, 1, btn_rect, full_clip);
+    try std.testing.expect(!r.hovered);
+    try std.testing.expect(ctx.wantsMouse());
+    ctx.endFrame();
+
+    ctx.closePopupStacked(99);
+    ctx.beginFrame(800, 600);
+    ctx.pushEvent(.{ .mouse_move = .{ .x = 10, .y = 10, .modifiers = 0 } });
+    const r2 = context_mod.buttonBehavior(&ctx, 1, btn_rect, full_clip);
+    try std.testing.expect(r2.hovered);
+    ctx.endFrame();
+}
+
 test "openPopup: clears active_id/hot_id just before opening" {
     var ctx = testCtx();
     defer ctx.deinit();
@@ -788,4 +1003,157 @@ test "tooltip text_y uses the same item_h/ink centering as popup" {
         else => {},
     };
     try std.testing.expect(saw_text);
+}
+
+// ── PopupItem.checked / popupMenuEx (persistent, keep_open_on_select) ──────────────────────────────
+
+test "popupMenu: a checked item draws an extra rect_filled (the check mark) besides bg/border/text" {
+    var ctx = testCtx();
+    defer ctx.deinit();
+    ctx.beginFrame(800, 600);
+    ctx.endFrame();
+
+    const items = [_]PopupItem{
+        .{ .label = "Files", .checked = true },
+        .{ .label = "Issues", .checked = false },
+    };
+    ctx.openPopup(1, .{ .x = 10, .y = 10 });
+    const before = ctx.draw_list.cmds.items.len;
+    const result = ctx.popupMenu(1, &items);
+    try std.testing.expect(result.open);
+    // bg(1) + border(1) + check-mark(1, only the checked row) + text*2 = 5 commands added
+    // (one more rect_filled than the unchecked-only "draws while open" test above).
+    try std.testing.expectEqual(before + 5, ctx.draw_list.cmds.items.len);
+}
+
+test "popupMenuEx: keep_open_on_select stays open and reports selected in the same call" {
+    var ctx = testCtx();
+    defer ctx.deinit();
+    ctx.beginFrame(800, 600);
+    ctx.endFrame();
+
+    var items = [_]PopupItem{
+        .{ .label = "Files", .checked = true },
+        .{ .label = "Issues", .checked = false },
+    };
+    ctx.openPopup(1, .{ .x = 0, .y = 0 });
+
+    // Click item1 ("Issues"), same geometry as the plain popupMenu click test.
+    ctx.beginFrame(800, 600);
+    ctx.pushEvent(.{ .mouse_down = .{ .x = 10, .y = 30, .button = 0, .modifiers = 0 } });
+    ctx.endFrame();
+
+    const result = ctx.popupMenuEx(1, &items, .{ .keep_open_on_select = true });
+    try std.testing.expectEqual(@as(?usize, 1), result.selected);
+    try std.testing.expect(result.open);
+    try std.testing.expect(ctx.hasOpenPopup()); // unlike popupMenu, the popup was not closed
+
+    // The caller applies the selection itself (a persistent multi-select popup's job, not gui's).
+    items[1].checked = true;
+
+    // A further frame confirms the popup really did stay open (not just "this call said so").
+    ctx.beginFrame(800, 600);
+    ctx.endFrame();
+    try std.testing.expect(ctx.isPopupOpen(1));
+}
+
+test "popupMenu (default opts): still closes on select, unaffected by popupMenuEx existing" {
+    var ctx = testCtx();
+    defer ctx.deinit();
+    ctx.beginFrame(800, 600);
+    ctx.endFrame();
+    ctx.openPopup(1, .{ .x = 0, .y = 0 });
+
+    ctx.beginFrame(800, 600);
+    ctx.pushEvent(.{ .mouse_down = .{ .x = 10, .y = 30, .button = 0, .modifiers = 0 } });
+    ctx.endFrame();
+
+    const result = ctx.popupMenu(1, &items3);
+    try std.testing.expectEqual(@as(?usize, 1), result.selected);
+    try std.testing.expect(!ctx.hasOpenPopup());
+}
+
+// ── Stacked popups (coexist with the classic slot) ──────────────────────────────
+
+test "openPopupStacked: coexists with the classic slot -- opening a stacked popup does not close it" {
+    var ctx = testCtx();
+    defer ctx.deinit();
+    ctx.beginFrame(800, 600);
+    ctx.endFrame();
+
+    ctx.openPopup(1, .{ .x = 0, .y = 0 });
+    ctx.openPopupStacked(2, .{ .x = 100, .y = 100 });
+
+    try std.testing.expect(ctx.isPopupOpen(1));
+    try std.testing.expect(!ctx.isPopupOpen(2)); // classic isPopupOpen does not see the stacked one
+    try std.testing.expect(ctx.isPopupOpenStacked(2));
+    try std.testing.expect(!ctx.isPopupOpenStacked(1)); // and vice versa
+    try std.testing.expect(ctx.isPopupOpenAny(1));
+    try std.testing.expect(ctx.isPopupOpenAny(2));
+    try std.testing.expectEqual(@as(usize, 2), ctx.openPopupCount());
+    try std.testing.expect(ctx.hasOpenPopup());
+}
+
+test "popupMenuStacked: draws and hit-tests a stacked popup independently of the classic one" {
+    var ctx = testCtx();
+    defer ctx.deinit();
+    ctx.beginFrame(800, 600);
+    ctx.endFrame();
+
+    // Classic popup stays open at (0,0) the whole test (menu-bar dropdown stand-in).
+    ctx.openPopup(1, .{ .x = 0, .y = 0 });
+    // Stacked popup opens far away at (200,200) (context-menu stand-in).
+    ctx.openPopupStacked(2, .{ .x = 200, .y = 200 });
+
+    const stacked_items = [_]PopupItem{ .{ .label = "Open" }, .{ .label = "Copy" } };
+
+    // Click inside the stacked popup's first item row (outer x=204,y=204; item0 y=[204,224)).
+    ctx.beginFrame(800, 600);
+    ctx.pushEvent(.{ .mouse_down = .{ .x = 210, .y = 210, .button = 0, .modifiers = 0 } });
+    ctx.endFrame();
+
+    const stacked_res = ctx.popupMenuStacked(2, &stacked_items, .{});
+    try std.testing.expectEqual(@as(?usize, 0), stacked_res.selected);
+    try std.testing.expect(!ctx.isPopupOpenStacked(2)); // closed after selecting (default opts)
+    try std.testing.expect(ctx.isPopupOpen(1)); // the classic popup is completely unaffected
+}
+
+test "popupMenuStacked: keep_open_on_select works the same as popupMenuEx" {
+    var ctx = testCtx();
+    defer ctx.deinit();
+    ctx.beginFrame(800, 600);
+    ctx.endFrame();
+    ctx.openPopupStacked(9, .{ .x = 0, .y = 0 });
+
+    ctx.beginFrame(800, 600);
+    ctx.pushEvent(.{ .mouse_down = .{ .x = 10, .y = 10, .button = 0, .modifiers = 0 } });
+    ctx.endFrame();
+
+    const result = ctx.popupMenuStacked(9, &items3, .{ .keep_open_on_select = true });
+    try std.testing.expectEqual(@as(?usize, 0), result.selected);
+    try std.testing.expect(ctx.isPopupOpenStacked(9));
+}
+
+test "openPopupCount: 0 with nothing open, 1 with only the classic slot, 2 with both" {
+    var ctx = testCtx();
+    defer ctx.deinit();
+    try std.testing.expectEqual(@as(usize, 0), ctx.openPopupCount());
+    ctx.openPopup(1, .{ .x = 0, .y = 0 });
+    try std.testing.expectEqual(@as(usize, 1), ctx.openPopupCount());
+    ctx.openPopupStacked(2, .{ .x = 0, .y = 0 });
+    try std.testing.expectEqual(@as(usize, 2), ctx.openPopupCount());
+    ctx.closePopup();
+    try std.testing.expectEqual(@as(usize, 1), ctx.openPopupCount());
+    ctx.closePopupStacked(2);
+    try std.testing.expectEqual(@as(usize, 0), ctx.openPopupCount());
+}
+
+test "popupPos: reads position from either backend, null when not open" {
+    var ctx = testCtx();
+    defer ctx.deinit();
+    try std.testing.expectEqual(@as(?Vec2, null), ctx.popupPos(1));
+    ctx.openPopup(1, .{ .x = 5, .y = 6 });
+    try std.testing.expectEqual(Vec2{ .x = 5, .y = 6 }, ctx.popupPos(1).?);
+    ctx.openPopupStacked(2, .{ .x = 7, .y = 8 });
+    try std.testing.expectEqual(Vec2{ .x = 7, .y = 8 }, ctx.popupPos(2).?);
 }

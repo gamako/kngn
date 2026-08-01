@@ -132,6 +132,7 @@ pub fn main(init: std.process.Init) !void {
                         .ESCAPE => {
                             if (popup_open) {
                                 ctx.closePopup();
+                                ctx.closePopupStacked(ui.Ids.context_popup);
                                 app.menu.open_title = null;
                                 app.menu.switch_click = false;
                             } else {
@@ -153,7 +154,8 @@ pub fn main(init: std.process.Init) !void {
                         const p: gui.Vec2 = .{ .x = m.x, .y = m.y };
                         if (ui.hitTestRow(&app, p)) |row| {
                             // Right-click requests opening context and is not forwarded to gui
-                            // (avoids outside right-press dismiss of the menu popup; for observing the one-popup constraint)
+                            // (a right press gui never sees cannot dismiss the menu-bar dropdown
+                            // as an "outside click"; the context menu opens stacked alongside it).
                             app.context_row = row;
                             ui.selectRow(&app, row, .mouse);
                             // Keep keyboard nav primed from a right-click selection the same way

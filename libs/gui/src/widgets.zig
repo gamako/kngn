@@ -140,17 +140,24 @@ pub fn buttonEx(ctx: *Context, label: []const u8, opts: ButtonOpts) ButtonResult
 pub fn buttonId(ctx: *Context, id: Id, label: []const u8, opts: ButtonOpts) ButtonResult {
     const result = behaviorFromCache(ctx, id);
     const style = ctx.style;
+    const disabled = ctx.isDisabled();
     const hot = ctx.state.hot_id == id;
-    // held > hover > selected > normal (selected adds accent fill)
-    const bg = if (result.held)
+    const base_bg = if (opts.selected) style.button_bg_selected else style.bg;
+    // disabled > held > hover > selected > normal (selected adds accent fill)
+    const bg = if (disabled)
+        style.disabledColor(base_bg)
+    else if (result.held)
         style.bg_active
     else if (hot)
         style.bg_hover
-    else if (opts.selected)
-        style.button_bg_selected
     else
-        style.bg;
-    const border_color = if (hot or opts.selected) style.border_hover else style.border;
+        base_bg;
+    const border_color = if (disabled)
+        style.disabledColor(style.border)
+    else if (hot or opts.selected)
+        style.border_hover
+    else
+        style.border;
     const thickness = if (opts.selected) style.button_border_selected else style.button_border;
     const pad = opts.padding orelse style.button_padding;
     // With `min_w`, width is fixed at call time assuming fixed-width font (`measure = 8×len`)
@@ -165,7 +172,7 @@ pub fn buttonId(ctx: *Context, id: Id, label: []const u8, opts: ButtonOpts) Butt
         .bg = bg,
         .border = makeBorder(border_color, thickness),
     });
-    ctx.labelEx(label, style.text);
+    ctx.labelEx(label, if (disabled) style.disabledColor(style.text) else style.text);
     ctx.endBox();
     return result;
 }
@@ -325,10 +332,26 @@ const IconButtonDraw = struct {
 /// in, for the reason `pointerEngaged` gives.
 fn keyboardActivated(ctx: *const Context, id: Id) bool {
     if (id == 0 or ctx.state.focused_id != id) return false;
-    if (ctx.popup_state != null or ctx.pointerEngaged()) return false;
+    if (ctx.popup_state != null or ctx.popup_stack.len != 0 or ctx.pointerEngaged()) return false;
     const all = input_mod.mod.all;
     return ctx.input.pressedPlain(input_mod.key.space, 0, all) or
         ctx.input.pressedPlain(input_mod.key.enter, 0, all);
+}
+
+/// If `id` currently holds the focus, hover, or press lock, release it immediately (called when a
+/// widget is submitted disabled). A disabled widget cannot act on Space/Enter or a drag in
+/// progress, so leaving any of these pointed at it would be a ghost: a focus ring with nothing to
+/// activate, a hover tint with nothing to press, an active lock a release could never resolve.
+/// Runs at submit time, before this frame's `emitNode` draws the ring, so disabling a focused
+/// widget and disabling it never draws a stray ring in the same frame.
+fn clearDisabledInteraction(ctx: *Context, id: Id) void {
+    if (ctx.state.focused_id == id) {
+        ctx.state.focused_id = 0;
+        ctx.state.focus_visible = false;
+    }
+    if (ctx.state.active_id == id) ctx.state.active_id = 0;
+    if (ctx.state.hot_id == id) ctx.state.hot_id = 0;
+    if (ctx.state.next_hot_id == id) ctx.state.next_hot_id = 0;
 }
 
 /// Shared pointer + keyboard behaviour for every widget that behaves like a button.
@@ -336,7 +359,18 @@ fn keyboardActivated(ctx: *const Context, id: Id) bool {
 /// Beyond the hit-test it does three things that make the widget a keyboard citizen: it enters the
 /// widget into this frame's Tab order, it takes the focus when the pointer presses it, and it
 /// reports Space/Enter as a click.
+///
+/// A disabled widget (`ctx.isDisabled()`) does none of this: it never joins the Tab order (WAI-ARIA
+/// APG's convention for disabled controls — Tab reaching a widget with nothing it can do to a
+/// press would be a dead stop), never hit-tests, and releases any focus/hover/active it held from
+/// before it became disabled. The caller still lays it out and draws it (grayed, via the widget's
+/// own `Style.disabledColor` draw path) — only interaction is rejected.
 fn behaviorFromCache(ctx: *Context, id: Id) ButtonResult {
+    if (ctx.isDisabled()) {
+        clearDisabledInteraction(ctx, id);
+        ctx.noteLastInteractive(id, .{ .x = 0, .y = 0, .w = 0, .h = 0 }, false);
+        return .{};
+    }
     ctx.registerFocusable(id);
     const cached = ctx.rect_cache.get(id) orelse {
         // Still record as last widget when cache is missing (`hovered=false`); tooltip can no-op.
@@ -500,9 +534,17 @@ pub fn textInputId(
     std.debug.assert(ctx.frame_active);
     std.debug.assert(id != 0);
 
-    // A text field is a control, so Tab reaches it alongside the buttons and checkboxes. It keeps
-    // its own handling of the keys it cares about; Tab is not one of them.
-    ctx.registerFocusable(id);
+    const disabled = ctx.isDisabled();
+    if (disabled) {
+        // Same reasoning as `behaviorFromCache`'s disabled path: no Tab entry, and release
+        // whatever this id held from before it became disabled so a stale focus cannot come back
+        // through the press-acquire block below (that block does not itself check `focused`).
+        clearDisabledInteraction(ctx, id);
+    } else {
+        // A text field is a control, so Tab reaches it alongside the buttons and checkboxes. It keeps
+        // its own handling of the keys it cares about; Tab is not one of them.
+        ctx.registerFocusable(id);
+    }
 
     var text_layout = text_edit.buildTextLayout(ctx.allocator(), ctx.font, buffer.slice()) catch
         @panic("textInput: OOM");
@@ -510,31 +552,33 @@ pub fn textInputId(
     clampTextInputState(per_id, text_layout.count());
     var claimed_here = false;
 
-    if (ctx.rect_cache.get(id)) |cached| {
-        // Press focus/caret acquisition is visibility-gated only (same contract as `buttonBehavior`).
-        // Selection drag continues outside clip (active drag capture).
-        const down = ctx.input.mouse_pressed.left and
-            context_mod.pointHitsVisible(cached.rect, cached.clip, ctx.input.mouse_pressed_pos);
-        if (down) {
-            claimed_here = true;
-            const local_x = ctx.input.mouse_pressed_pos.x - cached.rect.x - opts.padding[3] + per_id.scroll_x;
-            per_id.selection.beginDrag(text_edit.hitTest(text_layout, local_x), ctx.input.mouse_pressed_modifiers.shift);
-            per_id.caret = per_id.selection.extent;
-            _ = ctx.claimFocus(id);
-            per_id.caret_blink_start_s = ctx.now();
-        }
+    if (!disabled) {
+        if (ctx.rect_cache.get(id)) |cached| {
+            // Press focus/caret acquisition is visibility-gated only (same contract as `buttonBehavior`).
+            // Selection drag continues outside clip (active drag capture).
+            const down = ctx.input.mouse_pressed.left and
+                context_mod.pointHitsVisible(cached.rect, cached.clip, ctx.input.mouse_pressed_pos);
+            if (down) {
+                claimed_here = true;
+                const local_x = ctx.input.mouse_pressed_pos.x - cached.rect.x - opts.padding[3] + per_id.scroll_x;
+                per_id.selection.beginDrag(text_edit.hitTest(text_layout, local_x), ctx.input.mouse_pressed_modifiers.shift);
+                per_id.caret = per_id.selection.extent;
+                _ = ctx.claimFocus(id);
+                per_id.caret_blink_start_s = ctx.now();
+            }
 
-        if (per_id.selection.dragging and ctx.focusedId() == id and ctx.input.mouse_buttons.left) {
-            const local_x = ctx.input.mouse_pos.x - cached.rect.x - opts.padding[3] + per_id.scroll_x;
-            per_id.selection.updateDrag(text_edit.hitTest(text_layout, local_x));
-            per_id.caret = per_id.selection.extent;
-            per_id.caret_blink_start_s = ctx.now();
-        }
-        if (ctx.input.mouse_released.left and per_id.selection.dragging) {
-            const local_x = ctx.input.mouse_released_pos.x - cached.rect.x - opts.padding[3] + per_id.scroll_x;
-            per_id.selection.updateDrag(text_edit.hitTest(text_layout, local_x));
-            per_id.selection.dragging = false;
-            per_id.caret = per_id.selection.extent;
+            if (per_id.selection.dragging and ctx.focusedId() == id and ctx.input.mouse_buttons.left) {
+                const local_x = ctx.input.mouse_pos.x - cached.rect.x - opts.padding[3] + per_id.scroll_x;
+                per_id.selection.updateDrag(text_edit.hitTest(text_layout, local_x));
+                per_id.caret = per_id.selection.extent;
+                per_id.caret_blink_start_s = ctx.now();
+            }
+            if (ctx.input.mouse_released.left and per_id.selection.dragging) {
+                const local_x = ctx.input.mouse_released_pos.x - cached.rect.x - opts.padding[3] + per_id.scroll_x;
+                per_id.selection.updateDrag(text_edit.hitTest(text_layout, local_x));
+                per_id.selection.dragging = false;
+                per_id.caret = per_id.selection.extent;
+            }
         }
     }
 
@@ -711,11 +755,11 @@ pub fn textInputId(
         .focused = focused,
         .caret_visible = focused and blinkVisible(ctx.now(), per_id.caret_blink_start_s),
         .padding = opts.padding,
-        .background = ctx.style.input_background,
-        .selection_background = ctx.style.selection_background,
-        .caret_color = ctx.style.caret,
-        .text_color = ctx.style.text,
-        .placeholder_color = ctx.style.text_subtle,
+        .background = if (disabled) ctx.style.disabledColor(ctx.style.input_background) else ctx.style.input_background,
+        .selection_background = if (disabled) ctx.style.disabledColor(ctx.style.selection_background) else ctx.style.selection_background,
+        .caret_color = if (disabled) ctx.style.disabledColor(ctx.style.caret) else ctx.style.caret,
+        .text_color = if (disabled) ctx.style.disabledColor(ctx.style.text) else ctx.style.text,
+        .placeholder_color = if (disabled) ctx.style.disabledColor(ctx.style.text_subtle) else ctx.style.text_subtle,
         .preedit = preedit,
         .committed_prefix_w = committed_prefix_w,
         .preedit_w = preedit_w,
@@ -729,7 +773,10 @@ pub fn textInputId(
         .width = .{ .fixed = width },
         .height = .{ .fixed = height },
         .clip_children = true,
-        .border = .{ .color = if (focused) ctx.style.border_hover else ctx.style.border, .thickness = 1 },
+        .border = .{
+            .color = if (disabled) ctx.style.disabledColor(ctx.style.border) else if (focused) ctx.style.border_hover else ctx.style.border,
+            .thickness = 1,
+        },
     });
     ctx.custom(.{ .x = width, .y = height }, TextInputDraw.draw, draw_data);
     ctx.endBox();
@@ -1025,45 +1072,52 @@ fn sliderCore(ctx: *Context, id: Id, label: []const u8, cur: f64, spec: SliderSp
     std.debug.assert(spec.max > spec.min);
     if (spec.step) |s| std.debug.assert(s > 0);
     const style = ctx.style;
+    const disabled = ctx.isDisabled();
     const knob_w = style.slider_knob_w;
     const knob_h = style.slider_knob_h;
 
     // Clamp into range for display/hit-test (exact clamp; safe every frame, no drift).
     var value = std.math.clamp(cur, spec.min, spec.max);
 
-    ctx.registerFocusable(id);
+    if (disabled) {
+        // No Tab entry, no drag, no arrow-key nudge — release whatever this id held from before
+        // it became disabled (same reasoning as `behaviorFromCache`'s disabled path).
+        clearDisabledInteraction(ctx, id);
+    } else {
+        ctx.registerFocusable(id);
 
-    // hit-test / drag (take active from previous-frame track’s knob rect)
-    if (ctx.rect_cache.get(id)) |cached| {
-        const track = cached.rect;
-        const range = knobRange(track, knob_w);
-        const frac = (value - spec.min) / (spec.max - spec.min);
-        const kr = knobRectFor(track, knob_w, knob_h, frac);
-        const res = context_mod.buttonBehavior(ctx, id, kr, cached.clip);
-        if (res.held) {
-            _ = ctx.claimFocus(id);
-            const mx: f64 = @floatFromInt(ctx.input.mouse_pos.x);
-            const t = std.math.clamp((mx - range.lo) / range.span, 0, 1);
-            value = clampAndStep(spec.min + t * (spec.max - spec.min), spec); // Apply step only while dragging
+        // hit-test / drag (take active from previous-frame track’s knob rect)
+        if (ctx.rect_cache.get(id)) |cached| {
+            const track = cached.rect;
+            const range = knobRange(track, knob_w);
+            const frac = (value - spec.min) / (spec.max - spec.min);
+            const kr = knobRectFor(track, knob_w, knob_h, frac);
+            const res = context_mod.buttonBehavior(ctx, id, kr, cached.clip);
+            if (res.held) {
+                _ = ctx.claimFocus(id);
+                const mx: f64 = @floatFromInt(ctx.input.mouse_pos.x);
+                const t = std.math.clamp((mx - range.lo) / range.span, 0, 1);
+                value = clampAndStep(spec.min + t * (spec.max - spec.min), spec); // Apply step only while dragging
+            }
         }
-    }
 
-    // Arrow keys nudge the focused slider by one step, in the reading direction: right and up
-    // raise the value, left and down lower it. Suppressed on the same terms as Space and Enter,
-    // so a drag in progress is never fought over.
-    if (ctx.state.focused_id == id and ctx.popup_state == null and !ctx.pointerEngaged()) {
-        const all = input_mod.mod.all;
-        var delta: f64 = 0;
-        if (ctx.input.pressedPlain(input_mod.key.right, 0, all) or
-            ctx.input.pressedPlain(input_mod.key.up, 0, all)) delta += 1;
-        if (ctx.input.pressedPlain(input_mod.key.left, 0, all) or
-            ctx.input.pressedPlain(input_mod.key.down, 0, all)) delta -= 1;
-        if (delta != 0) value = clampAndStep(value + delta * keyStep(spec), spec);
+        // Arrow keys nudge the focused slider by one step, in the reading direction: right and up
+        // raise the value, left and down lower it. Suppressed on the same terms as Space and Enter,
+        // so a drag in progress is never fought over.
+        if (ctx.state.focused_id == id and ctx.popup_state == null and ctx.popup_stack.len == 0 and !ctx.pointerEngaged()) {
+            const all = input_mod.mod.all;
+            var delta: f64 = 0;
+            if (ctx.input.pressedPlain(input_mod.key.right, 0, all) or
+                ctx.input.pressedPlain(input_mod.key.up, 0, all)) delta += 1;
+            if (ctx.input.pressedPlain(input_mod.key.left, 0, all) or
+                ctx.input.pressedPlain(input_mod.key.down, 0, all)) delta -= 1;
+            if (delta != 0) value = clampAndStep(value + delta * keyStep(spec), spec);
+        }
     }
 
     // Build/draw: [label] [track(id)] [value text]
     ctx.beginBox(.{ .direction = .row, .gap = 6, .align_cross = .center });
-    ctx.label(label);
+    ctx.labelEx(label, if (disabled) style.disabledColor(style.text) else style.text);
 
     const data = ctx.allocator().create(SliderDraw) catch @panic("slider: OOM");
     data.* = .{
@@ -1071,9 +1125,14 @@ fn sliderCore(ctx: *Context, id: Id, label: []const u8, cur: f64, spec: SliderSp
         .knob_w = knob_w,
         .knob_h = knob_h,
         .track_h = style.slider_track_h,
-        .track_bg = style.slider_track_bg,
-        .knob_bg = if (ctx.state.active_id == id) style.slider_knob_active_bg else style.slider_knob_bg,
-        .border = style.border,
+        .track_bg = if (disabled) style.disabledColor(style.slider_track_bg) else style.slider_track_bg,
+        .knob_bg = if (disabled)
+            style.disabledColor(style.slider_knob_bg)
+        else if (ctx.state.active_id == id)
+            style.slider_knob_active_bg
+        else
+            style.slider_knob_bg,
+        .border = if (disabled) style.disabledColor(style.border) else style.border,
     };
     ctx.beginBox(.{
         .id = id,
@@ -1088,7 +1147,7 @@ fn sliderCore(ctx: *Context, id: Id, label: []const u8, cur: f64, spec: SliderSp
         std.fmt.bufPrint(&buf, "{d:.2}", .{value}) catch "?"
     else
         std.fmt.bufPrint(&buf, "{d}", .{@as(i64, @intFromFloat(@round(value)))}) catch "?";
-    ctx.label(txt); // `labelEx` dupes onto the arena, so a stack buf is safe
+    ctx.labelEx(txt, if (disabled) style.disabledColor(style.text) else style.text); // dupes onto the arena, so a stack buf is safe
 
     ctx.endBox();
 
@@ -1356,6 +1415,7 @@ pub fn checkboxId(ctx: *Context, id: Id, label: []const u8, value: *bool) bool {
     const result = behaviorFromCache(ctx, id);
     if (result.clicked) value.* = !value.*;
     const style = ctx.style;
+    const disabled = ctx.isDisabled();
     const size = style.checkbox_size;
     std.debug.assert(size > 0);
     const hot = ctx.state.hot_id == id;
@@ -1365,12 +1425,12 @@ pub fn checkboxId(ctx: *Context, id: Id, label: []const u8, value: *bool) bool {
     data.* = .{
         .size = size,
         .checked = value.*,
-        .border = if (hot) style.border_hover else style.border,
-        .bg = style.slider_track_bg,
-        .fill = style.bg_active,
+        .border = if (disabled) style.disabledColor(style.border) else if (hot) style.border_hover else style.border,
+        .bg = if (disabled) style.disabledColor(style.slider_track_bg) else style.slider_track_bg,
+        .fill = if (disabled) style.disabledColor(style.bg_active) else style.bg_active,
     };
     ctx.custom(.{ .x = size, .y = size }, CheckGlyph.draw, data);
-    ctx.labelEx(label, style.text);
+    ctx.labelEx(label, if (disabled) style.disabledColor(style.text) else style.text);
     ctx.endBox();
     return result.clicked;
 }
@@ -1413,6 +1473,7 @@ pub fn toggleId(ctx: *Context, id: Id, label: []const u8, value: *bool) bool {
     const result = behaviorFromCache(ctx, id);
     if (result.clicked) value.* = !value.*;
     const style = ctx.style;
+    const disabled = ctx.isDisabled();
     const w = style.switch_w;
     const h = style.switch_h;
     std.debug.assert(w > 0 and h > 0 and w >= h); // Keep the knob from going non-positive or past the track
@@ -1422,13 +1483,13 @@ pub fn toggleId(ctx: *Context, id: Id, label: []const u8, value: *bool) bool {
     const data = ctx.allocator().create(ToggleGlyph) catch @panic("toggle: OOM");
     data.* = .{
         .checked = value.*,
-        .border = if (hot) style.border_hover else style.border,
-        .track_off = style.slider_track_bg,
-        .track_on = style.bg_active,
-        .knob = style.slider_knob_bg,
+        .border = if (disabled) style.disabledColor(style.border) else if (hot) style.border_hover else style.border,
+        .track_off = if (disabled) style.disabledColor(style.slider_track_bg) else style.slider_track_bg,
+        .track_on = if (disabled) style.disabledColor(style.bg_active) else style.bg_active,
+        .knob = if (disabled) style.disabledColor(style.slider_knob_bg) else style.slider_knob_bg,
     };
     ctx.custom(.{ .x = w, .y = h }, ToggleGlyph.draw, data);
-    ctx.labelEx(label, style.text);
+    ctx.labelEx(label, if (disabled) style.disabledColor(style.text) else style.text);
     ctx.endBox();
     return result.clicked;
 }
@@ -1470,6 +1531,7 @@ pub fn radio(ctx: *Context, label: []const u8, selected: bool) bool {
 pub fn radioId(ctx: *Context, id: Id, label: []const u8, selected: bool) bool {
     const result = behaviorFromCache(ctx, id);
     const style = ctx.style;
+    const disabled = ctx.isDisabled();
     const size = style.radio_size;
     std.debug.assert(size > 0);
     const hot = ctx.state.hot_id == id;
@@ -1479,12 +1541,12 @@ pub fn radioId(ctx: *Context, id: Id, label: []const u8, selected: bool) bool {
     data.* = .{
         .size = size,
         .selected = selected,
-        .ring = if (hot) style.border_hover else style.border,
-        .bg = style.slider_track_bg,
-        .dot = style.bg_active,
+        .ring = if (disabled) style.disabledColor(style.border) else if (hot) style.border_hover else style.border,
+        .bg = if (disabled) style.disabledColor(style.slider_track_bg) else style.slider_track_bg,
+        .dot = if (disabled) style.disabledColor(style.bg_active) else style.bg_active,
     };
     ctx.custom(.{ .x = size, .y = size }, RadioGlyph.draw, data);
-    ctx.labelEx(label, style.text);
+    ctx.labelEx(label, if (disabled) style.disabledColor(style.text) else style.text);
     ctx.endBox();
     return result.clicked;
 }
@@ -5346,4 +5408,191 @@ test "beginFormRow: omits the description draw command when unset" {
     ctx.endFrame();
 
     try std.testing.expectEqual(@as(usize, 1), countDrawText(ctx.draw_list.cmds.items, "Cache"));
+}
+
+// ── Disabled ──
+
+test "beginDisabled: a button rejects a click and paints disabledColor(bg)" {
+    var ctx = testCtx();
+    defer ctx.deinit();
+
+    ctx.beginFrame(200, 40);
+    ctx.beginDisabled();
+    _ = ctx.button("Save");
+    ctx.endDisabled();
+    ctx.endFrame();
+    const c = center(ctx.getNodeRect(ctx.id_stack.make("Save")).?);
+
+    // Press + release across two frames, same as an ordinary click; disabled rejects it throughout.
+    ctx.beginFrame(200, 40);
+    pressAt(&ctx, c.x, c.y);
+    ctx.beginDisabled();
+    const held_result = ctx.buttonEx("Save", .{});
+    ctx.endDisabled();
+    ctx.endFrame();
+    try std.testing.expect(!held_result.held);
+    try std.testing.expect(!held_result.hovered);
+
+    ctx.beginFrame(200, 40);
+    ctx.pushEvent(.{ .mouse_up = .{ .x = c.x, .y = c.y, .button = 0, .modifiers = 0 } });
+    ctx.beginDisabled();
+    const clicked_result = ctx.buttonEx("Save", .{});
+    ctx.endDisabled();
+    ctx.endFrame();
+    try std.testing.expect(!clicked_result.clicked);
+
+    var pixels: [200 * 40]u32 = undefined;
+    @memset(&pixels, 0xFF000000);
+    const target: geom.RenderTarget = .{ .pixels = &pixels, .width = 200, .height = 40 };
+    render_mod.render(target, &ctx.draw_list, ctx.font, 1.0);
+    const rect = ctx.getNodeRect(ctx.id_stack.make("Save")).?;
+    const expect_bg: u32 = @bitCast(ctx.style.disabledColor(ctx.style.bg));
+    const mid_y: u32 = @intCast(rect.y + @as(i32, @intCast(rect.h / 2)));
+    // Sample just inside the border (border is disabledColor(border), not disabledColor(bg)).
+    try std.testing.expectEqual(expect_bg, pixels[mid_y * 200 + @as(u32, @intCast(rect.x + 2))]);
+}
+
+test "beginDisabled: a checkbox does not flip its value on click" {
+    var ctx = testCtx();
+    defer ctx.deinit();
+    var value = false;
+
+    ctx.beginFrame(200, 40);
+    ctx.beginDisabled();
+    _ = ctx.checkbox("Mute", &value);
+    ctx.endDisabled();
+    ctx.endFrame();
+    const c = center(ctx.getNodeRect(ctx.id_stack.make("Mute")).?);
+
+    ctx.beginFrame(200, 40);
+    ctx.beginDisabled();
+    clickAt(&ctx, c.x, c.y);
+    _ = ctx.checkbox("Mute", &value);
+    ctx.endDisabled();
+    ctx.endFrame();
+
+    try std.testing.expect(!value);
+}
+
+test "beginDisabled: a widget does not join Tab traversal" {
+    var ctx = testCtx();
+    defer ctx.deinit();
+    const a: Id = 0x7C01;
+    const b: Id = 0x7C02;
+
+    // Frame 1: settle rects (a disabled, b enabled).
+    ctx.beginFrame(200, 40);
+    ctx.beginBox(.{ .direction = .row, .gap = 8 });
+    ctx.beginDisabled();
+    _ = ctx.buttonId(a, "A", .{});
+    ctx.endDisabled();
+    _ = ctx.buttonId(b, "B", .{});
+    ctx.endBox();
+    ctx.endFrame();
+
+    // Tab from nothing: with `a` out of the order, the only reachable stop is `b`.
+    ctx.beginFrame(200, 40);
+    ctx.pushEvent(.{ .key_down = .{ .code = input_mod.key.tab, .modifiers = 0, .repeat = false } });
+    ctx.beginBox(.{ .direction = .row, .gap = 8 });
+    ctx.beginDisabled();
+    _ = ctx.buttonId(a, "A", .{});
+    ctx.endDisabled();
+    _ = ctx.buttonId(b, "B", .{});
+    ctx.endBox();
+    ctx.endFrame();
+
+    try std.testing.expectEqual(b, ctx.state.focused_id);
+}
+
+test "beginDisabled: disabling a focused widget clears focus (no ghost focus ring)" {
+    var ctx = testCtx();
+    defer ctx.deinit();
+    const id: Id = 0x7C03;
+
+    ctx.beginFrame(200, 40);
+    _ = ctx.buttonId(id, "Mode", .{});
+    ctx.endFrame();
+    const c = center(ctx.getNodeRect(id).?);
+
+    // Claim the focus with a click (not disabled yet).
+    ctx.beginFrame(200, 40);
+    clickAt(&ctx, c.x, c.y);
+    _ = ctx.buttonId(id, "Mode", .{});
+    ctx.endFrame();
+    try std.testing.expectEqual(id, ctx.state.focused_id);
+
+    // Caller flips the driving bool between frames: the same id is now submitted disabled.
+    ctx.beginFrame(200, 40);
+    ctx.beginDisabled();
+    _ = ctx.buttonId(id, "Mode", .{});
+    ctx.endDisabled();
+    ctx.endFrame();
+    try std.testing.expectEqual(@as(Id, 0), ctx.state.focused_id);
+}
+
+test "beginDisabled: a slider ignores drag and never writes the caller's value" {
+    var ctx = testCtx();
+    defer ctx.deinit();
+    var value: i32 = 0;
+    const opts: SliderI32Opts = .{ .min = 0, .max = 100 };
+
+    ctx.beginFrame(200, 40);
+    ctx.beginDisabled();
+    _ = ctx.sliderI32("Gain", &value, opts);
+    ctx.endDisabled();
+    ctx.endFrame();
+    const track = ctx.getNodeRect(ctx.id_stack.make("Gain")).?;
+
+    // Press at the far right of the track, as if dragging the knob to max.
+    ctx.beginFrame(200, 40);
+    ctx.beginDisabled();
+    pressAt(&ctx, track.x + @as(i32, @intCast(track.w)) - 2, track.y + @as(i32, @intCast(track.h / 2)));
+    const changed = ctx.sliderI32("Gain", &value, opts);
+    ctx.endDisabled();
+    ctx.endFrame();
+
+    try std.testing.expect(!changed);
+    try std.testing.expectEqual(@as(i32, 0), value);
+}
+
+test "beginDisabled: a textInput ignores a click (no focus, no caret)" {
+    var ctx = testCtx();
+    defer ctx.deinit();
+    var buffer = try TextBuffer.init(std.testing.allocator, "");
+    defer buffer.deinit();
+    const id: Id = 0x7C04;
+
+    ctx.beginFrame(200, 40);
+    ctx.beginDisabled();
+    _ = ctx.textInputId(id, &buffer, .{});
+    ctx.endDisabled();
+    ctx.endFrame();
+    const c = center(ctx.getNodeRect(id).?);
+
+    ctx.beginFrame(200, 40);
+    ctx.beginDisabled();
+    pressAt(&ctx, c.x, c.y);
+    const result = ctx.textInputId(id, &buffer, .{});
+    ctx.endDisabled();
+    ctx.endFrame();
+
+    try std.testing.expect(!result.focused);
+    try std.testing.expectEqual(@as(Id, 0), ctx.state.focused_id);
+}
+
+test "Context.beginDisabled/endDisabled: nests, and isDisabled reflects the current depth" {
+    var ctx = testCtx();
+    defer ctx.deinit();
+
+    ctx.beginFrame(200, 40);
+    try std.testing.expect(!ctx.isDisabled());
+    ctx.beginDisabled();
+    try std.testing.expect(ctx.isDisabled());
+    ctx.beginDisabled();
+    try std.testing.expect(ctx.isDisabled());
+    ctx.endDisabled();
+    try std.testing.expect(ctx.isDisabled()); // still nested one level in
+    ctx.endDisabled();
+    try std.testing.expect(!ctx.isDisabled());
+    ctx.endFrame();
 }

@@ -72,6 +72,38 @@ Two smaller helpers round out a settings-style form:
   shape as `beginCollapsible`); replaces hand-stacking `ctx.label` / `ctx.labelEx` next to a
   control with no declared relationship between them.
 
+**Disabling a widget:** `ctx.beginDisabled()` / `ctx.endDisabled()` open a nestable scope
+(not a per-call option, since checkbox/toggle/radio/`textInputId` take no options struct
+today). Every ordinary widget built inside — button, checkbox, toggle, radio, slider,
+`textInputId`, and (interaction-only, undecorated) colorSwatch/iconButton/beginCollapsible/tabId
+— rejects pointer and keyboard input, leaves the Tab order, and releases any focus/hover/press
+it held from before it became disabled. `ctx.isDisabled()` answers whether a widget built right
+now is inside such a scope. This is unrelated to `PopupItem.enabled` / `Command.enabled` below,
+which are per-item flags on a popup or menu row, not a scope over ordinary widgets.
+
+## Popups and menus (`src/popup.zig`, `src/menu.zig`)
+
+`ctx.openPopup(id, pos)` / `ctx.closePopup()` / `ctx.popupMenu(id, items)` are the classic
+mechanism: exactly one popup open at a time, closing on an item click or an outside click (call
+`popupMenu` after `ctx.endFrame()`, not inside the frame — see the doc comment at the top of
+`popup.zig`). A `PopupItem` can be `.checked = true` to draw a check mark before its label; pass
+`ctx.popupMenuEx(id, items, .{ .keep_open_on_select = true })` instead of `popupMenu` for a
+persistent, checkbox-backed multi-select popup that stays open when an item is chosen (the
+caller flips the item's own `checked` field and rebuilds the list; the popup does not close
+itself).
+
+A second, independent side channel — `ctx.openPopupStacked` / `ctx.closePopupStacked` /
+`ctx.popupMenuStacked` / `ctx.isPopupOpenStacked` — lets a handful of popups (up to
+`gui.max_stacked_popups`) stay open **at once**, alongside the classic slot: a menu-bar dropdown
+and a right-click context menu, say. `ctx.openPopupCount()` / `ctx.isPopupOpenAny(id)` /
+`ctx.popupPos(id)` read across both mechanisms. Each open popup dismisses on an outside click
+independently, judged against its own rect alone — a click that lands inside a *different* open
+popup still counts as "outside" for this one and closes it, the same rule a single open popup
+already followed.
+
+`gui.menuBar` / `gui.menuBarPopup` (a top menu row built from `Command` definitions) use the
+classic slot under the hood and are unaffected by any of the above.
+
 ## Layout engine limits
 
 - No wrap

@@ -63,16 +63,16 @@ const MatrixRow = struct {
 };
 
 const BASIC_MATRIX = [_]MatrixRow{
-    .{ .name = "button", .cells = .{ "ok", "demo", "demo", "N/A", "N/A", "ok", "N/A", "N/A", "N/A" } },
+    .{ .name = "button", .cells = .{ "ok", "demo", "demo", "N/A", "demo", "ok", "N/A", "N/A", "N/A" } },
     .{ .name = "label", .cells = .{ "ok", "N/A", "N/A", "N/A", "N/A", "ok", "N/A", "N/A", "N/A" } },
 };
 const TEXT_MATRIX = [_]MatrixRow{
     .{ .name = "selectable", .cells = .{ "ok", "N/A", "drag", "ok", "N/A", "ok", "N/A", "N/A", "ok" } },
-    .{ .name = "textInputId", .cells = .{ "ok", "demo", "demo", "ok", "N/A", "ok", "N/A", "N/A", "ok" } },
+    .{ .name = "textInputId", .cells = .{ "ok", "demo", "demo", "ok", "demo", "ok", "N/A", "N/A", "ok" } },
 };
 const VALUES_MATRIX = [_]MatrixRow{
-    .{ .name = "slider", .cells = .{ "ok", "demo", "demo", "N/A", "N/A", "N/A", "ok", "ok", "N/A" } },
-    .{ .name = "checkbox", .cells = .{ "ok", "demo", "demo", "N/A", "N/A", "ok", "N/A", "N/A", "N/A" } },
+    .{ .name = "slider", .cells = .{ "ok", "demo", "demo", "N/A", "demo", "N/A", "ok", "ok", "N/A" } },
+    .{ .name = "checkbox", .cells = .{ "ok", "demo", "demo", "N/A", "demo", "ok", "N/A", "N/A", "N/A" } },
     .{ .name = "toggle", .cells = .{ "ok", "demo", "demo", "N/A", "N/A", "ok", "N/A", "N/A", "N/A" } },
     .{ .name = "radio", .cells = .{ "ok", "demo", "demo", "N/A", "N/A", "ok", "N/A", "N/A", "ok" } },
 };
@@ -137,6 +137,7 @@ const Ids = struct {
     const popup_trigger: gui.Id = 0x3550;
     const popup: gui.Id = 0x3551;
     const grid: gui.Id = 0x3560;
+    const disabled_toggle: gui.Id = 0x3570;
 };
 
 const image_pixels = [_]u32{
@@ -209,6 +210,9 @@ const App = struct {
     checked: bool = true,
     toggled: bool = false,
     radio_brush: bool = false,
+    /// Drives the "Disabled" toggle repeated across basic/text/values: wraps one representative
+    /// control per section in ctx.beginDisabled()/endDisabled() (button / textInputId / slider+checkbox).
+    disabled_demo: bool = false,
     hue: f32 = 210,
     saturation: f32 = 0.65,
     value: f32 = 0.8,
@@ -302,7 +306,7 @@ fn toGuiEvent(ev: platform.Event) ?gui.InputEvent {
 fn galleryDigest(ctx_ptr: *anyopaque, buf: []u8) []const u8 {
     const app: *App = @ptrCast(@alignCast(ctx_ptr));
     const meta = SECTIONS[app.section];
-    return std.fmt.bufPrint(buf, "section={s} index={d} widgets={d} missing={d} schema={s} hot={s} active={s} focused={s}", .{
+    return std.fmt.bufPrint(buf, "section={s} index={d} widgets={d} missing={d} schema={s} hot={s} active={s} focused={s} disabled={d}", .{
         meta.name,
         app.section,
         meta.widgets,
@@ -311,6 +315,7 @@ fn galleryDigest(ctx_ptr: *anyopaque, buf: []u8) []const u8 {
         app.widgetName(app.ctx.state.hot_id),
         app.widgetName(app.ctx.state.active_id),
         app.widgetName(app.ctx.state.focused_id),
+        @as(u32, if (app.disabled_demo) 1 else 0),
     }) catch buf[0..0];
 }
 
@@ -378,13 +383,19 @@ fn renderOverview(ctx: *gui.Context) void {
 fn renderBasic(ctx: *gui.Context, app: *App) void {
     if (ctx.buttonId(Ids.primary_button, "Primary button", .{ .min_w = 160 }).clicked) app.clicks += 1;
     ctx.label("Label: normal text / empty text is documented as ✓");
+    _ = ctx.checkboxId(Ids.disabled_toggle, "Disabled", &app.disabled_demo);
+    if (app.disabled_demo) ctx.beginDisabled();
     if (ctx.buttonId(Ids.secondary_button, "Secondary", .{ .min_w = 160 }).clicked) app.clicks += 1;
+    if (app.disabled_demo) ctx.endDisabled();
     var buf: [32]u8 = undefined;
     ctx.labelEx(std.fmt.bufPrint(&buf, "clicked={d}", .{app.clicks}) catch "clicked=?", ctx.style.text_subtle);
 }
 
 fn renderText(ctx: *gui.Context, app: *App) void {
+    _ = ctx.checkboxId(Ids.disabled_toggle, "Disabled", &app.disabled_demo);
+    if (app.disabled_demo) ctx.beginDisabled();
     const input = ctx.textInputId(Ids.text_input, app.text, .{ .width = .{ .fixed = 320 }, .placeholder = "empty", .paste_text = app.paste_text });
+    if (app.disabled_demo) ctx.endDisabled();
     const selectable = ctx.selectableLabelId(Ids.selectable, "Selectable label (drag)", .{});
     // Cmd+C/X to the real clipboard (consumer wiring; same shape as example_28)
     if (input.copy_request) |r| platform.setClipboardText(r.text);
@@ -392,11 +403,16 @@ fn renderText(ctx: *gui.Context, app: *App) void {
 }
 
 fn renderValues(ctx: *gui.Context, app: *App) void {
+    _ = ctx.checkboxId(Ids.disabled_toggle, "Disabled (slider i32 + checkbox below)", &app.disabled_demo);
+    if (app.disabled_demo) ctx.beginDisabled();
     ctx.beginBox(.{ .direction = .row, .gap = 12 });
     _ = ctx.sliderI32Id(Ids.slider_i32, "i32", &app.slider_i32, .{ .min = -10, .max = 10, .step = 1, .track_w = 180 });
+    if (app.disabled_demo) ctx.endDisabled();
     _ = ctx.sliderF32Id(Ids.slider_f32, "f32", &app.slider_f32, .{ .min = 0, .max = 1, .step = 0.05, .track_w = 180 });
     ctx.endBox();
+    if (app.disabled_demo) ctx.beginDisabled();
     _ = ctx.checkboxId(Ids.checkbox, "Checkbox", &app.checked);
+    if (app.disabled_demo) ctx.endDisabled();
     _ = ctx.toggleId(Ids.toggle, "Toggle", &app.toggled);
     ctx.beginBox(.{ .direction = .row, .gap = 12 });
     if (ctx.radioId(Ids.radio_pen, "Pen", !app.radio_brush)) app.radio_brush = false;

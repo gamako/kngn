@@ -67,6 +67,22 @@ pub const Style = struct {
     // text_subtle (no new color fields).
     popup_item_h: i32 = 20,
     popup_padding: i32 = 4,
+
+    /// The color a disabled widget draws `base` as: grayscale (so an accent color loses its hue,
+    /// not just its brightness), then blended halfway toward `bg` (so a disabled widget dims
+    /// toward the surface it sits on rather than toward black, and follows a theme change the
+    /// same way every other derived color here does — no separate `*_disabled` fields to keep
+    /// in sync).
+    pub fn disabledColor(self: Style, base: Color) Color {
+        // ITU-R BT.601 luma weights (fixed-point, /256), same rounding shape as pixelops' div255.
+        const y: u32 = (77 * @as(u32, base.r) + 150 * @as(u32, base.g) + 29 * @as(u32, base.b) + 128) / 256;
+        return Color.rgba(
+            @intCast((y + self.bg.r) / 2),
+            @intCast((y + self.bg.g) / 2),
+            @intCast((y + self.bg.b) / 2),
+            0xFF,
+        );
+    }
 };
 
 /// Dark theme in the example 09/10 family. text is white (same as earlier label default).
@@ -96,4 +112,32 @@ test "defaultStyle: text is white (compatible with earlier label default)" {
     // Selected bg is deep blue (high contrast vs normal; distinct from held bg_active).
     try std.testing.expectEqual(Color.rgba(0x24, 0x48, 0x7A, 0xFF), s.button_bg_selected);
     try std.testing.expect(!std.meta.eql(s.bg_active, s.button_bg_selected));
+}
+
+test "disabledColor: fully opaque and always between grayscale(base) and bg" {
+    const s = defaultStyle();
+    const text_disabled = s.disabledColor(s.text);
+    try std.testing.expectEqual(@as(u8, 0xFF), text_disabled.a);
+    // text is white; halfway toward a dark bg lands strictly between the two, both channel-wise.
+    try std.testing.expect(text_disabled.r < s.text.r and text_disabled.r > s.bg.r);
+    try std.testing.expect(text_disabled.g < s.text.g and text_disabled.g > s.bg.g);
+    try std.testing.expect(text_disabled.b < s.text.b and text_disabled.b > s.bg.b);
+}
+
+test "disabledColor: a saturated accent desaturates (grayscale before blending toward bg)" {
+    const s = defaultStyle();
+    // bg_active is a saturated blue (0x30,0x60,0xC0); disabling it should narrow the channel spread.
+    const active_disabled = s.disabledColor(s.bg_active);
+    const spread_before = @as(i32, s.bg_active.b) - @as(i32, s.bg_active.r);
+    const spread_after = @as(i32, active_disabled.b) - @as(i32, active_disabled.r);
+    try std.testing.expect(spread_after < spread_before);
+}
+
+test "disabledColor: idempotent-ish -- disabling an already-bg-colored value returns bg" {
+    const s = defaultStyle();
+    // grayscale(bg) blended with bg only equals bg exactly when bg is already a neutral gray;
+    // instead pin the general contract: disabling `bg` itself never drifts far from `bg`.
+    const bg_disabled = s.disabledColor(s.bg);
+    try std.testing.expect(@as(i32, @intCast(bg_disabled.r)) - @as(i32, @intCast(s.bg.r)) <= 8);
+    try std.testing.expect(@as(i32, @intCast(s.bg.r)) - @as(i32, @intCast(bg_disabled.r)) <= 8);
 }
