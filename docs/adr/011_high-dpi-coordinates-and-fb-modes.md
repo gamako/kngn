@@ -1,6 +1,6 @@
 # ADR-011: The high-DPI (retina) coordinate model and framebuffer modes
 
-**Status:** Accepted (R1–R10 stand; the staged implementation has landed — see Implementation status)
+**Status:** Accepted (R1–R11 stand; the staged implementation of R1–R10 has landed — see Implementation status)
 **Date:** 2026-07-20
 **Category:** platform / gui / gfx, coordinate systems, the drawing pipeline
 
@@ -268,6 +268,36 @@ within the **increment** of the framebuffer double buffer relative to `.logical`
 temporary allocation. Exceeding the ceiling is the input for deciding between
 optimisation and cutting scope.
 
+### R11. Fullscreen and the framebuffer modes
+
+The framebuffer mode is orthogonal to whether a window is fullscreen: **both modes
+combine with fullscreen**, and the window creation contract that carries the mode into
+a fullscreen window is [019](019_window-creation-unification.md). (The other window
+options are not all orthogonal to fullscreen — which combinations are refused is 019
+R4.)
+
+One rule matters for R2's separation of logical size from framebuffer size. A backend
+that resolves the fullscreen size itself resolves it **in physical pixels** (X11's
+display dimensions, Win32's monitor metrics), so with `.physical` the conversion runs
+the other way round from the ordinary case:
+
+- the framebuffer size **is** the resolved screen size, used verbatim and never
+  recomputed from the logical size (the rounding does not round-trip);
+- the logical size is **derived** by dividing by the content scale, with the same
+  round-to-nearest and clamp-to-at-least-1 rule the `logical × scale` helper uses;
+- the derivation is repeated identically after a resize notification, so the logical
+  size does not change between the first frame and the first configure.
+
+With `.logical`, a fullscreen window keeps the screen size as both its logical and its
+framebuffer size, which is what it did before the modes existed.
+
+The performance consequence is real: a fullscreen `.physical` framebuffer is roughly
+14.7 Mpx on a 5K display, well above any window measured in
+`docs/performance-measurement.md`, where clearing every pixel already accounts for
+about half of a `.physical` 2x frame. R10's ceiling applies to it unchanged, and 019
+records that the combination becomes usable only with a fixed framebuffer size that
+presentation scales up.
+
 ## Staged plan
 
 The stages below were the original delivery order. **The contract surface of every stage
@@ -346,3 +376,6 @@ Factual (not a decision change). Verified against the tree as of this revision:
   unchanged.
 - 2026-07-27 Line-number citations removed (symbols / contracts only); R4 thickness
   bug note moved to past tense to match the landed implementation.
+- 2026-08-01 R11 added: fullscreen is orthogonal to the framebuffer mode, and with
+  `.physical` a self-resolved fullscreen size is physical, so the logical size is the
+  derived value. R1–R10 unchanged.
