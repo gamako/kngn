@@ -18,6 +18,15 @@ variables unset it passes through completely.
 Specifying `HOST` and `CONNECT` together disables netsync. A failure to listen or
 connect is fail-soft (the application continues without netsync).
 
+**Starting the client first is allowed.** A client whose connect is refused retries with an
+exponential backoff (100/200/400/800/1600 ms), bounded both by that ladder and by a 10 s
+wall-clock backstop for attempts that block rather than return, so the two processes can be
+launched by hand in either order. Once either bound is reached it is the same fail-soft as any
+other connect failure. On Windows the retry is entered on a coarser signal than elsewhere,
+because the standard library reports a refused connection as `error.Unexpected` there;
+`connectFailureIsRetryable` in `core/control/netsync.zig` records why that is the safe direction
+to be imprecise in, and the backstop is what keeps the imprecision from being expensive.
+
 **Relationship with the copilot transport**: during a netsync session, the copilot
 transport's operate commands (`action`, `begin_tx`, `end_tx`, `cancel_tx`) are
 rejected (observe — digest and snapshot — is still allowed). An agent's operations go

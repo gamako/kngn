@@ -1703,6 +1703,39 @@ pub fn initClient(addr: net.IpAddress) void {
     initClientAs(addr, client_actor_kind, client_label_buf[0..client_label_len]);
 }
 
+/// A backstop on how long a client may spend retrying, because the attempt count alone does not
+/// bound it: the connect below is made with no timeout of its own, so a single attempt against a
+/// host that silently drops the SYN blocks on the operating system's own connect timeout (tens of
+/// seconds), and multiplying that by the number of attempts would turn a misconfigured address into
+/// minutes of start-up delay. The budget is chosen shorter than one such blocking attempt, so that
+/// case gets exactly one. When attempts return promptly - the loopback start-up race this retry
+/// exists for - the backoff ladder is the binding limit instead and the budget never fires. An
+/// attempt that is merely slow rather than blocked spends the ladder early, which is the intent:
+/// the wait a user is asked to sit through is what is being bounded, not the number of tries.
+const CONNECT_RETRY_BUDGET_MS: i64 = 10_000;
+
+/// Whether a failed connect is worth retrying because the peer may simply not be listening yet.
+/// Runs while a connection is being established only, never on a frame or real-time path.
+///
+/// The classification is deliberately coarse in one direction on Windows. The standard library's
+/// Windows connect path names only SUCCESS, CANCELLED and INSUFFICIENT_RESOURCES and maps every
+/// other NTSTATUS - STATUS_CONNECTION_REFUSED among them - to `error.Unexpected`, and the status is
+/// not recoverable from the error value by any published API. So on Windows a refusal is
+/// indistinguishable from a permanent failure, and the choice is which way to be wrong: treating
+/// `error.Unexpected` as retryable spends the bounded budget above on a permanent failure, whereas
+/// excluding it leaves the start-up race unrecoverable. Both end in the same fail-soft, so the cost
+/// of the first is a bounded delay and the cost of the second is a feature that does not work.
+fn connectFailureIsRetryable(err: anyerror) bool {
+    return switch (err) {
+        // The peer is not listening yet, or its backlog has not answered.
+        error.ConnectionRefused, error.Timeout => true,
+        error.Unexpected => builtin.os.tag == .windows,
+        // A permanent error such as AddressUnavailable, HostUnreachable or AccessDenied: waiting
+        // would not fix it, so the user is not made to wait out the budget.
+        else => false,
+    };
+}
+
 pub fn initClientAs(addr: net.IpAddress, kind: ActorKind, label: []const u8) void {
     ensureIo();
     peers_mutex.lockUncancelable(io_val);
@@ -1726,22 +1759,18 @@ pub fn initClientAs(addr: net.IpAddress, kind: ActorKind, label: []const u8) voi
     // would trip the host's label limit and disconnect with a protocol error, so it is clamped at the API boundary).
     const label_clamped = client_label_buf[0..client_label_len];
 
-    // Retry a ConnectionRefused before the host is listening, briefly and with exponential backoff
+    // Retry a connection the host is not yet listening for, briefly and with exponential backoff
     // (absorbing the "wait a few seconds" of starting two windows by hand; at init only, never on a real-time or frame path).
-    // At most 6 attempts, waiting 100/200/400/800/1600 ms (about 3.1s in total). Past that it is the same fail-soft as before.
-    // The decision: ConnectionRefused and Timeout are typical of a start-up race, so they are retried.
-    // A permanent error such as AddressUnavailable, HostUnreachable or AccessDenied fails soft at once
-    // (waiting would not fix it, so the user is not made to wait out the limit).
+    // At most 6 attempts, waiting 100/200/400/800/1600 ms, and never past CONNECT_RETRY_BUDGET_MS.
+    // Once either limit is reached the outcome is the same fail-soft as an unretryable error.
     const backoff_ms = [_]u64{ 100, 200, 400, 800, 1600 };
+    const started_at = Io.Clock.awake.now(io_val);
     const stream = blk: {
         var attempt: usize = 0;
         while (true) {
             if (addr.connect(io_val, .{ .mode = .stream })) |s| break :blk s else |err| {
-                const retryable = switch (err) {
-                    error.ConnectionRefused, error.Timeout => true,
-                    else => false,
-                };
-                if (!retryable or attempt >= backoff_ms.len) {
+                const elapsed_ms = started_at.durationTo(Io.Clock.awake.now(io_val)).toMilliseconds();
+                if (!connectFailureIsRetryable(err) or attempt >= backoff_ms.len or elapsed_ms >= CONNECT_RETRY_BUDGET_MS) {
                     std.debug.print("[netsync] client connection failed: {s} (start-up continues with netsync disabled)\n", .{@errorName(err)});
                     return; // fail-soft
                 }
@@ -4076,14 +4105,40 @@ test "netsync: reusing a slot after one client disconnects" {
     try testing.expectEqualStrings("second", getPeer(0, &label_buf).?.label);
 }
 
-test "netsync: after a shutdown the connection is refused" {
+// What the connect fails with is platform-specific, so the assertion splits. Everywhere but
+// Windows it is the exact `error.ConnectionRefused`. On Windows the standard library reports every
+// connect NTSTATUS it does not name as `error.Unexpected` (see `connectFailureIsRetryable`), so
+// there the test asserts the weaker but still load-bearing property: the failure is one the client's
+// start-up retry treats as retryable. What Windows therefore does not verify is that the failure is
+// specifically a refusal rather than some other connect failure.
+test "netsync: after a shutdown the connection is no longer accepted" {
     resetForTest();
     initHost(0);
     const port = listeningPort().?;
     shutdown();
     ensureIo();
     const addr = net.IpAddress{ .ip4 = net.Ip4Address.loopback(port) };
-    try testing.expectError(error.ConnectionRefused, addr.connect(io_val, .{ .mode = .stream }));
+    if (builtin.os.tag == .windows) {
+        if (addr.connect(io_val, .{ .mode = .stream })) |s| {
+            s.close(io_val);
+            return error.TestExpectedConnectToFail;
+        } else |err| {
+            try testing.expect(connectFailureIsRetryable(err));
+        }
+    } else {
+        try testing.expectError(error.ConnectionRefused, addr.connect(io_val, .{ .mode = .stream }));
+    }
+}
+
+test "netsync: which connect failures the client retries" {
+    try testing.expect(connectFailureIsRetryable(error.ConnectionRefused));
+    try testing.expect(connectFailureIsRetryable(error.Timeout));
+    try testing.expect(!connectFailureIsRetryable(error.AccessDenied));
+    try testing.expect(!connectFailureIsRetryable(error.HostUnreachable));
+    try testing.expect(!connectFailureIsRetryable(error.AddressUnavailable));
+    // Windows cannot report a refusal any more precisely than error.Unexpected, so that error is
+    // retried there and only there.
+    try testing.expectEqual(builtin.os.tag == .windows, connectFailureIsRetryable(error.Unexpected));
 }
 
 test "netsync: a fail-soft when the host is not running" {
@@ -4099,7 +4154,7 @@ test "netsync: a fail-soft when the host is not running" {
 
 // Init the client first, then have the host listen a few hundred ms later; the retry still connects.
 // One process takes only one of the host and client roles, so a delayed dumb host thread does the listening.
-test "netsync: a client retries ConnectionRefused and connects to a delayed host" {
+test "netsync: a client retries a refused connection and connects to a delayed host" {
     resetForTest();
     defer resetForTest();
     ensureIo();
