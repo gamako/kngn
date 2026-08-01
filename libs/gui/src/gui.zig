@@ -21,6 +21,12 @@ pub const Color = @import("color.zig").Color;
 pub const DrawCmd = @import("draw.zig").DrawCmd;
 pub const DrawList = @import("draw.zig").DrawList;
 
+/// A `DrawList`'s observability pair for the harness `drawlist` custom probe (see
+/// docs/harness.md): `drawlistDigest` folds it to one stable-hash-plus-counts line,
+/// `drawlistDumpAlloc` renders the full one-line-per-command structure dump.
+pub const drawlistDigest = @import("drawlist_probe.zig").digest;
+pub const drawlistDumpAlloc = @import("drawlist_probe.zig").dumpAlloc;
+
 pub const Font = @import("font.zig").Font;
 pub const Metrics = @import("font.zig").Metrics;
 pub const BitmapFont = @import("font.zig").BitmapFont;

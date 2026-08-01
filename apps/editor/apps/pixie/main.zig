@@ -3523,6 +3523,16 @@ fn canvasSnapshot(ctx: *anyopaque, allocator: std.mem.Allocator) anyerror![]u8 {
     return core.encodePNG(app.canvas.compositeStraight(), app.doc.width, app.doc.height, allocator);
 }
 
+/// drawlist digest/snapshot: the current frame's DrawList (see libs/gui/src/drawlist_probe.zig).
+fn drawlistDigest(ctx: *anyopaque, buf: []u8) []const u8 {
+    const app: *App = @ptrCast(@alignCast(ctx));
+    return gui.drawlistDigest(&app.ctx.draw_list, buf);
+}
+fn drawlistSnapshot(ctx: *anyopaque, allocator: std.mem.Allocator) anyerror![]u8 {
+    const app: *App = @ptrCast(@alignCast(ctx));
+    return gui.drawlistDumpAlloc(allocator, &app.ctx.draw_list);
+}
+
 /// undo digest/snapshot: undo/redo stack depths (one JSON line). undo reduces depth.
 fn undoDigest(ctx: *anyopaque, buf: []u8) []const u8 {
     const app: *App = @ptrCast(@alignCast(ctx));
@@ -6848,6 +6858,7 @@ fn appInit(gpa: std.mem.Allocator, io: std.Io) !*App {
     platform.setNetsyncPostApplyHook(self, App.netsyncPostApplyHook);
 
     platform.registerProbe(.{ .name = "canvas", .ctx = self, .ext = "png", .snapshot = canvasSnapshot, .digest = canvasDigest });
+    platform.registerProbe(.{ .name = "drawlist", .ctx = self, .ext = "txt", .snapshot = drawlistSnapshot, .digest = drawlistDigest, .desc = "DrawList structure: per-kind counts + stable hash + offclip count (raw dump via snapshot)" });
     platform.registerProbe(.{ .name = "undo", .ctx = self, .ext = "json", .snapshot = undoSnapshot, .digest = undoDigest });
     platform.registerProbe(.{ .name = "tool", .ctx = self, .ext = "txt", .snapshot = toolSnapshot, .digest = toolDigest });
     platform.registerProbe(.{ .name = "cursor", .ctx = self, .ext = "txt", .snapshot = cursorSnapshot, .digest = cursorDigest });

@@ -154,7 +154,8 @@ built-in. Currently:
   `bbox=none from=none to=none`), `palette`
   (`colors=N used=M top=[#RRGGBB:NN%,...]` — the palette size, the number of unique
   colours in the composite, and the top four), plus `timeline`, `panels`, `menu`,
-  `appshell` and `presence`. Twelve in total.
+  `appshell`, `presence` and `drawlist` (the structure of the current frame's
+  `DrawList` — see "DrawList observability" below). Thirteen in total.
   - `appshell` payload:
     `dirty=0|1 path=... confirm=none|close|new|open recent=N recent0=... recovery=pending|none modal=recovery|confirmation|size|none autosave=0|1 netsync=0|1 title=... geom=WxH pos=...`.
     `modal=` is the top-level modal kind (priority: recovery → confirmation → size → none).
@@ -165,6 +166,40 @@ built-in. Currently:
 
 **The framework does not interpret the contents of a custom probe** (it only routes
 raw bytes and a one-line digest).
+
+### DrawList observability (`drawlist`)
+
+`digest drawlist` and `snapshot drawlist` expose the GUI's current-frame `DrawList`
+(`libs/gui/src/drawlist_probe.zig`) as text, so an assertion can check what a widget
+tree meant to draw without decoding a framebuffer PNG. This is the machine-checkable
+counterpart to eyeballing a `snapshot fb` PNG: a truncated panel (see the layered
+under-cut example this probe was built to catch) shows up as `offclip=1` on that
+command's line, not just as a pixel difference a human has to spot.
+
+- `snapshot drawlist [path]` (ext `txt`) writes the full structure dump: a `cmds=<N>`
+  header line, then one line per command in draw order, `cmd=<kind> k=v ...`. `rect_filled`
+  / `rect_outline` / `image` carry their rect and clip; `line` carries both endpoints;
+  `text` carries its position and its full string content, double-quoted and escaped
+  (`\"`, `\\`, `\n`, `\r`, `\t`, `\u{XXXX}` for other control bytes) so the line stays
+  single-line even when the text itself has a literal newline. `image` never embeds
+  pixels — only `src_w`/`src_h` and a content hash (`pixfnv=#XXXXXXXX`, FNV-1a 32-bit
+  over the raw pixel bytes). Every line ends with `offclip=0|1`: whether that command's
+  own extent (its rect for `rect_filled`/`rect_outline`/`image`, both endpoints for
+  `line`, the draw position for `text`) is fully contained by its own baked-in clip
+  rect. `offclip=1` is the same signal a truncated shape or a mis-placed label would
+  leave in a screenshot, just readable without one.
+- `digest drawlist` folds the same fields into one line:
+  `hash=#XXXXXXXX rect_filled=N rect_outline=N line=N text=N image=N offclip=N`. `hash`
+  is an FNV-1a 32-bit fold over every command's fields in draw order (including `text`
+  content and, for `image`, the pixel bytes), so it changes whenever anything the dump
+  would show changes; the five counts and `offclip` are the coarser, more stable half.
+- **Handling jitter**: an app with animated or continuously-varying draw positions
+  (a running clock label, a live cursor trail) makes `hash` change every frame by
+  design — do not `expect drawlist hash=...` there. The per-kind counts and `offclip`
+  do not fold in position, so they stay flat across such motion and are the field to
+  assert on (`expect drawlist offclip=0`, or a specific `text=N`). For a scene with
+  genuinely static content (a fixed dialog, a paused canvas) asserting the full `hash`
+  is fine and catches anything the counts alone would miss (e.g. a shifted rect).
 
 ### Where a digest goes
 
@@ -512,7 +547,7 @@ Rules and limits:
   value 64B, pattern 100B, desc 200B). **On violation it warns and drops `args`
   entirely to null** (the same fail-safe shape as blanking `desc`; registration still
   succeeds). The framework does not interpret the meaning of `kind`.
-- Worked examples: the editor's `canvas`, `undo` and `tool`
+- Worked examples: the editor's `canvas`, `undo`, `tool` and `drawlist`
   (`apps/editor/apps/pixie/main.zig`), and the synth's `voices` and `patch`
   (`apps/synth/main.zig`).
 
