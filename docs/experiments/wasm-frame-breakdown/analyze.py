@@ -209,6 +209,16 @@ def compare(groups: dict[str, list[dict]], a: str, b: str) -> None:
     if a not in groups or b not in groups:
         sys.exit(f"unknown condition: {a if a not in groups else b}")
     print(f"\n### {a}  vs  {b}")
+    # Which build each side came from. Pooling two builds inside one condition is already
+    # refused; across two conditions it is legitimate (that is how a compiler flag is
+    # compared), but it changes what the difference means, so it is stated rather than
+    # assumed either way.
+    # Compared in full; shown abbreviated.
+    sa = {r["wasm_sha256"] for r in groups[a]}
+    sb = {r["wasm_sha256"] for r in groups[b]}
+    same = "same build" if sa == sb else "DIFFERENT BUILDS"
+    short = lambda s: ",".join(sorted(x[:12] for x in s))
+    print(f"    build A {short(sa)}  build B {short(sb)}  ({same})")
     print(f"    {'section':<18} {'A us':>9} {'B us':>9} {'A-B us':>9}   95% CI of A-B")
     rows = [("rAF callback", ["raf_callback_ms", "mean"])] + \
            [(s, ["sections_ms", s]) for s in SECTIONS]

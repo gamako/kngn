@@ -39,7 +39,8 @@
     //          | "stale" (skip the copy, still upload) | "touch" (write a few bytes, upload)
     //          | "none" (skip both; the canvas stops updating — observer effect, see README)
     const PRESENT = str("present", "real");
-    // swizzle: "real" | "memcpy" | "noop"  (selected at runtime inside the wasm backend)
+    // swizzle: "real" | "memcpy" | "noop" | "u32" | "vecptr" | "deref"
+    //          (selected at runtime inside the wasm backend; see the README's table)
     const SWIZZLE = str("swizzle", "real");
     const LABEL = str("label", "");
     // Echoed back in the report so the runner matches a report to the run that
@@ -163,8 +164,29 @@
       const calib = readBlock();
       const nowCostMs = (calib[SECTIONS.length + 3] * 1000) / CALIBRATE;
 
-      const SWIZZLE_MODE = { real: 0, memcpy: 1, noop: 2, u32: 3, vecptr: 4 };
-      if (SWIZZLE !== "real") exp.kngn_prof_set_swizzle_mode(SWIZZLE_MODE[SWIZZLE] ?? 0);
+      const SWIZZLE_MODE = { real: 0, memcpy: 1, noop: 2, u32: 3, vecptr: 4, deref: 5 };
+      // A misspelt mode must not be measured as `real`: silently falling back would make one
+      // condition a duplicate of another and the comparison between them meaningless.
+      // hasOwn, not `in`: `constructor` and friends are not modes.
+      if (!Object.hasOwn(SWIZZLE_MODE, SWIZZLE)) {
+        report({ error: `unknown swizzle mode "${SWIZZLE}"; known: ${Object.keys(SWIZZLE_MODE).join(", ")}`,
+                 label: LABEL, token: TOKEN });
+        return;
+      }
+      if (SWIZZLE !== "real") exp.kngn_prof_set_swizzle_mode(SWIZZLE_MODE[SWIZZLE]);
+      // The staging writes being compared must agree on their output, or the cheaper one is
+      // cheaper for the wrong reason. A patch that cannot answer this is not measured: an
+      // absent export would otherwise read exactly like a passing check.
+      if (!exp.kngn_prof_equivalence_failed) {
+        report({ error: "kngn_prof_equivalence_failed is missing from the measurement patch",
+                 label: LABEL, token: TOKEN });
+        return;
+      }
+      if (exp.kngn_prof_equivalence_failed()) {
+        report({ error: "the staging-write candidates disagree on their output",
+                 label: LABEL, token: TOKEN });
+        return;
+      }
 
       // Warm up, then zero everything so the measured window is steady state only.
       await waitFrames(WARMUP);

@@ -243,6 +243,39 @@ each value is a per-frame mean, in µs. Instrument overhead was 2.0 µs/frame (1
 and the clock resolution 5 µs, so sections in the single digits are aggregate estimates
 rather than measurements.
 
+| section | 780x600 | 2560x1440 | 2560x1440 share |
+|---|---:|---:|---:|
+| events | 5.7 | 6.4 | 0.2% |
+| ui_build | 396.4 | 294.3 | 10.7% |
+| post_ui | 3.7 | 3.6 | 0.1% |
+| fb_clear | 41.0 | 244.5 | 8.9% |
+| canvas_composite | 142.5 | 145.1 | 5.3% |
+| canvas_blit | 101.5 | 95.6 | 3.5% |
+| overlays | 1.3 | 1.3 | 0.0% |
+| gui_render | 162.4 | 263.7 | 9.6% |
+| **swizzle** | **131.0** | **742.0** | **27.0%** |
+| **js present** | **155.8** | **922.0** | **33.6%** |
+| post_present | 0.2 | 0.3 | 0.0% |
+| residual | 19.7 | 28.1 | 1.0% |
+| **whole frame** | **1164.8** | **2743.1** | |
+
+The sections account for 99% of the callback at both sizes.
+
+Where the marks sit, because the split between two of them is a choice rather than a fact:
+`canvas_composite` closes after the composite (including the onion-skin build) and
+`canvas_blit` closes after the zoom blit and the minimap, so moving that boundary moves
+work between the two while their sum stays put.
+
+**The host-side present is the largest item and the swizzle is second**: together 61% of a
+2560x1440 frame. Everything the application draws — the UI tree, the clear, the canvas work,
+the GUI rasterisation — is the remaining 38%.
+
+#### Four sizes, measured while the swizzle was scalarised
+
+Kept because the size sweep below rests on it, and because its `swizzle` column is what the
+wrong load form cost. It predates the fix, so **its `swizzle` and whole-frame columns are not
+the current numbers**; the table above is.
+
 | section | 320x240 | 780x600 | 1600x900 | 2560x1440 |
 |---|---:|---:|---:|---:|
 | events | 5.1 | 5.1 | 4.9 | 6.1 |
@@ -259,26 +292,30 @@ rather than measurements.
 | residual | 17.6 | 17.4 | 20.7 | 26.5 |
 | **whole frame** | **817.5** | **1603.2** | **2361.7** | **4644.8** |
 
-The sections account for 98–99% of the callback at every size.
-
-**The BGRA→RGBA swizzle is the frame.** It is 58% of a 2560x1440 frame, and together with
-the host-side present the two of them are 77%. Everything the application actually draws —
-the UI tree, the clear, the canvas blit, the GUI rasterisation — is the remaining 23%.
+The two measurements line up where they should. At 2560x1440 this table's whole frame
+(4644.8) and swizzle (2677.4) are within 1% of the scalarised condition measured in the
+current build (4675.4 and 2675.6, the `deref` row below), which is the check that the two
+runs measured the same thing. Their `canvas_composite` and `canvas_blit` differ — 0.3/235.5
+against 145.1/95.6 — because the boundary between those two marks sits at a different point.
+The pair is comparable as a sum (235.8 against 240.7 µs, a 2% spread) rather than row by row.
 
 Splitting the host side (the `split` condition reimplements it so the two halves can be
 timed apart; `analyze.py` checks that its total still matches the untouched path):
 
-| size | copy into the ImageData | upload | total |
-|---|---:|---:|---:|
-| 320x240 | 11.2 | 25.0 | 36.1 |
-| 780x600 | 49.2 | 77.9 | 127.1 |
-| 1600x900 | 117.0 | 203.0 | 320.0 |
-| 2560x1440 | 406.0 | 493.9 | 899.9 |
+| size | copy into the ImageData | upload | total | drift against the untouched path |
+|---|---:|---:|---:|---:|
+| 780x600 | 67.3 | 77.3 | 144.6 | 0.9% |
+| 2560x1440 | 448.6 | 475.0 | 923.6 | 1.2% |
 
 Skipping the copy while still uploading (a stale `ImageData`) saves rather more than the
-copy's own 406 µs, because it also changes the cache state the upload then reads; writing
+copy's own cost, because it also changes the cache state the upload then reads; writing
 a few bytes instead of copying gives the same figure, which rules out a "contents
 unchanged" shortcut in the browser.
+
+The copy is not independent of what runs before it. Measured against the scalarised swizzle
+it was 406 µs at 2560x1440, against 449 µs here — the copy got *dearer* once the swizzle
+stopped taking so long over the same bytes. Sections in this path trade with each other
+through the cache, so each one is only a number in the company of the others.
 
 ### There is no fixed cost worth the name
 
@@ -297,35 +334,11 @@ at 2560x1440, and two of them are the whole story: `ui_build` (291) and `canvas_
 at 2560x1440, where it is the largest non-present section. Why building the UI tree costs
 *more* in a small window is not explained by these measurements.
 
-### Why `simd128` does not show up in the frame time
+### On wasm, how the bytes are loaded decides whether SIMD happens
 
-Enabling `simd128` moves the whole frame by about 1%, and the reason is not that the
-feature is inert. Comparing two builds that differ only in that feature, at 2560x1440
-(the ratio column is *without* ÷ *with*, so above 1 means `simd128` helped):
-
-| section | with simd128 | without | ratio |
-|---|---:|---:|---:|
-| whole frame | 4669.1 | 4681.5 | 1.00 |
-| swizzle | 2697.9 | 2690.5 | 1.00 |
-| gui_render | 254.6 | 268.0 | 1.05 |
-| ui_build | 290.4 | 290.7 | 1.00 |
-| canvas_blit | 236.6 | 236.9 | 1.00 |
-| js present | 908.9 | 906.3 | 1.00 |
-
-The swizzle costs the same in both builds — and the disassembly below shows why: it
-contains no SIMD instruction in either, so there was nothing for the feature to change.
-`gui_render` does gain 5%, but it is 5.5% of the frame, so the gain is 0.3% of the frame —
-smaller than the spread between runs of one condition. That is the whole answer: the one
-section large enough to matter is the one that is not being vectorised.
-
-That the feature works is shown by the same comparison against a swizzle written in a
-form the backend does vectorise: 758.7 µs with `simd128` against 2610.1 µs without, a
-factor of 3.4, and 1.65x on the whole frame.
-
-It is not vectorised because of how the bytes are loaded, not because of the shuffle.
-Disassembling the shipped module, the swizzle loop is 16 `i32.load8_u` and 16 `i32.store8`
-per 16-byte block — no `v128.load`, no `i8x16.shuffle`. Compiling the same loop standalone
-for `wasm32` with `simd128` isolates the trigger:
+A `@Vector(16, u8)` in the source is not SIMD in the binary. The same
+`@shuffle`, over the same bytes, is either one `i8x16.shuffle` or 16 scalar byte loads and
+stores depending on **how the 16 bytes are moved in and out**:
 
 | formulation | codegen |
 |---|---|
@@ -342,21 +355,31 @@ across every case measured is: **on wasm, move the 16 bytes through a `@Vector(1
 pointer, not through `slice[i..][0..16].*`; a byte-permuting `@shuffle` is scalarised in
 the second form.**
 
-The size of the prize, measured in the running application at 2560x1440 by switching the
-present path's staging write at runtime (one build, 5 runs each):
+What it is worth, measured in the running application by switching the present path's
+staging write at runtime (**one build**, 5 runs of 400 frames each, condition order
+shuffled). `deref` is the array-deref form and `real` is what ships:
 
-| what the present writes | swizzle section | whole frame |
-|---|---:|---:|
-| the shipped swizzle | 2697.9 | 4669.1 |
-| same shuffle through a vector pointer | 758.7 | 2784.9 |
-| the swap over u32 lanes | 762.1 | 2789.1 |
-| `@memcpy` of the same bytes | 409.1 | 2421.7 |
-| nothing | 0.2 | 1902.1 |
+| what the present writes | swizzle, 780x600 | frame, 780x600 | swizzle, 2560x1440 | frame, 2560x1440 |
+|---|---:|---:|---:|---:|
+| `deref` (the scalarised form) | 485.0 | 1488.4 | 2675.6 | 4675.4 |
+| **`real` (shipped)** | **131.0** | **1164.8** | **742.0** | **2743.1** |
+| the swap over u32 lanes | — | — | 762.1 | 2789.1 |
+| `@memcpy` of the same bytes | 50.4 | 1174.1 | 408.7 | 2416.0 |
+| nothing written | 0.3 | 1120.5 | 0.3 | 1918.8 |
 
-Every row here is a section median observed in this harness, not a clean isolated cost:
-changing what the present writes also changes the cache state the host-side present reads
-next, and the last two rows change it most. Even so the ranking is unambiguous — a
-vectorised channel swap lands within a factor of two of a plain copy of the same bytes,
-while the scalarised one costs about six times that copy. Fixing the load form is worth
-**1.9 ms per frame, a 1.7x whole-frame speedup** at this size, without changing the
-algorithm.
+At 2560x1440 the load form is worth **1.93 ms per frame — a 1.70x whole frame** — and 3.6x
+on the section itself; at 780x600, 0.32 ms and 1.28x. The bootstrap interval on each of
+those differences excludes zero.
+
+Two cautions about reading the rows below `real`. They are section medians in this harness,
+not isolated costs: changing what the present writes also changes the cache state the host
+side then reads, and `js present` measurably moves the other way (+31 µs at 2560x1440 when
+the swizzle gets faster). And a vectorised channel swap lands within a factor of two of a
+plain copy of the same bytes, while the scalarised one cost about six times that copy —
+which is why the load form, not the algorithm, was the thing to fix.
+
+`simd128` and this are the same subject. Enabling the feature moved the whole frame by about
+1% while the swizzle was written in the array-deref form, because the one section large
+enough to matter contained no SIMD instruction for the feature to affect (`gui_render`, which
+does gain about 5%, is a tenth of the frame). Do not read a flag as a speedup: read the
+disassembly of the loop you care about.

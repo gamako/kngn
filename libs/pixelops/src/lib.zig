@@ -432,6 +432,12 @@ pub fn swizzleBgraToRgbaScalar(dst: []u8, src: []const u8) void {
 }
 
 /// SIMD version (4px=@Vector(16,u8) byte shuffle + scalar tail). SIMD=scalar bit-identity pinned by tests.
+///
+/// The 16 bytes move through a `@Vector(16, u8)` pointer, and that is part of the contract
+/// rather than a matter of style: written as `src[i..][0..16].*`, the byte-permuting
+/// `@shuffle` below is emitted on wasm as 16 scalar byte loads and stores instead of
+/// `v128.load` + `i8x16.shuffle` + `v128.store` — measured in both the `ReleaseSmall` and
+/// `ReleaseFast` wasm builds. Alignment is not what decides it, so `align(1)` is enough here.
 pub fn swizzleBgraToRgba(dst: []u8, src: []const u8) void {
     std.debug.assert(dst.len == src.len);
     std.debug.assert(dst.len % 4 == 0);
@@ -442,11 +448,12 @@ pub fn swizzleBgraToRgba(dst: []u8, src: []const u8) void {
         10, 9,  8,  11,
         14, 13, 12, 15,
     };
+    const V = @Vector(16, u8);
     var i: usize = 0;
     const simd_end = src.len - (src.len % 16);
     while (i < simd_end) : (i += 16) {
-        const in: @Vector(16, u8) = src[i..][0..16].*;
-        dst[i..][0..16].* = @shuffle(u8, in, undefined, perm);
+        const in: V = @as(*align(1) const V, @ptrCast(src.ptr + i)).*;
+        @as(*align(1) V, @ptrCast(dst.ptr + i)).* = @shuffle(u8, in, undefined, perm);
     }
     // scalar tail (0..3 px)
     while (i < src.len) : (i += 4) {

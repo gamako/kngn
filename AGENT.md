@@ -519,6 +519,7 @@ zig build test-gui-leak         # measuring state leaks in PerIdStateStore (100 
 # Microbenchmarks (before-and-after for a performance change; fixed to ReleaseFast, no display or audio device, OS independent)
 zig build bench-canvas          # Canvas.composite and compositeStraight: ns/frame and Mpx/s
 zig build bench-fill            # u32 fill strategies: @memset vs a @Vector store loop vs a replicated block (ns and GB/s)
+zig build bench-swizzle         # BGRA->RGBA swizzle: the load forms (vector pointer / array deref / u32 lanes) vs scalar and a plain copy
 zig build bench-synth           # Synth(16 voices).render and MasterEffects.process: ns/block and × realtime
 zig build bench-gui-frame       # a full gui Context frame (beginFrame → build → endFrame → render; 500/1000 rows, avg/min/p95)
 

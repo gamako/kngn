@@ -2493,6 +2493,18 @@ pub fn build(b: *std.Build) void {
     const bench_fill_step = b.step("bench-fill", "Run u32 fill (framebuffer clear / rect fill) micro-benchmark (ReleaseFast)");
     bench_fill_step.dependOn(&b.addRunArtifact(bench_fill_exe).step);
 
+    // bench-swizzle: compare the ways the BGRA→RGBA swizzle can move its 16 bytes
+    // (a vector pointer, an array deref, u32 lanes) against a scalar reference and a plain copy.
+    const bench_swizzle_root = b.createModule(.{
+        .root_source_file = b.path("bench/swizzle.zig"),
+        .target = target,
+        .optimize = .ReleaseFast,
+    });
+    bench_swizzle_root.addImport("pixelops", bench_pixelops_mod);
+    const bench_swizzle_exe = b.addExecutable(.{ .name = "bench_swizzle", .root_module = bench_swizzle_root });
+    const bench_swizzle_step = b.step("bench-swizzle", "Run BGRA->RGBA swizzle micro-benchmark (ReleaseFast)");
+    bench_swizzle_step.dependOn(&b.addRunArtifact(bench_swizzle_exe).step);
+
     // bench-sprite: measure drawSprite / drawSpriteEx plain/flip/2x/tint.
     // No display/audio. Before/after comparisons stay on ReleaseFast.
     const bench_sprite_mod = b.createModule(.{

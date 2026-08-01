@@ -73,7 +73,8 @@ It must export:
 | `kngn_prof_reset()` | zero the block and the mark counter |
 | `kngn_prof_marks() -> f64` | marks recorded so far, so marks-per-frame can be checked |
 | `kngn_prof_calibrate(n) -> f64` | call the host clock `n` times; write the total seconds into the `now cost` slot and return the smallest non-zero delta seen (the effective clock resolution) |
-| `kngn_prof_set_swizzle_mode(u32)` | select the staging write: 0 real, 1 `@memcpy`, 2 nothing, plus any extra formulation under test |
+| `kngn_prof_set_swizzle_mode(u32)` | select the staging write: 0 real, 1 `@memcpy`, 2 nothing, plus any extra formulation under test (the mode numbers are the table under "Conditions") |
+| `kngn_prof_equivalence_failed() -> u32` | non-zero if the staging writes being compared do not produce the same bytes. `bench.html` refuses to report without this export, because a cheaper formulation that computes something else is not a cheaper formulation |
 
 The block is `sections + 4` `f64` slots: one accumulated seconds per section in the order
 `bench.html` lists in `SECTIONS`, then frame count, framebuffer width, framebuffer height,
@@ -117,13 +118,23 @@ Useful flags: `--sizes`, `--present`, `--swizzle`, `--repeats`, `--frames`,
 | `touch` | write a few bytes instead of copying, still upload | guards `stale` against a "contents unchanged" optimisation |
 | `none` | skip both | **observer effect**: the canvas stops updating, so paint and composite disappear too. A lower bound on synchronous cost, not a measurement of the present |
 
-`swizzle` selects what the backend writes into the staging buffer:
+`swizzle` selects what the backend writes into the staging buffer. The first three are the
+baseline and the two cost floors below it; the last three are formulations of the swizzle
+itself, kept selectable so that "which way of writing this is fastest on this target" stays a
+measurement:
 
 | Value | Read it as |
 |---|---|
-| `real` | the baseline |
+| `real` | the shipped implementation: the baseline |
 | `memcpy` | same bytes written, no channel shuffle. `real − memcpy` is the shuffle |
 | `noop` | nothing written. `memcpy − noop` estimates writing a frame's worth of bytes — an estimate, because cache state and what the host reads next both change too |
+| `vecptr` | the byte `@shuffle` with the 16 bytes moved through a `*align(1) @Vector(16, u8)`. This is what the shipped one does, so it is a duplicate of `real` unless that changes |
+| `u32` | the same swap expressed over `@Vector(4, u32)` lanes: equivalent output, different instruction mix |
+| `deref` | the byte `@shuffle` with the 16 bytes moved through `slice[i..][0..16].*`. **wasm scalarises this form** — 16 byte loads and stores per block — so it is the cost of getting the load form wrong |
+
+A mode this page does not know is an error, not a fall back to `real`: a misspelt
+`--swizzle` would otherwise become a silent duplicate of the baseline and the comparison
+between them would read as "no difference".
 
 ## Things that quietly invalidate a run
 
