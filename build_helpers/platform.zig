@@ -47,6 +47,23 @@ pub fn audioSupported(os: std.Target.Os.Tag) bool {
     return os == .macos or os == .linux or os == .windows;
 }
 
+/// The `single_threaded` every wasm module in the build graph compiles with — the app root,
+/// `platform`, `app_runtime`, `harness`, and the published modules alike, whether or not the
+/// target carries the wasm atomics feature for a shared-memory (`worklet_shared`) audio
+/// transport (see `docs/adr/018_wasm-audio-transport-build-time-selection.md`).
+///
+/// `single_threaded` is a Zig-language setting (it governs `std.heap.wasm_allocator` —
+/// `@compileError` when false — plus `std.Thread` availability and related codegen), which
+/// is a different axis from the target's wasm atomics feature (a codegen concern: whether
+/// `@atomicRmw` and friends lower to real wasm atomic instructions). A shared-memory synth
+/// target selects atomics so its AudioWorklet second `WebAssembly.Instance` can synchronise
+/// with the main thread through plain atomic reads and writes — no code in this backend
+/// spawns a `std.Thread`, so nothing here calls for `single_threaded=false`, and
+/// `core/platform_wasm.zig` uses `std.heap.wasm_allocator` unconditionally, which requires
+/// `single_threaded=true` to compile at all. One value serves every wasm module in the build,
+/// wasm-shared or not.
+pub const wasm_single_threaded = true;
+
 /// The build settings a `core/platform.zig` module needs, whichever path creates it.
 ///
 /// Two paths do create one — `createPlatformModule` below for executables inside this
@@ -55,16 +72,11 @@ pub fn audioSupported(os: std.Target.Os.Tag) bool {
 /// whether their imports go through the layer check of ADR-007. What must *not* differ is
 /// the shape of the module itself, so it is decided here and nowhere else.
 ///
-/// `wasm_shared` says whether the wasm target runs with shared memory, and it is a parameter
-/// because the two paths decide it from different things: `createPlatformModule` reads the
-/// target's atomics feature, while the published module takes the value its caller supplies.
-///
 /// Runs at build-graph configuration time only (not per-frame / RT).
 pub fn platformModuleOptions(
     target: std.Build.ResolvedTarget,
     platform_source: std.Build.LazyPath,
     backend: PlatformType,
-    wasm_shared: bool,
 ) std.Build.Module.CreateOptions {
     const is_wasm = backend == .wasm;
     return .{
@@ -76,7 +88,7 @@ pub fn platformModuleOptions(
         // Wasm reaches the host through wasi preview1 plus a hand-written JS shim. Linking
         // libc there pulls in crt1, whose `_start` export the browser glue cannot satisfy.
         .link_libc = !is_wasm,
-        .single_threaded = if (is_wasm) !wasm_shared else null,
+        .single_threaded = if (is_wasm) wasm_single_threaded else null,
     };
 }
 
@@ -178,15 +190,7 @@ pub fn createPlatformModule(
     /// The harness synthetic gamepad path always runs regardless of this value.
     features: PlatformFeatures,
 ) *std.Build.Module {
-    const mod = b.createModule(platformModuleOptions(
-        target,
-        platform_source,
-        backend,
-        // Shared wasm memory is read off the target here: an app that wants it selects a
-        // target carrying the atomics feature. The published module's caller decides it
-        // differently, which is why the two agree on the mapping and not on this value.
-        backend == .wasm and target.result.cpu.has(.wasm, .atomics),
-    ));
+    const mod = b.createModule(platformModuleOptions(target, platform_source, backend));
     configurePlatformModule(b, mod, platform_include_root, backend);
     // platform.zig + backends `@import("platform_types")`; the facade `@import("harness")`.
     mod.addImport("platform_types", types_mod);

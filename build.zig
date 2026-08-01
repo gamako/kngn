@@ -113,14 +113,15 @@ fn makeInternalWasmLinker(b: *std.Build) platform.WasmLinker {
                 std.debug.panic("internal wasm linker: app module has no resolved target", .{});
             };
 
-            // wasm_shared=false → single_threaded on platform modules (wasm_allocator).
-            // Atomics for shared-memory apps come from the target feature set, not multi-threaded Zig.
+            // Every wasm module (platform / app_runtime / harness alike, shared-memory synth
+            // included) compiles with `platform.wasm_single_threaded` — see that constant's
+            // doc comment for why a shared-memory, atomics-carrying target still uses it.
             const wasm_max_opts = bb.addOptions();
             wasm_max_opts.addOption(usize, "max_modules", @as(usize, 48));
             wasm_max_opts.addOption(bool, "has_frame_cap", false);
             wasm_max_opts.addOption(u32, "frame_cap_hz", @as(u32, 0));
-            const shared = SharedModules.init(bb, true, false, false, 48, wasm_max_opts.createModule(), target, .wasm);
-            const pm = makePlatformModules(bb, target, .wasm, &shared, false);
+            const shared = SharedModules.init(bb, true, false, 48, wasm_max_opts.createModule(), target, .wasm);
+            const pm = makePlatformModules(bb, target, .wasm, &shared);
 
             if (std.mem.eql(u8, link_ctx.spec.name, "pixie")) {
                 const root = TaggedModule{ .mod = link_ctx.app_module, .layer = .app, .name = "pixie" };
@@ -175,7 +176,7 @@ fn makeWasmAppSpecs(b: *std.Build, base_target: std.Build.ResolvedTarget, with_s
             .app_source = b.path("apps/editor/apps/pixie/main.zig"),
             .wasm_root_source = b.path("apps/editor/apps/pixie/wasm_root.zig"),
             .wasm_root_import_name = "pixie",
-            .single_threaded = true,
+            .single_threaded = platform.wasm_single_threaded,
             .audio = .none,
             .html_source = b.path("web/index.html"),
             .html_install_path = "web/index.html",
@@ -187,9 +188,10 @@ fn makeWasmAppSpecs(b: *std.Build, base_target: std.Build.ResolvedTarget, with_s
             .app_source = b.path("apps/synth/main.zig"),
             .wasm_root_source = b.path("apps/synth/wasm_root.zig"),
             .wasm_root_import_name = "synth_app",
-            // single_threaded=true: zig 0.16 wasm_allocator has no multi-thread path;
-            // +atomics on the target still emits i32.atomic.* for the JS dual-Instance setup.
-            .single_threaded = true,
+            // See `platform.wasm_single_threaded`'s doc comment: shared memory and wasm
+            // atomics are a target/linker concern (this app's `.shared_memory`/`.import_memory`
+            // below), independent of this Zig-language setting.
+            .single_threaded = platform.wasm_single_threaded,
             .audio = .worklet_shared,
             .shared_memory = true,
             .import_memory = true,
@@ -214,7 +216,7 @@ fn makeWasmAppSpecs(b: *std.Build, base_target: std.Build.ResolvedTarget, with_s
             .app_source = b.path("apps/synth/main.zig"),
             .wasm_root_source = b.path("apps/synth/wasm_root.zig"),
             .wasm_root_import_name = "synth_app",
-            .single_threaded = true,
+            .single_threaded = platform.wasm_single_threaded,
             .audio = .worklet_postmessage,
             .shared_memory = false,
             .import_memory = false,
@@ -422,7 +424,6 @@ pub fn build(b: *std.Build) void {
             b,
             true,
             false,
-            false,
             48,
             wasm_pub_opts.createModule(),
             target,
@@ -438,14 +439,14 @@ pub fn build(b: *std.Build) void {
         const app_runtime_wasm: TaggedModule = .{ .layer = .core, .name = "app_runtime", .mod = b.createModule(.{
             .root_source_file = b.path("core/app_runtime.zig"),
             .target = target,
-            .single_threaded = true,
+            .single_threaded = platform.wasm_single_threaded,
         }) };
         link(app_runtime_wasm, wasm_pub_shared.platform);
         app_runtime_wasm.mod.addImport("build_options", wasm_pub_shared.max_modules_mod);
         const kit_wasm: TaggedModule = .{ .layer = .kit, .name = "kit", .mod = b.addModule("kit", .{
             .root_source_file = b.path("kit/kit.zig"),
             .target = target,
-            .single_threaded = true,
+            .single_threaded = platform.wasm_single_threaded,
         }) };
         wireKitImports(kit_wasm, wasm_pub_shared.platform, &wasm_pub_shared, app_runtime_wasm);
         // BGRA→RGBA SIMD swizzle (same exception as makePlatformModules for wasm).
@@ -526,7 +527,7 @@ pub fn build(b: *std.Build) void {
     // Shared modules (OS/backend-independent; shared by main + examples + pixie + synth)
     // Also includes the external public modules (platform/png/font/gui).
     // ========================================
-    const shared_modules = SharedModules.init(b, false, false, enable_gamepad_ext, max_modules_option, max_modules_mod, target, platform_option);
+    const shared_modules = SharedModules.init(b, false, enable_gamepad_ext, max_modules_option, max_modules_mod, target, platform_option);
 
     // External public kit umbrella. Reuses SharedModules instances so type identity holds.
     // Obtained via dep.module("kit"). platform / gui / gamepad etc. are the same module instances through kit.
@@ -562,7 +563,7 @@ pub fn build(b: *std.Build) void {
 
     for (backends) |be| {
         const is_default = (be == platform_option);
-        const pm = makePlatformModules(b, target, be, &shared_modules, false);
+        const pm = makePlatformModules(b, target, be, &shared_modules);
 
         // ----- Main application -----
         const main_exe = addMainExe(b, target, optimize, platform_root, sdk_paths, be, artifactName(b, APP_NAME, be, default_be), &pm);
@@ -1724,7 +1725,7 @@ pub fn build(b: *std.Build) void {
     });
     blit_test_mod.addImport("paint", blit_core);
     // blit.zig uses kit.pixelops (same instance as shared_modules.pixelops).
-    const blit_pm = makePlatformModules(b, target, default_be, &shared_modules, false);
+    const blit_pm = makePlatformModules(b, target, default_be, &shared_modules);
     blit_test_mod.addImport("kit", blit_pm.kit.mod);
     const blit_test = b.addTest(.{ .root_module = blit_test_mod });
     const run_blit_test = b.addRunArtifact(blit_test);
@@ -1826,7 +1827,7 @@ pub fn build(b: *std.Build) void {
     const run_diff_test = b.addRunArtifact(diff_test);
 
     // history summary schema. Wires default-backend kit because it uses kit.platform.command types.
-    const history_summary_pm = makePlatformModules(b, target, default_be, &shared_modules, false);
+    const history_summary_pm = makePlatformModules(b, target, default_be, &shared_modules);
     const history_summary_mod = b.createModule(.{
         .root_source_file = b.path("apps/editor/apps/pixie/history_summary.zig"),
         .target = target,
@@ -2719,7 +2720,7 @@ pub fn build(b: *std.Build) void {
     });
     bench_blit_mod.addImport("paint", bench_blit_core);
     // blit.zig uses kit.pixelops (same path as the app). Kit is wired via makePlatformModules.
-    const bench_blit_pm = makePlatformModules(b, target, default_be, &shared_modules, false);
+    const bench_blit_pm = makePlatformModules(b, target, default_be, &shared_modules);
     bench_blit_mod.addImport("kit", bench_blit_pm.kit.mod);
     const bench_blit_root = b.createModule(.{
         .root_source_file = b.path("bench/blit.zig"),
@@ -2843,7 +2844,7 @@ fn wireKitImports(kit: TaggedModule, platform_mod: TaggedModule, common: *const 
     link(kit, app_runtime);
 }
 
-fn makePlatformModules(b: *std.Build, target: std.Build.ResolvedTarget, backend: platform.PlatformType, common: *const SharedModules, wasm_shared: bool) PlatformModules {
+fn makePlatformModules(b: *std.Build, target: std.Build.ResolvedTarget, backend: platform.PlatformType, common: *const SharedModules) PlatformModules {
     // opt-in-off edition (default). main/synth/modular/patch/most examples use this.
     const platform_mod: TaggedModule = .{ .layer = .core, .name = "platform", .mod = platform.createPlatformModule(
         b,
@@ -2892,7 +2893,7 @@ fn makePlatformModules(b: *std.Build, target: std.Build.ResolvedTarget, backend:
     const app_runtime: TaggedModule = .{ .layer = .core, .name = "app_runtime", .mod = b.createModule(.{
         .root_source_file = b.path("core/app_runtime.zig"),
         .target = target,
-        .single_threaded = if (backend == .wasm) !wasm_shared else null,
+        .single_threaded = if (backend == .wasm) platform.wasm_single_threaded else null,
     }) };
     link(app_runtime, platform_mod);
     app_runtime.mod.addImport("build_options", common.max_modules_mod);
@@ -2900,7 +2901,7 @@ fn makePlatformModules(b: *std.Build, target: std.Build.ResolvedTarget, backend:
     const app_runtime_gamepad: TaggedModule = .{ .layer = .core, .name = "app_runtime", .mod = b.createModule(.{
         .root_source_file = b.path("core/app_runtime.zig"),
         .target = target,
-        .single_threaded = if (backend == .wasm) !wasm_shared else null,
+        .single_threaded = if (backend == .wasm) platform.wasm_single_threaded else null,
     }) };
     link(app_runtime_gamepad, platform_gamepad_mod);
     app_runtime_gamepad.mod.addImport("build_options", common.max_modules_mod);
@@ -2908,7 +2909,7 @@ fn makePlatformModules(b: *std.Build, target: std.Build.ResolvedTarget, backend:
     const app_runtime_menu: TaggedModule = .{ .layer = .core, .name = "app_runtime", .mod = b.createModule(.{
         .root_source_file = b.path("core/app_runtime.zig"),
         .target = target,
-        .single_threaded = if (backend == .wasm) !wasm_shared else null,
+        .single_threaded = if (backend == .wasm) platform.wasm_single_threaded else null,
     }) };
     link(app_runtime_menu, platform_menu_mod);
     app_runtime_menu.mod.addImport("build_options", common.max_modules_mod);
@@ -3022,7 +3023,6 @@ const SharedModules = struct {
     /// Shared build_options Module (max_modules). createModule once; all consumers addImport.
     max_modules_mod: *std.Build.Module,
 
-    /// `wasm_shared`: for AudioWorklet. single_threaded=false so atomics are enabled.
     /// `enable_gamepad`: build_options for the external public platform module (default false).
     /// `max_modules` / `max_modules_mod`: concurrent modular module limit (default 48).
     /// The wasm path passes enable_gamepad=false and max_modules=48.
@@ -3030,7 +3030,7 @@ const SharedModules = struct {
     /// `platform_backend`: value of `-Dplatform` (or the OS default). Stamped into
     /// `build_options.platform_backend` and used to attach `@cImport`-required system libs
     /// (X11/Wayland). Must match the backend the consumer executable links against.
-    fn init(b: *std.Build, is_wasm: bool, wasm_shared: bool, enable_gamepad: bool, max_modules: usize, max_modules_mod: *std.Build.Module, target: std.Build.ResolvedTarget, platform_backend: platform.PlatformType) SharedModules {
+    fn init(b: *std.Build, is_wasm: bool, enable_gamepad: bool, max_modules: usize, max_modules_mod: *std.Build.Module, target: std.Build.ResolvedTarget, platform_backend: platform.PlatformType) SharedModules {
         // External public module. Available via dep.module("platform") and via kit.
         //
         // Its shape — libc, the platform.h include path, the backend's @cImport system libs
@@ -3046,7 +3046,6 @@ const SharedModules = struct {
             target,
             b.path("core/platform.zig"),
             platform_backend,
-            wasm_shared,
         );
         const platform_mod: TaggedModule = .{ .layer = .core, .name = "platform", .mod = if (is_wasm)
             b.createModule(platform_options)
@@ -3219,8 +3218,7 @@ const SharedModules = struct {
             .mod = b.createModule(.{
                 .root_source_file = b.path(if (is_wasm) "core/control/harness_wasm.zig" else "core/control/harness.zig"),
                 .link_libc = !is_wasm,
-                // wasm non-shared (pixie): single_threaded. shared audio (synth): multi (atomics).
-                .single_threaded = if (is_wasm) !wasm_shared else null,
+                .single_threaded = if (is_wasm) platform.wasm_single_threaded else null,
             }),
         };
         // The command adapter re-exports the command module held by harness from the facade.
