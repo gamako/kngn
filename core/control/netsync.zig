@@ -45,8 +45,31 @@ pub const FrameKind = enum(u8) {
     peer_info = 0x08,
     /// Ephemeral presence. Consumes neither a COMMIT nor a seq.
     presence = 0x09,
+    /// Undo-group bookkeeping. Carries no document change of its own: the members are ordinary COMMIT and
+    /// COMMIT_REVERT frames, and this only says which of them form one undo unit.
+    group = 0x0A,
     _,
 };
+
+/// The `GROUP` subtypes. BEGIN and END travel client→host and bracket the proposals that form one unit;
+/// DECLARE travels host→clients and names the seqs the host actually assigned to them.
+pub const GroupSubtype = enum(u8) {
+    begin = 0x01,
+    end = 0x02,
+    declare = 0x03,
+
+    pub fn fromByte(b: u8) ?GroupSubtype {
+        return switch (b) {
+            0x01 => .begin,
+            0x02 => .end,
+            0x03 => .declare,
+            else => null,
+        };
+    }
+};
+
+/// The member limit of one undo group, shared with the command log's own bound.
+pub const MAX_GROUP_MEMBERS: usize = command.MAX_UNDO_GROUP;
 
 /// The fixed PRESENCE payload length (origin_peer + subtype + reserved + ttl + 4×i32).
 pub const PRESENCE_PAYLOAD_LEN: usize = 24;
@@ -152,7 +175,7 @@ pub fn maxPayloadForKind(kind: u8) usize {
 }
 
 pub fn isKnownKind(kind: u8) bool {
-    return kind >= 0x01 and kind <= 0x09;
+    return kind >= 0x01 and kind <= 0x0A;
 }
 
 /// Encodes the 24B PRESENCE payload (little-endian). reserved is always 0.
@@ -394,6 +417,60 @@ pub fn parseCommitRevertPayload(payload: []const u8) ProtocolError!struct { seq:
         .seq = std.mem.readInt(u64, payload[0..8], .little),
         .target_seq = std.mem.readInt(u64, payload[8..16], .little),
     };
+}
+
+/// GROUP BEGIN / END: the subtype byte alone.
+pub fn formatGroupMarkPayload(buf: []u8, subtype: GroupSubtype) ![]const u8 {
+    if (buf.len < 1) return error.PayloadTooLarge;
+    buf[0] = @intFromEnum(subtype);
+    return buf[0..1];
+}
+
+/// GROUP DECLARE: `u8 subtype ++ u16 count ++ u64[count] seq`.
+pub fn formatGroupDeclarePayload(buf: []u8, seqs: []const u64) ![]const u8 {
+    if (seqs.len == 0 or seqs.len > MAX_GROUP_MEMBERS) return error.PayloadTooLarge;
+    const need = 3 + seqs.len * 8;
+    if (buf.len < need) return error.PayloadTooLarge;
+    buf[0] = @intFromEnum(GroupSubtype.declare);
+    std.mem.writeInt(u16, buf[1..3], @intCast(seqs.len), .little);
+    for (seqs, 0..) |s, i| {
+        const off = 3 + i * 8;
+        std.mem.writeInt(u64, buf[off..][0..8], s, .little);
+    }
+    return buf[0..need];
+}
+
+pub const GroupFrame = union(enum) {
+    begin,
+    end,
+    /// A slice into the caller's payload; valid only as long as that payload is.
+    declare: []const u8,
+};
+
+/// Decodes a GROUP payload. A DECLARE keeps its seq bytes as a slice; read them with `groupDeclareSeqAt`.
+pub fn parseGroupPayload(payload: []const u8) ProtocolError!GroupFrame {
+    if (payload.len < 1) return error.ProtocolError;
+    const subtype = GroupSubtype.fromByte(payload[0]) orelse return error.ProtocolError;
+    switch (subtype) {
+        .begin => return .begin,
+        .end => return .end,
+        .declare => {
+            if (payload.len < 3) return error.ProtocolError;
+            const count = std.mem.readInt(u16, payload[1..3], .little);
+            if (count == 0 or count > MAX_GROUP_MEMBERS) return error.ProtocolError;
+            if (payload.len != 3 + @as(usize, count) * 8) return error.ProtocolError;
+            return .{ .declare = payload[3..] };
+        },
+    }
+}
+
+/// The i-th seq of a DECLARE body returned by `parseGroupPayload`.
+pub fn groupDeclareSeqAt(body: []const u8, i: usize) u64 {
+    return std.mem.readInt(u64, body[i * 8 ..][0..8], .little);
+}
+
+pub fn groupDeclareCount(body: []const u8) usize {
+    return body.len / 8;
 }
 
 // ============================================================================
@@ -933,6 +1010,182 @@ fn pendingClear() void {
     pending_head = 0;
     pending_tail = 0;
     pending_count = 0;
+}
+
+// ----------------------------------------------------------------------------
+// Undo-group collection (host side)
+//
+// A peer that has to split one logical operation across several relayed actions brackets them with
+// GROUP BEGIN and GROUP END. Only the host knows which seq each of those proposals received, so the
+// host is what collects them; on END it declares the group to every peer, including itself.
+//
+// **Main thread only** (opened from the router, filled and closed from `pump`), so these need no lock.
+// Peer ids are handed out by `next_peer_id` and never reused, so an entry left behind by a peer that
+// disappeared mid-group can never be mistaken for a later peer's.
+// ----------------------------------------------------------------------------
+
+const GroupCollector = struct {
+    peer_id: u32 = 0,
+    open: bool = false,
+    /// Set once more than `MAX_GROUP_MEMBERS` members arrive. The group is then abandoned rather than
+    /// truncated, which leaves the members individually undoable instead of silently losing some.
+    overflow: bool = false,
+    count: usize = 0,
+    seqs: [MAX_GROUP_MEMBERS]u64 = undefined,
+};
+
+/// One per connected peer, plus index 0 for the host's own operations (peer id 0).
+var group_collectors: [MAX_PEERS + 1]GroupCollector = [_]GroupCollector{.{}} ** (MAX_PEERS + 1);
+
+fn groupCollectorsClear() void {
+    for (&group_collectors) |*c| c.* = .{};
+    local_group_depth = 0;
+}
+
+fn findGroupCollector(peer_id: u32) ?*GroupCollector {
+    for (&group_collectors) |*c| {
+        if (c.open and c.peer_id == peer_id) return c;
+    }
+    return null;
+}
+
+/// Opens (or restarts) `peer_id`'s collector. Returns false when every slot is already taken.
+/// A peer that disconnects between BEGIN and END leaves its collector open, so a slot is reclaimed from any
+/// peer that is no longer connected before the call gives up. Its members simply stay ungrouped.
+fn openGroupCollector(peer_id: u32) bool {
+    if (findGroupCollector(peer_id)) |c| {
+        c.* = .{ .peer_id = peer_id, .open = true };
+        return true;
+    }
+    for (&group_collectors) |*c| {
+        if (!c.open) {
+            c.* = .{ .peer_id = peer_id, .open = true };
+            return true;
+        }
+    }
+    for (&group_collectors) |*c| {
+        if (c.peer_id != HOST_PEER_ID and !peerIsActive(c.peer_id)) {
+            c.* = .{ .peer_id = peer_id, .open = true };
+            return true;
+        }
+    }
+    return false;
+}
+
+fn peerIsActive(peer_id: u32) bool {
+    if (!io_inited) return false;
+    peers_mutex.lockUncancelable(io_val);
+    defer peers_mutex.unlock(io_val);
+    for (&slots) |*s| {
+        if (s.state == .active and s.peer_id == peer_id) return true;
+    }
+    return false;
+}
+
+/// Records the seq the host just assigned to one of `peer_id`'s proposals, when a group is open for it.
+fn noteGroupMember(peer_id: u32, seq: u64) void {
+    const c = findGroupCollector(peer_id) orelse return;
+    if (c.count >= MAX_GROUP_MEMBERS) {
+        c.overflow = true;
+        return;
+    }
+    c.seqs[c.count] = seq;
+    c.count += 1;
+}
+
+/// Closes `peer_id`'s group: adopts it locally and declares it to every client. A group of fewer than two
+/// members, or one that overflowed, is dropped — both leave the members undoable one at a time, which is
+/// what a peer that never sent a GROUP frame gets anyway.
+fn closeGroupCollector(peer_id: u32) void {
+    const c = findGroupCollector(peer_id) orelse return;
+    defer c.* = .{};
+    if (c.overflow or c.count < 2) {
+        if (c.overflow) {
+            std.debug.print("[netsync] an undo group exceeded {d} members — leaving them ungrouped\n", .{MAX_GROUP_MEMBERS});
+        }
+        return;
+    }
+    declareGroup(c.seqs[0..c.count]);
+}
+
+/// Adopts a set of seqs as one undo group locally and broadcasts the DECLARE. Used both for a run of
+/// relayed commands and for the revert records a group undo appends.
+fn declareGroup(seqs: []const u64) void {
+    const exec = shared_executor orelse return;
+    _ = exec.adoptUndoGroup(seqs) catch |err| {
+        std.debug.print("[netsync] failed to adopt an undo group: {s} — leaving the members ungrouped\n", .{@errorName(err)});
+        return;
+    };
+    var gbuf: [3 + MAX_GROUP_MEMBERS * 8]u8 = undefined;
+    const payload = formatGroupDeclarePayload(&gbuf, seqs) catch return;
+    broadcast(@intFromEnum(FrameKind.group), payload);
+}
+
+/// Applies a DECLARE on a client. A group naming a record this peer never recorded (one lost to the ring,
+/// or one that predates its join snapshot) is dropped whole: the members stay individually undoable, which
+/// is the same degraded behaviour a peer that ignores the frame entirely gets.
+fn handleGroupFrame(from_peer: u32, payload: []const u8) void {
+    const parsed = parseGroupPayload(payload) catch {
+        std.debug.print("[netsync] failed to parse a GROUP frame\n", .{});
+        return;
+    };
+    switch (parsed) {
+        .begin => {
+            if (!isHost()) return;
+            if (!openGroupCollector(from_peer)) {
+                std.debug.print("[netsync] no undo-group slot is free for peer {d}\n", .{from_peer});
+            }
+        },
+        .end => {
+            if (!isHost()) return;
+            closeGroupCollector(from_peer);
+        },
+        .declare => |body| {
+            if (!isClient()) return;
+            const exec = shared_executor orelse return;
+            var seqs: [MAX_GROUP_MEMBERS]u64 = undefined;
+            const n = groupDeclareCount(body);
+            if (n > seqs.len) return;
+            for (0..n) |i| seqs[i] = groupDeclareSeqAt(body, i);
+            _ = exec.adoptUndoGroup(seqs[0..n]) catch |err| {
+                std.debug.print("[netsync] ignoring an undo group declaration: {s}\n", .{@errorName(err)});
+            };
+        },
+    }
+}
+
+/// How deep this peer's own begin/end nesting is. Only the outermost pair opens and closes a group, so an
+/// operation that internally groups (a redo of a group, say) joins an enclosing group instead of splitting
+/// it, and an unmatched `end` is a no-op rather than a stray frame.
+var local_group_depth: u32 = 0;
+
+/// Opens an undo group around the relayed actions that follow, so that one undo takes all of them back.
+/// A host collects locally; a client asks the host to collect. Outside a session it does nothing, because
+/// grouping is a property of the wire order and there is none.
+pub fn beginActionGroup() void {
+    local_group_depth += 1;
+    if (local_group_depth > 1) return;
+    if (isHost()) {
+        _ = openGroupCollector(HOST_PEER_ID);
+    } else if (isClient()) {
+        var mbuf: [1]u8 = undefined;
+        const payload = formatGroupMarkPayload(&mbuf, .begin) catch return;
+        _ = clientSend(@intFromEnum(FrameKind.group), payload);
+    }
+}
+
+/// Closes the group opened by the matching `beginActionGroup`.
+pub fn endActionGroup() void {
+    if (local_group_depth == 0) return;
+    local_group_depth -= 1;
+    if (local_group_depth > 0) return;
+    if (isHost()) {
+        closeGroupCollector(HOST_PEER_ID);
+    } else if (isClient()) {
+        var mbuf: [1]u8 = undefined;
+        const payload = formatGroupMarkPayload(&mbuf, .end) catch return;
+        _ = clientSend(@intFromEnum(FrameKind.group), payload);
+    }
 }
 
 fn pendingEnqueue(e: PendingEntry) bool {
@@ -1956,6 +2209,7 @@ fn handleInboundFrame(kind: u8, from_peer: u32, payload: []const u8) void {
         .commit_revert => handleCommitRevert(payload),
         .reject => handleReject(payload),
         .peer_info => handlePeerInfo(payload),
+        .group => handleGroupFrame(from_peer, payload),
         .sync => {
             std.debug.print("[netsync] unexpected SYNC on host path — ignore\n", .{});
         },
@@ -2201,6 +2455,7 @@ pub fn commitAndBroadcast(name: []const u8, args: []const u8, buf: []u8) anyerro
     const seq = allocateCommitSeq();
     const out = try applyWireCommit(name, args, 0, seq, null, buf);
     noteWireSeq(seq);
+    noteGroupMember(HOST_PEER_ID, seq);
     broadcastCommit(seq, 0, name, args);
     return out;
 }
@@ -2250,6 +2505,7 @@ fn handlePropose(from_peer: u32, payload: []const u8) void {
         return;
     };
     noteWireSeq(seq);
+    noteGroupMember(from_peer, seq);
     broadcastCommit(seq, from_peer, parsed.name, parsed.args);
 }
 
@@ -2265,6 +2521,51 @@ fn validateRevertTarget(target_seq: u64, proposer: u32) ?[]const u8 {
     if (!adapter.canUndo(adapter.ctx, rec)) return "too old";
     if (target_seq <= maxJoinSnapshotSeq()) return "before peer join";
     return null;
+}
+
+/// Expands a revert target into the members of its undo group, or into the target alone when it carries no
+/// group. An incomplete group is refused rather than partially reverted.
+fn revertTargetsFor(target_seq: u64, out: []u64) error{IncompleteGroup}![]u64 {
+    const exec = shared_executor orelse {
+        out[0] = target_seq;
+        return out[0..1];
+    };
+    const members = exec.undoGroupMembers(target_seq, out) catch |err| switch (err) {
+        error.IncompleteGroup => return error.IncompleteGroup,
+        error.OutOfRange => return error.IncompleteGroup,
+    };
+    if (members) |m| return m;
+    out[0] = target_seq;
+    return out[0..1];
+}
+
+/// All-or-nothing validation of a whole revert group: the first failing member's reason stands for the group.
+fn validateRevertTargets(seqs: []const u64, proposer: u32) ?[]const u8 {
+    for (seqs) |s| {
+        if (validateRevertTarget(s, proposer)) |reason| return reason;
+    }
+    return null;
+}
+
+/// Applies a validated revert group newest-first, broadcasting one COMMIT_REVERT per member, and finally
+/// declares the appended revert records as one group so that a later redo takes all of them back together.
+/// **This is not atomic on the wire**: a peer that fails to apply one member disables networking fail-soft,
+/// exactly as it does for a single COMMIT_REVERT.
+fn applyAndBroadcastRevertGroup(seqs: []const u64) !void {
+    const exec = shared_executor orelse return error.NoExecutor;
+    var new_seqs: [MAX_GROUP_MEMBERS]u64 = undefined;
+    var n: usize = 0;
+    var i: usize = seqs.len;
+    while (i > 0) {
+        i -= 1;
+        const new_seq = allocateCommitSeq();
+        try exec.applyWireRevert(seqs[i], new_seq);
+        noteWireSeq(new_seq);
+        new_seqs[n] = new_seq;
+        n += 1;
+        broadcastCommitRevert(new_seq, seqs[i]);
+    }
+    if (n > 1) declareGroup(new_seqs[0..n]);
 }
 
 fn writeNothing(buf: []u8, msg: []const u8) []const u8 {
@@ -2299,21 +2600,19 @@ fn handleProposeRevert(from_peer: u32, payload: []const u8) void {
         sendReject(from_peer, 0, "bad propose_revert");
         return;
     };
-    if (validateRevertTarget(parsed.target_seq, from_peer)) |reason| {
+    var targets: [MAX_GROUP_MEMBERS]u64 = undefined;
+    const seqs = revertTargetsFor(parsed.target_seq, &targets) catch {
+        sendReject(from_peer, parsed.proposal_id, "incomplete undo group");
+        return;
+    };
+    if (validateRevertTargets(seqs, from_peer)) |reason| {
         sendReject(from_peer, parsed.proposal_id, reason);
         return;
     }
-    const exec = shared_executor orelse {
-        sendReject(from_peer, parsed.proposal_id, "no executor");
-        return;
-    };
-    const new_seq = allocateCommitSeq();
-    exec.applyWireRevert(parsed.target_seq, new_seq) catch |err| {
+    applyAndBroadcastRevertGroup(seqs) catch |err| {
         sendReject(from_peer, parsed.proposal_id, @errorName(err));
         return;
     };
-    noteWireSeq(new_seq);
-    broadcastCommitRevert(new_seq, parsed.target_seq);
 }
 
 fn handleCommit(payload: []const u8) void {
@@ -2385,8 +2684,45 @@ fn handleReject(payload: []const u8) void {
     std.debug.print("[netsync] REJECT proposal={d} reason={s}\n", .{ parsed.proposal_id, lastRejectReason() });
 }
 
+/// Re-issues a whole revert group as a new group. The members are re-run in their original order, and the
+/// commands they produce are declared as one group again, so the redo stays undoable as a unit.
+fn commitRedoGroup(actor_peer: u32, cand: command.Executor.RedoGroupCandidate, buf: []u8) anyerror![]const u8 {
+    const exec = shared_executor orelse return error.NoExecutor;
+    const log = exec.log orelse return error.NoExecutor;
+
+    beginActionGroup();
+    var applied: usize = 0;
+    for (cand.targets) |target_seq| {
+        const target = log.findBySeq(target_seq) orelse break;
+        var name_buf: [command.MAX_CMD_NAME]u8 = undefined;
+        var args_buf: [command.MAX_CMD_ARGS]u8 = undefined;
+        const nlen = @min(target.name().len, name_buf.len);
+        const alen = @min(target.args().len, args_buf.len);
+        @memcpy(name_buf[0..nlen], target.name()[0..nlen]);
+        @memcpy(args_buf[0..alen], target.args()[0..alen]);
+        const seq = allocateCommitSeq();
+        // An action callback is promised a buffer of the same size a digest gets.
+        var out_buf: [1024]u8 = undefined;
+        _ = applyWireCommit(name_buf[0..nlen], args_buf[0..alen], actor_peer, seq, .{ .redo_of = target_seq }, &out_buf) catch break;
+        noteWireSeq(seq);
+        noteGroupMember(actor_peer, seq);
+        broadcastCommit(seq, actor_peer, name_buf[0..nlen], args_buf[0..alen]);
+        applied += 1;
+    }
+    endActionGroup();
+    // The group is burnt whether every member re-ran or not: whatever did re-run forms a new group of its
+    // own, so a single undo takes it back, and a half-applied bundle is never offered for redo again.
+    exec.markRedoGroupConsumed(cand.group_id);
+    if (applied == 0) return error.RedoFailed;
+    return std.fmt.bufPrint(buf, "redone {d}", .{applied}) catch "redone";
+}
+
 fn commitRedoOwn(actor_peer: u32, buf: []u8) anyerror![]const u8 {
     const exec = shared_executor orelse return error.NoExecutor;
+    var group_targets: [MAX_GROUP_MEMBERS]u64 = undefined;
+    if (exec.findRedoGroupCandidate(.{ .peer = actor_peer }, &group_targets)) |g| {
+        return commitRedoGroup(actor_peer, g, buf);
+    }
     const cand = exec.findRedoCandidate(.{ .peer = actor_peer }) orelse {
         return writeNothing(buf, "nothing to redo");
     };
@@ -2404,9 +2740,40 @@ fn commitRedoOwn(actor_peer: u32, buf: []u8) anyerror![]const u8 {
     return out;
 }
 
+/// The client's counterpart of `commitRedoGroup`: the members are proposed between GROUP BEGIN and END, so
+/// the host regroups the commits it assigns to them. The group is burnt here rather than on the COMMIT,
+/// because the proposals are what consume it and a rejected member must not resurrect the whole group.
+fn proposeRedoGroup(cand: command.Executor.RedoGroupCandidate, buf: []u8) anyerror![]const u8 {
+    const exec = shared_executor orelse return error.NoExecutor;
+    const log = exec.log orelse return error.NoExecutor;
+
+    beginActionGroup();
+    var proposed: usize = 0;
+    for (cand.targets) |target_seq| {
+        const target = log.findBySeq(target_seq) orelse break;
+        var name_buf: [command.MAX_CMD_NAME]u8 = undefined;
+        var args_buf: [command.MAX_CMD_ARGS]u8 = undefined;
+        const nlen = @min(target.name().len, name_buf.len);
+        const alen = @min(target.args().len, args_buf.len);
+        @memcpy(name_buf[0..nlen], target.name()[0..nlen]);
+        @memcpy(args_buf[0..alen], target.args()[0..alen]);
+        var out_buf: [128]u8 = undefined;
+        _ = proposeToHostWithMeta(name_buf[0..nlen], args_buf[0..alen], target_seq, &out_buf) catch break;
+        proposed += 1;
+    }
+    endActionGroup();
+    exec.markRedoGroupConsumed(cand.group_id);
+    if (proposed == 0) return error.ProposeSendFailed;
+    return std.fmt.bufPrint(buf, "redo proposed {d}", .{proposed}) catch "redo proposed";
+}
+
 fn proposeRedoOwn(buf: []u8) anyerror![]const u8 {
     const exec = shared_executor orelse return error.NoExecutor;
     const me = localPeerId();
+    var group_targets: [MAX_GROUP_MEMBERS]u64 = undefined;
+    if (exec.findRedoGroupCandidate(.{ .peer = me }, &group_targets)) |g| {
+        return proposeRedoGroup(g, buf);
+    }
     const cand = exec.findRedoCandidate(.{ .peer = me }) orelse {
         return writeNothing(buf, "nothing to redo");
     };
@@ -2440,15 +2807,17 @@ fn netsyncRouter(name: []const u8, args: []const u8, buf: []u8) anyerror![]const
             .undo_own => blk: {
                 const exec = shared_executor orelse break :blk error.NoExecutor;
                 const target = exec.findUndoCandidate(.{ .peer = 0 }) orelse break :blk writeNothing(buf, "nothing to undo");
-                if (validateRevertTarget(target, 0)) |reason| {
+                var targets: [MAX_GROUP_MEMBERS]u64 = undefined;
+                const seqs = revertTargetsFor(target, &targets) catch {
+                    std.debug.print("[netsync] host undo reject: incomplete undo group\n", .{});
+                    break :blk error.RevertRejected;
+                };
+                if (validateRevertTargets(seqs, 0)) |reason| {
                     std.debug.print("[netsync] host undo reject: {s}\n", .{reason});
                     break :blk error.RevertRejected;
                 }
-                const new_seq = allocateCommitSeq();
-                try exec.applyWireRevert(target, new_seq);
-                noteWireSeq(new_seq);
-                broadcastCommitRevert(new_seq, target);
-                break :blk (std.fmt.bufPrint(buf, "reverted {d}", .{target}) catch "reverted");
+                try applyAndBroadcastRevertGroup(seqs);
+                break :blk (std.fmt.bufPrint(buf, "reverted {d}", .{seqs[0]}) catch "reverted");
             },
             .redo_own => commitRedoOwn(0, buf),
         },
@@ -2669,6 +3038,7 @@ pub fn shutdown() void {
     last_rejected_proposal = 0;
     last_reject_reason_len = 0;
     pendingClear();
+    groupCollectorsClear();
 }
 
 fn requestCloseSlot(s: *ConnSlot) void {
@@ -3213,6 +3583,7 @@ pub fn resetForTest() void {
     awaiting_sync = false;
     freePendingSyncLocked();
     pendingClear();
+    groupCollectorsClear();
     if (io_inited) {
         presence_inbound.clear(io_val);
         peers_mutex.lockUncancelable(io_val);
@@ -3482,7 +3853,8 @@ test "netsync: the codec decodes an unknown kind while it is within the limit, a
     try testing.expectEqual(@as(usize, MAX_ACTION_FRAME_BYTES), maxPayloadForKind(0x01));
     try testing.expectEqual(@as(usize, PRESENCE_PAYLOAD_LEN), maxPayloadForKind(0x09));
     try testing.expect(isKnownKind(0x09));
-    try testing.expect(!isKnownKind(0x0A));
+    try testing.expect(isKnownKind(0x0A));
+    try testing.expect(!isKnownKind(0x0B));
 }
 
 test "netsync: a codec len over the limit gives PayloadTooLarge" {
@@ -6537,13 +6909,13 @@ test "netsync: PRESENCE codec round-trip / signed coords / subtype / reject" {
     try testing.expectEqual(@as(usize, 24), maxPayloadForKind(0x09));
 }
 
-test "netsync: an unknown kind 0x0A is discarded and carries on (compatibility with older peers)" {
+test "netsync: an unknown kind is discarded and carries on (compatibility with older peers)" {
     // The same branch as readerMain's: when isKnownKind is false it calls discardPayload and continues.
     // Here, at the codec layer, what is pinned is that "the frame after an unknown kind can still be read".
-    try testing.expect(!isKnownKind(0x0A));
+    try testing.expect(!isKnownKind(0x0B));
     var raw: [5 + 4 + 5 + 3]u8 = undefined;
-    // unknown kind 0x0A len=4
-    raw[0] = 0x0A;
+    // unknown kind 0x0B len=4
+    raw[0] = 0x0B;
     std.mem.writeInt(u32, raw[1..5], 4, .little);
     @memcpy(raw[5..9], "xxxx");
     // the equivalent of a known kind, PROPOSE, following
@@ -6553,7 +6925,7 @@ test "netsync: an unknown kind 0x0A is discarded and carries on (compatibility w
 
     var r = Io.Reader.fixed(&raw);
     const k1 = try r.takeByte();
-    try testing.expectEqual(@as(u8, 0x0A), k1);
+    try testing.expectEqual(@as(u8, 0x0B), k1);
     const len1 = try r.takeInt(u32, .little);
     try discardPayload(&r, len1);
     var pbuf: [16]u8 = undefined;
@@ -6902,4 +7274,220 @@ test "netsync: a host started after a client fail-soft is not disabled by the pr
 
     try testing.expect(isHost());
     try testing.expect(isEnabled());
+}
+
+// ---------------------------------------------------------------------------
+// undo groups
+// ---------------------------------------------------------------------------
+
+test "netsync: a host-local undo group is reverted by one undo and redone by one redo" {
+    resetForTest();
+    defer resetForTest();
+
+    var wu: WireUndo = undefined;
+    var log: command.CommandLog = undefined;
+    var exec: command.Executor = undefined;
+    setupWireUndo(&wu, &log, &exec);
+
+    var ctx: SemCtx = .{};
+    registerSem("stroke", &ctx, .relay);
+    registerSem("undo", &ctx, .undo_own);
+    registerSem("redo", &ctx, .redo_own);
+
+    initHost(0);
+    var buf: [128]u8 = undefined;
+
+    beginActionGroup();
+    _ = try action_registry.routeLocalAction("stroke", "chunk1", &buf); // seq1
+    _ = try action_registry.routeLocalAction("stroke", "chunk2", &buf); // seq2
+    endActionGroup();
+    _ = try action_registry.routeLocalAction("stroke", "solo", &buf); // seq3
+
+    try testing.expectEqual(@as(?u64, 1), log.findBySeq(1).?.undo_group_id);
+    try testing.expectEqual(@as(?u64, 1), log.findBySeq(2).?.undo_group_id);
+    try testing.expectEqual(@as(?u64, null), log.findBySeq(3).?.undo_group_id);
+
+    // The solo command is the newest, so it goes first and alone.
+    _ = try action_registry.routeLocalAction("undo", "", &buf);
+    try testing.expect(log.findBySeq(3).?.reverted);
+    try testing.expect(!log.findBySeq(2).?.reverted);
+
+    // One undo takes both chunks back.
+    _ = try action_registry.routeLocalAction("undo", "", &buf);
+    try testing.expect(log.findBySeq(1).?.reverted);
+    try testing.expect(log.findBySeq(2).?.reverted);
+    try testing.expect(exec.findUndoCandidate(.{ .peer = 0 }) == null);
+
+    // One redo re-runs both, and the two new commands form a group of their own.
+    const redone = try action_registry.routeLocalAction("redo", "", &buf);
+    try testing.expect(std.mem.indexOf(u8, redone, "redone 2") != null);
+    const latest = log.latest().?;
+    try testing.expect(latest.undo_group_id != null);
+    try testing.expectEqual(@as(u16, 2), latest.undo_group_count);
+    // The same group is never redone twice.
+    var out: [MAX_GROUP_MEMBERS]u64 = undefined;
+    try testing.expect(exec.findRedoGroupCandidate(.{ .peer = 0 }, &out) == null);
+}
+
+test "netsync: a group of one, and an unclosed group, leave the members individually undoable" {
+    resetForTest();
+    defer resetForTest();
+
+    var wu: WireUndo = undefined;
+    var log: command.CommandLog = undefined;
+    var exec: command.Executor = undefined;
+    setupWireUndo(&wu, &log, &exec);
+
+    var ctx: SemCtx = .{};
+    registerSem("stroke", &ctx, .relay);
+    registerSem("undo", &ctx, .undo_own);
+
+    initHost(0);
+    var buf: [128]u8 = undefined;
+
+    beginActionGroup();
+    _ = try action_registry.routeLocalAction("stroke", "only", &buf); // seq1
+    endActionGroup();
+    beginActionGroup();
+    _ = try action_registry.routeLocalAction("stroke", "dangling", &buf); // seq2 — no end
+    _ = try action_registry.routeLocalAction("undo", "", &buf);
+
+    try testing.expectEqual(@as(?u64, null), log.findBySeq(1).?.undo_group_id);
+    try testing.expectEqual(@as(?u64, null), log.findBySeq(2).?.undo_group_id);
+    try testing.expect(log.findBySeq(2).?.reverted);
+    try testing.expect(!log.findBySeq(1).?.reverted);
+}
+
+test "netsync: a client's grouped proposals are declared and reverted as one unit" {
+    resetForTest();
+    defer resetForTest();
+
+    var wu: WireUndo = undefined;
+    var log: command.CommandLog = undefined;
+    var exec: command.Executor = undefined;
+    setupWireUndo(&wu, &log, &exec);
+
+    var ctx: SemCtx = .{};
+    registerSem("stroke", &ctx, .relay);
+
+    initHost(0);
+    const port = listeningPort().?;
+    const addr = net.IpAddress{ .ip4 = net.Ip4Address.loopback(port) };
+    var stream = try rawHelloConnect(addr, "grp");
+    defer stream.close(io_val);
+    try waitPeers(1, 2000);
+    try pumpUntilAllSynced(2000);
+    try expectEmptySync(stream);
+
+    var wbuf: [256]u8 = undefined;
+    var writer = stream.writer(io_val, &wbuf);
+    var pbuf: [128]u8 = undefined;
+
+    const sendFrames = struct {
+        fn go(w: *Io.Writer, p: []u8, want_inbound: usize) !void {
+            try w.flush();
+            var waited: u64 = 0;
+            while (inboundLen() < want_inbound and waited < 2000) : (waited += 5) sleepMs(5);
+            pump();
+            _ = p;
+        }
+    }.go;
+
+    const begin = try formatGroupMarkPayload(&pbuf, .begin);
+    try encodeFrame(&writer.interface, @intFromEnum(FrameKind.group), begin);
+    const p1 = try formatProposePayload(&pbuf, 1, "stroke", "chunk1");
+    try encodeFrame(&writer.interface, @intFromEnum(FrameKind.propose), p1);
+    const p2 = try formatProposePayload(&pbuf, 2, "stroke", "chunk2");
+    try encodeFrame(&writer.interface, @intFromEnum(FrameKind.propose), p2);
+    const end = try formatGroupMarkPayload(&pbuf, .end);
+    try encodeFrame(&writer.interface, @intFromEnum(FrameKind.group), end);
+    try sendFrames(&writer.interface, &pbuf, 4);
+
+    try testing.expectEqual(@as(?u64, 1), log.findBySeq(1).?.undo_group_id);
+    try testing.expectEqual(@as(?u64, 1), log.findBySeq(2).?.undo_group_id);
+
+    // A revert proposed against either member takes the whole group back.
+    const prev = try formatProposeRevertPayload(&pbuf, 3, 2);
+    try encodeFrame(&writer.interface, @intFromEnum(FrameKind.propose_revert), prev);
+    try sendFrames(&writer.interface, &pbuf, 1);
+
+    try testing.expect(log.findBySeq(1).?.reverted);
+    try testing.expect(log.findBySeq(2).?.reverted);
+
+    // What the client sees on the wire: two COMMITs, a DECLARE, two COMMIT_REVERTs, a DECLARE.
+    var rbuf: [512]u8 = undefined;
+    var reader = stream.reader(io_val, &rbuf);
+    var fbuf: [512]u8 = undefined;
+    const f1 = try decodeFrame(&reader.interface, &fbuf);
+    try testing.expectEqual(@intFromEnum(FrameKind.commit), f1.kind);
+    const f2 = try decodeFrame(&reader.interface, &fbuf);
+    try testing.expectEqual(@intFromEnum(FrameKind.commit), f2.kind);
+    const f3 = try decodeFrame(&reader.interface, &fbuf);
+    try testing.expectEqual(@intFromEnum(FrameKind.group), f3.kind);
+    switch (try parseGroupPayload(f3.payload)) {
+        .declare => |body| {
+            try testing.expectEqual(@as(usize, 2), groupDeclareCount(body));
+            try testing.expectEqual(@as(u64, 1), groupDeclareSeqAt(body, 0));
+            try testing.expectEqual(@as(u64, 2), groupDeclareSeqAt(body, 1));
+        },
+        else => return error.TestUnexpectedResult,
+    }
+    const f4 = try decodeFrame(&reader.interface, &fbuf);
+    try testing.expectEqual(@intFromEnum(FrameKind.commit_revert), f4.kind);
+    const cr1 = try parseCommitRevertPayload(f4.payload);
+    try testing.expectEqual(@as(u64, 2), cr1.target_seq); // newest first
+    const f5 = try decodeFrame(&reader.interface, &fbuf);
+    try testing.expectEqual(@intFromEnum(FrameKind.commit_revert), f5.kind);
+    const cr2 = try parseCommitRevertPayload(f5.payload);
+    try testing.expectEqual(@as(u64, 1), cr2.target_seq);
+    const f6 = try decodeFrame(&reader.interface, &fbuf);
+    try testing.expectEqual(@intFromEnum(FrameKind.group), f6.kind);
+}
+
+test "netsync: a group naming a record the peer never had is dropped whole" {
+    resetForTest();
+    defer resetForTest();
+
+    var wu: WireUndo = undefined;
+    var log: command.CommandLog = undefined;
+    var exec: command.Executor = undefined;
+    setupWireUndo(&wu, &log, &exec);
+
+    var buf: [128]u8 = undefined;
+    _ = try exec.executeAction("stroke", "a", .{ .actor = .{ .peer = 0 } }, &buf); // seq1
+
+    ensureIo();
+    peers_mutex.lockUncancelable(io_val);
+    role = .client;
+    started = true;
+    peers_mutex.unlock(io_val);
+
+    var pbuf: [64]u8 = undefined;
+    const payload = try formatGroupDeclarePayload(&pbuf, &[_]u64{ 1, 77 });
+    handleGroupFrame(0, payload);
+    try testing.expectEqual(@as(?u64, null), log.findBySeq(1).?.undo_group_id);
+}
+
+test "netsync: the GROUP codec rejects a malformed declaration" {
+    var buf: [64]u8 = undefined;
+    try testing.expectError(error.ProtocolError, parseGroupPayload(""));
+    try testing.expectError(error.ProtocolError, parseGroupPayload(&[_]u8{0x7F}));
+    // a count that does not match the body length
+    buf[0] = @intFromEnum(GroupSubtype.declare);
+    std.mem.writeInt(u16, buf[1..3], 2, .little);
+    try testing.expectError(error.ProtocolError, parseGroupPayload(buf[0..11]));
+    // count zero
+    std.mem.writeInt(u16, buf[1..3], 0, .little);
+    try testing.expectError(error.ProtocolError, parseGroupPayload(buf[0..3]));
+
+    const ok = try formatGroupDeclarePayload(&buf, &[_]u64{ 4, 9 });
+    switch (try parseGroupPayload(ok)) {
+        .declare => |body| {
+            try testing.expectEqual(@as(usize, 2), groupDeclareCount(body));
+            try testing.expectEqual(@as(u64, 9), groupDeclareSeqAt(body, 1));
+        },
+        else => return error.TestUnexpectedResult,
+    }
+    const mark = try formatGroupMarkPayload(&buf, .begin);
+    try testing.expectEqual(GroupFrame.begin, try parseGroupPayload(mark));
 }

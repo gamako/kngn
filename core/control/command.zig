@@ -42,6 +42,9 @@ pub const MAX_OPEN_TX = 4;
 pub const MAX_TX_UNDO = 32;
 /// The limit on the bytes owned inline for a transaction label.
 pub const MAX_TX_LABEL = 64;
+/// The limit on the members of one undo group. A logical operation is split only when its arguments exceed
+/// `MAX_CMD_ARGS`, so this bounds the fan-out of the splitting, not the size of an ordinary edit.
+pub const MAX_UNDO_GROUP = 32;
 
 /// Who performs an operation. Used as the match test for undo and redo searches, the actor table and transaction checks.
 pub const ActorId = union(enum) {
@@ -91,6 +94,15 @@ pub const CommandRecord = struct {
     /// 1-based ordinal among that transaction's undoable members, and on the revert side the 1-based ordinal within the
     /// revert bundle. Used to decide whether an undo or a redo is complete (that the member with ordinal 1 still exists).
     tx_member_index: u16 = 0,
+    /// The undo group this record belongs to (null = not grouped). A group bundles records that a single
+    /// logical operation had to split across several commands, so that one undo takes all of them back.
+    /// **It shares no namespace with `transaction_id`**: a transaction id is allocated per process and means
+    /// nothing outside it, whereas a group id is the smallest seq among the group's members and therefore
+    /// identifies the same group on every participant that agrees on the seq order.
+    undo_group_id: ?u64 = null,
+    /// How many members the group was declared to hold. A scan that finds fewer live members than this
+    /// has lost some to the ring, and the group is then not a candidate for undo or redo.
+    undo_group_count: u16 = 0,
 
     pub fn name(self: *const CommandRecord) []const u8 {
         return self.name_buf[0..self.name_len];
@@ -874,6 +886,143 @@ pub const Executor = struct {
             .tx_member_index = 1,
             .source = .{ .remote_commit = .{ .seq = new_seq } },
         });
+    }
+
+    // ------------------------------------------------------------------
+    // undo groups (records that one logical operation had to split apart)
+    // ------------------------------------------------------------------
+
+    pub const UndoGroupError = error{
+        NoLog,
+        EmptyGroup,
+        GroupTooLarge,
+        DuplicateSeq,
+        UnknownSeq,
+        AlreadyGrouped,
+        MixedKinds,
+    };
+
+    /// Stamps an undo group onto records that are already in the log, **all or nothing**: nothing is written
+    /// unless every seq resolves to an ungrouped record and all of them share one `CommandKind`. The group id
+    /// returned is the smallest member seq, which makes the id agree across participants without a counter to
+    /// synchronise. Members may be given in any order.
+    pub fn adoptUndoGroup(self: *Executor, seqs: []const u64) UndoGroupError!u64 {
+        const log = self.log orelse return error.NoLog;
+        if (seqs.len == 0) return error.EmptyGroup;
+        if (seqs.len > MAX_UNDO_GROUP) return error.GroupTooLarge;
+
+        var group_id: u64 = seqs[0];
+        var kind: ?CommandKind = null;
+        for (seqs, 0..) |s, i| {
+            for (seqs[0..i]) |earlier| {
+                if (earlier == s) return error.DuplicateSeq;
+            }
+            const rec = log.findBySeq(s) orelse return error.UnknownSeq;
+            if (rec.undo_group_id != null) return error.AlreadyGrouped;
+            if (kind) |k| {
+                if (rec.kind != k) return error.MixedKinds;
+            } else kind = rec.kind;
+            if (s < group_id) group_id = s;
+        }
+
+        const count: u16 = @intCast(seqs.len);
+        for (seqs) |s| {
+            const rec = log.findBySeq(s).?;
+            rec.undo_group_id = group_id;
+            rec.undo_group_count = count;
+        }
+        return group_id;
+    }
+
+    /// The live members of the group `seq` belongs to, ascending, written into `out`.
+    /// `null` means the record carries no group and is an ordinary single-command target.
+    /// `error.IncompleteGroup` means the ring no longer holds every member, so the group cannot be
+    /// undone or redone as a unit.
+    pub fn undoGroupMembers(self: *Executor, seq: u64, out: []u64) error{ IncompleteGroup, OutOfRange }!?[]u64 {
+        const log = self.log orelse return null;
+        const rec = log.findBySeq(seq) orelse return null;
+        const group_id = rec.undo_group_id orelse return null;
+        const want = rec.undo_group_count;
+        const kind = rec.kind;
+        if (want > out.len) return error.OutOfRange;
+
+        var n: usize = 0;
+        var i: u32 = 0;
+        while (i < log.filled) : (i += 1) {
+            const r = log.recordAt(i);
+            if (r.kind != kind) continue;
+            const gid = r.undo_group_id orelse continue;
+            if (gid != group_id) continue;
+            if (n >= out.len) return error.OutOfRange;
+            out[n] = r.seq;
+            n += 1;
+        }
+        if (n != want) return error.IncompleteGroup;
+        return out[0..n];
+    }
+
+    /// The target seqs of the newest redoable revert group belonging to `actor`, ascending.
+    /// The conditions are `findRedoCandidate`'s, plus: the revert records carry a group, every member of that
+    /// group is still in the log, and every target still exists and is still reverted.
+    pub const RedoGroupCandidate = struct { group_id: u64, targets: []u64 };
+
+    pub fn findRedoGroupCandidate(self: *Executor, actor: ActorId, out: []u64) ?RedoGroupCandidate {
+        if (actor.eql(.system)) return null;
+        const log = self.log orelse return null;
+        const current_epoch = self.currentEpoch(actor);
+
+        var i: u32 = log.filled;
+        while (i > 0) {
+            i -= 1;
+            const rec = log.recordAt(i);
+            if (!rec.actor.eql(actor)) continue;
+            if (rec.kind != .revert) continue;
+            if (rec.redo_consumed) continue;
+            if (rec.epoch != current_epoch) continue;
+            if (rec.undo_group_id == null) continue;
+
+            var members: [MAX_UNDO_GROUP]u64 = undefined;
+            const member_seqs = (self.undoGroupMembers(rec.seq, &members) catch continue) orelse continue;
+            if (member_seqs.len > out.len) continue;
+
+            var n: usize = 0;
+            var viable = true;
+            for (member_seqs) |ms| {
+                const m = log.findBySeq(ms).?;
+                const t_seq = m.target_seq orelse {
+                    viable = false;
+                    break;
+                };
+                const t = log.findBySeq(t_seq) orelse {
+                    viable = false;
+                    break;
+                };
+                if (!t.reverted) {
+                    viable = false;
+                    break;
+                }
+                out[n] = t_seq;
+                n += 1;
+            }
+            if (!viable) continue;
+            std.mem.sort(u64, out[0..n], {}, std.sort.asc(u64));
+            return .{ .group_id = rec.undo_group_id.?, .targets = out[0..n] };
+        }
+        return null;
+    }
+
+    /// Burns a revert group, so that the same group is never redone twice. The counterpart of the
+    /// `redo_consumed` marking a local `performRedoBundle` does; a single-command wire redo keeps its own
+    /// behaviour and is untouched.
+    pub fn markRedoGroupConsumed(self: *Executor, group_id: u64) void {
+        const log = self.log orelse return;
+        var i: u32 = 0;
+        while (i < log.filled) : (i += 1) {
+            const r = log.recordAtMut(i);
+            if (r.kind != .revert) continue;
+            const gid = r.undo_group_id orelse continue;
+            if (gid == group_id) r.redo_consumed = true;
+        }
     }
 
     /// Scans backwards for the newest candidate matching "a matching actor, kind=normal, undoable, !reverted, canUndo=true",
@@ -2312,4 +2461,123 @@ test "persistent state restore clears dispatch-only state" {
     try testing.expect(exec.adapter != null);
     try testing.expectEqual(keep_adapter.?.ctx, exec.adapter.?.ctx);
     try testing.expectEqual(keep_wire, exec.wire_session);
+}
+
+// ---------------------------------------------------------------------------
+// undo groups
+// ---------------------------------------------------------------------------
+
+test "an undo group is adopted whole and its members are found from any one of them" {
+    var app: MockApp = undefined;
+    var log: CommandLog = undefined;
+    var exec: Executor = undefined;
+    wire(&app, &log, &exec);
+    var buf: [256]u8 = undefined;
+
+    _ = try exec1(&exec, .local_user, "move_a", &buf); // seq1
+    _ = try exec1(&exec, .local_user, "move_b", &buf); // seq2
+    _ = try exec1(&exec, .local_user, "move_c", &buf); // seq3
+
+    // The id is the smallest member seq, and the members may be declared in any order.
+    const gid = try exec.adoptUndoGroup(&[_]u64{ 3, 1 });
+    try testing.expectEqual(@as(u64, 1), gid);
+    try testing.expectEqual(@as(?u64, 1), log.findBySeq(1).?.undo_group_id);
+    try testing.expectEqual(@as(?u64, 1), log.findBySeq(3).?.undo_group_id);
+    try testing.expectEqual(@as(?u64, null), log.findBySeq(2).?.undo_group_id);
+
+    var out: [MAX_UNDO_GROUP]u64 = undefined;
+    const from3 = (try exec.undoGroupMembers(3, &out)).?;
+    try testing.expectEqualSlices(u64, &[_]u64{ 1, 3 }, from3);
+    const from1 = (try exec.undoGroupMembers(1, &out)).?;
+    try testing.expectEqualSlices(u64, &[_]u64{ 1, 3 }, from1);
+    // An ungrouped record reports no group rather than a group of one.
+    try testing.expectEqual(@as(?[]u64, null), try exec.undoGroupMembers(2, &out));
+}
+
+test "adopting an undo group is all or nothing" {
+    var app: MockApp = undefined;
+    var log: CommandLog = undefined;
+    var exec: Executor = undefined;
+    wire(&app, &log, &exec);
+    var buf: [256]u8 = undefined;
+
+    _ = try exec1(&exec, .local_user, "move_a", &buf); // seq1
+    _ = try exec1(&exec, .local_user, "move_b", &buf); // seq2
+
+    try testing.expectError(error.UnknownSeq, exec.adoptUndoGroup(&[_]u64{ 1, 99 }));
+    try testing.expectEqual(@as(?u64, null), log.findBySeq(1).?.undo_group_id);
+
+    try testing.expectError(error.DuplicateSeq, exec.adoptUndoGroup(&[_]u64{ 1, 1 }));
+    try testing.expectError(error.EmptyGroup, exec.adoptUndoGroup(&[_]u64{}));
+
+    _ = try exec.adoptUndoGroup(&[_]u64{ 1, 2 });
+    try testing.expectError(error.AlreadyGrouped, exec.adoptUndoGroup(&[_]u64{ 1, 2 }));
+}
+
+test "a group whose member fell out of the ring is incomplete rather than partial" {
+    var app: MockApp = undefined;
+    var log: CommandLog = undefined;
+    var exec: Executor = undefined;
+    wire(&app, &log, &exec);
+    var buf: [256]u8 = undefined;
+
+    _ = try exec1(&exec, .local_user, "move_a", &buf); // seq1
+    _ = try exec1(&exec, .local_user, "move_b", &buf); // seq2
+    _ = try exec.adoptUndoGroup(&[_]u64{ 1, 2 });
+
+    // Push seq1, and only seq1, out of the fixed ring.
+    var i: usize = 0;
+    while (i < MAX_CMD_LOG - 1) : (i += 1) {
+        _ = try exec1(&exec, .local_user, "filler", &buf);
+    }
+    try testing.expect(log.findBySeq(1) == null);
+    try testing.expect(log.findBySeq(2) != null);
+
+    var out: [MAX_UNDO_GROUP]u64 = undefined;
+    try testing.expectError(error.IncompleteGroup, exec.undoGroupMembers(2, &out));
+}
+
+test "a revert group is a single redo candidate and is burnt once consumed" {
+    var app: MockApp = undefined;
+    var log: CommandLog = undefined;
+    var exec: Executor = undefined;
+    wire(&app, &log, &exec);
+    var buf: [256]u8 = undefined;
+
+    _ = try exec1(&exec, .local_user, "move_a", &buf); // seq1
+    _ = try exec1(&exec, .local_user, "move_b", &buf); // seq2
+
+    // The shape a wire group undo produces: one revert record per member, then the reverts declared as a group.
+    try exec.applyWireRevert(2, 3);
+    try exec.applyWireRevert(1, 4);
+    _ = try exec.adoptUndoGroup(&[_]u64{ 3, 4 });
+
+    var out: [MAX_UNDO_GROUP]u64 = undefined;
+    const cand = exec.findRedoGroupCandidate(.local_user, &out).?;
+    try testing.expectEqual(@as(u64, 3), cand.group_id);
+    try testing.expectEqualSlices(u64, &[_]u64{ 1, 2 }, cand.targets);
+
+    exec.markRedoGroupConsumed(cand.group_id);
+    try testing.expect(exec.findRedoGroupCandidate(.local_user, &out) == null);
+    // A group is never offered through the single-command redo search either, because that search
+    // requires a one-member revert bundle and each of these carries its own.
+    try testing.expect(log.findBySeq(3).?.redo_consumed);
+    try testing.expect(log.findBySeq(4).?.redo_consumed);
+}
+
+test "an ungrouped revert stays a single-command redo candidate" {
+    var app: MockApp = undefined;
+    var log: CommandLog = undefined;
+    var exec: Executor = undefined;
+    wire(&app, &log, &exec);
+    var buf: [256]u8 = undefined;
+
+    _ = try exec1(&exec, .local_user, "move_a", &buf); // seq1
+    try exec.applyWireRevert(1, 2);
+
+    var out: [MAX_UNDO_GROUP]u64 = undefined;
+    try testing.expect(exec.findRedoGroupCandidate(.local_user, &out) == null);
+    const single = exec.findRedoCandidate(.local_user).?;
+    try testing.expectEqual(@as(u64, 1), single.target_seq);
+    try testing.expect(!log.findBySeq(2).?.redo_consumed);
 }

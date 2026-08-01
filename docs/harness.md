@@ -61,6 +61,7 @@ digest stats               # {"frame":..,"virtual_fps":60.0,"mouse_move_merge_co
 digest capabilities        # {"backend":"metal","headless_active":false,"probes":[{"name":..,"ext":..,"snapshot":bool,"digest":bool,"desc":..(,"args":[...])},...],"actions":[{"name":..,"desc":..(,"args":[...])},...]}
 snapshot capabilities /tmp/c.json # save capabilities as JSON (default capabilities_<n>.json)
 action <name> [args...]    # run a high-level operation the app registered (the write counterpart to a probe's read)
+group begin                # bracket the actions up to `group end` as one undo unit during a networked session
 expect fb crc=8702DD71     # expect <probe> <key><op><value>  (op ∈ = != > <). Compared against top-level k=v in the digest payload
 expect audio silent=0      # match → ok, mismatch → fail. Replay accumulates failures and exits non-zero; live returns an ok/fail line
 assert fb crc=8702DD71     # evaluated like expect. In replay it exits non-zero immediately on failure (fail-fast abort)
@@ -271,6 +272,14 @@ agent iterate without looking at anything.
   failures.
 - Record → replay symmetry, and being a no-op when the harness is disabled, are
   unchanged (this rides on the existing mechanism).
+
+### group (one undo unit across several actions)
+
+`group begin` … `group end` marks the actions between them as a single undo unit while a
+networked session is running, which is what an operation whose arguments do not fit in one
+action needs (see [netsync.md](netsync.md), "Undo groups"). Outside a session it succeeds and
+does nothing, because grouping is a property of the wire order and there is none. Anything
+other than `begin` or `end` is reported as a failed action, on the same counter as `action`.
 
 ### action (the high-level counterpart to a probe)
 

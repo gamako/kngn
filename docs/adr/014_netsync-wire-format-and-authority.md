@@ -197,6 +197,47 @@ including any later strokes by other peers that overlapped it. Removing that
 requires replaying the log after a rollback instead of applying a snapshot inverse,
 which is a larger change and was deliberately deferred.
 
+### Undo groups: grouping is metadata, not a new kind of commit
+
+An operation whose arguments exceed the command-argument budget has to be sent as several
+relayed actions, and those must still undo as one. The decision is that **grouping is
+advisory metadata carried out of band, and the document-mutating frames do not change**:
+the members stay ordinary `COMMIT`s, a group undo is broadcast as one ordinary
+`COMMIT_REVERT` per member, and a single additive kind (`GROUP`) says which seqs form one
+unit.
+
+That shape is chosen for one property. A peer that does not know the new kind discards it
+and carries on — which is already how an unknown kind is handled — so it still applies
+every member commit and every member revert, in the same order, and **its document
+converges exactly as before**. All it loses is the grouping in its own history. Had the
+group's members or its reverts travelled on new kinds instead, an older peer would have
+skipped document changes and diverged, which is precisely what Decision 5's compatibility
+argument does not permit. This is why adding the kind kept the protocol version at 1.
+
+Three consequences worth stating, because each was a live alternative:
+
+- **The group id is the smallest member seq**, not a counter. A counter would have to be
+  agreed between peers, and reusing the process-local `transaction_id` for it would put a
+  wire-assigned value into a namespace each peer allocates from independently — a
+  collision there silently merges two unrelated bundles. A seq is already unique across
+  the session and never reused.
+- **Undo needs no client→host frame of its own.** The client proposes an ordinary
+  `PROPOSE_REVERT` naming any one member and the host expands it, because the host is the
+  only participant that knows the group in the first place. Validation is all-or-nothing
+  over the members, on the same per-target checks a single revert uses.
+- **A group revert is not atomic on the wire.** The host validates the whole group before
+  applying any of it, but the members reach a peer as separate frames; a peer that fails
+  to apply one of them disables networking fail-soft, which is the existing contract for a
+  single `COMMIT_REVERT`. Making it atomic would mean either a new document-carrying kind
+  (which breaks the compatibility argument above) or buffering a declared group before
+  applying it, and neither was worth the cost for a failure that already ends that peer's
+  participation.
+
+**What the grouping does not survive.** Group membership lives on the command record and
+is not part of the record's persisted form, so a command log that is saved and reloaded
+comes back with its members individually undoable. That is acceptable because a session's
+peer identities do not survive a reload either.
+
 **Rejected: inferring undoability from stack depth.** Whether a committed operation
 can be reverted is established by tagging the undo entry with the commit `seq`
 during dispatch and asking the application afterwards whether such an entry was

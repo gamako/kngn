@@ -52,6 +52,7 @@ Frame = { kind: u8, len: u32 LE, payload: [len]u8 }
 | PROPOSE_REVERT | `0x06` | `u32 LE proposal_id` ++ `u64 LE target_seq` (client→host) |
 | COMMIT_REVERT | `0x07` | `u64 LE seq` ++ `u64 LE target_seq` (host→clients) |
 | PEER_INFO | `0x08` | `u32 LE peer_id ++ u8 kind ++ label` (see peer info distribution below) |
+| GROUP | `0x0A` | `u8 subtype` ++ a per-subtype body (see undo groups below). `0x01` BEGIN and `0x02` END are client→host and carry nothing else; `0x03` DECLARE is host→clients and carries `u16 LE count ++ u64 LE[count] seq` |
 
 The limit for action frames is `MAX_ACTION_FRAME_BYTES` (4096). SYNC uses a big entry
 (on the heap) up to `MAX_SYNC_BYTES` (16MiB). Exceeding either closes that connection.
@@ -244,6 +245,37 @@ scripts/kngn ctl --port-file ./.e2e/client.port 'quit'
 - Undoing a transaction is not supported during a session.
 - Cmd+Z from the keyboard goes through `routeAction("undo"/"redo")` while
   `netsyncActive()`.
+
+### Undo groups (one operation split across several actions)
+
+An operation whose arguments do not fit in one action — `MAX_CMD_ARGS` is 4096 bytes, the same
+scale as the action frame limit — has to be sent as several relayed actions. An **undo group**
+makes those actions one undo unit on every peer.
+
+Bracket them with `beginActionGroup()` / `endActionGroup()` (`group begin` / `group end` from the
+harness). The host is the only participant that knows which `seq` each proposal received, so the
+host collects them: a client's BEGIN opens a collector for that peer, every seq the host assigns to
+its later proposals is appended, and END makes the host adopt the group locally and broadcast a
+DECLARE naming those seqs. The host groups its own operations the same way, without frames.
+
+- **The group id is the smallest member seq.** It needs no counter to be kept in step between
+  peers, and it shares no namespace with the process-local `transaction_id`.
+- **A group is formed only if it has at least two members and no more than 32.** Fewer, more, or a
+  peer that disconnects before its END all leave the members individually undoable — the behaviour
+  of a peer that never sent a GROUP frame at all.
+- **Undo needs no new client→host frame.** A client proposes an ordinary `PROPOSE_REVERT` naming
+  any one member; the host expands it to the whole group, validates every member with the usual
+  checks (all or nothing), applies them newest-first, and broadcasts one `COMMIT_REVERT` per member
+  plus a DECLARE that groups the revert records.
+- **Redo re-issues every member as a new group**, so a redone group stays one undo unit.
+- **The members are ordinary COMMIT and COMMIT_REVERT frames**, so a peer that does not know kind
+  `0x0A` discards the DECLARE, applies every member in the same order, and converges on the same
+  document; all it loses is the grouping in its own history. That is why adding this kind kept the
+  protocol version at 1.
+- **A group revert is not atomic on the wire.** A peer that fails to apply one member disables
+  networking fail-soft, exactly as it does for a single `COMMIT_REVERT`.
+- A group naming a record a peer never recorded — one lost to the command-log ring, or one that
+  predates its join snapshot — is dropped whole on that peer rather than partially applied.
 
 Wait deterministically by re-checking `kngn ctl 'digest netsync'` in an until loop (do not
 retry on a fixed sleep; sleeping is acceptable only while waiting for a process's port

@@ -736,6 +736,8 @@ pub fn pollGateWithPump(native_continue: bool, pump: ?NativePump) bool {
             handleDigest(&it);
         } else if (std.mem.eql(u8, cmd, "action")) {
             handleAction(&it);
+        } else if (std.mem.eql(u8, cmd, "group")) {
+            handleGroup(&it);
         } else if (std.mem.eql(u8, cmd, "capture")) {
             handleCapture(&it);
         } else if (std.mem.eql(u8, cmd, "expect")) {
@@ -831,6 +833,8 @@ fn runFreeRunCommands() bool {
             handleDigest(&it);
         } else if (std.mem.eql(u8, cmd, "action")) {
             handleAction(&it);
+        } else if (std.mem.eql(u8, cmd, "group")) {
+            handleGroup(&it);
         } else if (std.mem.eql(u8, cmd, "capture")) {
             handleCapture(&it);
         } else if (std.mem.eql(u8, cmd, "expect")) {
@@ -2426,6 +2430,22 @@ fn handleDigest(it: *Tok) void {
 
 /// The body of the `action` command. `routeLocalAction`, then emitting the result, and nothing else (it neither interprets nor re-tokenises args).
 /// reportAction's wire formatting and its recording into expect_failures are unchanged.
+/// `group begin` / `group end`: brackets the actions between them as one undo unit while a networked
+/// session is running, which is what an operation too large for a single action's arguments needs.
+/// Outside a session it reports success and does nothing, because there is no wire order to group.
+fn handleGroup(it: *Tok) void {
+    const verb = it.next() orelse "";
+    if (std.mem.eql(u8, verb, "begin")) {
+        netsync.beginActionGroup();
+        reportAction(true, "group", "begin");
+    } else if (std.mem.eql(u8, verb, "end")) {
+        netsync.endActionGroup();
+        reportAction(true, "group", "end");
+    } else {
+        reportAction(false, "group", "expected begin or end");
+    }
+}
+
 fn handleAction(it: *Tok) void {
     const name = it.next() orelse "";
     if (name.len == 0) return reportAction(false, "?", "missing action name");
