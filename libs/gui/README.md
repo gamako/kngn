@@ -61,6 +61,10 @@ scope to avoid that.
   leftover pixels are absorbed by grow children
 - `clip_children` affects drawing only, not layout
 
+Full write-up of the sizing rules above, the two-pass measure/place model behind them, a worked
+example, and where the fit/grow interaction shows up in practice (`ScrollArea`'s `content_width`):
+[docs/layout.md](docs/layout.md).
+
 ## Frame order and hit-test timing
 
 A widget call (`ctx.button(...)` and friends) hits-test and returns its result
