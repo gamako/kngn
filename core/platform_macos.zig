@@ -422,13 +422,12 @@ pub const Window = struct {
     /// make the C side return NULL (→ WindowCreationFailed). Transparency assumes premultiplied
     /// alpha.
     ///
-    /// Fullscreen is **composed on this side** out of two entry points the C ABI already has — the
-    /// extended creation call, which carries the option flags, and the fullscreen call
-    /// (`NSWindow toggleFullScreen:`) — so no native implementation changes (ADR-019 R7). The
-    /// requested size is a placeholder valid only for the instant before the transition, which is
-    /// asynchronous; the real size becomes the screen resolution and the framebuffer follows
-    /// through the existing frame-size path, so an application follows `fb.width`/`fb.height`
-    /// (ADR-019 R3).
+    /// Fullscreen is **composed on this side** out of two C entry points — the extended creation
+    /// call, which carries the option flags, and the fullscreen transition
+    /// (`NSWindow toggleFullScreen:`). The requested size is a placeholder valid only for the
+    /// instant before the transition, which is asynchronous; the real size becomes the screen
+    /// resolution and the framebuffer follows through the existing frame-size path, so an
+    /// application follows `fb.width`/`fb.height` (ADR-019 R3).
     /// Hot path declaration: initialisation only (a single window creation).
     pub fn createWithOptions(width: u32, height: u32, title: [:0]const u8, opts: types.WindowOptions) Error!Window {
         var flags: u32 = 0;
@@ -450,7 +449,7 @@ pub const Window = struct {
             null,
             &copts,
         ) orelse return error.WindowCreationFailed;
-        if (opts.fullscreen) c.platform_enter_fullscreen(w);
+        if (opts.fullscreen) c.platform_set_fullscreen(w, true);
         return .{ .handle = w };
     }
 
@@ -714,6 +713,41 @@ pub fn getGeometry(win: Window) types.WindowGeometry {
         .flags = 0,
     };
     c.platform_get_window_geometry(win.handle, &geo);
+    return .{
+        .position = if ((geo.flags & c.PLATFORM_GEOMETRY_POSITION_VALID) != 0)
+            .{ .x = geo.x, .y = geo.y }
+        else
+            null,
+        .size = .{ .width = geo.width, .height = geo.height },
+    };
+}
+
+/// Whether the window is fullscreen right now, including a fullscreen the user started with the
+/// window button or Cmd+Ctrl+F (ADR-019 R10). The native side reads the window's style mask.
+/// Hot path declaration: event time only.
+pub fn isFullscreen(win: Window) bool {
+    return c.platform_is_fullscreen(win.handle);
+}
+
+/// Ask the window to enter or leave fullscreen. The transition is asynchronous, so the result is
+/// observed through `isFullscreen`, not from this call (ADR-019 R10).
+/// Hot path declaration: event time only.
+pub fn setFullscreen(win: Window, enable: bool) void {
+    c.platform_set_fullscreen(win.handle, enable);
+}
+
+/// The geometry an application should persist. The native side holds the snapshot taken when the
+/// window entered fullscreen, because only it observes a transition the user starts.
+/// Hot path declaration: window shutdown and event time only.
+pub fn restoreGeometry(win: Window) types.WindowGeometry {
+    var geo: c.PlatformWindowGeometry = .{
+        .x = 0,
+        .y = 0,
+        .width = 0,
+        .height = 0,
+        .flags = 0,
+    };
+    c.platform_get_restore_geometry(win.handle, &geo);
     return .{
         .position = if ((geo.flags & c.PLATFORM_GEOMETRY_POSITION_VALID) != 0)
             .{ .x = geo.x, .y = geo.y }

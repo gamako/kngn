@@ -405,6 +405,12 @@ final class PlatformWindowHandle: NSObject {
     let event_queue: EventQueue  // The name event_queue is kept (gamepad and existing code refer to it)
     var quitRequested: Bool = false
     var quitDelegate: QuitWindowDelegate?
+    // Fullscreen (platform_set_fullscreen / platform_is_fullscreen / platform_get_restore_geometry).
+    // The window delegate keeps these up to date across both user-started and program-started transitions.
+    var fsDesired: Bool = false      // the state most recently asked for (applied when a transition in flight ends)
+    var fsTransition: Bool = false   // a transition is in flight (between will- and did-)
+    var fsRestoreHeld: Bool = false  // fsRestore is the geometry to persist (held for the whole fullscreen period)
+    var fsRestore = PlatformWindowGeometry()
 
     init(window: NSWindow, backendView: any PlatformBackendView) {
         self.window = window
@@ -434,6 +440,47 @@ final class QuitWindowDelegate: NSObject, NSWindowDelegate {
         ev.type = PLATFORM_EVENT_QUIT
         handle.event_queue.push(ev)
         return false
+    }
+
+    // The fullscreen transition, whoever started it (platform_set_fullscreen, the green button, or
+    // Cmd+Ctrl+F). Entering snapshots the geometry to persist; that snapshot is held until the exit
+    // transition has finished, so it also covers the exit animation, during which the window still
+    // fills the screen. A request that arrived mid-transition is applied here.
+    func windowWillEnterFullScreen(_ notification: Notification) {
+        _ = notification
+        guard let handle = handle else { return }
+        handle.fsTransition = true
+        handle.fsDesired = true
+        if !handle.fsRestoreHeld {
+            handle.fsRestore = windowGeometry(handle)
+            handle.fsRestoreHeld = true
+        }
+    }
+
+    func windowDidEnterFullScreen(_ notification: Notification) {
+        _ = notification
+        guard let handle = handle else { return }
+        handle.fsTransition = false
+        if !handle.fsDesired {
+            platform_set_fullscreen(platformWindow: Unmanaged.passUnretained(handle).toOpaque(), enable: false)
+        }
+    }
+
+    func windowWillExitFullScreen(_ notification: Notification) {
+        _ = notification
+        guard let handle = handle else { return }
+        handle.fsTransition = true
+        handle.fsDesired = false
+    }
+
+    func windowDidExitFullScreen(_ notification: Notification) {
+        _ = notification
+        guard let handle = handle else { return }
+        handle.fsTransition = false
+        handle.fsRestoreHeld = false
+        if handle.fsDesired {
+            platform_set_fullscreen(platformWindow: Unmanaged.passUnretained(handle).toOpaque(), enable: true)
+        }
     }
 }
 
@@ -1195,23 +1242,26 @@ private func createWindowImpl(width: Int32, height: Int32, title: UnsafePointer<
 }
 
 // The current window geometry. The position is frame.origin, the size is the content size.
+// The current window geometry: the position is frame.origin and the size is the content size.
+func windowGeometry(_ handle: PlatformWindowHandle) -> PlatformWindowGeometry {
+    var geo = PlatformWindowGeometry()
+    let frame = handle.window.frame
+    let content = handle.window.contentRect(forFrameRect: frame)
+    geo.x = Int32(frame.origin.x)
+    geo.y = Int32(frame.origin.y)
+    geo.width = UInt32(lround(Double(content.size.width)))
+    geo.height = UInt32(lround(Double(content.size.height)))
+    geo.flags = UInt32(PLATFORM_GEOMETRY_POSITION_VALID)
+    return geo
+}
+
 @_cdecl("platform_get_window_geometry")
 func platform_get_window_geometry(window: UnsafeMutableRawPointer?, out: UnsafeMutablePointer<PlatformWindowGeometry>?) {
     guard let out = out else { return }
-    out.pointee.x = 0
-    out.pointee.y = 0
-    out.pointee.width = 0
-    out.pointee.height = 0
-    out.pointee.flags = 0
+    out.pointee = PlatformWindowGeometry()
     guard let window = window else { return }
     let handle = Unmanaged<PlatformWindowHandle>.fromOpaque(window).takeUnretainedValue()
-    let frame = handle.window.frame
-    let content = handle.window.contentRect(forFrameRect: frame)
-    out.pointee.x = Int32(frame.origin.x)
-    out.pointee.y = Int32(frame.origin.y)
-    out.pointee.width = UInt32(lround(Double(content.size.width)))
-    out.pointee.height = UInt32(lround(Double(content.size.height)))
-    out.pointee.flags = UInt32(PLATFORM_GEOMETRY_POSITION_VALID)
+    out.pointee = windowGeometry(handle)
 }
 
 // Update the title of the visible window (event time only).
@@ -1272,19 +1322,44 @@ func platform_show_quit_menu(platformWindow: UnsafeMutableRawPointer?) -> Void {
     }
 }
 
-// Make an existing window natively fullscreen (the same toggleFullScreen(nil) as the green button).
-// Already fullscreen is a no-op (no double toggle).
-@_cdecl("platform_enter_fullscreen")
-func platform_enter_fullscreen(platformWindow: UnsafeMutableRawPointer?) -> Void {
+// Ask the window to enter or leave fullscreen (the same toggleFullScreen(nil) transition as the
+// green button). toggleFullScreen is a toggle, not a set, so the request is compared against the
+// current state, and a request arriving while a transition is in flight is only recorded — the
+// delegate applies it when that transition finishes.
+@_cdecl("platform_set_fullscreen")
+func platform_set_fullscreen(platformWindow: UnsafeMutableRawPointer?, enable: Bool) -> Void {
     guard let platformWindow = platformWindow else { return }
     let handle = Unmanaged<PlatformWindowHandle>.fromOpaque(platformWindow).takeUnretainedValue()
     let window = handle.window
+    handle.fsDesired = enable
+    if handle.fsTransition { return } // applied by windowDidEnter/ExitFullScreen
     if !window.collectionBehavior.contains(.fullScreenPrimary) {
         window.collectionBehavior.insert(.fullScreenPrimary)
     }
-    if !window.styleMask.contains(.fullScreen) {
+    if window.styleMask.contains(.fullScreen) != enable {
         window.toggleFullScreen(nil)
     }
+}
+
+// The settled fullscreen state, as the window system reports it. It covers a fullscreen the user
+// started, which is the whole reason this is read rather than remembered from the creation option.
+@_cdecl("platform_is_fullscreen")
+func platform_is_fullscreen(platformWindow: UnsafeMutableRawPointer?) -> Bool {
+    guard let platformWindow = platformWindow else { return false }
+    let handle = Unmanaged<PlatformWindowHandle>.fromOpaque(platformWindow).takeUnretainedValue()
+    return handle.window.styleMask.contains(.fullScreen)
+}
+
+// The geometry an application should persist. While the window is fullscreen (from the moment the
+// transition starts until the exit transition has finished) that is the snapshot taken before it
+// entered, so persisting it does not save the screen.
+@_cdecl("platform_get_restore_geometry")
+func platform_get_restore_geometry(platformWindow: UnsafeMutableRawPointer?, out: UnsafeMutablePointer<PlatformWindowGeometry>?) {
+    guard let out = out else { return }
+    out.pointee = PlatformWindowGeometry()
+    guard let platformWindow = platformWindow else { return }
+    let handle = Unmanaged<PlatformWindowHandle>.fromOpaque(platformWindow).takeUnretainedValue()
+    out.pointee = handle.fsRestoreHeld ? handle.fsRestore : windowGeometry(handle)
 }
 
 @_cdecl("platform_run")

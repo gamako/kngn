@@ -33,6 +33,38 @@ pub const WindowGeometry = struct {
     size: WindowSize,
 };
 
+/// The geometry an application persists, held for a window that can go fullscreen (ADR-019 R10).
+///
+/// While fullscreen, the window's current geometry is the screen, so persisting it produces a
+/// screen-sized window on the next run. The contract this latch implements is "the last geometry
+/// observed while **not** fullscreen": a backend feeds it every settled geometry change together
+/// with the fullscreen state that goes with it, and reads it back through `get`.
+///
+/// The basis is whatever the backend's `getGeometry` uses (a logical content size, plus a position
+/// where the backend can report one), so the value round-trips into `WindowOptions` unchanged.
+/// A window that has never been windowed — one created fullscreen — keeps the geometry it was
+/// seeded with at creation, which is the size the application asked for.
+///
+/// Hot path declaration: event time only (a settled resize or a fullscreen transition).
+pub const RestoreGeometryLatch = struct {
+    /// The last geometry observed while not fullscreen (seeded at window creation).
+    geometry: WindowGeometry,
+    /// The fullscreen state that came with the most recent observation.
+    fullscreen: bool = false,
+
+    /// Record one settled observation. While fullscreen the stored geometry is left alone, which is
+    /// what makes it survive the transition.
+    pub fn observe(self: *RestoreGeometryLatch, fullscreen: bool, current: WindowGeometry) void {
+        self.fullscreen = fullscreen;
+        if (!fullscreen) self.geometry = current;
+    }
+
+    /// The geometry to persist: the current one while windowed, the latched one while fullscreen.
+    pub fn get(self: RestoreGeometryLatch, current: WindowGeometry) WindowGeometry {
+        return if (self.fullscreen) self.geometry else current;
+    }
+};
+
 /// The framebuffer resolution mode (ADR-011 R1). The default `.logical` keeps today's behaviour;
 /// `.physical` is opt-in (a framebuffer in physical pixels while the coordinates stay logical).
 pub const FramebufferMode = enum {
@@ -66,9 +98,10 @@ pub const WindowOptions = struct {
     /// With `fullscreen` it is accepted and adds nothing: a fullscreen window is not user-resizable
     /// to begin with, and it cannot stop the compositor resizing it.
     resizable: bool = true,
-    /// Create the window fullscreen. This is an **initial state, not a transition**: entering or
-    /// leaving fullscreen at run time, exclusive fullscreen, and choosing a monitor are separate
-    /// APIs with separate contracts (ADR-019 R2).
+    /// Create the window fullscreen. This is the **initial state only**: entering or leaving
+    /// fullscreen at run time is `Window.setFullscreen`, and the state at any later moment —
+    /// including one the user changed — is `Window.isFullscreen` (ADR-019 R2, R10). Exclusive
+    /// fullscreen and choosing a monitor remain separate APIs with separate contracts.
     /// With `fullscreen = true` the width and height are an initial *request*: a backend that knows
     /// the fullscreen size ignores them, one that negotiates asynchronously may replace them, and
     /// only a backend with no notion of fullscreen honours them (ADR-019 R3). Which option
@@ -836,6 +869,39 @@ test "WindowGeometry: the position null contract (unsupported, or unreadable)" {
     try std.testing.expect(geo.position == null);
     try std.testing.expectEqual(@as(u32, 780), geo.size.width);
     try std.testing.expectEqual(@as(u32, 600), geo.size.height);
+}
+
+test "RestoreGeometryLatch: a windowed observation is the value, a fullscreen one is ignored" {
+    const windowed: WindowGeometry = .{ .position = .{ .x = 10, .y = 20 }, .size = .{ .width = 780, .height = 600 } };
+    const screen: WindowGeometry = .{ .position = .{ .x = 0, .y = 0 }, .size = .{ .width = 3456, .height = 2234 } };
+
+    var latch: RestoreGeometryLatch = .{ .geometry = windowed };
+    // Windowed: the latch simply follows the current geometry.
+    latch.observe(false, windowed);
+    try std.testing.expectEqualDeep(windowed, latch.get(windowed));
+
+    // Fullscreen: the current geometry is the screen, and the windowed value survives it.
+    latch.observe(true, screen);
+    try std.testing.expectEqualDeep(windowed, latch.get(screen));
+
+    // Repeated fullscreen observations (a resize while fullscreen, a display change) never overwrite it.
+    latch.observe(true, .{ .position = .{ .x = 0, .y = 0 }, .size = .{ .width = 1920, .height = 1080 } });
+    try std.testing.expectEqualDeep(windowed, latch.get(screen));
+
+    // Leaving fullscreen: the value only moves once the restored geometry has been observed.
+    const restored: WindowGeometry = .{ .position = .{ .x = 10, .y = 20 }, .size = .{ .width = 900, .height = 700 } };
+    latch.observe(false, restored);
+    try std.testing.expectEqualDeep(restored, latch.get(restored));
+}
+
+test "RestoreGeometryLatch: a window created fullscreen keeps the geometry it was seeded with" {
+    // Nothing windowed is ever observed, so the seed — the size the application asked for — is what
+    // an application persists, instead of the screen it is filling.
+    const requested: WindowGeometry = .{ .position = null, .size = .{ .width = 1280, .height = 720 } };
+    var latch: RestoreGeometryLatch = .{ .geometry = requested, .fullscreen = true };
+    const screen: WindowGeometry = .{ .position = null, .size = .{ .width = 2560, .height = 1440 } };
+    latch.observe(true, screen);
+    try std.testing.expectEqualDeep(requested, latch.get(screen));
 }
 
 test "TextInputRange NOT_FOUND sentinel is UINT64_MAX" {

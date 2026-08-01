@@ -579,6 +579,23 @@ pub fn getGeometry(win: Window) types.WindowGeometry {
     };
 }
 
+/// Fullscreen is a documented no-op here, exactly as it is at creation (ADR-019 R4): the browser's
+/// fullscreen request needs a user gesture, which this API has no way to carry. The window is
+/// therefore never fullscreen, and the geometry to persist is always the current one (ADR-019 R10).
+pub fn isFullscreen(win: Window) bool {
+    _ = win;
+    return false;
+}
+
+pub fn setFullscreen(win: Window, enable: bool) void {
+    _ = win;
+    _ = enable;
+}
+
+pub fn restoreGeometry(win: Window) types.WindowGeometry {
+    return getGeometry(win);
+}
+
 pub const Framebuffer = struct {
     pixels: []u32,
     width: u32,

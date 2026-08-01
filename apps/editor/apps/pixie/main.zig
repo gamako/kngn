@@ -520,6 +520,8 @@ const App = struct {
     }
 
     /// Called before Window.destroy and App.deinit. Persists geometry into window_state.
+    /// The saved value is restoreGeometry(), not getGeometry(): quitting while fullscreen would
+    /// otherwise save the screen size and reopen a screen-sized window next run (ADR-019 R10).
     /// Also persists PanelHost visibility/extents into Preferences.
     /// size=0 (facade safe default / fetch failure) skips window_state save so existing state is kept.
     /// Preferences always attempts persist+save regardless of geometry success; failures are log-only.
@@ -530,7 +532,7 @@ const App = struct {
             std.log.err("pixie: preferences save failed: {s}", .{@errorName(err)});
         };
         if (comptime !appshell_dir_supported) return;
-        const geo = win.getGeometry();
+        const geo = win.restoreGeometry();
         if (geo.size.width == 0 or geo.size.height == 0) {
             std.log.warn("pixie: window_state save skipped (invalid geometry size={d}x{d})", .{ geo.size.width, geo.size.height });
             return;

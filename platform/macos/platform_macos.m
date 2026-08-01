@@ -62,7 +62,17 @@ struct PlatformWindow {
     EventQueue event_queue;
     __strong id quit_delegate;
     bool quit_requested;
+    // Fullscreen (platform_set_fullscreen / platform_is_fullscreen / platform_get_restore_geometry).
+    // The window delegate keeps these up to date across both user-started and program-started transitions.
+    bool fs_desired;      // the state most recently asked for (applied when a transition in flight ends)
+    bool fs_transition;   // a transition is in flight (between will- and did-)
+    bool fs_restore_held; // the snapshot below is the geometry to persist (held for the whole fullscreen period)
+    PlatformWindowGeometry fs_restore;
 };
+
+// Read the geometry a window would report through platform_get_window_geometry.
+// Declared here because the window delegate snapshots it when a fullscreen transition begins.
+static void window_geometry(PlatformWindow* window, PlatformWindowGeometry* out);
 
 // Forward declaration (defined below, after the mouse input helpers; used by the gamepad connect/disconnect handlers).
 static EventQueueToken queue_push(EventQueue* q, const PlatformEvent* ev);
@@ -85,6 +95,47 @@ static bool queue_mark_none(EventQueue* q, EventQueueToken token);
     ev.type = PLATFORM_EVENT_QUIT;
     queue_push(&window->event_queue, &ev);
     return NO;
+}
+
+// The fullscreen transition, whoever started it (platform_set_fullscreen, the green button, or
+// Cmd+Ctrl+F). Entering snapshots the geometry to persist; that snapshot is held until the exit
+// transition has finished, so it also covers the exit animation, during which the window still
+// fills the screen. A request that arrived mid-transition is applied here.
+- (void)windowWillEnterFullScreen:(NSNotification*)notification {
+    (void)notification;
+    PlatformWindow* window = self.platformWindow;
+    if (!window) return;
+    window->fs_transition = true;
+    window->fs_desired = true;
+    if (!window->fs_restore_held) {
+        window_geometry(window, &window->fs_restore);
+        window->fs_restore_held = true;
+    }
+}
+
+- (void)windowDidEnterFullScreen:(NSNotification*)notification {
+    (void)notification;
+    PlatformWindow* window = self.platformWindow;
+    if (!window) return;
+    window->fs_transition = false;
+    if (!window->fs_desired) platform_set_fullscreen(window, false);
+}
+
+- (void)windowWillExitFullScreen:(NSNotification*)notification {
+    (void)notification;
+    PlatformWindow* window = self.platformWindow;
+    if (!window) return;
+    window->fs_transition = true;
+    window->fs_desired = false;
+}
+
+- (void)windowDidExitFullScreen:(NSNotification*)notification {
+    (void)notification;
+    PlatformWindow* window = self.platformWindow;
+    if (!window) return;
+    window->fs_transition = false;
+    window->fs_restore_held = false;
+    if (window->fs_desired) platform_set_fullscreen(window, true);
 }
 @end
 
@@ -1913,6 +1964,10 @@ PlatformWindow* platform_create_window_ex(int width, int height, const char* tit
     memset(&platformWindow->event_queue, 0, sizeof(EventQueue));
     platformWindow->quit_delegate = nil;
     platformWindow->quit_requested = false;
+    platformWindow->fs_desired = false;
+    platformWindow->fs_transition = false;
+    platformWindow->fs_restore_held = false;
+    memset(&platformWindow->fs_restore, 0, sizeof(PlatformWindowGeometry));
 
     @autoreleasepool {
         // Get the NSApplication
@@ -2001,7 +2056,7 @@ PlatformWindow* platform_create_window_ex(int width, int height, const char* tit
 }
 
 // The current window geometry. The position is frame.origin, the size is the content size.
-void platform_get_window_geometry(PlatformWindow* platformWindow, PlatformWindowGeometry* out) {
+static void window_geometry(PlatformWindow* platformWindow, PlatformWindowGeometry* out) {
     if (!out) return;
     out->x = 0;
     out->y = 0;
@@ -2021,6 +2076,10 @@ void platform_get_window_geometry(PlatformWindow* platformWindow, PlatformWindow
     }
 }
 
+void platform_get_window_geometry(PlatformWindow* platformWindow, PlatformWindowGeometry* out) {
+    window_geometry(platformWindow, out);
+}
+
 // Update the title of the visible window (event time only).
 void platform_set_title(PlatformWindow* platformWindow, const char* title) {
     if (!platformWindow || !title) return;
@@ -2029,21 +2088,49 @@ void platform_set_title(PlatformWindow* platformWindow, const char* title) {
     }
 }
 
-// Make an existing window natively fullscreen (the same toggleFullScreen: as the green button).
-// A titled, resizable window can go fullscreen by default, but FullScreenPrimary is set on
-// collectionBehavior first, to be safe. Already fullscreen is a no-op (no double toggle).
-void platform_enter_fullscreen(PlatformWindow* window) {
+// Ask the window to enter or leave fullscreen (the same toggleFullScreen: transition as the green
+// button). A titled, resizable window can go fullscreen by default, but FullScreenPrimary is set on
+// collectionBehavior first, to be safe.
+//
+// toggleFullScreen: is a toggle, not a set, so the request is compared against the current state
+// and a request arriving while a transition is in flight is only recorded — the delegate applies it
+// when that transition finishes. Asking for the state the window is already in does nothing.
+void platform_set_fullscreen(PlatformWindow* window, bool enable) {
     if (!window) return;
     @autoreleasepool {
         NSWindow* w = window->window;
         if (!w) return;
+        window->fs_desired = enable;
+        if (window->fs_transition) return; // applied by windowDidEnter/ExitFullScreen:
         if (!([w collectionBehavior] & NSWindowCollectionBehaviorFullScreenPrimary)) {
             [w setCollectionBehavior:[w collectionBehavior] | NSWindowCollectionBehaviorFullScreenPrimary];
         }
-        if (!([w styleMask] & NSWindowStyleMaskFullScreen)) {
+        bool is_fullscreen = ([w styleMask] & NSWindowStyleMaskFullScreen) != 0;
+        if (is_fullscreen != enable) {
             [w toggleFullScreen:nil];
         }
     }
+}
+
+// The settled fullscreen state, as the window system reports it. It covers a fullscreen the user
+// started, which is the whole reason this is read rather than remembered from the creation option.
+bool platform_is_fullscreen(PlatformWindow* window) {
+    if (!window || !window->window) return false;
+    @autoreleasepool {
+        return ([window->window styleMask] & NSWindowStyleMaskFullScreen) != 0;
+    }
+}
+
+// The geometry an application should persist. While the window is fullscreen (from the moment the
+// transition starts until the exit transition has finished) that is the snapshot taken before it
+// entered, so persisting it does not save the screen.
+void platform_get_restore_geometry(PlatformWindow* window, PlatformWindowGeometry* out) {
+    if (!out) return;
+    if (window && window->fs_restore_held) {
+        *out = window->fs_restore;
+        return;
+    }
+    window_geometry(window, out);
 }
 
 // ========================================

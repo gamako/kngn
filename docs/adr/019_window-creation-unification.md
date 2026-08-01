@@ -1,13 +1,15 @@
 # ADR-019: Unifying window creation on `createWithOptions`
 
-- Status: Accepted
-- Date: 2026-08-01
+- Status: Accepted (revised: R6 and R7 are superseded by R10)
+- Date: 2026-08-01, revised 2026-08-02
 - Scope: the window creation surface of `core/platform.zig` and the `WindowOptions`
-  type, and how fullscreen combines with the framebuffer modes of
-  [011](011_high-dpi-coordinates-and-fb-modes.md). The present and frame pacing
-  contracts are [002](002_present-blocking-behaviour.md) and
-  [005](005_platform-support-tiers-and-frame-pacing.md); the policy that governs the
-  breaking change made here is [020](020_kit-versioning-and-maturity-gate.md).
+  type, how fullscreen combines with the framebuffer modes of
+  [011](011_high-dpi-coordinates-and-fb-modes.md), and (R10) the live fullscreen
+  state, the run-time transition and the geometry an application persists. The
+  present and frame pacing contracts are [002](002_present-blocking-behaviour.md)
+  and [005](005_platform-support-tiers-and-frame-pacing.md); the policy that governs
+  the breaking change made here is
+  [020](020_kit-versioning-and-maturity-gate.md).
 
 ## Context and problem
 
@@ -152,7 +154,7 @@ backends:
 | `fullscreen` + `fb_mode = .physical` | accepted; R5 defines it per backend |
 | `fullscreen` + `resizable = false` | accepted, and it adds nothing: a fullscreen window offers the user no resizing affordance anyway, and the request cannot stop a compositor from resizing it |
 | The framebuffer size of the first frame | **not guaranteed**; follow `fb.width`/`fb.height` (R3) |
-| `getGeometry` while fullscreen | the current geometry, never a restore geometry (R6) |
+| `getGeometry` while fullscreen | the current geometry, never a restore geometry (R6); the value to persist is `restoreGeometry` (R10) |
 | wasm + `fullscreen` | a **documented no-op**: accepted, and an ordinary canvas-sized window results |
 | null + `fullscreen` | accepted; the requested size is honoured (R3, third class) |
 
@@ -207,33 +209,30 @@ While fullscreen, `getGeometry` returns the window's **current** geometry, expre
 exactly as that backend already expresses it (wayland reports `position = null`; x11
 reports the client origin in root coordinates; Windows reports the window frame
 origin; macOS reports the frame origin with the content size). There is no promise of
-a pre-fullscreen size, and none of the backends stores one.
+a pre-fullscreen size.
 
-The consequence for an application that **persists** its window geometry: a geometry
-saved while fullscreen is the screen geometry, and restoring it produces a
-screen-sized window on the next run. Until a run-time fullscreen state query exists,
-**the application must remember its own intent** — it cannot be recovered from the
-platform. Under `Runtime(App)` that means the App itself, because `windowBootstrap`
-is a static declaration invoked before `App.init` and the shutdown hook does not
-receive the options.
+An application that **persists** its window geometry therefore does not save
+`getGeometry`: saved while fullscreen it is the screen geometry, and restoring it
+produces a screen-sized window on the next run. It saves `restoreGeometry` instead,
+which R10 defines and which equals `getGeometry` whenever the window is not
+fullscreen.
 
-Leaving fullscreen at run time, observing a fullscreen state the *user* initiated
-(the macOS window button, or a window manager shortcut), and a restore geometry are
-deliberately **not** part of this decision. They belong together, because a restore
-geometry is only meaningful once something can leave fullscreen, and a
-creation-time flag cannot describe a state the user changes afterwards.
+### R7. Creation composes two C calls, and the C ABI grows by function
 
-### R7. The C ABI does not change
+Creating a fullscreen window is composed on the Zig side: the extended creation entry
+point, which carries the option flags, followed by the fullscreen transition call.
 
-The macOS side is composed on the Zig side: the extended creation entry point, which
-already carries the option flags, followed by the existing fullscreen entry point.
-Both exist in the Objective-C and the shared Swift implementations, so **none of the
-three native implementations changes**.
+Fullscreen is **not** a flag in the C options struct. The header's contract is that an
+unknown flag makes creation return NULL, so a newer Zig side against an older prebuilt
+native archive would fail at window creation — a run-time failure, and one that has to
+be detected by hand for every flag added. Expressing fullscreen as C **functions**
+instead gives a version skew the opposite failure mode: an undefined symbol at link
+time, which no one can miss and no code has to check for. That is why R10 adds three
+functions to the header rather than a bit to the struct.
 
-Adding a fullscreen flag to the C options struct was rejected: it would touch the
-header and both native implementations, and the header's contract is that an unknown
-flag makes creation return NULL — so a newer Zig side against an older prebuilt
-native archive would fail at window creation rather than degrade.
+The scope of the ABI change is the macOS layer alone: x11, wayland and Windows are
+pure Zig and have no C ABI to skew. External consumers build this repository from
+source, so the link-time failure is the whole exposure.
 
 ### R8. What must be verified, and at which layer
 
@@ -275,13 +274,97 @@ is the point, since it is currently impossible — but does not make it fast. Ma
 usable needs a fixed framebuffer size that presentation scales up to the display area,
 which is a separate decision touching the present path of four backends.
 
+### R10. The live state, the transition, and the geometry to persist
+
+The creation option describes the state a window **starts** in. It cannot describe the
+state a window is in later, because the user changes that too: the macOS window button
+and Cmd+Ctrl+F, a window-manager shortcut on x11, a compositor shortcut on wayland.
+An application that persists its geometry therefore has an unfixable bug for as long as
+the platform offers nothing to read: quitting while the *user* has made the window
+fullscreen saves the screen, and the next run opens screen-sized. Remembering one's own
+intent, which R6 originally proposed, only covers the fullscreen the application asked
+for itself.
+
+Three calls on `Window`, implemented by every backend:
+
+| Call | Contract |
+|---|---|
+| `isFullscreen() bool` | whether the window is fullscreen **now**, whoever made it so. Never fails; false where fullscreen has no meaning (wasm) |
+| `setFullscreen(enable) void` | a **request**, not a result. It returns nothing, because on every backend but Windows the transition is asynchronous (the macOS animation, a wayland configure, an x11 window-manager round trip). The outcome is read back through `isFullscreen`. Asking for the state the window is already in does nothing |
+| `restoreGeometry() WindowGeometry` | the geometry to **persist**: the current geometry while windowed, and the geometry from immediately before the transition while fullscreen |
+
+Design points, each of which was a decision:
+
+- **One `setFullscreen(bool)`, not `enterFullscreen` plus `leaveFullscreen`.** The same
+  reason as R1: one implementation point per backend cannot drift against itself.
+- **No `Event` variant.** A `fullscreen_changed` event would be a better fit for an
+  application that reacts to the change, but adding a variant to the `Event` union
+  breaks the exhaustive `switch` of every consumer at once — the same cost R2 rejected
+  a `WindowMode` enum for. Polling covers the two things that motivated this decision
+  (persisting a geometry, and drawing a state indicator), so the event is left out.
+  Adding it later is compatible with everything here.
+- **`restoreGeometry` rather than `isFullscreen` plus branching in the application.**
+  An application that has to remember to branch is an application that reintroduces the
+  bug, and every caller would write the same branch. The accessor states the intent
+  ("the value to persist") and is identical to `getGeometry` when the window is not
+  fullscreen, so the correct code is also the shorter code.
+- **The basis is each backend's own `getGeometry` basis** — a logical content size, plus
+  a position where the backend can report one — so the value round-trips into
+  `WindowOptions` unchanged. It is *not* unified across backends: wayland still reports
+  `position = null`, x11 the client origin, Windows the window frame origin, macOS the
+  frame origin. A cross-backend position basis is not something a restore geometry can
+  invent, and persistence has always been per-machine.
+- **A window created fullscreen has never been windowed**, so its restore geometry is
+  seeded at creation with the size (and position) that was asked for. That is the
+  application's own intent, and it is the only value in the system that is not the
+  screen.
+
+The contract is one rule — *the last geometry observed while not fullscreen* — and one
+implementation, `RestoreGeometryLatch` in `platform_types.zig`, shared by x11, wayland,
+Windows and the null runtime. macOS holds the same state natively instead, because the
+Zig side has no per-window mutable state there and only the native side sees a
+transition the user starts.
+
+How each backend observes the state:
+
+| Backend | The live state | When the geometry is recorded |
+|---|---|---|
+| macOS | `NSWindow`'s style mask, read through the C ABI | the window delegate's enter-fullscreen callback, held until the exit transition has finished |
+| x11 | `_NET_WM_STATE`, cached | once per poll batch that saw a resize or a `_NET_WM_STATE` change |
+| wayland | the `xdg_toplevel` configure states, split out from the maximised/tiled question the decoration asks | at the ack of a configure, after its size has been applied |
+| Windows | a flag; fullscreen here is an undecorated window this code positions, and Win32 offers the user no way to toggle it | when settled metrics are committed, and immediately before the window is moved to the screen |
+| null / wasm | a stored flag / always false | nothing here resizes, so it is always the current geometry |
+
+**x11 reads the property rather than trusting event order.** The state change and the
+resize arrive as separate events whose order the X server does not fix, so the decision
+is taken once per poll batch, after every event in it, from a fresh read of
+`_NET_WM_STATE`. Reading "now" is conservative in the right direction: a batch that runs
+ahead of a state change keeps the previous windowed geometry rather than recording a
+screen-sized one. Judging by "the window covers the screen" was rejected — on a
+multi-monitor X11 display the root spans every output, so a fullscreen window is smaller
+than the root and the test fails exactly where it is needed.
+
+**R4's refusals are creation-time validation, and `setFullscreen` returns nothing, so a run-time
+transition is not validated the same way.** The one refusal that is a real impossibility rather
+than a documentation stance is Windows plus transparency — a layered-window present over the whole
+screen every frame — so that backend refuses the transition itself and the call is a no-op there.
+
+**macOS drives a toggle, so `setFullscreen` carries a small state machine.**
+`toggleFullScreen:` is a toggle, not a set: it is issued only when the current state
+differs, and a request that arrives while a transition is in flight is recorded and
+applied when that transition finishes, rather than queued as a second toggle. The
+geometry snapshot is held from the start of the enter transition until the exit
+transition has finished, so it also covers the exit animation, during which the window
+still fills the screen.
+
 ## Rejected alternatives
 
 - **A `WindowMode` enum instead of a `bool`.** More expressive, but it forces an
   exhaustive `switch` into every backend, so a later variant breaks all of them at
   once. Fields grow the API without that cost (R2).
-- **A new flag in the C options struct** rather than composing two existing C calls
-  (R7). Rejected for the version-skew failure mode.
+- **A new flag in the C options struct** rather than C functions (R7). Rejected for the
+  version-skew failure mode: an unknown flag fails at run time, an unknown function
+  fails at link time.
 - **Rejecting `fullscreen` on wasm.** It would break cross-platform applications on
   the one platform where the request cannot be honoured at initialisation (R4).
 - **Keeping the backends' `create` / `createFullscreen` declarations** as thin
@@ -292,9 +375,14 @@ which is a separate decision touching the present path of four backends.
   wrapper preserves the old size for the old call (R1, R3).
 - **Accepting `fullscreen` + `borderless`.** It adds no capability and currently
   breaks fullscreen on x11 (R4).
-- **Storing a pre-fullscreen geometry in the backends now.** That is half of the
-  leave-fullscreen design, and doing it early would fix the contract before the
-  transition it exists for (R6).
+- **A `fullscreen_changed` event instead of, or as well as, `isFullscreen`** (R10). The
+  union variant is a cross-cutting break of every consumer's exhaustive `switch`, and
+  polling answers what the two motivating cases need.
+- **Unifying the restore geometry's position basis across backends** (R10). Wayland has
+  no position to give, so the unified value would be "no position anywhere", which is
+  worse than each backend reporting what it can.
+- **Judging fullscreen on x11 by comparing the window size against the screen size**
+  (R10). It breaks on a multi-monitor display, where the root spans every output.
 - **A capability query API** (asking whether a backend supports fullscreen or
   transparency). `error.Unsupported` from the constructor already tells a caller what
   it needs to know for a fixed contract; a query is only useful for an application
@@ -314,11 +402,17 @@ which is a separate decision touching the present path of four backends.
   changes are caught by building the external consumers rather than by a version
   number: the external `.path` consumer, the template gate, and the fullscreen
   example.
-- 016's previous-frame hit-test contract is unaffected while fullscreen is a
-  creation-time option. A future run-time transition would interact with it, because
-  a large resize between frames invalidates the previous frame's rectangles.
+- **016's previous-frame hit-test contract meets a large resize between frames** now
+  that R10 makes the transition reachable at run time: for the one frame after the
+  transition, a pointer is hit-tested against the previous frame's rectangles, which
+  were laid out at the other size. This is the same shape as a drag-resize, which 016
+  already accepts, and the widget rectangles are rebuilt every frame — so it is a
+  one-frame staleness, not a lasting inconsistency. A fullscreen transition is
+  therefore part of what 016's contract is verified against, alongside a resize.
 - Fullscreen stays local UI state: it is not part of the document or action state, and
   so it is not synchronised across peers (014).
+- An application that persists window geometry saves `restoreGeometry` (R10). The one
+  in this repository is the pixel editor.
 
 ## Related
 

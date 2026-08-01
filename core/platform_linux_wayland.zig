@@ -353,6 +353,12 @@ const State = struct {
     pending_decoration_mode: u32 = 0,
     maximized: bool = false, // The maximized and tiled toplevel states (which decide whether the CSD frames fold away)
     pending_maximized: bool = false, // toplevelConfigure latches it from states, and the ack applies it to maximized
+    // Fullscreen on its own (ADR-019 R10). The compositor owns the state, so it is read from the
+    // configure states rather than remembered from the creation option: the user can change it with
+    // a compositor shortcut at any time.
+    fullscreen: bool = false,
+    pending_fullscreen: bool = false, // toplevelConfigure latches it from states, and the ack applies it to fullscreen
+    restore: types.RestoreGeometryLatch = .{ .geometry = .{ .position = null, .size = .{ .width = 0, .height = 0 } } },
     // The CSD subsurfaces (built only while deco_state==.csd). The order is fixed: 0=title, 1=left, 2=right, 3=bottom.
     csd_surfaces: [4]CsdSurface = .{
         .{ .part = .title }, .{ .part = .left }, .{ .part = .right }, .{ .part = .bottom },
@@ -697,6 +703,13 @@ fn xdgSurfaceConfigure(data: ?*anyopaque, xdg_surface: ?*c.struct_xdg_surface, s
             if (st.width != prev_w or st.height != prev_h) st.ct_region_valid = false;
         }
     }
+    // Fullscreen and the geometry to persist (ADR-019 R10). The state and the size travel in the
+    // same configure group, so both are settled here, **after** the size above has been applied:
+    // recording before it would store the fullscreen size as the geometry to restore.
+    st.fullscreen = st.pending_fullscreen;
+    // Only once the buffers exist, which is the same boundary the resize above uses: the configure
+    // that runs during window creation is still looking at the placeholder size.
+    if (st.buffers[0].buffer != null) st.restore.observe(st.fullscreen, currentGeometry(st));
     // Building and repositioning the decoration (only once the buffers exist; during create the first configure is called by create, after setupBuffers).
     if (st.buffers[0].buffer != null) syncDecorations(st);
 }
@@ -704,9 +717,12 @@ fn xdgSurfaceConfigure(data: ?*anyopaque, xdg_surface: ?*c.struct_xdg_surface, s
 fn toplevelConfigure(data: ?*anyopaque, toplevel: ?*c.struct_xdg_toplevel, width: i32, height: i32, states: ?*c.struct_wl_array) callconv(.c) void {
     _ = toplevel;
     const st: *State = @ptrCast(@alignCast(data.?));
-    // Latch states (maximized/fullscreen/tiled), which decide whether the CSD frames fold away. It is
-    // latest-wins, so states is re-read every time and applied at xdg_surface.configure (the ack), in the same sequence as the size.
+    // Latch states (maximized/fullscreen/tiled), which decide whether the CSD frames fold away, and
+    // fullscreen on its own, which is the live window state an application observes (ADR-019 R10).
+    // It is latest-wins, so states is re-read every time and applied at xdg_surface.configure (the
+    // ack), in the same sequence as the size.
     st.pending_maximized = parseMaximized(states);
+    st.pending_fullscreen = parseFullscreen(states);
     // A 0 in xdg-shell means "no size given, the client decides" and is not a minimise. Each configure is
     // latest-wins, so pending is recorded only when both axes are > 0; anything else (a 0 included) clears the
     // stale pending (which stops a value carrying over from the previous group). It is applied at xdg_surface.configure (the ack).
@@ -739,6 +755,22 @@ fn parseMaximized(states: ?*c.struct_wl_array) bool {
             => return true,
             else => {},
         }
+    }
+    return false;
+}
+
+/// Whether the toplevel states array carries the fullscreen state. Unlike `parseMaximized`, which
+/// answers a question about the decoration, this is the window state itself: a maximised or tiled
+/// window is not fullscreen (ADR-019 R10).
+fn parseFullscreen(states: ?*c.struct_wl_array) bool {
+    const arr = states orelse return false;
+    const raw = arr.data orelse return false;
+    const n = arr.size / @sizeOf(u32);
+    if (n == 0) return false;
+    const vals: [*]const u32 = @ptrCast(@alignCast(raw));
+    var i: usize = 0;
+    while (i < n) : (i += 1) {
+        if (vals[i] == c.XDG_TOPLEVEL_STATE_FULLSCREEN) return true;
     }
     return false;
 }
@@ -1553,6 +1585,15 @@ pub const Window = struct {
             .buffer_scale_dirty = true,
             .transparent = opts.transparent,
             .borderless = opts.borderless,
+            .fullscreen = fullscreen,
+            .pending_fullscreen = fullscreen,
+            // Seeded with the size that was asked for — not the 1x1 placeholder — so a window
+            // created fullscreen still reports a geometry an application can persist, having never
+            // been windowed (ADR-019 R10).
+            .restore = .{
+                .geometry = .{ .position = null, .size = .{ .width = req_width, .height = req_height } },
+                .fullscreen = fullscreen,
+            },
         };
         errdefer {
             teardown(st);
@@ -1947,14 +1988,48 @@ pub const Window = struct {
 };
 
 /// The current window geometry. Wayland has no position API, so position=null and only the size is given.
-/// Module level (the facade's `@hasDecl(backend, "getGeometry")` contract; a Window method would not do).
 /// The size is the logical content size (surface-local).
-pub fn getGeometry(win: Window) types.WindowGeometry {
-    const st = win.state;
+fn currentGeometry(st: *State) types.WindowGeometry {
     return .{
         .position = null,
         .size = .{ .width = st.logical_width, .height = st.logical_height },
     };
+}
+
+/// Module level (the facade's `@hasDecl(backend, "getGeometry")` contract; a Window method would not do).
+pub fn getGeometry(win: Window) types.WindowGeometry {
+    return currentGeometry(win.state);
+}
+
+/// Whether the window is fullscreen right now, including a fullscreen the user started with a
+/// compositor shortcut (ADR-019 R10). The value is the one the most recent configure carried, so it
+/// costs nothing to read.
+/// Hot path declaration: event time only.
+pub fn isFullscreen(win: Window) bool {
+    return win.state.fullscreen;
+}
+
+/// Ask the compositor to enter or leave fullscreen. `output = null` lets the compositor pick the
+/// output the surface is on, the same choice window creation makes. It is a request: the compositor
+/// answers with a configure, and `isFullscreen` reports the state from that.
+/// Hot path declaration: event time only.
+pub fn setFullscreen(win: Window, enable: bool) void {
+    const st = win.state;
+    const toplevel = st.toplevel orelse return;
+    if (enable) {
+        c.xdg_toplevel_set_fullscreen(toplevel, null);
+    } else {
+        c.xdg_toplevel_unset_fullscreen(toplevel);
+    }
+    _ = c.wl_display_flush(st.display);
+}
+
+/// The geometry an application should persist (ADR-019 R10): the current one while windowed, and
+/// the one held from before the transition while fullscreen.
+/// Hot path declaration: window shutdown and event time only.
+pub fn restoreGeometry(win: Window) types.WindowGeometry {
+    const st = win.state;
+    return st.restore.get(currentGeometry(st));
 }
 
 // ---- the system cursor ----

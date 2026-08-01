@@ -407,6 +407,62 @@ pub const Window = struct {
         return .{ .position = null, .size = .{ .width = 0, .height = 0 } };
     }
 
+    /// Whether the window is fullscreen **right now**, including a fullscreen the user started with
+    /// the window button, Cmd+Ctrl+F, or a window-manager shortcut (ADR-019 R10). It cannot be
+    /// derived from `WindowOptions.fullscreen`, which is only the state the window was created in.
+    ///
+    /// Always false on wasm, where fullscreen is a documented no-op (ADR-019 R4).
+    /// Hot path declaration: event time only. Every backend answers from a cached state, so this
+    /// costs no round trip to the window system.
+    pub fn isFullscreen(self: Window) bool {
+        if (comptime null_runtime_supported) {
+            if (self.inner == .null_win) return null_backend.isFullscreen(self.inner.null_win);
+        }
+        return native_backend.isFullscreen(self.inner.native);
+    }
+
+    /// Ask the window to enter or leave fullscreen. This is a **request, not a result**: on every
+    /// windowing backend but Windows the transition is asynchronous (the macOS animation, a wayland
+    /// configure, an x11 window-manager round trip), so it is observed afterwards through
+    /// `isFullscreen` rather than returned here. Asking for the state the window is already in does
+    /// nothing, and on wasm the call is a documented no-op.
+    ///
+    /// Leaving fullscreen restores the geometry the window had before it entered. The size the
+    /// application sees changes across the transition like any other resize, so it keeps following
+    /// `fb.width`/`fb.height` each frame (ADR-019 R3).
+    ///
+    /// Unlike creation, this is not validated against the option combinations of ADR-019 R4: it
+    /// returns nothing, so there is nothing to report. A **transparent window on Windows** refuses
+    /// the transition (a layered-window present cannot cover a whole screen every frame), which is
+    /// the one refusal that is an impossibility rather than a caution.
+    /// Hot path declaration: event time only.
+    pub fn setFullscreen(self: Window, enable: bool) void {
+        if (comptime null_runtime_supported) {
+            if (self.inner == .null_win) {
+                null_backend.setFullscreen(self.inner.null_win, enable);
+                return;
+            }
+        }
+        native_backend.setFullscreen(self.inner.native, enable);
+    }
+
+    /// The geometry an application should **persist**: the current geometry while the window is
+    /// windowed, and the geometry it had immediately before it entered fullscreen while it is
+    /// fullscreen (ADR-019 R10). Same basis as `getGeometry`, so the value round-trips into
+    /// `WindowOptions` unchanged.
+    ///
+    /// This is what a window-geometry persistence layer saves. `getGeometry` reports the *current*
+    /// geometry and nothing else (ADR-019 R6), so saving that while fullscreen stores the screen and
+    /// the next run opens a screen-sized window. A window created fullscreen has never been
+    /// windowed, and reports the size it was created with.
+    /// Hot path declaration: window shutdown and event time only.
+    pub fn restoreGeometry(self: Window) WindowGeometry {
+        if (comptime null_runtime_supported) {
+            if (self.inner == .null_win) return null_backend.restoreGeometry(self.inner.null_win);
+        }
+        return native_backend.restoreGeometry(self.inner.native);
+    }
+
     pub fn destroy(self: Window) void {
         // Clearing the callback goes through the facade/backend private clear path rather than passing null
         // to the public setRedrawCallback. It guards against a late setFrameSize after destroy.

@@ -615,3 +615,17 @@ fn setMaxFrameLatency(device: *ID3D11Device) void {
 pub fn getGeometry(window: Window) @import("platform_types").WindowGeometry {
     return window.core.getGeometry();
 }
+
+/// Fullscreen: the live state, the transition, and the geometry to persist (ADR-019 R10).
+/// Module level, like `getGeometry`.
+pub fn isFullscreen(window: Window) bool {
+    return window.core.isFullscreen();
+}
+
+pub fn setFullscreen(window: Window, enable: bool) void {
+    window.core.setFullscreen(enable);
+}
+
+pub fn restoreGeometry(window: Window) @import("platform_types").WindowGeometry {
+    return window.core.restoreGeometry();
+}

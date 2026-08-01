@@ -4,6 +4,9 @@ const std = @import("std");
 const platform = @import("platform");
 const command_types = @import("command_types");
 
+/// A null `Window` built by hand, with no allocation and no backend behind it. It leaves the null
+/// backend's mutable state at its default (the shared detached state), which is enough for the
+/// no-op and size contracts these tests check.
 fn nullWindow(w: u32, h: u32) platform.Window {
     return .{ .inner = .{ .null_win = .{ .pixels = &.{}, .width = w, .height = h } } };
 }

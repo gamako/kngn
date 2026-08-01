@@ -30,6 +30,9 @@ const Command = command_types.Command;
 
 const gpa = std.heap.page_allocator;
 
+/// The state shared by every `Window` that was not built by `createWithOptions` (see `Window.state`).
+var detached_state: Window.State = .{};
+
 pub fn init() Error!void {}
 
 pub fn shutdown() void {}
@@ -84,6 +87,22 @@ pub fn getGeometry(win: Window) WindowGeometry {
     };
 }
 
+/// Whether the window is fullscreen (ADR-019 R10). Nothing displays it, so this is exactly what was
+/// asked for — which is what makes the headless runtime a usable oracle for the state contract.
+pub fn isFullscreen(win: Window) bool {
+    return win.state.fullscreen;
+}
+
+/// Enter or leave fullscreen. There is no screen to fill, so the state changes and the size does not.
+pub fn setFullscreen(win: Window, enable: bool) void {
+    win.state.fullscreen = enable;
+}
+
+/// The geometry to persist. Nothing here ever resizes a window, so it is always the current geometry.
+pub fn restoreGeometry(win: Window) WindowGeometry {
+    return getGeometry(win);
+}
+
 pub fn saveFileDialog(_: std.mem.Allocator, _: std.Io, _: SaveDialogOptions) (DialogError || std.mem.Allocator.Error)!?[]u8 {
     return error.DialogFailed;
 }
@@ -129,12 +148,26 @@ pub const Window = struct {
     pixels: []u32,
     width: u32,
     height: u32,
+    /// The state a call can change. `Window` is a value the facade copies around, so anything
+    /// mutable lives behind this pointer rather than in the value itself. A `Window` built by hand
+    /// rather than by `createWithOptions` — a facade contract test with no backend behind it —
+    /// shares `detached_state`, which is never freed.
+    state: *State = &detached_state,
+
+    /// There is no screen and no user here, so fullscreen is a state and nothing else: no size ever
+    /// changes, and the geometry to persist is always the current one (ADR-019 R10).
+    pub const State = struct {
+        fullscreen: bool = false,
+    };
 
     fn allocBuffer(width: u32, height: u32) Error!Window {
         const n = @as(usize, width) * @as(usize, height);
         const pixels = gpa.alloc(u32, n) catch return error.WindowCreationFailed;
         @memset(pixels, 0);
-        return .{ .pixels = pixels, .width = width, .height = height };
+        errdefer gpa.free(pixels);
+        const state = gpa.create(State) catch return error.WindowCreationFailed;
+        state.* = .{};
+        return .{ .pixels = pixels, .width = width, .height = height, .state = state };
     }
 
     /// The single window creation entry point of this backend (ADR-019 R1).
@@ -142,18 +175,21 @@ pub const Window = struct {
         _ = title;
         // No scale support: .physical is accepted too, with contentScale=1 and logical==framebuffer (never Unsupported).
         _ = opts.fb_mode;
-        // There is no screen here, so fullscreen has no size of its own to resolve: the requested
-        // size is honoured as-is (ADR-019 R3, the third class).
-        _ = opts.fullscreen;
         // Nothing displays the window, so there is no user to resize it.
         _ = opts.resizable;
         const w = if (opts.size) |s| s.width else width;
         const h = if (opts.size) |s| s.height else height;
-        return allocBuffer(w, h);
+        var win = try allocBuffer(w, h);
+        // There is no screen here, so fullscreen has no size of its own to resolve: the requested
+        // size is honoured as-is (ADR-019 R3, the third class). The state is still recorded, so that
+        // `isFullscreen` answers for a window created fullscreen too (ADR-019 R10).
+        win.state.fullscreen = opts.fullscreen;
+        return win;
     }
 
     pub fn destroy(self: Window) void {
         if (self.pixels.len > 0) gpa.free(self.pixels);
+        if (self.state != &detached_state) gpa.destroy(self.state);
     }
 
     pub fn pollEvents(self: Window) bool {
@@ -291,6 +327,39 @@ test "null window: fullscreen honours the requested size, and geometry has posit
     const geo = getGeometry(win);
     try testing.expect(geo.position == null);
     try testing.expectEqual(@as(u32, 640), geo.size.width);
+    // A window created fullscreen reports so, which is what an application needs to know before it
+    // persists a geometry.
+    try testing.expect(isFullscreen(win));
+}
+
+test "null window: the fullscreen state follows setFullscreen and nothing resizes" {
+    var win = try Window.createWithOptions(320, 240, "t", .{});
+    defer win.destroy();
+    try testing.expect(!isFullscreen(win));
+
+    setFullscreen(win, true);
+    try testing.expect(isFullscreen(win));
+    // Asking twice is not a toggle.
+    setFullscreen(win, true);
+    try testing.expect(isFullscreen(win));
+
+    setFullscreen(win, false);
+    try testing.expect(!isFullscreen(win));
+
+    // There is no screen here, so the size is unaffected either way and the geometry to persist is
+    // always the current one.
+    try testing.expectEqual(@as(u32, 320), win.width);
+    try testing.expectEqualDeep(getGeometry(win), restoreGeometry(win));
+}
+
+test "null window: the state survives being copied by value" {
+    // `Window` is a value the facade copies into its own union, so the state a call changes has to
+    // outlive the copy.
+    var win = try Window.createWithOptions(64, 64, "t", .{});
+    defer win.destroy();
+    const copy = win;
+    setFullscreen(copy, true);
+    try testing.expect(isFullscreen(win));
 }
 
 test "null window: fullscreen with .physical keeps scale 1 and the requested size" {

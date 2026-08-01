@@ -30,12 +30,6 @@ bool platform_init(void);
 PlatformWindow* platform_create_window(int width, int height, const char* title,
                                        FrameCallback callback, void* userdata);
 
-// Turn an already-created window into a real fullscreen window.
-// The Zig side calls this right after platform_create_window_ex when the fullscreen option is set,
-// which is how fullscreen is composed without adding a creation flag. On macOS this is NSWindow's
-// toggleFullScreen: (the same as the green button; a no-op when the window is already fullscreen).
-void platform_enter_fullscreen(PlatformWindow* window);
-
 // ========================================
 // Transparent / borderless windows and interactive drag-to-move
 // ========================================
@@ -86,6 +80,36 @@ PlatformWindow* platform_create_window_ex(int width, int height, const char* tit
 // Read the current window geometry. A NULL window or a NULL out is a no-op.
 // On failure out is zero-filled and nothing crashes (the position is reported as not VALID).
 void platform_get_window_geometry(PlatformWindow* window, PlatformWindowGeometry* out);
+
+// ========================================
+// Fullscreen: the live state, the transition, and the geometry to persist
+// ========================================
+//
+// Fullscreen is a state the *user* can change too (the green button, Cmd+Ctrl+F), so it cannot be
+// tracked from the creation option alone. The three calls below are the whole surface: ask for a
+// state, read the settled state, and read the geometry an application should persist.
+//
+// A version skew here fails at link time with an undefined symbol, which is why fullscreen is
+// expressed as functions rather than as another flag in PlatformWindowOptions: an unknown flag
+// has to be detected at run time instead (see platform_create_window_ex above).
+
+// Ask the window to enter or leave fullscreen. On macOS this drives NSWindow's toggleFullScreen:
+// (the same transition as the green button), which is **asynchronous**: this call returns before
+// the state changes, and a request made during a transition is applied when that one finishes.
+// Asking for the state the window is already in is a no-op. The Zig side calls it right after
+// platform_create_window_ex when the fullscreen creation option is set.
+void platform_set_fullscreen(PlatformWindow* window, bool enable);
+
+// Whether the window is fullscreen right now, including a fullscreen the user started.
+// A NULL window is false.
+bool platform_is_fullscreen(PlatformWindow* window);
+
+// Read the geometry an application should persist: the current geometry while the window is
+// windowed, and the geometry it had immediately before it entered fullscreen while it is
+// fullscreen (or leaving it). Same basis and same failure behaviour as
+// platform_get_window_geometry. A window created fullscreen reports the geometry it was created
+// with, since it has never been windowed.
+void platform_get_restore_geometry(PlatformWindow* window, PlatformWindowGeometry* out);
 
 // Update the title of a visible window (event time only).
 void platform_set_title(PlatformWindow* window, const char* title);

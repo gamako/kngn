@@ -158,6 +158,8 @@ const CW_USEDEFAULT: c_int = @bitCast(@as(u32, 0x80000000));
 const SW_SHOW: c_int = 5;
 const PM_REMOVE: UINT = 0x0001;
 const GWLP_USERDATA: c_int = -21;
+const GWL_STYLE: c_int = -16; // the window style (read and written for the fullscreen transition)
+const SWP_FRAMECHANGED: UINT = 0x0020; // recompute the frame after a style change
 const IDC_ARROW: usize = 32512;
 
 const WM_DESTROY: UINT = 0x0002;
@@ -509,6 +511,17 @@ pub const Core = struct {
     layer_w: u32 = 0,
     layer_h: u32 = 0,
 
+    // Fullscreen (ADR-019 R10). Fullscreen here is an undecorated window covering the monitor, put
+    // there by this code, and Win32 offers the user no way to toggle it — so this flag *is* the
+    // state, and nothing has to be read back from the window system.
+    fullscreen: bool = false,
+    /// The style and outer frame to put back when leaving fullscreen. The frame is in physical
+    /// screen pixels, because that is what SetWindowPos takes; the geometry an application persists
+    /// is the logical one the latch holds.
+    windowed_style: DWORD = 0,
+    windowed_frame: RECT = .{ .left = 0, .top = 0, .right = 0, .bottom = 0 },
+    restore: types.RestoreGeometryLatch = .{ .geometry = .{ .position = null, .size = .{ .width = 0, .height = 0 } } },
+
     fn enqueue(self: *Core, ev: Event) void {
         self.queue.enqueue(ev);
     }
@@ -631,6 +644,22 @@ pub const Core = struct {
             // borderless: client == window. Without an explicit position it stays CW_USEDEFAULT.
         }
 
+        // The style and outer frame that leaving fullscreen puts back. A window created windowed
+        // gets its real frame from GetWindowRect the moment it enters fullscreen; this is the value
+        // for a window created fullscreen, which never had a windowed frame — the size that was
+        // asked for, at the position that was asked for (ADR-019 R10).
+        const windowed_style: DWORD = windowStyleFor(false, borderless, opts.resizable);
+        const windowed_client_w: u32 = if (!fullscreen) client_w else if (create_as_pmv2) roundToPhysicalPx(logical_w, create_scale) else logical_w;
+        const windowed_client_h: u32 = if (!fullscreen) client_h else if (create_as_pmv2) roundToPhysicalPx(logical_h, create_scale) else logical_h;
+        var windowed_frame = RECT{ .left = 0, .top = 0, .right = @intCast(windowed_client_w), .bottom = @intCast(windowed_client_h) };
+        // Best effort: when the frame cannot be computed the client rect stands in for it.
+        if (!borderless) _ = AdjustWindowRectEx(&windowed_frame, windowed_style, 0, ex_style);
+        if (opts.position) |pos| {
+            const fw = windowed_frame.right - windowed_frame.left;
+            const fh = windowed_frame.bottom - windowed_frame.top;
+            windowed_frame = .{ .left = pos.x, .top = pos.y, .right = pos.x + fw, .bottom = pos.y + fh };
+        }
+
         const core = alloc.create(Core) catch {
             restoreThreadDpiAwareness();
             return error.WindowCreationFailed;
@@ -685,6 +714,16 @@ pub const Core = struct {
             .redraw_ctx = undefined,
             .redraw_fn = null,
             .transparent = opts.transparent,
+            .fullscreen = fullscreen,
+            .windowed_style = windowed_style,
+            .windowed_frame = windowed_frame,
+            .restore = .{
+                .geometry = .{
+                    .position = if (opts.position) |pos| .{ .x = pos.x, .y = pos.y } else null,
+                    .size = .{ .width = logical_w, .height = logical_h },
+                },
+                .fullscreen = fullscreen,
+            },
         };
 
         const hwnd = CreateWindowExW(
@@ -861,6 +900,9 @@ pub const Core = struct {
             self.scale_epoch +%= 1;
         }
         self.metrics_dirty = false;
+        // The geometry to persist follows every settled size, so leaving fullscreen moves it back
+        // onto the restored window (ADR-019 R10). A change made while fullscreen is discarded by the latch.
+        self.restore.observe(self.fullscreen, self.getGeometry());
     }
 
     /// The current window geometry. The position comes from GetWindowRect.
@@ -878,6 +920,67 @@ pub const Core = struct {
             .position = if (have_pos) .{ .x = wr.left, .y = wr.top } else null,
             .size = .{ .width = self.logical_width, .height = self.logical_height },
         };
+    }
+
+    /// Whether the window is fullscreen right now (ADR-019 R10). Fullscreen here is a window this
+    /// code positions and styles itself, and Win32 gives the user no way to toggle it, so the flag
+    /// is the state — there is nothing to read back from the window system.
+    /// Hot path declaration: event time only.
+    pub fn isFullscreen(self: *Core) bool {
+        return self.fullscreen;
+    }
+
+    /// Enter or leave fullscreen: an undecorated window covering the primary monitor, or the style
+    /// and frame the window had before. Unlike the other platforms this takes effect immediately,
+    /// but the framebuffer still follows the resulting WM_SIZE through the ordinary pending-metrics
+    /// path, so an application reads its size from the frame as always (ADR-019 R3).
+    /// Asking for the state the window is already in does nothing, and a transparent window refuses
+    /// the transition outright: transparency selects an `UpdateLayeredWindow` present, which is not
+    /// viable for a whole screen every frame — the same reason creation refuses the combination
+    /// (ADR-019 R4).
+    /// Hot path declaration: event time only.
+    pub fn setFullscreen(self: *Core, enable: bool) void {
+        if (self.fullscreen == enable) return;
+        if (self.transparent) return;
+        if (enable) {
+            const sw = GetSystemMetrics(SM_CXSCREEN);
+            const sh = GetSystemMetrics(SM_CYSCREEN);
+            if (sw <= 0 or sh <= 0) return; // the monitor metrics are unreadable: stay windowed
+            // Both the frame to put back and the geometry to persist are settled *before* the window
+            // moves, because afterwards the window is the screen.
+            var wr = RECT{ .left = 0, .top = 0, .right = 0, .bottom = 0 };
+            if (GetWindowRect(self.hwnd, &wr) != 0) self.windowed_frame = wr;
+            self.windowed_style = @truncate(@as(usize, @bitCast(GetWindowLongPtrW(self.hwnd, GWL_STYLE))));
+            const windowed_geo = self.getGeometry();
+            self.restore.observe(false, windowed_geo); // the last windowed geometry
+            self.restore.observe(true, windowed_geo); // from here on the window is the screen
+            self.fullscreen = true;
+            // WS_VISIBLE is carried across both style writes: the window is already shown, and a
+            // style that drops the bit hides it. hWndInsertAfter = null is HWND_TOP.
+            _ = SetWindowLongPtrW(self.hwnd, GWL_STYLE, @bitCast(@as(usize, windowStyleFor(true, false, true) | WS_VISIBLE)));
+            _ = SetWindowPos(self.hwnd, null, 0, 0, sw, sh, SWP_FRAMECHANGED | SWP_NOACTIVATE);
+        } else {
+            self.fullscreen = false;
+            _ = SetWindowLongPtrW(self.hwnd, GWL_STYLE, @bitCast(@as(usize, self.windowed_style | WS_VISIBLE)));
+            const fr = self.windowed_frame;
+            _ = SetWindowPos(
+                self.hwnd,
+                null,
+                fr.left,
+                fr.top,
+                fr.right - fr.left,
+                fr.bottom - fr.top,
+                SWP_FRAMECHANGED | SWP_NOACTIVATE,
+            );
+            // The resulting WM_SIZE settles the real size, and the latch follows it at the next commit.
+        }
+    }
+
+    /// The geometry an application should persist (ADR-019 R10): the current one while windowed, and
+    /// the one held from before the transition while fullscreen.
+    /// Hot path declaration: window shutdown and event time only.
+    pub fn restoreGeometry(self: *Core) types.WindowGeometry {
+        return self.restore.get(self.getGeometry());
     }
 
     /// The present of a transparent window: it displays the premultiplied BGRA backing by compositing it with

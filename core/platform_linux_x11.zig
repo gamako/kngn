@@ -290,6 +290,17 @@ const State = struct {
     own_gc: bool = false, // Whether st.gc was made here with XCreateGC (for a transparent window; destroy XFreeGC's it)
     ct_region_valid: bool = false, // Whether the click-through input shape has been set (unset means the next present computes it once)
 
+    // Fullscreen (ADR-019 R10). The window manager owns the state, so it is read from
+    // `_NET_WM_STATE` rather than remembered from the creation option: the user can change it with
+    // a window-manager shortcut at any time.
+    net_wm_state: c.Atom = 0,
+    net_wm_state_fullscreen: c.Atom = 0,
+    fullscreen: bool = false,
+    /// Set while a poll batch has seen something that can change either the state or the size, so
+    /// that the geometry to persist is settled once per batch instead of once per event.
+    fullscreen_recheck: bool = false,
+    restore: types.RestoreGeometryLatch = .{ .geometry = .{ .position = null, .size = .{ .width = 0, .height = 0 } } },
+
     fn enqueue(self: *State, ev: Event) void {
         self.queue.enqueue(ev);
     }
@@ -374,7 +385,7 @@ pub const Window = struct {
             attrs.colormap = colormap;
             attrs.border_pixel = 0;
             attrs.background_pixel = 0; // a transparent background
-            attrs.event_mask = c.ExposureMask | c.StructureNotifyMask |
+            attrs.event_mask = c.ExposureMask | c.StructureNotifyMask | c.PropertyChangeMask |
                 c.KeyPressMask | c.KeyReleaseMask |
                 c.ButtonPressMask | c.ButtonReleaseMask | c.PointerMotionMask;
             const valuemask: c_ulong = c.CWColormap | c.CWBorderPixel | c.CWBackPixel | c.CWEventMask;
@@ -407,7 +418,9 @@ pub const Window = struct {
         }
 
         _ = c.XStoreName(dpy, win, title.ptr);
-        _ = c.XSelectInput(dpy, win, c.ExposureMask | c.StructureNotifyMask |
+        // PropertyChangeMask delivers the `_NET_WM_STATE` change the window manager makes when the
+        // user goes fullscreen with a window-manager shortcut (ADR-019 R10).
+        _ = c.XSelectInput(dpy, win, c.ExposureMask | c.StructureNotifyMask | c.PropertyChangeMask |
             c.KeyPressMask | c.KeyReleaseMask |
             c.ButtonPressMask | c.ButtonReleaseMask | c.PointerMotionMask);
 
@@ -504,6 +517,21 @@ pub const Window = struct {
             .buttons = .{},
             .keys = .{},
             .detectable_repeat = g_detectable_repeat,
+            .net_wm_state = c.XInternAtom(dpy, "_NET_WM_STATE", 0),
+            .net_wm_state_fullscreen = c.XInternAtom(dpy, "_NET_WM_STATE_FULLSCREEN", 0),
+            // The state asked for at creation. A window manager that refuses it corrects this at the
+            // first `_NET_WM_STATE` PropertyNotify (ADR-019 R10).
+            .fullscreen = fullscreen,
+            // Seeded with the size that was asked for — not the screen size a fullscreen window
+            // resolves for itself — so a window created fullscreen still reports a geometry an
+            // application can persist, having never been windowed.
+            .restore = .{
+                .geometry = .{
+                    .position = if (opts.position) |p| .{ .x = p.x, .y = p.y } else null,
+                    .size = .{ .width = width, .height = height },
+                },
+                .fullscreen = fullscreen,
+            },
         };
 
         // Set up the blit (shm when XShm is available, XPutImage when it is not or it fails).
@@ -559,6 +587,10 @@ pub const Window = struct {
                     const cw: u32 = @intCast(ev.xconfigure.width);
                     const ch: u32 = @intCast(ev.xconfigure.height);
                     applyConfigureSize(st, cw, ch);
+                    st.fullscreen_recheck = true;
+                },
+                c.PropertyNotify => {
+                    if (ev.xproperty.atom == st.net_wm_state) st.fullscreen_recheck = true;
                 },
                 c.Expose => {}, // present is called every frame, so this is a no-op
                 c.KeyPress => handleKeyPress(st, &ev.xkey),
@@ -568,6 +600,17 @@ pub const Window = struct {
                 c.MotionNotify => handleMotion(st, &ev.xmotion),
                 else => {},
             }
+        }
+        // The state and the size arrive as separate events whose order the X server does not fix, so
+        // the fullscreen state is settled **once per batch**, after every event in it has been
+        // applied, and the geometry to persist is recorded from that one decision. Reading the
+        // property here rather than trusting the notification's arrival order means the value is the
+        // window manager's current one; a batch that runs slightly ahead of a state change therefore
+        // keeps the previous windowed geometry rather than recording a screen-sized one.
+        if (st.fullscreen_recheck) {
+            st.fullscreen_recheck = false;
+            st.fullscreen = queryNetWmStateFullscreen(st);
+            st.restore.observe(st.fullscreen, currentGeometry(st));
         }
         return !st.quit_delivered;
     }
@@ -758,9 +801,7 @@ pub const Window = struct {
 /// The current window geometry.
 /// The position is the client origin in root coordinates (XTranslateCoordinates). On failure it is position=null.
 /// The size is the **logical** content (`logical_width/height`). Restoring uses the same basis, through WM_NORMAL_HINTS's StaticGravity.
-/// Module level (the facade's `@hasDecl(backend, "getGeometry")` contract; a Window method would not do).
-pub fn getGeometry(win: Window) types.WindowGeometry {
-    const st = win.state;
+fn currentGeometry(st: *State) types.WindowGeometry {
     var root_x: c_int = 0;
     var root_y: c_int = 0;
     var child: c.Window = undefined;
@@ -769,6 +810,75 @@ pub fn getGeometry(win: Window) types.WindowGeometry {
         .position = if (ok != 0) .{ .x = root_x, .y = root_y } else null,
         .size = .{ .width = st.logical_width, .height = st.logical_height },
     };
+}
+
+/// Module level (the facade's `@hasDecl(backend, "getGeometry")` contract; a Window method would not do).
+pub fn getGeometry(win: Window) types.WindowGeometry {
+    return currentGeometry(win.state);
+}
+
+/// Read `_NET_WM_STATE` and report whether it carries `_NET_WM_STATE_FULLSCREEN`. This is one round
+/// trip to the X server, so it is called at an event boundary and its result is cached; a window
+/// manager that publishes no such property (or none at all) reads as not fullscreen.
+/// Hot path declaration: event time only (a poll batch that saw a resize or a property change).
+fn queryNetWmStateFullscreen(st: *State) bool {
+    if (st.net_wm_state == 0 or st.net_wm_state_fullscreen == 0) return false;
+    var actual_type: c.Atom = 0;
+    var actual_format: c_int = 0;
+    var nitems: c_ulong = 0;
+    var bytes_after: c_ulong = 0;
+    var data: [*c]u8 = null;
+    // A generous length in 32-bit words: `_NET_WM_STATE` is a short atom list, so one request reads it whole.
+    const status = c.XGetWindowProperty(st.display, st.window, st.net_wm_state, 0, 64, 0, c.XA_ATOM, &actual_type, &actual_format, &nitems, &bytes_after, &data);
+    if (status != 0 or data == null) return false; // Xlib's Success is 0
+    defer _ = c.XFree(data);
+    if (actual_type != c.XA_ATOM or actual_format != 32) return false;
+    // format=32 means an element is a long, which is 64 bits wide on a 64-bit build.
+    const atoms: [*]const c_ulong = @ptrCast(@alignCast(data));
+    var i: usize = 0;
+    while (i < nitems) : (i += 1) {
+        if (atoms[i] == st.net_wm_state_fullscreen) return true;
+    }
+    return false;
+}
+
+/// Whether the window is fullscreen right now, including a fullscreen the user started with a
+/// window-manager shortcut (ADR-019 R10). The cached value is settled once per poll batch, so this
+/// costs no round trip and follows the same event boundary as every other observation.
+/// Hot path declaration: event time only.
+pub fn isFullscreen(win: Window) bool {
+    return win.state.fullscreen;
+}
+
+/// Ask the window manager to enter or leave fullscreen. The window is mapped by the time it exists,
+/// so the request takes the `_NET_WM_STATE` client message EWMH defines rather than a direct
+/// property write (which a window manager only honours before the map, as window creation does). It
+/// is a request: the result is observed through `isFullscreen` once the manager has answered.
+/// Hot path declaration: event time only.
+pub fn setFullscreen(win: Window, enable: bool) void {
+    const st = win.state;
+    if (st.net_wm_state == 0 or st.net_wm_state_fullscreen == 0) return;
+    const root = c.XDefaultRootWindow(st.display);
+    var ev = std.mem.zeroes(c.XEvent);
+    ev.xclient.type = c.ClientMessage;
+    ev.xclient.window = st.window;
+    ev.xclient.message_type = st.net_wm_state;
+    ev.xclient.format = 32;
+    ev.xclient.data.l[0] = if (enable) 1 else 0; // _NET_WM_STATE_ADD / _NET_WM_STATE_REMOVE
+    ev.xclient.data.l[1] = @intCast(st.net_wm_state_fullscreen);
+    ev.xclient.data.l[2] = 0; // no second property
+    ev.xclient.data.l[3] = 1; // the source is a normal application
+    ev.xclient.data.l[4] = 0;
+    _ = c.XSendEvent(st.display, root, 0, c.SubstructureNotifyMask | c.SubstructureRedirectMask, &ev);
+    _ = c.XFlush(st.display);
+}
+
+/// The geometry an application should persist (ADR-019 R10): the current one while windowed, and
+/// the one held from before the transition while fullscreen.
+/// Hot path declaration: window shutdown and event time only.
+pub fn restoreGeometry(win: Window) types.WindowGeometry {
+    const st = win.state;
+    return st.restore.get(currentGeometry(st));
 }
 
 /// Create an X11 Cursor for a CursorShape (0=None on failure). default and crosshair come from the

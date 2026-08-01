@@ -53,18 +53,27 @@ Prefer `kit.app_runtime.Runtime(App)` over a hand-written event loop. The app pr
 `windowBootstrap` is how an app asks for anything beyond a plain window — a physical-resolution
 framebuffer (`.fb_mode = .physical`), a transparent or borderless window, an initial position, a
 window the user cannot resize (`.resizable = false`), or **fullscreen** (`.fullscreen = true`).
-The rules are in ADR-019: fullscreen is an initial state rather than a transition, its size is a
-request the platform may replace (follow `fb.width` / `fb.height` each frame), and it cannot be
-combined with `position`, `borderless` or `transparent` (those give `error.Unsupported`). On the web
-it is accepted but has no effect, because the browser needs a user gesture to enter fullscreen.
-`resizable = false` holds on macOS and Windows but is only advice to a window manager or compositor
-on Linux, and a no-op on the web, so it never promises a fixed framebuffer size.
+The rules are in ADR-019: the option is the *initial* state, its size is a request the platform may
+replace (follow `fb.width` / `fb.height` each frame), and it cannot be combined with `position`,
+`borderless` or `transparent` (those give `error.Unsupported`). On the web it is accepted but has no
+effect, because the browser needs a user gesture to enter fullscreen. `resizable = false` holds on
+macOS and Windows but is only advice to a window manager or compositor on Linux, and a no-op on the
+web, so it never promises a fixed framebuffer size.
 
-If the app also **persists its window geometry** (`kit.appshell`'s window state), note that
-`getGeometry` reports the *current* geometry: saved while fullscreen, it restores as a
-screen-sized window. The platform has no run-time fullscreen query yet, so an app that asks for
-fullscreen has to remember that it did — `windowBootstrap` runs before `init`, so keep the flag
-somewhere the shutdown path can read.
+At run time the window carries three more calls:
+
+- `win.isFullscreen()` — whether it is fullscreen **now**, including a fullscreen the user started
+  with the window button, Cmd+Ctrl+F or a window-manager shortcut.
+- `win.setFullscreen(enable)` — enter or leave. It is a request: the transition is asynchronous
+  everywhere but Windows, so the result is read back through `isFullscreen()`. Leaving restores the
+  geometry the window had before it entered.
+- `win.restoreGeometry()` — the geometry to **persist**.
+
+If the app persists its window geometry (`kit.appshell`'s window state), save
+`restoreGeometry()`, not `getGeometry()`. `getGeometry` reports the *current* geometry, so saving it
+while fullscreen stores the screen and the next run opens a screen-sized window;
+`restoreGeometry` reports the pre-fullscreen geometry instead, and is identical to `getGeometry`
+whenever the window is not fullscreen.
 
 Native entry:
 
