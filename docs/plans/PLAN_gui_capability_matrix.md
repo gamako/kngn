@@ -116,7 +116,27 @@ The missing section shows these 15 items: Accordion, Alert / Message Dialog, Bre
 
 ### Disabled
 
-There is no shared disabled property. The gallery shows `PopupItem.enabled` and `Command.enabled` individually; general widget disabled is N/A. Only stepgrid `editable=false` is a partial case.
+A shared disabled scope now exists: `Context.beginDisabled()` / `endDisabled()` / `isDisabled()`, nestable,
+wired into `behaviorFromCache` (covers button / colorSwatch / iconButton / checkbox / toggle / radio /
+beginCollapsible / tabId) plus `sliderCore` and `textInputId` directly. A disabled widget leaves the Tab
+order, never hit-tests, and releases any focus/hover/active it held before becoming disabled; the four
+representative widgets (button/checkbox/toggle/radio/slider/textInputId) also draw with
+`Style.disabledColor`.
+
+Two widgets remain outside this scope by construction, because each hand-assembles its own hit-test instead
+of calling `behaviorFromCache`, and neither consults `ctx.isDisabled()`:
+
+- `gui.stepgrid.widgetRow` (calls `buttonBehavior` directly). §16.1 (the tracker/session grid shell) hits
+  this directly: wrapping a `stepgrid.widgetRow` call in `beginDisabled`/`endDisabled` has no effect, so the
+  example substitutes the widget's own `editable=false` option, which suppresses clicks but draws no
+  grayed-out look.
+- `gui.beginListboxRow` (calls `buttonBehavior` directly, by its own doc comment, to keep the roving-tab-stop
+  rule from being defeated by `behaviorFromCache`'s unconditional `registerFocusable`). Not exercised by any
+  reproduction bench so far (no shell has disabled an individual list row), so this is a documentation-level
+  finding rather than an example-pinned one.
+
+Closing either gap means changing that widget's own hit-test path to check `isDisabled()`, not adding a new
+widget.
 
 ### Focused / semantic
 
@@ -247,3 +267,63 @@ libs/gui itself was not changed. Gaps are recorded as example-side custom/hack o
 ### 15.3 Size checks
 
 Launch 640×360 / 1024×768 / 1440×900 as separate processes and visually inspect path-omitted `snapshot fb`. Adjust padding/gap by width; do not use fixed absolute placement.
+
+## 16. Tracker / Session View grid shell observations
+
+Evidence example: `examples/42_tracker_grid` (probes: `state` / `layout`; E2E: `e2e.sh`, 5 scenarios; ports
+9240–9249). A music tracker / Ableton Session View style grid: pattern tabs across the top, a track list at
+the left, an 8-track × 16-step grid in the middle (the existing `gui.stepgrid.widgetRow`, not a new widget),
+and a per-track detail panel on the right. libs/gui itself was not changed by this shell (`beginDisabled`
+already existed from the disabled-scope task).
+
+This shell exercises every widget this document's disabled-scope and popup-extension entries above cover,
+all in one screen: `ctx.tabId` (pattern
+switch, selection follows focus), `beginListboxRow`/`endListboxRow`/`gui.pollListNav` (track list, roving
+tab stop), `ctx.labelEllipsis` (track names) and `ctx.beginFormRow`/`endFormRow` (detail-panel rows, one
+using only `description` with no `label`), `ctx.beginDisabled`/`endDisabled` (a muted track's own
+Volume/Pan controls), and `ctx.popupMenuEx` with `PopupItem.checked` plus `keep_open_on_select` (the
+right-click track context menu: Mute / Solo / Clear Pattern, checked marks reflecting current state,
+staying open across toggles). It does not exercise `openPopupStacked`/`popupMenuStacked` — only one popup
+is ever open here, so the list+menu shell (§15) remains the evidence for simultaneous popups.
+
+### 16.1 New cross-cutting gap: stepgrid does not consult the disabled scope
+
+See §10 "Disabled" for the full writeup. In short: `gui.stepgrid.widgetRow` hand-assembles its own hit-test
+(`buttonBehavior`, not `behaviorFromCache`) and never checks `ctx.isDisabled()`, so wrapping a step-grid row
+in `beginDisabled`/`endDisabled` changes nothing about it. The shell works around this with the widget's own
+`editable` option (`editable = !track.muted`), which suppresses the click but draws no greyed-out look —
+counted as a hack below, not as a widget the shell chose to skip.
+
+### 16.2 custom / hack counts (example side)
+
+| Kind | Count | Detail |
+|---|---:|---|
+| track row hit-test + right-click context-menu glue | 1 | `hitTestTrack` + `getNodeCachedRect`; the right press is not forwarded to gui so it cannot dismiss the popup it just opened (same shape as §15.2's row/context glue) |
+| keyboard up/down nav | 1 | `gui.pollListNav` result applied by hand: move `selected_track`, `claimFocus` onto the new row |
+| stepgrid disabled non-compliance workaround | 1 | `editable = !track.muted` substitutes for a real disabled look (§16.1) |
+| custom draw | 0 | No `ctx.custom` / direct DrawList / custom rasterizer beyond `stepgrid`'s own library-side draw |
+
+### 16.3 Scorecard
+
+| Axis | Score | Note |
+|---|---:|---|
+| Structure | 5 | 640×360 / 1024×768 / 1440×900 all lay out without overflow, once the detail column and slider `track_w` were sized against the widest form-row content at each width tier (§16.4) |
+| Interaction | 5 | All 5 scenarios harness-automated: pattern tab switch, track select (mouse) + Up/Down (keyboard), step-grid toggle, mute → Volume drag rejected (disabled) → context-menu checked toggle → unmute → the same drag now changes Volume |
+| Information | 4 | Selection / mute / solo / checked / disabled are all visualized; the one gap is the step grid itself not visually reflecting "disabled" (§16.1) |
+| Ergonomics | 3 | 3 hacks (§16.2), 0 custom draw |
+
+Missing (priority): 1) stepgrid disabled non-compliance (§16.1, also §10) 2) no dedicated Grid/Table APG
+widget — the step grid is still `stepgrid` plus a hand-wrapped row box, not a general grid/table widget
+3) `openPopupStacked`/`popupMenuStacked` not exercised here (single popup only; see §15 for that evidence).
+
+### 16.4 Size checks
+
+Launch 640×360 / 1024×768 / 1440×900 as separate processes and visually inspect path-omitted `snapshot fb`.
+The first pass at this shell overflowed the detail panel: `sliderF32Id`'s `[label][track][value]` row and
+the two description labels both exceeded the panel's `.fixed` column width, and a `.fixed`-width box does
+not clip its own over-wide children, so the overflow bled all the way to the window's right edge in the
+harness screenshot rather than being merely cramped. Fixed by sizing the detail column and the slider
+`track_w` against the widest row's content at each width tier, and shortening the two description strings
+(a live example of the fit×grow layout trap: a `.fixed`-width box sizes itself from its own opts alone and
+never shrinks its children to fit, so an over-wide child inside it silently overflows rather than clipping
+or wrapping).
