@@ -198,6 +198,11 @@ kngn/
 │   └── noodle/        # the modular patch canvas: lo-fi generation plus live rewiring (run-noodle)
 ├── gates/             # builds that exercise the published surface from outside (not examples)
 │   └── consumer/      # links kit.audio / kit.midi through setupConsumerExe (zig build check-consumer)
+├── tests/             # tests that are not a `zig test` of one module
+│   ├── e2e/           # end-to-end scripts
+│   ├── gui_leak.zig   # PerIdStateStore state-leak measurement (zig build test-gui-leak)
+│   └── standalone-guard/ # a standalone build that breaks the shared-module contract on
+│                      #   purpose; the gate asserts it fails (zig build check-standalone-guard)
 └── docs/              # documentation (see the index above)
 ```
 
@@ -479,14 +484,19 @@ zig build -Dinstall-all=true
 # zig build -Dmax-modules=96 build-noodle
 # zig build -Dmax-modules=96 test-modular test-app-modular test-noodle
 
-# Run every test (the aggregate; it bundles every test-*, the template native gate and the
-# external consumer gate)
+# Run every test (the aggregate; it bundles every test-*, the template native gate, the
+# external consumer gate and the standalone gates)
 zig build test
 
 # The gates that build against the published surface from outside
 zig build check-consumer      # link kit.audio / kit.midi the way an external package does (gates/consumer/)
 zig build check-template      # build template/ as an external package
 zig build check-vendor        # vendored build_helpers copies are byte-identical (check-template-vendor is an alias)
+
+# The standalone gates (not registered on a Windows host: a checkout there expands the
+# build_helpers symlink, so no sample builds standalone — see docs/platform-verification.md)
+zig build check-example-standalone  # build one example on its own (the only path through buildStandalone's kit wiring)
+zig build check-standalone-guard    # a build that shares no pixelops module must fail during configuration
 
 # Individual tests (all included in the aggregate)
 zig build test-core             # libs/paint (undo, tools, Document and the .pix round trip) plus the editor's input state machine

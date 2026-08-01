@@ -315,21 +315,21 @@ fn assertVendoredHelpersIdentical(b: *std.Build) void {
     }
 }
 
-/// Run a child `zig build` inside template/ with an isolated cache and prefix.
+/// A child `zig build` inside `child_dir` with an isolated cache and prefix, returned as the
+/// Run itself so a caller can state what it expects of the child (an exit code, output to
+/// match). Use `addChildBuild` for a child that simply has to succeed.
 /// `has_side_effects` forces the child build on every parent gate invocation.
 /// When the parent was invoked with an explicit `-Dplatform` / `-Doptimize` (or `--release`),
 /// those flags are forwarded; otherwise the child uses its own host defaults.
-/// Cross-compilation of the template is not a gate guarantee (no automatic target rewrite).
-fn addChildBuild(
+/// Cross-compilation of a child is not a gate guarantee (no automatic target rewrite).
+fn addCheckedChildBuild(
     b: *std.Build,
     child_dir: []const u8,
-    step_name: []const u8,
-    step_description: []const u8,
     child_step: []const u8,
     cache_subdir: []const u8,
     explicit_platform: ?[]const u8,
     explicit_optimize: ?[]const u8,
-) *std.Build.Step {
+) *std.Build.Step.Run {
     // Absolute paths so the child (cwd=child_dir) does not create a cache inside it.
     // Each child gets its own cache_subdir, so their build graphs never share state.
     // cache_root.path is often relative (".zig-cache"); resolve against the process cwd.
@@ -368,7 +368,21 @@ fn addChildBuild(
     if (explicit_optimize) |o| {
         run.addArg(b.fmt("-Doptimize={s}", .{o}));
     }
+    return run;
+}
 
+/// `addCheckedChildBuild` behind a named step, for a child that only has to succeed.
+fn addChildBuild(
+    b: *std.Build,
+    child_dir: []const u8,
+    step_name: []const u8,
+    step_description: []const u8,
+    child_step: []const u8,
+    cache_subdir: []const u8,
+    explicit_platform: ?[]const u8,
+    explicit_optimize: ?[]const u8,
+) *std.Build.Step {
+    const run = addCheckedChildBuild(b, child_dir, child_step, cache_subdir, explicit_platform, explicit_optimize);
     const step = b.step(step_name, step_description);
     step.dependOn(&run.step);
     return step;
@@ -791,6 +805,50 @@ pub fn build(b: *std.Build) void {
         child_explicit_optimize,
     );
     check_consumer_step.dependOn(check_vendor_step);
+
+    // Standalone gates. `examples/*/build.zig` and `tests/standalone-guard/build.zig` reach
+    // the build helpers through a `build_helpers` symlink, which a Windows checkout expands
+    // into plain files (see docs/platform-verification.md); building a sample standalone
+    // there is not supported today, so the host decides whether these steps exist at all.
+    // `install` is the step to run: buildStandalone installs its artifact and declares no
+    // step of its own.
+    const standalone_gates: ?[2]*std.Build.Step = if (b.graph.host.result.os.tag == .windows) null else blk: {
+        // A standalone build is the only path that exercises buildStandalone's kit wiring;
+        // the parent build reaches kit a different way, so without this the whole path is
+        // unbuilt by `zig build test`. 32_sprite_anim is the strictest shape available:
+        // its pixelops sits two hops down, behind gfx's sprite module.
+        const example_step = addChildBuild(
+            b,
+            "examples/32_sprite_anim",
+            "check-example-standalone",
+            "Build one example standalone (child zig build install; exercises the kit wiring)",
+            "install",
+            "example-standalone-check",
+            child_explicit_platform,
+            child_explicit_optimize,
+        );
+
+        // The positive gate above cannot show that the shared-module checks fire: it passes
+        // whether or not they detect anything. This one breaks the pixelops contract on
+        // purpose and asserts on the diagnostic.
+        const guard_run = addCheckedChildBuild(
+            b,
+            "tests/standalone-guard",
+            "install",
+            "standalone-guard-check",
+            child_explicit_platform,
+            child_explicit_optimize,
+        );
+        guard_run.expectExitCode(1);
+        guard_run.addCheck(.{ .expect_stderr_match = "kit_libs.pixelops is unset" });
+        const guard_step = b.step(
+            "check-standalone-guard",
+            "Assert a standalone build that shares no pixelops module fails during configuration",
+        );
+        guard_step.dependOn(&guard_run.step);
+
+        break :blk .{ example_step, guard_step };
+    };
 
     if (install_all) {
         // Order: root package-web / package-web-single → check-template → check-template-web.
@@ -2438,6 +2496,8 @@ pub fn build(b: *std.Build) void {
     // gates/consumer/. Their wasm counterpart stays on -Dinstall-all=true.
     test_step.dependOn(check_template_step);
     test_step.dependOn(check_consumer_step);
+    // The standalone gates exist only where a standalone build does (see their definition).
+    if (standalone_gates) |gates| for (gates) |gate| test_step.dependOn(gate);
 
     // ========================================
     // Micro-benchmarks. Pure-logic measurement (no display / audio device; OS-independent).

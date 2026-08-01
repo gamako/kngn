@@ -332,12 +332,128 @@ pub const KitLibs = struct {
     /// null: buildStandalone creates its own (existing consumers unchanged).
     gamepad: ?*std.Build.Module = null,
     /// kit.pixelops. The shared pixel primitives are part of the public umbrella, so kit.zig
-    /// imports it unconditionally and a standalone build must supply it too. gui, font and paint
-    /// already take a pixelops module, so pass the **same instance** — separate instances put the
-    /// same lib.zig in two modules and fail to compile.
-    /// null: buildStandalone creates its own.
+    /// imports it unconditionally and a standalone build must supply it too. gui, font, gfx and
+    /// paint already take a pixelops module, so pass the **same instance** — separate instances
+    /// put the same lib.zig in two modules and fail to compile.
+    /// null is only for a caller that wires no pixelops at all (buildStandalone then creates
+    /// one); leaving it null while wiring one elsewhere ends the build with a diagnostic.
     pixelops: ?*std.Build.Module = null,
 };
+
+/// Every module wired under the import name `name` anywhere in the graph reachable from
+/// `roots`, deduplicated by pointer.
+///
+/// The walk is breadth-first with a visited set: `addImport` can make the module graph
+/// cyclic, and a caller may wire a shared library deep (into the `sprite` module behind
+/// `gfx`, say) rather than into a module it hands over directly.
+///
+/// Reads `std.Build.Module.import_table`, which is Zig 0.16 plumbing. If a later Zig
+/// removes or renames it this file stops compiling, which is the loud failure; if the
+/// field survives but stops describing imports, callers simply stop finding candidates
+/// and fall back to the behaviour they have without this function.
+fn collectWiredImports(
+    b: *std.Build,
+    roots: []const ?*std.Build.Module,
+    name: []const u8,
+) std.ArrayList(*std.Build.Module) {
+    var visited: std.AutoHashMapUnmanaged(*std.Build.Module, void) = .empty;
+    defer visited.deinit(b.allocator);
+    var queue: std.ArrayList(*std.Build.Module) = .empty;
+    defer queue.deinit(b.allocator);
+    var found: std.ArrayList(*std.Build.Module) = .empty;
+
+    for (roots) |maybe_root| {
+        const root = maybe_root orelse continue;
+        if (visited.fetchPut(b.allocator, root, {}) catch @panic("OOM") != null) continue;
+        queue.append(b.allocator, root) catch @panic("OOM");
+    }
+
+    var i: usize = 0;
+    while (i < queue.items.len) : (i += 1) {
+        var it = queue.items[i].import_table.iterator();
+        while (it.next()) |entry| {
+            const dep = entry.value_ptr.*;
+            if (std.mem.eql(u8, entry.key_ptr.*, name)) appendUnique(b, &found, dep);
+            if (visited.fetchPut(b.allocator, dep, {}) catch @panic("OOM") != null) continue;
+            queue.append(b.allocator, dep) catch @panic("OOM");
+        }
+    }
+    return found;
+}
+
+fn appendUnique(b: *std.Build, list: *std.ArrayList(*std.Build.Module), module: *std.Build.Module) void {
+    for (list.items) |existing| if (existing == module) return;
+    list.append(b.allocator, module) catch @panic("OOM");
+}
+
+/// The pixelops module kit re-exports, checked against what the caller already wired.
+///
+/// One source file may belong to only one module, so `libs/pixelops/src/lib.zig` has to
+/// reach kit as the very instance the caller gave to gui, font, gfx and paint. Creating a
+/// second one here compiles into
+/// `error: file exists in modules 'pixelops' and 'pixelops0'`, pointed at a file that has
+/// nothing to do with the mistake. Detecting it during build configuration keeps the
+/// diagnosis next to the fix.
+///
+/// Detection goes by the import name `pixelops`, which is not a free choice: the sources
+/// behind it write `@import("pixelops")`, so every caller has to wire it under that name.
+/// A module wired under some other name is therefore not detected, and a *different* file
+/// wired under this name is reported as a conflict.
+fn resolvePixelops(
+    b: *std.Build,
+    kl: KitLibs,
+    extra: []const Import,
+    kit_root: []const u8,
+) *std.Build.Module {
+    // Roots are what the caller handed over, never a module created in this file: walking
+    // one of those would find the very module this function is about to return.
+    var roots: std.ArrayList(?*std.Build.Module) = .empty;
+    defer roots.deinit(b.allocator);
+    roots.appendSlice(b.allocator, &.{
+        kl.platform_types, kl.command_types, kl.gui,   kl.png,     kl.font,
+        kl.dsp,            kl.synth,         kl.gmath, kl.gfx,     kl.sound,
+        kl.serde,          kl.appshell,      kl.paint, kl.gamepad,
+    }) catch @panic("OOM");
+    for (extra) |imp| roots.append(b.allocator, imp.module) catch @panic("OOM");
+
+    var found = collectWiredImports(b, roots.items, "pixelops");
+    defer found.deinit(b.allocator);
+    // An `extra` entry names the module it hands over, so it can be the pixelops module
+    // itself rather than something importing it.
+    for (extra) |imp| {
+        if (std.mem.eql(u8, imp.name, "pixelops")) appendUnique(b, &found, imp.module);
+    }
+
+    if (kl.pixelops) |explicit| {
+        for (found.items) |candidate| {
+            if (candidate == explicit) continue;
+            std.log.err(
+                "kit_libs.pixelops is a different module than the one wired as \"pixelops\" " ++
+                    "into the modules passed to buildStandalone. libs/pixelops/src/lib.zig can " ++
+                    "belong to only one module, so pass the same instance everywhere.",
+                .{},
+            );
+            std.process.exit(1);
+        }
+        return explicit;
+    }
+
+    if (found.items.len != 0) {
+        std.log.err(
+            "kit_libs.pixelops is unset while a \"pixelops\" module is already wired into the " ++
+                "modules passed to buildStandalone. kit re-exports pixelops, so leaving it unset " ++
+                "builds a second module for libs/pixelops/src/lib.zig and the compile fails with " ++
+                "\"file exists in modules 'pixelops' and 'pixelops0'\". Pass the module already " ++
+                "built here: .kit_libs = .{{ …, .pixelops = pixelops }}",
+            .{},
+        );
+        std.process.exit(1);
+    }
+
+    return b.createModule(.{
+        .root_source_file = .{ .cwd_relative = b.fmt("{s}/libs/pixelops/src/lib.zig", .{kit_root}) },
+    });
+}
 
 /// Create one exe per implemented backend for the target OS, plus install / `run-<backend>` /
 /// `run` (default). Resolve the SDK only for macOS backends (Linux needs no xcrun).
@@ -515,13 +631,12 @@ pub fn buildStandalone(
             };
             kit_mod.addImport("gamepad", kit_gamepad_mod);
             // pixelops: kit.zig re-exports it, so the module has to be present even when the
-            // application never names it. Reuse the caller's instance (gui/font/paint share one).
-            const kit_pixelops_mod: *std.Build.Module = if (kl.pixelops) |px|
-                px
-            else
-                b.createModule(.{
-                    .root_source_file = .{ .cwd_relative = b.fmt("{s}/libs/pixelops/src/lib.zig", .{kit_root}) },
-                });
+            // application never names it. The caller's gui/font/gfx/paint already import the same
+            // lib.zig, so a second module for it would put one file in two modules;
+            // resolvePixelops reports that during build configuration rather than letting the
+            // compiler emit "file exists in modules 'pixelops' and 'pixelops0'".
+            const kit_pixelops_mod: *std.Build.Module =
+                resolvePixelops(b, kl, spec.extra, kit_root);
             kit_mod.addImport("pixelops", kit_pixelops_mod);
             // recipe: kit.zig imports unconditionally (same as top-level build.zig
             // `link(kit, common.recipe)`). libs/recipe is a headless lib that depends only on serde.

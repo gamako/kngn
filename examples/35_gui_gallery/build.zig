@@ -79,6 +79,7 @@ pub fn build(b: *std.Build) void {
             .gmath = gmath,
             .gfx = gfx,
             .sound = sound,
+            .pixelops = pixelops,
         },
     });
 }

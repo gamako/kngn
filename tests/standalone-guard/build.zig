@@ -1,3 +1,13 @@
+//! A standalone build that breaks the pixelops contract on purpose.
+//!
+//! It wires a pixelops module **only behind another module** (`gfx` → `sprite` → pixelops)
+//! and leaves `kit_libs.pixelops` unset. `buildStandalone` has to notice the module anyway
+//! and stop during build configuration, so `check-standalone-guard` runs this and asserts
+//! that it fails with that diagnostic.
+//!
+//! Nothing here is ever compiled: the guard exits before the build graph runs. That also
+//! means the modules below only need to exist, not to be wired for a real build.
+
 const std = @import("std");
 
 // build_helpers/ is a symlink to ../../build_helpers.
@@ -9,7 +19,6 @@ pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
 
-    // kit wiring: follow apps/editor/build.zig; share one png instance (avoid duplication).
     const png = b.createModule(.{
         .root_source_file = .{ .cwd_relative = PROJECT_ROOT ++ "/libs/png/src/lib.zig" },
     });
@@ -27,65 +36,34 @@ pub fn build(b: *std.Build) void {
     const font = b.createModule(.{
         .root_source_file = .{ .cwd_relative = PROJECT_ROOT ++ "/libs/font/src/lib.zig" },
     });
-    font.addImport("png", png);
-    font.addImport("pixelops", pixelops);
-
     const gui = b.createModule(.{
         .root_source_file = .{ .cwd_relative = PROJECT_ROOT ++ "/libs/gui/src/gui.zig" },
     });
-    gui.addImport("font", font);
-    gui.addImport("pixelops", pixelops);
-    gui.addImport("command_types", command_types);
-
     const dsp = b.createModule(.{
         .root_source_file = .{ .cwd_relative = PROJECT_ROOT ++ "/src/dsp/dsp.zig" },
     });
     const synth = b.createModule(.{
         .root_source_file = .{ .cwd_relative = PROJECT_ROOT ++ "/libs/synth/src/synth.zig" },
     });
-    synth.addImport("dsp", dsp);
     const gmath = b.createModule(.{
         .root_source_file = .{ .cwd_relative = PROJECT_ROOT ++ "/libs/gmath/src/lib.zig" },
     });
     const sound = b.createModule(.{
         .root_source_file = .{ .cwd_relative = PROJECT_ROOT ++ "/libs/sound/src/sound.zig" },
     });
-    sound.addImport("dsp", dsp);
-    sound.addImport("synth", synth);
 
-    // kit.gfx: tilemap needs gmath, so wire gmath into gfx.
-    const gfx_keyboard = b.createModule(.{
-        .root_source_file = .{ .cwd_relative = PROJECT_ROOT ++ "/libs/gfx/src/keyboard.zig" },
-    });
-    gfx_keyboard.addImport("platform_types", platform_types);
+    // The only path to pixelops: two hops away from anything handed to buildStandalone.
     const gfx_sprite = b.createModule(.{
         .root_source_file = .{ .cwd_relative = PROJECT_ROOT ++ "/libs/gfx/src/sprite.zig" },
     });
-    gfx_sprite.addImport("png", png);
     gfx_sprite.addImport("pixelops", pixelops);
-    const gfx_ft = b.createModule(.{
-        .root_source_file = .{ .cwd_relative = PROJECT_ROOT ++ "/libs/gfx/src/fixed_timestep.zig" },
-    });
-    const gfx_fps = b.createModule(.{
-        .root_source_file = .{ .cwd_relative = PROJECT_ROOT ++ "/libs/gfx/src/fps_counter.zig" },
-    });
     const gfx = b.createModule(.{
         .root_source_file = .{ .cwd_relative = PROJECT_ROOT ++ "/libs/gfx/src/gfx.zig" },
     });
     gfx.addImport("sprite", gfx_sprite);
-    gfx.addImport("fixed_timestep", gfx_ft);
-    gfx.addImport("fps_counter", gfx_fps);
-    gfx.addImport("keyboard", gfx_keyboard);
-    const gamepad_mod = b.createModule(.{
-        .root_source_file = .{ .cwd_relative = PROJECT_ROOT ++ "/src/gamepad.zig" },
-    });
-    gamepad_mod.addImport("platform_types", platform_types);
-    gfx.addImport("gamepad", gamepad_mod);
-    gfx.addImport("platform_types", platform_types);
-    gfx.addImport("gmath", gmath);
 
     platform.buildStandalone(b, target, optimize, .{
-        .base_name = "example_36_tilemap",
+        .base_name = "standalone_guard",
         .main_source = b.path("main.zig"),
         .platform_source = .{ .cwd_relative = PROJECT_ROOT ++ "/core/platform.zig" },
         .platform_include = .{ .cwd_relative = PROJECT_ROOT ++ "/platform" },
@@ -102,9 +80,7 @@ pub fn build(b: *std.Build) void {
             .gmath = gmath,
             .gfx = gfx,
             .sound = sound,
-            .pixelops = pixelops,
-            // Same gamepad instance as gfx(action_map) (avoid dual modules)
-            .gamepad = gamepad_mod,
+            // .pixelops is deliberately absent. That is what this build exists to prove.
         },
     });
 }

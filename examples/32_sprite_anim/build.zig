@@ -104,6 +104,7 @@ pub fn build(b: *std.Build) void {
             .gmath = gmath,
             .gfx = gfx,
             .sound = sound,
+            .pixelops = pixelops,
             // Same gamepad instance as gfx(action_map) (avoid dual modules)
             .gamepad = gamepad_mod,
         },
