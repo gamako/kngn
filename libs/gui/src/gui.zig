@@ -129,6 +129,14 @@ pub const ListboxRowResult = @import("widgets.zig").ListboxRowResult;
 pub const pollListNav = @import("widgets.zig").pollListNav;
 pub const beginListboxRow = @import("widgets.zig").beginListboxRow;
 pub const endListboxRow = @import("widgets.zig").endListboxRow;
+// Ellipsis
+pub const EllipsisResult = @import("widgets.zig").EllipsisResult;
+pub const ellipsizeText = @import("widgets.zig").ellipsizeText;
+pub const labelEllipsis = @import("widgets.zig").labelEllipsis;
+// Form row
+pub const FormRowOpts = @import("widgets.zig").FormRowOpts;
+pub const beginFormRow = @import("widgets.zig").beginFormRow;
+pub const endFormRow = @import("widgets.zig").endFormRow;
 
 // PanelHost — dock-slot panel system.
 pub const PanelHost = @import("panel_host.zig").PanelHost;

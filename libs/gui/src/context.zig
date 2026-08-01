@@ -211,6 +211,12 @@ pub const Context = struct {
     pub const pollListNav = widgets.pollListNav;
     pub const beginListboxRow = widgets.beginListboxRow;
     pub const endListboxRow = widgets.endListboxRow;
+    // Ellipsis
+    pub const ellipsizeText = widgets.ellipsizeText;
+    pub const labelEllipsis = widgets.labelEllipsis;
+    // Form row
+    pub const beginFormRow = widgets.beginFormRow;
+    pub const endFormRow = widgets.endFormRow;
     // read-only text selection
     pub const selectableLabel = widgets.selectableLabel;
     pub const selectableLabelId = widgets.selectableLabelId;

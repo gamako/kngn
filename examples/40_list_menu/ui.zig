@@ -338,38 +338,6 @@ pub fn popupCount(app: *const App) u32 {
     return if (app.ctx.hasOpenPopup()) 1 else 0;
 }
 
-fn ellipsize(ctx: *gui.Context, text: []const u8, max_w: i32) struct { text: []const u8, used: bool } {
-    if (max_w <= 0) return .{ .text = text, .used = false };
-    const full_w: i32 = @intCast(ctx.font.measure(text));
-    if (full_w <= max_w) return .{ .text = text, .used = false };
-
-    const ellipsis = "...";
-    const ell_w: i32 = @intCast(ctx.font.measure(ellipsis));
-    if (ell_w >= max_w) {
-        const owned = ctx.allocator().dupe(u8, ellipsis) catch return .{ .text = text, .used = false };
-        return .{ .text = owned, .used = true };
-    }
-    const budget = max_w - ell_w;
-    // fixed-width font: 8px per codepoint; truncate by bytes carefully for ASCII names
-    var keep: usize = 0;
-    var w: i32 = 0;
-    var i: usize = 0;
-    while (i < text.len) {
-        const cp_len = std.unicode.utf8ByteSequenceLength(text[i]) catch 1;
-        if (i + cp_len > text.len) break;
-        const piece = text[i .. i + cp_len];
-        const pw: i32 = @intCast(ctx.font.measure(piece));
-        if (w + pw > budget) break;
-        w += pw;
-        keep = i + cp_len;
-        i += cp_len;
-    }
-    const owned = ctx.allocator().alloc(u8, keep + ellipsis.len) catch return .{ .text = text, .used = false };
-    @memcpy(owned[0..keep], text[0..keep]);
-    @memcpy(owned[keep..], ellipsis);
-    return .{ .text = owned, .used = true };
-}
-
 fn kindColor(kind: RowKind) gui.Color {
     return switch (kind) {
         .file => gui.Color.rgba(0x90, 0x98, 0xA0, 0xFF),
@@ -572,11 +540,11 @@ pub fn buildUi(app: *App) void {
             ctx.labelEx(row.kind.label(), kindColor(row.kind));
             ctx.endBox();
 
-            const el = ellipsize(ctx, row.name, name_max_w);
-            if (el.used) app.ellipsis_used = true;
-            // The row itself is the click/focus unit now, so the name is a plain label rather
-            // than a selectableLabelId (which would claim focus of its own and fight the row).
-            ctx.labelEx(el.text, ctx.style.text);
+            // The row itself is the click/focus unit now, so the name is a plain (ellipsized)
+            // label rather than a selectableLabelId, which would claim focus of its own and
+            // fight the row.
+            const el = ctx.labelEllipsis(row.name, name_max_w, ctx.style.text);
+            if (el.truncated) app.ellipsis_used = true;
 
             ctx.beginBox(.{ .width = .{ .fixed = 100 } });
             ctx.labelEx(row.detail, ctx.style.text_subtle);

@@ -19,7 +19,7 @@ Immediate-mode GUI library for KNGN. Standalone and platform-independent;
 | `src/context.zig` | Context (frame lifecycle + tree build + hit-test) |
 | `src/layout.zig` | Flex layout engine (measure / place) |
 | `src/style.zig` | Shared widget style (colours / sizes / padding, …) |
-| `src/widgets.zig` | Basic widgets (Button / Label / ColorSwatch / Slider / HSV picker / ScrollArea / checkbox / toggle / radio / Tabs / Listbox) |
+| `src/widgets.zig` | Basic widgets (Button / Label / ColorSwatch / Slider / HSV picker / ScrollArea / checkbox / toggle / radio / Tabs / Listbox / ellipsis / form row) |
 
 ## Frame flow
 
@@ -61,6 +61,16 @@ scope to avoid that.
   long list costs Tab one stop rather than one per row. `gui.pollListNav(ctx, active_row_id)`
   reports Up/Down for a row that holds the focus, once per frame, before any row is built —
   see "Keyboard focus" below for why the caller applies the move itself.
+
+Two smaller helpers round out a settings-style form:
+
+- `ctx.labelEllipsis(text, max_w, color) EllipsisResult` / `gui.ellipsizeText(ctx, text, max_w)`
+  — draw (or just compute) `text` truncated to a trailing `"..."` once it would exceed `max_w`
+  px, codepoint-aware. `result.truncated` says whether it was shortened.
+- `ctx.beginFormRow(opts) / ctx.endFormRow()` — an optional label above and an optional subtle
+  description below, wrapping the control(s) the caller builds in between (same begin/end
+  shape as `beginCollapsible`); replaces hand-stacking `ctx.label` / `ctx.labelEx` next to a
+  control with no declared relationship between them.
 
 ## Layout engine limits
 

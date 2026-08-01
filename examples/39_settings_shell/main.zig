@@ -444,13 +444,13 @@ fn renderGeneral(ctx: *gui.Context, app: *App) void {
     _ = ctx.sliderI32Id(Ids.general_ui_scale, "UI scale", &app.general.ui_scale, .{ .min = 50, .max = 200, .step = 1, .track_w = 180 });
     _ = ctx.sliderF32Id(Ids.general_interface_opacity, "Opacity", &app.general.interface_opacity, .{ .min = 0.2, .max = 1.0, .step = 0.05, .track_w = 180 });
 
-    ctx.label("Paths");
-    ctx.labelEx("Settings file path (text input).", ctx.style.text_subtle);
+    ctx.beginFormRow(.{ .label = "Paths", .description = "Settings file path (text input)." });
     _ = ctx.textInputId(Ids.general_settings_path, app.general.settings_path, .{
         .width = .{ .fixed = 320 },
         .placeholder = "/path/to/settings.conf",
         .paste_text = app.paste_text,
     });
+    ctx.endFormRow();
 
     // Tall form: add spacer rows so 640x360 still needs scroll
     formSpacer(ctx, 8);
@@ -509,13 +509,13 @@ fn renderEditor(ctx: *gui.Context, app: *App) void {
     formSpacer(ctx, 4);
     ctx.labelEx("Workspace path lives near the bottom of this long form.", ctx.style.text_subtle);
     formSpacer(ctx, 6);
-    ctx.label("Workspace");
-    ctx.labelEx("Root directory for the current workspace.", ctx.style.text_subtle);
+    ctx.beginFormRow(.{ .label = "Workspace", .description = "Root directory for the current workspace." });
     _ = ctx.textInputId(Ids.editor_workspace_path, app.editor.workspace_path, .{
         .width = .{ .fixed = 320 },
         .placeholder = "/path/to/workspace",
         .paste_text = app.paste_text,
     });
+    ctx.endFormRow();
     formSpacer(ctx, 4);
     ctx.labelEx("End of Editor form.", ctx.style.text_subtle);
     ctx.endScrollArea();

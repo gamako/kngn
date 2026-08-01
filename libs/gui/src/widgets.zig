@@ -2090,6 +2090,93 @@ pub fn endListboxRow(ctx: *Context) void {
 }
 
 // ============================================================
+// Ellipsis
+// ============================================================
+// A long label truncated to fit a pixel budget, with a trailing "...". Codepoint-aware (the
+// truncation point never lands inside a multi-byte UTF-8 sequence), same algorithm an
+// example previously hand-rolled with `font.measure` and a manual "..." append.
+
+pub const EllipsisResult = struct {
+    /// The text to draw: `text` unchanged, or a truncated arena copy ending in "...".
+    text: []const u8,
+    /// Whether `text` was shortened to fit `max_w`.
+    truncated: bool = false,
+};
+
+/// Truncate `text` to fit within `max_w` px under `ctx.font`, appending a trailing "...".
+/// Returns the original slice (and `truncated = false`) when it already fits, or when
+/// `max_w <= 0` (nothing to measure against). The truncated copy lives on the frame arena, so
+/// it is valid through this frame's `endFrame` like any other per-frame text.
+pub fn ellipsizeText(ctx: *Context, text: []const u8, max_w: i32) EllipsisResult {
+    if (max_w <= 0) return .{ .text = text };
+    const full_w: i32 = @intCast(ctx.font.measure(text));
+    if (full_w <= max_w) return .{ .text = text };
+
+    const ellipsis = "...";
+    const ell_w: i32 = @intCast(ctx.font.measure(ellipsis));
+    if (ell_w >= max_w) {
+        const owned = ctx.allocator().dupe(u8, ellipsis) catch return .{ .text = text };
+        return .{ .text = owned, .truncated = true };
+    }
+    const budget = max_w - ell_w;
+    var keep: usize = 0;
+    var w: i32 = 0;
+    var i: usize = 0;
+    while (i < text.len) {
+        const cp_len = std.unicode.utf8ByteSequenceLength(text[i]) catch 1;
+        if (i + cp_len > text.len) break;
+        const piece = text[i .. i + cp_len];
+        const pw: i32 = @intCast(ctx.font.measure(piece));
+        if (w + pw > budget) break;
+        w += pw;
+        keep = i + cp_len;
+        i += cp_len;
+    }
+    const owned = ctx.allocator().alloc(u8, keep + ellipsis.len) catch return .{ .text = text };
+    @memcpy(owned[0..keep], text[0..keep]);
+    @memcpy(owned[keep..], ellipsis);
+    return .{ .text = owned, .truncated = true };
+}
+
+/// Draw `text` as a label, truncated with `ellipsizeText` first if it would exceed `max_w`.
+pub fn labelEllipsis(ctx: *Context, text: []const u8, max_w: i32, color: Color) EllipsisResult {
+    const r = ellipsizeText(ctx, text, max_w);
+    ctx.labelEx(r.text, color);
+    return r;
+}
+
+// ============================================================
+// Form row
+// ============================================================
+// A composable label / control / description grouping: an optional label above and an
+// optional subtle description below, wrapping whatever control(s) the caller builds between
+// `beginFormRow` and `endFormRow` (the same begin/end shape as `beginCollapsible`). This closes
+// the gap a settings-style form otherwise fills by hand-stacking `ctx.label`, `ctx.labelEx` and
+// a control with no declared relationship between them.
+
+pub const FormRowOpts = struct {
+    /// Drawn above the control in `style.text`, when set.
+    label: ?[]const u8 = null,
+    /// Drawn between the label and the control in `style.text_subtle`, when set.
+    description: ?[]const u8 = null,
+    gap: i32 = 4,
+};
+
+/// Open a form row: draws `opts.label` then `opts.description` (either or both may be
+/// omitted), then a column box the caller fills with the control(s) this row is about.
+pub fn beginFormRow(ctx: *Context, opts: FormRowOpts) void {
+    ctx.beginBox(.{ .direction = .column, .gap = opts.gap });
+    const style = ctx.style;
+    if (opts.label) |l| ctx.labelEx(l, style.text);
+    if (opts.description) |d| ctx.labelEx(d, style.text_subtle);
+}
+
+/// Close a row opened by `beginFormRow`.
+pub fn endFormRow(ctx: *Context) void {
+    ctx.endBox();
+}
+
+// ============================================================
 // Tests
 // ============================================================
 
@@ -5181,4 +5268,82 @@ test "pollListNav: reports a direction only while the given id holds the focus" 
     ctx.pushEvent(.{ .key_down = .{ .code = input_mod.key.up, .modifiers = 0, .repeat = false } });
     try std.testing.expectEqual(ListNav.prev, pollListNav(&ctx, row));
     ctx.endFrame();
+}
+
+// ── Ellipsis ──
+
+test "ellipsizeText: text that already fits is returned unchanged" {
+    var ctx = testCtx();
+    defer ctx.deinit();
+
+    ctx.beginFrame(200, 40);
+    const r = ellipsizeText(&ctx, "short", 1000);
+    ctx.endFrame();
+    try std.testing.expectEqualStrings("short", r.text);
+    try std.testing.expect(!r.truncated);
+}
+
+test "ellipsizeText: long text is truncated with a trailing ellipsis that fits max_w" {
+    var ctx = testCtx();
+    defer ctx.deinit();
+    const long = "a-very-long-file-name-that-does-not-fit-the-column.txt";
+
+    ctx.beginFrame(200, 40);
+    const r = ellipsizeText(&ctx, long, 80);
+    ctx.endFrame();
+    try std.testing.expect(r.truncated);
+    try std.testing.expect(r.text.len < long.len);
+    try std.testing.expect(std.mem.endsWith(u8, r.text, "..."));
+    try std.testing.expect(@as(i32, @intCast(ctx.font.measure(r.text))) <= 80);
+}
+
+test "ellipsizeText: max_w<=0 returns the original text rather than an empty ellipsis" {
+    var ctx = testCtx();
+    defer ctx.deinit();
+
+    ctx.beginFrame(200, 40);
+    const r = ellipsizeText(&ctx, "anything", 0);
+    ctx.endFrame();
+    try std.testing.expectEqualStrings("anything", r.text);
+    try std.testing.expect(!r.truncated);
+}
+
+test "labelEllipsis: draws the truncated text as a label" {
+    var ctx = testCtx();
+    defer ctx.deinit();
+
+    ctx.beginFrame(200, 40);
+    const r = labelEllipsis(&ctx, "a-very-long-file-name-that-does-not-fit.txt", 80, Color.rgba(0xFF, 0xFF, 0xFF, 0xFF));
+    ctx.endFrame();
+    try std.testing.expect(r.truncated);
+    try std.testing.expectEqual(@as(usize, 1), countDrawText(ctx.draw_list.cmds.items, r.text));
+}
+
+// ── Form row ──
+
+test "beginFormRow/endFormRow: draws the label and description around the caller's control" {
+    var ctx = testCtx();
+    defer ctx.deinit();
+
+    ctx.beginFrame(200, 40);
+    beginFormRow(&ctx, .{ .label = "Paths", .description = "Settings file path." });
+    ctx.label("control-placeholder");
+    endFormRow(&ctx);
+    ctx.endFrame();
+
+    try std.testing.expectEqual(@as(usize, 1), countDrawText(ctx.draw_list.cmds.items, "Paths"));
+    try std.testing.expectEqual(@as(usize, 1), countDrawText(ctx.draw_list.cmds.items, "Settings file path."));
+    try std.testing.expectEqual(@as(usize, 1), countDrawText(ctx.draw_list.cmds.items, "control-placeholder"));
+}
+
+test "beginFormRow: omits the description draw command when unset" {
+    var ctx = testCtx();
+    defer ctx.deinit();
+
+    ctx.beginFrame(200, 40);
+    beginFormRow(&ctx, .{ .label = "Cache" });
+    endFormRow(&ctx);
+    ctx.endFrame();
+
+    try std.testing.expectEqual(@as(usize, 1), countDrawText(ctx.draw_list.cmds.items, "Cache"));
 }
