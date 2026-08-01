@@ -1,7 +1,7 @@
 //! GUI settings shell benchmark.
 //!
-//! VS Code / System Settings-style settings shell. Left nav + right form with 3 sections,
-//! current widgets only (libs/gui itself unchanged).
+//! VS Code / System Settings-style settings shell. Left nav + right form with 3 sections.
+//! The left nav is `gui.tabId` (selected-section semantics); the forms use existing widgets.
 //!
 //! Hot path declaration:
 //! - Widget build and DrawList command appends are per-frame. O(N) in the selected form's control count.
@@ -249,17 +249,6 @@ fn widgetName(id: gui.Id) []const u8 {
     };
 }
 
-/// The section on show follows the keyboard focus, so clicking a navigation entry and tabbing to
-/// one select it the same way.
-fn syncSection(app: *App) void {
-    app.section = switch (app.ctx.state.focused_id) {
-        Ids.nav_general => .general,
-        Ids.nav_editor => .editor,
-        Ids.nav_audio => .audio,
-        else => return,
-    };
-}
-
 fn stateDigest(ctx_ptr: *anyopaque, buf: []u8) []const u8 {
     const app: *App = @ptrCast(@alignCast(ctx_ptr));
     const ctx = app.ctx;
@@ -397,8 +386,6 @@ fn formSpacer(ctx: *gui.Context, n: usize) void {
 }
 
 fn renderNav(ctx: *gui.Context, app: *App) void {
-    const sel_bg = ctx.style.bg_active;
-    const idle_bg = gui.Color.rgba(0x20, 0x24, 0x2C, 0xFF);
     const nav_w: i32 = 148;
 
     const items = [_]struct { id: gui.Id, label: []const u8, section: Section }{
@@ -408,19 +395,15 @@ fn renderNav(ctx: *gui.Context, app: *App) void {
     };
 
     for (items) |it| {
-        const bg = if (app.section == it.section) sel_bg else idle_bg;
-        ctx.beginBox(.{
+        const res = ctx.tabId(it.id, it.label, app.section == it.section, .{
             .width = .{ .fixed = nav_w },
             .height = .{ .fixed = 28 },
             .padding = .{ 4, 8, 4, 8 },
-            .bg = bg,
-            .align_cross = .center,
         });
-        // These labels are the navigation, not prose, so Tab reaches them.
-        _ = ctx.selectableLabelId(it.id, it.label, .{ .focusable = true });
-        ctx.endBox();
+        // Selection follows focus: a click focuses immediately, and Tab traversal reaches a
+        // tab one frame later (ADR-021), so this stays in step with either path.
+        if (res.focused) app.section = it.section;
     }
-    syncSection(app);
 }
 
 fn renderGeneral(ctx: *gui.Context, app: *App) void {

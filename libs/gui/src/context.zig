@@ -205,6 +205,12 @@ pub const Context = struct {
     // Collapsible
     pub const beginCollapsible = widgets.beginCollapsible;
     pub const endCollapsible = widgets.endCollapsible;
+    // Tabs (selected-section semantics)
+    pub const tabId = widgets.tabId;
+    // Listbox (single selection + Up/Down keyboard navigation)
+    pub const pollListNav = widgets.pollListNav;
+    pub const beginListboxRow = widgets.beginListboxRow;
+    pub const endListboxRow = widgets.endListboxRow;
     // read-only text selection
     pub const selectableLabel = widgets.selectableLabel;
     pub const selectableLabelId = widgets.selectableLabelId;

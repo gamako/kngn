@@ -2,7 +2,8 @@
 //!
 //! Finder / GitHub Issues mini: toolbar / menuBar / 500-row scroll list /
 //! single selection / context menu / multi-filter popup / keyboard nav.
-//! Does not change libs/gui itself (gaps are example-side custom = hack).
+//! Row selection and Up/Down navigation are `gui.beginListboxRow`/`gui.pollListNav`; the
+//! multi-select filter popup, right-click context menu and ellipsis remain example-side.
 //!
 //! Hot path declaration:
 //! - Building / laying out / appending DrawList for 500 rows is per-frame O(N) (N=500).
@@ -140,16 +141,14 @@ pub fn main(init: std.process.Init) !void {
                         .Q => if (!popup_open) {
                             running = false;
                         },
-                        .UP => if (!popup_open and !k.is_repeat) {
-                            ui.navigateRows(&app, -1);
-                        },
-                        .DOWN => if (!popup_open and !k.is_repeat) {
-                            ui.navigateRows(&app, 1);
-                        },
                         else => {},
                     }
                 },
                 .mouse_down => |m| {
+                    // Left-click row selection and Up/Down navigation go through
+                    // `beginListboxRow` / `gui.pollListNav` inside `ui.buildUi` instead of a raw
+                    // handler here (they need the previous-frame rect cache and the keyboard
+                    // focus state, both of which belong to the gui frame, not this event loop).
                     if (m.button == .right) {
                         const p: gui.Vec2 = .{ .x = m.x, .y = m.y };
                         if (ui.hitTestRow(&app, p)) |row| {
@@ -157,14 +156,12 @@ pub fn main(init: std.process.Init) !void {
                             // (avoids outside right-press dismiss of the menu popup; for observing the one-popup constraint)
                             app.context_row = row;
                             ui.selectRow(&app, row, .mouse);
+                            // Keep keyboard nav primed from a right-click selection the same way
+                            // a left-click on a row already will be.
+                            _ = ctx.claimFocus(ui.Ids.row_base + @as(gui.Id, @intCast(row)));
                             app.context_open_pos = p;
                             app.context_open_request = true;
                             swallow_right_for_context = true;
-                        }
-                    } else if (m.button == .left and !ctx.hasOpenPopup()) {
-                        const p: gui.Vec2 = .{ .x = m.x, .y = m.y };
-                        if (ui.hitTestRow(&app, p)) |row| {
-                            ui.selectRow(&app, row, .mouse);
                         }
                     }
                 },

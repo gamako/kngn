@@ -19,7 +19,7 @@ Immediate-mode GUI library for KNGN. Standalone and platform-independent;
 | `src/context.zig` | Context (frame lifecycle + tree build + hit-test) |
 | `src/layout.zig` | Flex layout engine (measure / place) |
 | `src/style.zig` | Shared widget style (colours / sizes / padding, …) |
-| `src/widgets.zig` | Basic widgets (Button / Label / ColorSwatch / Slider / HSV picker / ScrollArea / checkbox / toggle / radio) |
+| `src/widgets.zig` | Basic widgets (Button / Label / ColorSwatch / Slider / HSV picker / ScrollArea / checkbox / toggle / radio / Tabs / Listbox) |
 
 ## Frame flow
 
@@ -49,6 +49,18 @@ if (ctx.radio("Eraser", tool == .eraser)) tool = .eraser;
 
 Identical labels in the same scope collide on ID; use the `~Id` variants or an `id_stack.push(i)`
 scope to avoid that.
+
+**Tabs and Listbox** follow the same caller-owned-selection convention:
+
+- `ctx.tabId(id, label, selected: bool, opts) TabResult` — one tab of a strip. `selected` is
+  display-only; react to `result.focused` to move the caller's own selection (a click focuses
+  immediately, and Tab traversal reaches a tab one frame later — ADR-021).
+- `ctx.beginListboxRow(id, selected: bool, opts) ListboxRowResult` / `ctx.endListboxRow()` —
+  one row of a single-select list; wrap arbitrary row content between the two calls (the same
+  begin/end shape as `beginCollapsible`). Registers as a Tab stop only while `selected`, so a
+  long list costs Tab one stop rather than one per row. `gui.pollListNav(ctx, active_row_id)`
+  reports Up/Down for a row that holds the focus, once per frame, before any row is built —
+  see "Keyboard focus" below for why the caller applies the move itself.
 
 ## Layout engine limits
 
@@ -117,6 +129,14 @@ Two things are worth knowing when driving this from a test or a replay script:
 `selectableLabel` stays out of the Tab order unless `.focusable = true` is passed: it is
 usually text to select rather than a control, and lists are built out of it. `TextInput` and
 the button-like widgets join it automatically.
+
+`beginListboxRow` carries this further: it registers as a Tab stop only for the row the
+caller marks `selected` (a roving tab stop), so a hundreds-of-rows list still costs Tab
+exactly one stop. Because which row a filtered/hidden list should move to next is data only
+the caller has, `gui.pollListNav(ctx, active_row_id)` reports a bare direction — the caller
+recomputes its own selection and calls `ctx.claimFocus` on the result, in the same frame the
+key arrived (not delayed like Tab traversal), the same timing a focused slider's arrow-key
+nudge already uses.
 
 The reasoning, and what was deliberately left out (Escape, scrolling the focus into view,
 two-dimensional drag widgets), is in `docs/adr/021_gui-keyboard-focus-traversal.md`.

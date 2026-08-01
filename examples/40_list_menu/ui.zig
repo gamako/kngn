@@ -3,9 +3,9 @@
 //!
 //! Hot path declaration:
 //! - Building / laying out / appending DrawList for 500 rows is per-frame O(N) (N=500).
-//! - Includes selectableLabelId text layout / frame arena.
+//! - Includes per-row label text layout (ellipsized name plus kind/detail) on the frame arena.
 //! - No new all-pixel loop, full framebuffer copy, custom rasterizer, or RT path.
-//! - popup ops / keyboard state updates / ellipsis calc are event-only / target-row only.
+//! - popup ops / keyboard nav / ellipsis calc are event-only / target-row only.
 
 const std = @import("std");
 const gui = @import("gui");
@@ -238,10 +238,12 @@ pub fn recomputeVisible(app: *App) void {
     app.empty_state = n == 0;
 }
 
-/// Move active/selected to previous/next visible row. delta = -1 (UP) or +1 (DOWN).
-pub fn navigateRows(app: *App, delta: i32) void {
-    if (app.visible_count == 0) return;
-    if (delta == 0) return;
+/// Move active/selected to previous/next visible row. delta = -1 (UP) or +1 (DOWN). Returns
+/// whether a row actually moved (false when nothing is visible, at an end-of-list clamp, or
+/// delta is 0) so a caller can decide whether to re-claim keyboard focus on the result.
+pub fn navigateRows(app: *App, delta: i32) bool {
+    if (app.visible_count == 0) return false;
+    if (delta == 0) return false;
 
     var start: i32 = app.active_row;
     if (start < 0) start = app.selected_row;
@@ -254,7 +256,7 @@ pub fn navigateRows(app: *App, delta: i32) void {
                     app.active_row = @intCast(i);
                     app.selected_row = app.active_row;
                     app.active_source = .keyboard;
-                    return;
+                    return true;
                 }
             }
         } else {
@@ -265,11 +267,11 @@ pub fn navigateRows(app: *App, delta: i32) void {
                     app.active_row = @intCast(i);
                     app.selected_row = app.active_row;
                     app.active_source = .keyboard;
-                    return;
+                    return true;
                 }
             }
         }
-        return;
+        return false;
     }
 
     if (delta > 0) {
@@ -279,12 +281,12 @@ pub fn navigateRows(app: *App, delta: i32) void {
                 app.active_row = @intCast(i);
                 app.selected_row = app.active_row;
                 app.active_source = .keyboard;
-                return;
+                return true;
             }
         }
-        // clamp: stay
+        return false; // clamp: stay
     } else {
-        if (start <= 0) return;
+        if (start <= 0) return false;
         var i: usize = @intCast(start);
         while (i > 0) {
             i -= 1;
@@ -292,9 +294,10 @@ pub fn navigateRows(app: *App, delta: i32) void {
                 app.active_row = @intCast(i);
                 app.selected_row = app.active_row;
                 app.active_source = .keyboard;
-                return;
+                return true;
             }
         }
+        return false;
     }
 }
 
@@ -431,6 +434,24 @@ pub fn buildUi(app: *App) void {
     const ctx = app.ctx;
     app.ellipsis_used = false;
 
+    // Same-frame reactive Up/Down (as a focused slider's arrow-key nudge): fires only while the
+    // currently active row holds the keyboard focus, so the newly active row's highlight is
+    // correct in the frame the key arrived, not one frame later as Tab traversal would give.
+    // Called before any row is built, since which row is "next" depends on the filter mask
+    // (app-only data) and must settle before the loop below reads `app.active_row`.
+    const active_row_id: gui.Id = if (app.active_row >= 0)
+        Ids.row_base + @as(gui.Id, @intCast(app.active_row))
+    else
+        0;
+    const nav_delta: i32 = switch (gui.pollListNav(ctx, active_row_id)) {
+        .prev => -1,
+        .next => 1,
+        .none => 0,
+    };
+    if (nav_delta != 0 and navigateRows(app, nav_delta)) {
+        _ = ctx.claimFocus(Ids.row_base + @as(gui.Id, @intCast(app.active_row)));
+    }
+
     const pad: i32 = if (app.screen_w < 800) 4 else if (app.screen_w < 1200) 8 else 12;
     const toolbar_gap: i32 = if (app.screen_w < 800) 4 else 8;
 
@@ -524,8 +545,7 @@ pub fn buildUi(app: *App) void {
     } else {
         // Available width for name: rough estimate from screen (list padding + kind col + detail)
         const name_max_w: i32 = @max(@as(i32, @intCast(app.screen_w)) - pad * 2 - 8 - 56 - 120, 40);
-        // Same family as example_39 nav: selected = style.bg_active (clear blue); unselected = alternating dark bands
-        const sel_bg = ctx.style.bg_active;
+        // Unselected rows alternate dark bands; beginListboxRow itself picks the selected fill.
         const idle_even = gui.Color.rgba(0x22, 0x26, 0x2E, 0xFF);
         const idle_odd = gui.Color.rgba(0x1C, 0x20, 0x28, 0xFF);
 
@@ -534,17 +554,17 @@ pub fn buildUi(app: *App) void {
             if (!isRowVisible(app, i)) continue;
             const row = app.rows[i];
             const idx: i32 = @intCast(i);
-            const selected = app.selected_row == idx or app.active_row == idx;
-            const bg = if (selected) sel_bg else if (i % 2 == 0) idle_even else idle_odd;
+            // selectRow always moves selected_row and active_row together, so active_row alone
+            // identifies the current row for both the highlight and the roving Tab stop.
+            const selected = app.active_row == idx;
+            const row_id = Ids.row_base + @as(gui.Id, @intCast(i));
 
-            ctx.beginBox(.{
-                .direction = .row,
-                .width = .{ .grow = 1 },
+            const res = ctx.beginListboxRow(row_id, selected, .{
                 .height = .{ .fixed = ROW_H },
                 .gap = 6,
                 .padding = .{ 0, 4, 0, 4 },
-                .bg = bg,
                 .align_cross = .center,
+                .idle_bg = if (i % 2 == 0) idle_even else idle_odd,
             });
 
             // kind badge
@@ -554,13 +574,16 @@ pub fn buildUi(app: *App) void {
 
             const el = ellipsize(ctx, row.name, name_max_w);
             if (el.used) app.ellipsis_used = true;
-            _ = ctx.selectableLabelId(Ids.row_base + @as(gui.Id, @intCast(i)), el.text, .{});
+            // The row itself is the click/focus unit now, so the name is a plain label rather
+            // than a selectableLabelId (which would claim focus of its own and fight the row).
+            ctx.labelEx(el.text, ctx.style.text);
 
             ctx.beginBox(.{ .width = .{ .fixed = 100 } });
             ctx.labelEx(row.detail, ctx.style.text_subtle);
             ctx.endBox();
 
-            ctx.endBox();
+            ctx.endListboxRow();
+            if (res.activated) selectRow(app, idx, .mouse);
         }
     }
     ctx.endScrollArea();

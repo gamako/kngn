@@ -1926,6 +1926,170 @@ pub fn endScrollArea(ctx: *Context) void {
 }
 
 // ============================================================
+// Tabs (selected-section semantics)
+// ============================================================
+// A tab strip holds a handful of items (unlike Listbox's hundreds below), so every tab is an
+// ordinary Tab stop like any other focusable widget — `tabId` is `behaviorFromCache` plus a
+// selected-look background, the same shape as `buttonId`.
+//
+// Selection follows focus (the ARIA "automatic activation" tabs model): the caller reacts to
+// `result.focused`, which is true the instant a click lands (`claimFocus` runs inside
+// `behaviorFromCache`, same frame) and one frame after Tab traversal reaches it (ADR-021's
+// `resolveFocusMove` delay). `result.activated` is also reported — click, or Space/Enter while
+// already focused — for a caller that wants the plain button-style edge instead.
+//
+// Which tab is selected is caller-owned (radioId's convention): `selected` is a display input,
+// and the caller decides what its current section is from `result.focused`.
+
+pub const TabOpts = struct {
+    width: layout.Sizing = .fit,
+    height: layout.Sizing = .fit,
+    /// null → style.button_padding
+    padding: ?[4]i32 = null,
+};
+
+pub const TabResult = struct {
+    /// Clicked, or Space/Enter fired while already focused (buttonId's "activated" contract).
+    activated: bool = false,
+    /// True this frame iff this tab holds the keyboard focus.
+    focused: bool = false,
+};
+
+/// One tab of a strip. `selected` is the caller's current choice (display only, same
+/// convention as `radioId`); a caller moves its selection by reacting to `result.focused`.
+pub fn tabId(ctx: *Context, id: Id, label: []const u8, selected: bool, opts: TabOpts) TabResult {
+    const result = behaviorFromCache(ctx, id);
+    const style = ctx.style;
+    const hot = ctx.state.hot_id == id;
+    // held > hover > selected > normal — the same priority buttonId uses.
+    const bg = if (result.held)
+        style.bg_active
+    else if (hot)
+        style.bg_hover
+    else if (selected)
+        style.button_bg_selected
+    else
+        style.bg;
+    const pad = opts.padding orelse style.button_padding;
+
+    ctx.beginBox(.{
+        .id = id,
+        .width = opts.width,
+        .height = opts.height,
+        .padding = pad,
+        .bg = bg,
+        .align_cross = .center,
+    });
+    ctx.labelEx(label, style.text);
+    ctx.endBox();
+
+    return .{ .activated = result.clicked, .focused = ctx.state.focused_id == id };
+}
+
+// ============================================================
+// Listbox (single selection + Up/Down keyboard navigation)
+// ============================================================
+// A listbox can hold hundreds of rows, so unlike Tabs it does not register every row as a Tab
+// stop — only the selected one does (a roving tab stop; ADR-021 already gives the same
+// reasoning for why `selectableLabel`'s `focusable` defaults off). Moving the selection with
+// Up/Down happens synchronously, in the same frame the key arrives (the timing `sliderCore`'s
+// arrow-key nudge uses, not Tab traversal's one-frame delay) — but *which* row is "next" is
+// data only the caller has (a list can be filtered or otherwise hide rows), so `pollListNav`
+// only reports a direction; applying it — recomputing the caller's own selection and moving
+// the keyboard focus onto the newly selected row's id via `claimFocus` — is the caller's job.
+
+pub const ListNav = enum { none, prev, next };
+
+/// Poll Up/Down for list-style keyboard navigation. Call once, before building any row, so the
+/// newly selected row's look is correct in the frame the key arrived rather than one frame
+/// later. Gated the same way a focused slider's arrow-key nudge is — no popup open, no pointer
+/// engaged — and additionally only while `active_row_id` (the caller's current selection,
+/// passed as a widget id) holds the keyboard focus, so a list nothing has ever selected
+/// reports `.none` rather than reacting to a keypress meant for something else on screen.
+pub fn pollListNav(ctx: *const Context, active_row_id: Id) ListNav {
+    if (active_row_id == 0 or ctx.state.focused_id != active_row_id) return .none;
+    if (ctx.popup_state != null or ctx.pointerEngaged()) return .none;
+    const all = input_mod.mod.all;
+    if (ctx.input.pressedPlain(input_mod.key.down, 0, all)) return .next;
+    if (ctx.input.pressedPlain(input_mod.key.up, 0, all)) return .prev;
+    return .none;
+}
+
+pub const ListboxRowOpts = struct {
+    width: layout.Sizing = .{ .grow = 1 },
+    height: layout.Sizing = .fit,
+    direction: layout.Direction = .row,
+    gap: i32 = 0,
+    /// top, right, bottom, left
+    padding: [4]i32 = .{ 0, 0, 0, 0 },
+    align_cross: layout.Align = .start,
+    /// Idle (unselected, unhovered) fill. null leaves the row transparent, so a caller can
+    /// zebra-stripe rows itself underneath (as example_40 does with alternating band colors).
+    idle_bg: ?Color = null,
+};
+
+pub const ListboxRowResult = struct {
+    /// Click, or Space/Enter fired while this row already holds the focus (buttonId's
+    /// "activated" contract). The caller applies this to its own selection model.
+    activated: bool = false,
+};
+
+/// One row of a single-select list. Wrap arbitrary content between `beginListboxRow` and
+/// `endListboxRow` (the same begin/end shape as `beginCollapsible`/`endCollapsible`); the
+/// caller owns which row is selected (`radioId`'s convention) and passes it in as `selected`.
+///
+/// Roving tab stop: registers as focusable only while `selected` is true, so a 500-row list
+/// costs Tab exactly one stop — whichever row is currently selected — never one per row.
+pub fn beginListboxRow(ctx: *Context, id: Id, selected: bool, opts: ListboxRowOpts) ListboxRowResult {
+    std.debug.assert(id != 0);
+    if (selected) ctx.registerFocusable(id);
+
+    // Same synchronous hit-test contract as behaviorFromCache, hand-assembled instead of
+    // reusing it: behaviorFromCache registers focusable unconditionally, which would defeat
+    // the roving-tab-stop rule above.
+    var btn: ButtonResult = .{};
+    if (ctx.rect_cache.get(id)) |cached| {
+        btn = context_mod.buttonBehavior(ctx, id, cached.rect, cached.clip);
+        if (btn.held) _ = ctx.claimFocus(id);
+        ctx.noteLastInteractive(id, cached.rect, btn.hovered);
+    } else {
+        ctx.noteLastInteractive(id, .{ .x = 0, .y = 0, .w = 0, .h = 0 }, false);
+    }
+    const activated = btn.clicked or keyboardActivated(ctx, id);
+
+    const style = ctx.style;
+    const hot = ctx.state.hot_id == id;
+    // held > hover > selected > normal — the same priority buttonId uses.
+    const bg = if (btn.held)
+        style.bg_active
+    else if (hot)
+        style.bg_hover
+    else if (selected)
+        style.button_bg_selected
+    else
+        opts.idle_bg;
+
+    // Opens unconditionally (no cache-miss early return), so `endListboxRow` always has a
+    // matching box to close.
+    ctx.beginBox(.{
+        .id = id,
+        .direction = opts.direction,
+        .width = opts.width,
+        .height = opts.height,
+        .gap = opts.gap,
+        .padding = opts.padding,
+        .align_cross = opts.align_cross,
+        .bg = bg,
+    });
+    return .{ .activated = activated };
+}
+
+/// Close a row opened by `beginListboxRow`.
+pub fn endListboxRow(ctx: *Context) void {
+    ctx.endBox();
+}
+
+// ============================================================
 // Tests
 // ============================================================
 
@@ -4874,4 +5038,147 @@ test "keyboard: a focused widget that left the layout cannot be activated" {
     fresh.pushEvent(.{ .key_down = .{ .code = input_mod.key.space, .modifiers = 0, .repeat = false } });
     try std.testing.expect(!buttonId(&fresh, 1, "a", .{}).clicked);
     fresh.endFrame();
+}
+
+// ── Tabs ──
+
+test "tabId: a click focuses immediately, and result.focused follows in the same frame" {
+    var ctx = testCtx();
+    defer ctx.deinit();
+    const id: Id = 0x7A01;
+
+    ctx.beginFrame(200, 40);
+    _ = ctx.tabId(id, "General", true, .{});
+    ctx.endFrame();
+    const c = center(ctx.getNodeRect(id).?);
+
+    ctx.beginFrame(200, 40);
+    clickAt(&ctx, c.x, c.y);
+    const res = ctx.tabId(id, "General", true, .{});
+    ctx.endFrame();
+    try std.testing.expect(res.activated);
+    try std.testing.expect(res.focused);
+}
+
+test "tabId: Tab traversal reaches a tab one frame later, matching ADR-021's delay" {
+    var ctx = testCtx();
+    defer ctx.deinit();
+    const general: Id = 0x7A02;
+    const editor: Id = 0x7A03;
+
+    const build = struct {
+        fn f(c: *Context) [2]TabResult {
+            var out: [2]TabResult = undefined;
+            out[0] = c.tabId(general, "General", false, .{});
+            out[1] = c.tabId(editor, "Editor", false, .{});
+            return out;
+        }
+    }.f;
+
+    ctx.beginFrame(200, 40);
+    _ = build(&ctx);
+    ctx.endFrame();
+
+    // Tab lands on the first submitted tab; the widget call that saw the Tab does not yet
+    // report it focused (ADR-021: the move resolves after this frame's draw commands).
+    ctx.beginFrame(200, 40);
+    ctx.pushEvent(.{ .key_down = .{ .code = input_mod.key.tab, .modifiers = 0, .repeat = false } });
+    const during = build(&ctx);
+    ctx.endFrame();
+    try std.testing.expect(!during[0].focused);
+
+    ctx.beginFrame(200, 40);
+    const after = build(&ctx);
+    ctx.endFrame();
+    try std.testing.expect(after[0].focused);
+    try std.testing.expect(!after[1].focused);
+}
+
+// ── Listbox ──
+
+test "beginListboxRow: only the selected row is a Tab stop (roving tab stop)" {
+    var ctx = testCtx();
+    defer ctx.deinit();
+    const row0: Id = 0x7B01;
+    const row1: Id = 0x7B02;
+    const row2: Id = 0x7B03;
+
+    const build = struct {
+        fn f(c: *Context, selected: Id) void {
+            for ([_]Id{ row0, row1, row2 }) |id| {
+                _ = beginListboxRow(c, id, id == selected, .{});
+                c.label("row");
+                endListboxRow(c);
+            }
+        }
+    }.f;
+
+    ctx.beginFrame(200, 200);
+    build(&ctx, row1);
+    ctx.endFrame();
+
+    try std.testing.expectEqual(@as(usize, 1), ctx.focus_order.items.len);
+    try std.testing.expectEqual(row1, ctx.focus_order.items[0]);
+}
+
+test "beginListboxRow: a click activates and claims the keyboard focus" {
+    var ctx = testCtx();
+    defer ctx.deinit();
+    const row0: Id = 0x7B11;
+    const row1: Id = 0x7B12;
+
+    const build = struct {
+        fn f(c: *Context, selected: Id) [2]ListboxRowResult {
+            var out: [2]ListboxRowResult = undefined;
+            var i: usize = 0;
+            for ([_]Id{ row0, row1 }) |id| {
+                out[i] = beginListboxRow(c, id, id == selected, .{});
+                c.label("row");
+                endListboxRow(c);
+                i += 1;
+            }
+            return out;
+        }
+    }.f;
+
+    ctx.beginFrame(200, 200);
+    _ = build(&ctx, row0);
+    ctx.endFrame();
+    const c1 = center(ctx.getNodeRect(row1).?);
+
+    ctx.beginFrame(200, 200);
+    clickAt(&ctx, c1.x, c1.y);
+    const res = build(&ctx, row0); // caller has not moved its own selection yet this frame
+    ctx.endFrame();
+    try std.testing.expect(res[1].activated);
+    try std.testing.expectEqual(row1, ctx.focusedId());
+}
+
+test "pollListNav: reports a direction only while the given id holds the focus" {
+    var ctx = testCtx();
+    defer ctx.deinit();
+    const row: Id = 0x7B21;
+
+    ctx.beginFrame(200, 200);
+    _ = beginListboxRow(&ctx, row, true, .{});
+    endListboxRow(&ctx);
+    ctx.endFrame();
+
+    // Nothing has claimed the focus yet: a keypress and an id of 0 both report .none.
+    ctx.beginFrame(200, 200);
+    ctx.pushEvent(.{ .key_down = .{ .code = input_mod.key.down, .modifiers = 0, .repeat = false } });
+    try std.testing.expectEqual(ListNav.none, pollListNav(&ctx, row));
+    try std.testing.expectEqual(ListNav.none, pollListNav(&ctx, 0));
+    ctx.endFrame();
+
+    ctx.beginFrame(200, 200);
+    _ = ctx.claimFocus(row);
+    ctx.pushEvent(.{ .key_down = .{ .code = input_mod.key.down, .modifiers = 0, .repeat = false } });
+    try std.testing.expectEqual(ListNav.next, pollListNav(&ctx, row));
+    ctx.endFrame();
+
+    ctx.beginFrame(200, 200);
+    ctx.pushEvent(.{ .key_down = .{ .code = input_mod.key.up, .modifiers = 0, .repeat = false } });
+    try std.testing.expectEqual(ListNav.prev, pollListNav(&ctx, row));
+    ctx.endFrame();
 }

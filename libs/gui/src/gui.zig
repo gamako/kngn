@@ -118,6 +118,17 @@ pub const selectableLabelId = @import("widgets.zig").selectableLabelId;
 pub const TextInputOpts = @import("widgets.zig").TextInputOpts;
 pub const TextInputResult = @import("widgets.zig").TextInputResult;
 pub const textInputId = @import("widgets.zig").textInputId;
+// Tabs (selected-section semantics)
+pub const TabOpts = @import("widgets.zig").TabOpts;
+pub const TabResult = @import("widgets.zig").TabResult;
+pub const tabId = @import("widgets.zig").tabId;
+// Listbox (single selection + Up/Down keyboard navigation)
+pub const ListNav = @import("widgets.zig").ListNav;
+pub const ListboxRowOpts = @import("widgets.zig").ListboxRowOpts;
+pub const ListboxRowResult = @import("widgets.zig").ListboxRowResult;
+pub const pollListNav = @import("widgets.zig").pollListNav;
+pub const beginListboxRow = @import("widgets.zig").beginListboxRow;
+pub const endListboxRow = @import("widgets.zig").endListboxRow;
 
 // PanelHost — dock-slot panel system.
 pub const PanelHost = @import("panel_host.zig").PanelHost;
