@@ -31,7 +31,8 @@ PlatformWindow* platform_create_window(int width, int height, const char* title,
                                        FrameCallback callback, void* userdata);
 
 // Turn an already-created window into a real fullscreen window.
-// The facade's Window.createFullscreen calls this right after create. On macOS this is NSWindow's
+// The Zig side calls this right after platform_create_window_ex when the fullscreen option is set,
+// which is how fullscreen is composed without adding a creation flag. On macOS this is NSWindow's
 // toggleFullScreen: (the same as the green button; a no-op when the window is already fullscreen).
 void platform_enter_fullscreen(PlatformWindow* window);
 
@@ -58,6 +59,7 @@ typedef struct PlatformWindowOptions {
 #define PLATFORM_WINDOW_BORDERLESS  (1u << 1)  // no title bar and no frame (borderless)
 #define PLATFORM_WINDOW_POSITION    (1u << 2)  // apply x/y as the initial position
 #define PLATFORM_WINDOW_FRAMEBUFFER_PHYSICAL (1u << 3)  // opt in to a physical framebuffer; unset = .logical
+#define PLATFORM_WINDOW_NOT_RESIZABLE (1u << 4)  // drop the resizing affordance; unset = freely resizable
 
 // The current window geometry. The size is the content/client area; the position is in OS screen coordinates.
 // When flags lacks PLATFORM_GEOMETRY_POSITION_VALID, x/y are undefined (position unsupported, or unreadable).
@@ -73,7 +75,9 @@ typedef struct PlatformWindowGeometry {
 
 // Create a window with options (an extension of platform_create_window).
 // opts==NULL behaves exactly like platform_create_window. Unknown flags or reserved!=0 return NULL
-// rather than being ignored silently (the facade turns that into error.Unsupported).
+// rather than being ignored silently, and the Zig side reports that as error.WindowCreationFailed.
+// This is what makes a version skew fail loudly: a newer Zig side asking for a flag an older
+// implementation does not know fails to create the window instead of silently losing the option.
 // The function signature is fixed. The position is read only when PLATFORM_WINDOW_POSITION is set.
 PlatformWindow* platform_create_window_ex(int width, int height, const char* title,
                                           FrameCallback callback, void* userdata,

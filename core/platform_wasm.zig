@@ -307,6 +307,9 @@ pub const Window = struct {
         _ = opts.borderless;
         _ = opts.position;
         _ = opts.fullscreen;
+        // A canvas cannot stop its viewport from changing (the page's layout owns the size), so
+        // resizable is a no-op here; the CSS box of the canvas is the author's lever instead.
+        _ = opts.resizable;
         const w = if (opts.size) |s| s.width else width;
         const h = if (opts.size) |s| s.height else height;
         try ensureFramebuffer(w, h);

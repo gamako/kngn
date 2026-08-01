@@ -95,6 +95,9 @@ pub const WindowOptions = struct {
     position: ?WindowPosition = null,
     size: ?WindowSize = null,
     fb_mode: FramebufferMode = .logical,
+    /// Ask that the user cannot resize the window. Advisory on x11 and wayland, a no-op on wasm,
+    /// and no promise that the framebuffer size never changes.
+    resizable: bool = true,
     /// Create the window fullscreen. This is an **initial state, not a transition**:
     /// entering or leaving fullscreen at run time, exclusive fullscreen, and choosing a
     /// monitor are separate APIs with separate contracts.
@@ -147,6 +150,7 @@ backends:
 | `fullscreen` + `borderless` | **`error.Unsupported`** (see below) |
 | `fullscreen` + `transparent` | **`error.Unsupported`** — on Windows, transparency selects an `UpdateLayeredWindow` present, which is not viable for a full screen every frame; the D3D11 backend already refuses transparency; macOS transparency across the fullscreen transition is unverified |
 | `fullscreen` + `fb_mode = .physical` | accepted; R5 defines it per backend |
+| `fullscreen` + `resizable = false` | accepted, and it adds nothing: a fullscreen window offers the user no resizing affordance anyway, and the request cannot stop a compositor from resizing it |
 | The framebuffer size of the first frame | **not guaranteed**; follow `fb.width`/`fb.height` (R3) |
 | `getGeometry` while fullscreen | the current geometry, never a restore geometry (R6) |
 | wasm + `fullscreen` | a **documented no-op**: accepted, and an ordinary canvas-sized window results |

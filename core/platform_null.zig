@@ -145,6 +145,8 @@ pub const Window = struct {
         // There is no screen here, so fullscreen has no size of its own to resolve: the requested
         // size is honoured as-is (ADR-019 R3, the third class).
         _ = opts.fullscreen;
+        // Nothing displays the window, so there is no user to resize it.
+        _ = opts.resizable;
         const w = if (opts.size) |s| s.width else width;
         const h = if (opts.size) |s| s.height else height;
         return allocBuffer(w, h);

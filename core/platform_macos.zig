@@ -435,6 +435,7 @@ pub const Window = struct {
         if (opts.transparent) flags |= c.PLATFORM_WINDOW_TRANSPARENT;
         if (opts.borderless) flags |= c.PLATFORM_WINDOW_BORDERLESS;
         if (opts.fb_mode == .physical) flags |= c.PLATFORM_WINDOW_FRAMEBUFFER_PHYSICAL;
+        if (!opts.resizable) flags |= c.PLATFORM_WINDOW_NOT_RESIZABLE;
         var copts = c.PlatformWindowOptions{ .flags = flags, .reserved = 0, .x = 0, .y = 0 };
         if (opts.position) |pos| {
             copts.flags |= c.PLATFORM_WINDOW_POSITION;

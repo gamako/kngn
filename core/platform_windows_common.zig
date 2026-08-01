@@ -329,6 +329,17 @@ pub fn roundToPhysicalPx(logical_px: u32, scale: f32) u32 {
     return @intFromFloat(v);
 }
 
+/// The window style a set of options asks for. Fullscreen and borderless are undecorated
+/// (`WS_POPUP`), where resizing has no frame to grab in the first place; a decorated window drops
+/// `WS_THICKFRAME` (the resizing border) and `WS_MAXIMIZEBOX` (which would resize it another way)
+/// when `resizable` is false. Unlike the window-manager *hints* of X11 and Wayland, this holds: the
+/// window simply has no resizing affordance.
+pub fn windowStyleFor(fullscreen: bool, borderless: bool, resizable: bool) DWORD {
+    if (fullscreen or borderless) return BORDERLESS_STYLE;
+    if (resizable) return WINDOW_STYLE;
+    return WINDOW_STYLE & ~(WS_THICKFRAME | WS_MAXIMIZEBOX);
+}
+
 /// A physical pixel count → logical points: the inverse of `roundToPhysicalPx`, with the same
 /// rounding and the same clamps. It is the derivation direction fullscreen needs, because the
 /// monitor metrics Win32 reports under per-monitor-aware v2 are already physical (ADR-011 R11): the
@@ -535,7 +546,7 @@ pub const Core = struct {
         // (the whole window size) disagree with the client size, losing the title bar's height or shrinking on WM_SIZE.
         // The width and height arguments are logical. `.physical` converts them into a physical client size under PMv2.
         const borderless = opts.borderless or opts.transparent;
-        const style: DWORD = if (fullscreen or borderless) BORDERLESS_STYLE else WINDOW_STYLE;
+        const style: DWORD = windowStyleFor(fullscreen, borderless, opts.resizable);
         var ex_style: DWORD = 0;
         if (opts.transparent) ex_style |= WS_EX_LAYERED;
         if (borderless) ex_style |= WS_EX_TOOLWINDOW; // frameless and transparent windows stay off the taskbar (for a mascot)
@@ -604,12 +615,12 @@ pub const Core = struct {
                         const d = GetDpiForSystem();
                         break :blk if (d == 0) 96 else d;
                     };
-                    if (AdjustWindowRectExForDpi(&rect, WINDOW_STYLE, 0, ex_style, dpi) == 0) {
+                    if (AdjustWindowRectExForDpi(&rect, style, 0, ex_style, dpi) == 0) {
                         restoreThreadDpiAwareness();
                         return error.WindowCreationFailed;
                     }
                 } else {
-                    if (AdjustWindowRectEx(&rect, WINDOW_STYLE, 0, 0) == 0) {
+                    if (AdjustWindowRectEx(&rect, style, 0, 0) == 0) {
                         restoreThreadDpiAwareness();
                         return error.WindowCreationFailed;
                     }
@@ -1565,4 +1576,25 @@ test "a fullscreen logical size does not move when the first resize reports the 
     const b = logicalSizeForPhysical(.physical, odd, 1.5);
     try std.testing.expectEqual(a.width, b.width);
     try std.testing.expectEqual(@as(u32, 1707), a.width); // 2560/1.5 = 1706.67 -> 1707
+}
+
+test "windowStyleFor: only a decorated resizable window carries the resizing styles" {
+    const resizable = windowStyleFor(false, false, true);
+    try std.testing.expect(resizable & WS_THICKFRAME != 0);
+    try std.testing.expect(resizable & WS_MAXIMIZEBOX != 0);
+    try std.testing.expectEqual(WINDOW_STYLE, resizable);
+
+    // Not resizable: the frame and the zoom box go, the rest of the decoration stays.
+    const fixed = windowStyleFor(false, false, false);
+    try std.testing.expect(fixed & WS_THICKFRAME == 0);
+    try std.testing.expect(fixed & WS_MAXIMIZEBOX == 0);
+    try std.testing.expect(fixed & WS_CAPTION != 0);
+    try std.testing.expect(fixed & WS_SYSMENU != 0);
+    try std.testing.expect(fixed & WS_MINIMIZEBOX != 0);
+
+    // Fullscreen and borderless are undecorated either way: resizable makes no difference.
+    try std.testing.expectEqual(BORDERLESS_STYLE, windowStyleFor(true, false, true));
+    try std.testing.expectEqual(BORDERLESS_STYLE, windowStyleFor(true, false, false));
+    try std.testing.expectEqual(BORDERLESS_STYLE, windowStyleFor(false, true, true));
+    try std.testing.expectEqual(BORDERLESS_STYLE, windowStyleFor(false, true, false));
 }

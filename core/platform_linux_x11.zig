@@ -423,12 +423,22 @@ pub const Window = struct {
             _ = c.XChangeProperty(dpy, win, net_wm_state, c.XA_ATOM, 32, c.PropModeReplace, @ptrCast(&fullscreen_atom), 1);
         } else {
             // Resizable. Only a minimum size is given, and no maximum (so it resizes freely).
+            // `resizable = false` instead pins the minimum and the maximum to the created size. That is
+            // **advice**: ICCCM's WM_NORMAL_HINTS is a hint, and a window manager is free to resize the
+            // window anyway, so the resize path still has to work.
             // With an explicit position, PPosition and PWinGravity=StaticGravity are set together, which puts
             // saving (the client origin, in root coordinates) and restoring on the same basis.
             var hints = std.mem.zeroes(c.XSizeHints);
             hints.flags = c.PMinSize;
             hints.min_width = 1;
             hints.min_height = 1;
+            if (!opts.resizable) {
+                hints.flags |= c.PMaxSize;
+                hints.min_width = @intCast(win_w);
+                hints.min_height = @intCast(win_h);
+                hints.max_width = @intCast(win_w);
+                hints.max_height = @intCast(win_h);
+            }
             if (opts.position) |p| {
                 hints.flags |= c.PPosition | c.PWinGravity;
                 hints.x = p.x;

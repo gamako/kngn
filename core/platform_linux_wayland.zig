@@ -1596,6 +1596,14 @@ pub const Window = struct {
         if (fullscreen) {
             // output=null (the compositor matches the output the surface is on). It is requested before the first commit.
             c.xdg_toplevel_set_fullscreen(st.toplevel, null);
+        } else if (!opts.resizable) {
+            // A minimum equal to the maximum is how xdg-shell expresses "do not resize me", in
+            // surface-local (logical) coordinates. It is **advice**: the compositor may still send a
+            // configure with another size, and the client is obliged to honour a configure, so the
+            // resize path still has to work. Fullscreen skips it, because pinning the size there
+            // would fight the fullscreen configure itself.
+            c.xdg_toplevel_set_min_size(st.toplevel, @intCast(width), @intCast(height));
+            c.xdg_toplevel_set_max_size(st.toplevel, @intCast(width), @intCast(height));
         }
 
         // Deciding the decoration mode. It happens after the toplevel is created and before the first commit (v1's ordering constraint).

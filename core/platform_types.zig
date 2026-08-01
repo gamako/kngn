@@ -57,6 +57,15 @@ pub const WindowOptions = struct {
     position: ?WindowPosition = null,
     size: ?WindowSize = null,
     fb_mode: FramebufferMode = .logical,
+    /// Ask that the user cannot resize the window. **How strong that is depends on the platform**:
+    /// macOS and Windows drop the resizing affordance from the window itself, so it holds; X11
+    /// (`WM_NORMAL_HINTS`) and Wayland (`set_min_size`/`set_max_size`) can only *advise* the window
+    /// manager or compositor, which may resize anyway; on the web it is a no-op, because a canvas
+    /// cannot stop its viewport from changing. It therefore **does not promise that the framebuffer
+    /// size never changes** — an application still handles resizes and follows `fb.width`/`fb.height`.
+    /// With `fullscreen` it is accepted and adds nothing: a fullscreen window is not user-resizable
+    /// to begin with, and it cannot stop the compositor resizing it.
+    resizable: bool = true,
     /// Create the window fullscreen. This is an **initial state, not a transition**: entering or
     /// leaving fullscreen at run time, exclusive fullscreen, and choosing a monitor are separate
     /// APIs with separate contracts (ADR-019 R2).
@@ -769,13 +778,16 @@ test "MidiEvent: the MIDI 7-bit boundary values 0 and 127 are kept" {
     try std.testing.expectEqual(@as(u8, 127), high.note_on.velocity);
 }
 
-test "WindowOptions: the defaults are backwards compatible (no transparency, no borderless, no position or size, a logical fb)" {
+test "WindowOptions: the defaults are backwards compatible (no transparency, no borderless, no position or size, a logical fb, resizable, not fullscreen)" {
     const opts: WindowOptions = .{};
     try std.testing.expect(!opts.transparent);
     try std.testing.expect(!opts.borderless);
     try std.testing.expect(opts.position == null);
     try std.testing.expect(opts.size == null);
     try std.testing.expectEqual(FramebufferMode.logical, opts.fb_mode);
+    // An ordinary window is resizable and not fullscreen, so `.{}` still means what it always did.
+    try std.testing.expect(opts.resizable);
+    try std.testing.expect(!opts.fullscreen);
 }
 
 test "FramebufferMode: logical is the default and physical is opt-in" {

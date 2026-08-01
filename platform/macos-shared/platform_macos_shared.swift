@@ -1090,24 +1090,26 @@ func platform_create_window_ex(width: Int32, height: Int32, title: UnsafePointer
     var transparent = false
     var borderless = false
     var physical = false
+    var notResizable = false
     var position: (x: Int32, y: Int32)? = nil
     if let opts = opts {
         let flags = opts.pointee.flags
-        let known = UInt32(PLATFORM_WINDOW_TRANSPARENT) | UInt32(PLATFORM_WINDOW_BORDERLESS) | UInt32(PLATFORM_WINDOW_POSITION) | UInt32(PLATFORM_WINDOW_FRAMEBUFFER_PHYSICAL)
+        let known = UInt32(PLATFORM_WINDOW_TRANSPARENT) | UInt32(PLATFORM_WINDOW_BORDERLESS) | UInt32(PLATFORM_WINDOW_POSITION) | UInt32(PLATFORM_WINDOW_FRAMEBUFFER_PHYSICAL) | UInt32(PLATFORM_WINDOW_NOT_RESIZABLE)
         if (flags & ~known) != 0 || opts.pointee.reserved != 0 { return nil }
         transparent = (flags & UInt32(PLATFORM_WINDOW_TRANSPARENT)) != 0
         borderless = (flags & UInt32(PLATFORM_WINDOW_BORDERLESS)) != 0
         physical = (flags & UInt32(PLATFORM_WINDOW_FRAMEBUFFER_PHYSICAL)) != 0
+        notResizable = (flags & UInt32(PLATFORM_WINDOW_NOT_RESIZABLE)) != 0
         if (flags & UInt32(PLATFORM_WINDOW_POSITION)) != 0 {
             position = (opts.pointee.x, opts.pointee.y)
         }
     }
-    return createWindowImpl(width: width, height: height, title: title, callback: callback, userdata: userdata, transparent: transparent, borderless: borderless, position: position, physical: physical)
+    return createWindowImpl(width: width, height: height, title: title, callback: callback, userdata: userdata, transparent: transparent, borderless: borderless, position: position, physical: physical, notResizable: notResizable)
 }
 
 // The shared skeleton of window creation. Creating the backend-specific view is delegated to the
 // makePlatformBackendView() factory (defined in each backend file). The window-level style, transparency and placement are shared.
-private func createWindowImpl(width: Int32, height: Int32, title: UnsafePointer<CChar>, callback: FrameCallback?, userdata: UnsafeMutableRawPointer?, transparent: Bool, borderless: Bool, position: (x: Int32, y: Int32)?, physical: Bool) -> UnsafeMutableRawPointer? {
+private func createWindowImpl(width: Int32, height: Int32, title: UnsafePointer<CChar>, callback: FrameCallback?, userdata: UnsafeMutableRawPointer?, transparent: Bool, borderless: Bool, position: (x: Int32, y: Int32)?, physical: Bool, notResizable: Bool = false) -> UnsafeMutableRawPointer? {
     let app = NSApplication.shared
     app.setActivationPolicy(.regular)
 
@@ -1115,9 +1117,13 @@ private func createWindowImpl(width: Int32, height: Int32, title: UnsafePointer<
     let windowHeight = CGFloat(height)
     let frame = NSRect(x: 0, y: 0, width: windowWidth, height: windowHeight)
 
+    // Without .resizable the frame has no drag handles and the zoom button is inactive, so the user
+    // cannot resize the window (the app still can).
     let styleMask: NSWindow.StyleMask = borderless
-        ? [.borderless]                                    // frameless
-        : [.titled, .closable, .miniaturizable, .resizable] // freely resizable
+        ? [.borderless]                            // frameless
+        : (notResizable
+            ? [.titled, .closable, .miniaturizable]
+            : [.titled, .closable, .miniaturizable, .resizable])
 
     // borderless uses the subclass that can become the key window (transparent on its own works with a plain NSWindow)
     let window: NSWindow = borderless

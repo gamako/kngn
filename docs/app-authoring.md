@@ -51,12 +51,14 @@ Prefer `kit.app_runtime.Runtime(App)` over a hand-written event loop. The app pr
 | `pub fn windowBootstrap(gpa, io) !kit.platform.WindowOptions` | optional; the window options the runtime creates the window with |
 
 `windowBootstrap` is how an app asks for anything beyond a plain window — a physical-resolution
-framebuffer (`.fb_mode = .physical`), a transparent or borderless window, an initial position, or
-**fullscreen** (`.fullscreen = true`). The rules are in ADR-019: fullscreen is an initial state
-rather than a transition, its size is a request the platform may replace (follow `fb.width` /
-`fb.height` each frame), and it cannot be combined with `position`, `borderless` or `transparent`
-(those give `error.Unsupported`). On the web it is accepted but has no effect, because the browser
-needs a user gesture to enter fullscreen.
+framebuffer (`.fb_mode = .physical`), a transparent or borderless window, an initial position, a
+window the user cannot resize (`.resizable = false`), or **fullscreen** (`.fullscreen = true`).
+The rules are in ADR-019: fullscreen is an initial state rather than a transition, its size is a
+request the platform may replace (follow `fb.width` / `fb.height` each frame), and it cannot be
+combined with `position`, `borderless` or `transparent` (those give `error.Unsupported`). On the web
+it is accepted but has no effect, because the browser needs a user gesture to enter fullscreen.
+`resizable = false` holds on macOS and Windows but is only advice to a window manager or compositor
+on Linux, and a no-op on the web, so it never promises a fixed framebuffer size.
 
 If the app also **persists its window geometry** (`kit.appshell`'s window state), note that
 `getGeometry` reports the *current* geometry: saved while fullscreen, it restores as a

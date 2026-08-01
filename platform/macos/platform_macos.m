@@ -1887,16 +1887,18 @@ PlatformWindow* platform_create_window(int width, int height, const char* title,
 PlatformWindow* platform_create_window_ex(int width, int height, const char* title,
                                           FrameCallback callback, void* userdata,
                                           const PlatformWindowOptions* opts) {
-    // Unknown flags or reserved!=0 give NULL (never ignored silently; the facade turns it into error.Unsupported)
-    BOOL transparent = NO, borderless = NO, has_position = NO, physical = NO;
+    // Unknown flags or reserved!=0 give NULL (never ignored silently; the Zig side reports it as error.WindowCreationFailed)
+    BOOL transparent = NO, borderless = NO, has_position = NO, physical = NO, not_resizable = NO;
     int pos_x = 0, pos_y = 0;
     if (opts) {
         const uint32_t known = PLATFORM_WINDOW_TRANSPARENT | PLATFORM_WINDOW_BORDERLESS |
-                               PLATFORM_WINDOW_POSITION | PLATFORM_WINDOW_FRAMEBUFFER_PHYSICAL;
+                               PLATFORM_WINDOW_POSITION | PLATFORM_WINDOW_FRAMEBUFFER_PHYSICAL |
+                               PLATFORM_WINDOW_NOT_RESIZABLE;
         if ((opts->flags & ~known) != 0 || opts->reserved != 0) return NULL;
         transparent = (opts->flags & PLATFORM_WINDOW_TRANSPARENT) != 0;
         borderless = (opts->flags & PLATFORM_WINDOW_BORDERLESS) != 0;
         physical = (opts->flags & PLATFORM_WINDOW_FRAMEBUFFER_PHYSICAL) != 0;
+        not_resizable = (opts->flags & PLATFORM_WINDOW_NOT_RESIZABLE) != 0;
         if ((opts->flags & PLATFORM_WINDOW_POSITION) != 0) {
             has_position = YES;
             pos_x = opts->x;
@@ -1925,8 +1927,10 @@ PlatformWindow* platform_create_window_ex(int width, int height, const char* tit
         } else {
             styleMask = NSWindowStyleMaskTitled |
                         NSWindowStyleMaskClosable |
-                        NSWindowStyleMaskMiniaturizable |
-                        NSWindowStyleMaskResizable; // freely resizable
+                        NSWindowStyleMaskMiniaturizable;
+            // Without the resizable mask the frame has no drag handles and the zoom button is
+            // inactive, so the user cannot resize the window (the app still can).
+            if (!not_resizable) styleMask |= NSWindowStyleMaskResizable;
         }
 
         // borderless uses the subclass that can become the key window (transparent on its own works with a plain NSWindow)
