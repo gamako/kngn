@@ -1849,6 +1849,28 @@ pub fn build(b: *std.Build) void {
     const test_history_summary_step = b.step("test-history-summary", "Run history_summary schema unit tests");
     test_history_summary_step.dependOn(&run_history_summary_test.step);
 
+    // History persistence: composing command/undo codecs onto the journal store.
+    // Needs kit (command types, the journal store) and paint (Op codec, UndoStack).
+    const history_persist_pm = makePlatformModules(b, target, default_be, &shared_modules, false);
+    const history_persist_paint = b.createModule(.{
+        .root_source_file = b.path("libs/paint/src/paint.zig"),
+    });
+    history_persist_paint.addImport("pixelops", shared_modules.pixelops.mod);
+    history_persist_paint.addImport("png", shared_modules.png.mod);
+    history_persist_paint.addImport("serde", shared_modules.serde.mod);
+    history_persist_paint.addImport("font", shared_modules.font.mod);
+    const history_persist_mod = b.createModule(.{
+        .root_source_file = b.path("apps/editor/apps/pixie/history_persist.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    history_persist_mod.addImport("kit", history_persist_pm.kit.mod);
+    history_persist_mod.addImport("paint", history_persist_paint);
+    const history_persist_test = b.addTest(.{ .root_module = history_persist_mod });
+    const run_history_persist_test = b.addRunArtifact(history_persist_test);
+    const test_history_persist_step = b.step("test-history-persist", "Run history persistence (journal composition) tests");
+    test_history_persist_step.dependOn(&run_history_persist_test.step);
+
     // Layer-name inline-edit input state machine. std only; no paint/App/kit; no imports.
     const layer_rename_input_test = b.addTest(.{
         .root_module = b.createModule(.{
@@ -1895,6 +1917,7 @@ pub fn build(b: *std.Build) void {
     test_core_step.dependOn(&run_actions_test.step);
     test_core_step.dependOn(&run_diff_test.step);
     test_core_step.dependOn(&run_history_summary_test.step);
+    test_core_step.dependOn(&run_history_persist_test.step);
     test_core_step.dependOn(&run_history_thumbnail_test.step);
     test_core_step.dependOn(&run_layer_rename_input_test.step);
     test_core_step.dependOn(&run_text_content_input_test.step);

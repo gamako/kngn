@@ -45,6 +45,7 @@ const layer_rename_input = @import("layer_rename_input.zig");
 const text_content_input = @import("text_content_input.zig");
 const history_summary = @import("history_summary.zig");
 const history_thumbnail = @import("history_thumbnail.zig");
+const history_persist = @import("history_persist.zig");
 
 // Layer-name max length is defined independently in libs/paint (save side) and pixie (edit buffer)
 // (avoids a cyclic import; see the top of layer_rename_input.zig). Comptime-assert they match.
@@ -670,6 +671,14 @@ const App = struct {
     recent: appshell.recent_files.RecentFiles = undefined,
     autosave: appshell.autosave.Controller = undefined,
     recovery: ?appshell.autosave.Candidate = null,
+    /// History-journal directory inside the application data directory (native only).
+    history_dir: std.Io.Dir = undefined,
+    /// Journal for the document currently open; null while the document is unsaved.
+    history_store: ?appshell.history_journal.NativeStore = null,
+    /// Composition of the command log and undo stack onto the journal.
+    history_journal: history_persist.Persist = undefined,
+    /// Outcome of the last restore attempt, reported by `digest appshell`.
+    history_restore: history_persist.LoadOutcome = .{ .status = .no_store },
     pending_png_path: ?[]u8 = null,
     png_import_pending: bool = false,
     /// For the `new W H` confirmation flow (consumed by hostNewDocument).
@@ -3602,7 +3611,10 @@ fn appshellDigest(ctx: *anyopaque, buf: []u8) []const u8 {
         (std.fmt.bufPrint(&pos_buf, "{d},{d}", .{ p.x, p.y }) catch "err")
     else
         "none";
-    return std.fmt.bufPrint(buf, "dirty={d} path={s} confirm={s} recent={d} recent0={s} recovery={s} modal={s} autosave={d} netsync={d} title={s} geom={d}x{d} pos={s}", .{
+    // History-journal observability: whether a journal is bound, how the last restore went,
+    // and how many records it holds (so a replay can assert persistence without a file path).
+    const journal_stats = if (app.history_store) |*store| store.store().stats() else null;
+    return std.fmt.bufPrint(buf, "dirty={d} path={s} confirm={s} recent={d} recent0={s} recovery={s} modal={s} autosave={d} netsync={d} history_journal={d} history_restore={s} history_undo={d} history_records={d} title={s} geom={d}x{d} pos={s}", .{
         @intFromBool(app.host.isDirty()),
         path,
         @tagName(app.host.confirmation()),
@@ -3612,6 +3624,10 @@ fn appshellDigest(ctx: *anyopaque, buf: []u8) []const u8 {
         modal,
         @intFromBool(activeAutosavePresent(app)),
         @intFromBool(platform.netsyncActive()),
+        @intFromBool(app.history_store != null),
+        @tagName(app.history_restore.status),
+        app.history_restore.undo_records,
+        if (journal_stats) |st| st.live_count else 0,
         title,
         geo.size.width,
         geo.size.height,
@@ -6497,8 +6513,88 @@ fn clearAutosave(app: *App) !void {
     if (comptime appshell_dir_supported) try app.autosave.clear();
 }
 
+/// Close the journal bound to the previous document, if any.
+///
+/// Detaching the composition layer first keeps it from holding a `Store` whose backing
+/// `NativeStore` is about to be destroyed.
+fn closeHistoryStore(app: *App) void {
+    app.history_journal.setStore(null);
+    app.history_restore = .{ .status = .no_store };
+    if (app.history_store) |*store| {
+        store.deinit();
+        app.history_store = null;
+    }
+}
+
+/// Bind the journal that belongs to `path`, replacing any journal already open.
+///
+/// Failing to open one is not an error the user needs to see: history simply is not
+/// persisted for this document, and the editor behaves exactly as it did before.
+fn bindHistoryStore(app: *App, path: []const u8) void {
+    if (comptime !appshell_dir_supported) {
+        closeHistoryStore(app);
+        return;
+    }
+    const canonical = appshell.paths.normalizePath(app.io, app.gpa, path) catch {
+        closeHistoryStore(app);
+        return;
+    };
+    defer app.gpa.free(canonical);
+    // Already bound to this document: keep it. Rebinding would discard the map of which Ops
+    // are already in the journal, and every save would write them all again.
+    if (app.history_store) |*open_store| {
+        if (std.mem.eql(u8, open_store.documentPath(), canonical)) return;
+    }
+    closeHistoryStore(app);
+    const file_name = (appshell.paths.historyFileName(app.io, app.gpa, path) catch return) orelse return;
+    defer app.gpa.free(file_name);
+    app.history_store = appshell.history_journal.NativeStore.openOrReset(
+        app.gpa,
+        app.io,
+        app.history_dir,
+        file_name,
+        canonical,
+    ) catch return;
+    app.history_journal.setStore(app.history_store.?.store());
+}
+
+/// Persist the current history against the document bytes that were just written.
+fn persistHistory(app: *App, doc_bytes: []const u8) void {
+    const outcome = app.history_journal.save(
+        &app.doc.undo,
+        &app.cmd_log,
+        &app.cmd_exec,
+        history_persist.documentDigest(doc_bytes),
+    ) catch |err| {
+        std.log.warn("pixie: history journal save failed: {s}", .{@errorName(err)});
+        return;
+    };
+    if (outcome.dropped_by_budget > 0) {
+        app.setSaveMsg("History: {d} older steps exceeded the size budget", .{outcome.dropped_by_budget});
+    }
+}
+
+/// Restore the history recorded for the document bytes that were just loaded.
+///
+/// Any mismatch — a document saved by another editor, an edited file, a journal from a
+/// different document — leaves the freshly loaded document with no history, which is the
+/// same state a file that never had a journal starts in.
+fn restoreHistory(app: *App, doc_bytes: []const u8) void {
+    app.history_restore = app.history_journal.load(
+        &app.doc.undo,
+        &app.cmd_log,
+        &app.cmd_exec,
+        history_persist.documentDigest(doc_bytes),
+    );
+    if (app.history_restore.status == .restored) {
+        app.last_seen_handle = app.doc.undo.next_handle;
+        app.markHistoryDirty();
+    }
+}
+
 fn hostNewDocument(ctx: *anyopaque) !void {
     const app: *App = @ptrCast(@alignCast(ctx));
+    closeHistoryStore(app);
     if (app.pending_png_path) |path| {
         app.doOpenPath(path) catch |err| return err;
         app.gpa.free(path);
@@ -6535,6 +6631,10 @@ fn hostSaveDocument(ctx: *anyopaque, path: []const u8) !void {
     const bytes = try core.document_io.encodeDocument(&app.doc, app.gpa);
     defer app.gpa.free(bytes);
     try appshell.file_safety.writeAtomic(app.io, path, bytes, .{ .backup = true });
+    // Only after the document is on disk: an index must never claim to describe a save
+    // that did not happen.
+    bindHistoryStore(app, path);
+    persistHistory(app, bytes);
     try app.recent.push(path);
     try clearAutosave(app);
     try app.autosave.setPath(path);
@@ -6566,6 +6666,8 @@ fn loadProjectPath(app: *App, path: []const u8) !void {
     app.loadPaletteFromDoc();
     app.syncPreviewCanvas();
     try app.setProjectPath(path);
+    bindHistoryStore(app, path);
+    restoreHistory(app, bytes);
 }
 
 /// Draw status-bar zoom%/cursor directly with post-updateViewport values.
@@ -6658,6 +6760,7 @@ fn recoverAutosave(app: *App) !void {
     if (comptime appshell_dir_supported) {
         try appshell.autosave.discardCandidate(app.io, app.autosave.dir, candidate.file_name);
     }
+    closeHistoryStore(app);
     app.doc.deinit();
     app.doc = decoded;
     decoded = undefined;
@@ -6752,6 +6855,22 @@ fn appInit(gpa: std.mem.Allocator, io: std.Io) !*App {
     else
         undefined;
     errdefer if (comptime appshell_dir_supported) autosave_dir.close(io);
+    var history_dir: std.Io.Dir = if (comptime appshell_dir_supported)
+        try appshell.paths.openHistoryDir(io, data_dir)
+    else
+        undefined;
+    errdefer if (comptime appshell_dir_supported) history_dir.close(io);
+    // Amortised housekeeping: bounded per launch, and a failure never blocks startup.
+    if (comptime appshell_dir_supported) {
+        const now = std.Io.Clock.now(.real, io);
+        _ = appshell.history_journal.maintain(
+            gpa,
+            io,
+            history_dir,
+            @divFloor(now.nanoseconds, std.time.ns_per_s),
+            .{},
+        ) catch |err| std.log.warn("pixie: history journal sweep failed: {s}", .{@errorName(err)});
+    }
     var recent = appshell.recent_files.RecentFiles.init(gpa, 10);
     errdefer recent.deinit();
     if (comptime appshell_dir_supported) {
@@ -6791,6 +6910,8 @@ fn appInit(gpa: std.mem.Allocator, io: std.Io) !*App {
         .onion_scratch = onion_scratch,
         .data_dir = data_dir,
         .autosave_dir = autosave_dir,
+        .history_dir = history_dir,
+        .history_journal = .{ .gpa = gpa },
         .recent = recent,
         .autosave = autosave_controller,
         .recovery = recovery,
@@ -6900,7 +7021,10 @@ fn appDeinit(self: *App) void {
     self.autosave.deinit();
     self.recent.deinit();
     self.preferences.deinit();
+    closeHistoryStore(self);
+    self.history_journal.deinit();
     if (comptime appshell_dir_supported) {
+        self.history_dir.close(self.io);
         self.autosave_dir.close(self.io);
         self.data_dir.close(self.io);
     }
