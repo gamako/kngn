@@ -1,6 +1,13 @@
 //! Shared App state + UI construction for the game inventory shell.
 //! Used by examples/43_game_inventory/main.zig.
 //!
+//! Item drag-and-drop between grid slots goes through the library's `gui.dragSource` /
+//! `gui.dropTarget` / `gui.finishDrag` (see libs/gui/src/dnd.zig): a slot offers itself as a
+//! source with its index as the payload, and as a target that rejects a locked occupant. The
+//! rotary "Min Rarity" knob is a different kind of drag entirely (a single widget dragging its
+//! own value, not a payload moving between widgets), so it keeps its own hand-rolled glue in
+//! main.zig's mouse handlers, the same shape a slider's internal drag uses.
+//!
 //! Hot path declaration:
 //! - Building / laying out / appending DrawList for the grid is per-frame O(N), N bounded by a
 //!   fixed 6x4 = 24 slot grid plus a handful of detail-panel controls and one knob.
@@ -34,6 +41,10 @@ pub const Ids = struct {
     pub const discard_button: gui.Id = 0x8101;
     pub const context_popup: gui.Id = 0x8200;
 };
+
+/// `gui.DragPayload.kind` tag for a slot-to-slot item move (the library never interprets it; this
+/// is only meaningful within this shell).
+const DRAG_KIND_SLOT: u32 = 1;
 
 /// Intentionally long, so the detail panel's `labelEllipsis` truncates it at every window size
 /// this shell is checked at (640x360 included).
@@ -77,8 +88,16 @@ pub const App = struct {
     select_source: SelectSource = .none,
     hover_slot: i32 = -1,
 
-    dragging: ?struct { from: i32, item: Item } = null,
-    drag_pos: gui.Vec2 = .{ .x = 0, .y = 0 },
+    /// The item currently lifted out of its slot -- by an in-flight mouse drag
+    /// (`gui.isDragging(ctx)`, set on `gui.dragSource`'s `.started` edge) or by a keyboard/gamepad
+    /// pickup (`kbd_pickup` below, set the instant it picks up). Used for the ghost's color/text
+    /// and for restoring the item if the drag/pickup ends without a place to land. At most one of
+    /// the two pickup mechanisms is ever in flight at once, so sharing this field costs nothing.
+    drag_item: ?Item = null,
+    /// The origin slot of a keyboard/gamepad pickup (`activateCursor`) -- a separate two-press
+    /// protocol (pick up, move the cursor, activate again to drop), not a pointer drag at all, so
+    /// it tracks its own origin independently of `gui.dragSource`'s internal state.
+    kbd_pickup: ?i32 = null,
 
     min_rarity: u8 = 0,
     knob_drag: ?struct { start_y: i32, start_value: u8 } = null,
@@ -132,61 +151,59 @@ pub fn hitTestKnob(app: *const App, p: gui.Vec2) bool {
     return r.clip.contains(p) and r.rect.contains(p);
 }
 
-/// Pick up the item at `slot` (mouse press or gamepad "A"). No-op (returns false) for an empty or
-/// locked slot -- a locked item cannot be dragged, the same "editable=false substitutes for real
-/// disabled" shape the tracker shell hit with `stepgrid`, except here there is no widget to
-/// suppress at all (custom-drawn slots), so the check is just an ordinary early return.
-pub fn beginDrag(app: *App, slot: i32) bool {
-    const idx = clampSlot(slot);
-    const item = app.slots[idx] orelse return false;
-    if (item.locked) return false;
-    app.dragging = .{ .from = @intCast(idx), .item = item };
-    app.slots[idx] = null;
-    app.cursor = @intCast(idx);
-    return true;
-}
-
-pub fn updateDragPos(app: *App, p: gui.Vec2) void {
-    app.drag_pos = p;
-}
-
-/// Drop the currently dragged item at `dest` (null = released outside the grid). Occupied and
-/// unlocked: swap. Occupied and locked: reject, the item returns to its origin. Empty: place.
-pub fn endDrag(app: *App, dest: ?i32) void {
-    const drag = app.dragging orelse return;
-    app.dragging = null;
-    const from = clampSlot(drag.from);
-    const to_opt = dest;
-    const to = to_opt orelse {
-        app.slots[from] = drag.item;
-        return;
-    };
-    const to_idx = clampSlot(to);
-    if (to_idx == from) {
-        app.slots[from] = drag.item;
+/// Places `item` (already lifted out of `from`) into `to`. `to == from`: puts it straight back (a
+/// self-drop is a no-op move). Occupied by an unlocked item: swap. Occupied by a locked item:
+/// reject -- the item returns to `from` instead (a locked slot cannot be overwritten either).
+/// Empty: place. Shared by the mouse drop-accept path and the keyboard/gamepad pickup below --
+/// `gui.dropTarget`'s `can_accept` already filters out a locked destination for the mouse path, so
+/// the reject branch here is only ever exercised by the keyboard/gamepad path, which has no
+/// upfront filter of its own.
+fn placeOrReject(app: *App, from: usize, to: usize, item: Item) void {
+    if (to == from) {
+        app.slots[from] = item;
         return;
     }
-    if (app.slots[to_idx]) |existing| {
+    if (app.slots[to]) |existing| {
         if (existing.locked) {
-            // Reject: the destination is occupied by a locked item.
-            app.slots[from] = drag.item;
+            app.slots[from] = item;
             return;
         }
-        app.slots[to_idx] = drag.item;
+        app.slots[to] = item;
         app.slots[from] = existing;
     } else {
-        app.slots[to_idx] = drag.item;
+        app.slots[to] = item;
     }
-    app.cursor = @intCast(to_idx);
+    app.cursor = @intCast(to);
 }
 
 /// Gamepad "A" / keyboard Enter-Space: pick up the item at the cursor, or drop the one already
-/// being dragged there. The single activation both mouse click-drag and this share.
+/// picked up there. A two-press protocol (pick up, move the cursor, activate again to drop) --
+/// unlike the mouse path, there is no continuous pointer position driving it, so it does not go
+/// through `gui.dragSource`/`dropTarget` at all; it is its own, independent state machine sharing
+/// only `placeOrReject` (the swap/reject/place decision) with the mouse-drop-accept path.
 pub fn activateCursor(app: *App) void {
-    if (app.dragging == null) {
-        _ = beginDrag(app, app.cursor);
+    if (app.kbd_pickup) |from_i| {
+        const from: usize = clampSlot(from_i);
+        const item = app.drag_item orelse {
+            app.kbd_pickup = null; // should not happen (nothing to place); fail safe rather than panic
+            return;
+        };
+        app.drag_item = null;
+        app.kbd_pickup = null;
+        placeOrReject(app, from, clampSlot(app.cursor), item);
     } else {
-        endDrag(app, app.cursor);
+        const idx = clampSlot(app.cursor);
+        if (app.slots[idx]) |it| {
+            if (!it.locked) {
+                // Unlike the mouse path, there is no movement threshold here: the item leaves its
+                // slot the instant it is picked up (the same "A/Space always commits" shape the
+                // original hand-rolled version had -- a two-press protocol has no intermediate
+                // "held but maybe still just a click" state to preserve).
+                app.kbd_pickup = @intCast(idx);
+                app.drag_item = it;
+                app.slots[idx] = null;
+            }
+        }
     }
 }
 
@@ -288,10 +305,42 @@ pub fn buildUi(app: *App) void {
                     }
                 }
             }
+
+            // Drag-and-drop: this slot offers itself as a source (only when it holds an unlocked
+            // item -- a locked one is not draggable, and an empty one has nothing to lift), and as
+            // a target (can_accept is false only for a locked occupant; an empty slot or an
+            // unlocked one both accept).
+            if (app.slots[idx]) |it| {
+                if (!it.locked) {
+                    const src = ctx.dragSource(id, gui.DragPayload.fromValue(i32, DRAG_KIND_SLOT, @as(i32, @intCast(idx))));
+                    if (src.started) {
+                        app.drag_item = it;
+                        app.slots[idx] = null;
+                    }
+                }
+            }
+            const can_accept = if (app.slots[idx]) |it| !it.locked else true;
+            if (ctx.dropTarget(id, can_accept).accepted) |payload| {
+                const from: usize = @intCast(payload.read(i32, DRAG_KIND_SLOT).?);
+                const item = app.drag_item.?;
+                app.drag_item = null;
+                placeOrReject(app, from, idx, item);
+            }
         }
         ctx.endBox();
     }
     ctx.endBox(); // grid column
+
+    // Once per frame, after every dropTarget call above: released over nothing (or over a
+    // rejecting target, which never accepts) hands the lifted item back to its origin.
+    if (ctx.finishDrag()) |payload| {
+        if (payload.read(i32, DRAG_KIND_SLOT)) |from| {
+            if (app.drag_item) |item| {
+                app.slots[clampSlot(from)] = item;
+                app.drag_item = null;
+            }
+        }
+    }
 
     // Detail panel for the cursor slot.
     ctx.beginBox(.{ .direction = .column, .width = .{ .fixed = detail_w }, .height = .{ .grow = 1 }, .gap = 6 });
@@ -420,20 +469,25 @@ pub fn handleOverlays(app: *App) void {
         }, gui.Color.rgba(0xE0, 0xC0, 0x40, 0xFF)) catch @panic("inventory: OOM");
     }
 
-    // Drag ghost: follows the cursor while an item is picked up. Semi-transparent, so the slot
-    // underneath the cursor stays legible. No dedicated drag-and-drop API exists in libs/gui;
-    // this overlay plus the pointer-event glue in main.zig is the example-side workaround.
-    if (app.dragging) |drag| {
-        const half: i32 = 16;
-        const rect: gui.Rect = .{
-            .x = app.drag_pos.x - half,
-            .y = app.drag_pos.y - half,
-            .w = @intCast(half * 2),
-            .h = @intCast(half * 2),
-        };
-        const ghost_c = rarityColor(drag.item.rarity);
-        dl.rectFilled(rect, gui.Color.rgba(ghost_c.r, ghost_c.g, ghost_c.b, 0xB0)) catch @panic("inventory: OOM");
-        dl.rectOutline(rect, gui.Color.rgba(0xF0, 0xF0, 0xF0, 0xFF), 1) catch @panic("inventory: OOM");
+    // Drag ghost: follows the cursor while a mouse drag is in flight (`gui.isDragging`). Semi-
+    // transparent, so the slot underneath the cursor stays legible. `drag_item` (lifted at
+    // `.started`) supplies the rarity color; the library only tracks the payload and position, not
+    // how to draw it. A keyboard/gamepad pickup (`app.kbd_pickup`) draws no ghost -- there is no
+    // continuous pointer position to anchor one to.
+    if (gui.isDragging(ctx)) {
+        if (app.drag_item) |item| {
+            const pos = ctx.dragPosition().?;
+            const half: i32 = 16;
+            const rect: gui.Rect = .{
+                .x = pos.x - half,
+                .y = pos.y - half,
+                .w = @intCast(half * 2),
+                .h = @intCast(half * 2),
+            };
+            const ghost_c = rarityColor(item.rarity);
+            dl.rectFilled(rect, gui.Color.rgba(ghost_c.r, ghost_c.g, ghost_c.b, 0xB0)) catch @panic("inventory: OOM");
+            dl.rectOutline(rect, gui.Color.rgba(0xF0, 0xF0, 0xF0, 0xFF), 1) catch @panic("inventory: OOM");
+        }
     }
 }
 
@@ -466,7 +520,7 @@ pub fn stateDigest(ctx_ptr: *anyopaque, buf: []u8) []const u8 {
     });
     appendFmt(buf, &off, " hover_slot={d} dragging={d} min_rarity={d}", .{
         app.hover_slot,
-        @as(u32, if (app.dragging != null) 1 else 0),
+        @as(u32, if (gui.isDragging(app.ctx) or app.kbd_pickup != null) 1 else 0),
         app.min_rarity,
     });
     appendFmt(buf, &off, " popup={s} context_slot={d}", .{

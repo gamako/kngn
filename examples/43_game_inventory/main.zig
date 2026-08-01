@@ -6,13 +6,15 @@
 //! `PopupItem.checked` + `keep_open_on_select`); the detail panel's Discard button is disabled
 //! (`ctx.beginDisabled`/`endDisabled`) while the cursor sits on an empty slot.
 //!
-//! Of the four capabilities this shell was asked to reproduce, only drag-and-drop and the rotary
-//! knob are genuinely missing from libs/gui (see ui.zig's doc comment for the example-side
-//! workaround each gets). The tooltip is not a workaround: `ctx.tooltip` already exists (a
-//! hover-delay, screen-edge-clamped overlay, its own test suite) -- a capability-matrix staleness
-//! this shell's construction found and corrected, not a gap it fills. Gamepad navigation uses the
-//! same `platform`+`gamepad` (src/gamepad.zig) pair examples/22_gamepad uses directly (this
-//! example does not import kit).
+//! Item drag-and-drop between slots goes through libs/gui's `gui.dragSource`/`dropTarget`/
+//! `finishDrag` (see libs/gui/src/dnd.zig and ui.zig's doc comment); the rotary knob is a
+//! different kind of drag (a single widget dragging its own value, not a payload moving between
+//! widgets) and keeps its own hand-rolled glue below, the same shape a slider's internal drag
+//! uses. The tooltip is not a workaround either: `ctx.tooltip` already exists (a hover-delay,
+//! screen-edge-clamped overlay, its own test suite) -- a capability-matrix staleness this shell's
+//! construction found and corrected, not a gap it fills. Gamepad navigation uses the same
+//! `platform`+`gamepad` (src/gamepad.zig) pair examples/22_gamepad uses directly (this example
+//! does not import kit).
 //!
 //! Hot path declaration:
 //! - Building / laying out / appending DrawList for the shell is per-frame O(N) over a fixed
@@ -160,10 +162,11 @@ pub fn main(init: std.process.Init) !void {
                         if (ui.hitTestKnob(&app, p)) {
                             app.knob_drag = .{ .start_y = m.y, .start_value = app.min_rarity };
                         } else if (ui.hitTestSlot(&app, p)) |slot| {
+                            // Selecting the cursor on press happens regardless of what the press
+                            // turns into (a plain click, or a drag `gui.dragSource` picks up from
+                            // `ui.buildUi` once this event reaches the gui Context below).
                             app.cursor = slot;
                             app.select_source = .mouse;
-                            _ = ui.beginDrag(&app, slot);
-                            ui.updateDragPos(&app, p);
                         }
                     } else if (m.button == .right) {
                         // Right-click requests opening the Lock/Discard context menu; the same
@@ -183,8 +186,6 @@ pub fn main(init: std.process.Init) !void {
                     }
                 },
                 .mouse_move => |m| {
-                    const p: gui.Vec2 = .{ .x = m.x, .y = m.y };
-                    if (app.dragging != null) ui.updateDragPos(&app, p);
                     if (app.knob_drag) |kd| {
                         const delta_y = kd.start_y - m.y;
                         const pixels_per_step: i32 = 12;
@@ -194,13 +195,10 @@ pub fn main(init: std.process.Init) !void {
                     }
                 },
                 .mouse_up => |m| {
-                    if (m.button == .left) {
-                        if (app.dragging != null) {
-                            const p: gui.Vec2 = .{ .x = m.x, .y = m.y };
-                            ui.endDrag(&app, ui.hitTestSlot(&app, p));
-                        }
-                        app.knob_drag = null;
-                    }
+                    // Item drag release is handled inside ui.buildUi (gui.dropTarget/finishDrag
+                    // read ctx.input directly once this event reaches pushEvent below); only the
+                    // knob's own hand-rolled drag needs releasing here.
+                    if (m.button == .left) app.knob_drag = null;
                 },
                 else => {},
             }

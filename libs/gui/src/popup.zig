@@ -267,11 +267,15 @@ pub fn hitTestItem(geo: PopupGeometry, item_count: usize, p: Vec2) ?usize {
 
 /// Open a popup. Records id/pos and releases any widget that was active/hot just before open
 /// (invariant: active_id==0 while a popup is shown; also clears stale hot_id draw leftovers).
+/// Also drops any in-flight drag-and-drop as a fail-safe (dnd.zig's contract puts the burden of
+/// calling `cancelDrag` first on the caller; this only keeps an app that forgets from leaving a
+/// drag stuck forever behind a modal popup, at the cost of losing that payload silently).
 pub fn openPopup(ctx: *Context, id: Id, pos: Vec2) void {
     ctx.popup_state = .{ .id = id, .pos = pos };
     ctx.state.active_id = 0;
     ctx.state.hot_id = 0;
     ctx.state.next_hot_id = 0;
+    ctx.drag = null;
 }
 
 /// Explicitly close the popup. Caller decides ESC etc. (libs/gui does not know platform.KeyCode,
@@ -312,12 +316,14 @@ pub fn openPopupCount(ctx: *const Context) usize {
 
 /// Open (or move) a popup that can coexist with the classic slot and with other stacked popups —
 /// see `PopupStack`'s doc comment for the motivation. Same active/hot reset as `openPopup`,
-/// since either kind being open already means background widgets are modally blocked.
+/// since either kind being open already means background widgets are modally blocked (including
+/// the same drag-and-drop fail-safe; see `openPopup`'s doc comment).
 pub fn openPopupStacked(ctx: *Context, id: Id, pos: Vec2) void {
     ctx.popup_stack.open(id, pos);
     ctx.state.active_id = 0;
     ctx.state.hot_id = 0;
     ctx.state.next_hot_id = 0;
+    ctx.drag = null;
 }
 
 /// Close a popup opened with `openPopupStacked`. Does not touch the classic slot.

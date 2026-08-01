@@ -174,9 +174,17 @@ read -r c0x c0y <<<"$(rect_center "$s0x" "$s0y" "$s0w" "$s0h")"
 read -r c1x c1y <<<"$(rect_center "$s1x" "$s1y" "$s1w" "$s1h")"
 drive "inject mouse_move $c0x $c0y; step 1; inject mouse_down left; step 1" >>"$LOG" 2>&1
 digest_state >/dev/null
+# A press alone is "armed" only (gui.dragSource's threshold has not been crossed yet): no drag,
+# item still in its slot. Confirms a plain click never flickers an item out of place.
+expect_state "dragging=0"
+expect_state "slot0=filled,1,1,0"
+drive "inject mouse_move $c1x $c1y; step 2" >>"$LOG" 2>&1
+digest_state >/dev/null
+# Moving toward slot1 crosses the threshold well before arriving (slot spacing >> a few px): now
+# actually dragging, and the item has been lifted out of slot0.
 expect_state "dragging=1"
 expect_state "slot0=empty"
-drive "inject mouse_move $c1x $c1y; step 2; inject mouse_up left; step 1" >>"$LOG" 2>&1
+drive "inject mouse_up left; step 1" >>"$LOG" 2>&1
 digest_state >/dev/null
 expect_state "dragging=0"
 expect_state "slot0=empty"

@@ -200,6 +200,21 @@ pub const collectMenuCommands = @import("menu.zig").collectMenuCommands;
 pub const menuBar = @import("menu.zig").menuBar;
 pub const menuBarPopup = @import("menu.zig").menuBarPopup;
 
+// Cross-widget drag-and-drop. See dnd.zig for the full contract (armed→dragging lifecycle,
+// the payload's trivially-copyable-only rule, and the popup/disabled-scope interactions).
+pub const MAX_DRAG_PAYLOAD_BYTES = @import("dnd.zig").MAX_DRAG_PAYLOAD_BYTES;
+pub const drag_threshold_px = @import("dnd.zig").drag_threshold_px;
+pub const DragPayload = @import("dnd.zig").DragPayload;
+pub const DragSourceResult = @import("dnd.zig").DragSourceResult;
+pub const DropResult = @import("dnd.zig").DropResult;
+pub const dragSource = @import("dnd.zig").dragSource;
+pub const dropTarget = @import("dnd.zig").dropTarget;
+pub const isDragging = @import("dnd.zig").isDragging;
+pub const dragPayload = @import("dnd.zig").dragPayload;
+pub const dragPosition = @import("dnd.zig").dragPosition;
+pub const finishDrag = @import("dnd.zig").finishDrag;
+pub const cancelDrag = @import("dnd.zig").cancelDrag;
+
 // Collect each file's tests for test-gui.
 // A decl reference like `pub const X = @import("f.zig").X` does not pull in f.zig's tests, so
 // reference the whole namespace with `_ = @import(...)` to bring the test blocks in.
@@ -221,4 +236,5 @@ test {
     _ = @import("menu.zig");
     _ = @import("stepgrid.zig");
     _ = @import("panel_host.zig");
+    _ = @import("dnd.zig");
 }

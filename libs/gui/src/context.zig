@@ -55,6 +55,8 @@ const widgets = @import("widgets.zig");
 // popup.zig uses the same mutual-import pattern.
 const popup_mod = @import("popup.zig");
 const stepgrid_mod = @import("stepgrid.zig");
+// dnd.zig uses the same mutual-import pattern (Context.drag is declared here; the state machine lives there).
+const dnd_mod = @import("dnd.zig");
 
 pub const Rect = geom.Rect;
 pub const Vec2 = geom.Vec2;
@@ -78,6 +80,9 @@ pub const PopupItem = popup_mod.PopupItem;
 pub const PopupResult = popup_mod.PopupResult;
 pub const PopupMenuOpts = popup_mod.PopupMenuOpts;
 pub const stepgrid = stepgrid_mod;
+// Cross-widget drag-and-drop. Implementation and doc comments live in dnd.zig.
+pub const DragPayload = dnd_mod.DragPayload;
+pub const DragState = dnd_mod.DragState;
 
 /// Entry in the rect cache.
 /// `clip` is the effective clip after intersecting ancestor `clip_children` (matches draw pushClip bounds).
@@ -184,6 +189,13 @@ pub const Context = struct {
     /// option, because several widgets (checkbox/toggle/radio/textInputId) take no options struct
     /// today; wrapping a group of widgets is also the common case ("disable this whole section").
     disabled_depth: u32 = 0,
+    // ── drag-and-drop. At most one drag in flight UI-wide (see dnd.zig's doc comment for the
+    // armed→dragging lifecycle). null = no drag and no armed press.
+    drag: ?DragState = null,
+    /// Whether `dragSource` was called this frame for `drag.?.source_id` (frame-local; reset in
+    /// beginFrame). Lets endFrame cancel an `armed` drag whose source widget stopped being built,
+    /// instead of leaving it stuck (see dnd.zig).
+    drag_submitted_this_frame: bool = false,
 
     // ── Widget layer. Implementations live in widgets.zig (aliases for method syntax) ──
     pub const button = widgets.button;
@@ -254,6 +266,14 @@ pub const Context = struct {
     pub const openPopupCount = popup_mod.openPopupCount;
     pub const popupMenuStacked = popup_mod.popupMenuStacked;
     pub const popupPos = popup_mod.popupPos;
+    // Cross-widget drag-and-drop. Implementation and contract: see dnd.zig.
+    pub const dragSource = dnd_mod.dragSource;
+    pub const dropTarget = dnd_mod.dropTarget;
+    pub const isDragging = dnd_mod.isDragging;
+    pub const dragPayload = dnd_mod.dragPayload;
+    pub const dragPosition = dnd_mod.dragPosition;
+    pub const finishDrag = dnd_mod.finishDrag;
+    pub const cancelDrag = dnd_mod.cancelDrag;
 
     pub fn init(gpa: Allocator, font: Font) Context {
         return .{
@@ -320,6 +340,7 @@ pub const Context = struct {
         self.tooltip_hover_refreshed = false;
         self.tooltip_candidate_text = null;
         self.tooltip_candidate_anchor = .{ .x = 0, .y = 0, .w = 0, .h = 0 };
+        self.drag_submitted_this_frame = false;
         self.draw_list.reset(screen_w, screen_h);
         // Implicit layout-tree root (callers just start with beginBox)
         const root = self.allocator().create(layout.Node) catch @panic("Context.beginFrame: OOM");
@@ -378,6 +399,16 @@ pub const Context = struct {
         // already released, clear active_id to prevent stickiness (wantsMouse drag-along).
         if (self.state.active_id != 0 and !self.state.active_submitted and !self.input.mouse_buttons.left) {
             self.state.active_id = 0;
+        }
+        // An armed (pre-threshold) drag whose source widget was not called this frame is
+        // cancelled outright, regardless of button state: `armed` alone never mutates caller
+        // state (see dnd.zig), so there is nothing to hand back. A `dragging` drag is exempt —
+        // by design it no longer depends on its source widget being resubmitted at all.
+        if (self.drag) |d| {
+            if (d.phase == .armed and !self.drag_submitted_this_frame) {
+                if (self.state.active_id == d.source_id) self.state.active_id = 0;
+                self.drag = null;
+            }
         }
         // Tab traversal, after the draw commands are out (so the move shows next frame) and before
         // the trim below (so the widget just focused is protected from it).
