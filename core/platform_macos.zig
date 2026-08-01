@@ -417,31 +417,18 @@ fn clearDocumentAccess() void {
 pub const Window = struct {
     handle: *c.PlatformWindow,
 
-    pub fn create(width: u32, height: u32, title: [:0]const u8) Error!Window {
-        const w = c.platform_create_window(
-            @intCast(width),
-            @intCast(height),
-            title.ptr,
-            null,
-            null,
-        ) orelse return error.WindowCreationFailed;
-        return .{ .handle = w };
-    }
-
-    /// Create a real fullscreen window. The facade's Window.createFullscreen finds this through
-    /// `@hasDecl` and uses it. It creates an ordinary window and then makes it natively fullscreen with
-    /// `platform_enter_fullscreen` (NSWindow toggleFullScreen:). The real size becomes the screen
-    /// resolution, and the framebuffer follows through the existing setFrameSize path (reaching fb.width/height).
-    /// The initial size is a placeholder, valid only for the instant before the toggle.
-    pub fn createFullscreen(title: [:0]const u8) Error!Window {
-        const w = c.platform_create_window(1280, 720, title.ptr, null, null) orelse return error.WindowCreationFailed;
-        c.platform_enter_fullscreen(w);
-        return .{ .handle = w };
-    }
-
-    /// Create a window with the transparency, borderless and initial position options.
-    /// The facade's Window.createWithOptions finds this through `@hasDecl` and uses it. Unknown flags make
-    /// the C side return NULL (→ WindowCreationFailed). Transparency assumes premultiplied alpha.
+    /// The single window creation entry point of this backend (ADR-019 R1), carrying the
+    /// transparency, borderless, position, framebuffer-mode and fullscreen options. Unknown flags
+    /// make the C side return NULL (→ WindowCreationFailed). Transparency assumes premultiplied
+    /// alpha.
+    ///
+    /// Fullscreen is **composed on this side** out of two entry points the C ABI already has — the
+    /// extended creation call, which carries the option flags, and the fullscreen call
+    /// (`NSWindow toggleFullScreen:`) — so no native implementation changes (ADR-019 R7). The
+    /// requested size is a placeholder valid only for the instant before the transition, which is
+    /// asynchronous; the real size becomes the screen resolution and the framebuffer follows
+    /// through the existing frame-size path, so an application follows `fb.width`/`fb.height`
+    /// (ADR-019 R3).
     /// Hot path declaration: initialisation only (a single window creation).
     pub fn createWithOptions(width: u32, height: u32, title: [:0]const u8, opts: types.WindowOptions) Error!Window {
         var flags: u32 = 0;
@@ -462,6 +449,7 @@ pub const Window = struct {
             null,
             &copts,
         ) orelse return error.WindowCreationFailed;
+        if (opts.fullscreen) c.platform_enter_fullscreen(w);
         return .{ .handle = w };
     }
 

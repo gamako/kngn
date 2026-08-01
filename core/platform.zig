@@ -235,6 +235,38 @@ pub fn normalizeEventWithScale(scale_in: f32, event: Event) Event {
     return ev;
 }
 
+/// The size `Window.createFullscreen` requests. It reaches every backend, but by ADR-019 R3 only a
+/// backend with no notion of fullscreen honours it as the effective size — wasm and the headless
+/// null runtime, where it is also the size they used before fullscreen became an option.
+pub const fullscreen_request_size: WindowSize = .{ .width = 1920, .height = 1080 };
+
+/// What `Window.createFullscreen` passes on: the size above plus `fullscreen = true` and no other
+/// option (ADR-019 R1). It is a value rather than a literal inside the wrapper so that the mapping
+/// is pinned by a test without creating a window — a facade test links no backend.
+const FullscreenRequest = struct { size: WindowSize, opts: WindowOptions };
+
+fn fullscreenRequest() FullscreenRequest {
+    return .{ .size = fullscreen_request_size, .opts = .{ .fullscreen = true } };
+}
+
+/// The option combinations of ADR-019 R4, decided once for every backend rather than in each.
+///
+/// `fullscreen` is refused together with:
+/// - `position`: the meaning "which monitor" is reserved for a future option, and wayland has no
+///   position API at all.
+/// - `borderless`: fullscreen is already undecorated everywhere, so this only adds
+///   platform-specific side effects (taskbar visibility), and on x11 the two requests write the
+///   same window-manager property and the second drops the first.
+/// - `transparent`: on Windows transparency selects a layered-window present, which is not viable
+///   for a whole screen every frame; the D3D11 backend refuses transparency outright.
+///
+/// Every other combination is accepted, including `fullscreen` with `.physical` (ADR-011 R11).
+/// Hot path declaration: initialisation only (once per window creation).
+pub fn validateWindowOptions(opts: WindowOptions) Error!void {
+    if (!opts.fullscreen) return;
+    if (opts.position != null or opts.borderless or opts.transparent) return error.Unsupported;
+}
+
 /// The Window facade. The four hooks are inserted only while the harness is enabled; with it disabled every call passes straight through to the backend.
 /// Under the **null runtime**, `inner` holds a `null_backend.Window`, which owns the primary framebuffer.
 /// `lockFramebuffer`/`nextEvent` take a `*Window` because they hold the latched snapshot.
@@ -312,40 +344,44 @@ pub const Window = struct {
         return normalizeEventWithScale(self.eventScale(), event);
     }
 
+    /// Create an ordinary window. A documented wrapper over `createWithOptions` with default
+    /// options (ADR-019 R1): every backend implements window creation once, as `createWithOptions`.
+    /// Hot path declaration: initialisation only (a single window creation).
     pub fn create(width: u32, height: u32, title: [:0]const u8) Error!Window {
-        if (comptime null_runtime_supported) {
-            if (runtime_null) {
-                return .{ .inner = .{ .null_win = try null_backend.Window.create(width, height, title) } };
-            }
-        }
-        return .{ .inner = .{ .native = try native_backend.Window.create(width, height, title) } };
+        return createWithOptions(width, height, title, .{});
     }
 
-    /// Create a real fullscreen window: this is the OS-level fullscreen entry point of the API.
-    /// When `native_backend.Window` implements `createFullscreen` (Linux x11/wayland) that path is
-    /// used; otherwise this falls back to an ordinary window of a fixed size (the macOS and Windows
-    /// backends need no change of their own for it).
+    /// Create a fullscreen window. A documented wrapper over `createWithOptions` with
+    /// `fullscreen = true` (ADR-019 R1).
+    ///
+    /// Fullscreen is implemented natively on every windowing backend (macOS through the window
+    /// transition, x11 through EWMH, wayland through xdg-shell, Windows through an undecorated
+    /// window covering the primary monitor). On wasm it is a documented no-op, because the
+    /// browser's fullscreen request needs a user gesture and cannot be issued while a window is
+    /// being created (ADR-019 R4).
+    ///
+    /// The size passed on is a *request*: a backend that resolves the fullscreen size itself
+    /// ignores it, and it is honoured as the effective size only where fullscreen has no meaning
+    /// (wasm, and the headless null runtime, which have no screen to fill). An application follows
+    /// `fb.width`/`fb.height` each frame rather than assuming a size (ADR-019 R3).
     /// Hot path declaration: initialisation only (a single window creation).
     pub fn createFullscreen(title: [:0]const u8) Error!Window {
-        if (comptime null_runtime_supported) {
-            if (runtime_null) {
-                return .{ .inner = .{ .null_win = try null_backend.Window.createFullscreen(title) } };
-            }
-        }
-        if (@hasDecl(native_backend.Window, "createFullscreen")) {
-            return .{ .inner = .{ .native = try native_backend.Window.createFullscreen(title) } };
-        }
-        return .{ .inner = .{ .native = try native_backend.Window.create(1920, 1080, title) } };
+        const req = fullscreenRequest();
+        return createWithOptions(req.size.width, req.size.height, title, req.opts);
     }
 
-    /// Create a window with options: transparency, borderless, an initial position and a size.
-    /// `.{}` behaves exactly like plain create. w/h are overridden only when `opts.size` is given.
-    /// When the backend implements `createWithOptions` that is used; otherwise a request for
-    /// transparency or borderless gives `error.Unsupported`, and with neither it falls back to create.
+    /// Create a window with options: fullscreen, transparency, borderless, an initial position and
+    /// a size. **This is the single dispatch point** (ADR-019 R1): `.{}` behaves exactly like plain
+    /// create, and w/h are overridden only when `opts.size` is given.
+    ///
+    /// The option combinations that no backend supports are refused here, once, rather than in
+    /// each backend (`validateWindowOptions`, ADR-019 R4).
+    ///
     /// The null runtime (`KNGN_HEADLESS=1`) accepts the options and runs on the CPU framebuffer alone
     /// (nothing is displayed, but the framebuffer alpha can still be checked through a digest; the position is always null).
     /// Hot path declaration: initialisation only (a single window creation).
     pub fn createWithOptions(width: u32, height: u32, title: [:0]const u8, opts: WindowOptions) Error!Window {
+        try validateWindowOptions(opts);
         const w = if (opts.size) |s| s.width else width;
         const h = if (opts.size) |s| s.height else height;
         if (comptime null_runtime_supported) {
@@ -353,11 +389,7 @@ pub const Window = struct {
                 return .{ .inner = .{ .null_win = try null_backend.Window.createWithOptions(w, h, title, opts) } };
             }
         }
-        if (@hasDecl(native_backend.Window, "createWithOptions")) {
-            return .{ .inner = .{ .native = try native_backend.Window.createWithOptions(w, h, title, opts) } };
-        }
-        if (opts.transparent or opts.borderless) return error.Unsupported;
-        return .{ .inner = .{ .native = try native_backend.Window.create(w, h, title) } };
+        return .{ .inner = .{ .native = try native_backend.Window.createWithOptions(w, h, title, opts) } };
     }
 
     /// Return the current window geometry. It never fails, and falls back to safe defaults.
@@ -1338,4 +1370,46 @@ test "displayRefreshHz serves the process cache without a native query" {
     try std.testing.expectEqual(@as(f64, 75.0), displayRefreshHz());
     try std.testing.expectEqual(@as(f64, 75.0), displayRefreshHz());
     cached_display_refresh_hz = null;
+}
+
+test "validateWindowOptions: fullscreen refuses position, borderless and transparent" {
+    // ADR-019 R4: the combinations no backend supports are refused once, here.
+    try std.testing.expectError(error.Unsupported, validateWindowOptions(.{ .fullscreen = true, .position = .{ .x = 0, .y = 0 } }));
+    try std.testing.expectError(error.Unsupported, validateWindowOptions(.{ .fullscreen = true, .borderless = true }));
+    try std.testing.expectError(error.Unsupported, validateWindowOptions(.{ .fullscreen = true, .transparent = true }));
+    // Both at once is still one error, not a different one.
+    try std.testing.expectError(error.Unsupported, validateWindowOptions(.{ .fullscreen = true, .borderless = true, .transparent = true }));
+}
+
+test "validateWindowOptions: fullscreen accepts a framebuffer mode and an explicit size" {
+    try validateWindowOptions(.{ .fullscreen = true });
+    try validateWindowOptions(.{ .fullscreen = true, .fb_mode = .physical });
+    try validateWindowOptions(.{ .fullscreen = true, .size = .{ .width = 640, .height = 480 } });
+    try validateWindowOptions(.{ .fullscreen = true, .fb_mode = .physical, .size = .{ .width = 640, .height = 480 } });
+}
+
+test "validateWindowOptions: without fullscreen every existing combination stays accepted" {
+    // The restrictions apply to fullscreen alone: a transparent borderless window at a position is
+    // what the desktop-mascot example asks for, and it must keep working.
+    try validateWindowOptions(.{});
+    try validateWindowOptions(.{ .transparent = true, .borderless = true, .position = .{ .x = 100, .y = 50 } });
+    try validateWindowOptions(.{ .borderless = true, .fb_mode = .physical });
+    try validateWindowOptions(.{ .position = .{ .x = -10, .y = -20 }, .size = .{ .width = 320, .height = 240 } });
+}
+
+test "createFullscreen requests the documented size, fullscreen, and nothing else" {
+    // The wrapper's mapping is a contract (ADR-019 R1). A facade test cannot create a window (no
+    // backend is linked here), so the request itself is what gets pinned.
+    const req = fullscreenRequest();
+    try std.testing.expectEqual(@as(u32, 1920), req.size.width);
+    try std.testing.expectEqual(@as(u32, 1080), req.size.height);
+    try std.testing.expect(req.opts.fullscreen);
+    // Nothing else is set: any of these would make every createFullscreen call fail validation.
+    try std.testing.expect(!req.opts.borderless);
+    try std.testing.expect(!req.opts.transparent);
+    try std.testing.expect(req.opts.position == null);
+    try std.testing.expect(req.opts.size == null);
+    try std.testing.expectEqual(FramebufferMode.logical, req.opts.fb_mode);
+    // And the request must be one the combination rules accept.
+    try validateWindowOptions(req.opts);
 }

@@ -48,6 +48,21 @@ Prefer `kit.app_runtime.Runtime(App)` over a hand-written event loop. The app pr
 | `pub fn init(gpa, io) !*App` | allocate and register harness hooks |
 | `pub fn frame(self, win, now) !bool` | one frame; return `false` to quit |
 | `pub fn deinit(self: *App) void` | free |
+| `pub fn windowBootstrap(gpa, io) !kit.platform.WindowOptions` | optional; the window options the runtime creates the window with |
+
+`windowBootstrap` is how an app asks for anything beyond a plain window — a physical-resolution
+framebuffer (`.fb_mode = .physical`), a transparent or borderless window, an initial position, or
+**fullscreen** (`.fullscreen = true`). The rules are in ADR-019: fullscreen is an initial state
+rather than a transition, its size is a request the platform may replace (follow `fb.width` /
+`fb.height` each frame), and it cannot be combined with `position`, `borderless` or `transparent`
+(those give `error.Unsupported`). On the web it is accepted but has no effect, because the browser
+needs a user gesture to enter fullscreen.
+
+If the app also **persists its window geometry** (`kit.appshell`'s window state), note that
+`getGeometry` reports the *current* geometry: saved while fullscreen, it restores as a
+screen-sized window. The platform has no run-time fullscreen query yet, so an app that asks for
+fullscreen has to remember that it did — `windowBootstrap` runs before `init`, so keep the flag
+somewhere the shutdown path can read.
 
 Native entry:
 

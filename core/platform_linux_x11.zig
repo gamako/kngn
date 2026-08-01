@@ -34,7 +34,7 @@ const build_options = @import("build_options");
 const c = @cImport({
     @cInclude("X11/Xlib.h");
     @cInclude("X11/Xutil.h");
-    @cInclude("X11/Xatom.h"); // XA_ATOM (for setting _NET_WM_STATE in createFullscreen)
+    @cInclude("X11/Xatom.h"); // XA_ATOM (for setting _NET_WM_STATE when a window is created fullscreen)
     @cInclude("X11/XKBlib.h"); // XkbSetDetectableAutoRepeat
     @cInclude("X11/cursorfont.h"); // XC_left_ptr / XC_crosshair (the system cursors)
     @cInclude("X11/Xresource.h"); // The Xrm API (Xft.dpi → content_scale)
@@ -71,6 +71,29 @@ fn roundToPhysicalPx(logical_px: u32, scale: f32) u32 {
     if (!std.math.isFinite(v) or v < 1.0) return 1;
     if (v > @as(f64, @floatFromInt(std.math.maxInt(u32)))) return std.math.maxInt(u32);
     return @intFromFloat(v);
+}
+
+/// A physical pixel count → logical points: the inverse of `roundToPhysicalPx`, with the same
+/// rounding and the same clamps. It is the derivation direction fullscreen needs, because the X11
+/// screen dimensions are already physical (ADR-011 R11): the framebuffer size is the screen size
+/// verbatim and the logical size is derived from it, never the other way round.
+fn logicalFromPhysicalPx(physical_px: u32, scale: f32) u32 {
+    const s: f64 = if (scale > 0 and std.math.isFinite(scale)) scale else 1.0;
+    const v: f64 = @round(@as(f64, @floatFromInt(physical_px)) / s);
+    if (!std.math.isFinite(v) or v < 1.0) return 1;
+    if (v > @as(f64, @floatFromInt(std.math.maxInt(u32)))) return std.math.maxInt(u32);
+    return @intFromFloat(v);
+}
+
+/// The logical size that goes with a physical window size under `fb_mode` — the pair used both when
+/// a fullscreen window is created and when a resize notification arrives, so that the logical size
+/// cannot differ between the first frame and the first configure (ADR-011 R11).
+fn logicalSizeForPhysical(fb_mode: FramebufferMode, physical: WindowSize, scale: f32) WindowSize {
+    if (fb_mode == .logical) return physical;
+    return .{
+        .width = logicalFromPhysicalPx(physical.width, scale),
+        .height = logicalFromPhysicalPx(physical.height, scale),
+    };
 }
 
 /// The physical framebuffer size. Under .logical it is always the logical size itself (which is where the structural guarantee lives).
@@ -279,29 +302,19 @@ const State = struct {
 pub const Window = struct {
     state: *State,
 
-    pub fn create(width: u32, height: u32, title: [:0]const u8) Error!Window {
-        return createInternal(width, height, title, false, .{});
-    }
-
-    /// Create with the transparency and borderless options. The facade detects this through @hasDecl.
+    /// The single window creation entry point of this backend (ADR-019 R1).
     /// Transparency needs a 32-bit ARGB visual (XMatchVisualInfo; without one it gives error.Unsupported) plus a colormap plus XCreateWindow.
-    /// **Actually seeing through to what is behind needs a compositor (picom and the like).** Hot path declaration: initialisation only.
+    /// **Actually seeing through to what is behind needs a compositor (picom and the like).**
+    /// Fullscreen sets the EWMH `_NET_WM_STATE_FULLSCREEN` property before the map, and resolves its
+    /// own size, so the width and height are ignored in that case (ADR-019 R3).
+    /// Hot path declaration: initialisation only.
     pub fn createWithOptions(width: u32, height: u32, title: [:0]const u8, opts: types.WindowOptions) Error!Window {
-        return createInternal(width, height, title, false, opts);
+        return createInternal(width, height, title, opts.fullscreen, opts);
     }
 
-    /// Create a real fullscreen window (undecorated and filling the screen resolution).
-    /// The screen resolution comes from `XDisplayWidth`/`XDisplayHeight` (the default screen), and before
-    /// `XMapWindow` the EWMH `_NET_WM_STATE_FULLSCREEN` is set on the `_NET_WM_STATE` property. A conforming
-    /// window manager reads it as it maps and goes undecorated and full screen (the behaviour of `create()` is unchanged).
-    pub fn createFullscreen(title: [:0]const u8) Error!Window {
-        const dpy = g_display orelse return error.WindowCreationFailed;
-        const screen = c.XDefaultScreen(dpy);
-        const w: u32 = @intCast(c.XDisplayWidth(dpy, screen));
-        const h: u32 = @intCast(c.XDisplayHeight(dpy, screen));
-        return createInternal(w, h, title, true, .{});
-    }
-
+    /// `width`/`height` are logical points, **except when `fullscreen` is set**: then they are
+    /// ignored and the default screen's resolution is used instead, which X11 reports in physical
+    /// pixels (ADR-019 R3, ADR-011 R11).
     fn createInternal(width: u32, height: u32, title: [:0]const u8, fullscreen: bool, opts: types.WindowOptions) Error!Window {
         const dpy = g_display orelse return error.WindowCreationFailed;
         if (width == 0 or height == 0) return error.WindowCreationFailed;
@@ -316,8 +329,22 @@ pub const Window = struct {
 
         // Xft.dpi → content_scale (a failure gives 1.0). The real scale is kept whatever fb_mode is.
         const scale = queryXftContentScale(dpy);
-        const logical: WindowSize = .{ .width = width, .height = height };
-        const fb_size = effectiveFramebufferSize(opts.fb_mode, logical, scale);
+        // Fullscreen resolves its own size, and the screen dimensions X11 reports are already
+        // physical pixels, so the derivation runs the other way round: the window (and the
+        // framebuffer) is the screen size verbatim and the logical size comes from dividing it. Not
+        // doing so would apply the scale twice and ask for a window twice the size of the screen
+        // (ADR-011 R11). Off fullscreen this is the ordinary direction: the arguments are logical
+        // and `.physical` multiplies up, because X11 applies no scaling of its own.
+        const screen_size: WindowSize = if (fullscreen) .{
+            .width = @intCast(c.XDisplayWidth(dpy, screen)),
+            .height = @intCast(c.XDisplayHeight(dpy, screen)),
+        } else undefined;
+        const logical: WindowSize = if (fullscreen)
+            logicalSizeForPhysical(opts.fb_mode, screen_size, scale)
+        else
+            .{ .width = width, .height = height };
+        const fb_size = if (fullscreen) screen_size else effectiveFramebufferSize(opts.fb_mode, logical, scale);
+        if (fb_size.width == 0 or fb_size.height == 0) return error.WindowCreationFailed;
         const win_w = fb_size.width;
         const win_h = fb_size.height;
 
@@ -432,8 +459,8 @@ pub const Window = struct {
             .display = dpy,
             .window = win,
             .gc = gc,
-            .logical_width = width,
-            .logical_height = height,
+            .logical_width = logical.width,
+            .logical_height = logical.height,
             .physical_width = win_w,
             .physical_height = win_h,
             .width = win_w,
@@ -1195,17 +1222,16 @@ fn applyConfigureSize(st: *State, new_phys_w: u32, new_phys_h: u32) void {
     if (new_phys_w == 0 or new_phys_h == 0) return;
     if (new_phys_w == st.physical_width and new_phys_h == st.physical_height) return;
 
-    // A Configure size is always the real window pixel size = physical = the framebuffer.
-    const new_logical_w: u32 = if (st.fb_mode == .logical) new_phys_w else blk: {
-        const s = effectiveContentScale(st.content_scale);
-        const v = @round(@as(f64, @floatFromInt(new_phys_w)) / @as(f64, s));
-        break :blk if (!std.math.isFinite(v) or v < 1.0) 1 else @intFromFloat(v);
-    };
-    const new_logical_h: u32 = if (st.fb_mode == .logical) new_phys_h else blk: {
-        const s = effectiveContentScale(st.content_scale);
-        const v = @round(@as(f64, @floatFromInt(new_phys_h)) / @as(f64, s));
-        break :blk if (!std.math.isFinite(v) or v < 1.0) 1 else @intFromFloat(v);
-    };
+    // A Configure size is always the real window pixel size = physical = the framebuffer. The
+    // derivation is the same helper window creation uses, so a fullscreen window's logical size
+    // cannot change between the first frame and the first configure (ADR-011 R11).
+    const new_logical = logicalSizeForPhysical(
+        st.fb_mode,
+        .{ .width = new_phys_w, .height = new_phys_h },
+        effectiveContentScale(st.content_scale),
+    );
+    const new_logical_w: u32 = new_logical.width;
+    const new_logical_h: u32 = new_logical.height;
 
     resizeBlit(st, new_phys_w, new_phys_h);
     // physical is updated only when resizeBlit succeeds. On failure the old size is kept, so logical is left alone too.
@@ -1295,4 +1321,55 @@ test "effectiveContentScale corrects a non-positive or non-finite value to 1.0" 
     try std.testing.expectEqual(@as(f32, 1.0), effectiveContentScale(-1.0));
     try std.testing.expectEqual(@as(f32, 1.0), effectiveContentScale(std.math.nan(f32)));
     try std.testing.expectEqual(@as(f32, 1.0), effectiveContentScale(std.math.inf(f32)));
+}
+
+test "logicalFromPhysicalPx is the inverse of roundToPhysicalPx and clamps to the range" {
+    try std.testing.expectEqual(@as(u32, 800), logicalFromPhysicalPx(1600, 2.0));
+    try std.testing.expectEqual(@as(u32, 800), logicalFromPhysicalPx(1200, 1.5));
+    try std.testing.expectEqual(@as(u32, 1600), logicalFromPhysicalPx(1600, 1.0));
+    try std.testing.expectEqual(@as(u32, 1600), logicalFromPhysicalPx(1600, 0.0)); // invalid scale -> 1.0
+    try std.testing.expectEqual(@as(u32, 1600), logicalFromPhysicalPx(1600, std.math.nan(f32)));
+    try std.testing.expectEqual(@as(u32, 1), logicalFromPhysicalPx(1, 2.0)); // 1/2 rounds to 0 -> clamp to 1
+    // A scale below 1 divides up; the result is clamped to the u32 range rather than wrapping.
+    try std.testing.expectEqual(@as(u32, std.math.maxInt(u32)), logicalFromPhysicalPx(std.math.maxInt(u32), 0.5));
+    // Round-tripping an exact multiple returns the same physical size.
+    const scales = [_]f32{ 1.0, 1.5, 2.0, 3.0 };
+    for (scales) |s| {
+        const phys = roundToPhysicalPx(640, s);
+        try std.testing.expectEqual(@as(u32, 640), logicalFromPhysicalPx(phys, s));
+    }
+}
+
+test "logicalSizeForPhysical: a fullscreen screen size is physical, so the logical size is derived" {
+    // The size a fullscreen window resolves for itself is already in physical pixels: under
+    // .physical the logical size divides by the scale, and under .logical it is that same size.
+    const screen: WindowSize = .{ .width = 3840, .height = 2160 };
+    const derived = logicalSizeForPhysical(.physical, screen, 2.0);
+    try std.testing.expectEqual(@as(u32, 1920), derived.width);
+    try std.testing.expectEqual(@as(u32, 1080), derived.height);
+
+    const same = logicalSizeForPhysical(.logical, screen, 2.0);
+    try std.testing.expectEqual(screen.width, same.width);
+    try std.testing.expectEqual(screen.height, same.height);
+
+    // Applying the scale in the wrong direction would ask for a window twice the size of the
+    // screen, which is the mistake this pair of helpers exists to prevent.
+    try std.testing.expectEqual(@as(u32, 7680), effectiveFramebufferSize(.physical, screen, 2.0).width);
+}
+
+test "a fullscreen logical size does not move when the first resize reports the same physical size" {
+    // The creation path and the resize path derive the logical size through the same helper, so a
+    // window created fullscreen keeps the logical size of its first frame.
+    const screen: WindowSize = .{ .width = 3840, .height = 2160 };
+    const at_creation = logicalSizeForPhysical(.physical, screen, 2.0);
+    const after_configure = logicalSizeForPhysical(.physical, screen, 2.0);
+    try std.testing.expectEqual(at_creation.width, after_configure.width);
+    try std.testing.expectEqual(at_creation.height, after_configure.height);
+
+    // A scale that is not an integer keeps the same property (the rounding is the same rounding).
+    const odd: WindowSize = .{ .width = 2560, .height = 1440 };
+    const a = logicalSizeForPhysical(.physical, odd, 1.5);
+    const b = logicalSizeForPhysical(.physical, odd, 1.5);
+    try std.testing.expectEqual(a.width, b.width);
+    try std.testing.expectEqual(@as(u32, 1707), a.width); // 2560/1.5 = 1706.67 -> 1707
 }

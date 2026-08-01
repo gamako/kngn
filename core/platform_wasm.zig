@@ -295,20 +295,22 @@ pub const Window = struct {
     width: u32,
     height: u32,
 
-    pub fn create(width: u32, height: u32, _: [:0]const u8) Error!Window {
-        try ensureFramebuffer(width, height);
-        return .{ .width = fb_w, .height = fb_h };
-    }
-
-    /// Transparency, borderless and an explicit size. wasm has no display position, so position is ignored.
-    /// transparent and borderless mean little on a DOM canvas either, but they are accepted so that the size can be overridden.
-    pub fn createWithOptions(width: u32, height: u32, title: [:0]const u8, opts: types.WindowOptions) Error!Window {
+    /// The single window creation entry point of this backend (ADR-019 R1). wasm has no display
+    /// position, so position is ignored; transparency and borderless mean little on a DOM canvas
+    /// but are accepted, and so is fullscreen — the browser's fullscreen request needs a user
+    /// gesture and cannot be issued here, so it is a **documented no-op** rather than an error, and
+    /// a cross-platform application that asks for fullscreen still starts on the web
+    /// (ADR-019 R4). An option documented as having no effect is not the same as one ignored
+    /// silently.
+    pub fn createWithOptions(width: u32, height: u32, _: [:0]const u8, opts: types.WindowOptions) Error!Window {
         _ = opts.transparent;
         _ = opts.borderless;
         _ = opts.position;
+        _ = opts.fullscreen;
         const w = if (opts.size) |s| s.width else width;
         const h = if (opts.size) |s| s.height else height;
-        return create(w, h, title);
+        try ensureFramebuffer(w, h);
+        return .{ .width = fb_w, .height = fb_h };
     }
 
     pub fn destroy(_: Window) void {
@@ -650,7 +652,7 @@ test "kngn_resize: lockFramebuffer applies the new size" {
     testResetFramebufferState();
     defer testResetFramebufferState();
 
-    var win = try Window.create(320, 240, "t");
+    var win = try Window.createWithOptions(320, 240, "t", .{});
     defer win.destroy();
 
     kngn_resize(640, 480);
@@ -688,7 +690,7 @@ test "kngn_resize: on an OOM the old framebuffer survives and the pending value 
     testResetFramebufferState();
     defer testResetFramebufferState();
 
-    var win = try Window.create(320, 240, "t");
+    var win = try Window.createWithOptions(320, 240, "t", .{});
     defer win.destroy();
 
     // make every later alloc fail (two-phase, so the old buffers should be untouched)
@@ -714,7 +716,7 @@ test "kngn_resize: the framebuffer keeps its old size while the pending value is
     testResetFramebufferState();
     defer testResetFramebufferState();
 
-    var win = try Window.create(320, 240, "t");
+    var win = try Window.createWithOptions(320, 240, "t", .{});
     defer win.destroy();
 
     _ = win.lockFramebuffer() orelse unreachable;

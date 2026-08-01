@@ -88,19 +88,9 @@ extern "gdi32" fn StretchDIBits(
 pub const Window = struct {
     core: *common.Core,
 
-    pub fn create(width: u32, height: u32, title: [:0]const u8) Error!Window {
-        const core = try common.Core.create(width, height, title);
-        return .{ .core = core };
-    }
-
-    /// Create a real fullscreen window. StretchDIBits is stateless on GDI, so this merely wraps Core's
-    /// full-monitor window (present follows the size held by core).
-    pub fn createFullscreen(title: [:0]const u8) Error!Window {
-        const core = try common.Core.createFullscreen(title);
-        return .{ .core = core };
-    }
-
-    /// Create with the transparency and borderless options. The facade detects this through @hasDecl.
+    /// The single window creation entry point of this backend (ADR-019 R1). Every option, fullscreen
+    /// included, is handled by the shared Win32 layer; StretchDIBits is stateless, so present simply
+    /// follows the size held by core.
     /// While core.transparent, present goes through UpdateLayeredWindow (see present below).
     pub fn createWithOptions(width: u32, height: u32, title: [:0]const u8, opts: @import("platform_types").WindowOptions) Error!Window {
         const core = try common.Core.createWithOptions(width, height, title, opts);

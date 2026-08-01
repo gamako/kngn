@@ -312,18 +312,10 @@ pub const Window = struct {
     core: *common.Core,
     d3d: *D3DState,
 
-    pub fn create(width: u32, height: u32, title: [:0]const u8) Error!Window {
-        return finishFromCore(try common.Core.create(width, height, title));
-    }
-
-    /// Create a real fullscreen window. It creates Core's full-monitor window and builds the swap chain
-    /// and the upload texture at that real size (core.width/height).
-    pub fn createFullscreen(title: [:0]const u8) Error!Window {
-        return finishFromCore(try common.Core.createFullscreen(title));
-    }
-
-    /// Create with the transparency and borderless options. Transparency does not coexist with the swap
-    /// chain path and currently gives error.Unsupported (use the gdi backend, or a future layered path; borderless, an opaque window with no frame, is supported).
+    /// The single window creation entry point of this backend (ADR-019 R1). The swap chain and the
+    /// upload texture are built at core.width/height, which is the monitor's real size when the
+    /// window is fullscreen. Transparency does not coexist with the swap chain path and gives
+    /// error.Unsupported (use the gdi backend, or a future layered path; borderless, an opaque window with no frame, is supported).
     pub fn createWithOptions(width: u32, height: u32, title: [:0]const u8, opts: @import("platform_types").WindowOptions) Error!Window {
         if (opts.transparent) return error.Unsupported; // transparency on d3d11 is follow-up work (use gdi)
         return finishFromCore(try common.Core.createWithOptions(width, height, title, opts));

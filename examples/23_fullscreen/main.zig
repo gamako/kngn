@@ -6,10 +6,13 @@ const FRAME_PERIOD_S: f64 = 1.0 / 60.0;
 /// 23_fullscreen: real caller and demo of `platform.Window.createFullscreen`.
 ///
 /// Fills the whole screen with an animated vertical gradient; exit with ESC / Q or quit.
-/// `createFullscreen` is a true fullscreen when the backend supports it (X11=EWMH
-/// `_NET_WM_STATE_FULLSCREEN` / Wayland=`xdg_toplevel_set_fullscreen`); unsupported backends
-/// (macOS/Windows) fall back to a 1920x1080 normal window. The actual resolution follows
-/// `fb.width`/`fb.height` (screen/compositor size when fullscreen).
+/// `createFullscreen` is a wrapper over `createWithOptions` with `fullscreen = true`, and it is a
+/// true fullscreen on every windowing backend (macOS through the window transition, X11 through
+/// EWMH `_NET_WM_STATE_FULLSCREEN`, Wayland through `xdg_toplevel_set_fullscreen`, Windows through
+/// an undecorated window covering the primary monitor). On the web it is a documented no-op, and
+/// under the headless null runtime there is no screen, so both keep the requested size.
+/// **The resolution is not known up front**: it follows `fb.width`/`fb.height` every frame, which is
+/// what this loop does — the transition is asynchronous on macOS and negotiated on Wayland.
 ///
 /// Hot path declaration: paints every pixel each frame, but computes colour **once per row** (vertical gradient)
 /// and bulk-writes the row slice with `@memset`. No per-pixel division or floating point (`/denom` is

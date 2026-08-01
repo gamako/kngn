@@ -57,6 +57,14 @@ pub const WindowOptions = struct {
     position: ?WindowPosition = null,
     size: ?WindowSize = null,
     fb_mode: FramebufferMode = .logical,
+    /// Create the window fullscreen. This is an **initial state, not a transition**: entering or
+    /// leaving fullscreen at run time, exclusive fullscreen, and choosing a monitor are separate
+    /// APIs with separate contracts (ADR-019 R2).
+    /// With `fullscreen = true` the width and height are an initial *request*: a backend that knows
+    /// the fullscreen size ignores them, one that negotiates asynchronously may replace them, and
+    /// only a backend with no notion of fullscreen honours them (ADR-019 R3). Which option
+    /// combinations are refused is ADR-019 R4, decided once in the facade.
+    fullscreen: bool = false,
 };
 
 // ============================================================================

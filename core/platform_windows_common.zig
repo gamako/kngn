@@ -329,6 +329,29 @@ pub fn roundToPhysicalPx(logical_px: u32, scale: f32) u32 {
     return @intFromFloat(v);
 }
 
+/// A physical pixel count → logical points: the inverse of `roundToPhysicalPx`, with the same
+/// rounding and the same clamps. It is the derivation direction fullscreen needs, because the
+/// monitor metrics Win32 reports under per-monitor-aware v2 are already physical (ADR-011 R11): the
+/// framebuffer size is that size verbatim and the logical size is derived from it.
+pub fn logicalFromPhysicalPx(physical_px: u32, scale: f32) u32 {
+    const s: f64 = if (scale > 0 and std.math.isFinite(scale)) scale else 1.0;
+    const v: f64 = @round(@as(f64, @floatFromInt(physical_px)) / s);
+    if (!std.math.isFinite(v) or v < 1.0) return 1;
+    if (v > @as(f64, @floatFromInt(std.math.maxInt(u32)))) return std.math.maxInt(u32);
+    return @intFromFloat(v);
+}
+
+/// The logical size that goes with a physical client size under `fb_mode` — the pair used when a
+/// fullscreen window is created and when a resize or DPI change is latched, so that the logical
+/// size cannot differ between the first frame and the first settled metrics (ADR-011 R11).
+pub fn logicalSizeForPhysical(fb_mode: FramebufferMode, physical: WindowSize, scale: f32) WindowSize {
+    if (fb_mode == .logical) return physical;
+    return .{
+        .width = logicalFromPhysicalPx(physical.width, scale),
+        .height = logicalFromPhysicalPx(physical.height, scale),
+    };
+}
+
 /// The physical framebuffer size. Under .logical it is always the logical size itself (which is where the structural guarantee lives).
 pub fn effectiveFramebufferSize(fb_mode: FramebufferMode, logical: WindowSize, scale: f32) WindowSize {
     if (fb_mode == .logical) return logical;
@@ -484,26 +507,14 @@ pub const Core = struct {
     }
 
     /// Create the window, allocate the canonical BGRA backing, and return a `*Core` (on the heap).
-    /// It holds no presentation resource (each backend prepares its own in create).
-    pub fn create(width: u32, height: u32, title: [:0]const u8) Error!*Core {
-        return createInternal(width, height, title, false, .{});
-    }
-
-    /// Create with the transparency and borderless options. Called from each backend's Window.createWithOptions.
+    /// It holds no presentation resource (each backend prepares its own in create). Called from each
+    /// backend's `Window.createWithOptions`, which is the single entry point of ADR-019 R1.
     /// transparent → WS_EX_LAYERED plus an UpdateLayeredWindow present. borderless → WS_POPUP plus hidden from the taskbar.
+    /// fullscreen → an undecorated (WS_POPUP) window at (0,0) covering the whole primary monitor,
+    /// whose size the backend resolves itself, so the width and height are ignored (ADR-019 R3).
     /// Hot path declaration: initialisation only.
     pub fn createWithOptions(width: u32, height: u32, title: [:0]const u8, opts: types.WindowOptions) Error!*Core {
-        return createInternal(width, height, title, false, opts);
-    }
-
-    /// Create a real fullscreen window. It places an undecorated (WS_POPUP) window covering the whole
-    /// primary monitor at (0,0). The real size comes from `GetSystemMetrics`, and the backing and
-    /// core.width/height take that size too (the presentation of gdi and d3d11 follows it).
-    pub fn createFullscreen(title: [:0]const u8) Error!*Core {
-        const sw = GetSystemMetrics(SM_CXSCREEN);
-        const sh = GetSystemMetrics(SM_CYSCREEN);
-        if (sw <= 0 or sh <= 0) return error.WindowCreationFailed;
-        return createInternal(@intCast(sw), @intCast(sh), title, true, .{});
+        return createInternal(width, height, title, opts.fullscreen, opts);
     }
 
     fn createInternal(width: u32, height: u32, title: [:0]const u8, fullscreen: bool, opts: types.WindowOptions) Error!*Core {
@@ -547,8 +558,29 @@ pub const Core = struct {
         if (create_as_pmv2) {
             create_scale = scaleFromDpi(GetDpiForSystem());
         }
-        const client_w: u32 = if (create_as_pmv2) roundToPhysicalPx(logical_w, create_scale) else logical_w;
-        const client_h: u32 = if (create_as_pmv2) roundToPhysicalPx(logical_h, create_scale) else logical_h;
+
+        // Fullscreen resolves its own size from the primary monitor, and the metrics are read
+        // **after** the awareness switch above: DPI virtualisation makes what GetSystemMetrics
+        // reports depend on the calling thread's awareness context. Under `.physical` plus PMv2 the
+        // value is therefore physical pixels, so the framebuffer takes it verbatim and the logical
+        // size is derived from it once the scale settles (ADR-011 R11) — the opposite direction from
+        // an ordinary window, whose logical arguments are multiplied up.
+        const fs_size: WindowSize = if (fullscreen) blk: {
+            const sw = GetSystemMetrics(SM_CXSCREEN);
+            const sh = GetSystemMetrics(SM_CYSCREEN);
+            if (sw <= 0 or sh <= 0) {
+                restoreThreadDpiAwareness();
+                return error.WindowCreationFailed;
+            }
+            break :blk .{ .width = @intCast(sw), .height = @intCast(sh) };
+        } else .{ .width = 0, .height = 0 };
+
+        const client_w: u32 = if (fullscreen)
+            fs_size.width
+        else if (create_as_pmv2) roundToPhysicalPx(logical_w, create_scale) else logical_w;
+        const client_h: u32 = if (fullscreen)
+            fs_size.height
+        else if (create_as_pmv2) roundToPhysicalPx(logical_h, create_scale) else logical_h;
 
         var outer_w: c_int = @intCast(client_w);
         var outer_h: c_int = @intCast(client_h);
@@ -595,7 +627,18 @@ pub const Core = struct {
         errdefer alloc.destroy(core);
 
         // The initial backing is the framebuffer size derived from the logical size (physical under `.physical` plus PMv2). It is reallocated after creation if the settled scale demands it.
-        const init_fb = effectiveFramebufferSize(fb_mode, .{ .width = logical_w, .height = logical_h }, if (create_as_pmv2) create_scale else 1.0);
+        // Fullscreen uses the resolved monitor size verbatim: it is already the physical size, and
+        // recomputing it from a logical value would apply the scale twice.
+        const init_fb = if (fullscreen)
+            fs_size
+        else
+            effectiveFramebufferSize(fb_mode, .{ .width = logical_w, .height = logical_h }, if (create_as_pmv2) create_scale else 1.0);
+        // Fullscreen's logical size is derived from the physical monitor size; the estimate at
+        // creation is replaced once the real scale settles below.
+        const init_logical: WindowSize = if (fullscreen)
+            logicalSizeForPhysical(fb_mode, fs_size, if (create_as_pmv2) create_scale else 1.0)
+        else
+            .{ .width = logical_w, .height = logical_h };
         const px_count = std.math.mul(usize, init_fb.width, init_fb.height) catch {
             restoreThreadDpiAwareness();
             return error.WindowCreationFailed;
@@ -611,8 +654,8 @@ pub const Core = struct {
             .hwnd = undefined,
             .width = init_fb.width,
             .height = init_fb.height,
-            .logical_width = logical_w,
-            .logical_height = logical_h,
+            .logical_width = init_logical.width,
+            .logical_height = init_logical.height,
             .fb_mode = fb_mode,
             .is_pmv2 = false, // settled after Create
             .pending_content_scale = 1.0,
@@ -687,7 +730,12 @@ pub const Core = struct {
         core.content_scale = scale;
 
         // The framebuffer size implied by the settled scale. Under `.physical`, a difference from the estimate at creation brings the window and the backing into line.
-        const final_fb = effectiveFramebufferSize(fb_mode, .{ .width = logical_w, .height = logical_h }, scale);
+        // Fullscreen is exempt: its framebuffer is the monitor size the window manager gives it, so
+        // there is nothing to recompute from a logical value (the real client size is read below).
+        const final_fb: WindowSize = if (fullscreen)
+            .{ .width = core.width, .height = core.height }
+        else
+            effectiveFramebufferSize(fb_mode, .{ .width = logical_w, .height = logical_h }, scale);
         if (final_fb.width != core.width or final_fb.height != core.height) {
             core.resizeBacking(final_fb.width, final_fb.height);
             // On an OOM the old size is kept (the window survives).
@@ -742,6 +790,14 @@ pub const Core = struct {
             core.pending_client_w = core.width;
             core.pending_client_h = core.height;
         }
+        // Fullscreen under `.physical`: the settled framebuffer is the monitor's physical size, so
+        // the logical size is derived from it with the settled scale (ADR-011 R11). `.logical`
+        // already took the client size above.
+        if (fullscreen and fb_mode == .physical) {
+            const fs_logical = logicalSizeForPhysical(fb_mode, .{ .width = core.width, .height = core.height }, scale);
+            core.logical_width = fs_logical.width;
+            core.logical_height = fs_logical.height;
+        }
         core.metrics_dirty = false;
 
         // Restore the thread awareness that `.physical` switched temporarily back to the start-up context
@@ -772,17 +828,12 @@ pub const Core = struct {
         }
 
         // The client size is the real window pixel size = the framebuffer.
-        // `.logical`: client = logical = fb. `.physical`: client = physical = fb, and logical is derived back.
-        const new_logical_w: u32 = if (self.fb_mode == .logical) cw else blk: {
-            const s = new_scale;
-            const v = @round(@as(f64, @floatFromInt(cw)) / @as(f64, s));
-            break :blk if (!std.math.isFinite(v) or v < 1.0) 1 else @intFromFloat(v);
-        };
-        const new_logical_h: u32 = if (self.fb_mode == .logical) ch else blk: {
-            const s = new_scale;
-            const v = @round(@as(f64, @floatFromInt(ch)) / @as(f64, s));
-            break :blk if (!std.math.isFinite(v) or v < 1.0) 1 else @intFromFloat(v);
-        };
+        // `.logical`: client = logical = fb. `.physical`: client = physical = fb, and logical is
+        // derived back — through the same helper window creation uses, so a window created
+        // fullscreen keeps the logical size it started with (ADR-011 R11).
+        const new_logical = logicalSizeForPhysical(self.fb_mode, .{ .width = cw, .height = ch }, new_scale);
+        const new_logical_w: u32 = new_logical.width;
+        const new_logical_h: u32 = new_logical.height;
 
         const old_w = self.width;
         const old_h = self.height;
@@ -1463,4 +1514,55 @@ test "effectiveContentScale corrects a non-positive or non-finite value to 1.0" 
     try std.testing.expectEqual(@as(f32, 1.0), effectiveContentScale(-1.0));
     try std.testing.expectEqual(@as(f32, 1.0), effectiveContentScale(std.math.nan(f32)));
     try std.testing.expectEqual(@as(f32, 1.0), effectiveContentScale(std.math.inf(f32)));
+}
+
+test "logicalFromPhysicalPx is the inverse of roundToPhysicalPx and clamps to the range" {
+    try std.testing.expectEqual(@as(u32, 800), logicalFromPhysicalPx(1600, 2.0));
+    try std.testing.expectEqual(@as(u32, 800), logicalFromPhysicalPx(1200, 1.5));
+    try std.testing.expectEqual(@as(u32, 1600), logicalFromPhysicalPx(1600, 1.0));
+    try std.testing.expectEqual(@as(u32, 1600), logicalFromPhysicalPx(1600, 0.0)); // invalid scale -> 1.0
+    try std.testing.expectEqual(@as(u32, 1600), logicalFromPhysicalPx(1600, std.math.nan(f32)));
+    try std.testing.expectEqual(@as(u32, 1), logicalFromPhysicalPx(1, 2.0)); // 1/2 rounds to 0 -> clamp to 1
+    // A scale below 1 divides up; the result is clamped to the u32 range rather than wrapping.
+    try std.testing.expectEqual(@as(u32, std.math.maxInt(u32)), logicalFromPhysicalPx(std.math.maxInt(u32), 0.5));
+    // Round-tripping an exact multiple returns the same physical size.
+    const scales = [_]f32{ 1.0, 1.5, 2.0, 3.0 };
+    for (scales) |s| {
+        const phys = roundToPhysicalPx(640, s);
+        try std.testing.expectEqual(@as(u32, 640), logicalFromPhysicalPx(phys, s));
+    }
+}
+
+test "logicalSizeForPhysical: a fullscreen screen size is physical, so the logical size is derived" {
+    // The size a fullscreen window resolves for itself is already in physical pixels: under
+    // .physical the logical size divides by the scale, and under .logical it is that same size.
+    const screen: WindowSize = .{ .width = 3840, .height = 2160 };
+    const derived = logicalSizeForPhysical(.physical, screen, 2.0);
+    try std.testing.expectEqual(@as(u32, 1920), derived.width);
+    try std.testing.expectEqual(@as(u32, 1080), derived.height);
+
+    const same = logicalSizeForPhysical(.logical, screen, 2.0);
+    try std.testing.expectEqual(screen.width, same.width);
+    try std.testing.expectEqual(screen.height, same.height);
+
+    // Applying the scale in the wrong direction would ask for a window twice the size of the
+    // screen, which is the mistake this pair of helpers exists to prevent.
+    try std.testing.expectEqual(@as(u32, 7680), effectiveFramebufferSize(.physical, screen, 2.0).width);
+}
+
+test "a fullscreen logical size does not move when the first resize reports the same physical size" {
+    // The creation path and the resize path derive the logical size through the same helper, so a
+    // window created fullscreen keeps the logical size of its first frame.
+    const screen: WindowSize = .{ .width = 3840, .height = 2160 };
+    const at_creation = logicalSizeForPhysical(.physical, screen, 2.0);
+    const after_configure = logicalSizeForPhysical(.physical, screen, 2.0);
+    try std.testing.expectEqual(at_creation.width, after_configure.width);
+    try std.testing.expectEqual(at_creation.height, after_configure.height);
+
+    // A scale that is not an integer keeps the same property (the rounding is the same rounding).
+    const odd: WindowSize = .{ .width = 2560, .height = 1440 };
+    const a = logicalSizeForPhysical(.physical, odd, 1.5);
+    const b = logicalSizeForPhysical(.physical, odd, 1.5);
+    try std.testing.expectEqual(a.width, b.width);
+    try std.testing.expectEqual(@as(u32, 1707), a.width); // 2560/1.5 = 1706.67 -> 1707
 }

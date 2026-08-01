@@ -137,20 +137,14 @@ pub const Window = struct {
         return .{ .pixels = pixels, .width = width, .height = height };
     }
 
-    pub fn create(width: u32, height: u32, title: [:0]const u8) Error!Window {
-        _ = title;
-        return allocBuffer(width, height);
-    }
-
-    pub fn createFullscreen(title: [:0]const u8) Error!Window {
-        _ = title;
-        return allocBuffer(1920, 1080);
-    }
-
+    /// The single window creation entry point of this backend (ADR-019 R1).
     pub fn createWithOptions(width: u32, height: u32, title: [:0]const u8, opts: WindowOptions) Error!Window {
         _ = title;
         // No scale support: .physical is accepted too, with contentScale=1 and logical==framebuffer (never Unsupported).
         _ = opts.fb_mode;
+        // There is no screen here, so fullscreen has no size of its own to resolve: the requested
+        // size is honoured as-is (ADR-019 R3, the third class).
+        _ = opts.fullscreen;
         const w = if (opts.size) |s| s.width else width;
         const h = if (opts.size) |s| s.height else height;
         return allocBuffer(w, h);
@@ -257,7 +251,7 @@ pub const Window = struct {
 const testing = std.testing;
 
 test "null window: create→lock→write→present→lock keeps the contents" {
-    var win = try Window.create(4, 2, "t");
+    var win = try Window.createWithOptions(4, 2, "t", .{});
     defer win.destroy();
 
     const fb1 = win.lockFramebuffer() orelse return error.TestUnexpectedResult;
@@ -273,7 +267,7 @@ test "null window: create→lock→write→present→lock keeps the contents" {
 }
 
 test "null window: zeroed right after create, and present does not change the size" {
-    var win = try Window.create(3, 1, "t");
+    var win = try Window.createWithOptions(3, 1, "t", .{});
     defer win.destroy();
     const fb = win.lockFramebuffer() orelse return error.TestUnexpectedResult;
     defer fb.unlock();
@@ -283,14 +277,27 @@ test "null window: zeroed right after create, and present does not change the si
     try testing.expectEqual(@as(u32, 1), win.height);
 }
 
-test "null window: fullscreen defaults to 1920x1080, and geometry has position=null" {
-    var win = try Window.createFullscreen("t");
+test "null window: fullscreen honours the requested size, and geometry has position=null" {
+    // There is no screen to fill here, so the requested size is the only size there is: the null
+    // backend is the third class of ADR-019 R3 and honours it exactly. (The facade's
+    // createFullscreen wrapper requests 1920x1080, which is what this backend produced before
+    // fullscreen became an option.)
+    var win = try Window.createWithOptions(640, 360, "t", .{ .fullscreen = true });
     defer win.destroy();
-    try testing.expectEqual(@as(u32, 1920), win.width);
-    try testing.expectEqual(@as(u32, 1080), win.height);
+    try testing.expectEqual(@as(u32, 640), win.width);
+    try testing.expectEqual(@as(u32, 360), win.height);
     const geo = getGeometry(win);
     try testing.expect(geo.position == null);
-    try testing.expectEqual(@as(u32, 1920), geo.size.width);
+    try testing.expectEqual(@as(u32, 640), geo.size.width);
+}
+
+test "null window: fullscreen with .physical keeps scale 1 and the requested size" {
+    var win = try Window.createWithOptions(1280, 720, "t", .{ .fullscreen = true, .fb_mode = .physical });
+    defer win.destroy();
+    try testing.expectEqual(@as(f32, 1.0), win.contentScale());
+    try testing.expectEqual(@as(u32, 1280), win.logicalSize().width);
+    try testing.expectEqual(@as(u32, 1280), win.framebufferSize().width);
+    try testing.expectEqual(@as(u32, 720), win.framebufferSize().height);
 }
 
 test "null window: options.size wins, plus the poll/nextEvent/stats no-op interface" {
@@ -335,7 +342,7 @@ test "null .physical is accepted with scale=1 and an unchanged size, rather than
 }
 
 test "null .logical keeps the size on the width/height/pixels CRC path, snapshot included" {
-    var win = try Window.create(4, 2, "t");
+    var win = try Window.createWithOptions(4, 2, "t", .{});
     defer win.destroy();
     const fb = win.lockFramebuffer() orelse return error.TestUnexpectedResult;
     defer fb.unlock();

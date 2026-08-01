@@ -1517,27 +1517,23 @@ fn destroyCsd(st: *State) void {
 pub const Window = struct {
     state: *State,
 
-    pub fn create(width: u32, height: u32, title: [:0]const u8) Error!Window {
-        return createInternal(width, height, title, false, .{});
-    }
-
-    /// Create with the transparency and borderless options. The facade detects this through @hasDecl.
+    /// The single window creation entry point of this backend (ADR-019 R1).
     /// Transparency needs ARGB8888 (without it, error.Unsupported). borderless has no decoration.
+    /// Fullscreen asks for `xdg_toplevel_set_fullscreen` before the first commit and takes its size
+    /// from the compositor, so the width and height are ignored in that case (ADR-019 R3).
     /// Hot path declaration: initialisation only.
     pub fn createWithOptions(width: u32, height: u32, title: [:0]const u8, opts: types.WindowOptions) Error!Window {
-        return createInternal(width, height, title, false, opts);
+        return createInternal(width, height, title, opts.fullscreen, opts);
     }
 
-    /// Create a real fullscreen toplevel. It asks for `xdg_toplevel_set_fullscreen` before the first commit.
-    /// The compositor reports the real size in the first configure, so the width and height arguments are
-    /// placeholders (overwritten by whatever the first configure settles).
-    pub fn createFullscreen(title: [:0]const u8) Error!Window {
-        return createInternal(1, 1, title, true, .{});
-    }
-
-    fn createInternal(width: u32, height: u32, title: [:0]const u8, fullscreen: bool, opts: types.WindowOptions) Error!Window {
+    /// `width`/`height` are logical points, **except when `fullscreen` is set**: the compositor
+    /// reports the real size in the first configure, so they are replaced by a 1x1 placeholder that
+    /// allocates nothing worth reallocating (ADR-019 R3, the asynchronous class).
+    fn createInternal(req_width: u32, req_height: u32, title: [:0]const u8, fullscreen: bool, opts: types.WindowOptions) Error!Window {
         const dpy = g_display orelse return error.WindowCreationFailed;
-        if (width == 0 or height == 0) return error.WindowCreationFailed;
+        if (req_width == 0 or req_height == 0) return error.WindowCreationFailed;
+        const width: u32 = if (fullscreen) 1 else req_width;
+        const height: u32 = if (fullscreen) 1 else req_height;
 
         // The initial scale falls back to 1.0 before any enter. The physical size follows fb_mode.
         const logical: WindowSize = .{ .width = width, .height = height };
