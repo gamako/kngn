@@ -79,7 +79,13 @@ pub const RouterFn = *const fn (name: []const u8, args: []const u8, buf: []u8) a
 /// The return value may borrow `scratch` or static storage; the router consumes it synchronously.
 pub const CanonicalizeFn = *const fn (ctx: *anyopaque, args: []const u8, scratch: []u8) anyerror![]const u8;
 
-pub const MAX_ACTIONS = 48; // A fixed-size registry: registering beyond this limit is skipped with a warning.
+/// A fixed-size registry (event-time only; never touched per frame or per sample, so the array's
+/// static memory is not a hot-path cost): registering beyond this limit is skipped with a warning.
+/// Sized at the busiest registrant plus headroom, not open-ended: `@sizeOf(Action)` is 80B, so each
+/// added slot costs 80B of static memory. The busiest application (the pixel editor) registers 49
+/// actions; 64 leaves 15 slots of headroom above that (24 above the next busiest, the modular patch
+/// canvas at 40) without growing unbounded.
+pub const MAX_ACTIONS = 64;
 
 var actions: [MAX_ACTIONS]Action = undefined;
 var action_count: usize = 0;

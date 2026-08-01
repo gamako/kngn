@@ -5104,6 +5104,19 @@ fn actionOpenProject(ctx: *anyopaque, args: []const u8, buf: []u8) anyerror![]co
     return std.fmt.bufPrint(buf, "ok open_project={s}", .{@tagName(result)}) catch error.BufferTooSmall;
 }
 
+/// `save_project <path>`: writes a .pix project (layer structure preserved) to `path` and does
+/// not quit the app, symmetric with `open_project <path>`. Unlike `request_close` +
+/// `confirm_save <path>` (the only other headless route to a project write), this never sets
+/// `app.running = false`: `DocumentHost.saveAs` cannot return `.allowed` (only `requestClose`'s
+/// confirmation flow does), so `finishHostResult` never reaches its quit branch here.
+fn actionSaveProject(ctx: *anyopaque, args: []const u8, buf: []u8) anyerror![]const u8 {
+    const app = actionApp(ctx);
+    if (args.len == 0) return error.InvalidArgument;
+    const result = try app.host.saveAs(args);
+    finishHostResult(app, result);
+    return std.fmt.bufPrint(buf, "ok save_project={s}", .{@tagName(result)}) catch error.BufferTooSmall;
+}
+
 fn actionConfirmSave(ctx: *anyopaque, args: []const u8, buf: []u8) anyerror![]const u8 {
     const app = actionApp(ctx);
     const result = try app.host.confirmSave(if (args.len == 0) null else args);
@@ -5263,6 +5276,8 @@ fn registerActions(app: *App) void {
     platform.registerAction(.{ .name = "set_grid", .ctx = app, .run = recordedAction("set_grid", .record), .network_policy = .local_only, .desc = "toggle the pixel grid overlay 0|1 (view only, no undo)", .args = pixie_args_set_grid });
     // loupe (magnifier) overlay toggle (view only, no undo; a per-peer canvas overlay, not document state)
     platform.registerAction(.{ .name = "set_loupe", .ctx = app, .run = recordedAction("set_loupe", .record), .network_policy = .local_only, .desc = "toggle the loupe magnifier overlay 0|1 (view only, no undo)", .args = pixie_args_set_loupe });
+    // project save (bypass executor, not recorded in CommandLog, local_only): writes .pix without quitting, symmetric with open_project
+    platform.registerAction(.{ .name = "save_project", .ctx = app, .run = actionSaveProject, .network_policy = .local_only, .desc = "save .pix project to path (does not quit; alternative to request_close+confirm_save)", .args = pixie_args_path });
 }
 
 fn netsyncExport(ctx: *anyopaque, allocator: std.mem.Allocator) anyerror![]u8 {
