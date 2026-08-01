@@ -32,10 +32,18 @@ let instance;
 /** @type {WebAssembly.Module | null} */
 let wasmModule = null;
 
-// ImageData is reused (recreated only on size change or memory growth)
+// The copy path's own ImageData is reused, and rebuilt when the frame size or its byte
+// length changes. It does not view wasm memory, so growing memory does not invalidate it.
 let imageData = null;
 let imageW = 0;
 let imageH = 0;
+// Whether present may hand putImageData an ImageData that views wasm memory directly
+// instead of copying into one. Latched when memory is created: an ImageData cannot be
+// built over a SharedArrayBuffer, and whether memory is shared is fixed for the run.
+let presentCanAlias = false;
+// Set if constructing that ImageData ever throws for a reason the shared check did not
+// predict, so the copy path takes over for good and the warning is printed once.
+let presentAliasFailed = false;
 
 const CURSOR_CSS = ["default", "crosshair", "none"];
 
@@ -1488,15 +1496,40 @@ function makeImportObject() {
       kngn_present(ptr, w, h) {
         // memory growth detaches the old ArrayBuffer, so rebuild the view from buffer every time
         const nbytes = (w * h * 4) >>> 0;
-        const wasmView = new Uint8ClampedArray(memory.buffer, ptr, nbytes);
+        let wasmView = new Uint8ClampedArray(memory.buffer, ptr, nbytes);
+        if (canvas.width !== w || canvas.height !== h) {
+          canvas.width = w;
+          canvas.height = h;
+        }
+        if (presentCanAlias && !presentAliasFailed) {
+          // An ImageData built from a Uint8ClampedArray keeps that array rather than copying
+          // it, so this uploads straight out of wasm memory and the frame-sized copy below
+          // does not happen. It is rebuilt every frame on purpose: growing memory detaches
+          // the buffer, and a retained ImageData would then throw InvalidStateError on
+          // upload, so not retaining one removes that failure mode instead of guarding it.
+          let aliased = null;
+          try {
+            aliased = new ImageData(wasmView, w, h);
+          } catch (e) {
+            // Only the construction is guarded. An upload that fails is a different fault
+            // and must not be recorded as "this engine cannot alias".
+            presentAliasFailed = true;
+            console.warn(
+              "kngn_present: cannot upload from wasm memory directly, copying instead (" +
+                String((e && e.message) || e) + ")",
+            );
+            // The throw may have been a detached buffer, so do not copy from the old view.
+            wasmView = new Uint8ClampedArray(memory.buffer, ptr, nbytes);
+          }
+          if (aliased) {
+            ctx2d.putImageData(aliased, 0, 0);
+            return;
+          }
+        }
         if (!imageData || imageW !== w || imageH !== h || imageData.data.length !== nbytes) {
           imageData = ctx2d.createImageData(w, h);
           imageW = w;
           imageH = h;
-          if (canvas.width !== w || canvas.height !== h) {
-            canvas.width = w;
-            canvas.height = h;
-          }
         }
         imageData.data.set(wasmView);
         ctx2d.putImageData(imageData, 0, 0);
@@ -1662,6 +1695,12 @@ export async function boot(opts = {}) {
     instance = await WebAssembly.instantiate(wasmModule, importObject);
     memory = /** @type {WebAssembly.Memory} */ (instance.exports.memory);
   }
+  // Decided once, because it cannot change afterwards: the ImageData constructor rejects a
+  // view over a SharedArrayBuffer, which is what shared audio builds get.
+  presentCanAlias =
+    typeof SharedArrayBuffer === "undefined" ||
+    !(memory.buffer instanceof SharedArrayBuffer);
+  presentAliasFailed = false;
 
   // Audio worklet setup before kngn_init. Failures stop boot (no half-started audio).
   if (useShared) {

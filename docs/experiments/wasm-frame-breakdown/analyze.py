@@ -6,7 +6,7 @@ section together with a bootstrap confidence interval, so that a difference betw
 conditions can be told apart from run-to-run noise.
 
     python3 analyze.py breakdown.json [more.json ...]
-    python3 analyze.py --compare 2560x1440/real/real 2560x1440/real/memcpy *.json
+    python3 analyze.py --compare 2560x1440/real/real/on 2560x1440/real/memcpy/on *.json
 """
 
 from __future__ import annotations
@@ -26,7 +26,12 @@ SECTIONS = ["events", "ui_build", "post_ui", "fb_clear", "canvas_composite",
 
 def key_of(run: dict) -> str:
     c = run.get("conditions", {})
-    return f"{c.get('w')}x{c.get('h')}/{c.get('present')}/{c.get('swizzle')}"
+    # `alias` names which host-side present ran. Two runs that differ in it are different
+    # conditions, so it belongs in the key: leaving it out pools them and averages the very
+    # difference the run was set up to measure. Older files without the field read as "on",
+    # which is what they were.
+    return (f"{c.get('w')}x{c.get('h')}/{c.get('present')}/{c.get('swizzle')}"
+            f"/{c.get('alias', 'on')}")
 
 
 REQUIRED_CONDITION_FIELDS = ("w", "h", "present", "swizzle")
@@ -117,14 +122,18 @@ def load(paths: list[str]) -> dict[str, list[dict]]:
                 continue
             key = key_of(run)
             groups[key].append(run)
-            builds[key].add(run["wasm_sha256"])
+            # The build identity is the module *and* the host glue: a change to kngn.js or to
+            # this harness's page moves the numbers with the module untouched, so pooling on
+            # the module hash alone would merge two different systems into one condition.
+            builds[key].add((run["wasm_sha256"], run.get("host_sha256", "")))
     # Two builds under one condition cannot be pooled: the whole point of a condition is
     # that only the named axis differs.
     mixed = {k: v for k, v in builds.items() if len(v) > 1}
     if mixed:
-        for k, shas in mixed.items():
-            print(f"ERROR: {k} pools {len(shas)} different wasm builds: "
-                  f"{', '.join(sorted(s[:12] for s in shas))}", file=sys.stderr)
+        for k, ids in mixed.items():
+            shown = sorted(w[:12] + "/" + (h[:12] or "host?") for w, h in ids)
+            print(f"ERROR: {k} pools {len(ids)} different builds: {', '.join(shown)}",
+                  file=sys.stderr)
         sys.exit("refusing to summarise across builds; analyse each build's results separately")
     return groups
 
@@ -214,10 +223,11 @@ def compare(groups: dict[str, list[dict]], a: str, b: str) -> None:
     # compared), but it changes what the difference means, so it is stated rather than
     # assumed either way.
     # Compared in full; shown abbreviated.
-    sa = {r["wasm_sha256"] for r in groups[a]}
-    sb = {r["wasm_sha256"] for r in groups[b]}
+    sa = {(r["wasm_sha256"], r.get("host_sha256", "")) for r in groups[a]}
+    sb = {(r["wasm_sha256"], r.get("host_sha256", "")) for r in groups[b]}
     same = "same build" if sa == sb else "DIFFERENT BUILDS"
-    short = lambda s: ",".join(sorted(x[:12] for x in s))
+    def short(ids):
+        return ",".join(sorted(w[:12] + "/" + (h[:8] or "host?") for w, h in ids))
     print(f"    build A {short(sa)}  build B {short(sb)}  ({same})")
     print(f"    {'section':<18} {'A us':>9} {'B us':>9} {'A-B us':>9}   95% CI of A-B")
     rows = [("rAF callback", ["raf_callback_ms", "mean"])] + \
@@ -254,10 +264,10 @@ def check_split_fidelity(groups: dict[str, list[dict]]) -> bool:
     printed = False
     failed = []
     for key, runs in list(groups.items()):
-        size, present, swizzle = key.split("/")
+        size, present, swizzle, alias = key.split("/")
         if present != "split":
             continue
-        base = groups.get(f"{size}/real/{swizzle}")
+        base = groups.get(f"{size}/real/{swizzle}/{alias}")
         if not base:
             # Without the untouched path to compare against, the split cannot be shown
             # to still reproduce it, so its breakdown is not usable.

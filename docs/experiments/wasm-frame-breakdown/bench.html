@@ -42,6 +42,20 @@
     // swizzle: "real" | "memcpy" | "noop" | "u32" | "vecptr" | "deref"
     //          (selected at runtime inside the wasm backend; see the README's table)
     const SWIZZLE = str("swizzle", "real");
+    // alias: "on" leaves the host present as it is; "off" makes the aliasing ImageData
+    // construction fail, so the application falls back to copying. Both are then measurable
+    // in one build, which is the only way to compare them without changing the module.
+    const ALIAS = str("alias", "on");
+    if (ALIAS === "off") {
+      // Installed before the module loads, so the app's own present takes its fallback.
+      const RealImageData = ImageData;
+      window.ImageData = class extends RealImageData {
+        constructor(a, b, c) {
+          if (a instanceof Uint8ClampedArray) throw new TypeError("alias disabled for this run");
+          super(a, b, c);
+        }
+      };
+    }
     const LABEL = str("label", "");
     // Echoed back in the report so the runner matches a report to the run that
     // produced it, instead of to whichever arrived next.
@@ -68,12 +82,16 @@
     });
 
     // ---- 2. present wrapper (installed by intercepting the import object) ----
-    // The app's own present is: build a view over wasm memory, copy it into an ImageData,
-    // upload that ImageData. "split" reimplements exactly that so the copy and the upload
-    // can be timed apart; its total is compared against "real" to prove the reimplementation
-    // is faithful.
+    // The app's own present builds a view over wasm memory, gets an ImageData over those
+    // bytes — by aliasing the view where the engine allows it, otherwise by copying into
+    // one — and uploads it. "split" reimplements exactly that so the two halves can be
+    // timed apart; its total is compared against "real" to prove the reimplementation is
+    // faithful.
     let setMs = 0, putMs = 0, presentCalls = 0;
     let imageData = null, imageW = 0, imageH = 0, setupCalls = 0;
+    // Whether an ImageData can view wasm memory here; latched on the first present, because
+    // it depends on the memory the module was instantiated with.
+    let canAlias = null;
     let ctx2d = null;
     let memory = null;
     let wasmExports = null;
@@ -88,6 +106,15 @@
           if (!ctx2d) ctx2d = canvas.getContext("2d", { alpha: false });
           const nbytes = (w * h * 4) >>> 0;
           const view = new Uint8ClampedArray(memory.buffer, ptr, nbytes);
+          if (canAlias === null) {
+            // The same two things the application decides from: whether the buffer can be
+            // aliased at all, and whether this run asked for the copy path instead.
+            canAlias = ALIAS === "on" &&
+                       (typeof SharedArrayBuffer === "undefined" ||
+                        !(memory.buffer instanceof SharedArrayBuffer));
+          }
+          // Never retained across frames: growing memory detaches the buffer behind it.
+          let aliased = null;
           if (!imageData || imageW !== w || imageH !== h || imageData.data.length !== nbytes) {
             // Counted separately: this is present cost that is not the copy or the upload.
             setupCalls++;
@@ -97,13 +124,20 @@
           }
           const a = performance.now();
           if (PRESENT === "split") {
-            imageData.data.set(view);
+            // Mirrors what the application's present does, which is the only reason the two
+            // halves add up to it. When the ImageData can view wasm memory the first half is
+            // building that view; when it cannot, the first half is the copy.
+            if (canAlias) {
+              aliased = new ImageData(view, w, h);
+            } else {
+              imageData.data.set(view);
+            }
           } else if (PRESENT === "touch") {
             // Defeat a possible "same contents" optimisation without paying for a full copy.
             imageData.data[0] = (imageData.data[0] + 1) & 0xff;
           } // "stale": leave the ImageData untouched
           const b = performance.now();
-          ctx2d.putImageData(imageData, 0, 0);
+          ctx2d.putImageData(aliased || imageData, 0, 0);
           const c = performance.now();
           setMs += b - a;
           putMs += c - b;
@@ -164,6 +198,12 @@
       const calib = readBlock();
       const nowCostMs = (calib[SECTIONS.length + 3] * 1000) / CALIBRATE;
 
+      // Refused the same way every other bad input is, so the runner sees a report rather
+      // than a page that died before saying why.
+      if (ALIAS !== "on" && ALIAS !== "off") {
+        report({ error: `alias must be "on" or "off", got "${ALIAS}"`, label: LABEL, token: TOKEN });
+        return;
+      }
       const SWIZZLE_MODE = { real: 0, memcpy: 1, noop: 2, u32: 3, vecptr: 4, deref: 5 };
       // A misspelt mode must not be measured as `real`: silently falling back would make one
       // condition a duplicate of another and the comparison between them meaningless.
@@ -210,7 +250,8 @@
       report({
         label: LABEL,
         token: TOKEN,
-        conditions: { w: W, h: H, present: PRESENT, swizzle: SWIZZLE, frames: FRAMES, warmup: WARMUP },
+        conditions: { w: W, h: H, present: PRESENT, swizzle: SWIZZLE, alias: ALIAS,
+                      frames: FRAMES, warmup: WARMUP },
         // Proof the run measured the size it claims to have measured.
         actual: { fb_w: blk[SECTIONS.length + 1], fb_h: blk[SECTIONS.length + 2],
                   css_w: canvas.clientWidth, css_h: canvas.clientHeight,

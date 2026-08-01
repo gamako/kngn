@@ -238,37 +238,37 @@ checks and refuses to pool two builds under one condition.
 ### Where a frame goes
 
 Measured on aarch64-macos, headless Chromium 150, the pixel editor, `ReleaseSmall` with
-`simd128`, device pixel ratio 1. Median across 5 runs of 400 frames from **one build**;
+`simd128`, device pixel ratio 1. Median across 7 runs of 400 frames from **one build**;
 each value is a per-frame mean, in µs. Instrument overhead was 2.0 µs/frame (12 marks)
 and the clock resolution 5 µs, so sections in the single digits are aggregate estimates
 rather than measurements.
 
 | section | 780x600 | 2560x1440 | 2560x1440 share |
 |---|---:|---:|---:|
-| events | 5.7 | 6.4 | 0.2% |
-| ui_build | 396.4 | 294.3 | 10.7% |
-| post_ui | 3.7 | 3.6 | 0.1% |
-| fb_clear | 41.0 | 244.5 | 8.9% |
-| canvas_composite | 142.5 | 145.1 | 5.3% |
-| canvas_blit | 101.5 | 95.6 | 3.5% |
-| overlays | 1.3 | 1.3 | 0.0% |
-| gui_render | 162.4 | 263.7 | 9.6% |
-| **swizzle** | **131.0** | **742.0** | **27.0%** |
-| **js present** | **155.8** | **922.0** | **33.6%** |
-| post_present | 0.2 | 0.3 | 0.0% |
-| residual | 19.7 | 28.1 | 1.0% |
-| **whole frame** | **1164.8** | **2743.1** | |
+| events | 6.3 | 6.4 | 0.3% |
+| ui_build | 417.4 | 300.9 | 12.8% |
+| post_ui | 4.2 | 3.6 | 0.2% |
+| fb_clear | 45.4 | 244.7 | 10.4% |
+| canvas_composite | 146.7 | 148.6 | 6.3% |
+| canvas_blit | 107.1 | 98.0 | 4.2% |
+| overlays | 1.6 | 1.2 | 0.0% |
+| gui_render | 169.6 | 267.8 | 11.4% |
+| **swizzle** | **133.8** | **761.3** | **32.5%** |
+| **js present** | **97.7** | **479.5** | **20.5%** |
+| post_present | 0.2 | 0.2 | 0.0% |
+| residual | 18.0 | 24.8 | 1.1% |
+| **whole frame** | **1139.2** | **2343.4** | |
 
-The sections account for 99% of the callback at both sizes.
+The sections account for 98–99% of the callback at both sizes.
 
 Where the marks sit, because the split between two of them is a choice rather than a fact:
 `canvas_composite` closes after the composite (including the onion-skin build) and
 `canvas_blit` closes after the zoom blit and the minimap, so moving that boundary moves
 work between the two while their sum stays put.
 
-**The host-side present is the largest item and the swizzle is second**: together 61% of a
-2560x1440 frame. Everything the application draws — the UI tree, the clear, the canvas work,
-the GUI rasterisation — is the remaining 38%.
+**The channel swizzle is the largest item and the host-side present is second**: together
+53% of a 2560x1440 frame. Everything the application draws — the UI tree, the clear, the
+canvas work, the GUI rasterisation — is the remaining 45%.
 
 #### Four sizes, measured while the swizzle was scalarised
 
@@ -302,20 +302,47 @@ The pair is comparable as a sum (235.8 against 240.7 µs, a 2% spread) rather th
 Splitting the host side (the `split` condition reimplements it so the two halves can be
 timed apart; `analyze.py` checks that its total still matches the untouched path):
 
-| size | copy into the ImageData | upload | total | drift against the untouched path |
+| size | prepare the ImageData | upload | total | drift against the untouched path |
 |---|---:|---:|---:|---:|
-| 780x600 | 67.3 | 77.3 | 144.6 | 0.9% |
-| 2560x1440 | 448.6 | 475.0 | 923.6 | 1.2% |
+| 780x600 | 10.8 | 74.2 | 85.1 | 2.9% |
+| 2560x1440 | 13.5 | 464.2 | 477.8 | 0.9% |
 
-Skipping the copy while still uploading (a stale `ImageData`) saves rather more than the
-copy's own cost, because it also changes the cache state the upload then reads; writing
-a few bytes instead of copying gives the same figure, which rules out a "contents
-unchanged" shortcut in the browser.
+**Preparing costs almost nothing because nothing is copied.** An `ImageData` built from a
+`Uint8ClampedArray` keeps that array instead of copying it, so the glue hands
+`putImageData` a view straight into wasm memory; what is left of the first half is
+constructing the wrapper. That is only possible while wasm memory is not a
+`SharedArrayBuffer` — see below.
 
-The copy is not independent of what runs before it. Measured against the scalarised swizzle
-it was 406 µs at 2560x1440, against 449 µs here — the copy got *dearer* once the swizzle
-stopped taking so long over the same bytes. Sections in this path trade with each other
-through the cache, so each one is only a number in the company of the others.
+Skipping the upload's input entirely (a stale `ImageData`) saves more than that first half
+costs, because it also changes the cache state the upload then reads; writing a few bytes
+instead gives the same figure, which rules out a "contents unchanged" shortcut in the
+browser.
+
+#### What the copy costs when it cannot be avoided
+
+An `ImageData` cannot view a `SharedArrayBuffer`, so a build with shared-memory audio has to
+copy the frame into one first. Both paths exist in the shipped glue, and the harness can
+force the copy (`--alias off`) so the two are measured in **one build**, order shuffled,
+7 runs each:
+
+| size | section | aliasing | copying | difference (95% CI) |
+|---|---|---:|---:|---|
+| 2560x1440 | js present | 479.5 | 922.2 | −442.7 [−451.4, −433.2] |
+| 2560x1440 | whole frame | 2343.4 | 2746.9 | −403.5 [−433.1, −383.4] |
+| 780x600 | js present | 97.7 | 175.7 | −77.9 [−90.3, −39.7] |
+| 780x600 | whole frame | 1139.2 | 1265.8 | −126.7 [−157.3, +164.8] |
+
+At 2560x1440 that is 17% of the frame; at 780x600 the section improves but the whole-frame
+interval spans zero, because `ui_build` dominates that size and is noisy. The p95 of the
+callback is no worse either way (2445 against 2895 µs at 2560x1440; 1700 against 1740 µs at
+780x600), so across these runs, building an `ImageData` per frame did not show up as
+allocation outliers.
+
+The swizzle costs 22 µs *more* when the copy is gone (761.3 against 739.6, an interval that
+excludes zero). The copy used to read the same bytes the swizzle had just written, so the
+increase is consistent with the two trading through the cache — but that mechanism was not
+isolated here, only the difference was measured. Either way it is a reminder that a section
+in this path is only a number in the company of the others.
 
 ### There is no fixed cost worth the name
 

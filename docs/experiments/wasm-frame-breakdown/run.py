@@ -176,6 +176,8 @@ def main() -> None:
     ap.add_argument("--sizes", default="64x64,780x600,1600x900,2560x1440")
     ap.add_argument("--present", default="real,split,stale,touch,none")
     ap.add_argument("--swizzle", default="real,memcpy,noop")
+    ap.add_argument("--alias", default="on",
+                    help="host present: on (alias wasm memory) / off (force the copy path)")
     ap.add_argument("--matrix", default="default", choices=["default", "full"],
                     help="'default' varies one axis at a time from the baseline; "
                          "'full' takes the cartesian product")
@@ -197,30 +199,39 @@ def main() -> None:
     sizes = [tuple(int(v) for v in s.split("x")) for s in args.sizes.split(",")]
     presents = args.present.split(",")
     swizzles = args.swizzle.split(",")
+    aliases = args.alias.split(",")
 
     conds = []
     if args.matrix == "full":
         for (w, h) in sizes:
             for p in presents:
                 for s in swizzles:
-                    conds.append({"w": w, "h": h, "present": p, "swizzle": s})
+                    for al in aliases:
+                        conds.append({"w": w, "h": h, "present": p, "swizzle": s, "alias": al})
     else:
         # One axis at a time. Comparing two conditions that differ in two places tells
         # you nothing about either.
         for (w, h) in sizes:
-            conds.append({"w": w, "h": h, "present": presents[0], "swizzle": swizzles[0]})
+            conds.append({"w": w, "h": h, "present": presents[0], "swizzle": swizzles[0],
+                          "alias": aliases[0]})
         base_w, base_h = sizes[-1]
         for p in presents[1:]:
-            conds.append({"w": base_w, "h": base_h, "present": p, "swizzle": swizzles[0]})
+            conds.append({"w": base_w, "h": base_h, "present": p, "swizzle": swizzles[0],
+                          "alias": aliases[0]})
         for s in swizzles[1:]:
-            conds.append({"w": base_w, "h": base_h, "present": presents[0], "swizzle": s})
+            conds.append({"w": base_w, "h": base_h, "present": presents[0], "swizzle": s,
+                          "alias": aliases[0]})
+        for al in aliases[1:]:
+            conds.append({"w": base_w, "h": base_h, "present": presents[0],
+                          "swizzle": swizzles[0], "alias": al})
 
     plan = []
     for rep in range(args.repeats):
         for c in conds:
             plan.append({**c, "frames": args.frames, "warmup": args.warmup,
-                         "token": f"r{rep}-{c['w']}x{c['h']}-{c['present']}-{c['swizzle']}",
-                         "label": f"{c['w']}x{c['h']}/{c['present']}/{c['swizzle']}/rep{rep}"})
+                         "token": f"r{rep}-{c['w']}x{c['h']}-{c['present']}-{c['swizzle']}-{c['alias']}",
+                         "label": f"{c['w']}x{c['h']}/{c['present']}/{c['swizzle']}/"
+                                  f"alias-{c['alias']}/rep{rep}"})
     # Randomised order: a fixed cycle leaves an order effect indistinguishable from a
     # condition effect.
     random.Random(args.seed).shuffle(plan)
@@ -242,11 +253,24 @@ def main() -> None:
 
     import hashlib
     wasm_sha = hashlib.sha256(wasm_bytes).hexdigest()
+    # The measured system is the module plus the host glue plus this page. A change to the
+    # glue moves the numbers while leaving the module identical, so the host side is
+    # identified too — otherwise two such runs pool under one condition unnoticed.
+    def sha_of(path: Path) -> str:
+        try:
+            return hashlib.sha256(path.read_bytes()).hexdigest()
+        except OSError:
+            return ""
+    host_sha = hashlib.sha256(
+        (sha_of(Path(args.web_dir) / "kngn.js") + sha_of(HERE / "bench.html")).encode()
+    ).hexdigest()
     for r in Collector.reports:
         r["wasm_sha256"] = wasm_sha
+        r["host_sha256"] = host_sha
     out = {
         "meta": {
             "wasm_sha256": wasm_sha,
+            "host_sha256": host_sha,
             "wasm_bytes": len(wasm_bytes),
             "chrome": chrome,
             "repeats": args.repeats,

@@ -90,6 +90,16 @@ Heavy frames underrun audio. Queue = 8 blocks × 128 frames (~21 ms @ 48 kHz pre
 refill when ≤4 blocks remain. Larger queue raises latency. Underruns surface on `#kngn-error`
 (no silent fallback to `.none`).
 
+**`.worklet_shared` also costs a frame-sized copy on every present.** Choosing it makes wasm
+memory a `SharedArrayBuffer`, and the `ImageData` constructor refuses a view over one
+(`TypeError: The provided Uint8ClampedArray value must not be shared`). Without shared memory
+the glue hands `putImageData` an `ImageData` that views wasm memory directly; with it, the
+frame has to be copied into a separate `ImageData` first. What that copy costs was measured
+**in the pixel editor**, by forcing the same fallback the shared build takes: 442 µs per
+frame at 2560x1440, about 17% of the frame. It is the cost of the path, not a measurement of
+the synth. The glue picks the path from the buffer type, so nothing breaks either way, but
+the cost belongs in the transport decision along with latency.
+
 ### Delivery matrix (measured / designed)
 
 | Delivery | `.none` | `.worklet_postmessage` | `.worklet_shared` | Latency |

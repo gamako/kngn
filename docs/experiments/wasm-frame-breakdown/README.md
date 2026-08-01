@@ -100,7 +100,7 @@ python3 docs/experiments/wasm-frame-breakdown/analyze.py /tmp/breakdown.json
 browser per condition, and collects each run's JSON report over HTTP. Nothing connects to
 a debugging port, so it runs unattended.
 
-Useful flags: `--sizes`, `--present`, `--swizzle`, `--repeats`, `--frames`,
+Useful flags: `--sizes`, `--present`, `--swizzle`, `--alias`, `--repeats`, `--frames`,
 `--matrix full` for the cartesian product instead of one-axis-at-a-time.
 
 `analyze.py` prints per-condition medians with bootstrap confidence intervals, and
@@ -113,7 +113,7 @@ Useful flags: `--sizes`, `--present`, `--swizzle`, `--repeats`, `--frames`,
 | Value | Behaviour | Read it as |
 |---|---|---|
 | `real` | the application's own present, untouched | the baseline |
-| `split` | the same steps, reimplemented so the copy and the upload are timed apart | the split; its total should match `real`'s `js_present`, which is the check that the reimplementation is faithful |
+| `split` | the same steps, reimplemented so preparing the `ImageData` and uploading it are timed apart | the split; its total should match `real`'s `js_present`, which is the check that the reimplementation is faithful. Which two halves those are follows the application: preparing means aliasing the view where that is possible and copying into an `ImageData` where it is not |
 | `stale` | skip the copy, still upload | upload cost with unchanged pixels |
 | `touch` | write a few bytes instead of copying, still upload | guards `stale` against a "contents unchanged" optimisation |
 | `none` | skip both | **observer effect**: the canvas stops updating, so paint and composite disappear too. A lower bound on synchronous cost, not a measurement of the present |
@@ -135,6 +135,22 @@ measurement:
 A mode this page does not know is an error, not a fall back to `real`: a misspelt
 `--swizzle` would otherwise become a silent duplicate of the baseline and the comparison
 between them would read as "no difference".
+
+`alias` selects which host-side present the application takes, without changing the module:
+
+| Value | Read it as |
+|---|---|
+| `on` | the present as it ships: hand `putImageData` an `ImageData` that views wasm memory, so no frame-sized copy happens |
+| `off` | make that construction fail, so the application takes its copying fallback — which is also the path a shared-memory build is on, because an `ImageData` cannot view a `SharedArrayBuffer` |
+
+`off` is how the two are compared **in one build**. Two separate builds cannot answer it:
+the change is in the host glue, so the module hash is identical either way and nothing would
+stop the two sets of runs from being pooled — see the identity note below.
+
+Each report carries `wasm_sha256` **and** `host_sha256` (the glue plus this page), and
+`analyze.py` treats the pair as the build identity. Without the second half, editing
+`kngn.js` and re-running would silently pool two different systems under one condition,
+which is the one mistake this harness exists to prevent.
 
 ## Things that quietly invalidate a run
 
