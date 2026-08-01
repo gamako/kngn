@@ -241,6 +241,18 @@ const TEXT_EDIT_BOX_ID: gui.Id = TEXT_PANEL_ID_BASE + 6;
 /// toggle / 2=opacity slider / 3=thumb). Right-click hit-testing uses the full row rect.
 const LAYER_ROW_PART_ROW: gui.Id = 4;
 const LAYER_ROW_PART_IME: gui.Id = 5;
+/// Wraps the opacity slider assembly (label + track + value text) in one explicit-id box purely
+/// so its previous-frame width is queryable via `getNodeRect` — the slider itself only exposes
+/// an id for its draggable track, not the row it sits in. No layout/visual effect (`.fit`, no
+/// padding); read by the name-field width computation below.
+const LAYER_ROW_PART_SLIDER_WRAP: gui.Id = 6;
+/// Floor for the layer-name field's computed width (`buildLayerPanel`): always wide enough for
+/// the button's own padding plus a short ellipsized name, even when the row's other, fixed-width
+/// children (thumb/V-H/opacity slider) leave very little over at the panel's minimum extent.
+/// Sized generously above `button_padding` (16px) plus a 3-char ellipsis ("...") so
+/// `ellipsizeText`'s own "ellipsis alone does not fit `max_w`" fallback (which returns "..."
+/// unclipped) never triggers here.
+const LAYER_NAME_MIN_W: i32 = 56;
 /// Explicit IDs for the history panel.
 const HISTORY_PANEL_ID_BASE: gui.Id = 0xA431_0000;
 /// Explicit IDs for tool / symmetry icons. Offsets 0..13 are a fixed assignment.
@@ -5666,16 +5678,14 @@ fn layerWidgetId(idx: usize, part: gui.Id) gui.Id {
     return LAYER_ROW_ID_BASE + @as(gui.Id, idx) * LAYER_PANEL_ID_STRIDE + part;
 }
 
-/// Display cap for layer names (**total codepoints including truncation**). A display-only limit that fits the
-/// 200px right-pane row; the stored name itself (`layer_name_max`=32B) is never truncated.
-///
-/// Measured: after subtracting thumb(24px)+visibility toggle(min_w 22)+opacity slider(track_w 40 etc.) from the
-/// 200px right pane, the name field overflows the scroll viewport's opacity slider (and becomes unusable) once
-/// total drawn characters exceed **7** (fixed font 8px/codepoint;
-/// `libs/gui/src/font.zig`) — confirmed via harness snapshot (7 chars="Layer 1" fits; 8 chars≈"Layer 10"
-/// does not). Default "Layer N" fits exactly at 7 chars for one digit; two digits and beyond
-/// ("Layer 10".."Layer 99") are shortened by the truncation below to forms like "Layer.."
-/// (the number is lost, but selection highlight/thumb still distinguish rows; three+ digits likewise).
+/// Display cap for a layer name shown in a field sized from its own measured text (`min_w` as a
+/// floor only, or plain `.fit`) rather than from the space actually available, so an untruncated
+/// long name would grow the box, and with it the row, without bound. The stored name itself
+/// (`layer_name_max`=32B) is never truncated; this is a display-only limit (**total codepoints
+/// including truncation**). Used by the Text Layer panel's inline text editor and the timeline's
+/// fixed-width per-layer label column. The Layers panel's own name field does not use this: its
+/// width is computed from the row's actual available space (see `buildLayerPanel`), and its shown
+/// text is fit to that computed width via `ellipsizeText`, not to a fixed character count.
 const LAYER_NAME_DISPLAY_MAX: usize = 7;
 
 /// Truncate a layer name for display so the **total codepoints including truncation** fit `max_total_chars`
@@ -5824,11 +5834,12 @@ fn buildLayerPanel(ctx: *gui.Context, app: *App) !void {
             .{ .color = ctx.style.border_hover, .thickness = 1 }
         else
             null;
+        const row_gap: i32 = 3; // shared with the name-width computation below
         ctx.beginBox(.{
             .id = row_id,
             .direction = .row,
             .width = .{ .grow = 1 },
-            .gap = 3,
+            .gap = row_gap,
             .align_cross = .center,
             .bg = row_bg,
             .border = row_border,
@@ -5840,16 +5851,35 @@ fn buildLayerPanel(ctx: *gui.Context, app: *App) !void {
         const thumb_border = if (selected) ctx.style.border_hover else ctx.style.border;
         ctx.imageBox(layerWidgetId(idx, 3), thumb, LAYER_THUMB_W, LAYER_THUMB_H, .{ .border = thumb_border });
 
+        // Layer-name field width: computed, not `.grow` — the thumb, V/H button and opacity
+        // slider are all fixed-width, so whatever the row's previous-frame width leaves over
+        // after them (3 gaps of `row_gap`) is exactly the name field's fair share. Reads each
+        // sibling's own previous-frame cached rect (one-frame lag, the same synchronous
+        // hit-test contract every cache-based widget in this file already follows) rather than
+        // hand-duplicating their sizing formulas, so it tracks style/content changes on its own.
+        // Clamped to `LAYER_NAME_MIN_W` so a very narrow right panel still shows a legible
+        // ellipsized name instead of collapsing toward zero width (the panel's own `min_extent`
+        // already lets this row's total width exceed the viewport at that extreme — matching
+        // the pre-existing fixed-width behavior this replaces, not a new trade-off).
+        const row_prev_w: i32 = if (ctx.getNodeRect(row_id)) |r| @intCast(r.w) else content_w;
+        const thumb_w: i32 = if (ctx.getNodeRect(layerWidgetId(idx, 3))) |r| @intCast(r.w) else LAYER_THUMB_W;
+        const vis_w: i32 = if (ctx.getNodeRect(layerWidgetId(idx, 1))) |r| @intCast(r.w) else 24;
+        const slider_w: i32 = if (ctx.getNodeRect(layerWidgetId(idx, LAYER_ROW_PART_SLIDER_WRAP))) |r| @intCast(r.w) else 100;
+        const name_w: i32 = @max(LAYER_NAME_MIN_W, row_prev_w - thumb_w - vis_w - slider_w - row_gap * 3);
+        const name_hpad: i32 = ctx.style.button_padding[1] + ctx.style.button_padding[3];
+        const name_max_w: i32 = @max(0, name_w - name_hpad);
+
         // Layer-name display. While renaming, only the target row shows the pre-commit buffer + caret.
         if (app.rename_in.active and app.rename_in.layer_idx == idx) {
-            const shown = truncateForDisplay(ctx.allocator(), app.rename_in.text(), LAYER_NAME_DISPLAY_MAX);
             ctx.beginBox(.{
                 .id = layerWidgetId(idx, LAYER_ROW_PART_IME),
+                .width = .{ .fixed = name_w },
                 .padding = .{ 2, 4, 2, 4 },
                 .bg = ctx.style.bg_active,
                 .border = .{ .color = ctx.style.border_hover, .thickness = 1 },
             });
             if (app.preedit().len > 0) {
+                const shown = ctx.ellipsizeText(app.rename_in.text(), name_max_w).text;
                 const draw_ctx = ctx.allocator().create(InlineCompositionDraw) catch @panic("composition draw ctx: OOM");
                 draw_ctx.* = .{
                     .committed = shown,
@@ -5861,14 +5891,16 @@ fn buildLayerPanel(ctx: *gui.Context, app: *App) !void {
                 };
                 ctx.custom(.{ .x = @intCast(ctx.font.measure(shown) + ctx.font.measure(app.preedit())), .y = gui.fontInkHeight(ctx.font) }, drawInlineComposition, draw_ctx);
             } else {
-                var cursor_buf: [96]u8 = undefined;
-                const with_cursor = std.fmt.bufPrint(&cursor_buf, "{s}_", .{shown}) catch shown;
+                // Reserve room for the trailing caret ("_") so appending it cannot itself overflow name_max_w.
+                const caret_w: i32 = @intCast(ctx.font.measure("_"));
+                const shown = ctx.ellipsizeText(app.rename_in.text(), @max(0, name_max_w - caret_w)).text;
+                const with_cursor = std.fmt.allocPrint(ctx.allocator(), "{s}_", .{shown}) catch shown;
                 ctx.labelEx(with_cursor, ctx.style.text);
             }
             ctx.endBox();
         } else {
-            const shown = truncateForDisplay(ctx.allocator(), layer.name(), LAYER_NAME_DISPLAY_MAX);
-            if (ctx.buttonId(layerWidgetId(idx, 0), shown, .{ .selected = selected, .min_w = 28 }).clicked) {
+            const shown = ctx.ellipsizeText(layer.name(), name_max_w).text;
+            if (ctx.buttonId(layerWidgetId(idx, 0), shown, .{ .selected = selected, .min_w = name_w }).clicked) {
                 app.doSelectLayer(idx) catch {};
             }
         }
@@ -5877,11 +5909,13 @@ fn buildLayerPanel(ctx: *gui.Context, app: *App) !void {
         if (ctx.buttonId(layerWidgetId(idx, 1), vis_label, .{ .selected = layer.visible, .min_w = 22 }).clicked) {
             if (platform.netsyncActive()) app.routeUiLayerVisible(idx, !layer.visible) else app.doToggleLayerVisible(idx);
         }
+        ctx.beginBox(.{ .id = layerWidgetId(idx, LAYER_ROW_PART_SLIDER_WRAP) });
         var op_i32: i32 = layer.opacity;
         if (ctx.sliderI32Id(layerWidgetId(idx, 2), "O", &op_i32, .{ .min = 0, .max = 255, .track_w = 40 })) {
             const v: u8 = @intCast(std.math.clamp(op_i32, 0, 255));
             if (platform.netsyncActive()) app.routeUiLayerOpacity(idx, v) else app.doSetLayerOpacity(idx, v) catch {};
         }
+        ctx.endBox(); // slider wrap
         ctx.endBox(); // row
 
         // Right-click: test against both the row rect and the ancestor clip (ScrollArea viewport).
