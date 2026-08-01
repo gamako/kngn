@@ -47,7 +47,7 @@ Basic, Trees, Collapsing Headers, Text, Images, Combo, List boxes, Selectables, 
 | Dialog (Modal) | Popups & Modal windows | Distinct from popup modal absorption | settings shell |
 | Grid | Tables / Selectables | stepgrid is not a substitute for APG Grid | list+menu shell / deferred |
 | Link | Basic | No dedicated API. Do not substitute button | settings shell |
-| Listbox | List boxes | Unsupported | list+menu shell |
+| Listbox | List boxes | `beginListboxRow`/`endListboxRow` + `gui.pollListNav` (roving tab stop, single selection) | list+menu shell / tracker shell |
 | Menu and Menubar | Menus | menuBar / menuBarPopup / popup | list+menu shell |
 | Meter | Plotting / Range | Unsupported | settings shell |
 | Radio Group | Selectables | radio; exclusive state owned by the caller | settings shell / list+menu shell |
@@ -55,22 +55,35 @@ Basic, Trees, Collapsing Headers, Text, Images, Combo, List boxes, Selectables, 
 | Slider (Multi-Thumb) | Range widgets | Unsupported | deferred |
 | Switch | Basic | toggle | settings shell |
 | Table | Tables | Column table unsupported | list+menu shell |
-| Tabs | Tabs | Unsupported | settings shell |
+| Tabs | Tabs | `ctx.tabId` (selection follows focus, radioId's caller-owns-selection convention) | settings shell / tracker shell |
 | Toolbar | Basic / Layout | row + button; no dedicated API | settings shell / list+menu shell |
-| Tooltip | — | Unsupported | settings shell / deferred |
+| Tooltip | — | `ctx.tooltip(text)` (500ms hover delay, virtual-clock deterministic, screen-edge clamp via `popupContentWidth`'s clamp rules) | game inventory shell |
 | Tree View / Treegrid | Trees / Tables | Unsupported | list+menu shell / deferred |
 | Window Splitter | Layout & Scrolling | splitter | settings shell |
+
+**Correction (2026-08-02, found while building the tracker and game-inventory reproduction benches):**
+Tabs, Listbox and Tooltip were all already implemented — Tabs and Listbox by the widget-extension
+round this matrix's own maintainer ran just before these two shells, and Tooltip much earlier
+(predating this document; `ctx.tooltip` has its own hover-delay/clamp/leave test suite). None of the
+three landing updated this file, so the three rows above, and the corresponding three entries this
+document's §9 used to list as unsupported, were stale until this pass. `examples/35_gui_gallery`'s own
+`MISSING` array is a second, separate place the same kind of staleness can hide (it still lists
+"Listbox"/"Tabs" and target-task ids for since-finished work) — flagged here rather than silently
+fixed, since reconciling the gallery's own demo array is a larger, separate pass this correction does
+not attempt.
 
 ## 6. Current libs/gui API inventory
 
 | Category | Concrete API |
 |---|---|
 | Basic | Context.buttonId, Context.label |
-| Text | gui.selectableLabelId, Context.textInputId |
+| Text | gui.selectableLabelId, Context.textInputId, Context.labelEllipsis / gui.ellipsizeText |
 | Values | Context.sliderI32Id, Context.sliderF32Id, Context.checkboxId, Context.toggleId, Context.radioId |
 | Color / Image | Context.colorSwatchId, Context.svSquareId, Context.hueBarId, Context.imageBox |
-| Layout | gui.splitter, Context.beginScrollArea/endScrollArea |
-| Popup / Menu | Context.popupMenu, gui.menuBar, gui.menuBarPopup |
+| Layout | gui.splitter, Context.beginScrollArea/endScrollArea, Context.beginFormRow/endFormRow |
+| Selection | Context.tabId, Context.beginListboxRow/endListboxRow + gui.pollListNav |
+| State | Context.beginDisabled/endDisabled/isDisabled |
+| Popup / Menu | Context.popupMenu / popupMenuEx (PopupItem.checked, keep_open_on_select), gui.openPopupStacked/popupMenuStacked, gui.menuBar, gui.menuBarPopup, Context.tooltip |
 | Step grid | gui.stepgrid.widgetRow |
 
 Use only Id-bearing variants that actually exist in libs/gui, and avoid collisions within a section. Do not change libs/gui itself for this matrix work.
@@ -79,7 +92,7 @@ Use only Id-bearing variants that actually exist in libs/gui, and avoid collisio
 
 `normal` is the caller's owned initial value. `hover` and `active` are live states from the previous-frame rect cache and `Context.state.hot_id` / `active_id`. `focused` is TextInput focus. `disabled` is covered only where `PopupItem.enabled` / `Command.enabled` apply individually.
 
-`empty` is an empty label / empty text. `min` / `max` are slider, picker, and layout endpoints. `none` is a "no value" display such as radio. There is no shared disabled property, semantic role, ARIA attribute, or dedicated focus-visible API in the current surface.
+`empty` is an empty label / empty text. `min` / `max` are slider, picker, and layout endpoints. `none` is a "no value" display such as radio. A shared disabled property (`Context.beginDisabled`/`endDisabled`/`isDisabled`, see §10) and a keyboard focus-visible ring (see the focus-traversal ADR) both now exist; there is still no semantic role or ARIA-equivalent attribute in the current surface.
 
 ## 8. Current widget state matrix
 
@@ -104,7 +117,13 @@ Use only Id-bearing variants that actually exist in libs/gui, and avoid collisio
 
 ## 9. Unsupported-widget empty sections
 
-The missing section shows these 15 items: Accordion, Alert / Message Dialog, Breadcrumb, Carousel, Combobox, Dialog (Modal), Disclosure, Listbox, Meter, Spinbutton, Table, Tabs, Tooltip, Tree View, Treegrid. Each item is only a rectangle, NOT IMPLEMENTED, and a follow-up category (torture suite / settings shell / list+menu shell / deferred). No widget implementation is included.
+The missing section originally showed 15 items. Tabs, Listbox and Tooltip have since gained real APIs
+(`ctx.tabId`, `beginListboxRow`/`endListboxRow`/`gui.pollListNav`, `ctx.tooltip`; see §5's correction
+note), leaving these 12: Accordion, Alert / Message Dialog, Breadcrumb, Carousel, Combobox, Dialog
+(Modal), Disclosure, Meter, Spinbutton, Table, Tree View, Treegrid. Each item is only a rectangle, NOT
+IMPLEMENTED, and a follow-up category (torture suite / settings shell / list+menu shell / deferred). No
+widget implementation is included. `examples/35_gui_gallery`'s own placeholder count and `MISSING` array
+have not been re-synced to this correction (see §5's note) — this section's count is the corrected one.
 
 ## 10. Cross-cutting gaps
 
@@ -327,3 +346,79 @@ harness screenshot rather than being merely cramped. Fixed by sizing the detail 
 (a live example of the fit×grow layout trap: a `.fixed`-width box sizes itself from its own opts alone and
 never shrinks its children to fit, so an over-wide child inside it silently overflows rather than clipping
 or wrapping).
+
+## 17. Game inventory shell observations
+
+Evidence example: `examples/43_game_inventory` (probes: `state` / `layout`; E2E: `e2e.sh`, 8 scenarios;
+ports 9250–9259). A 6×4 item grid with a 2D cursor, drag-and-drop, a hover tooltip, a rotary "Min Rarity"
+filter knob, and a right-click Lock/Discard context menu. libs/gui itself was not changed by this shell.
+
+This shell was asked to reproduce four capabilities (drag-and-drop, tooltip, gamepad navigation, a knob).
+Only two of the four are genuine gaps:
+
+- **Drag and drop**: no dedicated API. Pointer glue in `main.zig` (press-on-a-filled-slot starts a drag,
+  release hit-tests the destination) plus a translucent ghost square drawn directly onto `ctx.draw_list`
+  after `endFrame` (the same "overlay after the layout tree" placement `popup.zig` uses for popups and
+  `ctx.tooltip`) are both example-side. **Requested here; not filed as a new task** per this family's
+  standing rule — recorded as a hack (pointer glue) plus a custom draw (the ghost) in §17.2.
+- **Knob**: no rotary/dial widget. `ui.zig`'s "Min Rarity" control is a fixed-size base plate plus a small
+  indicator dot placed by angle (`sin`/`cos` against the current value, not a per-pixel circle rasterizer)
+  plus hand-rolled vertical-drag interaction in `main.zig`. **Requested here; not filed as a new task** —
+  recorded as a hack plus a custom draw in §17.2.
+
+The other two turned out not to be gaps at all:
+
+- **Tooltip**: `ctx.tooltip(text)` already exists (§5/§9's correction note traces this to a widget-history
+  commit long predating this matrix; `jj file annotate` on `libs/gui/src/context.zig` finds it, not a
+  reference kept in this document). This shell calls it directly — `ctx.noteLastInteractive` plus `ctx.tooltip`, the
+  same pairing `iconButtonId`'s own hover path uses internally, added by hand only because a grid slot is a
+  plain `beginBox` rather than a widget that already calls `noteLastInteractive` for itself. Confirmed
+  visually: hovering a filled, locked slot for the library's own 500ms delay raises a correctly positioned,
+  clamped overlay reading `<name> (rarity N) [locked]`. **Not a hack, not a custom draw** — ordinary use of
+  an existing API.
+- **Gamepad navigation**: `platform` + `gamepad` (`src/gamepad.zig`, `justPressed` edge detection) already
+  exist and are exactly what `examples/22_gamepad` already uses directly (this example does not import
+  `kit` either). What is genuinely hand-rolled is the *2D grid cursor* the dpad drives — `gui.pollListNav`
+  is one-dimensional (a listbox), so moving a cursor across a 6×4 grid by row/col has no library
+  counterpart. Recorded as one hack in §17.2 (not two): the same `moveCursor`/`activateCursor` pair serves
+  keyboard (arrows + Enter/Space) and the gamepad (dpad + A) alike, so there is exactly one 2D-nav gap, not
+  a separate one per input device. `platform`/`gamepad` themselves are not counted as a gap.
+
+### 17.1 New cross-cutting finding: two capability-matrix entries were stale, not missing
+
+Tooltip's status here matches §5/§9's correction: this document said "Unsupported" for a widget that has
+had a full implementation and test suite since well before this matrix existed. This shell is the second
+and third data point
+(after the tracker shell's stepgrid finding) that a widget landing does not reliably propagate to this
+document — worth a standing habit, not just a one-time fix: **before recording a widget as "requested,
+unimplemented" in this family, grep libs/gui/src for the capability first.**
+
+### 17.2 custom / hack counts (example side)
+
+| Kind | Count | Detail |
+|---|---:|---|
+| drag-and-drop pointer glue | 1 | press-on-filled-slot starts drag / release hit-tests destination / locked slots and locked destinations reject it (`ui.beginDrag`/`endDrag`) |
+| 2D grid cursor nav | 1 | `moveCursor`/`activateCursor`, shared by keyboard arrows+Enter/Space and gamepad dpad+A (one gap, two input devices) |
+| knob interaction | 1 | vertical mouse-drag → value, hand-rolled hit-test against a reserved `beginBox` |
+| drag ghost (custom draw) | 1 | translucent `rectFilled` at the cursor, direct `ctx.draw_list` use after `endFrame` |
+| knob face + indicator (custom draw) | 1 | base-plate `rectFilled`/`rectOutline` plus one angle-placed indicator dot, direct `ctx.draw_list` use |
+| rarity-dim overlay (custom draw) | 1 | a translucent `rectFilled` over each slot below the knob's threshold, direct `ctx.draw_list` use |
+
+### 17.3 Scorecard
+
+| Axis | Score | Note |
+|---|---:|---|
+| Structure | 5 | 640×360 / 1024×768 / 1440×900 all lay out without overflow (grid + detail panel sizes are responsive to `screen_w`, following §16.4's lesson from the start this time) |
+| Interaction | 5 | All 8 scenarios harness-automated: initial state, hover→tooltip, drag-and-drop onto an empty slot (plus the reverse), a locked slot rejecting a drag, keyboard nav, gamepad dpad nav, gamepad A pickup/drop, the rarity knob drag, and the Lock/Discard context menu |
+| Information | 4 | Cursor / locked / dragging / rarity-dim / checked are all visualized; no visual distinction for "why did this drag get rejected" (a locked source or a locked destination look identical to the player: nothing moves) |
+| Ergonomics | 3 | 3 hacks + 3 custom draws (§17.2) — the highest custom-draw count of the family so far, expected: this shell's four requested capabilities are two genuine gaps (dnd, knob) each needing both an interaction hack and a visual, plus one gap (2D nav) that is interaction-only, plus one capability (tooltip) that needed no hack at all |
+
+Missing (priority): 1) drag-and-drop (§17, "requested here") 2) knob / rotary control (§17, "requested
+here") 3) no dedicated 2D grid/cursor-nav widget (distinct from `Table`/`Grid`'s existing missing entries,
+which are about tabular *display*, not keyboard/gamepad *navigation* over one).
+
+### 17.4 Size checks
+
+Launch 640×360 / 1024×768 / 1440×900 as separate processes and visually inspect path-omitted `snapshot fb`.
+Grid `slot` size, detail-panel width and padding all key off `screen_w` from the first draft (learned from
+§16.4), and no overflow was observed at any of the three sizes.
