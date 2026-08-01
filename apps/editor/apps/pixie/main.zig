@@ -5685,7 +5685,17 @@ fn updateCursorAndHover(app: *App, window: platform.Window, ctx: *const gui.Cont
         window.setCursor(shape);
     }
 
-    app.hover_screen = if (in_canvas and !app.isPointerBusy()) mouse else null;
+    // The tool glyph / brush footprint ring / loupe (all downstream readers of hover_screen)
+    // paint over whatever is under the cursor, including the minimap thumbnail. Excluding its rect
+    // here keeps them off the minimap the same way a press there is already excluded from starting
+    // a stroke (see the on_minimap gate above canvas_input dispatch).
+    const on_minimap = blk: {
+        const area = app.last_area orelse break :blk false;
+        const mm = currentMinimapRect(app, area) orelse break :blk false;
+        break :blk minimap_mod.contains(mm, mouse.x, mouse.y);
+    };
+
+    app.hover_screen = if (in_canvas and !on_minimap and !app.isPointerBusy()) mouse else null;
     app.hover_cell = if (app.hover_screen != null) hover_cell else null;
 }
 
@@ -7583,10 +7593,16 @@ fn appFrameInner(self: *App, win: *platform.Window) !void {
         }
         // Pixel grid overlay (view-only; draw_list-based, so it paints on top of the raw-pixel
         // canvas/minimap regardless of call order relative to those, same as every other overlay below).
+        // The minimap sits inside this same clip_area, so its rect is carved out of the grid lines
+        // (see grid_overlay.zig's doc comment) rather than relying on draw order to keep it clear.
         if (self.grid_enabled) {
             if (canvas_rect) |rect| if (self.last_area) |area| {
                 const clip_area: gui.Rect = .{ .x = area.x, .y = area.y, .w = @intCast(area.w), .h = @intCast(area.h) };
-                grid_overlay.draw(&self.ctx, rect, self.view_zoom, clip_area);
+                const minimap_rect: ?gui.Rect = if (currentMinimapRect(self, area)) |mm|
+                    .{ .x = mm.x, .y = mm.y, .w = @intCast(mm.w), .h = @intCast(mm.h) }
+                else
+                    null;
+                grid_overlay.draw(&self.ctx, rect, self.view_zoom, clip_area, minimap_rect);
             };
         }
         // presence overlay (right after canvas blit; below bezier/selection)
