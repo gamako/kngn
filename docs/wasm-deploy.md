@@ -376,6 +376,27 @@ python3 zig-out/web/serve-coop-coep.py 8080
 > `index.html`). Pixie still runs under cross-origin isolation; that does not hurt standalone
 > use. To verify pixie the way production serves it (no headers), use `python3 -m http.server`.
 
+### Unattended verification (the harness host bridge)
+
+The checks above want a human at a browser. For the ones that do not — "does the synth
+still make sound", "does the backend follow a device pixel ratio of 2" — build the wasm
+with the observation plane and drive it from a script:
+
+```bash
+zig build package-web -Dwasm-harness=true
+python3 docs/experiments/wasm-harness-bridge/drive.py \
+  --wasm synth.wasm --audio-transport worklet_shared \
+  -c 'inject key_down A
+step 90
+digest audio
+assert audio silent=0'
+```
+
+`-Dwasm-harness=true` is **not** the shipping build: it adds about 10% to the module. The
+default is unchanged, so a package built without the flag is byte-for-byte what it was.
+[harness.md](harness.md) covers what the bridge does and does not offer, and
+`docs/experiments/wasm-harness-bridge/README.md` the driver's flags.
+
 ### Checking COOP/COEP (DevTools)
 
 1. Open the page in a browser

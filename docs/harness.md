@@ -80,9 +80,11 @@ WAV/digest), `stats` (`EventStats` plus the virtual fps → JSON), and
 script can assert them together. Its fields are ADR-011 R2's logical/framebuffer
 split plus `content_scale` and `scale_epoch` (the scale-change generation counter):
 `logical_w`/`logical_h`, `fb_w`/`fb_h`, `scale` and `epoch`. It is `unavailable`
-before the first present, exactly like `fb`. On the null (headless) backend and on
-wasm, `content_scale` is always `1.0` and `scale_epoch` is always `0`, since neither
-has a notion of a display scale of its own.
+before the first present, exactly like `fb`. On the null (headless) backend
+`content_scale` is always `1.0` and `scale_epoch` always `0`, since it has no notion
+of a display scale of its own. On wasm both are live: the backend follows the page's
+`devicePixelRatio`, and a run in a browser at a ratio of 2 reads `scale=2.0000` with
+`fb_w`/`fb_h` twice the logical size (see "wasm: the host bridge" below).
 
 `audio` measures **the most recent window (latest wins)**, so "what is playing right
 now" can be asserted (silence is `silent=1`, `f0=0`). Its keys are additive and the
@@ -684,3 +686,66 @@ zig-out/bin/kngn mcp --port-file /tmp/kngn.port
   argument — kngn mcp injects an absolute path under `--out`); an action becomes
   `<name>` (or `a_<name>` on a collision).
 - **Verification**: `zig build test-mcp` (unit tests of the pure functions).
+
+## wasm: the host bridge
+
+A wasm module has no environment to read, no socket to listen on and no thread to run
+one — so nothing about the *transport* survives the port. Everything else does: the
+command language, the probes, the actions and the execution model are the same code, and
+a browser drives them through linear memory instead of a connection.
+
+The build is opt-in, because compiling the observation plane into a page that only wants
+to run costs about 10% of the module:
+
+```bash
+zig build package-web -Dwasm-harness=true
+```
+
+Without the flag a wasm build keeps the no-op stub and is byte-for-byte what it was.
+
+### What the page sees
+
+With the flag, the module exports a small bridge and `web/kngn.js` wraps it as
+`globalThis.__kngnHarness`, installed when `boot()` is given `harness: true`:
+
+| Call | Meaning |
+|---|---|
+| `exec(text)` | send one command batch, resolve with the response — the same text the TCP transport returns. Calls are serialised |
+| `resize(w, h, dpr)` | drive the platform resize seam, the call `ResizeObserver` and the DPR watcher make. It does **not** change the browser's own `devicePixelRatio` |
+| `devicePixelRatio()` | what the browser reports right now |
+
+`boot({ harness: true })` also takes `harnessCaptureFrames`. It is off by default, which
+is the host-bridge spelling of `KNGN_HARNESS_SKIP_FRAME_COPY=1`: observing a run then
+costs no framebuffer-sized copy per frame. Turn it on when `digest fb` has to be
+meaningful, and accept the per-frame memcpy that comes with it.
+
+### What is not there
+
+The clock is always free-run: the page owns frame driving, so `step N` and `await` wait
+on a frame barrier exactly as they do under `KNGN_HARNESS_LISTEN` without
+`KNGN_HARNESS_MANUAL_CLOCK`. Consequently:
+
+| Not available | Why |
+|---|---|
+| `snapshot` | it names a file, and a write through the WASI shim becomes a browser download whose destination the caller does not choose. Refused with `error: snapshot: unavailable on this transport (use digest)`; every probe's `digest` still works |
+| `capture` | the synthetic source generates on a worker thread and publishes a 64-bit atomic, neither of which a single-threaded wasm32 module has. Opening fails |
+| script replay, manual clock, `record` | all reached through environment variables, and there is no environment |
+| the copilot transport, netsync | both need sockets |
+
+A refusal is always an `error:` line in the response, never silence, so a driver can tell
+"unsupported" from "no output".
+
+### Driving it from outside
+
+`docs/experiments/wasm-harness-bridge/` holds a driver: it serves the packaged bundle with
+COOP/COEP, launches one headless browser, and relays command batches to the page over
+plain HTTP. Nothing connects to a debugging port, so it runs unattended.
+
+```bash
+zig build package-web -Dwasm-harness=true
+python3 docs/experiments/wasm-harness-bridge/drive.py -c 'step 10
+digest window'
+```
+
+Its `README.md` covers the page commands (`@resize`, `@env`), the audio transports and the
+launch-time device scale factor.

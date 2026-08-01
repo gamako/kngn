@@ -99,6 +99,99 @@ const WASI_WHENCE_SET = 0;
 const WASI_WHENCE_CUR = 1;
 const WASI_WHENCE_END = 2;
 
+// ---- harness host bridge ----
+// Present only when the module was built with the real harness (`-Dwasm-harness=true`); a normal
+// build exports none of `kngn_harness_*` and pays nothing here but one feature test at boot.
+// The page submits one command batch, the wasm side runs it across as many frames as `step` and
+// `await` ask for, and the response is picked up in the frame loop the moment it is ready.
+/** @type {{resolve: (s: string) => void, reject: (e: Error) => void} | null} */
+let harnessPending = null;
+/** Serialises exec(): the bridge accepts one request at a time. */
+let harnessChain = Promise.resolve();
+let harnessEnabled = false;
+
+function harnessAvailable() {
+  return (
+    !!instance &&
+    typeof instance.exports.kngn_harness_submit === "function" &&
+    typeof instance.exports.kngn_harness_enable === "function"
+  );
+}
+
+/** Reads and clears the response the wasm side just published. */
+function harnessTakeResponse() {
+  const ptr = instance.exports.kngn_harness_response_ptr() >>> 0;
+  const len = instance.exports.kngn_harness_response_len() >>> 0;
+  const copy = new Uint8Array(len);
+  copy.set(new Uint8Array(memory.buffer, ptr, len));
+  instance.exports.kngn_harness_response_clear();
+  return new TextDecoder().decode(copy);
+}
+
+/** Called once per frame, right after kngn_frame, which is where a response becomes ready. */
+function harnessPump() {
+  if (!harnessPending) return;
+  if (!instance.exports.kngn_harness_response_ready()) return;
+  const p = harnessPending;
+  harnessPending = null;
+  p.resolve(harnessTakeResponse());
+}
+
+function harnessSubmit(text) {
+  return new Promise((resolve, reject) => {
+    if (!harnessEnabled) {
+      reject(new Error("harness bridge is not enabled in this build"));
+      return;
+    }
+    const bytes = new TextEncoder().encode(text.endsWith("\n") ? text : text + "\n");
+    const cap = instance.exports.kngn_harness_request_cap() >>> 0;
+    if (bytes.length > cap) {
+      reject(new Error("harness request is " + bytes.length + " bytes, over the " + cap + " limit"));
+      return;
+    }
+    const ptr = instance.exports.kngn_harness_request_ptr() >>> 0;
+    new Uint8Array(memory.buffer, ptr, cap).set(bytes);
+    if (!instance.exports.kngn_harness_submit(bytes.length)) {
+      reject(new Error("harness bridge refused the request (not started, or one is in flight)"));
+      return;
+    }
+    harnessPending = { resolve, reject };
+  });
+}
+
+/**
+ * Installs `globalThis.__kngnHarness`. `exec(text)` sends one command batch and resolves with the
+ * response, the same text the TCP transport would return. Calls are serialised, so an external
+ * driver may fire them without tracking whether the previous one has landed.
+ */
+function installHarnessBridge(captureFrames) {
+  instance.exports.kngn_harness_enable(captureFrames ? 0 : 1);
+  harnessEnabled = true;
+  globalThis.__kngnHarness = {
+    exec(text) {
+      const run = harnessChain.then(
+        () => harnessSubmit(text),
+        () => harnessSubmit(text),
+      );
+      harnessChain = run.catch(() => {});
+      return run;
+    },
+    /**
+     * Drives the platform resize seam directly — the same call bindResize and bindDprWatcher make.
+     * It exercises how the backend commits a size or ratio change (and therefore scale_epoch). It
+     * does **not** change the browser's own devicePixelRatio, which is fixed for the page's life:
+     * a driver that wants a real ratio must launch the browser with one.
+     */
+    resize(w, h, dpr) {
+      instance.exports.kngn_resize(w >>> 0, h >>> 0, +dpr);
+    },
+    /** What the browser reports right now, so a driver can record the environment it measured in. */
+    devicePixelRatio() {
+      return window.devicePixelRatio;
+    },
+  };
+}
+
 /** @type {Record<number, string>} */
 const lineBuf = { 1: "", 2: "" };
 
@@ -1797,12 +1890,16 @@ export async function boot(opts = {}) {
   bindInput();
   bindResize();
   bindDprWatcher();
+  // Before kngn_init: platform.init() settles the transport decision, and after that enabling has
+  // no effect. A build without the harness has no export to call, so the option is simply inert.
+  if (opts.harness && harnessAvailable()) installHarnessBridge(!!opts.harnessCaptureFrames);
   instance.exports.kngn_init();
   // kngn_init may grow SharedArrayBuffer memory and detach the worklet's prebuilt view.
   requestSharedViewRebuild();
 
   function loop(ts) {
     instance.exports.kngn_frame(ts); // rAF ms. Zig divides by 1000
+    if (harnessEnabled) harnessPump();
     requestAnimationFrame(loop);
   }
   requestAnimationFrame(loop);

@@ -38,7 +38,20 @@ const png = @import("png");
 const dsp = @import("dsp"); // magnitudeSpectrum (band, centroid, onset). Never called on a real-time path
 const capture_synthetic = @import("capture_synthetic"); // the synthetic capture source
 pub const action_registry = @import("action_registry.zig"); // the Action and registry split
-pub const netsync = @import("netsync.zig"); // PROPOSE/COMMIT/REJECT (sharing the one action_registry instance)
+
+/// wasm32 has no sockets, no threads and no environment, so the transport, the copilot server and
+/// the netsync client are all unavailable there. The command language, the probes, the actions and
+/// the execution model are not: they run unchanged, driven by the host bridge below instead of by a
+/// TCP connection. Every `is_wasm` branch in this file marks one of those substitutions.
+const is_wasm = builtin.target.cpu.arch.isWasm();
+
+/// Whether `snapshot` can name a file. The wasm transport refuses the command, so `capabilities`
+/// must not advertise it there either: a driver that turns every capability into a tool would
+/// otherwise generate one that always fails.
+const snapshot_available = !is_wasm;
+
+// PROPOSE/COMMIT/REJECT (sharing the one action_registry instance)
+pub const netsync = if (is_wasm) @import("netsync_wasm.zig") else @import("netsync.zig");
 
 const Event = types.Event;
 const KeyCode = types.KeyCode;
@@ -574,7 +587,25 @@ pub fn isCaptureSyntheticActive() bool {
 pub fn startTransport() void {
     if (initialized) return;
     initialized = true;
+    if (comptime is_wasm) startHostBridgeTransport() else startNativeTransport();
+}
 
+/// The wasm transport: no script file and no socket, so the only decision left is whether the host
+/// asked for the harness at all (`kngn_harness_enable`, before `kngn_init`). It is always live and
+/// free-run — the page owns frame driving, and a request is drained at a frame boundary.
+fn startHostBridgeTransport() void {
+    if (!host_bridge_requested) return;
+    // No command on this transport reaches file or socket IO, but `io_val` is initialised all the
+    // same so that no path can ever find it undefined.
+    threaded = std.Io.Threaded.init(gpa, .{});
+    io_val = threaded.io();
+    mode = .live;
+    clock_mode = .free_run;
+    action_registry.setEnabled(true);
+    std.debug.print("[harness] host bridge enabled (free-run)\n", .{});
+}
+
+fn startNativeTransport() void {
     const script_path = pending_script_path;
     const listen = parseListenPortValue(pending_listen_raw);
     const decision = decideTransport(script_path != null, listen, pending_manual_clock);
@@ -817,6 +848,10 @@ fn runFreeRunCommands() bool {
 
 /// The free-run non-blocking drain. When empty it polls the listener exactly once with poll(0).
 fn drainFreeRunTransport() void {
+    if (comptime is_wasm) drainHostBridge() else drainFreeRunTransportNative();
+}
+
+fn drainFreeRunTransportNative() void {
     if (freerun_reading) {
         tryReadFreeRunRequest();
         return;
@@ -842,7 +877,8 @@ fn drainFreeRunTransport() void {
 const PollReady = enum { ready, not_ready, err };
 
 fn pollFdReady(fd: net.Socket.Handle) PollReady {
-    switch (comptime builtin.os.tag) {
+    // wasm has no poll(2). Its transport is the host bridge, which never reaches here.
+    if (comptime is_wasm) return .not_ready else switch (comptime builtin.os.tag) {
         .windows => {
             // Windows: the non-blocking contract is a different API. The free-run unit test assumes POSIX and is skipped.
             // Attempting an accept could block, so an empty drain treats it as not_ready.
@@ -1176,7 +1212,8 @@ fn runNativePump(pump: ?NativePump) bool {
 /// Polls until the fd is readable, running the native pump on each timeout.
 /// `false` = the pump reported a window close, or the fd errored.
 fn waitFdReadable(fd: net.Socket.Handle, pump: ?NativePump) bool {
-    switch (comptime builtin.os.tag) {
+    // wasm has no poll(2), and its host bridge is free-run only, so no caller reaches here.
+    if (comptime is_wasm) return false else switch (comptime builtin.os.tag) {
         .windows => unreachable,
         else => return waitFdReadablePosix(fd, pump),
     }
@@ -1284,7 +1321,9 @@ fn acceptLiveRequest(pump: ?NativePump) bool {
 fn finishLiveRequest() void {
     if (!live_req_open) return;
     pending_wait = .none;
-    if (live_stream_owned) {
+    if (comptime is_wasm) {
+        publishHostResponse();
+    } else if (live_stream_owned) {
         var wbuf: [4096]u8 = undefined;
         var writer = live_stream.writer(io_val, &wbuf);
         writer.interface.writeAll(resp_buf.items) catch {};
@@ -1324,6 +1363,139 @@ fn writePortFile(port: u16) void {
     std.Io.Dir.cwd().writeFile(io_val, .{ .sub_path = path, .data = txt }) catch |err| {
         std.debug.print("[harness] failed to write the port file {s}: {s}\n", .{ path, @errorName(err) });
     };
+}
+
+// ============================================================================
+// the host bridge (the wasm transport)
+//
+// The browser has no loopback socket to hand a wasm module, so on wasm the page passes a request
+// in and takes the response out through linear memory. The exported entry points below are the
+// whole interface, and `web/kngn.js` wraps them as `globalThis.__kngnHarness`.
+//
+// The protocol is the one the socket transport speaks: a request is the same command text, and the
+// response is the same unprefixed `<probe> <payload>` lines. Only the delivery differs, so a script
+// written for `KNGN_HARNESS_LISTEN` runs here unchanged.
+//
+// Hot path: none. A request is drained at a frame boundary and only when one has been submitted,
+// so a page that submits nothing costs one `bool` test per frame inside the free-run gate.
+// ============================================================================
+
+/// The largest request the host may submit in one call. The socket transport accepts up to 1 MiB
+/// per request, but a browser drives one command batch at a time and a fixed buffer keeps the
+/// bridge allocation-free.
+const HOST_REQ_CAP: usize = 8 * 1024;
+/// The largest response the host can read back. `digest` and `expect` lines are short; a batch of
+/// several hundred of them still fits.
+const HOST_RESP_CAP: usize = 64 * 1024;
+const HOST_TRUNCATED_MARK = "error: response truncated\n";
+
+var host_bridge_requested = false;
+var host_req_buf: [HOST_REQ_CAP]u8 = undefined;
+var host_req_len: usize = 0;
+var host_req_pending = false;
+var host_resp_buf: [HOST_RESP_CAP]u8 = undefined;
+var host_resp_len: usize = 0;
+var host_resp_ready = false;
+
+/// Turns the harness on for this run. It must be called before `platform.init()` reaches
+/// `startTransport()`; afterwards the transport decision is settled and this has no effect.
+///
+/// `skip_frame_copy` is the host-bridge spelling of `KNGN_HARNESS_SKIP_FRAME_COPY`: non-zero keeps
+/// `onPresent` from copying every pixel of every frame. A page that only wants `digest window`,
+/// `digest audio` or `digest stats` passes 1, so that observing the run does not add a
+/// framebuffer-sized memcpy to each frame. Passing 0 keeps `digest fb` meaningful.
+fn hostBridgeEnable(skip_frame_copy_flag: u32) callconv(.c) void {
+    host_bridge_requested = true;
+    skip_frame_copy = skip_frame_copy_flag != 0;
+}
+
+fn hostBridgeRequestPtr() callconv(.c) [*]u8 {
+    return &host_req_buf;
+}
+
+fn hostBridgeRequestCap() callconv(.c) u32 {
+    return @intCast(host_req_buf.len);
+}
+
+/// Submits the `len` bytes the host wrote at `kngn_harness_request_ptr()`.
+/// Returns 1 when the request was taken, and 0 when it was refused: the harness is not started,
+/// `quit` has already ended the run, the length does not fit, a previous request is still in
+/// flight, or its response has not been read yet. Refusing on an unread response is what keeps a
+/// host that loses track of its own ordering from silently dropping one.
+fn hostBridgeSubmit(len: u32) callconv(.c) u32 {
+    if (mode != .live or quit_requested) return 0;
+    if (len > host_req_buf.len) return 0;
+    if (host_req_pending or live_req_open or host_resp_ready) return 0;
+    host_req_len = len;
+    host_req_pending = true;
+    host_resp_len = 0;
+    return 1;
+}
+
+/// 1 once the submitted request has run to completion and its response is readable.
+fn hostBridgeResponseReady() callconv(.c) u32 {
+    return @intFromBool(host_resp_ready);
+}
+
+fn hostBridgeResponsePtr() callconv(.c) [*]const u8 {
+    return &host_resp_buf;
+}
+
+fn hostBridgeResponseLen() callconv(.c) u32 {
+    return @intCast(host_resp_len);
+}
+
+/// Releases the response so the next request may be submitted.
+fn hostBridgeResponseClear() callconv(.c) void {
+    host_resp_ready = false;
+    host_resp_len = 0;
+}
+
+comptime {
+    if (is_wasm) {
+        @export(&hostBridgeEnable, .{ .name = "kngn_harness_enable" });
+        @export(&hostBridgeRequestPtr, .{ .name = "kngn_harness_request_ptr" });
+        @export(&hostBridgeRequestCap, .{ .name = "kngn_harness_request_cap" });
+        @export(&hostBridgeSubmit, .{ .name = "kngn_harness_submit" });
+        @export(&hostBridgeResponseReady, .{ .name = "kngn_harness_response_ready" });
+        @export(&hostBridgeResponsePtr, .{ .name = "kngn_harness_response_ptr" });
+        @export(&hostBridgeResponseLen, .{ .name = "kngn_harness_response_len" });
+        @export(&hostBridgeResponseClear, .{ .name = "kngn_harness_response_clear" });
+    }
+}
+
+/// The free-run drain on wasm: adopt a submitted request as the current command source.
+/// It is the host-bridge counterpart of accepting a connection and reading it to half-close.
+fn drainHostBridge() void {
+    if (live_req_open or !host_req_pending) return;
+    host_req_pending = false;
+    resp_buf.clearRetainingCapacity();
+    cmd_buf = host_req_buf[0..host_req_len];
+    cursor = 0;
+    line_no = 0;
+    live_req_open = true;
+    // The request text lives in a fixed buffer and the response goes back through memory, so
+    // neither the heap-owned request nor the socket ownership of the native path applies.
+    live_stream_owned = false;
+    req_bytes = &.{};
+}
+
+/// Publishes the accumulated response and makes it readable by the host. A response longer than
+/// the buffer is cut short and ends with `HOST_TRUNCATED_MARK`, so a truncated read is never
+/// mistaken for a complete one.
+fn publishHostResponse() void {
+    const src = resp_buf.items;
+    if (src.len <= host_resp_buf.len) {
+        @memcpy(host_resp_buf[0..src.len], src);
+        host_resp_len = src.len;
+    } else {
+        const keep = host_resp_buf.len - HOST_TRUNCATED_MARK.len;
+        @memcpy(host_resp_buf[0..keep], src[0..keep]);
+        @memcpy(host_resp_buf[keep..][0..HOST_TRUNCATED_MARK.len], HOST_TRUNCATED_MARK);
+        host_resp_len = host_resp_buf.len;
+    }
+    host_resp_ready = true;
+    resp_buf.clearRetainingCapacity();
 }
 
 // ============================================================================
@@ -1673,6 +1845,14 @@ fn parseCodepoint(tok: []const u8) ?u32 {
 }
 
 fn handleSnapshot(it: *Tok) void {
+    // `snapshot` names a file, and on wasm there is no filesystem to name: a write through the WASI
+    // shim becomes a browser download, whose destination the caller does not choose. Rather than
+    // give the same command a different meaning, refuse it and say so in the response. Every probe
+    // that offers a digest is still readable through `digest`.
+    if (comptime is_wasm) warnLine("snapshot: unavailable on this transport (use digest)") else handleSnapshotNative(it);
+}
+
+fn handleSnapshotNative(it: *Tok) void {
     const probe = it.next() orelse return warnLine("snapshot: the probe name is missing");
     const path_arg = it.next();
     var path_buf: [1024]u8 = undefined;
@@ -1929,7 +2109,7 @@ fn formatCapabilitiesPayload(buf: []u8) []const u8 {
                 truncated = true;
                 break :probes_blk;
             }
-            if (!appendProbeEntry(buf, content_limit, &len, b.name, b.ext, b.snapshot, b.digest, b.desc, null)) {
+            if (!appendProbeEntry(buf, content_limit, &len, b.name, b.ext, b.snapshot and snapshot_available, b.digest, b.desc, null)) {
                 len = saved_len;
                 truncated = true;
                 break :probes_blk;
@@ -1943,7 +2123,7 @@ fn formatCapabilitiesPayload(buf: []u8) []const u8 {
                 truncated = true;
                 break :probes_blk;
             }
-            if (!appendProbeEntry(buf, content_limit, &len, p.name, p.ext, p.snapshot != null, p.digest != null, p.desc, p.args)) {
+            if (!appendProbeEntry(buf, content_limit, &len, p.name, p.ext, p.snapshot != null and snapshot_available, p.digest != null, p.desc, p.args)) {
                 len = saved_len;
                 truncated = true;
                 break :probes_blk;
@@ -2547,6 +2727,10 @@ fn reportExpect(kind: []const u8, pass: bool, expr_text: []const u8, actual: ?[]
 /// At the end of a replay: if there were failures, print a summary and exit non-zero.
 /// **The mode gate is closed inside the function**, so for live and for a normal run (disabled) it is always a no-op (it never calls process.exit).
 fn replayExitIfFailed() void {
+    // Replay is a native-only mode (it reads a script file), and a wasm module has no process to
+    // exit — importing `proc_exit` for a branch that cannot be reached would only force the host to
+    // supply it. On wasm the failure count reaches the driver through the response instead.
+    if (comptime is_wasm) return;
     if (mode == .replay and expect_failures > 0) {
         std.debug.print("[harness] verification failures: {d} (expect/assert/action)\n", .{expect_failures});
         std.process.exit(1);
@@ -3142,9 +3326,15 @@ fn warnLine(msg: []const u8) void {
 
 /// Reads an environment variable. 0.16's std has no libc-independent getenv, so libc getenv is used
 /// (the platform module is always built with `link_libc`).
+/// A wasm module has no environment: every variable reads as unset, and the host bridge configures
+/// the harness instead (`kngn_harness_enable`).
 fn getEnv(name: [*:0]const u8) ?[]const u8 {
-    const v = std.c.getenv(name) orelse return null;
-    return std.mem.span(v);
+    if (comptime is_wasm) {
+        return null;
+    } else {
+        const v = std.c.getenv(name) orelse return null;
+        return std.mem.span(v);
+    }
 }
 
 // ============================================================================
@@ -6167,7 +6357,7 @@ test "the free-run execution model: true every frame even with no agent present"
 // It is a single line purely so that the facade reaches it as `@import("harness").copilot`;
 // harness never calls a copilot function (the semantic dependency runs one way, copilot→harness).
 // ============================================================================
-pub const copilot = @import("copilot.zig");
+pub const copilot = if (is_wasm) @import("copilot_wasm.zig") else @import("copilot.zig");
 
 // The namespace re-export of the command model. As with copilot, this shares the one
 // instance of the types (so the facade reaches it as `@import("harness").command`; command.zig is std only).

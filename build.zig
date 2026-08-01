@@ -102,9 +102,10 @@ fn defaultWasmWebAssets(b: *std.Build) platform.WasmWebAssets {
 
 /// Root-only linker: SharedModules + makePlatformModules + layer-checked `link()`.
 /// Keeps TaggedModule / flux wiring out of the public consumer surface.
-fn makeInternalWasmLinker(b: *std.Build) platform.WasmLinker {
+fn makeInternalWasmLinker(b: *std.Build, wasm_harness: bool) platform.WasmLinker {
     const Ctx = struct {
         b: *std.Build,
+        wasm_harness: bool,
 
         fn apply(ctx_ptr: *anyopaque, link_ctx: platform.WasmLinkContext) void {
             const self: *@This() = @ptrCast(@alignCast(ctx_ptr));
@@ -120,7 +121,7 @@ fn makeInternalWasmLinker(b: *std.Build) platform.WasmLinker {
             wasm_max_opts.addOption(usize, "max_modules", @as(usize, 48));
             wasm_max_opts.addOption(bool, "has_frame_cap", false);
             wasm_max_opts.addOption(u32, "frame_cap_hz", @as(u32, 0));
-            const shared = SharedModules.init(bb, true, false, 48, wasm_max_opts.createModule(), target, .wasm);
+            const shared = SharedModules.init(bb, true, self.wasm_harness, false, 48, wasm_max_opts.createModule(), target, .wasm);
             const pm = makePlatformModules(bb, target, .wasm, &shared);
 
             if (std.mem.eql(u8, link_ctx.spec.name, "pixie")) {
@@ -145,7 +146,7 @@ fn makeInternalWasmLinker(b: *std.Build) platform.WasmLinker {
     };
 
     const ctx = b.allocator.create(Ctx) catch @panic("OOM");
-    ctx.* = .{ .b = b };
+    ctx.* = .{ .b = b, .wasm_harness = wasm_harness };
     return .{ .context = ctx, .apply = Ctx.apply };
 }
 
@@ -234,13 +235,13 @@ fn makeWasmAppSpecs(b: *std.Build, base_target: std.Build.ResolvedTarget, with_s
 
 /// wasm32-wasi-only build (pixie + synth audio).
 /// Root is wasm_root.zig (no main) to avoid the wasi command/_start path (reactor = export-driven).
-fn buildWasm(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode) void {
+fn buildWasm(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode, wasm_harness: bool) void {
     var specs = makeWasmAppSpecs(b, target, true);
     const apps = platform.addWasmWebPackage(b, .{
         .apps = &specs,
         .assets = defaultWasmWebAssets(b),
         .optimize = optimize,
-        .linker = makeInternalWasmLinker(b),
+        .linker = makeInternalWasmLinker(b, wasm_harness),
         .default_install = true,
         .create_package_step = true,
         .package_step_description = "Package wasm web deploy bundle to zig-out/web/ (pixie + synth + static assets)",
@@ -255,7 +256,7 @@ fn buildWasm(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.buil
 /// Cross-compile wasm web artifacts from the native target into zig-out/web/.
 /// When `install_all` is true, wasm/HTML/shared assets join the default install step
 /// (so `zig build -Dinstall-all=true` packages the web deploy bundle).
-fn packageWebFromNative(b: *std.Build, optimize: std.builtin.OptimizeMode, install_all: bool) void {
+fn packageWebFromNative(b: *std.Build, optimize: std.builtin.OptimizeMode, install_all: bool, wasm_harness: bool) void {
     const wasi_target = b.resolveTargetQuery(.{
         .cpu_arch = .wasm32,
         .os_tag = .wasi,
@@ -265,7 +266,7 @@ fn packageWebFromNative(b: *std.Build, optimize: std.builtin.OptimizeMode, insta
         .apps = &specs,
         .assets = defaultWasmWebAssets(b),
         .optimize = optimize,
-        .linker = makeInternalWasmLinker(b),
+        .linker = makeInternalWasmLinker(b, wasm_harness),
         .default_install = install_all,
         .create_package_step = true,
         .package_step_description = "Package wasm web deploy bundle to zig-out/web/ (pixie + synth + static assets)",
@@ -405,6 +406,14 @@ pub fn build(b: *std.Build) void {
         .ReleaseSmall;
     const target_os = target.result.os.tag;
     const is_wasm = target.result.cpu.arch.isWasm();
+    // The real harness on wasm: the observation plane a browser can drive (see docs/harness.md).
+    // Off by default, because compiling it in costs about 10% of the module and a shipped page
+    // does not want the control plane. It has no effect on a native target.
+    const wasm_harness = b.option(
+        bool,
+        "wasm-harness",
+        "Build the wasm modules with the real harness (host bridge) instead of the no-op stub",
+    ) orelse false;
 
     // ========================================
     // wasm-only branch (wasm32-wasi)
@@ -423,6 +432,7 @@ pub fn build(b: *std.Build) void {
         const wasm_pub_shared = SharedModules.init(
             b,
             true,
+            wasm_harness,
             false,
             48,
             wasm_pub_opts.createModule(),
@@ -452,7 +462,7 @@ pub fn build(b: *std.Build) void {
         // BGRA→RGBA SIMD swizzle (same exception as makePlatformModules for wasm).
         linkCoreException(wasm_pub_shared.platform, wasm_pub_shared.pixelops, "BGRA→RGBA SIMD swizzle for wasm present");
 
-        buildWasm(b, target, wasm_optimize);
+        buildWasm(b, target, wasm_optimize, wasm_harness);
         return;
     }
 
@@ -527,7 +537,7 @@ pub fn build(b: *std.Build) void {
     // Shared modules (OS/backend-independent; shared by main + examples + pixie + synth)
     // Also includes the external public modules (platform/png/font/gui).
     // ========================================
-    const shared_modules = SharedModules.init(b, false, enable_gamepad_ext, max_modules_option, max_modules_mod, target, platform_option);
+    const shared_modules = SharedModules.init(b, false, wasm_harness, enable_gamepad_ext, max_modules_option, max_modules_mod, target, platform_option);
 
     // External public kit umbrella. Reuses SharedModules instances so type identity holds.
     // Obtained via dep.module("kit"). platform / gui / gamepad etc. are the same module instances through kit.
@@ -737,7 +747,7 @@ pub fn build(b: *std.Build) void {
     // ----- wasm web distribution package -----
     // Cross-compile from the native target into zig-out/web/. The web/ layout used in development is unchanged.
     // With -Dinstall-all=true, wasm package joins the default install step.
-    packageWebFromNative(b, wasm_optimize, install_all);
+    packageWebFromNative(b, wasm_optimize, install_all, wasm_harness);
 
     // ----- external-consumer gates -----
     // Vendored helper byte identity: compared at configuration time below, so any root
@@ -3030,7 +3040,7 @@ const SharedModules = struct {
     /// `platform_backend`: value of `-Dplatform` (or the OS default). Stamped into
     /// `build_options.platform_backend` and used to attach `@cImport`-required system libs
     /// (X11/Wayland). Must match the backend the consumer executable links against.
-    fn init(b: *std.Build, is_wasm: bool, enable_gamepad: bool, max_modules: usize, max_modules_mod: *std.Build.Module, target: std.Build.ResolvedTarget, platform_backend: platform.PlatformType) SharedModules {
+    fn init(b: *std.Build, is_wasm: bool, wasm_harness: bool, enable_gamepad: bool, max_modules: usize, max_modules_mod: *std.Build.Module, target: std.Build.ResolvedTarget, platform_backend: platform.PlatformType) SharedModules {
         // External public module. Available via dep.module("platform") and via kit.
         //
         // Its shape — libc, the platform.h include path, the backend's @cImport system libs
@@ -3211,19 +3221,21 @@ const SharedModules = struct {
         // within one exe, inject the same harness into both the platform module (per-backend,
         // makePlatformModules→createPlatformModule) and the audio module.
         // harness depends on png (encodePNG/crc32) and link_libc for getenv.
-        // Under wasm, swap in harness_wasm.zig (no-op stub) and do not wire png/capture_synthetic/dsp.
+        // Under wasm the default is harness_wasm.zig (a no-op stub) with none of png/capture_synthetic/dsp
+        // wired; `-Dwasm-harness` selects the real one instead, which the host bridge drives from the page.
+        const real_harness = !is_wasm or wasm_harness;
         const harness: TaggedModule = .{
             .layer = .core,
             .name = "harness",
             .mod = b.createModule(.{
-                .root_source_file = b.path(if (is_wasm) "core/control/harness_wasm.zig" else "core/control/harness.zig"),
+                .root_source_file = b.path(if (real_harness) "core/control/harness.zig" else "core/control/harness_wasm.zig"),
                 .link_libc = !is_wasm,
                 .single_threaded = if (is_wasm) platform.wasm_single_threaded else null,
             }),
         };
         // The command adapter re-exports the command module held by harness from the facade.
         link(harness, command_types);
-        if (!is_wasm) {
+        if (real_harness) {
             linkCoreException(harness, png, "PNG encode / crc32 for snapshot fb (ADR-007 R1 exception)");
         }
         link(harness, types);
@@ -3270,14 +3282,16 @@ const SharedModules = struct {
         // Depends only on capture_types. link_libc=true for std.c.nanosleep (real-time pacing of the
         // audio generation thread — a POSIX sleep requirement, not a std.Thread.spawn one;
         // same situation as core/audio_null.zig).
+        // Under wasm the null source stands in: the real one generates on a worker thread and
+        // publishes a 64-bit atomic, neither of which a single-threaded wasm32 module has.
         const capture_synthetic: TaggedModule = .{ .layer = .core, .name = "capture_synthetic", .mod = b.createModule(.{
-            .root_source_file = b.path("core/capture_synthetic.zig"),
-            .link_libc = true,
+            .root_source_file = b.path(if (is_wasm) "core/capture_synthetic_null.zig" else "core/capture_synthetic.zig"),
+            .link_libc = !is_wasm,
+            .single_threaded = if (is_wasm) platform.wasm_single_threaded else null,
         }) };
-        link(capture_synthetic, capture_types);
+        if (!is_wasm) link(capture_synthetic, capture_types);
         // harness.zig uses it via `@import("capture_synthetic")` (`capture` command/probe).
-        // The wasm stub does not depend on capture_synthetic, so do not wire it.
-        if (!is_wasm) link(harness, capture_synthetic);
+        if (real_harness) link(harness, capture_synthetic);
 
         // dsp (L2): Oscillator / Envelope / Filter / Mixer. Pure Zig.
         // (Still physically under src/dsp; move into libs/audio is opportunistic under R8.)
@@ -3286,8 +3300,8 @@ const SharedModules = struct {
         }) };
         // digest audio band/centroid/onset uses magnitudeSpectrum.
         // Link harness after dsp is defined (linkCoreException, same as png; recorded in ADR-007).
-        // The wasm stub does not depend on dsp, so do not wire it.
-        if (!is_wasm) linkCoreException(harness, dsp, "digest audio spectrum analysis (band/centroid/onset)");
+        // The no-op harness stub does not depend on dsp, so do not wire it there.
+        if (real_harness) linkCoreException(harness, dsp, "digest audio spectrum analysis (band/centroid/onset)");
 
         // synth (L3): Voice/VoicePool/Patch/Synth + GUI↔Audio handoff. Depends on dsp.
         const synth: TaggedModule = .{ .layer = .lib, .name = "synth", .mod = b.createModule(.{

@@ -1,0 +1,119 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <title>kngn wasm harness bridge</title>
+  <style>
+    html, body { margin: 0; height: 100%; background: #101014; color: #ccc; font-family: system-ui, sans-serif; }
+    #wrap { display: flex; flex-direction: column; align-items: flex-start; gap: 6px; padding: 8px; }
+    canvas { background: #242020; outline: none; image-rendering: pixelated; }
+    #log { font: 12px ui-monospace, monospace; white-space: pre-wrap; opacity: 0.8; }
+  </style>
+</head>
+<body>
+  <div id="wrap">
+    <canvas id="kngn-canvas" tabindex="0"></canvas>
+    <div id="log">booting</div>
+  </div>
+  <script type="module">
+    // The page half of the harness host bridge: it boots the application with the harness enabled,
+    // then long-polls the driver for command batches and posts each response back. Nothing connects
+    // to a debugging port, so it runs unattended.
+    //
+    // A batch beginning with `@` is a page command, handled here rather than by the harness:
+    //   @resize <w> <h> <dpr>   drive the platform resize seam (see __kngnHarness.resize)
+    //   @env                    report the browser's own devicePixelRatio and canvas geometry
+    globalThis.__kngnManualBoot = true;
+
+    const params = new URLSearchParams(location.search);
+    const token = params.get("token") || "";
+    const wasm = params.get("wasm") || "pixie.wasm";
+    const transport = params.get("audio-transport") || "none";
+    const width = parseInt(params.get("w") || "780", 10);
+    const height = parseInt(params.get("h") || "600", 10);
+    const captureFrames = params.get("fb") === "1";
+
+    const canvas = document.getElementById("kngn-canvas");
+    // The framebuffer follows the element's client box, so set the CSS box from the same numbers
+    // the driver asked for and let the backing store follow devicePixelRatio.
+    canvas.style.width = width + "px";
+    canvas.style.height = height + "px";
+    canvas.width = width;
+    canvas.height = height;
+
+    const log = document.getElementById("log");
+    function say(s) { log.textContent = s; }
+
+    async function post(path, body) {
+      const r = await fetch(path, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify(body),
+      });
+      if (r.status === 204) return {};
+      return await r.json();
+    }
+
+    async function pageCommand(text) {
+      const t = text.trim().split(/\s+/);
+      if (t[0] === "@resize") {
+        const w = parseInt(t[1], 10), h = parseInt(t[2], 10), dpr = parseFloat(t[3]);
+        if (!Number.isFinite(w) || !Number.isFinite(h) || !Number.isFinite(dpr)) {
+          return "error: @resize <w> <h> <dpr>\n";
+        }
+        // The element's CSS box is deliberately left alone: changing it would wake the
+        // ResizeObserver, which re-reads the browser's own devicePixelRatio and would overwrite
+        // the ratio this command is testing before the backend ever commits it.
+        globalThis.__kngnHarness.resize(w, h, dpr);
+        return `@resize ok w=${w} h=${h} dpr=${dpr}\n`;
+      }
+      if (t[0] === "@env") {
+        const dpr = globalThis.__kngnHarness.devicePixelRatio();
+        return `@env device_pixel_ratio=${dpr} css_w=${canvas.clientWidth} css_h=${canvas.clientHeight}` +
+               ` backing_w=${canvas.width} backing_h=${canvas.height} isolated=${!!globalThis.crossOriginIsolated}\n`;
+      }
+      return `error: unknown page command ${t[0]}\n`;
+    }
+
+    async function drive() {
+      for (;;) {
+        const next = await post("/harness/pull", { token });
+        if (next.done) { say("done"); return; }
+        if (next.idle) continue;
+        let response = "";
+        let error = null;
+        try {
+          response = next.cmd.trimStart().startsWith("@")
+            ? await pageCommand(next.cmd)
+            : await globalThis.__kngnHarness.exec(next.cmd);
+        } catch (e) {
+          error = String((e && e.message) || e);
+        }
+        say(`seq=${next.seq} ${error ? "error" : "ok"}`);
+        await post("/harness/result", { token, seq: next.seq, response, error });
+      }
+    }
+
+    try {
+      const mod = await import("./kngn.js");
+      await mod.boot({
+        wasm,
+        audioTransport: transport,
+        audio: transport !== "none",
+        sharedMemory: transport === "worklet_shared",
+        harness: true,
+        harnessCaptureFrames: captureFrames,
+      });
+      if (!globalThis.__kngnHarness) {
+        throw new Error("the module exports no harness bridge (build with -Dwasm-harness=true)");
+      }
+      await post("/harness/ready", { token, device_pixel_ratio: window.devicePixelRatio });
+      say("ready");
+      await drive();
+    } catch (e) {
+      say("boot failed: " + String((e && e.message) || e));
+      await post("/harness/ready", { token, error: String((e && e.stack) || e) });
+    }
+  </script>
+</body>
+</html>
