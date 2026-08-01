@@ -12,11 +12,19 @@
       height: 100%;
       overflow: hidden;
       background: #1a1818;
+      display: flex;
+      align-items: center;
+      justify-content: center;
     }
     canvas {
+      /* No explicit width/height here: the canvas renders at its intrinsic width/height
+         attribute, which kngn.js seeds from the app's declared App.window size before this
+         stylesheet's absence of an override matters (see kngn.js's primeDeclaredWindowSize
+         and docs/wasm-deploy.md). A page that wants the canvas to track the browser
+         viewport instead can give it an explicit CSS box (e.g. width: 100vw; height: 100vh)
+         — that raises per-frame cost with the viewport size, so it is a choice for the page
+         author to make, not this template's default. */
       display: block;
-      width: 100vw;
-      height: 100vh;
       background: #242020;
       outline: none;
       image-rendering: pixelated;
@@ -27,7 +35,13 @@
 <body data-wasm="template.wasm"
       data-audio-transport="none"
       data-shared="0">
-  <canvas id="kngn-canvas" width="320" height="240" tabindex="0"></canvas>
+  <!-- No explicit width/height attribute: kngn.js seeds it from the app's declared
+       App.window size before the CSS box below is read for the first time. This relies on
+       the wasm module exporting kngn_declared_window_w/kngn_declared_window_h (present since
+       this template and its wasm are always built and packaged together); a page pairing this
+       HTML with an older wasm build lacking those exports gets the browser's UA-default canvas
+       box until the first resize clamps it, rather than App.window's size. -->
+  <canvas id="kngn-canvas" tabindex="0"></canvas>
   <!-- kngn:inline-module -->
   <script type="module" src="./kngn.js"></script>
 </body>

@@ -164,6 +164,19 @@ pixie/synth linker internals.
 - Template uses `audio = .none`. Shared / postMessage transports follow existing root
   specs; see [`docs/wasm-deploy.md`](wasm-deploy.md)
 
+**Framebuffer size is asymmetric between native and wasm.** Native's `Window.create` /
+`createWithOptions` fixes the OS window's client size, and it stays that until something
+resizes the window. Wasm has no OS window: the canvas element's live CSS box is what
+`ResizeObserver` reports through `kngn_resize`, continuously, for as long as the app runs.
+`App.window.w`/`.h` only seeds the canvas's intrinsic width/height attribute, and only if the
+page left that attribute unset (the page's own markup is never overridden). Whether or not
+it seeds, the very next resize report always reflects the canvas's live CSS box, so an
+explicit CSS box wins immediately regardless. A page that wants the web build to open at
+`App.window`'s size, the way the native build does, should either size the canvas's CSS box
+to match it, or give it neither a `width`/`height` attribute nor a CSS box at all, as
+`template/web/template.html` does — within the `[320, 8192]` clamp range: see
+[`docs/wasm-deploy.md`](wasm-deploy.md) for that and the rest of the DPR/clamping contract.
+
 ## 7. Verification and iteration
 
 | Command | What it checks |

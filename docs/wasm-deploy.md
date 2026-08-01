@@ -49,6 +49,42 @@ Both steps share the same wasm compile graph per app when requested together.
 Template intentionally stays on `.none` so the minimal external example does not require
 COOP/COEP or audio transport design.
 
+## Canvas size, DPR and clamping
+
+There is no OS window on the web: the framebuffer size is always the canvas element's
+**live CSS box**, in CSS pixels. A `ResizeObserver` in `web/kngn.js` reports the canvas's
+`clientWidth`/`clientHeight` on every layout change through `kngn_resize`, applied at the
+next frame boundary (never mid-frame). A page whose canvas CSS box tracks the viewport
+(`width: 100vw; height: 100vh`, say) gets a framebuffer whose size — and per-frame cost —
+tracks the viewport too.
+
+`App.window.w`/`.h` only seeds the canvas's **intrinsic** `width`/`height` attribute, and
+only before the page's CSS box is read for the first time. The seeding step itself checks
+only the HTML attribute (an author's explicit `width`/`height` markup is never overridden,
+whether or not it agrees with `App.window`) — it does not check for a CSS box, because
+`kngn_resize`'s very next report (from the same `ResizeObserver` that starts observing right
+after) makes that check moot: it reports the canvas's live CSS-computed box regardless, so an
+explicit CSS box wins immediately either way, continuously, from the first frame on. It is
+the same "the current box is truth" model a native window uses once something resizes it,
+just starting a little earlier on the web. A canvas with neither a `width`/`height`
+attribute nor a CSS box therefore renders at whatever the seeding step just set, so its
+initial framebuffer matches `App.window`, clamped to the range below — the same starting
+point `zig build run` gives a native app. `template/web/template.html` gives its canvas
+neither for exactly this reason, so it stays at `App.window`'s size (320x240) by default.
+
+**DPR does not apply.** `WindowOptions.fb_mode` is accepted on wasm but has no effect: every
+window behaves as `.logical`, `content_scale` is always `1.0`, and the framebuffer this
+backend allocates is always the canvas's CSS-pixel box, never multiplied by
+`devicePixelRatio`. A HiDPI display gets the browser's own bitmap upscale of the canvas —
+softer than a native `.physical` window's actual higher-resolution present.
+
+**Clamping**: each resize dimension is clamped to `[320, 8192]` (`core/platform_wasm.zig`'s
+`clampResizeDim`), applied uniformly both at window creation (including a declared
+`App.window` outside that range) and at every later resize — the framebuffer a running app
+sees is never inconsistent with the range below. A canvas box smaller than 320x240 still
+allocates at the minimum; the maximum exists so a canvas whose CSS box tracks an unusually
+large viewport cannot allocate an unbounded framebuffer.
+
 ## Artefacts
 
 Output of `zig build package-web` (`zig-out/web/`):
