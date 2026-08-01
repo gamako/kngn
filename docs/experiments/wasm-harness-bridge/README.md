@@ -44,7 +44,8 @@ Useful flags:
 | `--wasm` | which module to boot (`pixie.wasm`, `synth.wasm`, `synth_postmessage.wasm`) |
 | `--audio-transport` | `none`, `worklet_shared` (needs the isolation the server already sends), `worklet_postmessage` |
 | `--device-scale-factor` | the browser's `devicePixelRatio` for the run. **Launch-time only** — a browser cannot change it afterwards |
-| `--capture-frames` | let the harness copy every framebuffer, which `digest fb` needs and which costs a frame-sized memcpy per frame |
+| `--capture-frames` | let the harness copy every framebuffer, which `digest fb` and `snapshot fb` need and which costs a frame-sized memcpy per frame |
+| `--snapshot-dir` | where a `snapshot`'s bytes are written (default: the current directory). The page has no filesystem, so they come back over the bridge |
 | `--size` | the canvas CSS box, `WxH` |
 | `--console-log` | write the browser's stderr, which carries the application's own output, to a file |
 | `--json` | one JSON object per batch instead of the human format |
@@ -87,6 +88,21 @@ assert window scale=1.5000
 assert window epoch=1'
 ```
 
+A picture of what the page is actually drawing, which is the one thing reading the code
+cannot give you — a clipped panel or a mislaid row shows up here and nowhere else:
+
+```bash
+python3 docs/experiments/wasm-harness-bridge/drive.py \
+  --capture-frames --snapshot-dir /tmp/shots \
+  -c 'step 30
+snapshot fb editor.png'
+# → # wrote /tmp/shots/editor.png (1872808 bytes)
+```
+
+`--capture-frames` is not optional here: without it the harness never copied the frame,
+and the run says so rather than writing a blank image. The name is a name and not a path
+(see `harness.md`), so `/tmp/shots` comes from the driver, not from the command.
+
 Audio out of the shared-memory synth, whose worklet runs a second instance over the same
 memory — so a non-silent digest here is also evidence that the tap the real-time thread
 writes and the digest reads is in fact shared:
@@ -111,7 +127,8 @@ assert audio silent=0'
   `--autoplay-policy=no-user-gesture-required` is passed for the same reason.
 - **`--device-scale-factor` is launch-time.** Asserting a ratio change within one run needs
   `@resize`, which is a different claim — see above.
-- **`digest fb` without `--capture-frames`** reads a framebuffer that was deliberately not
-  copied. The frame copy is off by default so that observing a run does not change its cost.
+- **`digest fb` and `snapshot fb` without `--capture-frames`** read a framebuffer that was
+  deliberately not copied. The frame copy is off by default so that observing a run does not
+  change its cost.
 - **The framebuffer follows the element's client box**, so `--size` larger than the window
   silently measures a smaller one. `@env` reports what the canvas actually got.

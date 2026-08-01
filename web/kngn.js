@@ -118,14 +118,36 @@ function harnessAvailable() {
   );
 }
 
-/** Reads and clears the response the wasm side just published. */
+/**
+ * Reads and clears the response the wasm side just published, together with the snapshots the
+ * batch took. A snapshot is binary and travels beside the text, on its own channel: a blob of
+ * concatenated bytes plus a manifest naming and locating each one. Both are read before the clear,
+ * and every view over `memory.buffer` is made fresh, since a growing memory detaches the old one.
+ * @returns {{response: string, snapshots: Array<{name: string, bytes: Uint8Array}>}}
+ */
 function harnessTakeResponse() {
   const ptr = instance.exports.kngn_harness_response_ptr() >>> 0;
   const len = instance.exports.kngn_harness_response_len() >>> 0;
   const copy = new Uint8Array(len);
   copy.set(new Uint8Array(memory.buffer, ptr, len));
+  const snapshots = harnessTakeSnapshots();
   instance.exports.kngn_harness_response_clear();
-  return new TextDecoder().decode(copy);
+  return { response: new TextDecoder().decode(copy), snapshots };
+}
+
+/** The snapshot half of `harnessTakeResponse`. Empty unless the batch took one. */
+function harnessTakeSnapshots() {
+  const mptr = instance.exports.kngn_harness_attachments_manifest_ptr() >>> 0;
+  const mlen = instance.exports.kngn_harness_attachments_manifest_len() >>> 0;
+  if (mlen === 0) return [];
+  const manifest = new TextDecoder().decode(new Uint8Array(memory.buffer, mptr, mlen).slice());
+  const entries = JSON.parse(manifest);
+  if (entries.length === 0) return [];
+  const bptr = instance.exports.kngn_harness_attachments_ptr() >>> 0;
+  return entries.map((e) => ({
+    name: e.name,
+    bytes: new Uint8Array(memory.buffer, bptr + e.off, e.len).slice(),
+  }));
 }
 
 /** Called once per frame, right after kngn_frame, which is where a response becomes ready. */
@@ -159,6 +181,16 @@ function harnessSubmit(text) {
   });
 }
 
+/** Queues one batch behind the ones already in flight: the bridge accepts a single request at a time. */
+function harnessExec(text) {
+  const run = harnessChain.then(
+    () => harnessSubmit(text),
+    () => harnessSubmit(text),
+  );
+  harnessChain = run.catch(() => {});
+  return run;
+}
+
 /**
  * Installs `globalThis.__kngnHarness`. `exec(text)` sends one command batch and resolves with the
  * response, the same text the TCP transport would return. Calls are serialised, so an external
@@ -169,12 +201,15 @@ function installHarnessBridge(captureFrames) {
   harnessEnabled = true;
   globalThis.__kngnHarness = {
     exec(text) {
-      const run = harnessChain.then(
-        () => harnessSubmit(text),
-        () => harnessSubmit(text),
-      );
-      harnessChain = run.catch(() => {});
-      return run;
+      return harnessExec(text).then((r) => r.response);
+    },
+    /**
+     * The same batch as `exec`, resolving with the snapshots as well: `{response, snapshots}`,
+     * where each snapshot is `{name, bytes}`. A `snapshot` command has no file to write to here,
+     * so its bytes come back this way and the caller decides where they go; `exec` drops them.
+     */
+    execWithSnapshots(text) {
+      return harnessExec(text);
     },
     /**
      * Drives the platform resize seam directly — the same call bindResize and bindDprWatcher make.

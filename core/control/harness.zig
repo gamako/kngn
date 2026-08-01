@@ -45,11 +45,6 @@ pub const action_registry = @import("action_registry.zig"); // the Action and re
 /// TCP connection. Every `is_wasm` branch in this file marks one of those substitutions.
 const is_wasm = builtin.target.cpu.arch.isWasm();
 
-/// Whether `snapshot` can name a file. The wasm transport refuses the command, so `capabilities`
-/// must not advertise it there either: a driver that turns every capability into a tool would
-/// otherwise generate one that always fails.
-const snapshot_available = !is_wasm;
-
 // PROPOSE/COMMIT/REJECT (sharing the one action_registry instance)
 pub const netsync = if (is_wasm) @import("netsync_wasm.zig") else @import("netsync.zig");
 
@@ -532,7 +527,12 @@ pub fn parseConfig() void {
     if (getEnv("KNGN_HARNESS_OUT")) |d| out_dir = d;
 
     capture_synthetic_requested = getEnv("KNGN_HARNESS_CAPTURE_SYNTHETIC") != null;
-    skip_frame_copy = if (getEnv("KNGN_HARNESS_SKIP_FRAME_COPY")) |v| std.mem.eql(u8, v, "1") else false;
+    // The frame copy is the one setting the host bridge also owns, and the bridge settles it before
+    // this runs. A wasm module has no environment, so reading an always-unset variable here would
+    // overwrite the page's choice with the default and make every observed frame pay the memcpy.
+    if (comptime !is_wasm) {
+        skip_frame_copy = if (getEnv("KNGN_HARNESS_SKIP_FRAME_COPY")) |v| std.mem.eql(u8, v, "1") else false;
+    }
 }
 
 /// The compatibility setter platform calls once it has settled `KNGN_HEADLESS=1`.
@@ -1389,6 +1389,13 @@ const HOST_REQ_CAP: usize = 8 * 1024;
 const HOST_RESP_CAP: usize = 64 * 1024;
 const HOST_TRUNCATED_MARK = "error: response truncated\n";
 
+/// The largest total of snapshot bytes one response may carry. A snapshot is binary and does not
+/// belong in the response text, so it travels on its own channel (see `attachSnapshot`), and the
+/// budget bounds both the module's peak footprint — the wasm memory tops out at 64 MiB — and the
+/// copy the page makes when it reads the channel out. A framebuffer PNG runs at roughly four bytes
+/// per pixel, the encoder storing rather than compressing them, so this holds a few megapixels.
+const HOST_ATTACH_CAP: usize = 16 * 1024 * 1024;
+
 var host_bridge_requested = false;
 var host_req_buf: [HOST_REQ_CAP]u8 = undefined;
 var host_req_len: usize = 0;
@@ -1396,6 +1403,14 @@ var host_req_pending = false;
 var host_resp_buf: [HOST_RESP_CAP]u8 = undefined;
 var host_resp_len: usize = 0;
 var host_resp_ready = false;
+
+/// One attachment: where its name and its bytes sit inside `host_attach_names` and
+/// `host_attach_blob`. Offsets rather than slices, because both lists move as they grow.
+const HostAttachment = struct { name_off: u32, name_len: u32, data_off: u32, data_len: u32 };
+var host_attach_blob: std.ArrayList(u8) = .empty;
+var host_attach_names: std.ArrayList(u8) = .empty;
+var host_attach_index: std.ArrayList(HostAttachment) = .empty;
+var host_attach_manifest: std.ArrayList(u8) = .empty;
 
 /// Turns the harness on for this run. It must be called before `platform.init()` reaches
 /// `startTransport()`; afterwards the transport decision is settled and this has no effect.
@@ -1445,10 +1460,31 @@ fn hostBridgeResponseLen() callconv(.c) u32 {
     return @intCast(host_resp_len);
 }
 
-/// Releases the response so the next request may be submitted.
+/// The concatenated bytes of every snapshot this response carries. Valid, like the response text,
+/// from `kngn_harness_response_ready()` until `kngn_harness_response_clear()`.
+fn hostBridgeAttachmentsPtr() callconv(.c) [*]const u8 {
+    return host_attach_blob.items.ptr;
+}
+
+fn hostBridgeAttachmentsLen() callconv(.c) u32 {
+    return @intCast(host_attach_blob.items.len);
+}
+
+/// Describes the blob: a JSON array of `{"name":...,"off":...,"len":...}`, one entry per snapshot,
+/// in the order the commands took them. `[]` when the response carries none.
+fn hostBridgeAttachmentsManifestPtr() callconv(.c) [*]const u8 {
+    return host_attach_manifest.items.ptr;
+}
+
+fn hostBridgeAttachmentsManifestLen() callconv(.c) u32 {
+    return @intCast(host_attach_manifest.items.len);
+}
+
+/// Releases the response, and the snapshots that came with it, so the next request may be submitted.
 fn hostBridgeResponseClear() callconv(.c) void {
     host_resp_ready = false;
     host_resp_len = 0;
+    clearHostAttachments();
 }
 
 comptime {
@@ -1461,7 +1497,59 @@ comptime {
         @export(&hostBridgeResponsePtr, .{ .name = "kngn_harness_response_ptr" });
         @export(&hostBridgeResponseLen, .{ .name = "kngn_harness_response_len" });
         @export(&hostBridgeResponseClear, .{ .name = "kngn_harness_response_clear" });
+        @export(&hostBridgeAttachmentsPtr, .{ .name = "kngn_harness_attachments_ptr" });
+        @export(&hostBridgeAttachmentsLen, .{ .name = "kngn_harness_attachments_len" });
+        @export(&hostBridgeAttachmentsManifestPtr, .{ .name = "kngn_harness_attachments_manifest_ptr" });
+        @export(&hostBridgeAttachmentsManifestLen, .{ .name = "kngn_harness_attachments_manifest_len" });
     }
+}
+
+fn clearHostAttachments() void {
+    host_attach_blob.clearRetainingCapacity();
+    host_attach_names.clearRetainingCapacity();
+    host_attach_index.clearRetainingCapacity();
+    host_attach_manifest.clearRetainingCapacity();
+}
+
+/// Puts one snapshot's bytes on the response's attachment channel under `name`, and emits the
+/// snapshot line naming it. The bytes are copied, so the caller keeps ownership of `bytes`.
+///
+/// Hot path: none. It runs only while a `snapshot` command is being handled.
+fn attachSnapshot(probe: []const u8, name: []const u8, bytes: []const u8, info: []const u8) void {
+    if (host_attach_blob.items.len + bytes.len > HOST_ATTACH_CAP) {
+        return warnLine("snapshot: the attachment budget is exhausted -> skip");
+    }
+    const name_off = host_attach_names.items.len;
+    const data_off = host_attach_blob.items.len;
+    host_attach_names.appendSlice(gpa, name) catch return warnLine("snapshot: out of memory -> skip");
+    host_attach_blob.appendSlice(gpa, bytes) catch {
+        host_attach_names.shrinkRetainingCapacity(name_off);
+        return warnLine("snapshot: out of memory -> skip");
+    };
+    host_attach_index.append(gpa, .{
+        .name_off = @intCast(name_off),
+        .name_len = @intCast(name.len),
+        .data_off = @intCast(data_off),
+        .data_len = @intCast(bytes.len),
+    }) catch {
+        host_attach_names.shrinkRetainingCapacity(name_off);
+        host_attach_blob.shrinkRetainingCapacity(data_off);
+        return warnLine("snapshot: out of memory -> skip");
+    };
+    emitSnapshot(probe, name, info);
+}
+
+/// Builds the manifest that describes the blob. Called once per response, next to the response text.
+fn buildHostAttachmentManifest() void {
+    host_attach_manifest.clearRetainingCapacity();
+    host_attach_manifest.append(gpa, '[') catch return;
+    for (host_attach_index.items, 0..) |a, i| {
+        if (i != 0) host_attach_manifest.append(gpa, ',') catch return;
+        const name = host_attach_names.items[a.name_off..][0..a.name_len];
+        // The name is restricted to `[A-Za-z0-9._-]` when it is accepted, so it needs no escaping.
+        host_attach_manifest.print(gpa, "{{\"name\":\"{s}\",\"off\":{d},\"len\":{d}}}", .{ name, a.data_off, a.data_len }) catch return;
+    }
+    host_attach_manifest.append(gpa, ']') catch return;
 }
 
 /// The free-run drain on wasm: adopt a submitted request as the current command source.
@@ -1470,6 +1558,7 @@ fn drainHostBridge() void {
     if (live_req_open or !host_req_pending) return;
     host_req_pending = false;
     resp_buf.clearRetainingCapacity();
+    clearHostAttachments();
     cmd_buf = host_req_buf[0..host_req_len];
     cursor = 0;
     line_no = 0;
@@ -1480,10 +1569,11 @@ fn drainHostBridge() void {
     req_bytes = &.{};
 }
 
-/// Publishes the accumulated response and makes it readable by the host. A response longer than
-/// the buffer is cut short and ends with `HOST_TRUNCATED_MARK`, so a truncated read is never
-/// mistaken for a complete one.
+/// Publishes the accumulated response, and the manifest of the snapshots taken alongside it, and
+/// makes both readable by the host. A response longer than the buffer is cut short and ends with
+/// `HOST_TRUNCATED_MARK`, so a truncated read is never mistaken for a complete one.
 fn publishHostResponse() void {
+    buildHostAttachmentManifest();
     const src = resp_buf.items;
     if (src.len <= host_resp_buf.len) {
         @memcpy(host_resp_buf[0..src.len], src);
@@ -1514,7 +1604,9 @@ fn emitDigest(probe: []const u8, payload: []const u8) void {
     }
 }
 
-/// Emits a snapshot result: `<path>` (live) or `[harness] snapshot <probe> -> <path> (<info>)` (replay).
+/// Emits a snapshot result: `<where>` (live) or `[harness] snapshot <probe> -> <where> (<info>)`
+/// (replay), where `where` is the file it was written to, or the name it travels back under when
+/// the transport has no filesystem.
 fn emitSnapshot(probe: []const u8, path: []const u8, info: []const u8) void {
     if (mode == .live) {
         appendResp(path);
@@ -1845,11 +1937,111 @@ fn parseCodepoint(tok: []const u8) ?u32 {
 }
 
 fn handleSnapshot(it: *Tok) void {
-    // `snapshot` names a file, and on wasm there is no filesystem to name: a write through the WASI
-    // shim becomes a browser download, whose destination the caller does not choose. Rather than
-    // give the same command a different meaning, refuse it and say so in the response. Every probe
-    // that offers a digest is still readable through `digest`.
-    if (comptime is_wasm) warnLine("snapshot: unavailable on this transport (use digest)") else handleSnapshotNative(it);
+    // The command means the same thing on both transports — take the probe's bytes now and hand
+    // them to whoever asked. Only the sink differs: a native run writes a file, and a wasm run has
+    // no filesystem to write one to (a write through the WASI shim becomes a browser download whose
+    // destination the caller does not choose), so it puts the bytes on the response's attachment
+    // channel and lets the driver decide where they land.
+    if (comptime is_wasm) handleSnapshotHost(it) else handleSnapshotNative(it);
+}
+
+/// The wasm sink for `snapshot`: the probe's bytes go onto the attachment channel instead of into a
+/// file. The path argument becomes the *name* the driver saves under (its last path component,
+/// which also keeps a script written for a native run from naming a directory the driver has no
+/// business writing to), and omitting it gives the same default name a native run would.
+///
+/// Hot path: none. Encoding happens only while a `snapshot` command is being handled.
+fn handleSnapshotHost(it: *Tok) void {
+    const probe = it.next() orelse return warnLine("snapshot: the probe name is missing");
+    const path_arg = it.next();
+    var name_buf: [256]u8 = undefined;
+    var info_buf: [32]u8 = undefined;
+
+    if (std.mem.eql(u8, probe, "fb")) {
+        if (skip_frame_copy) return warnLine("snapshot fb: the frame copy is off, so there are no pixels -> skip");
+        if (!have_frame) return warnLine("snapshot fb: before a present (the frame is unsettled) -> skip");
+        const n = @as(usize, frame_w) * @as(usize, frame_h);
+        const bytes = png.encodePNG(frame_pixels[0..n], frame_w, frame_h, gpa) catch |err| return warnEncodeFailed("fb", err);
+        defer gpa.free(bytes);
+        const name = attachmentName(path_arg, &name_buf, "frame", "png") orelse return;
+        const info = std.fmt.bufPrint(&info_buf, "{d}x{d}", .{ frame_w, frame_h }) catch "?";
+        attachSnapshot("fb", name, bytes, info);
+    } else if (std.mem.eql(u8, probe, "audio")) {
+        const channels = audio_channels.load(.monotonic);
+        const rate = audio_rate.load(.monotonic);
+        const n = peekRecentAudio(&audio_scratch);
+        if (n == 0 or channels == 0) return warnLine("snapshot audio: no samples -> skip");
+        const bytes = encodeWav(audio_scratch[0..n], channels, rate, gpa) catch |err| return warnEncodeFailed("audio", err);
+        defer gpa.free(bytes);
+        const name = attachmentName(path_arg, &name_buf, "audio", "wav") orelse return;
+        const info = std.fmt.bufPrint(&info_buf, "{d} samples", .{n}) catch "?";
+        attachSnapshot("audio", name, bytes, info);
+    } else if (std.mem.eql(u8, probe, "stats")) {
+        var json_buf: [512]u8 = undefined;
+        const name = attachmentName(path_arg, &name_buf, "stats", "json") orelse return;
+        attachSnapshot("stats", name, formatStatsPayload(&json_buf), "json");
+    } else if (std.mem.eql(u8, probe, "capabilities")) {
+        const json = formatCapabilitiesPayload(&capabilities_buf);
+        const name = attachmentName(path_arg, &name_buf, "capabilities", "json") orelse return;
+        attachSnapshot("capabilities", name, json, "json");
+    } else if (std.mem.eql(u8, probe, "capture")) {
+        if (synth_video) |*dev| {
+            const frame = dev.renderFrame(frame_index);
+            const bytes = png.encodePNG(frame.pixels, frame.width, frame.height, gpa) catch |err| return warnEncodeFailed("capture", err);
+            defer gpa.free(bytes);
+            const name = attachmentName(path_arg, &name_buf, "capture", "png") orelse return;
+            const info = std.fmt.bufPrint(&info_buf, "{d}x{d}", .{ frame.width, frame.height }) catch "?";
+            attachSnapshot("capture", name, bytes, info);
+        } else {
+            warnLine("snapshot capture: video is not open -> skip");
+        }
+    } else if (std.mem.eql(u8, probe, "gamepad")) {
+        var buf: [DIGEST_BUF_LEN]u8 = undefined;
+        const name = attachmentName(path_arg, &name_buf, "gamepad", "txt") orelse return;
+        attachSnapshot("gamepad", name, formatGamepadPayload(&buf), "txt");
+    } else if (findProbe(probe)) |p| {
+        const snap = p.snapshot orelse return warnLine("snapshot: this probe does not support snapshot");
+        const bytes = snap(p.ctx, gpa) catch |err| return warnEncodeFailed(p.name, err);
+        defer gpa.free(bytes);
+        const name = attachmentName(path_arg, &name_buf, p.name, p.ext) orelse return;
+        const info = std.fmt.bufPrint(&info_buf, "{d} bytes", .{bytes.len}) catch "?";
+        attachSnapshot(p.name, name, bytes, info);
+    } else {
+        warnLine("snapshot: unknown probe");
+    }
+}
+
+fn warnEncodeFailed(probe: []const u8, err: anyerror) void {
+    std.debug.print("[harness] snapshot {s} failed: {s}\n", .{ probe, @errorName(err) });
+    warnLine("snapshot: the probe failed to produce bytes -> skip");
+}
+
+/// The name an attachment is stored and reported under: the last path component of `path_arg`, or
+/// `<stem>_<frame>.<ext>` when it is absent. Restricted to `[A-Za-z0-9._-]` so that it stays a
+/// single file name on whatever the driver writes to, and needs no escaping in the manifest.
+/// A rejected name warns and returns null, so the caller stops rather than inventing one.
+fn attachmentName(path_arg: ?[]const u8, buf: []u8, stem: []const u8, ext: []const u8) ?[]const u8 {
+    const arg = path_arg orelse {
+        return std.fmt.bufPrint(buf, "{s}_{d}.{s}", .{ stem, frame_index, ext }) catch {
+            warnLine("snapshot: failed to build the name");
+            return null;
+        };
+    };
+    var base = arg;
+    if (std.mem.lastIndexOfAny(u8, base, "/\\")) |i| base = base[i + 1 ..];
+    if (base.len == 0 or base.len > buf.len) {
+        warnLine("snapshot: the name is empty or too long");
+        return null;
+    }
+    for (base) |c| {
+        const ok = (c >= 'A' and c <= 'Z') or (c >= 'a' and c <= 'z') or
+            (c >= '0' and c <= '9') or c == '.' or c == '_' or c == '-';
+        if (!ok) {
+            warnLine("snapshot: the name must be [A-Za-z0-9._-] on this transport");
+            return null;
+        }
+    }
+    return base;
 }
 
 fn handleSnapshotNative(it: *Tok) void {
@@ -2109,7 +2301,7 @@ fn formatCapabilitiesPayload(buf: []u8) []const u8 {
                 truncated = true;
                 break :probes_blk;
             }
-            if (!appendProbeEntry(buf, content_limit, &len, b.name, b.ext, b.snapshot and snapshot_available, b.digest, b.desc, null)) {
+            if (!appendProbeEntry(buf, content_limit, &len, b.name, b.ext, b.snapshot, b.digest, b.desc, null)) {
                 len = saved_len;
                 truncated = true;
                 break :probes_blk;
@@ -2123,7 +2315,7 @@ fn formatCapabilitiesPayload(buf: []u8) []const u8 {
                 truncated = true;
                 break :probes_blk;
             }
-            if (!appendProbeEntry(buf, content_limit, &len, p.name, p.ext, p.snapshot != null and snapshot_available, p.digest != null, p.desc, p.args)) {
+            if (!appendProbeEntry(buf, content_limit, &len, p.name, p.ext, p.snapshot != null, p.digest != null, p.desc, p.args)) {
                 len = saved_len;
                 truncated = true;
                 break :probes_blk;

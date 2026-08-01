@@ -711,6 +711,7 @@ With the flag, the module exports a small bridge and `web/kngn.js` wraps it as
 | Call | Meaning |
 |---|---|
 | `exec(text)` | send one command batch, resolve with the response — the same text the TCP transport returns. Calls are serialised |
+| `execWithSnapshots(text)` | the same batch, resolving with `{response, snapshots}`, where each snapshot is `{name, bytes}`. `exec` drops the snapshots |
 | `resize(w, h, dpr)` | drive the platform resize seam, the call `ResizeObserver` and the DPR watcher make. It does **not** change the browser's own `devicePixelRatio` |
 | `devicePixelRatio()` | what the browser reports right now |
 
@@ -718,6 +719,39 @@ With the flag, the module exports a small bridge and `web/kngn.js` wraps it as
 is the host-bridge spelling of `KNGN_HARNESS_SKIP_FRAME_COPY=1`: observing a run then
 costs no framebuffer-sized copy per frame. Turn it on when `digest fb` has to be
 meaningful, and accept the per-frame memcpy that comes with it.
+
+### `snapshot`: the bytes come back instead of a file
+
+`snapshot` means the same thing here as anywhere — take the probe's bytes now — and only
+the sink differs. A page has no filesystem to write to (a write through the WASI shim
+becomes a browser download whose destination the caller does not choose), so the bytes
+travel back beside the response, on a channel of their own, and whoever drives the page
+decides where they land. The command language is unchanged, so a script written for
+`KNGN_HARNESS_LISTEN` runs here too:
+
+```
+step 30
+snapshot fb editor.png
+```
+
+Two consequences follow from there being no filesystem:
+
+- **The path argument is a name, not a path.** Only its last component is used, and it
+  must be `[A-Za-z0-9._-]`; anything else is refused with an `error:` line. `snapshot fb`
+  with no argument gives the same default name a native run would (`frame_<n>.png`).
+- **Nothing is written until a driver writes it.** `execWithSnapshots` hands the caller
+  `{name, bytes}`; `drive.py` turns that into a file under `--snapshot-dir`.
+
+`snapshot fb` reads the same copied framebuffer `digest fb` does, so it needs
+`harnessCaptureFrames` (`--capture-frames` in the driver) exactly as `digest fb` does.
+Without it the answer is `error: snapshot fb: the frame copy is off, so there are no
+pixels -> skip`, never a blank image.
+
+One response carries at most 16 MiB of snapshots in total. A framebuffer PNG costs roughly
+four bytes per pixel — the encoder stores the pixels rather than compressing them — so a
+780x600 frame is about 1.9 MB and the budget holds a few megapixels. Past it a snapshot is
+refused with `error: snapshot: the attachment budget is exhausted -> skip`, so a batch that
+wants more takes them across several batches.
 
 ### What is not there
 
@@ -727,7 +761,6 @@ on a frame barrier exactly as they do under `KNGN_HARNESS_LISTEN` without
 
 | Not available | Why |
 |---|---|
-| `snapshot` | it names a file, and a write through the WASI shim becomes a browser download whose destination the caller does not choose. Refused with `error: snapshot: unavailable on this transport (use digest)`; every probe's `digest` still works |
 | `capture` | the synthetic source generates on a worker thread and publishes a 64-bit atomic, neither of which a single-threaded wasm32 module has. Opening fails |
 | script replay, manual clock, `record` | all reached through environment variables, and there is no environment |
 | the copilot transport, netsync | both need sockets |
@@ -747,5 +780,5 @@ python3 docs/experiments/wasm-harness-bridge/drive.py -c 'step 10
 digest window'
 ```
 
-Its `README.md` covers the page commands (`@resize`, `@env`), the audio transports and the
-launch-time device scale factor.
+Its `README.md` covers the page commands (`@resize`, `@env`), the audio transports, the
+launch-time device scale factor and where snapshots are written.

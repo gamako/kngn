@@ -54,6 +54,17 @@
       return await r.json();
     }
 
+    // btoa takes a string, and spreading a megabyte-sized array into String.fromCharCode overflows
+    // the argument list, so the bytes are folded in chunks.
+    function base64(bytes) {
+      let s = "";
+      const step = 0x8000;
+      for (let i = 0; i < bytes.length; i += step) {
+        s += String.fromCharCode.apply(null, bytes.subarray(i, i + step));
+      }
+      return btoa(s);
+    }
+
     async function pageCommand(text) {
       const t = text.trim().split(/\s+/);
       if (t[0] === "@resize") {
@@ -81,16 +92,23 @@
         if (next.done) { say("done"); return; }
         if (next.idle) continue;
         let response = "";
+        let snapshots = [];
         let error = null;
         try {
-          response = next.cmd.trimStart().startsWith("@")
-            ? await pageCommand(next.cmd)
-            : await globalThis.__kngnHarness.exec(next.cmd);
+          if (next.cmd.trimStart().startsWith("@")) {
+            response = await pageCommand(next.cmd);
+          } else {
+            const r = await globalThis.__kngnHarness.execWithSnapshots(next.cmd);
+            response = r.response;
+            // A snapshot has no file to be written to in a browser, so its bytes ride back to the
+            // driver, which is the side that has a filesystem. base64 keeps the result one JSON body.
+            snapshots = r.snapshots.map((s) => ({ name: s.name, b64: base64(s.bytes) }));
+          }
         } catch (e) {
           error = String((e && e.message) || e);
         }
         say(`seq=${next.seq} ${error ? "error" : "ok"}`);
-        await post("/harness/result", { token, seq: next.seq, response, error });
+        await post("/harness/result", { token, seq: next.seq, response, snapshots, error });
       }
     }
 

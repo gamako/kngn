@@ -21,6 +21,7 @@ Read `--help` for the knobs.
 from __future__ import annotations
 
 import argparse
+import base64
 import http.server
 import json
 import os
@@ -188,6 +189,26 @@ def launch_chrome(chrome: str, url: str, profile: str, win_w: int, win_h: int,
     return subprocess.Popen(argv, stdout=subprocess.DEVNULL, stderr=out)
 
 
+def save_snapshots(snapshots: list, out_dir: Path) -> list[dict]:
+    """Writes the bytes a batch's `snapshot` commands produced, and reports what landed where.
+
+    The name comes from the page, so only its last component is used: a driver never writes
+    outside the directory it was told to write to.
+    """
+    written = []
+    for s in snapshots:
+        name = os.path.basename(str(s.get("name", "")))
+        if not name or name in (".", ".."):
+            print(f"# skipped a snapshot with an unusable name: {s.get('name')!r}", file=sys.stderr)
+            continue
+        data = base64.b64decode(s.get("b64", ""))
+        out_dir.mkdir(parents=True, exist_ok=True)
+        path = out_dir / name
+        path.write_bytes(data)
+        written.append({"name": name, "path": str(path), "bytes": len(data)})
+    return written
+
+
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -204,8 +225,11 @@ def main() -> None:
     ap.add_argument("--device-scale-factor", default="1",
                     help="the browser's devicePixelRatio for the run (launch-time only)")
     ap.add_argument("--capture-frames", action="store_true",
-                    help="let the harness copy every framebuffer, which digest fb needs "
-                         "and which costs a frame-sized memcpy per frame")
+                    help="let the harness copy every framebuffer, which digest fb and "
+                         "snapshot fb need and which costs a frame-sized memcpy per frame")
+    ap.add_argument("--snapshot-dir", default=".",
+                    help="where a snapshot's bytes are written; the page has no filesystem, "
+                         "so they come back over the bridge and land here")
     ap.add_argument("--boot-timeout", type=float, default=60.0)
     ap.add_argument("--timeout", type=float, default=120.0, help="seconds to wait for one batch")
     ap.add_argument("--console-log", default=None,
@@ -222,6 +246,7 @@ def main() -> None:
         sys.exit("nothing to run: pass --script or -c")
 
     web_dir = Path(args.web_dir).resolve()
+    snapshot_dir = Path(args.snapshot_dir).resolve()
     if not (web_dir / args.wasm).exists():
         sys.exit(f"no {args.wasm} under {web_dir}; "
                  f"run `zig build package-web -Dwasm-harness=true` first")
@@ -281,15 +306,19 @@ def main() -> None:
                         break
                     if res.get("error"):
                         failures += 1
+                    written = save_snapshots(res.get("snapshots") or [], snapshot_dir)
                     if args.json:
                         print(json.dumps({"seq": seq, "cmd": batch,
                                           "response": res.get("response", ""),
+                                          "snapshots": written,
                                           "error": res.get("error")}))
                     else:
                         print(f"# batch {seq}: {batch.strip()}")
                         if res.get("error"):
                             print("error: " + res["error"], file=sys.stderr)
                         sys.stdout.write(res.get("response", ""))
+                        for s in written:
+                            print(f"# wrote {s['path']} ({s['bytes']} bytes)")
                     sys.stdout.flush()
         finally:
             session.done.set()
