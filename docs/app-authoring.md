@@ -204,3 +204,16 @@ GET of the `.wasm` file (see [`docs/wasm-deploy.md`](wasm-deploy.md)).
 
 When reporting problems, include target OS, `-Dplatform` backend, Zig version, and the
 exact command line.
+
+## 8. Editor-shaped applications
+
+If the application has documents, edits and undo, there is a further rail — a command model
+with actors and transactions, a contract for what an operation may refer to, storage for
+history, and relay to another process. Those parts fit together only if they are adopted in
+order, and the order plus what to read at each step is listed in
+[`docs/adr/023_editor-identity-and-inverse-operations.md`](adr/023_editor-identity-and-inverse-operations.md)
+("Where a new editor application starts").
+
+Read it **before writing the first operation**. The one rule that is expensive to adopt late
+is that an operation refers to a document object by a stable, never-reused id rather than by
+its position; the ADR records what retrofitting that costs in an application that did not.
