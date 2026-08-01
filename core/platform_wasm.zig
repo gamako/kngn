@@ -5,6 +5,33 @@
 //! BGRA→RGBA swizzle (pixelops SIMD). JS pushes input onto the queue with `kngn_push_*`, and Zig drains it in nextEvent.
 //!
 //! Hot path declaration: the all-pixel swizzle in present runs every frame. Input and init happen at event time and at initialisation only.
+//!
+//! **Framebuffer size contract**: there is no OS window here, so the size this backend uses is
+//! always the canvas's live CSS box (in CSS px), delivered by `kngn_resize` from a
+//! `ResizeObserver` in the JS glue and applied at the next `lockFramebuffer` (`applyPendingResize`,
+//! never mid-frame). `App.window.w`/`.h` (`core/app_runtime.zig`'s `kngn_declared_window_w`/`_h`
+//! exports) seed the canvas's intrinsic width/height attribute once, right after instantiation.
+//! If the page's CSS never gives the canvas an explicit box, that seeded size *is* the canvas's
+//! box from then on (a plain canvas with no CSS renders at its intrinsic attribute size, and
+//! nothing else changes it), so `App.window` holds for the run, not just the first frame. The
+//! moment the page's CSS does give the canvas an explicit box, that box is what `kngn_resize`
+//! reports instead, continuously, from the very next delivery on.
+//!
+//! **DPR**: `WindowOptions.fb_mode` is accepted (see `createWithOptions`) but has no effect —
+//! there is no `.physical` framebuffer here yet. `content_scale` is always `1.0` and the size
+//! this backend allocates is always the canvas's CSS-pixel box, never multiplied by
+//! `devicePixelRatio`. A HiDPI display gets the browser's own bitmap upscale of the canvas
+//! instead of a native-resolution present. Adding real DPR support would need a `kngn_resize`
+//! ABI change (an extra scale argument), a `devicePixelRatio`-change watcher (a display or zoom
+//! change can happen mid-session, unlike the OS-queried scale native reads once), and wiring
+//! `fb_mode` through this file's `ensureFramebuffer`/`lockFramebuffer`/`present` — a self-contained
+//! follow-on, not a small addition to the size contract above.
+//!
+//! [320, 8192] is the clamp on each resize dimension (`clampResizeDim`), applied uniformly at
+//! window creation (including a declared `App.window` outside that range) and at every later
+//! resize: a canvas box below the minimum still allocates at the minimum, and the maximum
+//! exists so a runaway CSS box (`vw`/`vh` at a very large monitor, say) cannot allocate an
+//! unbounded framebuffer.
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -310,9 +337,16 @@ pub const Window = struct {
         // A canvas cannot stop its viewport from changing (the page's layout owns the size), so
         // resizable is a no-op here; the CSS box of the canvas is the author's lever instead.
         _ = opts.resizable;
-        const w = if (opts.size) |s| s.width else width;
-        const h = if (opts.size) |s| s.height else height;
-        try ensureFramebuffer(w, h);
+        // `.physical` is accepted but has no effect: wasm has no DPR switch yet, so every
+        // window behaves as `.logical` and `content_scale` stays 1.0 (see `lockFramebuffer`).
+        _ = opts.fb_mode;
+        const requested_w = if (opts.size) |s| s.width else width;
+        const requested_h = if (opts.size) |s| s.height else height;
+        // The same [320, 8192] clamp `kngn_resize` applies (`clampResizeDim`), so a declared
+        // size outside that range does not create a framebuffer that the very next resize
+        // report immediately replaces with a different, clamped one.
+        const clamped = clampResizeDim(requested_w, requested_h);
+        try ensureFramebuffer(clamped.w, clamped.h);
         return .{ .width = fb_w, .height = fb_h };
     }
 

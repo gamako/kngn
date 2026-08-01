@@ -837,6 +837,34 @@ function shouldPreventKey(e) {
   );
 }
 
+/**
+ * Seed the canvas's intrinsic width/height from the app's declared `App.window` size, so the
+ * initial framebuffer matches it instead of the UA's default 300x150 canvas box.
+ *
+ * Only applies when the host page left both attributes unset (`hasAttribute`, not the IDL
+ * getter, which always returns a number) — an author's explicit markup is never overridden.
+ *
+ * This is not a one-frame default: a canvas with no CSS box renders at its intrinsic attribute
+ * size, so absent a CSS override this stays the canvas's box (and therefore the framebuffer's
+ * size, via `bindResize()`'s `ResizeObserver`) for as long as the app runs. The moment the
+ * page's CSS gives the canvas an explicit box, that box wins instead, immediately and
+ * continuously, from the next resize report on. `template/web/template.html` relies on the
+ * first behaviour (no CSS box, so it stays at `App.window`'s size); a page that wants the
+ * canvas to track the viewport instead opts into the second by giving it one.
+ */
+function primeDeclaredWindowSize() {
+  if (canvas.hasAttribute("width") || canvas.hasAttribute("height")) return;
+  const declW = instance.exports.kngn_declared_window_w;
+  const declH = instance.exports.kngn_declared_window_h;
+  if (!declW || !declH) return; // older wasm without these exports
+  const w = declW();
+  const h = declH();
+  if (w > 0 && h > 0) {
+    canvas.width = w;
+    canvas.height = h;
+  }
+}
+
 /** Notify wasm of the container's logical px (no DPR). Applied at the frame boundary via pending. */
 function reportCanvasSize() {
   if (!instance) return;
@@ -1717,6 +1745,7 @@ export async function boot(opts = {}) {
     maybeStartAudioProbe();
   }
 
+  primeDeclaredWindowSize();
   bindInput();
   bindResize();
   instance.exports.kngn_init();

@@ -123,6 +123,40 @@ pub fn Runtime(comptime App: type) type {
             if (!builtin.cpu.arch.isWasm()) return;
             _ = &kngn_init;
             _ = &kngn_frame;
+            _ = &kngn_declared_window_w;
+            _ = &kngn_declared_window_h;
+        }
+
+        /// `App.window.w`/`.h`, read by the JS glue right after instantiation, before it starts
+        /// observing the canvas's CSS box. A canvas has no OS window to size, so the glue uses
+        /// these to seed the canvas's intrinsic `width`/`height` attribute — but only when the
+        /// host page left both attributes unset, so an author's own explicit markup is never
+        /// overridden. This is not a one-frame default: a canvas with no CSS box renders at its
+        /// intrinsic attribute size, so absent a CSS override this value holds for the whole run
+        /// (the same "current box is truth" model native uses once a window is resized, just
+        /// with nothing here to trigger a change). The moment the page's CSS gives the canvas an
+        /// explicit box, that box wins instead, continuously, from the next resize report on.
+        /// The raw `App.window` value returned here is not clamped to `[320, 8192]` — the wasm
+        /// backend's `Window.createWithOptions` applies that clamp itself when it allocates the
+        /// framebuffer, so a declared size outside that range still ends up with a consistent,
+        /// clamped framebuffer rather than a one-frame mismatch.
+        ///
+        /// Known gap: an app whose `windowBootstrap` returns a `WindowOptions.size` that
+        /// differs from `App.window` on wasm will still have the canvas seeded from the
+        /// declared `App.window` value, not the effective size `createWithOptions` ends up
+        /// using — computing the effective size would mean running `windowBootstrap` before
+        /// the JS glue can prime the canvas, which is not how boot is sequenced today. None of
+        /// the in-tree wasm apps hit this (pixie's `windowBootstrap` always falls back to
+        /// `App.window`'s own constants on wasm; synth and the template have no
+        /// `windowBootstrap` at all).
+        export fn kngn_declared_window_w() u32 {
+            if (!builtin.cpu.arch.isWasm()) return 0;
+            return App.window.w;
+        }
+
+        export fn kngn_declared_window_h() u32 {
+            if (!builtin.cpu.arch.isWasm()) return 0;
+            return App.window.h;
         }
 
         export fn kngn_init() void {
