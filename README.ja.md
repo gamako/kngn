@@ -3,7 +3,7 @@
 **AI が、自分の作ったものを見られる。ネイティブアプリの土台。**
 
 [![Zig 0.16](https://img.shields.io/badge/zig-0.16.0-f7a41d)](https://ziglang.org/)
-[![platforms](https://img.shields.io/badge/platforms-macOS%20%7C%20Linux%20%7C%20Windows-blue)](docs/build.md)
+[![platforms](https://img.shields.io/badge/platforms-macOS%20%7C%20Linux%20%7C%20Windows%20%7C%20wasm-blue)](docs/build.md)
 [![zig package deps](https://img.shields.io/badge/zig%20package%20deps-0-brightgreen)](build.zig.zon)
 [![License: MIT](https://img.shields.io/badge/license-MIT-green)](LICENSE)
 
