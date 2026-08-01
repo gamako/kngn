@@ -259,8 +259,9 @@ libs/gui itself was not changed. Gaps are recorded as example-side custom/hack o
 
 ### 15.1 Observations (complete Missing list)
 
-1. **500-row full Context frame time** — Every frame builds all rows with `selectableLabelId`. Measure avg/min/p95 with `bench-gui-list-menu` (compare against the 500-row values from existing `bench-gui-frame`). No virtualization.
-2. **No dedicated Listbox semantics** — `selectableLabelId` is for text selection, not a single-line listbox selection model. Row select / highlight is app state (`selected_row` / `active_row`).
+1. **500-row full Context frame time** — Every frame builds all rows. No virtualization: `beginScrollArea` only clips and offsets, it does not skip building or measuring rows outside the viewport.
+   **Measured** (`zig build bench-gui-list-menu`, ReleaseFast, 1024×768, warmup 100, 1000 iterations, Apple M1 Max, zig 0.16.0, 2026-08-02, 3 runs): avg 448–471µs, min 427–448µs, p95 459–524µs. For comparison, `bench-gui-frame` at the same row count and scale (bare `buttonId` rows, no toolbar/menu/filter) measures avg ≈263µs at 500 rows and avg ≈416µs at 1000 rows — a different-shaped benchmark, not a per-row multiplier of the list+menu figure above. Both are well inside a 16.67ms (60fps) frame budget.
+2. **No dedicated Listbox semantics beyond what now exists** — Row select / highlight is app state (`selected_row` / `active_row`) layered on top of `gui.beginListboxRow`/`endListboxRow` (added after this section was first written; see §5's correction note). The library gives roving-tab-stop navigation and a selected-row background; multi-select, drag-select and column/tree semantics are still app-side or absent (items 8 and 10 below).
 3. **No list keyboard navigation API** — Up/down active-row movement is a custom app handler for `key_down UP/DOWN`. List nav is suppressed while a popup is open.
 4. **No checkbox-backed persistent multi-select popup** — `PopupItem` has no checked state. Filters rebuild `[on]`/`[off]` labels and, after item selection closes the popup, the app reopens to simulate multi-select (`filter_reopen_count`).
 5. **At most one popup at a time** — `PopupState` holds only one. menuBar and context/filter cannot be held together. E2E scenario 7: right-clicking a row while the File menu is open still yields `popup_count=1` (observed: after right-click the menu keeps the popup / context does not fully replace it, or the menu reclaims on the next frame). Overlaying menu and context is impossible.
@@ -268,7 +269,7 @@ libs/gui itself was not changed. Gaps are recorded as example-side custom/hack o
 7. **No virtualization API** — All 500 rows are built and laid out every frame. Scrolling is `beginScrollArea` only.
 8. **No multi-row select / drag select** — This screen is single-select only. The probe explicitly reports `multi_select=0` / `drag_select=0`.
 9. **No dedicated Toolbar API** — Back / New / Refresh are a `buttonId` row.
-10. **No Table / column / tree view** — The list is hand-built from row box + kind label + selectableLabel + detail. No column layout or tree.
+10. **No Table / column / tree view** — The list is hand-built from `beginListboxRow`/`endListboxRow` plus a kind label, an ellipsized name (`labelEllipsis`) and a detail label (`labelEx`) inside each row (updated from the original `selectableLabelId`-based row after Tabs/Listbox landed; see §5's correction note). No column layout or tree.
 
 ### 15.2 custom / hack counts (example side)
 
