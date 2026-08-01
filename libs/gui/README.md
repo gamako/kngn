@@ -92,6 +92,31 @@ Verification: `zig build test-gui` (nested-wheel unit tests in `widgets.zig`);
 `examples/37_gui_torture` case `input_state` (`e2e_input_state.txt` pins values
 across a layout-shifting drag) and case `scroll` (nested-wheel digests).
 
+## Keyboard focus
+
+Pressing a widget focuses it, and Tab / Shift+Tab walk the widgets in the order they were
+submitted, which is the order they are drawn. Space and Enter activate a focused
+button-like widget; the arrow keys step a focused slider. An application writes no glue for
+any of this.
+
+A ring is drawn around the focused widget **only when the focus was reached with the
+keyboard** — a pointer already shows the user where the focus went. `ctx.isFocusVisible(id)`
+answers the same question a caller might want to match.
+
+Two things are worth knowing when driving this from a test or a replay script:
+
+- **A Tab lands on the next frame.** It is resolved at the end of the frame that saw it,
+  after that frame has been drawn, so observing the result takes one more `step`.
+- **A frame the pointer takes part in ignores the keyboard.** A press, or a drag still in
+  progress, suppresses Tab, Space, Enter and the arrow keys for that frame.
+
+`selectableLabel` stays out of the Tab order unless `.focusable = true` is passed: it is
+usually text to select rather than a control, and lists are built out of it. `TextInput` and
+the button-like widgets join it automatically.
+
+The reasoning, and what was deliberately left out (Escape, scrolling the focus into view,
+two-dimensional drag widgets), is in `docs/adr/021_gui-keyboard-focus-traversal.md`.
+
 ## Text measurement and drawing
 
 The default font (`BitmapFont`, `src/font.zig`) covers ASCII `32..127` at a fixed

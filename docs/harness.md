@@ -172,6 +172,21 @@ works on every path: key_down/up, mouse_move/down/up and scroll. For example
 event is not injected at all** (fail-fast, so a typo in a modifier name is never
 swallowed). With no modifiers, the set is empty as before.
 
+### Tab takes an extra step to observe
+
+A GUI application resolves `inject key_down TAB` at the end of the frame that received it,
+after that frame has already been drawn, so the focus lands on the *next* frame (ADR-021 —
+the same one-frame rule the previous-frame hit-test follows). A script that injects Tab and
+then reads the result has to step twice:
+
+```
+inject key_down TAB; step 2; digest state    # focus has moved
+inject key_down TAB shift; step 2            # and back
+```
+
+Stepping once leaves the previous focus in whatever the probe or snapshot reports. The same
+applies to the focus ring in `snapshot fb`.
+
 ### expect and assert (the assertion layer)
 
 Compares an expected value against a probe's **one-line digest payload**, so a script

@@ -47,6 +47,9 @@ pub const MouseButtons = @import("input.zig").MouseButtons;
 pub const ModifierFlags = @import("input.zig").ModifierFlags;
 pub const Vec2f = @import("input.zig").Vec2f;
 pub const CompositionState = @import("input.zig").CompositionState;
+/// Key codes and modifier bits this library reacts to, for callers that push events by hand.
+pub const key = @import("input.zig").key;
+pub const mod = @import("input.zig").mod;
 
 pub const Id = @import("id.zig").Id;
 pub const IdStack = @import("id.zig").IdStack;

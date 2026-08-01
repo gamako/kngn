@@ -28,6 +28,10 @@ pub const Style = struct {
     selection_background: Color = Color.rgba(0x30, 0x60, 0xC0, 0xFF),
     /// Color reserved for future caret drawing (caret itself is not drawn yet)
     caret: Color = Color.rgba(0xFF, 0xFF, 0xFF, 0xFF),
+    /// Ring around the widget holding keyboard focus. Drawn only when the focus was reached with
+    /// the keyboard, so it has to stand out against every widget fill rather than blend in.
+    focus_ring: Color = Color.rgba(0x7A, 0xB8, 0xFF, 0xFF),
+    focus_ring_thickness: u32 = 2,
     swatch_size: i32 = 18,
     swatch_border: i32 = 1,
     swatch_border_selected: i32 = 2,

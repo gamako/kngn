@@ -122,8 +122,6 @@ const App = struct {
     screen_w: u32,
     screen_h: u32,
     section: Section = .general,
-    /// nav activation path: focus (selectableLabelId claimFocus) / click (hot+pressed glue)
-    nav_via_focus: bool = true,
     general: GeneralState,
     editor: EditorState,
     audio: AudioState,
@@ -251,44 +249,15 @@ fn widgetName(id: gui.Id) []const u8 {
     };
 }
 
-fn claimInteract(ctx: *gui.Context, id: gui.Id, active: bool) void {
-    // checkbox / toggle / radio / slider do not claimFocus, so take focus on the app side to match
-    // the E2E focused= expectation (hack: interaction focus glue for non-text widgets).
-    if (active) _ = ctx.claimFocus(id);
-}
-
+/// The section on show follows the keyboard focus, so clicking a navigation entry and tabbing to
+/// one select it the same way.
 fn syncSection(app: *App) void {
-    const fid = app.ctx.state.focused_id;
-    if (fid == Ids.nav_general) {
-        app.section = .general;
-        app.nav_via_focus = true;
-        return;
-    }
-    if (fid == Ids.nav_editor) {
-        app.section = .editor;
-        app.nav_via_focus = true;
-        return;
-    }
-    if (fid == Ids.nav_audio) {
-        app.section = .audio;
-        app.nav_via_focus = true;
-        return;
-    }
-
-    // fallback: click glue when selectableLabelId does not reflect into focused
-    if (app.ctx.input.mouse_pressed.left) {
-        const hot = app.ctx.state.hot_id;
-        if (hot == Ids.nav_general) {
-            app.section = .general;
-            app.nav_via_focus = false;
-        } else if (hot == Ids.nav_editor) {
-            app.section = .editor;
-            app.nav_via_focus = false;
-        } else if (hot == Ids.nav_audio) {
-            app.section = .audio;
-            app.nav_via_focus = false;
-        }
-    }
+    app.section = switch (app.ctx.state.focused_id) {
+        Ids.nav_general => .general,
+        Ids.nav_editor => .editor,
+        Ids.nav_audio => .audio,
+        else => return,
+    };
 }
 
 fn stateDigest(ctx_ptr: *anyopaque, buf: []u8) []const u8 {
@@ -447,10 +416,10 @@ fn renderNav(ctx: *gui.Context, app: *App) void {
             .bg = bg,
             .align_cross = .center,
         });
-        _ = ctx.selectableLabelId(it.id, it.label, .{});
+        // These labels are the navigation, not prose, so Tab reaches them.
+        _ = ctx.selectableLabelId(it.id, it.label, .{ .focusable = true });
         ctx.endBox();
     }
-    // focus path (primary) + click glue (fallback)
     syncSection(app);
 }
 
@@ -467,42 +436,30 @@ fn renderGeneral(ctx: *gui.Context, app: *App) void {
     formSpacer(ctx, 1);
 
     ctx.label("Startup");
-    if (ctx.checkboxId(Ids.general_launch_at_login, "Launch at login", &app.general.launch_at_login))
-        claimInteract(ctx, Ids.general_launch_at_login, true);
-    if (ctx.checkboxId(Ids.general_check_updates, "Check for updates", &app.general.check_updates))
-        claimInteract(ctx, Ids.general_check_updates, true);
-    if (ctx.checkboxId(Ids.general_send_telemetry, "Send telemetry", &app.general.send_telemetry))
-        claimInteract(ctx, Ids.general_send_telemetry, true);
+    _ = ctx.checkboxId(Ids.general_launch_at_login, "Launch at login", &app.general.launch_at_login);
+    _ = ctx.checkboxId(Ids.general_check_updates, "Check for updates", &app.general.check_updates);
+    _ = ctx.checkboxId(Ids.general_send_telemetry, "Send telemetry", &app.general.send_telemetry);
 
     ctx.label("Notifications");
-    if (ctx.toggleId(Ids.general_show_notifications, "Show notifications", &app.general.show_notifications))
-        claimInteract(ctx, Ids.general_show_notifications, true);
-    if (ctx.toggleId(Ids.general_use_native_dialogs, "Use native dialogs", &app.general.use_native_dialogs))
-        claimInteract(ctx, Ids.general_use_native_dialogs, true);
+    _ = ctx.toggleId(Ids.general_show_notifications, "Show notifications", &app.general.show_notifications);
+    _ = ctx.toggleId(Ids.general_use_native_dialogs, "Use native dialogs", &app.general.use_native_dialogs);
 
     ctx.label("Theme");
     ctx.beginBox(.{ .direction = .row, .gap = 12 });
     if (ctx.radioId(Ids.general_theme_system, "System", app.general.theme == .system)) {
         app.general.theme = .system;
-        claimInteract(ctx, Ids.general_theme_system, true);
     }
     if (ctx.radioId(Ids.general_theme_light, "Light", app.general.theme == .light)) {
         app.general.theme = .light;
-        claimInteract(ctx, Ids.general_theme_light, true);
     }
     if (ctx.radioId(Ids.general_theme_dark, "Dark", app.general.theme == .dark)) {
         app.general.theme = .dark;
-        claimInteract(ctx, Ids.general_theme_dark, true);
     }
     ctx.endBox();
 
     ctx.label("Scale & opacity");
-    if (ctx.sliderI32Id(Ids.general_ui_scale, "UI scale", &app.general.ui_scale, .{ .min = 50, .max = 200, .step = 1, .track_w = 180 }))
-        claimInteract(ctx, Ids.general_ui_scale, true);
-    if (ctx.state.active_id == Ids.general_ui_scale) claimInteract(ctx, Ids.general_ui_scale, true);
-    if (ctx.sliderF32Id(Ids.general_interface_opacity, "Opacity", &app.general.interface_opacity, .{ .min = 0.2, .max = 1.0, .step = 0.05, .track_w = 180 }))
-        claimInteract(ctx, Ids.general_interface_opacity, true);
-    if (ctx.state.active_id == Ids.general_interface_opacity) claimInteract(ctx, Ids.general_interface_opacity, true);
+    _ = ctx.sliderI32Id(Ids.general_ui_scale, "UI scale", &app.general.ui_scale, .{ .min = 50, .max = 200, .step = 1, .track_w = 180 });
+    _ = ctx.sliderF32Id(Ids.general_interface_opacity, "Opacity", &app.general.interface_opacity, .{ .min = 0.2, .max = 1.0, .step = 0.05, .track_w = 180 });
 
     ctx.label("Paths");
     ctx.labelEx("Settings file path (text input).", ctx.style.text_subtle);
@@ -534,28 +491,21 @@ fn renderEditor(ctx: *gui.Context, app: *App) void {
     formSpacer(ctx, 1);
 
     ctx.label("Display");
-    if (ctx.checkboxId(Ids.editor_word_wrap, "Word wrap", &app.editor.word_wrap))
-        claimInteract(ctx, Ids.editor_word_wrap, true);
-    if (ctx.checkboxId(Ids.editor_show_minimap, "Show minimap", &app.editor.show_minimap))
-        claimInteract(ctx, Ids.editor_show_minimap, true);
-    if (ctx.checkboxId(Ids.editor_format_on_save, "Format on save", &app.editor.format_on_save))
-        claimInteract(ctx, Ids.editor_format_on_save, true);
+    _ = ctx.checkboxId(Ids.editor_word_wrap, "Word wrap", &app.editor.word_wrap);
+    _ = ctx.checkboxId(Ids.editor_show_minimap, "Show minimap", &app.editor.show_minimap);
+    _ = ctx.checkboxId(Ids.editor_format_on_save, "Format on save", &app.editor.format_on_save);
 
     ctx.label("Editing");
-    if (ctx.toggleId(Ids.editor_auto_indent, "Auto indent", &app.editor.auto_indent))
-        claimInteract(ctx, Ids.editor_auto_indent, true);
-    if (ctx.toggleId(Ids.editor_bracket_pair_colorization, "Bracket pair colorization", &app.editor.bracket_pair_colorization))
-        claimInteract(ctx, Ids.editor_bracket_pair_colorization, true);
+    _ = ctx.toggleId(Ids.editor_auto_indent, "Auto indent", &app.editor.auto_indent);
+    _ = ctx.toggleId(Ids.editor_bracket_pair_colorization, "Bracket pair colorization", &app.editor.bracket_pair_colorization);
 
     ctx.label("Indent style");
     ctx.beginBox(.{ .direction = .row, .gap = 12 });
     if (ctx.radioId(Ids.editor_indent_tabs, "Tabs", app.editor.indent_style == .tabs)) {
         app.editor.indent_style = .tabs;
-        claimInteract(ctx, Ids.editor_indent_tabs, true);
     }
     if (ctx.radioId(Ids.editor_indent_spaces, "Spaces", app.editor.indent_style == .spaces)) {
         app.editor.indent_style = .spaces;
-        claimInteract(ctx, Ids.editor_indent_spaces, true);
     }
     ctx.endBox();
 
@@ -563,21 +513,15 @@ fn renderEditor(ctx: *gui.Context, app: *App) void {
     ctx.beginBox(.{ .direction = .row, .gap = 12 });
     if (ctx.radioId(Ids.editor_font_system, "System", app.editor.font_family == .system)) {
         app.editor.font_family = .system;
-        claimInteract(ctx, Ids.editor_font_system, true);
     }
     if (ctx.radioId(Ids.editor_font_monospace, "Monospace", app.editor.font_family == .monospace)) {
         app.editor.font_family = .monospace;
-        claimInteract(ctx, Ids.editor_font_monospace, true);
     }
     ctx.endBox();
 
     ctx.label("Sizes");
-    if (ctx.sliderI32Id(Ids.editor_tab_width, "Tab width", &app.editor.tab_width, .{ .min = 2, .max = 8, .step = 1, .track_w = 160 }))
-        claimInteract(ctx, Ids.editor_tab_width, true);
-    if (ctx.state.active_id == Ids.editor_tab_width) claimInteract(ctx, Ids.editor_tab_width, true);
-    if (ctx.sliderF32Id(Ids.editor_font_size, "Font size", &app.editor.font_size, .{ .min = 8.0, .max = 32.0, .step = 0.5, .track_w = 160 }))
-        claimInteract(ctx, Ids.editor_font_size, true);
-    if (ctx.state.active_id == Ids.editor_font_size) claimInteract(ctx, Ids.editor_font_size, true);
+    _ = ctx.sliderI32Id(Ids.editor_tab_width, "Tab width", &app.editor.tab_width, .{ .min = 2, .max = 8, .step = 1, .track_w = 160 });
+    _ = ctx.sliderF32Id(Ids.editor_font_size, "Font size", &app.editor.font_size, .{ .min = 8.0, .max = 32.0, .step = 0.5, .track_w = 160 });
 
     formSpacer(ctx, 4);
     ctx.labelEx("Workspace path lives near the bottom of this long form.", ctx.style.text_subtle);
@@ -607,28 +551,21 @@ fn renderAudio(ctx: *gui.Context, app: *App) void {
     formSpacer(ctx, 1);
 
     ctx.label("Enablement");
-    if (ctx.checkboxId(Ids.audio_enabled, "Audio enabled", &app.audio.audio_enabled))
-        claimInteract(ctx, Ids.audio_enabled, true);
-    if (ctx.checkboxId(Ids.audio_exclusive_mode, "Exclusive mode", &app.audio.exclusive_mode))
-        claimInteract(ctx, Ids.audio_exclusive_mode, true);
-    if (ctx.checkboxId(Ids.audio_show_meter, "Show meter", &app.audio.show_meter))
-        claimInteract(ctx, Ids.audio_show_meter, true);
+    _ = ctx.checkboxId(Ids.audio_enabled, "Audio enabled", &app.audio.audio_enabled);
+    _ = ctx.checkboxId(Ids.audio_exclusive_mode, "Exclusive mode", &app.audio.exclusive_mode);
+    _ = ctx.checkboxId(Ids.audio_show_meter, "Show meter", &app.audio.show_meter);
 
     ctx.label("Routing");
-    if (ctx.toggleId(Ids.audio_input_monitor, "Input monitor", &app.audio.input_monitor))
-        claimInteract(ctx, Ids.audio_input_monitor, true);
-    if (ctx.toggleId(Ids.audio_normalize_output, "Normalize output", &app.audio.normalize_output))
-        claimInteract(ctx, Ids.audio_normalize_output, true);
+    _ = ctx.toggleId(Ids.audio_input_monitor, "Input monitor", &app.audio.input_monitor);
+    _ = ctx.toggleId(Ids.audio_normalize_output, "Normalize output", &app.audio.normalize_output);
 
     ctx.label("Output device");
     ctx.beginBox(.{ .direction = .row, .gap = 12 });
     if (ctx.radioId(Ids.audio_output_default, "Default", app.audio.output == .default)) {
         app.audio.output = .default;
-        claimInteract(ctx, Ids.audio_output_default, true);
     }
     if (ctx.radioId(Ids.audio_output_headphones, "Headphones", app.audio.output == .headphones)) {
         app.audio.output = .headphones;
-        claimInteract(ctx, Ids.audio_output_headphones, true);
     }
     ctx.endBox();
 
@@ -636,25 +573,18 @@ fn renderAudio(ctx: *gui.Context, app: *App) void {
     ctx.beginBox(.{ .direction = .row, .gap = 12 });
     if (ctx.radioId(Ids.audio_buffer_low, "Low", app.audio.buffer_size == .low)) {
         app.audio.buffer_size = .low;
-        claimInteract(ctx, Ids.audio_buffer_low, true);
     }
     if (ctx.radioId(Ids.audio_buffer_medium, "Medium", app.audio.buffer_size == .medium)) {
         app.audio.buffer_size = .medium;
-        claimInteract(ctx, Ids.audio_buffer_medium, true);
     }
     if (ctx.radioId(Ids.audio_buffer_high, "High", app.audio.buffer_size == .high)) {
         app.audio.buffer_size = .high;
-        claimInteract(ctx, Ids.audio_buffer_high, true);
     }
     ctx.endBox();
 
     ctx.label("Levels");
-    if (ctx.sliderI32Id(Ids.audio_master_volume, "Master volume", &app.audio.master_volume, .{ .min = 0, .max = 100, .step = 1, .track_w = 180 }))
-        claimInteract(ctx, Ids.audio_master_volume, true);
-    if (ctx.state.active_id == Ids.audio_master_volume) claimInteract(ctx, Ids.audio_master_volume, true);
-    if (ctx.sliderF32Id(Ids.audio_balance, "Balance", &app.audio.balance, .{ .min = -1.0, .max = 1.0, .step = 0.05, .track_w = 180 }))
-        claimInteract(ctx, Ids.audio_balance, true);
-    if (ctx.state.active_id == Ids.audio_balance) claimInteract(ctx, Ids.audio_balance, true);
+    _ = ctx.sliderI32Id(Ids.audio_master_volume, "Master volume", &app.audio.master_volume, .{ .min = 0, .max = 100, .step = 1, .track_w = 180 });
+    _ = ctx.sliderF32Id(Ids.audio_balance, "Balance", &app.audio.balance, .{ .min = -1.0, .max = 1.0, .step = 0.05, .track_w = 180 });
 
     ctx.label("Cache");
     _ = ctx.textInputId(Ids.audio_cache_path, app.audio.audio_cache_path, .{

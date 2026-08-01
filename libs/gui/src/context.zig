@@ -134,6 +134,12 @@ pub const Context = struct {
     /// Explicit-ID (cfg.id != 0) node id → {rect, clip}. GPA-owned, survives across frames, and
     /// is updated only in endFrame (first half of the frame still holds previous-frame values = sync hit-test contract).
     rect_cache: std.AutoHashMapUnmanaged(Id, CachedRect) = .empty,
+    /// Widgets that took part in keyboard focus traversal this frame, in submission order —
+    /// which is draw order, so Tab walks the interface the way it looks. Cleared every frame with
+    /// the capacity kept, so a steady interface reallocates nothing after the first frame.
+    focus_order: std.ArrayList(Id) = .empty,
+    /// A Tab press waiting to be resolved at the end of the frame, once `focus_order` is complete.
+    focus_move: enum { none, next, prev } = .none,
     /// Scroll-area begin→end state stack (supports nesting). Not on the arena (push/pop within the frame).
     scroll_stack: std.ArrayList(ScrollState) = .empty,
     /// Unconsumed wheel delta for the frame (seeded from input.scroll_delta at the first endScrollArea).
@@ -231,6 +237,7 @@ pub const Context = struct {
     pub fn deinit(self: *Context) void {
         self.rect_cache.deinit(self.gpa);
         self.per_id_state.deinit(self.gpa);
+        self.focus_order.deinit(self.gpa);
         self.scroll_stack.deinit(self.gpa);
         self.draw_list.deinit();
         self.id_stack.deinit();
@@ -269,6 +276,8 @@ pub const Context = struct {
         self.state.beginFrame();
         self.per_id_state.beginFrame();
         self.composition = .{};
+        self.focus_order.clearRetainingCapacity();
+        self.focus_move = .none;
         self.wheel_remaining = .{};
         self.wheel_remaining_seeded = false;
         // tooltip frame-local (continuous-hover id/start/rect persist across frames)
@@ -314,16 +323,29 @@ pub const Context = struct {
             self.tooltip_hover_id = 0;
         }
         self.frame_active = false;
+        // Tab moves the focus forward, Shift+Tab back. The event is read but not consumed, so an
+        // application that gives Tab its own meaning still sees it.
+        if (self.input.pressedPlain(input_mod.key.tab, input_mod.mod.shift, input_mod.mod.ctrl | input_mod.mod.alt | input_mod.mod.cmd)) {
+            self.focus_move = .prev;
+        } else if (self.input.pressedPlain(input_mod.key.tab, 0, input_mod.mod.all)) {
+            self.focus_move = .next;
+        }
+        // A frame the pointer is taking part in belongs to the pointer, so any Tab in it is dropped.
+        if (self.pointerEngaged()) self.focus_move = .none;
         // Clear keyboard focus only when no focused TextInput-like widget claimed an outside click this frame.
         // Frames with no mouse down keep focus.
         if (self.input.mouse_pressed.left and !self.state.focus_claimed_this_frame) {
             self.state.focused_id = 0;
+            self.state.focus_visible = false;
         }
         // If the active widget was not evaluated this frame (hidden / branched away) and the button is
         // already released, clear active_id to prevent stickiness (wantsMouse drag-along).
         if (self.state.active_id != 0 and !self.state.active_submitted and !self.input.mouse_buttons.left) {
             self.state.active_id = 0;
         }
+        // Tab traversal, after the draw commands are out (so the move shows next frame) and before
+        // the trim below (so the widget just focused is protected from it).
+        self.resolveFocusMove();
         // PerIdStateStore LRU trim. Frame boundary only. Protects visible and in-use IDs.
         self.per_id_state.trim(.{
             .active_id = self.state.active_id,
@@ -360,10 +382,14 @@ pub const Context = struct {
 
     /// Claim keyboard focus when a widget sees mouse down. Per-ID selection state
     /// lives in a separate store, so switching focus does not clear the selection.
+    ///
+    /// The focus this gives is not "focus-visible": no ring is drawn, because the caller already
+    /// knows where it put the focus. Only Tab traversal raises the ring.
     pub fn claimFocus(self: *Context, id: Id) bool {
         std.debug.assert(self.frame_active);
         if (id == 0) return false;
         self.state.focused_id = id;
+        self.state.focus_visible = false;
         self.state.focus_claimed_this_frame = true;
         return true;
     }
@@ -373,10 +399,120 @@ pub const Context = struct {
     pub fn releaseFocus(self: *Context) void {
         std.debug.assert(self.frame_active);
         self.state.focused_id = 0;
+        self.state.focus_visible = false;
     }
 
     pub fn focusedId(self: *const Context) Id {
         return self.state.focused_id;
+    }
+
+    /// Whether `id` holds a focus that was reached with the keyboard, and so should show a ring.
+    /// The ring itself is drawn by endFrame; this is for callers that want to match it.
+    pub fn isFocusVisible(self: *const Context, id: Id) bool {
+        return id != 0 and self.state.focused_id == id and self.state.focus_visible;
+    }
+
+    /// Enter `id` into this frame's Tab traversal, at the point it is submitted.
+    ///
+    /// Widgets call this themselves; an application only calls it for something it draws and
+    /// hit-tests by hand. Submitting the widget is what puts it in the order, so a widget behind a
+    /// closed branch leaves the order on its own. A widget behind an open popup is not submitted
+    /// for these purposes at all — see the popup guard in `buttonBehavior`.
+    ///
+    /// Runs once per focusable widget per frame; the append is amortised free after the first
+    /// frame because `focus_order` keeps its capacity.
+    pub fn registerFocusable(self: *Context, id: Id) void {
+        std.debug.assert(self.frame_active);
+        if (id == 0 or self.popup_state != null) return;
+        self.focus_order.append(self.gpa, id) catch @panic("Context.registerFocusable: OOM");
+    }
+
+    /// Whether the pointer is taking part in this frame — pressed now, or still held from an
+    /// earlier frame in the middle of a drag.
+    ///
+    /// Keyboard focus stands down for such a frame: Tab does not move, Space and Enter do not
+    /// activate, and arrow keys do not step a slider. A press states plainly what the user means
+    /// to operate, and a drag in progress owns the widget it grabbed until it is let go — moving
+    /// the focus out from under either one would act on something the user is not looking at.
+    pub fn pointerEngaged(self: *const Context) bool {
+        return self.input.mouse_pressed.left or self.input.mouse_buttons.left;
+    }
+
+    /// Whether `id` can be reached by Tab given the geometry it ended up with this frame.
+    /// A widget that was submitted but laid out to nothing, or fully clipped away, is invisible to
+    /// the user and so must be invisible to traversal.
+    fn focusReachable(self: *const Context, id: Id) bool {
+        const cached = self.rect_cache.get(id) orelse return false;
+        if (cached.rect.w == 0 or cached.rect.h == 0) return false;
+        const visible = Rect.intersect(cached.rect, cached.clip);
+        return visible.w > 0 and visible.h > 0;
+    }
+
+    /// Move the focus to the next or previous entry of this frame's traversal order.
+    ///
+    /// Called from endFrame after the draw commands are emitted, so the move lands on the *next*
+    /// frame's drawing — the same generation rule the previous-frame hit-test follows (ADR-016).
+    fn resolveFocusMove(self: *Context) void {
+        const direction = self.focus_move;
+        if (direction == .none) return;
+
+        // Reachability is decided from the rect cache endFrame has just refreshed, so this reads
+        // the geometry of the frame that is ending, not of the one before it.
+        var reachable: usize = 0;
+        for (self.focus_order.items) |id| {
+            if (self.focusReachable(id)) reachable += 1;
+        }
+        // Nothing to land on. Leaving focus_claimed_this_frame alone matters: raising it here would
+        // suppress the outside-click clear for a move that never happened.
+        if (reachable == 0) return;
+
+        const current = self.state.focused_id;
+        var current_index: ?usize = null;
+        for (self.focus_order.items, 0..) |id, i| {
+            if (id == current and self.focusReachable(id)) {
+                current_index = i;
+                break;
+            }
+        }
+
+        const next_id = if (current_index) |start| blk: {
+            // Step over unreachable entries, wrapping at the ends. At most one lap: `reachable` is
+            // non-zero, so a reachable entry is always found.
+            const len = self.focus_order.items.len;
+            var step: usize = 1;
+            while (step <= len) : (step += 1) {
+                const i = switch (direction) {
+                    .next => (start + step) % len,
+                    .prev => (start + len - (step % len)) % len,
+                    .none => unreachable,
+                };
+                const id = self.focus_order.items[i];
+                if (self.focusReachable(id)) break :blk id;
+            }
+            break :blk current;
+        } else blk: {
+            // The focus is gone (or was never in the order): start from whichever end the
+            // direction implies.
+            switch (direction) {
+                .next => for (self.focus_order.items) |id| {
+                    if (self.focusReachable(id)) break :blk id;
+                },
+                .prev => {
+                    var i = self.focus_order.items.len;
+                    while (i > 0) {
+                        i -= 1;
+                        const id = self.focus_order.items[i];
+                        if (self.focusReachable(id)) break :blk id;
+                    }
+                },
+                .none => unreachable,
+            }
+            unreachable; // reachable > 0 was checked above
+        };
+
+        self.state.focused_id = next_id;
+        self.state.focus_visible = true;
+        self.state.focus_claimed_this_frame = true;
     }
 
     pub fn now(self: *const Context) f64 {
@@ -567,6 +703,18 @@ pub const Context = struct {
         if (node.cfg.clip_children) self.draw_list.popClip();
         if (node.cfg.border) |b| {
             self.draw_list.rectOutline(node.rect, b.color, b.thickness) catch
+                @panic("Context.endFrame: OOM");
+        }
+        // Focus ring, on the same terms as the border: this frame's rect, after popClip, so it sits
+        // above the children and is clipped by the ancestor rather than by the node's own clip.
+        // A widget draws no ring of its own — the ring belongs to whichever node carries the id, and
+        // updateRectCache has already asserted that only one node per frame does.
+        // A ring behind an open popup would point at a widget the popup has taken input away from,
+        // so none is drawn while one is open.
+        if (self.popup_state == null and self.state.focus_visible and
+            node.cfg.id != 0 and node.cfg.id == self.state.focused_id)
+        {
+            self.draw_list.rectOutline(node.rect, self.style.focus_ring, self.style.focus_ring_thickness) catch
                 @panic("Context.endFrame: OOM");
         }
     }
@@ -1531,4 +1679,319 @@ test "tooltip: if not built this frame, no stale overlay appears" {
     ctx.endFrame();
     try std.testing.expect(!tooltipHasText(&ctx, "stale"));
     try std.testing.expectEqual(@as(Id, 0), ctx.tooltip_hover_id);
+}
+
+// ── Keyboard focus traversal ──
+
+const key = input_mod.key;
+const mod_bits = input_mod.mod;
+
+fn tabEvent(ctx: *Context, modifiers: u32) void {
+    ctx.pushEvent(.{ .key_down = .{ .code = key.tab, .modifiers = modifiers, .repeat = false } });
+}
+
+/// Submit `ids` as a row of focusable boxes of the given size and end the frame.
+fn focusFrame(ctx: *Context, ids: []const Id, w: i32, h: i32) void {
+    for (ids) |id| {
+        ctx.registerFocusable(id);
+        ctx.beginBox(.{ .id = id, .width = .{ .fixed = w }, .height = .{ .fixed = h } });
+        ctx.endBox();
+    }
+}
+
+test "focus traversal: Tab walks submission order forward and Shift+Tab back, wrapping at both ends" {
+    var ctx = testCtx();
+    defer ctx.deinit();
+    const ids = [_]Id{ 1, 2, 3 };
+
+    // Frame 1 only registers the order; nothing is focused yet, so Tab starts at the first entry.
+    ctx.beginFrame(800, 600);
+    focusFrame(&ctx, &ids, 40, 20);
+    tabEvent(&ctx, 0);
+    ctx.endFrame();
+    try std.testing.expectEqual(@as(Id, 1), ctx.state.focused_id);
+    try std.testing.expect(ctx.state.focus_visible);
+
+    ctx.beginFrame(800, 600);
+    focusFrame(&ctx, &ids, 40, 20);
+    tabEvent(&ctx, 0);
+    ctx.endFrame();
+    try std.testing.expectEqual(@as(Id, 2), ctx.state.focused_id);
+
+    // Forward off the end wraps to the front.
+    ctx.beginFrame(800, 600);
+    focusFrame(&ctx, &ids, 40, 20);
+    tabEvent(&ctx, 0);
+    ctx.endFrame();
+    try std.testing.expectEqual(@as(Id, 3), ctx.state.focused_id);
+    ctx.beginFrame(800, 600);
+    focusFrame(&ctx, &ids, 40, 20);
+    tabEvent(&ctx, 0);
+    ctx.endFrame();
+    try std.testing.expectEqual(@as(Id, 1), ctx.state.focused_id);
+
+    // Backward off the front wraps to the end.
+    ctx.beginFrame(800, 600);
+    focusFrame(&ctx, &ids, 40, 20);
+    tabEvent(&ctx, mod_bits.shift);
+    ctx.endFrame();
+    try std.testing.expectEqual(@as(Id, 3), ctx.state.focused_id);
+}
+
+test "focus traversal: Shift is read from the Tab event, not from the last event of the frame" {
+    var ctx = testCtx();
+    defer ctx.deinit();
+    const ids = [_]Id{ 1, 2, 3 };
+
+    ctx.beginFrame(800, 600);
+    focusFrame(&ctx, &ids, 40, 20);
+    tabEvent(&ctx, 0);
+    ctx.endFrame();
+    try std.testing.expectEqual(@as(Id, 1), ctx.state.focused_id);
+
+    // Shift+Tab arrives first, an unmodified key after it. Reading the frame's trailing modifier
+    // state would lose the Shift and step forward instead of back.
+    ctx.beginFrame(800, 600);
+    focusFrame(&ctx, &ids, 40, 20);
+    tabEvent(&ctx, mod_bits.shift);
+    ctx.pushEvent(.{ .key_down = .{ .code = 'A', .modifiers = 0, .repeat = false } });
+    ctx.endFrame();
+    try std.testing.expectEqual(@as(Id, 3), ctx.state.focused_id);
+}
+
+test "focus traversal: auto-repeat and modified Tab do not move the focus" {
+    var ctx = testCtx();
+    defer ctx.deinit();
+    const ids = [_]Id{ 1, 2 };
+
+    ctx.beginFrame(800, 600);
+    focusFrame(&ctx, &ids, 40, 20);
+    ctx.pushEvent(.{ .key_down = .{ .code = key.tab, .modifiers = 0, .repeat = true } });
+    ctx.endFrame();
+    try std.testing.expectEqual(@as(Id, 0), ctx.state.focused_id);
+
+    ctx.beginFrame(800, 600);
+    focusFrame(&ctx, &ids, 40, 20);
+    tabEvent(&ctx, mod_bits.cmd);
+    ctx.endFrame();
+    try std.testing.expectEqual(@as(Id, 0), ctx.state.focused_id);
+}
+
+test "focus traversal: a widget that stops being submitted leaves the order" {
+    var ctx = testCtx();
+    defer ctx.deinit();
+
+    ctx.beginFrame(800, 600);
+    focusFrame(&ctx, &.{ 1, 2, 3 }, 40, 20);
+    tabEvent(&ctx, 0);
+    ctx.endFrame();
+    try std.testing.expectEqual(@as(Id, 1), ctx.state.focused_id);
+
+    // 2 is gone this frame, so Tab from 1 lands on 3.
+    ctx.beginFrame(800, 600);
+    focusFrame(&ctx, &.{ 1, 3 }, 40, 20);
+    tabEvent(&ctx, 0);
+    ctx.endFrame();
+    try std.testing.expectEqual(@as(Id, 3), ctx.state.focused_id);
+}
+
+test "focus traversal: a submitted widget laid out to nothing is skipped" {
+    var ctx = testCtx();
+    defer ctx.deinit();
+
+    ctx.beginFrame(800, 600);
+    ctx.registerFocusable(1);
+    ctx.beginBox(.{ .id = 1, .width = .{ .fixed = 40 }, .height = .{ .fixed = 20 } });
+    ctx.endBox();
+    // Submitted, focusable, and zero-size: invisible to the user, so invisible to Tab.
+    ctx.registerFocusable(2);
+    ctx.beginBox(.{ .id = 2, .width = .{ .fixed = 0 }, .height = .{ .fixed = 0 } });
+    ctx.endBox();
+    ctx.registerFocusable(3);
+    ctx.beginBox(.{ .id = 3, .width = .{ .fixed = 40 }, .height = .{ .fixed = 20 } });
+    ctx.endBox();
+    tabEvent(&ctx, 0);
+    ctx.endFrame();
+    try std.testing.expectEqual(@as(Id, 1), ctx.state.focused_id);
+
+    ctx.beginFrame(800, 600);
+    ctx.registerFocusable(1);
+    ctx.beginBox(.{ .id = 1, .width = .{ .fixed = 40 }, .height = .{ .fixed = 20 } });
+    ctx.endBox();
+    ctx.registerFocusable(2);
+    ctx.beginBox(.{ .id = 2, .width = .{ .fixed = 0 }, .height = .{ .fixed = 0 } });
+    ctx.endBox();
+    ctx.registerFocusable(3);
+    ctx.beginBox(.{ .id = 3, .width = .{ .fixed = 40 }, .height = .{ .fixed = 20 } });
+    ctx.endBox();
+    tabEvent(&ctx, 0);
+    ctx.endFrame();
+    try std.testing.expectEqual(@as(Id, 3), ctx.state.focused_id);
+}
+
+test "focus traversal: with nothing reachable the focus stays put and an outside click still clears it" {
+    var ctx = testCtx();
+    defer ctx.deinit();
+
+    ctx.beginFrame(800, 600);
+    focusFrame(&ctx, &.{1}, 40, 20);
+    tabEvent(&ctx, 0);
+    ctx.endFrame();
+    try std.testing.expectEqual(@as(Id, 1), ctx.state.focused_id);
+
+    // Only a zero-size candidate is left. The move must not happen, and must not mark the frame as
+    // having claimed focus — otherwise the click below would be swallowed.
+    ctx.beginFrame(800, 600);
+    ctx.registerFocusable(2);
+    ctx.beginBox(.{ .id = 2, .width = .{ .fixed = 0 }, .height = .{ .fixed = 0 } });
+    ctx.endBox();
+    tabEvent(&ctx, 0);
+    ctx.pushEvent(.{ .mouse_down = .{ .x = 700, .y = 500, .button = 0, .modifiers = 0 } });
+    ctx.endFrame();
+    try std.testing.expectEqual(@as(Id, 0), ctx.state.focused_id);
+    try std.testing.expect(!ctx.state.focus_visible);
+}
+
+test "focus traversal: a pointer press in the same frame beats a pending Tab" {
+    var ctx = testCtx();
+    defer ctx.deinit();
+    const ids = [_]Id{ 1, 2, 3 };
+
+    ctx.beginFrame(800, 600);
+    focusFrame(&ctx, &ids, 40, 20);
+    tabEvent(&ctx, 0);
+    ctx.endFrame();
+    try std.testing.expectEqual(@as(Id, 1), ctx.state.focused_id);
+
+    // Tab plus a click that claims focus elsewhere: the click wins and the ring stays off.
+    ctx.beginFrame(800, 600);
+    focusFrame(&ctx, &ids, 40, 20);
+    tabEvent(&ctx, 0);
+    ctx.pushEvent(.{ .mouse_down = .{ .x = 5, .y = 5, .button = 0, .modifiers = 0 } });
+    _ = ctx.claimFocus(3);
+    ctx.endFrame();
+    try std.testing.expectEqual(@as(Id, 3), ctx.state.focused_id);
+    try std.testing.expect(!ctx.state.focus_visible);
+
+    // Tab plus a click that claims nothing: the click drops the focus rather than the Tab moving it.
+    ctx.beginFrame(800, 600);
+    focusFrame(&ctx, &ids, 40, 20);
+    tabEvent(&ctx, 0);
+    ctx.pushEvent(.{ .mouse_down = .{ .x = 700, .y = 500, .button = 0, .modifiers = 0 } });
+    ctx.endFrame();
+    try std.testing.expectEqual(@as(Id, 0), ctx.state.focused_id);
+}
+
+test "focus traversal: claimFocus focuses without raising the ring" {
+    var ctx = testCtx();
+    defer ctx.deinit();
+
+    ctx.beginFrame(800, 600);
+    focusFrame(&ctx, &.{ 1, 2 }, 40, 20);
+    tabEvent(&ctx, 0);
+    ctx.endFrame();
+    try std.testing.expect(ctx.isFocusVisible(1));
+
+    ctx.beginFrame(800, 600);
+    focusFrame(&ctx, &.{ 1, 2 }, 40, 20);
+    _ = ctx.claimFocus(2);
+    ctx.endFrame();
+    try std.testing.expectEqual(@as(Id, 2), ctx.state.focused_id);
+    try std.testing.expect(!ctx.isFocusVisible(2));
+}
+
+test "focus traversal: an open popup takes widgets out of the order" {
+    var ctx = testCtx();
+    defer ctx.deinit();
+
+    ctx.beginFrame(800, 600);
+    focusFrame(&ctx, &.{ 1, 2 }, 40, 20);
+    ctx.endFrame();
+
+    ctx.popup_state = .{ .id = 99, .pos = .{ .x = 0, .y = 0 } };
+    ctx.beginFrame(800, 600);
+    focusFrame(&ctx, &.{ 1, 2 }, 40, 20);
+    tabEvent(&ctx, 0);
+    ctx.endFrame();
+    try std.testing.expectEqual(@as(usize, 0), ctx.focus_order.items.len);
+    try std.testing.expectEqual(@as(Id, 0), ctx.state.focused_id);
+}
+
+test "focus traversal: focus_order does not reallocate once the interface has settled" {
+    var ctx = testCtx();
+    defer ctx.deinit();
+    const ids = [_]Id{ 1, 2, 3, 4, 5, 6, 7, 8 };
+
+    // Warm up: the first frames grow the list to its working size.
+    for (0..3) |_| {
+        ctx.beginFrame(800, 600);
+        focusFrame(&ctx, &ids, 40, 20);
+        ctx.endFrame();
+    }
+    const settled = ctx.focus_order.capacity;
+    try std.testing.expect(settled >= ids.len);
+
+    for (0..20) |_| {
+        ctx.beginFrame(800, 600);
+        focusFrame(&ctx, &ids, 40, 20);
+        ctx.endFrame();
+        try std.testing.expectEqual(settled, ctx.focus_order.capacity);
+    }
+}
+
+test "focus traversal: a Tab during a drag does not pull the focus off the dragged widget" {
+    var ctx = testCtx();
+    defer ctx.deinit();
+    const ids = [_]Id{ 1, 2, 3 };
+
+    ctx.beginFrame(800, 600);
+    focusFrame(&ctx, &ids, 40, 20);
+    ctx.pushEvent(.{ .mouse_down = .{ .x = 5, .y = 5, .button = 0, .modifiers = 0 } });
+    _ = ctx.claimFocus(1);
+    ctx.endFrame();
+    try std.testing.expectEqual(@as(Id, 1), ctx.state.focused_id);
+
+    // Second frame of the drag: the button is still down, no fresh press. Tab must not move the
+    // focus out from under a widget the pointer is holding.
+    ctx.beginFrame(800, 600);
+    focusFrame(&ctx, &ids, 40, 20);
+    tabEvent(&ctx, 0);
+    _ = ctx.claimFocus(1);
+    ctx.endFrame();
+    try std.testing.expectEqual(@as(Id, 1), ctx.state.focused_id);
+
+    // Released: Tab works again.
+    ctx.beginFrame(800, 600);
+    focusFrame(&ctx, &ids, 40, 20);
+    ctx.pushEvent(.{ .mouse_up = .{ .x = 5, .y = 5, .button = 0, .modifiers = 0 } });
+    tabEvent(&ctx, 0);
+    ctx.endFrame();
+    try std.testing.expectEqual(@as(Id, 2), ctx.state.focused_id);
+}
+
+test "focus traversal: with the focus outside the order, next takes the first and prev the last" {
+    var ctx = testCtx();
+    defer ctx.deinit();
+
+    ctx.beginFrame(800, 600);
+    focusFrame(&ctx, &.{ 1, 2, 3 }, 40, 20);
+    _ = ctx.claimFocus(99); // never submitted
+    ctx.endFrame();
+
+    ctx.beginFrame(800, 600);
+    focusFrame(&ctx, &.{ 1, 2, 3 }, 40, 20);
+    tabEvent(&ctx, 0);
+    ctx.endFrame();
+    try std.testing.expectEqual(@as(Id, 1), ctx.state.focused_id);
+
+    ctx.beginFrame(800, 600);
+    focusFrame(&ctx, &.{ 1, 2, 3 }, 40, 20);
+    _ = ctx.claimFocus(99);
+    ctx.endFrame();
+
+    ctx.beginFrame(800, 600);
+    focusFrame(&ctx, &.{ 1, 2, 3 }, 40, 20);
+    tabEvent(&ctx, mod_bits.shift);
+    ctx.endFrame();
+    try std.testing.expectEqual(@as(Id, 3), ctx.state.focused_id);
 }

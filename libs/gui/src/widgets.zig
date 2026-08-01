@@ -53,6 +53,13 @@ pub const SelectableLabelOpts = struct {
     text_color: ?Color = null,
     /// null → `Context.style.selection_background`
     selection_background: ?Color = null,
+    /// Whether Tab can reach this label.
+    ///
+    /// Off by default, because a selectable label is a piece of text a user may drag across rather
+    /// than a control they operate, and a list built out of them would otherwise turn every row
+    /// into a Tab stop. Turn it on for the ones that really are controls, such as the entries of a
+    /// navigation sidebar.
+    focusable: bool = false,
 };
 
 pub const SelectableLabelResult = struct {
@@ -307,13 +314,42 @@ const IconButtonDraw = struct {
 /// not shown last frame) are non-hits (sync hit-test contract).
 /// Records last-widget info on Context additively (return value and hit-test behavior unchanged).
 /// Tooltips use `result.hovered` (raw `buttonBehavior` value), not `state.hot_id`.
+/// Whether a widget holding the focus is being activated from the keyboard this frame.
+///
+/// Space and Enter both activate, matching what a button does everywhere else. A modifier turns
+/// the chord into something else (Cmd+Space belongs to the system, Shift+Enter to text), so only
+/// the bare key counts, and auto-repeat does not activate twice.
+///
+/// While a popup is open it never fires: the popup has taken over input, and the focus left behind
+/// it still points at a background widget. Nor does it fire in a frame the pointer is taking part
+/// in, for the reason `pointerEngaged` gives.
+fn keyboardActivated(ctx: *const Context, id: Id) bool {
+    if (id == 0 or ctx.state.focused_id != id) return false;
+    if (ctx.popup_state != null or ctx.pointerEngaged()) return false;
+    const all = input_mod.mod.all;
+    return ctx.input.pressedPlain(input_mod.key.space, 0, all) or
+        ctx.input.pressedPlain(input_mod.key.enter, 0, all);
+}
+
+/// Shared pointer + keyboard behaviour for every widget that behaves like a button.
+///
+/// Beyond the hit-test it does three things that make the widget a keyboard citizen: it enters the
+/// widget into this frame's Tab order, it takes the focus when the pointer presses it, and it
+/// reports Space/Enter as a click.
 fn behaviorFromCache(ctx: *Context, id: Id) ButtonResult {
+    ctx.registerFocusable(id);
     const cached = ctx.rect_cache.get(id) orelse {
         // Still record as last widget when cache is missing (`hovered=false`); tooltip can no-op.
         ctx.noteLastInteractive(id, .{ .x = 0, .y = 0, .w = 0, .h = 0 }, false);
+        // No geometry yet means nothing the user can see, and Tab already refuses to land on such
+        // a widget. Keyboard activation follows the same line, so a stale focus on something that
+        // has gone out of the layout cannot be operated.
         return .{};
     };
-    const result = context_mod.buttonBehavior(ctx, id, cached.rect, cached.clip);
+    var result = context_mod.buttonBehavior(ctx, id, cached.rect, cached.clip);
+    // Pressing a widget focuses it, so a pointer and the keyboard agree on where the focus is.
+    if (result.held) _ = ctx.claimFocus(id);
+    if (keyboardActivated(ctx, id)) result.clicked = true;
     ctx.noteLastInteractive(id, cached.rect, result.hovered);
     return result;
 }
@@ -333,6 +369,8 @@ pub fn selectableLabelId(
 ) SelectableLabelResult {
     std.debug.assert(ctx.frame_active);
     std.debug.assert(id != 0);
+
+    if (opts.focusable) ctx.registerFocusable(id);
 
     // Layout arrays live in the per-frame arena. Built with O(codepoint) work at the widget call,
     // and must outlive through the endFrame custom-leaf callback.
@@ -461,6 +499,10 @@ pub fn textInputId(
 ) TextInputResult {
     std.debug.assert(ctx.frame_active);
     std.debug.assert(id != 0);
+
+    // A text field is a control, so Tab reaches it alongside the buttons and checkboxes. It keeps
+    // its own handling of the keys it cares about; Tab is not one of them.
+    ctx.registerFocusable(id);
 
     var text_layout = text_edit.buildTextLayout(ctx.allocator(), ctx.font, buffer.slice()) catch
         @panic("textInput: OOM");
@@ -936,6 +978,18 @@ const SliderSpec = struct {
     is_float: bool,
 };
 
+/// How far one arrow-key press moves a slider.
+///
+/// An explicit `step` is what the caller wants a press to mean, so it wins. Otherwise an integer
+/// slider moves by one — the smallest change it can represent — and a float slider by a hundredth
+/// of its range. Giving an integer slider a fraction of its range instead would round most presses
+/// back to where they started, leaving the arrow keys apparently dead on short ranges.
+fn keyStep(spec: SliderSpec) f64 {
+    if (spec.step) |s| return s;
+    if (!spec.is_float) return 1;
+    return (spec.max - spec.min) / 100;
+}
+
 /// Range the knob center can travel [lo, lo+span] (px, f64). Margin of knob_w/2 on each side of the track.
 const KnobRange = struct { lo: f64, span: f64 };
 fn knobRange(track: Rect, knob_w: i32) KnobRange {
@@ -977,6 +1031,8 @@ fn sliderCore(ctx: *Context, id: Id, label: []const u8, cur: f64, spec: SliderSp
     // Clamp into range for display/hit-test (exact clamp; safe every frame, no drift).
     var value = std.math.clamp(cur, spec.min, spec.max);
 
+    ctx.registerFocusable(id);
+
     // hit-test / drag (take active from previous-frame track’s knob rect)
     if (ctx.rect_cache.get(id)) |cached| {
         const track = cached.rect;
@@ -985,10 +1041,24 @@ fn sliderCore(ctx: *Context, id: Id, label: []const u8, cur: f64, spec: SliderSp
         const kr = knobRectFor(track, knob_w, knob_h, frac);
         const res = context_mod.buttonBehavior(ctx, id, kr, cached.clip);
         if (res.held) {
+            _ = ctx.claimFocus(id);
             const mx: f64 = @floatFromInt(ctx.input.mouse_pos.x);
             const t = std.math.clamp((mx - range.lo) / range.span, 0, 1);
             value = clampAndStep(spec.min + t * (spec.max - spec.min), spec); // Apply step only while dragging
         }
+    }
+
+    // Arrow keys nudge the focused slider by one step, in the reading direction: right and up
+    // raise the value, left and down lower it. Suppressed on the same terms as Space and Enter,
+    // so a drag in progress is never fought over.
+    if (ctx.state.focused_id == id and ctx.popup_state == null and !ctx.pointerEngaged()) {
+        const all = input_mod.mod.all;
+        var delta: f64 = 0;
+        if (ctx.input.pressedPlain(input_mod.key.right, 0, all) or
+            ctx.input.pressedPlain(input_mod.key.up, 0, all)) delta += 1;
+        if (ctx.input.pressedPlain(input_mod.key.left, 0, all) or
+            ctx.input.pressedPlain(input_mod.key.down, 0, all)) delta -= 1;
+        if (delta != 0) value = clampAndStep(value + delta * keyStep(spec), spec);
     }
 
     // Build/draw: [label] [track(id)] [value text]
@@ -4536,4 +4606,272 @@ fn focusTextInputOpts(ctx: *Context, id: Id, buffer: *TextBuffer, opts: TextInpu
     clickAt(ctx, rect.x + 8, rect.y + 8);
     _ = ctx.textInputId(id, buffer, opts);
     ctx.endFrame();
+}
+
+// ── Keyboard focus and activation ──
+
+test "keyboard: Space and Enter activate the focused button, modifiers and repeat do not" {
+    var ctx = testCtx();
+    defer ctx.deinit();
+    const id: Id = 1;
+
+    // Frame 1 builds the rect cache the behaviour reads from.
+    ctx.beginFrame(800, 600);
+    _ = buttonId(&ctx, id, "ok", .{});
+    ctx.endFrame();
+
+    // Tab focuses it; the button is not clicked by the Tab itself.
+    ctx.beginFrame(800, 600);
+    const tabbed = buttonId(&ctx, id, "ok", .{});
+    ctx.pushEvent(.{ .key_down = .{ .code = input_mod.key.tab, .modifiers = 0, .repeat = false } });
+    try std.testing.expect(!tabbed.clicked);
+    ctx.endFrame();
+    try std.testing.expect(ctx.isFocusVisible(id));
+
+    ctx.beginFrame(800, 600);
+    ctx.pushEvent(.{ .key_down = .{ .code = input_mod.key.space, .modifiers = 0, .repeat = false } });
+    try std.testing.expect(buttonId(&ctx, id, "ok", .{}).clicked);
+    ctx.endFrame();
+
+    ctx.beginFrame(800, 600);
+    ctx.pushEvent(.{ .key_down = .{ .code = input_mod.key.enter, .modifiers = 0, .repeat = false } });
+    try std.testing.expect(buttonId(&ctx, id, "ok", .{}).clicked);
+    ctx.endFrame();
+
+    // Auto-repeat is the key still being held, not a new press.
+    ctx.beginFrame(800, 600);
+    ctx.pushEvent(.{ .key_down = .{ .code = input_mod.key.space, .modifiers = 0, .repeat = true } });
+    try std.testing.expect(!buttonId(&ctx, id, "ok", .{}).clicked);
+    ctx.endFrame();
+
+    // A chord belongs to whoever owns the chord, not to the focused button.
+    ctx.beginFrame(800, 600);
+    ctx.pushEvent(.{ .key_down = .{ .code = input_mod.key.space, .modifiers = input_mod.mod.cmd, .repeat = false } });
+    try std.testing.expect(!buttonId(&ctx, id, "ok", .{}).clicked);
+    ctx.endFrame();
+}
+
+test "keyboard: an unfocused button is not activated by Space" {
+    var ctx = testCtx();
+    defer ctx.deinit();
+
+    ctx.beginFrame(800, 600);
+    _ = buttonId(&ctx, 1, "a", .{});
+    _ = buttonId(&ctx, 2, "b", .{});
+    ctx.endFrame();
+
+    ctx.beginFrame(800, 600);
+    ctx.pushEvent(.{ .key_down = .{ .code = input_mod.key.tab, .modifiers = 0, .repeat = false } });
+    _ = buttonId(&ctx, 1, "a", .{});
+    _ = buttonId(&ctx, 2, "b", .{});
+    ctx.endFrame();
+    try std.testing.expectEqual(@as(Id, 1), ctx.focusedId());
+
+    ctx.beginFrame(800, 600);
+    ctx.pushEvent(.{ .key_down = .{ .code = input_mod.key.space, .modifiers = 0, .repeat = false } });
+    try std.testing.expect(buttonId(&ctx, 1, "a", .{}).clicked);
+    try std.testing.expect(!buttonId(&ctx, 2, "b", .{}).clicked);
+    ctx.endFrame();
+}
+
+test "keyboard: checkbox, toggle and radio all activate from the keyboard" {
+    var ctx = testCtx();
+    defer ctx.deinit();
+    var checked = false;
+    var toggled = false;
+
+    ctx.beginFrame(800, 600);
+    _ = checkboxId(&ctx, 1, "c", &checked);
+    ctx.endFrame();
+    ctx.beginFrame(800, 600);
+    ctx.pushEvent(.{ .key_down = .{ .code = input_mod.key.tab, .modifiers = 0, .repeat = false } });
+    _ = checkboxId(&ctx, 1, "c", &checked);
+    ctx.endFrame();
+    ctx.beginFrame(800, 600);
+    ctx.pushEvent(.{ .key_down = .{ .code = input_mod.key.space, .modifiers = 0, .repeat = false } });
+    try std.testing.expect(checkboxId(&ctx, 1, "c", &checked));
+    ctx.endFrame();
+    try std.testing.expect(checked);
+
+    ctx.beginFrame(800, 600);
+    _ = toggleId(&ctx, 2, "t", &toggled);
+    ctx.endFrame();
+    ctx.beginFrame(800, 600);
+    _ = ctx.claimFocus(2);
+    _ = toggleId(&ctx, 2, "t", &toggled);
+    ctx.endFrame();
+    ctx.beginFrame(800, 600);
+    ctx.pushEvent(.{ .key_down = .{ .code = input_mod.key.enter, .modifiers = 0, .repeat = false } });
+    try std.testing.expect(toggleId(&ctx, 2, "t", &toggled));
+    ctx.endFrame();
+    try std.testing.expect(toggled);
+
+    ctx.beginFrame(800, 600);
+    _ = radioId(&ctx, 3, "r", false);
+    ctx.endFrame();
+    ctx.beginFrame(800, 600);
+    _ = ctx.claimFocus(3);
+    _ = radioId(&ctx, 3, "r", false);
+    ctx.endFrame();
+    ctx.beginFrame(800, 600);
+    ctx.pushEvent(.{ .key_down = .{ .code = input_mod.key.space, .modifiers = 0, .repeat = false } });
+    try std.testing.expect(radioId(&ctx, 3, "r", false));
+    ctx.endFrame();
+}
+
+test "keyboard: arrow keys step an integer slider by one and a float slider by a hundredth" {
+    var ctx = testCtx();
+    defer ctx.deinit();
+    var iv: i32 = 5;
+
+    ctx.beginFrame(800, 600);
+    _ = sliderI32Id(&ctx, 1, "i", &iv, .{ .min = 0, .max = 10 });
+    ctx.endFrame();
+    ctx.beginFrame(800, 600);
+    _ = ctx.claimFocus(1);
+    _ = sliderI32Id(&ctx, 1, "i", &iv, .{ .min = 0, .max = 10 });
+    ctx.endFrame();
+
+    // A tenth of the range would round straight back to 5 and the key would look dead.
+    ctx.beginFrame(800, 600);
+    ctx.pushEvent(.{ .key_down = .{ .code = input_mod.key.right, .modifiers = 0, .repeat = false } });
+    _ = sliderI32Id(&ctx, 1, "i", &iv, .{ .min = 0, .max = 10 });
+    ctx.endFrame();
+    try std.testing.expectEqual(@as(i32, 6), iv);
+
+    ctx.beginFrame(800, 600);
+    ctx.pushEvent(.{ .key_down = .{ .code = input_mod.key.left, .modifiers = 0, .repeat = false } });
+    _ = sliderI32Id(&ctx, 1, "i", &iv, .{ .min = 0, .max = 10 });
+    ctx.endFrame();
+    try std.testing.expectEqual(@as(i32, 5), iv);
+
+    var fv: f32 = 0.5;
+    ctx.beginFrame(800, 600);
+    _ = sliderF32Id(&ctx, 2, "f", &fv, .{ .min = 0, .max = 1 });
+    ctx.endFrame();
+    ctx.beginFrame(800, 600);
+    _ = ctx.claimFocus(2);
+    _ = sliderF32Id(&ctx, 2, "f", &fv, .{ .min = 0, .max = 1 });
+    ctx.endFrame();
+    ctx.beginFrame(800, 600);
+    ctx.pushEvent(.{ .key_down = .{ .code = input_mod.key.up, .modifiers = 0, .repeat = false } });
+    _ = sliderF32Id(&ctx, 2, "f", &fv, .{ .min = 0, .max = 1 });
+    ctx.endFrame();
+    try std.testing.expectApproxEqAbs(@as(f32, 0.51), fv, 0.0001);
+}
+
+test "focus: a selectable label joins the Tab order only when asked to" {
+    var ctx = testCtx();
+    defer ctx.deinit();
+
+    ctx.beginFrame(800, 600);
+    _ = selectableLabelId(&ctx, 1, "row", .{});
+    _ = selectableLabelId(&ctx, 2, "nav", .{ .focusable = true });
+    ctx.endFrame();
+    try std.testing.expectEqual(@as(usize, 1), ctx.focus_order.items.len);
+    try std.testing.expectEqual(@as(Id, 2), ctx.focus_order.items[0]);
+}
+
+test "focus: a pressed widget takes the focus without raising the ring" {
+    var ctx = testCtx();
+    defer ctx.deinit();
+    const id: Id = 1;
+
+    ctx.beginFrame(800, 600);
+    _ = buttonId(&ctx, id, "ok", .{});
+    ctx.endFrame();
+    const rect = ctx.rect_cache.get(id).?.rect;
+
+    ctx.beginFrame(800, 600);
+    ctx.pushEvent(.{ .mouse_move = .{ .x = rect.x + 2, .y = rect.y + 2, .modifiers = 0 } });
+    ctx.pushEvent(.{ .mouse_down = .{ .x = rect.x + 2, .y = rect.y + 2, .button = 0, .modifiers = 0 } });
+    _ = buttonId(&ctx, id, "ok", .{});
+    ctx.endFrame();
+    try std.testing.expectEqual(id, ctx.focusedId());
+    try std.testing.expect(!ctx.isFocusVisible(id));
+}
+
+test "keyboard: a press elsewhere in the same frame suppresses activation, whatever the submission order" {
+    // The focused widget must not fire because the pointer went somewhere else in the same frame,
+    // and that must not depend on which of the two is built first.
+    for ([_]bool{ true, false }) |focused_first| {
+        var ctx = testCtx();
+        defer ctx.deinit();
+
+        ctx.beginFrame(800, 600);
+        _ = buttonId(&ctx, 1, "a", .{});
+        _ = buttonId(&ctx, 2, "b", .{});
+        ctx.endFrame();
+        const b_rect = ctx.rect_cache.get(2).?.rect;
+
+        ctx.beginFrame(800, 600);
+        _ = ctx.claimFocus(1);
+        _ = buttonId(&ctx, 1, "a", .{});
+        _ = buttonId(&ctx, 2, "b", .{});
+        ctx.endFrame();
+
+        ctx.beginFrame(800, 600);
+        ctx.pushEvent(.{ .key_down = .{ .code = input_mod.key.space, .modifiers = 0, .repeat = false } });
+        ctx.pushEvent(.{ .mouse_move = .{ .x = b_rect.x + 2, .y = b_rect.y + 2, .modifiers = 0 } });
+        ctx.pushEvent(.{ .mouse_down = .{ .x = b_rect.x + 2, .y = b_rect.y + 2, .button = 0, .modifiers = 0 } });
+        var a_clicked = false;
+        if (focused_first) {
+            a_clicked = buttonId(&ctx, 1, "a", .{}).clicked;
+            _ = buttonId(&ctx, 2, "b", .{});
+        } else {
+            _ = buttonId(&ctx, 2, "b", .{});
+            a_clicked = buttonId(&ctx, 1, "a", .{}).clicked;
+        }
+        ctx.endFrame();
+        try std.testing.expect(!a_clicked);
+    }
+}
+
+test "keyboard: a slider being dragged ignores arrow keys" {
+    var ctx = testCtx();
+    defer ctx.deinit();
+    var v: i32 = 5;
+
+    ctx.beginFrame(800, 600);
+    _ = sliderI32Id(&ctx, 1, "i", &v, .{ .min = 0, .max = 10 });
+    ctx.endFrame();
+
+    ctx.beginFrame(800, 600);
+    ctx.pushEvent(.{ .mouse_down = .{ .x = 5, .y = 5, .button = 0, .modifiers = 0 } });
+    _ = ctx.claimFocus(1);
+    _ = sliderI32Id(&ctx, 1, "i", &v, .{ .min = 0, .max = 10 });
+    ctx.endFrame();
+    const during_press = v;
+
+    // Button still held, arrow pressed: the drag owns the slider.
+    ctx.beginFrame(800, 600);
+    ctx.pushEvent(.{ .key_down = .{ .code = input_mod.key.right, .modifiers = 0, .repeat = false } });
+    _ = sliderI32Id(&ctx, 1, "i", &v, .{ .min = 0, .max = 10 });
+    ctx.endFrame();
+    try std.testing.expectEqual(during_press, v);
+}
+
+test "keyboard: a focused widget that left the layout cannot be activated" {
+    var ctx = testCtx();
+    defer ctx.deinit();
+
+    ctx.beginFrame(800, 600);
+    _ = buttonId(&ctx, 1, "a", .{});
+    ctx.endFrame();
+    ctx.beginFrame(800, 600);
+    _ = ctx.claimFocus(1);
+    _ = buttonId(&ctx, 1, "a", .{});
+    ctx.endFrame();
+
+    // The widget keeps the focus but stops being laid out; a fresh Context has no rect for it at
+    // all. Space must not reach through to it.
+    var fresh = testCtx();
+    defer fresh.deinit();
+    fresh.beginFrame(800, 600);
+    _ = fresh.claimFocus(1);
+    fresh.endFrame();
+    fresh.beginFrame(800, 600);
+    fresh.pushEvent(.{ .key_down = .{ .code = input_mod.key.space, .modifiers = 0, .repeat = false } });
+    try std.testing.expect(!buttonId(&fresh, 1, "a", .{}).clicked);
+    fresh.endFrame();
 }

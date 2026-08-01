@@ -172,8 +172,15 @@ pub const InteractionState = struct {
     hot_id: Id = 0, // Previous-frame settled hover ID (for drawing; stable)
     active_id: Id = 0, // Press-lock ID
     next_hot_id: Id = 0, // Hover candidate computed this frame (last writer wins in draw order)
-    focused_id: Id = 0, // TextInput focus
+    focused_id: Id = 0, // Keyboard focus
     focus_claimed_this_frame: bool = false,
+    /// Whether the current focus was reached with the keyboard, which is what decides if a focus
+    /// ring is drawn (the meaning of CSS `:focus-visible`). A pointer already shows the user where
+    /// they are, so clicking a widget focuses it without a ring.
+    ///
+    /// It moves with `focused_id`: `claimFocus` clears it, resolving Tab sets it, and clearing the
+    /// focus clears it. It survives `beginFrame` for the same reason `focused_id` does.
+    focus_visible: bool = false,
     this_frame_hovered_any: bool = false, // for wantsMouse
     active_submitted: bool = false, // Whether an active widget was evaluated this frame (anti-stick)
 

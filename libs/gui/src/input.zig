@@ -46,6 +46,31 @@ pub const InputEvent = union(enum) {
     char_input: struct { codepoint: u32, modifiers: u32 },
 };
 
+/// The key codes this library reacts to.
+///
+/// libs/gui does not import core/platform (ADR-007), so the values are written out here. They
+/// are the values of `platform_types.KeyCode`, which the conversion adapter passes through
+/// unchanged, and changing one on either side breaks keyboard handling silently.
+pub const key = struct {
+    pub const space: u32 = 32;
+    pub const escape: u32 = 256;
+    pub const enter: u32 = 257;
+    pub const tab: u32 = 258;
+    pub const left: u32 = 263;
+    pub const right: u32 = 264;
+    pub const up: u32 = 265;
+    pub const down: u32 = 266;
+};
+
+/// Raw modifier bits, matching `ModifierFlags` above.
+pub const mod = struct {
+    pub const shift: u32 = 0x01;
+    pub const ctrl: u32 = 0x02;
+    pub const alt: u32 = 0x04;
+    pub const cmd: u32 = 0x08;
+    pub const all: u32 = shift | ctrl | alt | cmd;
+};
+
 /// Sequence that preserves arrival order of key_down and char_input.
 pub const OrderedTextEvent = union(enum) {
     key_down: struct { code: u32, modifiers: u32, repeat: bool },
@@ -161,6 +186,26 @@ pub const Input = struct {
 
     pub fn orderedTextEvents(self: *const Input) []const OrderedTextEvent {
         return self.ordered_text_events.items;
+    }
+
+    /// Whether this frame carries a fresh press of `code` holding exactly the modifiers asked for:
+    /// every bit of `required` set, and no bit of `forbidden`. Auto-repeat does not count.
+    ///
+    /// Modifiers come from the key_down event itself rather than from `Input.modifiers`, which only
+    /// holds the last event of the frame — with several events in one frame it reports the wrong
+    /// combination for all but the last. Every keyboard interaction in this library goes through
+    /// here so that the repeat and modifier rules stay identical across widgets.
+    pub fn pressedPlain(self: *const Input, code: u32, required: u32, forbidden: u32) bool {
+        for (self.ordered_text_events.items) |event| switch (event) {
+            .key_down => |k| {
+                if (k.code != code or k.repeat) continue;
+                if (k.modifiers & required != required) continue;
+                if (k.modifiers & forbidden != 0) continue;
+                return true;
+            },
+            .char_input => {},
+        };
+        return false;
     }
 
     pub fn isDown(self: *const Input, code: u32) bool {
