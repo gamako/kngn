@@ -507,7 +507,7 @@ pub const Window = struct {
                 const snap = snapshotFromBackendFb(fb);
                 self.latched_snapshot = snap;
                 self.has_latched = true;
-                if (harness.isEnabled()) harness.onLock(fb.pixels, fb.width, fb.height);
+                if (harness.isEnabled()) harness.onLock(fb.pixels, fb.width, fb.height, snap);
                 return .{
                     .pixels = fb.pixels,
                     .width = snap.framebuffer_size.width,
@@ -527,7 +527,7 @@ pub const Window = struct {
         const snap = snapshotFromBackendFb(fb);
         self.latched_snapshot = snap;
         self.has_latched = true;
-        if (harness.isEnabled()) harness.onLock(fb.pixels, fb.width, fb.height);
+        if (harness.isEnabled()) harness.onLock(fb.pixels, fb.width, fb.height, snap);
         return .{
             .pixels = fb.pixels,
             .width = snap.framebuffer_size.width,

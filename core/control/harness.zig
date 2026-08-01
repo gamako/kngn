@@ -1,9 +1,10 @@
-//! The headless verification harness: file replay plus the fb probe, and live TCP plus the audio and stats probes.
+//! The headless verification harness: file replay plus the fb and window probes, and live TCP plus the audio and stats probes.
 //!
 //! The purpose: to give an existing application, unmodified and through the hooks in `src/platform.zig` (the facade), all of
 //!   - input injection (keys, the mouse, scrolling)
 //!   - a virtual clock (getTime = frame_index/60)
-//!   - probes (`fb` as PNG or a digest, `audio` as WAV or a digest, `stats` as JSON)
+//!   - probes (`fb` as PNG or a digest, `window` as a digest of the logical/framebuffer size and scale,
+//!     `audio` as WAV or a digest, `stats` as JSON)
 //! With the environment unset, every API is a no-op (matching existing behaviour exactly).
 //!
 //! ## The transports (where a command comes from)
@@ -147,12 +148,25 @@ var lock_pixels: []const u32 = &.{};
 var lock_w: u32 = 0;
 var lock_h: u32 = 0;
 var lock_valid = false;
+var lock_snap: types.FramebufferSnapshot = default_snap;
 
 // The most recently presented frame (an owned copy, whose buffer is reused as it grows)
 var frame_pixels: []u32 = &.{};
 var frame_w: u32 = 0;
 var frame_h: u32 = 0;
 var have_frame = false;
+// The `window` probe's settled value: the snapshot passed to onLock at the same present that
+// settled frame_w/frame_h/have_frame above (so `window` and `fb` always describe the same frame).
+var frame_snap: types.FramebufferSnapshot = default_snap;
+
+/// The value frame_snap/lock_snap hold before any onLock call: a zero-sized sentinel (scale 1,
+/// epoch 0) that never leaks into a digest, since `window` is gated on `have_frame` exactly like `fb`.
+const default_snap: types.FramebufferSnapshot = .{
+    .logical_size = .{ .width = 0, .height = 0 },
+    .framebuffer_size = .{ .width = 0, .height = 0 },
+    .content_scale = 1.0,
+    .scale_epoch = 0,
+};
 
 // The most recent EventStats (pushed by present)
 var last_stats: EventStats = .{ .mouse_move_merge_count = 0, .mouse_scroll_merge_count = 0, .event_drop_count = 0 };
@@ -301,7 +315,8 @@ pub const InputBlocker = *const fn (ctx: *anyopaque, event: Event) ?[]const u8;
 /// it writes the raw bytes snapshot returns straight to a file, and passes the one line digest returns to the existing sink.
 /// All the meaning of a probe (turning it into a PNG, formatting JSON) is closed inside the application's callback.
 pub const Probe = struct {
-    /// The probe name (the argument of a snapshot or digest command. fb, audio, stats, capabilities and capture are reserved and cannot be registered).
+    /// The probe name (the argument of a snapshot or digest command. fb, window, audio, stats, capabilities,
+    /// capture, gamepad and midi are reserved and cannot be registered).
     name: []const u8,
     /// The opaque context handed to the callback (a pointer to the application's state).
     ctx: *anyopaque,
@@ -354,8 +369,8 @@ pub fn registerProbe(p: Probe) void {
 }
 
 fn isReservedProbeName(name: []const u8) bool {
-    return std.mem.eql(u8, name, "fb") or std.mem.eql(u8, name, "audio") or std.mem.eql(u8, name, "stats") or
-        std.mem.eql(u8, name, "capabilities") or std.mem.eql(u8, name, "capture") or
+    return std.mem.eql(u8, name, "fb") or std.mem.eql(u8, name, "window") or std.mem.eql(u8, name, "audio") or
+        std.mem.eql(u8, name, "stats") or std.mem.eql(u8, name, "capabilities") or std.mem.eql(u8, name, "capture") or
         std.mem.eql(u8, name, "gamepad") or std.mem.eql(u8, name, "midi");
 }
 
@@ -1072,12 +1087,14 @@ pub fn getGamepadState(index: u8) ?GamepadState {
     return gamepad_states[index];
 }
 
-/// Records the current pixels and dimensions when lockFramebuffer succeeds (present takes the owned copy).
-pub fn onLock(pixels: []const u32, w: u32, h: u32) void {
+/// Records the current pixels, dimensions and window/scale snapshot when lockFramebuffer succeeds
+/// (present takes the owned copy of both).
+pub fn onLock(pixels: []const u32, w: u32, h: u32, snap: types.FramebufferSnapshot) void {
     lock_pixels = pixels;
     lock_w = w;
     lock_h = h;
     lock_valid = true;
+    lock_snap = snap;
 }
 
 /// Called when lockFramebuffer returns null. It invalidates the view so present does not re-copy stale pixels.
@@ -1113,6 +1130,7 @@ pub fn onPresent() void {
         @memcpy(frame_pixels[0..n], lock_pixels[0..n]);
         frame_w = lock_w;
         frame_h = lock_h;
+        frame_snap = lock_snap;
         have_frame = true;
     }
     lock_valid = false; // the next frame needs its own onLock
@@ -1780,6 +1798,7 @@ const CapabilityBuiltin = struct {
 };
 const CAPABILITY_BUILTINS = [_]CapabilityBuiltin{
     .{ .name = "fb", .ext = "png", .desc = "framebuffer PNG/digest" },
+    .{ .name = "window", .ext = "txt", .snapshot = false, .digest = true, .desc = "logical size / framebuffer size / content scale / scale_epoch (ADR-011 R2)" },
     .{ .name = "audio", .ext = "wav", .desc = "audio tap PCM16 WAV / rms, peak, f0, silent / band, centroid, onsets, lufs" },
     .{ .name = "stats", .ext = "json", .desc = "EventStats + virtual fps JSON" },
     .{ .name = "capabilities", .ext = "json", .desc = "introspective listing of the registered probes and actions" },
@@ -1880,7 +1899,7 @@ fn appendActionEntry(buf: []u8, limit: usize, len: *usize, name: []const u8, des
     return appendRaw(buf, limit, len, "}");
 }
 
-/// Lists the registered probes (the seven built in, then the custom ones in registration order) and actions (in registration order) as one line of JSON.
+/// Lists the registered probes (the eight built in, then the custom ones in registration order) and actions (in registration order) as one line of JSON.
 /// Top-level fields `backend` and `headless_active` always appear before `probes`, so they survive capacity truncation.
 /// The contract is that it **always returns valid JSON** (assuming `buf.len >= MIN_CAPABILITIES_BUF_LEN`). When an entry is
 /// left out because of the capacity, or because of an invalid character in name or ext, `"truncated":true` is appended at the end.
@@ -1989,6 +2008,9 @@ fn digestPayload(probe: []const u8, buf: []u8) DigestResult {
     if (std.mem.eql(u8, probe, "fb")) {
         if (!have_frame) return .{ .unavailable = "fb not presented" };
         return .{ .ok = formatFbPayload(buf) };
+    } else if (std.mem.eql(u8, probe, "window")) {
+        if (!have_frame) return .{ .unavailable = "window not presented" };
+        return .{ .ok = formatWindowPayload(buf) };
     } else if (std.mem.eql(u8, probe, "audio")) {
         return .{ .ok = formatAudioPayload(buf) };
     } else if (std.mem.eql(u8, probe, "stats")) {
@@ -2591,6 +2613,25 @@ fn formatFbPayload(buf: []u8) []u8 {
 }
 
 // ============================================================================
+// window probe payload
+// ============================================================================
+
+/// Writes `logical_w=<n> logical_h=<n> fb_w=<n> fb_h=<n> scale=<f> epoch=<n>` (ADR-011 R2's
+/// logical/framebuffer split, plus content_scale and scale_epoch) into buf and returns it.
+/// Reflects `frame_snap`, the snapshot settled at the same present that settled `fb`'s frame_w/frame_h,
+/// so `window` and `fb` always describe the same frame.
+fn formatWindowPayload(buf: []u8) []u8 {
+    return std.fmt.bufPrint(buf, "logical_w={d} logical_h={d} fb_w={d} fb_h={d} scale={d:.4} epoch={d}", .{
+        frame_snap.logical_size.width,
+        frame_snap.logical_size.height,
+        frame_snap.framebuffer_size.width,
+        frame_snap.framebuffer_size.height,
+        frame_snap.content_scale,
+        frame_snap.scale_epoch,
+    }) catch buf[0..0];
+}
+
+// ============================================================================
 // the audio probe (draining the tap, the analysis, and WAV)
 // ============================================================================
 
@@ -3144,8 +3185,10 @@ fn resetForTest() void {
     lock_w = 0;
     lock_h = 0;
     lock_valid = false;
+    lock_snap = default_snap;
     frame_w = 0;
     frame_h = 0;
+    frame_snap = default_snap;
     have_frame = false;
     audio_head = .init(0);
     audio_channels = .init(0);
@@ -3537,14 +3580,26 @@ test "the execution model: native_continue=false stops it" {
     try testing.expect(!pollGate(false));
 }
 
+/// A `FramebufferSnapshot` for a test that only cares about pixels/crc: logical and framebuffer
+/// size both equal w x h, scale 1, epoch 0 (the "no window metrics" default `snapshotFromBackendFb`
+/// falls back to for a backend with no scale of its own).
+fn testSnap(w: u32, h: u32) types.FramebufferSnapshot {
+    return .{
+        .logical_size = .{ .width = w, .height = h },
+        .framebuffer_size = .{ .width = w, .height = h },
+        .content_scale = 1.0,
+        .scale_epoch = 0,
+    };
+}
+
 test "the virtual clock: getTime = frame_index/60, advancing on a present" {
     resetForTest();
     try testing.expectEqual(@as(f64, 0.0), now());
     const px = [_]u32{0xFF112233};
-    onLock(&px, 1, 1);
+    onLock(&px, 1, 1, testSnap(1, 1));
     onPresent();
     try testing.expectEqual(@as(f64, 1.0 / 60.0), now());
-    onLock(&px, 1, 1);
+    onLock(&px, 1, 1, testSnap(1, 1));
     onPresent();
     try testing.expectEqual(@as(f64, 2.0 / 60.0), now());
     try testing.expect(have_frame);
@@ -3556,13 +3611,13 @@ test "skip_frame_copy: while it is on, only frame_index advances and the @memcpy
     skip_frame_copy = true;
     defer skip_frame_copy = false;
     const px = [_]u32{0xFF445566};
-    onLock(&px, 1, 1);
+    onLock(&px, 1, 1, testSnap(1, 1));
     onPresent();
     try testing.expectEqual(@as(u64, 1), frame_index);
     try testing.expectEqual(@as(f64, 1.0 / 60.0), now());
     // The frame is not copied as owned, so have_frame is not raised.
     try testing.expect(!have_frame);
-    onLock(&px, 1, 1);
+    onLock(&px, 1, 1, testSnap(1, 1));
     onPresent();
     try testing.expectEqual(@as(u64, 2), frame_index);
     try testing.expect(!have_frame);
@@ -3571,7 +3626,7 @@ test "skip_frame_copy: while it is on, only frame_index advances and the @memcpy
 test "a lock miss: a present after a null lock does not re-copy stale pixels" {
     resetForTest();
     const px = [_]u32{0xFFAABBCC};
-    onLock(&px, 1, 1);
+    onLock(&px, 1, 1, testSnap(1, 1));
     onPresent();
     try testing.expect(have_frame);
     try testing.expectEqual(@as(u32, 0xFFAABBCC), frame_pixels[0]);
@@ -3586,6 +3641,7 @@ test "snapshot and digest: skipped before a present (safe even with the io or th
     cmd_buf =
         \\snapshot fb /tmp/should_not_write.png
         \\digest fb
+        \\digest window
         \\quit
     ;
     try testing.expect(!pollGate(true));
@@ -3608,6 +3664,83 @@ test "the fb payload: known pixels, asserting crc and top against absolute value
     try testing.expectEqualStrings(expected, payload);
     // frame_pixels belongs to the test, so harness must not free it
     frame_pixels = &.{};
+}
+
+test "the window payload: known snapshot fields, asserting the exact formatted string" {
+    resetForTest();
+    frame_snap = .{
+        .logical_size = .{ .width = 800, .height = 600 },
+        .framebuffer_size = .{ .width = 1600, .height = 1200 },
+        .content_scale = 2.0,
+        .scale_epoch = 3,
+    };
+    have_frame = true;
+    var buf: [128]u8 = undefined;
+    const payload = formatWindowPayload(&buf);
+    try testing.expectEqualStrings("logical_w=800 logical_h=600 fb_w=1600 fb_h=1200 scale=2.0000 epoch=3", payload);
+}
+
+test "window: unavailable before a present, and available (unaffected by fb) once one lands" {
+    resetForTest();
+    var buf: [DIGEST_BUF_LEN]u8 = undefined;
+    switch (digestPayload("window", &buf)) {
+        .ok => try testing.expect(false),
+        .unavailable => |reason| try testing.expectEqualStrings("window not presented", reason),
+    }
+
+    const px = [_]u32{0xFF000000};
+    onLock(&px, 1, 1, .{
+        .logical_size = .{ .width = 1920, .height = 1080 },
+        .framebuffer_size = .{ .width = 1920, .height = 1080 },
+        .content_scale = 1.0,
+        .scale_epoch = 0,
+    });
+    onPresent();
+    switch (digestPayload("window", &buf)) {
+        .ok => |payload| try testing.expectEqualStrings("logical_w=1920 logical_h=1080 fb_w=1920 fb_h=1080 scale=1.0000 epoch=0", payload),
+        .unavailable => try testing.expect(false),
+    }
+}
+
+// ADR-019 R5's null-backend cell of the `.physical` + fullscreen table: `content_scale` stays 1
+// and `framebuffer_size` is the requested screen size verbatim, so `logical_size` equals it too
+// (scale 1 makes the logical/physical conversion the identity). The 1920x1080 literal mirrors
+// `core/platform.zig`'s `fullscreen_request_size`; that value changing means this one must follow.
+//
+// Scope: this replay test pins that the harness's `window` probe correctly digests and asserts a
+// `FramebufferSnapshot` shaped like that cell — it does not exercise `core/platform_null.zig`
+// itself (the harness test module does not import `platform`, by design). The null backend
+// actually producing this shape is pinned separately, by `core/platform_null.zig`'s "null window:
+// fullscreen with .physical keeps scale 1 and the requested size". Together the two tests cover
+// the same two layers ADR-019 R8 splits verification into: the backend produces the value, and
+// the observation plane (here) can assert it.
+test "ADR-019 R5 via the window probe: .physical fullscreen on the null backend keeps logical == framebuffer at scale 1" {
+    resetForTest();
+    // The pixel buffer itself is a throwaway 1x1 (only `fb`, not tested here, reads it); what this
+    // test pins is the FramebufferSnapshot passed alongside it.
+    const px = [_]u32{0xFF000000};
+    onLock(&px, 1, 1, .{
+        .logical_size = .{ .width = 1920, .height = 1080 },
+        .framebuffer_size = .{ .width = 1920, .height = 1080 },
+        .content_scale = 1.0,
+        .scale_epoch = 0,
+    });
+    onPresent();
+
+    // One pollGate call bundles every expect up to (and including) the trailing step, so cmd_buf
+    // is never drained to EOF (see "expect under replay" above for why that matters: EOF re-checks
+    // expect_failures and would exit(1) if it were nonzero).
+    cmd_buf =
+        \\expect window logical_w=1920
+        \\expect window logical_h=1080
+        \\expect window fb_w=1920
+        \\expect window fb_h=1080
+        \\expect window scale=1.0000
+        \\expect window epoch=0
+        \\step 1
+    ;
+    try testing.expect(pollGate(true));
+    try testing.expectEqual(@as(usize, 0), expect_failures);
 }
 
 test "the audio ring: latest-wins, so only the most recent capacity can be peeked at" {
@@ -4467,7 +4600,7 @@ test "capabilities: registration is refused for a reserved name" {
     try testing.expectEqual(@as(usize, 0), probe_count);
 }
 
-test "capabilities: with no custom probe or action, the 7 built-in probes plus actions:[]" {
+test "capabilities: with no custom probe or action, the 8 built-in probes plus actions:[]" {
     resetForTest();
     var buf: [MIN_CAPABILITIES_BUF_LEN]u8 = undefined;
     _ = &buf; // unused (capabilities_buf is used directly)
@@ -4480,11 +4613,18 @@ test "capabilities: with no custom probe or action, the 7 built-in probes plus a
     try testing.expectEqualStrings("unknown", root.get("backend").?.string);
     try testing.expect(!root.get("headless_active").?.bool);
     const probes_arr = root.get("probes").?.array.items;
-    try testing.expectEqual(@as(usize, 7), probes_arr.len);
-    const expected_names = [_][]const u8{ "fb", "audio", "stats", "capabilities", "capture", "gamepad", "midi" };
+    try testing.expectEqual(@as(usize, 8), probes_arr.len);
+    const expected_names = [_][]const u8{ "fb", "window", "audio", "stats", "capabilities", "capture", "gamepad", "midi" };
+    // window and midi are the two builtins with no snapshot support; every other builtin has one.
+    const no_snapshot_names = [_][]const u8{ "window", "midi" };
     for (probes_arr, 0..) |entry, i| {
         try testing.expectEqualStrings(expected_names[i], entry.object.get("name").?.string);
-        try testing.expect(if (i == 6) !entry.object.get("snapshot").?.bool else entry.object.get("snapshot").?.bool);
+        const name = entry.object.get("name").?.string;
+        var expect_snapshot = true;
+        for (no_snapshot_names) |ns| {
+            if (std.mem.eql(u8, name, ns)) expect_snapshot = false;
+        }
+        try testing.expect(entry.object.get("snapshot").?.bool == expect_snapshot);
         try testing.expect(entry.object.get("digest").?.bool);
     }
     try testing.expectEqual(@as(usize, 0), root.get("actions").?.array.items.len);
@@ -4630,16 +4770,16 @@ test "capabilities: a custom probe and action appear with their field values, in
     defer parsed.deinit();
     const root = parsed.value.object;
     const probes_arr = root.get("probes").?.array.items;
-    try testing.expectEqual(@as(usize, 9), probes_arr.len); // the 7 built in plus the 2 custom
+    try testing.expectEqual(@as(usize, 10), probes_arr.len); // the 8 built in plus the 2 custom
 
-    const p1 = probes_arr[7].object;
+    const p1 = probes_arr[8].object;
     try testing.expectEqualStrings("p1", p1.get("name").?.string);
     try testing.expectEqualStrings("png", p1.get("ext").?.string);
     try testing.expectEqualStrings("d1", p1.get("desc").?.string);
     try testing.expect(!p1.get("snapshot").?.bool);
     try testing.expect(p1.get("digest").?.bool);
 
-    const p2 = probes_arr[8].object;
+    const p2 = probes_arr[9].object;
     try testing.expectEqualStrings("p2", p2.get("name").?.string);
     try testing.expectEqualStrings("json", p2.get("ext").?.string);
     try testing.expectEqualStrings("", p2.get("desc").?.string);
@@ -4682,8 +4822,8 @@ test "capabilities: an invalid character in name (a \" or a control character) l
     const root = parsed.value.object;
     try testing.expect(root.get("truncated").?.bool);
     const probes_arr = root.get("probes").?.array.items;
-    try testing.expectEqual(@as(usize, 8), probes_arr.len); // the 7 built in plus good1 (bad is left out)
-    try testing.expectEqualStrings("good1", probes_arr[7].object.get("name").?.string);
+    try testing.expectEqual(@as(usize, 9), probes_arr.len); // the 8 built in plus good1 (bad is left out)
+    try testing.expectEqualStrings("good1", probes_arr[8].object.get("name").?.string);
 }
 
 test "capabilities: a control character in an action name (a NUL, which passes isValidActionName but is invalid in JSON) leaves the entry out and gives truncated" {
@@ -4708,7 +4848,7 @@ test "capabilities: an invalid character in ext (a tab) also leaves the entry ou
     defer parsed.deinit();
     const root = parsed.value.object;
     try testing.expect(root.get("truncated").?.bool);
-    try testing.expectEqual(@as(usize, 7), root.get("probes").?.array.items.len); // the 7 built in only (p is left out)
+    try testing.expectEqual(@as(usize, 8), root.get("probes").?.array.items.len); // the 8 built in only (p is left out)
 }
 
 test "capabilities: even a buf of exactly MIN_CAPABILITIES_BUF_LEN gives valid JSON plus truncated=true, by the fail-safe" {
@@ -4750,7 +4890,7 @@ test "capabilities: the same JSON comes back through digestPayload (digest capab
         .ok => |payload| {
             var parsed = try parseCapabilities(payload);
             defer parsed.deinit();
-            try testing.expectEqual(@as(usize, 7), parsed.value.object.get("probes").?.array.items.len);
+            try testing.expectEqual(@as(usize, 8), parsed.value.object.get("probes").?.array.items.len);
         },
         .unavailable => try testing.expect(false),
     }
@@ -4825,7 +4965,7 @@ test "capture video: video_frame follows harness's virtual clock (frame_index), 
     const px = [_]u32{0xFF000000};
     var i: usize = 0;
     while (i < 3) : (i += 1) {
-        onLock(&px, 1, 1);
+        onLock(&px, 1, 1, testSnap(1, 1));
         onPresent();
     }
     try testing.expectEqual(@as(u64, 3), frame_index);
@@ -5533,7 +5673,7 @@ test "harness onLock and onPresent: the observation copy goes from the borrowed 
     defer resetForTest();
 
     var pixels = [_]u32{ 0xFF112233, 0xFF112233, 0xFF112233, 0xFF112233 };
-    onLock(&pixels, 2, 2);
+    onLock(&pixels, 2, 2, testSnap(2, 2));
     onPresent();
     try testing.expect(have_frame);
     try testing.expectEqual(@as(u32, 0xFF112233), frame_pixels[0]);
@@ -5953,7 +6093,7 @@ test "await: timeout 0 checks once; positive waits across frames (manual)" {
 
     resetForTest();
     var pixels = [_]u32{0xFF0000FF} ** 4;
-    onLock(&pixels, 2, 2);
+    onLock(&pixels, 2, 2, testSnap(2, 2));
     onPresent(); // frame_index=1, have_frame
     // a mismatch plus timeout 1: it does not fail at once but goes pending → and fails one frame later
     cmd_buf = "await fb crc=00000000 1\nstep 1\n";
@@ -5969,7 +6109,7 @@ test "await: timeout 0 checks once; positive waits across frames (manual)" {
 test "await: timeout 0 pass when predicate already true" {
     resetForTest();
     var pixels = [_]u32{0xFF112233} ** 4;
-    onLock(&pixels, 2, 2);
+    onLock(&pixels, 2, 2, testSnap(2, 2));
     onPresent();
     var digbuf: [DIGEST_BUF_LEN]u8 = undefined;
     const payload = formatFbPayload(&digbuf);

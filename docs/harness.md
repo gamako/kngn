@@ -55,6 +55,7 @@ snapshot fb  /tmp/out.png  # save the most recent presented frame as PNG (defaul
 snapshot audio /tmp/a.wav  # save the most recent audio tap as PCM16 WAV (default audio_<n>.wav)
 snapshot stats /tmp/s.json # save stats as JSON (default stats_<n>.json)
 digest fb                  # fb <w>x<h> crc=<hex> top=[#RRGGBB:NN%,...]
+digest window              # window logical_w=<n> logical_h=<n> fb_w=<n> fb_h=<n> scale=<f> epoch=<n>
 digest audio               # audio rms=<f> peak=<f> f0=<Hz> silent=<0|1> frames=<n> band_low/mid/high=<0..1> centroid=<Hz> onsets=<n> lufs=<f>
 digest stats               # {"frame":..,"virtual_fps":60.0,"mouse_move_merge_count":..,"mouse_scroll_merge_count":..,"event_drop_count":..,"modal_blocked_injections":..} (one line of JSON)
 digest capabilities        # {"backend":"metal","headless_active":false,"probes":[{"name":..,"ext":..,"snapshot":bool,"digest":bool,"desc":..(,"args":[...])},...],"actions":[{"name":..,"desc":..(,"args":[...])},...]}
@@ -69,9 +70,19 @@ quit                       # terminate (EOF also terminates)
 
 ### Built-in probes (owned by the framework)
 
-`fb` (framebuffer → PNG/digest), `audio` (output tapped by the `core/audio.zig`
-facade → WAV/digest), `stats` (`EventStats` plus the virtual fps → JSON), and
+`fb` (framebuffer → PNG/digest), `window` (the per-frame `FramebufferSnapshot` —
+logical size, framebuffer size, content scale and scale epoch — digest only, no
+snapshot; below), `audio` (output tapped by the `core/audio.zig` facade →
+WAV/digest), `stats` (`EventStats` plus the virtual fps → JSON), and
 `capabilities` (introspection, below).
+
+`window` reflects the same frame `fb` does (both settle at the same present), so a
+script can assert them together. Its fields are ADR-011 R2's logical/framebuffer
+split plus `content_scale` and `scale_epoch` (the scale-change generation counter):
+`logical_w`/`logical_h`, `fb_w`/`fb_h`, `scale` and `epoch`. It is `unavailable`
+before the first present, exactly like `fb`. On the null (headless) backend and on
+wasm, `content_scale` is always `1.0` and `scale_epoch` is always `0`, since neither
+has a notion of a display scale of its own.
 
 `audio` measures **the most recent window (latest wins)**, so "what is playing right
 now" can be asserted (silence is `silent=1`, `f0=0`). Its keys are additive and the
@@ -98,8 +109,8 @@ first** (before `probes`), so they remain present even when the listing is trunc
   `false` when the native platform backend is running. Together with `backend`, this
   distinguishes e.g. a d3d11 build under null runtime from a real d3d11 session.
 
-Then the listing: the seven built-ins (`fb`, `audio`, `stats`, `capabilities` itself,
-`capture`, `gamepad`, `midi`, each with a fixed description), then custom probes in
+Then the listing: the eight built-ins (`fb`, `window`, `audio`, `stats`, `capabilities`
+itself, `capture`, `gamepad`, `midi`, each with a fixed description), then custom probes in
 registration order, then actions in registration order. Each probe entry carries
 `name`, `ext`, `snapshot` (bool), `digest` (bool) and `desc`; each action entry
 carries `name` and `desc`. `args` can be added **by adding a field only** (below).
@@ -119,7 +130,7 @@ frame, not per sample) and is not a hot path.
   `int`, `float`, `string`, `bool`, `enum`, `path`; an application may use its own,
   and interpretation belongs to the consumer).
 - **The contract of always returning valid JSON**: the registry limits (16 custom
-  probes, 48 actions, 7 built-ins) and the sanitisation of `desc` and `args` at
+  probes, 48 actions, 8 built-ins) and the sanitisation of `desc` and `args` at
   registration time (below) mean this normally cannot happen, but as a fail-safe an
   entry that does not fit, or whose `name` or `ext` contains a character that would
   break the JSON, ends the listing there and appends `"truncated":true` (the field is
@@ -482,8 +493,9 @@ Rules and limits:
 
 - **A snapshot is raw bytes, a digest is one line; images are PNG and structured data
   is JSON or text** (the same rules as the built-ins).
-- `fb`, `audio`, `stats` and `capabilities` are reserved names (registration is
-  rejected). A custom probe with a duplicate name overwrites. The registry limit is 16.
+- `fb`, `window`, `audio`, `stats`, `capabilities`, `capture`, `gamepad` and `midi` are
+  reserved names (registration is rejected). A custom probe with a duplicate name
+  overwrites. The registry limit is 16.
 - `registerProbe` is **a no-op when the harness is disabled** (its environment
   variables unset), so it never affects a normal run and can always be called.
 - Reading state touched by the audio real-time thread (the synth's `voices` and

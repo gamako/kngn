@@ -106,7 +106,7 @@ pub fn getGamepadState(_: u8) ?GamepadState {
     return null;
 }
 
-pub fn onLock(_: []const u32, _: u32, _: u32) void {}
+pub fn onLock(_: []const u32, _: u32, _: u32, _: types.FramebufferSnapshot) void {}
 
 pub fn onLockMiss() void {}
 
