@@ -214,19 +214,32 @@ summary is lost, and the only surviving message is the unrelated-looking
 `error: unable to read results of configure phase`. Redirecting to a file gives an
 ordinary synchronous handle, and the same command then prints its whole summary.
 
-**Expect the netsync connect tests to fail.** `test-netsync` and `test-harness` both
-contain `netsync: after a shutdown the connection is refused`, which asserts that
-connecting to a closed port yields `error.ConnectionRefused`. Zig 0.16's Windows connect
-path maps every status other than success, cancellation and resource exhaustion to
-`error.Unexpected` (the log reads `error.Unexpected NTSTATUS=0xc0000236`, which *is*
-`CONNECTION_REFUSED`), so `error.ConnectionRefused` cannot be produced there and the
-assertion fails in both binaries. The same gap disables the client's start-up retry in
-`core/control/netsync.zig`, which treats `error.ConnectionRefused` and `error.Timeout` as
-retryable: on Windows a client started before its host fails soft at once instead of
-retrying for a few seconds. A third netsync test,
-`netsync: the router's five policy branches on a host`, fails intermittently from the same
-cause. So the expected Windows result is `258/263 steps succeeded (2 failed)` with two or
-three failing tests, all of them in netsync; anything outside that is a regression.
+**Expect the suite to be green.** The whole aggregate passes on Windows — measured
+`270/270 steps succeeded`, about 3450 tests. The step count grows as steps are added, so
+the signal is that nothing failed, not the number itself.
+
+**Give the nested gates a minimal `PATH`.** `check-consumer` and `check-template` run a
+`zig build` of their own, and those child builds inherit the environment. With a full
+inherited `%PATH%` they die inside the compiler with
+`error.Unexpected NTSTATUS=0xc00004bc` from `std.Io.Threaded` — an unreadable directory on
+the path is enough, and the failure looks like a compile error in the gate rather than an
+environment fault. The top-level build survives it, so the aggregate reports three failed
+steps and everything else green. Set the path to the toolchain plus the system
+directories:
+
+```powershell
+set "PATH=C:\Users\<user>\tools\zig-x86_64-windows-0.16.0;C:\Windows\system32;C:\Windows"
+```
+
+The connect-error classification that used to fail two netsync tests here is handled in
+`core/control/netsync.zig`: Zig 0.16's Windows connect path maps every status other than
+success, cancellation and resource exhaustion to `error.Unexpected` (the log reads
+`error.Unexpected NTSTATUS=0xc0000236`, which *is* `CONNECTION_REFUSED`), so
+`error.ConnectionRefused` is unreachable on Windows. The retry predicate therefore treats
+`error.Unexpected` as retryable on Windows only, bounded by a wall-clock budget, and the
+tests assert through that predicate rather than on the error identity. What Windows no
+longer distinguishes is a refusal from any other connect failure; a POSIX host still
+asserts `error.ConnectionRefused` exactly.
 
 ### Confirming the selected backend
 
