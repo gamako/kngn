@@ -7179,7 +7179,7 @@ fn appInit(gpa: std.mem.Allocator, io: std.Io) !*App {
         };
         // A missing/corrupt/out-of-range value falls back to the field's own default (16) rather
         // than a clamp toward one edge of the range, so a stale or hand-edited preferences.ash
-        // cannot silently pin the spacing at 1 or 4096.
+        // cannot silently pin the spacing at either end of the range.
         if (self.preferences.getI64("grid.coarse_spacing")) |v| {
             if (v >= actions.MIN_GRID_SPACING and v <= actions.MAX_GRID_SPACING) {
                 self.coarse_grid_spacing = @intCast(v);

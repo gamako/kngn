@@ -715,10 +715,13 @@ pub fn parseCoarseGrid(args: []const u8) ParseError!bool {
 
 /// The coarse grid's spacing range, shared by the UI slider, this parser, and the persisted
 /// preferences clamp (one range, so a value valid in one place is valid everywhere): at least one
-/// canvas pixel, and capped at the largest canvas edge (a wider spacing could never mark a tile
-/// boundary inside any document this editor can hold).
+/// canvas pixel, and capped at 256. The cap is set by what the grid is for — marking tile and
+/// sprite boundaries, which live in the 8..128 range — rather than by what a document can hold.
+/// A cap near the largest canvas edge would only buy spacings that draw at most one line across a
+/// typical document, at the cost of spreading the slider's travel so thin that the useful values
+/// become hard to hit.
 pub const MIN_GRID_SPACING: u32 = 1;
-pub const MAX_GRID_SPACING: u32 = MAX_CANVAS_EDGE;
+pub const MAX_GRID_SPACING: u32 = 256;
 
 /// `set_grid_spacing <N>` (N is MIN_GRID_SPACING..=MAX_GRID_SPACING, in canvas pixels).
 pub fn parseGridSpacing(args: []const u8) ParseError!i32 {
