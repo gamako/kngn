@@ -358,8 +358,176 @@ at 2560x1440, and two of them are the whole story: `ui_build` (291) and `canvas_
 (236, which follows the document size and zoom rather than the window).
 
 `ui_build` behaves the opposite way to a pixel cost: 515 µs at 320x240 falling to 291 µs
-at 2560x1440, where it is the largest non-present section. Why building the UI tree costs
-*more* in a small window is not explained by these measurements.
+at 2560x1440, where it is the largest non-present section. Building the UI tree does not
+get cheaper in a bigger window — **the measurements indicate a higher execution rate by the
+time that section runs**. The next section is that measurement.
+
+### A section's cost is a function of how idle the frame loop is
+
+**A section timed inside a paced frame loop does not measure only the work in it.** It also
+measures how fast the processor happens to be running, and that depends on how much work
+surrounds the section — in the same frame and in the frames before it. On a machine that
+scales its clock with load, a loop that is idle 95% of the time executes its next frame
+considerably more slowly than the same loop with no idle at all.
+
+This accounts for most of the observed inverse correlation on native and much of it in the
+browser (the residue is below). `ui_build` is the first large section of the frame, so it is
+where the effect is most visible; a bigger canvas leaves less idle between frames, so the
+processor is further up its ramp when the section runs.
+
+Everything below is the pixel editor, `ReleaseFast`, aarch64-macos, the null backend — which
+reports a 60 Hz refresh, so the default cap resolves to a 16.67 ms frame period — with
+run-level means over 300 frames per run and the condition order shuffled inside one build.
+The browser rows are headless Chromium on the same machine, whose animation frames arrive at
+120 Hz.
+
+#### The work that was counted does not change with the window
+
+Counted per frame from the layout and text layers (the counters are temporary
+instrumentation, as below). This is the UI-structure work, not an instruction count:
+
+| logical size | `Font.measure` calls | bytes measured | layout visits | DrawList commands | frame-arena capacity |
+|---|---:|---:|---:|---:|---:|
+| 320x240 | 109 | 310 | 168 | 454 | 133534 |
+| 780x600 | 109 | 310 | 168 | 451 | 133534 |
+| 1600x900 | 104 | 305 | 164 | 447 | 133534 |
+| 2560x1440 | 104 | 305 | 164 | 447 | 133534 |
+
+Under 5% across a 9x range of canvas area, in the direction that would make the small
+window *cheaper*. So whatever moves the timing by a factor of two, **the work these counters
+cover does not explain it**. The one number that does move — commands drawn outside their
+clip, 398 at 320x240 against 0 at 2560x1440 — is paid by the rasteriser, not by the build.
+
+For reference, the timings these counts go with, all four sizes at the default 60 Hz cap
+(five runs each):
+
+| logical size | `build_ui` | measured gap |
+|---|---:|---:|
+| 320x240 | 714.9 | 15.35 ms |
+| 780x600 | 637.9 | 14.68 ms |
+| 1600x900 | 688.2 | 12.91 ms |
+| 2560x1440 | 571.1 | 12.08 ms |
+
+That 144 µs spread between the extremes is the effect to explain, and it is the number the
+matched-gap table below overturns.
+
+#### Hold the size fixed and vary only the idle gap
+
+Same window, same UI, only the frame cap changes. `gap` is measured, not derived from the
+cap: `frame_start[i+1] - frame_start[i] - frame_body[i]`.
+
+| frame cap | measured gap | `build_ui` |
+|---|---:|---:|
+| unpaced | 1.6 µs | **91.5 µs** |
+| 60 Hz | 14.5 ms | 681.8 |
+| 30 Hz | 30.8 ms | 844.8 |
+| 20 Hz | 47.7 ms | 825.4 |
+| 10 Hz | 97.6 ms | 946.4 |
+
+**7.4x, with the work held constant.** The whole size sweep spans 1.25x (715 µs at 320x240
+against 571 at 2560x1440), so the size effect is a small corner of this one.
+
+#### A rate change, not a cold cache
+
+Between the unpaced and the 60 Hz condition above, **every section scales by nearly the same
+factor** — including the last one in the frame, which any one-off cache or TLB refill would
+have finished paying for long before:
+
+| section | unpaced | 60 Hz | ratio |
+|---|---:|---:|---:|
+| `event_drain` | 0.2 | 13.9 | 69x |
+| `build_ui` | 91.5 | 681.8 | 7.5x |
+| `end_frame` | 14.1 | 82.3 | 5.8x |
+| `post_ui` | 240.7 | 1270.0 | 5.3x |
+| whole frame body | 346.4 | 2066.1 | 6.0x |
+
+A uniform multiplier across sections is what a change in execution *rate* looks like, and it
+is what a cold cache alone does not: a refill is paid once, near the start, and would leave
+the last section of the frame alone. These runs read no hardware counters, so this is
+evidence **consistent with dynamic frequency scaling and against a cache-only explanation**,
+not a direct measurement of a clock. The gradient on top of the multiplier — 69x for the
+first section, falling to 5.3x for the last — is a ramp: whatever the rate is, it is still
+climbing while the frame runs, so **the earlier a section sits in the frame, the more of the
+ramp it absorbs**. `event_drain` does almost no work and still costs 13.7 µs more than it
+does unpaced, which is that ramp with the work subtracted out.
+
+#### Matching the gap removes the size effect
+
+Four sizes measured at three matched idle gaps (per-size caps chosen from a separate
+calibration run, seven runs per cell, `build_ui` medians in µs):
+
+| matched gap | 320x240 | 780x600 | 1600x900 | 2560x1440 |
+|---|---:|---:|---:|---:|
+| 17 ms | 688.6 | 741.3 | 802.1 | 776.0 |
+| 25 ms | 738.7 | 767.0 | 821.4 | 801.4 |
+| 40 ms | 788.9 | 811.4 | 820.8 | 878.3 |
+
+At the fixed 60 Hz cap the small window was 144 µs *more* expensive (the table above); at a
+matched gap it is 87 µs *less*. **The sign flips**, so what the size sweep measured was the
+gap.
+
+Two honest limits on this table. The gaps a size can reach are not the same: a cap cannot
+push the gap below `refresh period − frame body`, so the largest window can reach 10.7 ms and
+the smallest only 15.5 ms, and the band the size sweep itself produces (12.1–15.3 ms) is
+**below the range where all four can be compared**. And the run-to-run scatter on this machine
+(±150 µs) is the same order as the size effect being tested, so this table is consistent with
+the conclusion rather than independent evidence for it; the 7.4x above is the evidence.
+
+#### The browser behaves the same way
+
+The same application in headless Chromium, sweeping the canvas, reproduces the original
+inverse correlation — and `end_frame`, whose work is size-invariant, moves by the same factor
+as `build_ui`, which is the control:
+
+| canvas | `build_ui` | `end_frame` | measured gap |
+|---|---:|---:|---:|
+| 320x240 | 612.4 | 46.1 | 7.42 ms |
+| 780x600 | 473.9 | 36.3 | 7.00 ms |
+| 1600x900 | 383.3 | 28.9 | 6.50 ms |
+| 2560x1440 | 295.4 | 21.8 | 5.90 ms |
+
+Animation frames arrive at a fixed rate, so the gap cannot be set directly; running the
+application frame only every Nth animation frame varies it while holding the work fixed
+(2560x1440, `build_ui` in µs):
+
+| every Nth animation frame | measured gap | `build_ui` | `end_frame` |
+|---|---:|---:|---:|
+| 1 | 5.9 ms | 301.5 | 23.2 |
+| 2 | 14.0 ms | 332.1 | 29.2 |
+| 4 | 29.5 ms | 460.4 | 40.5 |
+| 8 | 59.6 ms | 1060.2 | 76.7 |
+
+3.5x on `build_ui` and 3.3x on `end_frame` — the same uniform multiplier as native. **So this
+is not a wasm property**: it is the machine, seen through two different frame drivers.
+
+One difference is worth recording rather than smoothing over. In the browser, matching the
+gap **shrinks the size effect but does not remove it** (at a gap of ~14 ms the smallest canvas
+still costs about twice the largest, narrowing to about 1.3x at ~60 ms), while natively it
+disappears. Idle gap is therefore not the only input to the processor's rate — the amount of
+work per unit time differs between two sizes even at an equal gap — and these measurements do
+not separate the remaining factors.
+
+#### What to do with this
+
+- **Do not read a section value as the cost of the code in it.** It is that cost as executed
+  at whatever rate the processor was running at. Two conditions with different total frame work
+  are not comparable section by section, even inside one build.
+- **Do not bank a section as an optimisation opportunity.** The 682 µs the UI build costs at
+  780x600 and 60 Hz is about 92 µs of work at full rate; deleting it would not return 682 µs,
+  because the rest of the frame would then run with more idle in front of it.
+- **Report the idle gap next to any section table.** Without it, a reader cannot tell a
+  workload difference from a rate difference. A profiler wired into the observation plane
+  should carry the frame gap and the frame body total alongside its sections for this reason.
+- **When comparing two variants, hold the frame's total work as close as possible** — or
+  compare unpaced, which removes the pacing-induced rate difference and brings the numbers
+  closer to the work (thermal state and scheduling still move them).
+- The reproduction uses temporary instrumentation of the same kind as
+  [the wasm frame breakdown](experiments/wasm-frame-breakdown/README.md): per-section
+  accumulators around the event drain, the UI build, `endFrame` and the rest of the frame;
+  the frame body total and frame start-to-start; an environment override for the window size
+  and for the frame cap so one build can sweep them; and, in the browser, a host-side driver
+  that re-registers the animation frame every tick but calls the application only every Nth.
+  None of it is in the build, for the same reason.
 
 ### On wasm, how the bytes are loaded decides whether SIMD happens
 

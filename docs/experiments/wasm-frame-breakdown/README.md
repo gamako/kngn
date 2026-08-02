@@ -176,3 +176,9 @@ which is the one mistake this harness exists to prevent.
   effect. `run.py` shuffles, seeded.
 - **Headless does not necessarily pace to a real display.** Treat the interval as this
   configuration's effective interval, not as the display refresh.
+- **A section's value includes the rate the processor was running at**, which depends on how
+  idle the frame loop is. Two conditions whose total frame work differs — two canvas sizes,
+  say — are therefore not comparable section by section, and a section can get *cheaper* as
+  the canvas grows without doing less. Report the idle gap next to any section table, and see
+  "A section's cost is a function of how idle the frame loop is" in
+  [../../performance-measurement.md](../../performance-measurement.md).
