@@ -55,6 +55,12 @@ pub fn setSharedExecutor(_: ?*command.Executor) void {}
 pub fn forgetSharedExecutor() void {}
 pub fn setPostApplyHook(_: ?*anyopaque, _: ?PostApplyHook) void {}
 
+/// Grouping brackets a run of actions into one undo unit **on the wire**, so with no session
+/// there is nothing to group and both ends are no-ops — the same behaviour the native module
+/// has outside a session.
+pub fn beginActionGroup() void {}
+pub fn endActionGroup() void {}
+
 pub fn pendingProposalCount() usize {
     return 0;
 }
