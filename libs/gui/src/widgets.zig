@@ -962,6 +962,51 @@ const SwatchDraw = struct {
 // While active, map `Input.dragPos().x` onto the track travel range and update `*value`. Internals use f64.
 // Layout is [fixed name label] [track] [dynamic value text]; track.x does not depend on value digit count.
 
+pub const SliderGroupOpts = struct {
+    /// The group's own width, in its parent's terms. The default fills the parent: in a column it
+    /// takes the parent's content width, in a row it takes the width left over by the row's other
+    /// children. Pass `.{ .fixed = n }` where taking the leftovers would push siblings around — a
+    /// status bar, say — or where the parent is `fit` and so has no width to hand out.
+    width: layout.Sizing = .{ .grow = 1 },
+    /// Gap between a row's three columns.
+    column_gap: i32 = 6,
+    /// Gap between rows.
+    row_gap: i32 = 4,
+};
+
+/// Open a slider group: the sliders built until `endSliderGroup` are laid out as a table of
+/// `[label][track][value]` rows that share one set of column widths.
+///
+/// The label and value columns are as wide as the widest label and the widest value **any** row in
+/// the group can show, and the track takes everything left over, so a row's track ends and its
+/// value begins at the same x on every row. `SliderI32Opts.track_w` / `SliderF32Opts.track_w` are
+/// ignored inside a group — taking the leftover width is the point of it.
+///
+/// When the group is narrower than its label and value columns need, the track is what collapses
+/// (down to nothing); the value stays readable rather than being pushed out of view.
+///
+/// A slider built outside any group keeps its own `[label][track_w][value]` row exactly as before.
+/// Groups do not nest.
+pub fn beginSliderGroup(ctx: *Context, opts: SliderGroupOpts) void {
+    std.debug.assert(ctx.slider_group == null);
+    ctx.slider_group = .{ .column_gap = opts.column_gap };
+    ctx.beginBox(.{ .direction = .column, .width = opts.width, .gap = opts.row_gap });
+}
+
+/// Close a group opened by `beginSliderGroup`, settling its column widths.
+pub fn endSliderGroup(ctx: *Context) void {
+    const group = ctx.slider_group.?;
+    ctx.slider_group = null;
+    // Layout has not run yet (it runs in endFrame), so widening the cells here settles the columns
+    // for the very frame that draws them.
+    var it = group.cells;
+    while (it) |cell| : (it = cell.next) {
+        cell.label_node.cfg.width = .{ .fixed = group.label_w };
+        cell.value_node.cfg.width = .{ .fixed = group.value_w };
+    }
+    ctx.endBox();
+}
+
 /// i32 slider (auto ID: `IdStack.make(label)`). Returns true when the value changes.
 /// Use `sliderI32Id` when the same label appears in one scope.
 pub fn sliderI32(ctx: *Context, label: []const u8, value: *i32, opts: SliderI32Opts) bool {
@@ -1041,6 +1086,53 @@ fn knobRectFor(track: Rect, knob_w: i32, knob_h: i32, frac: f64) Rect {
     };
 }
 
+/// Render a slider's value the one way it is ever rendered, into `buf` (32 bytes is always enough:
+/// the widest form is a sign, 17 digits of f64 integer part and two decimals).
+fn formatSliderValue(buf: []u8, value: f64, is_float: bool) []const u8 {
+    return if (is_float)
+        std.fmt.bufPrint(buf, "{d:.2}", .{value}) catch "?"
+    else
+        std.fmt.bufPrint(buf, "{d}", .{@as(i64, @intFromFloat(@round(value)))}) catch "?";
+}
+
+/// The width the value column needs, derived from the range and the format rather than from the
+/// value on screen right now.
+///
+/// Measuring the current text would make the column breathe as the value passes 9, 99, -1: every
+/// row in a group would shift sideways mid-drag. The range and the format decide the widest string
+/// the slider can ever print, so this is both stable and exact.
+///
+/// The widest string is composed rather than taken from an endpoint, because a proportional font
+/// need not give every digit the same advance: the digit count comes from the endpoints (a
+/// monotone range prints its longest value at one of them), and the width comes from the widest
+/// digit in the font plus the sign and decimal point when the range can produce them.
+fn valueColumnWidth(font: font_mod.Font, spec: SliderSpec) i32 {
+    var lo_buf: [32]u8 = undefined;
+    var hi_buf: [32]u8 = undefined;
+    const lo = formatSliderValue(&lo_buf, spec.min, spec.is_float);
+    const hi = formatSliderValue(&hi_buf, spec.max, spec.is_float);
+
+    var digits: usize = 0;
+    var negative = false;
+    for ([_][]const u8{ lo, hi }) |s| {
+        var n: usize = 0;
+        for (s) |c| {
+            if (c >= '0' and c <= '9') n += 1;
+            if (c == '-') negative = true;
+        }
+        digits = @max(digits, n);
+    }
+
+    var widest_digit: u32 = 0;
+    for ("0123456789") |d| {
+        widest_digit = @max(widest_digit, font.measure(&[_]u8{d}));
+    }
+    var w: u32 = widest_digit * @as(u32, @intCast(digits));
+    if (negative) w += font.measure("-");
+    if (spec.is_float) w += font.measure(".");
+    return @intCast(w);
+}
+
 fn clampAndStep(v: f64, spec: SliderSpec) f64 {
     var x = std.math.clamp(v, spec.min, spec.max);
     if (spec.step) |s| {
@@ -1100,8 +1192,27 @@ fn sliderCore(ctx: *Context, id: Id, label: []const u8, cur: f64, spec: SliderSp
     }
 
     // Build/draw: [label] [track(id)] [value text]
-    ctx.beginBox(.{ .direction = .row, .gap = 6, .align_cross = .center });
-    ctx.labelEx(label, if (disabled) style.disabledColor(style.text) else style.text);
+    const text_col = if (disabled) style.disabledColor(style.text) else style.text;
+    const group = if (ctx.slider_group) |*g| g else null;
+
+    if (group) |g| {
+        // A row in a group fills the group's width; its three columns are settled by
+        // `endSliderGroup`, which widens the two cells registered below.
+        ctx.beginBox(.{ .direction = .row, .width = .{ .grow = 1 }, .gap = g.column_gap, .align_cross = .center });
+        ctx.beginBox(.{});
+        const label_node = ctx.openBox();
+        ctx.labelEx(label, text_col);
+        ctx.endBox();
+        const cell = ctx.allocator().create(context_mod.SliderGroupCell) catch @panic("slider: OOM");
+        cell.* = .{ .label_node = label_node, .value_node = undefined };
+        if (g.last) |last| last.next = cell else g.cells = cell;
+        g.last = cell;
+        g.label_w = @max(g.label_w, @as(i32, @intCast(ctx.font.measure(label))));
+        g.value_w = @max(g.value_w, valueColumnWidth(ctx.font, spec));
+    } else {
+        ctx.beginBox(.{ .direction = .row, .gap = 6, .align_cross = .center });
+        ctx.labelEx(label, text_col);
+    }
 
     const data = ctx.allocator().create(SliderDraw) catch @panic("slider: OOM");
     data.* = .{
@@ -1120,18 +1231,27 @@ fn sliderCore(ctx: *Context, id: Id, label: []const u8, cur: f64, spec: SliderSp
     };
     ctx.beginBox(.{
         .id = id,
-        .width = .{ .fixed = spec.track_w },
+        .width = if (group != null) .{ .grow = 1 } else .{ .fixed = spec.track_w },
         .height = .{ .fixed = knob_h },
     });
     ctx.custom(.{ .x = spec.track_w, .y = knob_h }, SliderDraw.draw, data);
+    // The custom leaf carries the drawing, and `SliderDraw.draw` derives the knob rect from the
+    // rect it is handed, so it has to be the same rect the knob was hit-tested against — the track
+    // box's, which is what the rect cache holds under `id`. Growing the leaf to fill the box keeps
+    // the two identical whether the box is fixed or takes the leftover width of a group's row.
+    ctx.openBox().last_child.?.cfg.width = .{ .grow = 1 };
     ctx.endBox();
 
     var buf: [32]u8 = undefined;
-    const txt = if (spec.is_float)
-        std.fmt.bufPrint(&buf, "{d:.2}", .{value}) catch "?"
-    else
-        std.fmt.bufPrint(&buf, "{d}", .{@as(i64, @intFromFloat(@round(value)))}) catch "?";
-    ctx.labelEx(txt, if (disabled) style.disabledColor(style.text) else style.text); // dupes onto the arena, so a stack buf is safe
+    const txt = formatSliderValue(&buf, value, spec.is_float);
+    if (group) |g| {
+        ctx.beginBox(.{});
+        g.last.?.value_node = ctx.openBox();
+        ctx.labelEx(txt, text_col); // dupes onto the arena, so a stack buf is safe
+        ctx.endBox();
+    } else {
+        ctx.labelEx(txt, text_col); // dupes onto the arena, so a stack buf is safe
+    }
 
     ctx.endBox();
 
@@ -1598,8 +1718,11 @@ pub fn beginCollapsible(ctx: *Context, id: Id, title: []const u8, open: *bool) b
 
     if (!open.*) return false;
 
-    // Open the body column only when open (`endCollapsible` closes it)
-    ctx.beginBox(.{ .direction = .column, .gap = 4, .padding = .{ 0, 0, 0, pad[3] + collapsible_glyph_px + style.checkbox_gap } });
+    // Open the body column only when open (`endCollapsible` closes it).
+    // The body takes the width its parent offers rather than shrinking to its contents, so a
+    // control built inside it can fill the section it belongs to — a panel's collapsible section is
+    // as wide as the panel. A `fit` parent still offers nothing to fill, as everywhere else.
+    ctx.beginBox(.{ .direction = .column, .width = .{ .grow = 1 }, .gap = 4, .padding = .{ 0, 0, 0, pad[3] + collapsible_glyph_px + style.checkbox_gap } });
     collapsible_body_depth += 1;
     return true;
 }
@@ -3145,6 +3268,205 @@ fn sliderFrame1I32(ctx: *Context, value: *i32, opts: SliderI32Opts) Rect {
 
 fn trackCenterY(track: Rect) i32 {
     return track.y + @divTrunc(@as(i32, @intCast(track.h)), 2);
+}
+
+// ── Slider group ───────────────────────────────
+// The group's rows are placed inside a fixed-width host box so the assertions can talk about
+// absolute x. `sliderRowGeometry` reads back the placed nodes of one row from the layout tree,
+// which is where the column widths actually end up.
+
+const GROUP_HOST_ID: Id = 0x9E0000;
+
+const SliderRowGeometry = struct { label: Rect, track: Rect, value: Rect };
+
+/// The three placed cells of the row whose track carries `track_id`, found by walking the tree.
+fn sliderRowGeometry(ctx: *Context, track_id: Id) SliderRowGeometry {
+    const track = ctx.getNodeRect(track_id).?;
+    const row = findRowOf(ctx.layout_root.?, track_id).?;
+    var kids: [3]Rect = undefined;
+    var n: usize = 0;
+    var it = row.first_child;
+    while (it) |c| : (it = c.next_sibling) {
+        if (n < kids.len) kids[n] = c.rect;
+        n += 1;
+    }
+    std.debug.assert(n == 3);
+    return .{ .label = kids[0], .track = track, .value = kids[2] };
+}
+
+fn findRowOf(node: *const layout.Node, track_id: Id) ?*const layout.Node {
+    var it = node.first_child;
+    while (it) |c| : (it = c.next_sibling) {
+        if (c.id == track_id) return node;
+        if (findRowOf(c, track_id)) |found| return found;
+    }
+    return null;
+}
+
+/// Build one frame of a fixed-width group holding the caller's sliders.
+fn groupFrame(ctx: *Context, host_w: i32, body: *const fn (ctx: *Context) void) void {
+    ctx.beginFrame(800, 600);
+    ctx.beginBox(.{ .id = GROUP_HOST_ID, .direction = .column, .width = .{ .fixed = host_w } });
+    ctx.beginSliderGroup(.{});
+    body(ctx);
+    ctx.endSliderGroup();
+    ctx.endBox();
+    ctx.endFrame();
+}
+
+const HSV_IDS = [_]Id{ 0x9E0001, 0x9E0002, 0x9E0003 };
+var hsv_values = [_]f32{ 180, 0.5, 0.5 };
+
+fn buildHsvGroup(ctx: *Context) void {
+    _ = ctx.sliderF32Id(HSV_IDS[0], "Hue", &hsv_values[0], .{ .min = 0, .max = 360 });
+    _ = ctx.sliderF32Id(HSV_IDS[1], "S", &hsv_values[1], .{ .min = 0, .max = 1 });
+    _ = ctx.sliderF32Id(HSV_IDS[2], "Brightness", &hsv_values[2], .{ .min = 0, .max = 1 });
+}
+
+test "sliderGroup: rows share one set of column widths on the very first frame" {
+    var ctx = testCtx();
+    defer ctx.deinit();
+    hsv_values = .{ 180, 0.5, 0.5 };
+
+    groupFrame(&ctx, 300, buildHsvGroup);
+
+    const a = sliderRowGeometry(&ctx, HSV_IDS[0]);
+    const b = sliderRowGeometry(&ctx, HSV_IDS[1]);
+    const c = sliderRowGeometry(&ctx, HSV_IDS[2]);
+
+    // No frame of settling: the widths agree already on the frame the group is first built.
+    for ([_]SliderRowGeometry{ b, c }) |row| {
+        try std.testing.expectEqual(a.label.w, row.label.w);
+        try std.testing.expectEqual(a.track.x, row.track.x);
+        try std.testing.expectEqual(a.track.w, row.track.w);
+        try std.testing.expectEqual(a.value.x, row.value.x);
+        try std.testing.expectEqual(a.value.w, row.value.w);
+    }
+    // The label column fits the widest label, not the first one.
+    try std.testing.expect(a.label.w >= @as(u32, ctx.font.measure("Brightness")));
+}
+
+test "sliderGroup: the track takes the width the label and value columns leave" {
+    var ctx = testCtx();
+    defer ctx.deinit();
+    hsv_values = .{ 180, 0.5, 0.5 };
+
+    groupFrame(&ctx, 300, buildHsvGroup);
+    const narrow = sliderRowGeometry(&ctx, HSV_IDS[0]);
+
+    groupFrame(&ctx, 500, buildHsvGroup);
+    const wide = sliderRowGeometry(&ctx, HSV_IDS[0]);
+
+    // A wider host spends all of the extra width on the track; the fixed columns do not move.
+    try std.testing.expectEqual(narrow.label.w, wide.label.w);
+    try std.testing.expectEqual(narrow.value.w, wide.value.w);
+    try std.testing.expectEqual(narrow.track.w + 200, wide.track.w);
+    // The value stays inside the host.
+    try std.testing.expect(wide.value.x + @as(i32, @intCast(wide.value.w)) <= 500);
+    try std.testing.expect(narrow.value.x + @as(i32, @intCast(narrow.value.w)) <= 300);
+}
+
+var lone_value: f32 = 0.5;
+
+fn buildOneSlider(ctx: *Context) void {
+    _ = ctx.sliderF32Id(HSV_IDS[0], "S", &lone_value, .{ .min = 0, .max = 1 });
+}
+
+test "sliderGroup: a group narrower than its columns collapses the track, not the value" {
+    var ctx = testCtx();
+    defer ctx.deinit();
+    lone_value = 0.5;
+
+    groupFrame(&ctx, 24, buildOneSlider);
+    const row = sliderRowGeometry(&ctx, HSV_IDS[0]);
+
+    try std.testing.expectEqual(@as(u32, 0), row.track.w);
+    try std.testing.expect(row.label.w > 0);
+    try std.testing.expect(row.value.w > 0);
+}
+
+test "sliderGroup: the value column does not breathe as the value changes" {
+    var ctx = testCtx();
+    defer ctx.deinit();
+
+    lone_value = 0;
+    groupFrame(&ctx, 300, buildOneSlider);
+    const at_zero = sliderRowGeometry(&ctx, HSV_IDS[0]);
+
+    lone_value = 1;
+    groupFrame(&ctx, 300, buildOneSlider);
+    const at_one = sliderRowGeometry(&ctx, HSV_IDS[0]);
+
+    try std.testing.expectEqual(at_zero.value.w, at_one.value.w);
+    try std.testing.expectEqual(at_zero.value.x, at_one.value.x);
+}
+
+test "sliderGroup: a row that appears between frames still aligns within its own frame" {
+    var ctx = testCtx();
+    defer ctx.deinit();
+    hsv_values = .{ 180, 0.5, 0.5 };
+
+    // One short label, then a frame where a much longer one joins it.
+    groupFrame(&ctx, 300, buildOneSlider);
+    groupFrame(&ctx, 300, buildHsvGroup);
+
+    const a = sliderRowGeometry(&ctx, HSV_IDS[0]);
+    const c = sliderRowGeometry(&ctx, HSV_IDS[2]);
+    try std.testing.expectEqual(a.label.w, c.label.w);
+    try std.testing.expectEqual(a.track.x, c.track.x);
+    try std.testing.expect(a.label.w >= @as(u32, ctx.font.measure("Brightness")));
+}
+
+test "sliderGroup: a slider outside any group keeps its own track_w" {
+    var ctx = testCtx();
+    defer ctx.deinit();
+    var v: i32 = 5;
+
+    ctx.beginFrame(800, 600);
+    _ = ctx.sliderI32Id(SLIDER_ID, "S", &v, .{ .min = 0, .max = 10, .track_w = 77 });
+    ctx.endFrame();
+
+    try std.testing.expectEqual(@as(u32, 77), ctx.getNodeRect(SLIDER_ID).?.w);
+}
+
+test "valueColumnWidth: covers the sign, the decimals and the widest digit count of the range" {
+    const font = font_mod.default_font;
+    const digit: i32 = @intCast(font.measure("0"));
+    const sign: i32 = @intCast(font.measure("-"));
+    const dot: i32 = @intCast(font.measure("."));
+
+    // 0..255 prints at most three digits, with no sign and no point.
+    try std.testing.expectEqual(3 * digit, valueColumnWidth(font, .{
+        .min = 0,
+        .max = 255,
+        .step = null,
+        .track_w = 80,
+        .is_float = false,
+    }));
+    // -100..1 needs the sign as well.
+    try std.testing.expectEqual(3 * digit + sign, valueColumnWidth(font, .{
+        .min = -100,
+        .max = 1,
+        .step = null,
+        .track_w = 80,
+        .is_float = false,
+    }));
+    // 0..360 as a float prints "360.00": five digits plus the point.
+    try std.testing.expectEqual(5 * digit + dot, valueColumnWidth(font, .{
+        .min = 0,
+        .max = 360,
+        .step = null,
+        .track_w = 80,
+        .is_float = true,
+    }));
+    // -1..1 as a float prints "-1.00".
+    try std.testing.expectEqual(3 * digit + dot + sign, valueColumnWidth(font, .{
+        .min = -1,
+        .max = 1,
+        .step = null,
+        .track_w = 80,
+        .is_float = true,
+    }));
 }
 
 test "slider: knobRectFor centers at track ends for frac=0/1 (travel range)" {

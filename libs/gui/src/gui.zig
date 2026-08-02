@@ -137,6 +137,10 @@ pub const labelEllipsis = @import("widgets.zig").labelEllipsis;
 pub const FormRowOpts = @import("widgets.zig").FormRowOpts;
 pub const beginFormRow = @import("widgets.zig").beginFormRow;
 pub const endFormRow = @import("widgets.zig").endFormRow;
+// Slider group — label / track / value columns shared by the slider rows inside
+pub const SliderGroupOpts = @import("widgets.zig").SliderGroupOpts;
+pub const beginSliderGroup = @import("widgets.zig").beginSliderGroup;
+pub const endSliderGroup = @import("widgets.zig").endSliderGroup;
 
 // PanelHost — dock-slot panel system.
 pub const PanelHost = @import("panel_host.zig").PanelHost;

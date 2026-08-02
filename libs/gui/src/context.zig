@@ -120,6 +120,29 @@ pub const ScrollState = struct {
     viewport_node: ?*layout.Node = null,
 };
 
+/// One row's two fixed-width cells, held so `endSliderGroup` can widen them once the group's
+/// widest label and widest value are known. Allocated on the frame arena and linked in build order.
+pub const SliderGroupCell = struct {
+    label_node: *layout.Node,
+    value_node: *layout.Node,
+    next: ?*SliderGroupCell = null,
+};
+
+/// Internal state carried across a slider group's begin→end.
+///
+/// Column widths are settled inside the frame that draws them, not carried over from the previous
+/// one: each row registers its cells here while it builds, and `endSliderGroup` writes the group's
+/// maxima back into every cell. Layout does not run until `endFrame`, so the widths every row is
+/// finally measured and placed with are this frame's. No row is ever drawn misaligned, not even the
+/// first frame of a group or the frame its label set changes.
+pub const SliderGroupState = struct {
+    column_gap: i32,
+    cells: ?*SliderGroupCell = null,
+    last: ?*SliderGroupCell = null,
+    label_w: i32 = 0,
+    value_w: i32 = 0,
+};
+
 pub const Context = struct {
     gpa: Allocator,
     arena: std.heap.ArenaAllocator,
@@ -196,6 +219,8 @@ pub const Context = struct {
     /// beginFrame). Lets endFrame cancel an `armed` drag whose source widget stopped being built,
     /// instead of leaving it stuck (see dnd.zig).
     drag_submitted_this_frame: bool = false,
+    /// The slider group `beginSliderGroup` opened, if one is open. Groups do not nest.
+    slider_group: ?SliderGroupState = null,
 
     // ── Widget layer. Implementations live in widgets.zig (aliases for method syntax) ──
     pub const button = widgets.button;
@@ -241,6 +266,9 @@ pub const Context = struct {
     // Form row
     pub const beginFormRow = widgets.beginFormRow;
     pub const endFormRow = widgets.endFormRow;
+    // Slider group (label / track / value columns shared by the rows inside)
+    pub const beginSliderGroup = widgets.beginSliderGroup;
+    pub const endSliderGroup = widgets.endSliderGroup;
     // read-only text selection
     pub const selectableLabel = widgets.selectableLabel;
     pub const selectableLabelId = widgets.selectableLabelId;
@@ -341,6 +369,8 @@ pub const Context = struct {
         self.tooltip_candidate_text = null;
         self.tooltip_candidate_anchor = .{ .x = 0, .y = 0, .w = 0, .h = 0 };
         self.drag_submitted_this_frame = false;
+        // The cells a group collects live on the frame arena, so the group cannot outlive the frame.
+        self.slider_group = null;
         self.draw_list.reset(screen_w, screen_h);
         // Implicit layout-tree root (callers just start with beginBox)
         const root = self.allocator().create(layout.Node) catch @panic("Context.beginFrame: OOM");
@@ -358,6 +388,9 @@ pub const Context = struct {
         // Every beginDisabled needs a matching endDisabled within the same frame (immediate-mode
         // begin/end nesting rule, the same contract beginCollapsible's body depth follows).
         std.debug.assert(self.disabled_depth == 0);
+        // Likewise every beginSliderGroup needs its endSliderGroup: the group's column widths are
+        // written back there, so an unclosed group would leave its rows at zero-width columns.
+        std.debug.assert(self.slider_group == null);
         const root = self.layout_root.?;
         // Detect beginBox / endBox mismatches
         std.debug.assert(self.layout_current == root);
@@ -693,6 +726,18 @@ pub const Context = struct {
         };
         layout.appendChild(parent, node);
         self.layout_current = node;
+    }
+
+    /// The layout node of the innermost box still open (the last `beginBox` whose `endBox` has not
+    /// run), or the frame's root when no box is open.
+    ///
+    /// For a widget that must revise a box's configuration after building something the
+    /// configuration depends on. The slider group is the only such caller: it equalises its column
+    /// widths at `endSliderGroup`, once every row has declared what it needs. Valid only until the
+    /// frame ends, because the node lives on the frame arena.
+    pub fn openBox(self: *Context) *layout.Node {
+        std.debug.assert(self.frame_active);
+        return self.layout_current.?;
     }
 
     pub fn endBox(self: *Context) void {

@@ -106,7 +106,12 @@ const PanKind = enum { space_left, middle, cmd_left };
 const CHECKER_LIGHT = blit.CHECKER_LIGHT;
 const CHECKER_DARK = blit.CHECKER_DARK;
 // Default PanelHost slot extents (inherits the former right/bottom pane constants).
-const RIGHT_PANE_DEFAULT: i32 = 200;
+// The right slot's default is set by its widest row — a layer row carries a thumbnail, an
+// ellipsized name no narrower than `LAYER_NAME_MIN_W`, a visibility button and an opacity slider
+// whose value has to stay inside the panel, less the vertical scrollbar the slot shows once its
+// panels are taller than it. A user is free to drag it narrower; the default is the width at
+// which nothing is cut off.
+const RIGHT_PANE_DEFAULT: i32 = 250;
 const RIGHT_PANE_MIN: i32 = 120;
 const LEFT_PANE_DEFAULT: i32 = 200;
 const LEFT_PANE_MIN: i32 = 120;
@@ -252,6 +257,10 @@ const LAYER_ROW_PART_SLIDER_WRAP: gui.Id = 6;
 /// Sized generously above `button_padding` (16px) plus a 3-char ellipsis ("...") so
 /// `ellipsizeText`'s own "ellipsis alone does not fit `max_w`" fallback (which returns "..."
 /// unclipped) never triggers here.
+///
+/// This floor and the opacity slider's slot together set what the right panel's default extent
+/// has to be: a row narrower than their sum pushes the opacity value out past the panel edge,
+/// where a clipped number reads as a wrong number.
 const LAYER_NAME_MIN_W: i32 = 56;
 /// Explicit IDs for the history panel.
 const HISTORY_PANEL_ID_BASE: gui.Id = 0xA431_0000;
@@ -5946,8 +5955,13 @@ fn buildLayerPanel(ctx: *gui.Context, app: *App) !void {
         const row_prev_w: i32 = if (ctx.getNodeRect(row_id)) |r| @intCast(r.w) else content_w;
         const thumb_w: i32 = if (ctx.getNodeRect(layerWidgetId(idx, 3))) |r| @intCast(r.w) else LAYER_THUMB_W;
         const vis_w: i32 = if (ctx.getNodeRect(layerWidgetId(idx, 1))) |r| @intCast(r.w) else 24;
-        const slider_w: i32 = if (ctx.getNodeRect(layerWidgetId(idx, LAYER_ROW_PART_SLIDER_WRAP))) |r| @intCast(r.w) else 100;
-        const name_w: i32 = @max(LAYER_NAME_MIN_W, row_prev_w - thumb_w - vis_w - slider_w - row_gap * 3);
+        // The opacity slider's slot is a width this row decides, not one it reads back: the name
+        // field takes whatever the row's other children leave over, and a slot that grew would be
+        // defined in terms of a name field that is defined in terms of it. The slot holds the
+        // slider's label, its widest value and a short track — what a 0..255 opacity needs to stay
+        // legible in a panel this narrow.
+        const opacity_slot_w: i32 = @intCast(ctx.font.measure("O") + ctx.font.measure("255") + 2 * 6 + 16);
+        const name_w: i32 = @max(LAYER_NAME_MIN_W, row_prev_w - thumb_w - vis_w - opacity_slot_w - row_gap * 3);
         const name_hpad: i32 = ctx.style.button_padding[1] + ctx.style.button_padding[3];
         const name_max_w: i32 = @max(0, name_w - name_hpad);
 
@@ -5991,12 +6005,14 @@ fn buildLayerPanel(ctx: *gui.Context, app: *App) !void {
         if (ctx.buttonId(layerWidgetId(idx, 1), vis_label, .{ .selected = layer.visible, .min_w = 22 }).clicked) {
             if (platform.netsyncActive()) app.routeUiLayerVisible(idx, !layer.visible) else app.doToggleLayerVisible(idx);
         }
-        ctx.beginBox(.{ .id = layerWidgetId(idx, LAYER_ROW_PART_SLIDER_WRAP) });
+        ctx.beginBox(.{ .id = layerWidgetId(idx, LAYER_ROW_PART_SLIDER_WRAP), .width = .{ .fixed = opacity_slot_w } });
         var op_i32: i32 = layer.opacity;
-        if (ctx.sliderI32Id(layerWidgetId(idx, 2), "O", &op_i32, .{ .min = 0, .max = 255, .track_w = 40 })) {
+        ctx.beginSliderGroup(.{});
+        if (ctx.sliderI32Id(layerWidgetId(idx, 2), "O", &op_i32, .{ .min = 0, .max = 255 })) {
             const v: u8 = @intCast(std.math.clamp(op_i32, 0, 255));
             if (platform.netsyncActive()) app.routeUiLayerOpacity(idx, v) else app.doSetLayerOpacity(idx, v) catch {};
         }
+        ctx.endSliderGroup();
         ctx.endBox(); // slider wrap
         ctx.endBox(); // row
 
@@ -6407,9 +6423,11 @@ fn panelBuildColor(ctx: *gui.Context, user_data: *anyopaque) anyerror!void {
     _ = ctx.svSquareId(0xCED10001, app.edit_h, &app.edit_s, &app.edit_v, .{ .size = 80 });
     _ = ctx.hueBarId(0xCED10002, &app.edit_h, .{ .h = 80 });
     ctx.endBox();
-    _ = ctx.sliderF32Id(0xCED10003, "H", &app.edit_h, .{ .min = 0, .max = 360, .step = 1, .track_w = 96 });
-    _ = ctx.sliderF32Id(0xCED10004, "S", &app.edit_s, .{ .min = 0, .max = 1, .step = 0.01, .track_w = 96 });
-    _ = ctx.sliderF32Id(0xCED10005, "V", &app.edit_v, .{ .min = 0, .max = 1, .step = 0.01, .track_w = 96 });
+    ctx.beginSliderGroup(.{});
+    _ = ctx.sliderF32Id(0xCED10003, "H", &app.edit_h, .{ .min = 0, .max = 360, .step = 1 });
+    _ = ctx.sliderF32Id(0xCED10004, "S", &app.edit_s, .{ .min = 0, .max = 1, .step = 0.01 });
+    _ = ctx.sliderF32Id(0xCED10005, "V", &app.edit_v, .{ .min = 0, .max = 1, .step = 0.01 });
+    ctx.endSliderGroup();
     app.edit_h = @min(app.edit_h, 360 - 1e-3); // Same [0,360) contract as hueBar
     app.applyEditColor();
 }
@@ -6525,13 +6543,14 @@ fn panelBuildToolOptions(ctx: *gui.Context, user_data: *anyopaque) anyerror!void
     }
     if (app.coarse_grid_enabled) {
         var spacing = app.coarse_grid_spacing;
+        ctx.beginSliderGroup(.{});
         if (ctx.sliderI32Id(0xB0_0004, "Spacing", &spacing, .{
             .min = @intCast(actions.MIN_GRID_SPACING),
             .max = @intCast(actions.MAX_GRID_SPACING),
-            .track_w = 160,
         })) {
             app.setCoarseGridSpacing(spacing);
         }
+        ctx.endSliderGroup();
     }
     if (app.active_kind == .brush or app.active_kind == .bezier) {
         _ = ctx.sliderI32Id(0xB0_0001, "Size", &app.brush_size_i32, .{ .min = 1, .max = 64, .track_w = 90 });
@@ -6642,9 +6661,17 @@ fn buildUi(ctx: *gui.Context, app: *App, canvas_rect: ?core.Rect) !void {
     // produces an integer zoom (1..32); shrink stages (1/2..1/4) show as 1 and stay reachable only
     // via wheel/keys, matching the "snap to integer stages" contract.
     var zoom_i32: i32 = app.view_zoom.toInteger() orelse 1;
-    if (ctx.sliderI32Id(STATUS_ZOOM_SLIDER_ID, "Zoom", &zoom_i32, .{ .min = 1, .max = @intCast(Zoom.max_integer), .track_w = 80 })) {
+    // A fixed width, not the default "take what is left": the status bar is one row, and a slider
+    // group that grew would push the counters that follow it off the end. Sized like the text slots
+    // above — the label, the widest value, the track, and the two column gaps.
+    var zoom_max_buf: [8]u8 = undefined;
+    const zoom_max_txt = std.fmt.bufPrint(&zoom_max_buf, "{d}", .{Zoom.max_integer}) catch "32";
+    const zoom_slider_group_w: i32 = @intCast(ctx.font.measure("Zoom") + ctx.font.measure(zoom_max_txt) + 80 + 2 * 6);
+    ctx.beginSliderGroup(.{ .width = .{ .fixed = zoom_slider_group_w } });
+    if (ctx.sliderI32Id(STATUS_ZOOM_SLIDER_ID, "Zoom", &zoom_i32, .{ .min = 1, .max = @intCast(Zoom.max_integer) })) {
         app.zoomInPlace(Zoom.fromInteger(zoom_i32));
     }
+    ctx.endSliderGroup();
     ctx.labelEx(
         try std.fmt.allocPrint(arena, "layer: {d}/{d}", .{ app.canvas.selected_layer + 1, app.canvas.layers.items.len }),
         ctx.style.text_subtle,
