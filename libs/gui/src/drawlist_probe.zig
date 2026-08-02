@@ -174,17 +174,18 @@ fn appendCmdLine(list: *std.ArrayList(u8), allocator: Allocator, cmd: DrawCmd) !
             c.clip.x, c.clip.y, c.clip.w, c.clip.h, @intFromBool(!rectFullyInside(c.rect, c.clip)),
         }),
         .rect_outline => |c| try appendFmt(list, allocator, "cmd=rect_outline x={d} y={d} w={d} h={d} thickness={d} color=#{X:0>8} clip_x={d} clip_y={d} clip_w={d} clip_h={d} offclip={d}\n", .{
-            c.rect.x, c.rect.y, c.rect.w, c.rect.h, c.thickness, colorBits(c.color),
+            c.rect.x, c.rect.y, c.rect.w, c.rect.h, c.thickness,                                    colorBits(c.color),
             c.clip.x, c.clip.y, c.clip.w, c.clip.h, @intFromBool(!rectFullyInside(c.rect, c.clip)),
         }),
         .line => |c| try appendFmt(list, allocator, "cmd=line x0={d} y0={d} x1={d} y1={d} thickness={d} color=#{X:0>8} clip_x={d} clip_y={d} clip_w={d} clip_h={d} offclip={d}\n", .{
-            c.p0.x, c.p0.y, c.p1.x, c.p1.y, c.thickness, colorBits(c.color),
+            c.p0.x,   c.p0.y,   c.p1.x,   c.p1.y,   c.thickness,                                                      colorBits(c.color),
             c.clip.x, c.clip.y, c.clip.w, c.clip.h, @intFromBool(!(c.clip.contains(c.p0) and c.clip.contains(c.p1))),
         }),
         .text => |c| {
             try appendFmt(list, allocator, "cmd=text x={d} y={d} color=#{X:0>8} font={s} clip_x={d} clip_y={d} clip_w={d} clip_h={d} offclip={d} text=", .{
-                c.pos.x, c.pos.y, colorBits(c.color), if (c.font == null) "default" else "custom",
-                c.clip.x, c.clip.y, c.clip.w, c.clip.h, @intFromBool(!c.clip.contains(c.pos)),
+                c.pos.x,                               c.pos.y,  colorBits(c.color), if (c.font == null) "default" else "custom",
+                c.clip.x,                              c.clip.y, c.clip.w,           c.clip.h,
+                @intFromBool(!c.clip.contains(c.pos)),
             });
             try appendEscapedText(list, allocator, c.text);
             try list.append(allocator, '\n');
@@ -192,7 +193,7 @@ fn appendCmdLine(list: *std.ArrayList(u8), allocator: Allocator, cmd: DrawCmd) !
         .image => |c| {
             const pixfnv = std.hash.Fnv1a_32.hash(std.mem.sliceAsBytes(c.pixels));
             try appendFmt(list, allocator, "cmd=image x={d} y={d} w={d} h={d} src_w={d} src_h={d} pixfnv=#{X:0>8} clip_x={d} clip_y={d} clip_w={d} clip_h={d} offclip={d}\n", .{
-                c.rect.x, c.rect.y, c.rect.w, c.rect.h, c.src_w, c.src_h, pixfnv,
+                c.rect.x, c.rect.y, c.rect.w, c.rect.h, c.src_w,                                        c.src_h, pixfnv,
                 c.clip.x, c.clip.y, c.clip.w, c.clip.h, @intFromBool(!rectFullyInside(c.rect, c.clip)),
             });
         },
