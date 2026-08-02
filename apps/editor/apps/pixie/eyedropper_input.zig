@@ -34,11 +34,16 @@ pub const EyedropperInput = struct {
         zoom: Zoom,
         mouse_pos: core.Vec2,
         mouse_pressed_pos: core.Vec2,
+        mouse_released_pos: core.Vec2,
         pressed_left: bool, // Already gated (true only inside canvas area and when no widget is active)
         released_left: bool,
     };
 
     /// Process one frame. Returns the canvas coord to sample if any (null when out of range / not picking).
+    ///
+    /// On the release frame the sample comes from `mouse_released_pos`, so a move delivered after
+    /// the up edge within the same frame cannot make the pick land on a different pixel — the same
+    /// rule the stroke, selection and shape paths follow.
     pub fn update(self: *EyedropperInput, frame: Frame) ?core.Vec2 {
         if (!self.picking) {
             if (frame.canvas_rect) |rect| {
@@ -48,9 +53,10 @@ pub const EyedropperInput = struct {
             }
         }
         if (!self.picking) return null;
+        const pos = if (frame.released_left) frame.mouse_released_pos else frame.mouse_pos;
         if (frame.released_left) self.picking = false;
         const rect = frame.canvas_rect orelse return null;
-        return zoom_mod.screenToCanvas(frame.mouse_pos, rect, frame.zoom);
+        return zoom_mod.screenToCanvas(pos, rect, frame.zoom);
     }
 };
 
@@ -67,6 +73,7 @@ test "EyedropperInput: press inside canvas starts picking and returns a coord" {
         .zoom = Zoom.one(),
         .mouse_pos = .{ .x = 3, .y = 4 },
         .mouse_pressed_pos = .{ .x = 3, .y = 4 },
+        .mouse_released_pos = .{ .x = 3, .y = 4 },
         .pressed_left = true,
         .released_left = false,
     });
@@ -81,6 +88,7 @@ test "EyedropperInput: press outside the display area does not start picking" {
         .zoom = Zoom.one(),
         .mouse_pos = .{ .x = 100, .y = 100 },
         .mouse_pressed_pos = .{ .x = 100, .y = 100 },
+        .mouse_released_pos = .{ .x = 100, .y = 100 },
         .pressed_left = true,
         .released_left = false,
     });
@@ -95,6 +103,7 @@ test "EyedropperInput: while held, follows move and returns a coord every frame"
         .zoom = Zoom.one(),
         .mouse_pos = .{ .x = 0, .y = 0 },
         .mouse_pressed_pos = .{ .x = 0, .y = 0 },
+        .mouse_released_pos = .{ .x = 0, .y = 0 },
         .pressed_left = true,
         .released_left = false,
     });
@@ -103,6 +112,7 @@ test "EyedropperInput: while held, follows move and returns a coord every frame"
         .zoom = Zoom.one(),
         .mouse_pos = .{ .x = 5, .y = 6 },
         .mouse_pressed_pos = .{ .x = 0, .y = 0 },
+        .mouse_released_pos = .{ .x = 5, .y = 6 },
         .pressed_left = false,
         .released_left = false,
     });
@@ -117,6 +127,7 @@ test "EyedropperInput: drag outside returns null but picking continues; release 
         .zoom = Zoom.one(),
         .mouse_pos = .{ .x = 2, .y = 2 },
         .mouse_pressed_pos = .{ .x = 2, .y = 2 },
+        .mouse_released_pos = .{ .x = 2, .y = 2 },
         .pressed_left = true,
         .released_left = false,
     });
@@ -126,6 +137,7 @@ test "EyedropperInput: drag outside returns null but picking continues; release 
         .zoom = Zoom.one(),
         .mouse_pos = .{ .x = 100, .y = 2 },
         .mouse_pressed_pos = .{ .x = 2, .y = 2 },
+        .mouse_released_pos = .{ .x = 100, .y = 2 },
         .pressed_left = false,
         .released_left = false,
     });
@@ -137,6 +149,7 @@ test "EyedropperInput: drag outside returns null but picking continues; release 
         .zoom = Zoom.one(),
         .mouse_pos = .{ .x = 100, .y = -50 },
         .mouse_pressed_pos = .{ .x = 2, .y = 2 },
+        .mouse_released_pos = .{ .x = 100, .y = -50 },
         .pressed_left = false,
         .released_left = true,
     });
@@ -151,6 +164,7 @@ test "EyedropperInput: release inside canvas returns a coord and ends picking" {
         .zoom = Zoom.one(),
         .mouse_pos = .{ .x = 1, .y = 1 },
         .mouse_pressed_pos = .{ .x = 1, .y = 1 },
+        .mouse_released_pos = .{ .x = 1, .y = 1 },
         .pressed_left = true,
         .released_left = false,
     });
@@ -159,11 +173,37 @@ test "EyedropperInput: release inside canvas returns a coord and ends picking" {
         .zoom = Zoom.one(),
         .mouse_pos = .{ .x = 9, .y = 9 },
         .mouse_pressed_pos = .{ .x = 1, .y = 1 },
+        .mouse_released_pos = .{ .x = 9, .y = 9 },
         .pressed_left = false,
         .released_left = true,
     });
     try std.testing.expect(!ei.picking);
     try std.testing.expectEqualDeep(@as(?core.Vec2, .{ .x = 9, .y = 9 }), cp);
+}
+
+test "EyedropperInput: a move after the release edge does not shift the sampled pixel" {
+    var ei: EyedropperInput = .{};
+    _ = ei.update(.{
+        .canvas_rect = RECT0,
+        .zoom = Zoom.one(),
+        .mouse_pos = .{ .x = 1, .y = 1 },
+        .mouse_pressed_pos = .{ .x = 1, .y = 1 },
+        .mouse_released_pos = .{ .x = 0, .y = 0 },
+        .pressed_left = true,
+        .released_left = false,
+    });
+    // The frame delivers up at (4, 5) and then a stray move to (12, 13).
+    const cp = ei.update(.{
+        .canvas_rect = RECT0,
+        .zoom = Zoom.one(),
+        .mouse_pos = .{ .x = 12, .y = 13 },
+        .mouse_pressed_pos = .{ .x = 1, .y = 1 },
+        .mouse_released_pos = .{ .x = 4, .y = 5 },
+        .pressed_left = false,
+        .released_left = true,
+    });
+    try std.testing.expect(!ei.picking);
+    try std.testing.expectEqualDeep(@as(?core.Vec2, .{ .x = 4, .y = 5 }), cp);
 }
 
 test "EyedropperInput: unset canvas_rect (first frame) does not start picking" {
@@ -173,6 +213,7 @@ test "EyedropperInput: unset canvas_rect (first frame) does not start picking" {
         .zoom = Zoom.one(),
         .mouse_pos = .{ .x = 1, .y = 1 },
         .mouse_pressed_pos = .{ .x = 1, .y = 1 },
+        .mouse_released_pos = .{ .x = 1, .y = 1 },
         .pressed_left = true,
         .released_left = false,
     });

@@ -891,11 +891,14 @@ pub fn buttonBehavior(ctx: *Context, id: Id, rect: Rect, clip: Rect) ButtonResul
 
     // 3. hold / release. While active, keep held even when dragging outside clip (drag capture).
     //    On release edge: clear active + confirm click if visibly hovered at up.
+    //    The click test uses `dragPos` (the coordinates at the up edge, not the frame's final
+    //    mouse_pos), on the same reasoning as step 2's use of the press origin: a move delivered
+    //    after the up in the same frame must not decide whether the click landed.
     if (ctx.state.active_id == id) {
         result.held = true;
         ctx.state.active_submitted = true; // Anti-stick: mark evaluated this frame
         if (ctx.input.mouse_released.left) {
-            if (hovered_now) result.clicked = true;
+            if (pointHitsVisible(rect, clip, ctx.input.dragPos())) result.clicked = true;
             ctx.state.active_id = 0;
         }
     }
@@ -953,6 +956,50 @@ test "buttonBehavior: down→up completed in the same frame still returns clicke
     const r = buttonBehavior(&ctx, 1, btn_rect, full_clip);
     try std.testing.expect(r.clicked);
     ctx.endFrame();
+}
+
+test "buttonBehavior: a move off the widget after the release edge still makes clicked true" {
+    var ctx = testCtx();
+    defer ctx.deinit();
+    const id: Id = 1;
+
+    ctx.beginFrame(800, 600);
+    ctx.pushEvent(.{ .mouse_move = .{ .x = 10, .y = 10, .modifiers = 0 } });
+    ctx.pushEvent(.{ .mouse_down = .{ .x = 10, .y = 10, .button = 0, .modifiers = 0 } });
+    _ = buttonBehavior(&ctx, id, btn_rect, full_clip);
+    ctx.endFrame();
+
+    // Up inside the button, then one more move that leaves it in the same frame.
+    ctx.beginFrame(800, 600);
+    ctx.pushEvent(.{ .mouse_up = .{ .x = 10, .y = 10, .button = 0, .modifiers = 0 } });
+    ctx.pushEvent(.{ .mouse_move = .{ .x = 500, .y = 500, .modifiers = 0 } });
+    const r = buttonBehavior(&ctx, id, btn_rect, full_clip);
+    ctx.endFrame();
+
+    try std.testing.expect(r.clicked);
+    try std.testing.expect(!r.hovered); // hover still follows the frame's final position
+}
+
+test "buttonBehavior: a move onto the widget after the release edge does not make clicked true" {
+    var ctx = testCtx();
+    defer ctx.deinit();
+    const id: Id = 1;
+
+    ctx.beginFrame(800, 600);
+    ctx.pushEvent(.{ .mouse_move = .{ .x = 10, .y = 10, .modifiers = 0 } });
+    ctx.pushEvent(.{ .mouse_down = .{ .x = 10, .y = 10, .button = 0, .modifiers = 0 } });
+    _ = buttonBehavior(&ctx, id, btn_rect, full_clip);
+    ctx.endFrame();
+
+    // Up outside the button, then a move back onto it in the same frame.
+    ctx.beginFrame(800, 600);
+    ctx.pushEvent(.{ .mouse_up = .{ .x = 500, .y = 500, .button = 0, .modifiers = 0 } });
+    ctx.pushEvent(.{ .mouse_move = .{ .x = 10, .y = 10, .modifiers = 0 } });
+    const r = buttonBehavior(&ctx, id, btn_rect, full_clip);
+    ctx.endFrame();
+
+    try std.testing.expect(!r.clicked);
+    try std.testing.expect(r.hovered);
 }
 
 test "buttonBehavior: no hover/click outside clip" {

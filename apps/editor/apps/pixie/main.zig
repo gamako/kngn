@@ -7552,6 +7552,7 @@ fn appFrameInner(self: *App, win: *platform.Window) !void {
                     .zoom = self.view_zoom,
                     .mouse_pos = .{ .x = in.mouse_pos.x, .y = in.mouse_pos.y },
                     .mouse_pressed_pos = .{ .x = in.mouse_pressed_pos.x, .y = in.mouse_pressed_pos.y },
+                    .mouse_released_pos = .{ .x = in.mouse_released_pos.x, .y = in.mouse_released_pos.y },
                     .pressed_left = pressed_left_gated,
                     .released_left = in.mouse_released.left,
                 };

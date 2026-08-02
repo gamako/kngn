@@ -184,6 +184,30 @@ pub const Input = struct {
         }
     }
 
+    /// The pointer position a drag in progress must use for this frame.
+    ///
+    /// A frame can carry several pointer events, and the platform commonly delivers a left
+    /// `mouse_up` followed by another `mouse_move` within one frame (lifting a finger off a
+    /// trackpad is the everyday case). `mouse_pos` is the frame's *final* position, which is what
+    /// hover wants; a drag wants the position the gesture actually ended at. So on the frame the
+    /// left button is released this reports `mouse_released_pos`, and otherwise `mouse_pos`.
+    ///
+    /// Every widget that turns a pointer position into a value while held reads this rather than
+    /// `mouse_pos`, so that the value a drag settles on cannot be moved by an event that arrives
+    /// after the release edge.
+    pub inline fn dragPos(self: *const Input) Vec2 {
+        return if (self.mouse_released.left) self.mouse_released_pos else self.mouse_pos;
+    }
+
+    /// `dragPos` measured against the previous frame's final position — the delta counterpart of
+    /// `dragPos`, for widgets that consume movement rather than absolute position (a splitter, a
+    /// scrollbar thumb). Movement delivered after the release edge is excluded, so it matches
+    /// `mouse_delta` on every frame except the one a drag ends on.
+    pub inline fn dragDelta(self: *const Input) Vec2 {
+        const p = self.dragPos();
+        return .{ .x = p.x - self.mouse_prev.x, .y = p.y - self.mouse_prev.y };
+    }
+
     pub fn orderedTextEvents(self: *const Input) []const OrderedTextEvent {
         return self.ordered_text_events.items;
     }
@@ -340,6 +364,61 @@ test "Input: mouse_pos updates even on up without a move" {
     in.pushEvent(.{ .mouse_up = .{ .x = 33, .y = 44, .button = 0, .modifiers = 0 } });
     try std.testing.expectEqual(@as(i32, 33), in.mouse_pos.x);
     try std.testing.expectEqual(@as(i32, 44), in.mouse_pos.y);
+}
+
+test "Input: dragPos follows mouse_pos while the button stays down" {
+    var in = Input.init(std.testing.allocator);
+    defer in.deinit();
+
+    in.beginFrame();
+    in.pushEvent(.{ .mouse_down = .{ .x = 10, .y = 10, .button = 0, .modifiers = 0 } });
+    in.pushEvent(.{ .mouse_move = .{ .x = 40, .y = 30, .modifiers = 0 } });
+
+    try std.testing.expectEqual(@as(i32, 40), in.dragPos().x);
+    try std.testing.expectEqual(@as(i32, 30), in.dragPos().y);
+    // With no release edge, dragDelta and mouse_delta agree.
+    try std.testing.expectEqual(in.mouse_delta.x, in.dragDelta().x);
+    try std.testing.expectEqual(in.mouse_delta.y, in.dragDelta().y);
+}
+
+test "Input: dragPos reports the release coordinates when a move follows the up in one frame" {
+    var in = Input.init(std.testing.allocator);
+    defer in.deinit();
+
+    // Frame 1: press, then drag to (40, 30).
+    in.beginFrame();
+    in.pushEvent(.{ .mouse_down = .{ .x = 10, .y = 10, .button = 0, .modifiers = 0 } });
+    in.pushEvent(.{ .mouse_move = .{ .x = 40, .y = 30, .modifiers = 0 } });
+
+    // Frame 2: release at (40, 30), then a stray move to (90, 80).
+    in.beginFrame();
+    in.pushEvent(.{ .mouse_up = .{ .x = 40, .y = 30, .button = 0, .modifiers = 0 } });
+    in.pushEvent(.{ .mouse_move = .{ .x = 90, .y = 80, .modifiers = 0 } });
+
+    try std.testing.expectEqual(@as(i32, 40), in.dragPos().x);
+    try std.testing.expectEqual(@as(i32, 30), in.dragPos().y);
+    // mouse_pos still holds the frame's final position, for hover.
+    try std.testing.expectEqual(@as(i32, 90), in.mouse_pos.x);
+    try std.testing.expectEqual(@as(i32, 80), in.mouse_pos.y);
+}
+
+test "Input: dragDelta excludes movement delivered after the release edge" {
+    var in = Input.init(std.testing.allocator);
+    defer in.deinit();
+
+    in.beginFrame();
+    in.pushEvent(.{ .mouse_down = .{ .x = 10, .y = 10, .button = 0, .modifiers = 0 } });
+
+    in.beginFrame(); // mouse_prev = (10, 10)
+    in.pushEvent(.{ .mouse_move = .{ .x = 25, .y = 18, .modifiers = 0 } });
+    in.pushEvent(.{ .mouse_up = .{ .x = 25, .y = 18, .button = 0, .modifiers = 0 } });
+    in.pushEvent(.{ .mouse_move = .{ .x = 200, .y = 300, .modifiers = 0 } });
+
+    try std.testing.expectEqual(@as(i32, 15), in.dragDelta().x);
+    try std.testing.expectEqual(@as(i32, 8), in.dragDelta().y);
+    // mouse_delta keeps counting the stray move.
+    try std.testing.expectEqual(@as(i32, 190), in.mouse_delta.x);
+    try std.testing.expectEqual(@as(i32, 290), in.mouse_delta.y);
 }
 
 test "Input: key edge (pressed/released last one frame; down persists)" {

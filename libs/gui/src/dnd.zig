@@ -192,11 +192,12 @@ pub fn dropTarget(ctx: *Context, id: Id, can_accept: bool) DropResult {
     const d = if (ctx.drag) |*d| d else return .{};
     if (d.phase != .dragging or d.accepted) return .{};
     const cached = ctx.rect_cache.get(id) orelse return .{};
-    if (!pointHitsVisible(cached.rect, cached.clip, ctx.input.mouse_pos)) return .{};
+    // `dragPos` rather than `mouse_pos`: on the frame the drop lands, the position that decides
+    // where it landed is the one at the release edge, so a move delivered after that edge in the
+    // same frame cannot pull the pointer off the target and lose the drop.
+    if (!pointHitsVisible(cached.rect, cached.clip, ctx.input.dragPos())) return .{};
 
-    if (ctx.input.mouse_released.left and can_accept and
-        pointHitsVisible(cached.rect, cached.clip, ctx.input.mouse_released_pos))
-    {
+    if (ctx.input.mouse_released.left and can_accept) {
         d.accepted = true;
         return .{ .hovering = true, .accepted = d.payload };
     }
@@ -386,6 +387,36 @@ test "dropTarget: accepts on release inside its rect, finishDrag reports claimed
     const finished = finishDrag(&ctx);
     try testing.expect(finished == null); // claimed: dropTarget's own return is the caller's copy
     try testing.expect(!isDragging(&ctx));
+    ctx.endFrame();
+}
+
+test "dropTarget: a move off the target after the release edge still lands the drop" {
+    var ctx = testCtx();
+    defer ctx.deinit();
+    const boxes = frameWithTwoBoxes(&ctx, 1, 2);
+    const pa: Vec2 = .{ .x = boxes.a.x + 2, .y = boxes.a.y + 2 };
+    const pb: Vec2 = .{ .x = boxes.b.x + 2, .y = boxes.b.y + 2 };
+
+    ctx.beginFrame(200, 200);
+    press(&ctx, pa.x, pa.y);
+    _ = dragSource(&ctx, 1, DragPayload.fromValue(TestPayload, test_kind, .{ .slot = 5 }));
+    ctx.endFrame();
+
+    ctx.beginFrame(200, 200);
+    moveTo(&ctx, pa.x + drag_threshold_px + 1, pa.y);
+    _ = dragSource(&ctx, 1, DragPayload.fromValue(TestPayload, test_kind, .{ .slot = 5 }));
+    ctx.endFrame();
+
+    // Release over b, then one more move that leaves b within the same frame.
+    ctx.beginFrame(200, 200);
+    moveTo(&ctx, pb.x, pb.y);
+    release(&ctx, pb.x, pb.y);
+    moveTo(&ctx, 190, 190);
+    _ = dragSource(&ctx, 1, DragPayload.fromValue(TestPayload, test_kind, .{ .slot = 5 }));
+    const drop = dropTarget(&ctx, 2, true);
+    try testing.expect(drop.accepted != null);
+    try testing.expectEqual(@as(i32, 5), drop.accepted.?.read(TestPayload, test_kind).?.slot);
+    try testing.expect(finishDrag(&ctx) == null);
     ctx.endFrame();
 }
 

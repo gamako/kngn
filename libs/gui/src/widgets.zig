@@ -959,7 +959,7 @@ const SwatchDraw = struct {
 // ── Slider ─────────────────────────────────────
 // Register the track as an explicit-ID box → each frame derive the knob rect from value →
 // call `buttonBehavior` on the knob rect for active (press only on the knob = clicking the track alone does not jump).
-// While active, map `mouse_pos.x` onto the track travel range and update `*value`. Internals use f64.
+// While active, map `Input.dragPos().x` onto the track travel range and update `*value`. Internals use f64.
 // Layout is [fixed name label] [track] [dynamic value text]; track.x does not depend on value digit count.
 
 /// i32 slider (auto ID: `IdStack.make(label)`). Returns true when the value changes.
@@ -1079,7 +1079,7 @@ fn sliderCore(ctx: *Context, id: Id, label: []const u8, cur: f64, spec: SliderSp
             const res = context_mod.buttonBehavior(ctx, id, kr, cached.clip);
             if (res.held) {
                 _ = ctx.claimFocus(id);
-                const mx: f64 = @floatFromInt(ctx.input.mouse_pos.x);
+                const mx: f64 = @floatFromInt(ctx.input.dragPos().x);
                 const t = std.math.clamp((mx - range.lo) / range.span, 0, 1);
                 value = clampAndStep(spec.min + t * (spec.max - spec.min), spec); // Apply step only while dragging
             }
@@ -1201,8 +1201,9 @@ pub fn svSquareId(ctx: *Context, id: Id, hue: f32, s: *f32, v: *f32, opts: SvSqu
         if (res.held) {
             const w1: f32 = @floatFromInt(@as(i32, @intCast(r.w)) - 1);
             const h1: f32 = @floatFromInt(@as(i32, @intCast(r.h)) - 1);
-            const mx: f32 = @floatFromInt(ctx.input.mouse_pos.x - r.x);
-            const my: f32 = @floatFromInt(ctx.input.mouse_pos.y - r.y);
+            const dp = ctx.input.dragPos();
+            const mx: f32 = @floatFromInt(dp.x - r.x);
+            const my: f32 = @floatFromInt(dp.y - r.y);
             s.* = std.math.clamp(mx / w1, 0, 1);
             v.* = std.math.clamp(1 - my / h1, 0, 1); // Top = bright
         }
@@ -1279,7 +1280,7 @@ pub fn hueBarId(ctx: *Context, id: Id, h: *f32, opts: HueBarOpts) bool {
         const res = context_mod.buttonBehavior(ctx, id, r, cached.clip);
         if (res.held) {
             const hh: f32 = @floatFromInt(r.h);
-            const my: f32 = @floatFromInt(ctx.input.mouse_pos.y - r.y);
+            const my: f32 = @floatFromInt(ctx.input.dragPos().y - r.y);
             const t = std.math.clamp(my / hh, 0, 1);
             h.* = @min(t * 360, 360 - 1e-3);
         }
@@ -1699,14 +1700,14 @@ pub const SplitterOpts = struct {
     invert: bool = false,
 };
 
-/// Signed delta from the orient-axis raw component of `mouse_delta`, after invert.
+/// Signed delta from the orient-axis raw component of `Input.dragDelta`, after invert.
 fn splitterDelta(orient: Orient, mouse_dx: i32, mouse_dy: i32, invert: bool) i32 {
     const d = if (orient == .vertical) mouse_dx else mouse_dy;
     return if (invert) -d else d;
 }
 
 /// Drag the boundary band to grow/shrink `size` (true when it changed).
-/// Sync hit-test: `buttonBehavior` on previous-frame rect; while held, apply `mouse_delta` to size with min/max clamp.
+/// Sync hit-test: `buttonBehavior` on previous-frame rect; while held, apply `Input.dragDelta` to size with min/max clamp.
 /// Placed as an explicit-id box: vertical=thickness wide × grow tall / horizontal=thickness tall × grow wide.
 pub fn splitter(ctx: *Context, id: Id, orient: Orient, size: *i32, opts: SplitterOpts) bool {
     std.debug.assert(opts.thickness > 0);
@@ -1716,7 +1717,8 @@ pub fn splitter(ctx: *Context, id: Id, orient: Orient, size: *i32, opts: Splitte
     if (ctx.rect_cache.get(id)) |cached| {
         const res = context_mod.buttonBehavior(ctx, id, cached.rect, cached.clip);
         if (res.held) {
-            const delta = splitterDelta(orient, ctx.input.mouse_delta.x, ctx.input.mouse_delta.y, opts.invert);
+            const dd = ctx.input.dragDelta();
+            const delta = splitterDelta(orient, dd.x, dd.y, opts.invert);
             size.* = std.math.clamp(size.* + delta, opts.min, opts.max);
         }
     }
@@ -1809,13 +1811,13 @@ pub fn beginScrollArea(ctx: *Context, id: Id, scroll: *Vec2f, opts: ScrollAreaOp
     const need_v = max_y > 0;
     const need_h = max_x > 0;
 
-    // Thumb drag (`buttonBehavior` on previous-frame thumb rect; map held `mouse_delta` into scroll)
+    // Thumb drag (`buttonBehavior` on previous-frame thumb rect; map held `Input.dragDelta` into scroll)
     if (need_v) {
         if (ctx.rect_cache.get(vthumb_id)) |c| {
             const res = context_mod.buttonBehavior(ctx, vthumb_id, c.rect, c.clip);
             if (res.held) {
                 const travel = @max(1, vp_h - scrollThumbLen(vp_h, content_h));
-                scroll.y += @as(f32, @floatFromInt(ctx.input.mouse_delta.y)) *
+                scroll.y += @as(f32, @floatFromInt(ctx.input.dragDelta().y)) *
                     @as(f32, @floatFromInt(max_y)) / @as(f32, @floatFromInt(travel));
             }
         }
@@ -1825,7 +1827,7 @@ pub fn beginScrollArea(ctx: *Context, id: Id, scroll: *Vec2f, opts: ScrollAreaOp
             const res = context_mod.buttonBehavior(ctx, hthumb_id, c.rect, c.clip);
             if (res.held) {
                 const travel = @max(1, vp_w - scrollThumbLen(vp_w, content_w));
-                scroll.x += @as(f32, @floatFromInt(ctx.input.mouse_delta.x)) *
+                scroll.x += @as(f32, @floatFromInt(ctx.input.dragDelta().x)) *
                     @as(f32, @floatFromInt(max_x)) / @as(f32, @floatFromInt(travel));
             }
         }
@@ -2251,9 +2253,13 @@ fn pressAt(ctx: *Context, x: i32, y: i32) void {
     ctx.pushEvent(.{ .mouse_down = .{ .x = x, .y = y, .button = 0, .modifiers = 0 } });
 }
 
+fn releaseAt(ctx: *Context, x: i32, y: i32) void {
+    ctx.pushEvent(.{ .mouse_up = .{ .x = x, .y = y, .button = 0, .modifiers = 0 } });
+}
+
 fn clickAt(ctx: *Context, x: i32, y: i32) void {
     pressAt(ctx, x, y);
-    ctx.pushEvent(.{ .mouse_up = .{ .x = x, .y = y, .button = 0, .modifiers = 0 } });
+    releaseAt(ctx, x, y);
 }
 
 fn center(rect: Rect) struct { x: i32, y: i32 } {
@@ -2351,6 +2357,35 @@ test "splitter: vertical drag moves size by delta and clamps at max" {
     _ = ctx.splitter(ID, .vertical, &size, opts);
     ctx.endFrame();
     try std.testing.expectEqual(@as(i32, 400), size);
+}
+
+test "splitter: movement delivered after the release edge is not applied to size" {
+    var ctx = testCtx();
+    defer ctx.deinit();
+    var size: i32 = 200;
+    const ID: Id = 0x5117e3;
+    const opts: SplitterOpts = .{ .min = 100, .max = 400, .thickness = 6 };
+
+    ctx.beginFrame(800, 600);
+    _ = ctx.splitter(ID, .vertical, &size, opts);
+    ctx.endFrame();
+    const c = center(ctx.getNodeRect(ID).?);
+
+    ctx.beginFrame(800, 600);
+    pressAt(&ctx, c.x, c.y);
+    _ = ctx.splitter(ID, .vertical, &size, opts);
+    ctx.endFrame();
+
+    // Drag +30, release there, then receive one more move far to the right.
+    const before = size;
+    ctx.beginFrame(800, 600);
+    moveTo(&ctx, c.x + 30, c.y);
+    releaseAt(&ctx, c.x + 30, c.y);
+    moveTo(&ctx, c.x + 1000, c.y);
+    _ = ctx.splitter(ID, .vertical, &size, opts);
+    ctx.endFrame();
+
+    try std.testing.expectEqual(before + 30, size);
 }
 
 test "splitter: horizontal + invert moves the opposite way" {
@@ -3142,6 +3177,36 @@ test "slider: drag updates *value and clamps to [min,max]" {
     try std.testing.expectEqual(@as(i32, 100), v);
 }
 
+test "slider: a move delivered after the release edge does not move the value" {
+    var ctx = testCtx();
+    defer ctx.deinit();
+    var v: i32 = 0;
+    const opts: SliderI32Opts = .{ .min = 0, .max = 100 };
+
+    const track = sliderFrame1I32(&ctx, &v, opts);
+    const kw = ctx.style.slider_knob_w;
+    const lo = track.x + @divTrunc(kw, 2);
+    const span = @as(i32, @intCast(track.w)) - kw;
+    const yc = trackCenterY(track);
+
+    // frame2: grab the knob at v=0
+    ctx.beginFrame(800, 600);
+    pressAt(&ctx, lo, yc);
+    _ = ctx.sliderI32Id(SLIDER_ID, "S", &v, opts);
+    ctx.endFrame();
+
+    // frame3: drag to mid-track, release there, and then receive one more move far to the right.
+    ctx.beginFrame(800, 600);
+    moveTo(&ctx, lo + @divTrunc(span, 2), yc);
+    releaseAt(&ctx, lo + @divTrunc(span, 2), yc);
+    moveTo(&ctx, track.x + @as(i32, @intCast(track.w)) + 500, yc);
+    _ = ctx.sliderI32Id(SLIDER_ID, "S", &v, opts);
+    ctx.endFrame();
+
+    // The value settles where the release happened, not where the stray move landed.
+    try std.testing.expect(v >= 45 and v <= 55);
+}
+
 test "slider: with step, values snap to step units" {
     var ctx = testCtx();
     defer ctx.deinit();
@@ -3275,6 +3340,35 @@ test "svSquare: in-area drag updates s,v and clamps to [0,1]" {
     try std.testing.expectApproxEqAbs(@as(f32, 0), v, 0.001);
 }
 
+test "svSquare: a move delivered after the release edge does not move s,v" {
+    var ctx = testCtx();
+    defer ctx.deinit();
+    var s: f32 = 0;
+    var v: f32 = 1;
+
+    ctx.beginFrame(800, 600);
+    _ = ctx.svSquareId(PICKER_ID, 0, &s, &v, .{ .size = 64 });
+    ctx.endFrame();
+    const r = ctx.getNodeRect(PICKER_ID).?;
+
+    // frame2: grab near the top-left
+    ctx.beginFrame(800, 600);
+    pressAt(&ctx, r.x + 5, r.y + 5);
+    _ = ctx.svSquareId(PICKER_ID, 0, &s, &v, .{ .size = 64 });
+    ctx.endFrame();
+
+    // frame3: drag to the middle, release there, then receive a move past the bottom-right corner
+    ctx.beginFrame(800, 600);
+    moveTo(&ctx, r.x + 32, r.y + 32);
+    releaseAt(&ctx, r.x + 32, r.y + 32);
+    moveTo(&ctx, r.x + @as(i32, @intCast(r.w)) + 500, r.y + @as(i32, @intCast(r.h)) + 500);
+    _ = ctx.svSquareId(PICKER_ID, 0, &s, &v, .{ .size = 64 });
+    ctx.endFrame();
+
+    try std.testing.expectApproxEqAbs(@as(f32, 0.5), s, 0.05);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.5), v, 0.05);
+}
+
 test "svSquare: press outside the area does not take active (hit-test region limited)" {
     var ctx = testCtx();
     defer ctx.deinit();
@@ -3346,6 +3440,32 @@ test "hueBar: drag updates h in [0,360)" {
     moveTo(&ctx, r.x + 8, r.y + @as(i32, @intCast(@divTrunc(r.h, 2))));
     _ = ctx.hueBarId(PICKER_ID, &h, .{ .w = 16, .h = 64 });
     ctx.endFrame();
+    try std.testing.expectApproxEqAbs(@as(f32, 180), h, 20);
+}
+
+test "hueBar: a move delivered after the release edge does not move h" {
+    var ctx = testCtx();
+    defer ctx.deinit();
+    var h: f32 = 0;
+
+    ctx.beginFrame(800, 600);
+    _ = ctx.hueBarId(PICKER_ID, &h, .{ .w = 16, .h = 64 });
+    ctx.endFrame();
+    const r = ctx.getNodeRect(PICKER_ID).?;
+    const mid_y = r.y + @as(i32, @intCast(@divTrunc(r.h, 2)));
+
+    ctx.beginFrame(800, 600);
+    pressAt(&ctx, r.x + 8, r.y + 2);
+    _ = ctx.hueBarId(PICKER_ID, &h, .{ .w = 16, .h = 64 });
+    ctx.endFrame();
+
+    ctx.beginFrame(800, 600);
+    moveTo(&ctx, r.x + 8, mid_y);
+    releaseAt(&ctx, r.x + 8, mid_y);
+    moveTo(&ctx, r.x + 8, r.y + @as(i32, @intCast(r.h)) + 500);
+    _ = ctx.hueBarId(PICKER_ID, &h, .{ .w = 16, .h = 64 });
+    ctx.endFrame();
+
     try std.testing.expectApproxEqAbs(@as(f32, 180), h, 20);
 }
 
@@ -3467,6 +3587,49 @@ test "scrollArea: dragging the vertical thumb increases scroll.y (sync drag)" {
     ctx.endScrollArea();
     ctx.endFrame();
     try std.testing.expect(scroll.y > before);
+}
+
+test "scrollArea: thumb movement delivered after the release edge is not applied to scroll" {
+    var ctx = testCtx();
+    defer ctx.deinit();
+    const SID: Id = 0x5C0023;
+    const CHILD: Id = 0xC0FFEE23;
+    var scroll: Vec2f = .{};
+    const opts: ScrollAreaOpts = .{ .width = .{ .fixed = 100 }, .height = .{ .fixed = 60 } };
+
+    var warm: usize = 0;
+    while (warm < 2) : (warm += 1) {
+        ctx.beginFrame(300, 300);
+        ctx.beginScrollArea(SID, &scroll, opts);
+        buildFixedContent(&ctx, CHILD, 80, 200);
+        ctx.endScrollArea();
+        ctx.endFrame();
+    }
+
+    const vthumb_id = id_mod.hashInt(SID, 2);
+    const tc = center(ctx.getNodeRect(vthumb_id).?);
+
+    ctx.beginFrame(300, 300);
+    pressAt(&ctx, tc.x, tc.y);
+    ctx.beginScrollArea(SID, &scroll, opts);
+    buildFixedContent(&ctx, CHILD, 80, 200);
+    ctx.endScrollArea();
+    ctx.endFrame();
+
+    // Drag down 20, release there, then receive a move far past the bottom of the track.
+    const before = scroll.y;
+    ctx.beginFrame(300, 300);
+    moveTo(&ctx, tc.x, tc.y + 20);
+    releaseAt(&ctx, tc.x, tc.y + 20);
+    moveTo(&ctx, tc.x, tc.y + 2000);
+    ctx.beginScrollArea(SID, &scroll, opts);
+    buildFixedContent(&ctx, CHILD, 80, 200);
+    ctx.endScrollArea();
+    ctx.endFrame();
+
+    // Content 200 in a 60-high viewport gives max_y = 140; the stray move alone would pin it there.
+    try std.testing.expect(scroll.y > before);
+    try std.testing.expect(scroll.y < 140);
 }
 
 fn nestScrollWarmup(ctx: *Context, outer_id: Id, inner_id: Id, mid_id: ?Id, outer: *Vec2f, mid: ?*Vec2f, inner: *Vec2f) void {
