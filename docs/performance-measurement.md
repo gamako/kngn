@@ -80,6 +80,17 @@ the synth 44.2 → 58.7fps.
   **"The backend waits first" is not a guarantee**: measured on metal, present did not
   block and the caller waited 9.6ms on average to produce 60.4fps (the real OS wait was
   11.0ms at p95, with one sleep call per frame).
+- **Remove the caller's pacing and the support tier becomes visible.** `-Dframe-cap=0`
+  disables the pacing the caller does; a backend that paces itself still does. Measured
+  on the editor at 3554x1886 on a 60Hz display, ReleaseFast, over 600 frames: metal holds
+  **60.0fps** with `gap_ms=0.048` and its `present` section at 12.8ms, consistent with
+  the fifo and inflight waits taken inside present — while objc and swift free-run at
+  **139fps** with `present` returning in 0.67ms. At 139 submissions a second to a 60Hz
+  display, about 57% of them cannot land on a display refresh of their own (the probe
+  counts presents, not refreshes, so that is what the numbers support). That is the
+  first-class and best-effort distinction of ADR-005 as a measurement. **The comparison
+  needs the cap off**: with a caller-side cap in place the caller's own sleep sets the
+  period, so how the backend paces itself is not what the frame rate is showing.
 - `frameDelay` (a fixed sleep) remains for compatibility but **is not used in new code**.
   The examples use deadline pacing (`framePaceUntil`), except `examples/30_sound_demo` and
   `examples/38_minigame`, which budget a real-time frame with bare `platform.sleep` so the
@@ -101,10 +112,12 @@ timing sections inside the frame body, averaged over 300 frames: clearing every 
 ending the frame 0.12. The sections sum to 9.80ms; the whole frame body under the same
 conditions is 10.43ms, so the 0.63ms difference is present and other unmeasured work.
 (The real fps was 101 under the different condition of `SKIP_FRAME_COPY=1`.)
-**The largest term is clearing every pixel, not the blit.** Those section figures predate
-`pixelops.fill32`; at the same framebuffer size the clear now measures 3.7-4.0ms paced and
-4.8ms free-run with objc, and 0.44ms with metal, and unpaced throughput went 94.8 to
-116.6fps.
+**Under those conditions the largest term is clearing every pixel, not the blit.** That
+measurement uses an `@memset` clear; the current clear uses `pixelops.fill32`.
+A `fill32` clear runs at memory bandwidth on all three macOS backends instead: measured
+through the `frameprof` probe at 3554x1886 (6.70Mpx, 26.8MB a frame), objc 0.441ms
+free-run and 0.448ms paced, swift 0.441ms free-run, metal 0.510ms free-run and 0.457ms
+paced. objc's figure is 60.8GB/s, the rate `bench-fill` measures for a replicated block.
 
 - **A whole-framebuffer u32 fill goes through `pixelops.fill32`, not `@memset`**: measured
   on aarch64-macos with zig 0.16 and ReleaseFast, a `@memset` of a u32 pattern that does
@@ -122,20 +135,23 @@ conditions is 10.43ms, so the 0.63ms difference is present and other unmeasured 
   rather than a proven optimum. A `@Vector(16, u32)` store loop measures the same 60-62GB/s
   as the replicated block, and the block was chosen because the same shape also fills the
   rows of `fillRect32` and because it delegates to a bulk copy the target tunes itself.
-- **On objc and swift (a CALayer plus a CGImage per present), the first write to every
-  page of the framebuffer costs about 4.3ms per frame extra** (metal does not have this).
-  The 4.3ms comes from the clear section in the row-`@memcpy` experiment: objc 4.72ms
-  minus metal 0.40ms. The difference between the first and second identical memset gives
-  5.38 − 2.30 = 3.1ms. **The mechanism is not established** (buffer ownership with the
-  compositor, copy-on-write and page sharing are the candidates).
-  The observations are: a second identical memset drops from 5.38 to 2.30ms; metal is
-  1.87ms from the first; going back to `CGColorSpaceCreateDeviceRGB()` makes this cost
-  disappear but the ColorSync conversion drops 98.9 → 41.1fps (so removing the colour
-  space fix is not an option, and the conversion cost is paid outside the frame body and
-  therefore does not show up in the section timings).
-- This is one measurement point (the editor, objc, 2x) and is **not** a substitute for
-  the performance matrix ADR-011 R10 asks for (1x/1.5x/2x × gui/font/canvas/viz × frame
-  time and peak memory).
+- **A `fill32` clear costs the same on objc, swift and metal**, so none of them shows a
+  measurable extra cost for the first write to a page of the framebuffer (objc 0.441ms
+  against metal 0.510ms at 6.70Mpx: 60.8GB/s, the rate `bench-fill` measures, against
+  52.5GB/s, the same memory-bandwidth regime). A `@memset` clear instead measures
+  several ms higher on objc than on metal, which reads as a
+  per-page first-touch cost specific to a CALayer plus a CGImage per present — at
+  `fill32`'s bandwidth there is no room left for one. **That comparison is the check to
+  make before attributing a cost to a backend**: convert the clear section to GB/s and
+  put it next to `bench-fill`. It bounds the claim to this clear at this framebuffer
+  size, and is not a general statement that a page's first write is free.
+  One backend-specific cost around the clear is established and still applies:
+  `CGColorSpaceCreateDeviceRGB()` on objc makes the ColorSync conversion drop
+  98.9 → 41.1fps, which is why the layer takes the screen's colour space instead. That
+  conversion is paid outside the frame body and so never appears in the section timings.
+- These are measurements of the editor at one window size and one scale (2x), and are
+  **not** a substitute for the performance matrix ADR-011 R10 asks for
+  (1x/1.5x/2x × gui/font/canvas/viz × frame time and peak memory).
 
 ## Frame-cap measurement (`-Dframe-cap`, free-run)
 
