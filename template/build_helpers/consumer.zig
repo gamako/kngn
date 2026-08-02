@@ -64,7 +64,7 @@ pub const PlatformFeatures = struct {
     enable_mascot: bool = false,
     /// Fullscreen: the transition, the live state and the geometry to persist. While off,
     /// creating a fullscreen window fails with `error.Unsupported`, `setFullscreen` is a
-    /// no-op, `isFullscreen` is always false, and `restoreGeometry` reports a zero geometry
+    /// no-op, `isFullscreen` is always false, and `windowedGeometry` reports a zero geometry
     /// (the window's pre-fullscreen geometry is not tracked, so there is nothing to restore).
     enable_fullscreen: bool = false,
     /// The macOS native text input machinery: `NSTextInputClient`, IME composition, and

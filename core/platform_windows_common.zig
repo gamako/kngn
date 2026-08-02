@@ -1017,7 +1017,7 @@ pub const Core = struct {
     /// The geometry an application should persist (ADR-019 R10): the current one while windowed, and
     /// the one held from before the transition while fullscreen.
     /// Hot path declaration: window shutdown and event time only.
-    pub fn restoreGeometry(self: *Core) types.WindowGeometry {
+    pub fn windowedGeometry(self: *Core) types.WindowGeometry {
         return self.restore.get(self.getGeometry());
     }
 

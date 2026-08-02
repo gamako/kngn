@@ -876,7 +876,7 @@ pub fn setFullscreen(win: Window, enable: bool) void {
 /// The geometry an application should persist (ADR-019 R10): the current one while windowed, and
 /// the one held from before the transition while fullscreen.
 /// Hot path declaration: window shutdown and event time only.
-pub fn restoreGeometry(win: Window) types.WindowGeometry {
+pub fn windowedGeometry(win: Window) types.WindowGeometry {
     const st = win.state;
     return st.restore.get(currentGeometry(st));
 }

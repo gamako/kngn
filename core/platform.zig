@@ -456,11 +456,11 @@ pub const Window = struct {
     /// the next run opens a screen-sized window. A window created fullscreen has never been
     /// windowed, and reports the size it was created with.
     /// Hot path declaration: window shutdown and event time only.
-    pub fn restoreGeometry(self: Window) WindowGeometry {
+    pub fn windowedGeometry(self: Window) WindowGeometry {
         if (comptime null_runtime_supported) {
-            if (self.inner == .null_win) return null_backend.restoreGeometry(self.inner.null_win);
+            if (self.inner == .null_win) return null_backend.windowedGeometry(self.inner.null_win);
         }
-        return native_backend.restoreGeometry(self.inner.native);
+        return native_backend.windowedGeometry(self.inner.native);
     }
 
     pub fn destroy(self: Window) void {

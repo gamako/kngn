@@ -420,12 +420,12 @@ final class PlatformWindowHandle: NSObject {
     var quitRequested: Bool = false
     var quitDelegate: QuitWindowDelegate?
 #if KNGN_ENABLE_FULLSCREEN
-    // Fullscreen (platform_set_fullscreen / platform_is_fullscreen / platform_get_restore_geometry).
+    // Fullscreen (platform_set_fullscreen / platform_is_fullscreen / platform_get_windowed_geometry).
     // The window delegate keeps these up to date across both user-started and program-started transitions.
     var fsDesired: Bool = false      // the state most recently asked for (applied when a transition in flight ends)
     var fsTransition: Bool = false   // a transition is in flight (between will- and did-)
-    var fsRestoreHeld: Bool = false  // fsRestore is the geometry to persist (held for the whole fullscreen period)
-    var fsRestore = PlatformWindowGeometry()
+    var fsWindowedHeld: Bool = false  // fsWindowed is the geometry to persist (held for the whole fullscreen period)
+    var fsWindowed = PlatformWindowGeometry()
 #endif
 
     init(window: NSWindow, backendView: any PlatformBackendView) {
@@ -468,9 +468,9 @@ final class QuitWindowDelegate: NSObject, NSWindowDelegate {
         guard let handle = handle else { return }
         handle.fsTransition = true
         handle.fsDesired = true
-        if !handle.fsRestoreHeld {
-            handle.fsRestore = windowGeometry(handle)
-            handle.fsRestoreHeld = true
+        if !handle.fsWindowedHeld {
+            handle.fsWindowed = windowGeometry(handle)
+            handle.fsWindowedHeld = true
         }
     }
 
@@ -494,7 +494,7 @@ final class QuitWindowDelegate: NSObject, NSWindowDelegate {
         _ = notification
         guard let handle = handle else { return }
         handle.fsTransition = false
-        handle.fsRestoreHeld = false
+        handle.fsWindowedHeld = false
         if handle.fsDesired {
             platform_set_fullscreen(platformWindow: Unmanaged.passUnretained(handle).toOpaque(), enable: true)
         }
@@ -1396,13 +1396,13 @@ func platform_is_fullscreen(platformWindow: UnsafeMutableRawPointer?) -> Bool {
 // The geometry an application should persist. While the window is fullscreen (from the moment the
 // transition starts until the exit transition has finished) that is the snapshot taken before it
 // entered, so persisting it does not save the screen.
-@_cdecl("platform_get_restore_geometry")
-func platform_get_restore_geometry(platformWindow: UnsafeMutableRawPointer?, out: UnsafeMutablePointer<PlatformWindowGeometry>?) {
+@_cdecl("platform_get_windowed_geometry")
+func platform_get_windowed_geometry(platformWindow: UnsafeMutableRawPointer?, out: UnsafeMutablePointer<PlatformWindowGeometry>?) {
     guard let out = out else { return }
     out.pointee = PlatformWindowGeometry()
     guard let platformWindow = platformWindow else { return }
     let handle = Unmanaged<PlatformWindowHandle>.fromOpaque(platformWindow).takeUnretainedValue()
-    out.pointee = handle.fsRestoreHeld ? handle.fsRestore : windowGeometry(handle)
+    out.pointee = handle.fsWindowedHeld ? handle.fsWindowed : windowGeometry(handle)
 }
 
 #endif // KNGN_ENABLE_FULLSCREEN

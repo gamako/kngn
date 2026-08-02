@@ -99,7 +99,7 @@ pub fn setFullscreen(win: Window, enable: bool) void {
 }
 
 /// The geometry to persist. Nothing here ever resizes a window, so it is always the current geometry.
-pub fn restoreGeometry(win: Window) WindowGeometry {
+pub fn windowedGeometry(win: Window) WindowGeometry {
     return getGeometry(win);
 }
 
@@ -349,7 +349,7 @@ test "null window: the fullscreen state follows setFullscreen and nothing resize
     // There is no screen here, so the size is unaffected either way and the geometry to persist is
     // always the current one.
     try testing.expectEqual(@as(u32, 320), win.width);
-    try testing.expectEqualDeep(getGeometry(win), restoreGeometry(win));
+    try testing.expectEqualDeep(getGeometry(win), windowedGeometry(win));
 }
 
 test "null window: the state survives being copied by value" {

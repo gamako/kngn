@@ -240,6 +240,6 @@ pub fn setFullscreen(window: Window, enable: bool) void {
     window.core.setFullscreen(enable);
 }
 
-pub fn restoreGeometry(window: Window) types.WindowGeometry {
-    return window.core.restoreGeometry();
+pub fn windowedGeometry(window: Window) types.WindowGeometry {
+    return window.core.windowedGeometry();
 }

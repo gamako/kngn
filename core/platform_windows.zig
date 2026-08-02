@@ -31,7 +31,7 @@ pub const shutdown = backend.shutdown;
 pub const getGeometry = backend.getGeometry; // window geometry
 pub const isFullscreen = backend.isFullscreen; // the live fullscreen state
 pub const setFullscreen = backend.setFullscreen; // the fullscreen transition
-pub const restoreGeometry = backend.restoreGeometry; // the geometry to persist
+pub const windowedGeometry = backend.windowedGeometry; // the geometry to persist
 pub const displayRefreshHz = backend.displayRefreshHz;
 
 // The drawing-independent shared implementation (each backend re-exports it from platform_windows_common).

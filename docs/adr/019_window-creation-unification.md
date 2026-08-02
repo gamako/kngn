@@ -154,7 +154,7 @@ backends:
 | `fullscreen` + `fb_mode = .physical` | accepted; R5 defines it per backend |
 | `fullscreen` + `resizable = false` | accepted, and it adds nothing: a fullscreen window offers the user no resizing affordance anyway, and the request cannot stop a compositor from resizing it |
 | The framebuffer size of the first frame | **not guaranteed**; follow `fb.width`/`fb.height` (R3) |
-| `getGeometry` while fullscreen | the current geometry, never a restore geometry (R6); the value to persist is `restoreGeometry` (R10) |
+| `getGeometry` while fullscreen | the current geometry, never a windowed geometry (R6); the value to persist is `windowedGeometry` (R10) |
 | wasm + `fullscreen` | a **documented no-op**: accepted, and an ordinary canvas-sized window results |
 | null + `fullscreen` | accepted; the requested size is honoured (R3, third class) |
 
@@ -203,7 +203,7 @@ Two numerical rules:
 `.logical` with fullscreen keeps today's behaviour: the screen size is both the
 logical size and the framebuffer size.
 
-### R6. `getGeometry` reports the current geometry, not a restore geometry
+### R6. `getGeometry` reports the current geometry, not a windowed geometry
 
 While fullscreen, `getGeometry` returns the window's **current** geometry, expressed
 exactly as that backend already expresses it (wayland reports `position = null`; x11
@@ -213,7 +213,7 @@ a pre-fullscreen size.
 
 An application that **persists** its window geometry therefore does not save
 `getGeometry`: saved while fullscreen it is the screen geometry, and restoring it
-produces a screen-sized window on the next run. It saves `restoreGeometry` instead,
+produces a screen-sized window on the next run. It saves `windowedGeometry` instead,
 which R10 defines and which equals `getGeometry` whenever the window is not
 fullscreen.
 
@@ -291,7 +291,7 @@ Three calls on `Window`, implemented by every backend:
 |---|---|
 | `isFullscreen() bool` | whether the window is fullscreen **now**, whoever made it so. Never fails; false where fullscreen has no meaning (wasm) |
 | `setFullscreen(enable) void` | a **request**, not a result. It returns nothing, because on every backend but Windows the transition is asynchronous (the macOS animation, a wayland configure, an x11 window-manager round trip). The outcome is read back through `isFullscreen`. Asking for the state the window is already in does nothing |
-| `restoreGeometry() WindowGeometry` | the geometry to **persist**: the current geometry while windowed, and the geometry from immediately before the transition while fullscreen |
+| `windowedGeometry() WindowGeometry` | the geometry to **persist**: the current geometry while windowed, and the geometry from immediately before the transition while fullscreen |
 
 Design points, each of which was a decision:
 
@@ -303,7 +303,7 @@ Design points, each of which was a decision:
   a `WindowMode` enum for. Polling covers the two things that motivated this decision
   (persisting a geometry, and drawing a state indicator), so the event is left out.
   Adding it later is compatible with everything here.
-- **`restoreGeometry` rather than `isFullscreen` plus branching in the application.**
+- **`windowedGeometry` rather than `isFullscreen` plus branching in the application.**
   An application that has to remember to branch is an application that reintroduces the
   bug, and every caller would write the same branch. The accessor states the intent
   ("the value to persist") and is identical to `getGeometry` when the window is not
@@ -312,9 +312,9 @@ Design points, each of which was a decision:
   a position where the backend can report one — so the value round-trips into
   `WindowOptions` unchanged. It is *not* unified across backends: wayland still reports
   `position = null`, x11 the client origin, Windows the window frame origin, macOS the
-  frame origin. A cross-backend position basis is not something a restore geometry can
+  frame origin. A cross-backend position basis is not something a windowed geometry can
   invent, and persistence has always been per-machine.
-- **A window created fullscreen has never been windowed**, so its restore geometry is
+- **A window created fullscreen has never been windowed**, so its windowed geometry is
   seeded at creation with the size (and position) that was asked for. That is the
   application's own intent, and it is the only value in the system that is not the
   screen.
@@ -378,7 +378,7 @@ still fills the screen.
 - **A `fullscreen_changed` event instead of, or as well as, `isFullscreen`** (R10). The
   union variant is a cross-cutting break of every consumer's exhaustive `switch`, and
   polling answers what the two motivating cases need.
-- **Unifying the restore geometry's position basis across backends** (R10). Wayland has
+- **Unifying the windowed geometry's position basis across backends** (R10). Wayland has
   no position to give, so the unified value would be "no position anywhere", which is
   worse than each backend reporting what it can.
 - **Judging fullscreen on x11 by comparing the window size against the screen size**
@@ -411,7 +411,7 @@ still fills the screen.
   therefore part of what 016's contract is verified against, alongside a resize.
 - Fullscreen stays local UI state: it is not part of the document or action state, and
   so it is not synchronised across peers (014).
-- An application that persists window geometry saves `restoreGeometry` (R10). The one
+- An application that persists window geometry saves `windowedGeometry` (R10). The one
   in this repository is the pixel editor.
 
 ## Related

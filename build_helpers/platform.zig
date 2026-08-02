@@ -827,7 +827,7 @@ fn addFeatureDefines(compile_cmd: *std.Build.Step.Run, features: PlatformFeature
     if (features.enable_cursor) compile_cmd.addArg("-DKNGN_ENABLE_CURSOR");
     // Transparent / borderless / always-on-top / click-through windows and the quit menu.
     if (features.enable_mascot) compile_cmd.addArg("-DKNGN_ENABLE_MASCOT");
-    // Fullscreen transition, live state and restore geometry.
+    // Fullscreen transition, live state and windowed geometry.
     if (features.enable_fullscreen) compile_cmd.addArg("-DKNGN_ENABLE_FULLSCREEN");
     // NSTextInputClient: character input, IME composition and document access.
     if (features.enable_text_input) compile_cmd.addArg("-DKNGN_ENABLE_TEXT_INPUT");

@@ -592,7 +592,7 @@ pub fn setFullscreen(win: Window, enable: bool) void {
     _ = enable;
 }
 
-pub fn restoreGeometry(win: Window) types.WindowGeometry {
+pub fn windowedGeometry(win: Window) types.WindowGeometry {
     return getGeometry(win);
 }
 

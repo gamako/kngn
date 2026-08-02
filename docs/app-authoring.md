@@ -67,12 +67,12 @@ At run time the window carries three more calls:
 - `win.setFullscreen(enable)` — enter or leave. It is a request: the transition is asynchronous
   everywhere but Windows, so the result is read back through `isFullscreen()`. Leaving restores the
   geometry the window had before it entered.
-- `win.restoreGeometry()` — the geometry to **persist**.
+- `win.windowedGeometry()` — the geometry to **persist**.
 
 If the app persists its window geometry (`kit.appshell`'s window state), save
-`restoreGeometry()`, not `getGeometry()`. `getGeometry` reports the *current* geometry, so saving it
+`windowedGeometry()`, not `getGeometry()`. `getGeometry` reports the *current* geometry, so saving it
 while fullscreen stores the screen and the next run opens a screen-sized window;
-`restoreGeometry` reports the pre-fullscreen geometry instead, and is identical to `getGeometry`
+`windowedGeometry` reports the pre-fullscreen geometry instead, and is identical to `getGeometry`
 whenever the window is not fullscreen.
 
 Native entry:

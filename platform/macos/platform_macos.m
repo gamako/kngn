@@ -65,7 +65,7 @@ struct PlatformWindow {
     __strong id quit_delegate;
     bool quit_requested;
 #if defined(KNGN_ENABLE_FULLSCREEN)
-    // Fullscreen (platform_set_fullscreen / platform_is_fullscreen / platform_get_restore_geometry).
+    // Fullscreen (platform_set_fullscreen / platform_is_fullscreen / platform_get_windowed_geometry).
     // The window delegate keeps these up to date across both user-started and program-started transitions.
     bool fs_desired;      // the state most recently asked for (applied when a transition in flight ends)
     bool fs_transition;   // a transition is in flight (between will- and did-)
@@ -2215,7 +2215,7 @@ bool platform_is_fullscreen(PlatformWindow* window) {
 // The geometry an application should persist. While the window is fullscreen (from the moment the
 // transition starts until the exit transition has finished) that is the snapshot taken before it
 // entered, so persisting it does not save the screen.
-void platform_get_restore_geometry(PlatformWindow* window, PlatformWindowGeometry* out) {
+void platform_get_windowed_geometry(PlatformWindow* window, PlatformWindowGeometry* out) {
     if (!out) return;
     if (window && window->fs_restore_held) {
         *out = window->fs_restore;

@@ -109,7 +109,7 @@ bool platform_is_fullscreen(PlatformWindow* window);
 // fullscreen (or leaving it). Same basis and same failure behaviour as
 // platform_get_window_geometry. A window created fullscreen reports the geometry it was created
 // with, since it has never been windowed.
-void platform_get_restore_geometry(PlatformWindow* window, PlatformWindowGeometry* out);
+void platform_get_windowed_geometry(PlatformWindow* window, PlatformWindowGeometry* out);
 
 // Update the title of a visible window (event time only).
 void platform_set_title(PlatformWindow* window, const char* title);

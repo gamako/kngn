@@ -2915,7 +2915,7 @@ const exe_features = struct {
     /// A transparent, borderless, click-through window — example 24 takes no text either.
     const mascot: platform.PlatformFeatures = .{ .enable_mascot = true, .enable_text_input = false };
     /// The pixel editor: a native menu bar, file panels, a crosshair over the canvas, and
-    /// fullscreen (it persists `restoreGeometry`).
+    /// fullscreen (it persists `windowedGeometry`).
     const editor: platform.PlatformFeatures = .{
         .enable_menu = true,
         .enable_dialog = true,

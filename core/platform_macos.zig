@@ -810,7 +810,7 @@ pub fn setFullscreen(win: Window, enable: bool) void {
 /// instead would let a persistence layer save the screen size of a window the user had put
 /// fullscreen with the green button, and reopen at that size.
 /// Hot path declaration: window shutdown and event time only.
-pub fn restoreGeometry(win: Window) types.WindowGeometry {
+pub fn windowedGeometry(win: Window) types.WindowGeometry {
     if (comptime !fullscreen_enabled) return .{ .position = null, .size = .{ .width = 0, .height = 0 } };
     var geo: c.PlatformWindowGeometry = .{
         .x = 0,
@@ -819,7 +819,7 @@ pub fn restoreGeometry(win: Window) types.WindowGeometry {
         .height = 0,
         .flags = 0,
     };
-    c.platform_get_restore_geometry(win.handle, &geo);
+    c.platform_get_windowed_geometry(win.handle, &geo);
     return .{
         .position = if ((geo.flags & c.PLATFORM_GEOMETRY_POSITION_VALID) != 0)
             .{ .x = geo.x, .y = geo.y }

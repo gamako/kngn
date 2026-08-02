@@ -204,7 +204,7 @@ The symbols counted per column are `platform_save_file_dialog` /
 `platform_begin_window_drag` / `platform_set_always_on_top` /
 `platform_set_click_through` / `platform_set_dock_visible` /
 `platform_show_quit_menu`; `platform_set_fullscreen` / `platform_is_fullscreen` /
-`platform_get_restore_geometry`; and `platform_get_composition_snapshot` /
+`platform_get_windowed_geometry`; and `platform_get_composition_snapshot` /
 `platform_set_composition_rect` / `platform_set_text_input_active` /
 `platform_set_text_input_document_access`. Each group is present or absent as a
 whole.
@@ -255,7 +255,7 @@ trio.
 contract.** A disabled capability is not an error at the call site: `setCursor`,
 `beginDrag`, `setAlwaysOnTop`, `setClickThrough`, `showQuitMenu`, `setDockVisible`,
 `setFullscreen`, `setCompositionRect` and `setTextInputActive` become no-ops;
-`isFullscreen` is always false; `restoreGeometry` reports a zero geometry —
+`isFullscreen` is always false; `windowedGeometry` reports a zero geometry —
 "nothing to restore", chosen over the live geometry so that a persistence layer
 cannot save a screen-sized window the user had put fullscreen with the green
 button; the file panels report `error.DialogUnavailable`; and asking to create a
