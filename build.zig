@@ -235,7 +235,13 @@ fn makeWasmAppSpecs(b: *std.Build, base_target: std.Build.ResolvedTarget, with_s
 
 /// wasm32-wasi-only build (pixie + synth audio).
 /// Root is wasm_root.zig (no main) to avoid the wasi command/_start path (reactor = export-driven).
-fn buildWasm(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode, wasm_harness: bool) void {
+fn buildWasm(
+    b: *std.Build,
+    target: std.Build.ResolvedTarget,
+    optimize: std.builtin.OptimizeMode,
+    wasm_harness: bool,
+    install_all: bool,
+) void {
     var specs = makeWasmAppSpecs(b, target, true);
     const apps = platform.addWasmWebPackage(b, .{
         .apps = &specs,
@@ -251,6 +257,7 @@ fn buildWasm(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.buil
     addBuildStep(b, "build-pixie", "Build Pixie wasm (wasm32-wasi)", apps[0].exe);
     addBuildStep(b, "build-synth-wasm", "Build Synth wasm (shared memory + AudioWorklet)", apps[1].exe);
     addBuildStep(b, "build-synth-postmessage-wasm", "Build Synth wasm (postMessage audio, no shared memory)", apps[2].exe);
+    addWasmHarnessGate(b, target, optimize, wasm_harness, install_all, apps);
 }
 
 /// Cross-compile wasm web artifacts from the native target into zig-out/web/.
@@ -276,6 +283,64 @@ fn packageWebFromNative(b: *std.Build, optimize: std.builtin.OptimizeMode, insta
     addBuildStep(b, "build-pixie-wasm", "Build Pixie wasm for web (wasm32-wasi)", apps[0].exe);
     addBuildStep(b, "build-synth-wasm", "Build Synth wasm for web (shared memory + AudioWorklet)", apps[1].exe);
     addBuildStep(b, "build-synth-postmessage-wasm", "Build Synth wasm for web (postMessage audio, no shared memory)", apps[2].exe);
+    addWasmHarnessGate(b, wasi_target, optimize, wasm_harness, install_all, apps);
+}
+
+/// Gate the wasm build that carries the real harness (`-Dwasm-harness=true`).
+///
+/// What it asserts: the three wasm apps still **compile and link** with the observation
+/// plane compiled in, and their export tables still pass `check-wasm-exports`. Packaging
+/// (HTML and the shared static assets) is not in scope — `package-web` already covers it.
+///
+/// Why it exists: the shipping wasm build selects `core/control/harness_wasm.zig`, a no-op
+/// stub, so nothing else in the tree compiles `core/control/harness.zig` against the wasm
+/// module set. A call that the real harness makes into a module with a wasm-only variant —
+/// `core/control/netsync_wasm.zig` is the one that matters — can therefore go missing and
+/// break only this configuration, which no other gate builds.
+///
+/// The gate is registered unconditionally so `zig build check-wasm-harness` resolves under
+/// every flag combination, and it joins the default install step only under `-Dinstall-all`
+/// (a plain build should not pay for a second wasm compile).
+fn addWasmHarnessGate(
+    b: *std.Build,
+    target: std.Build.ResolvedTarget,
+    optimize: std.builtin.OptimizeMode,
+    wasm_harness: bool,
+    install_all: bool,
+    shipped: []platform.WasmAppBuild,
+) void {
+    const step = b.step(
+        "check-wasm-harness",
+        "Compile and export-check the wasm apps with the real harness compiled in",
+    );
+
+    if (wasm_harness) {
+        // The shipped graph already carries the harness; gating it twice would only
+        // compile the same configuration a second time.
+        for (shipped) |app| step.dependOn(&app.export_check.step);
+        if (install_all) b.getInstallStep().dependOn(step);
+        return;
+    }
+
+    // A second app graph, harness-enabled regardless of the caller's option. The linker
+    // must be built with `true` here, not the outer `wasm_harness`, or this would be one
+    // more copy of the no-op configuration and assert nothing.
+    //
+    // `single_html = false` keeps the packer and the single-HTML nodes out of it; nothing
+    // here ships. The install nodes that `addWasmApp` always creates stay unreachable,
+    // because no step below depends on them and `default_install` is false.
+    var specs = makeWasmAppSpecs(b, target, false);
+    const apps = platform.addWasmWebPackage(b, .{
+        .apps = &specs,
+        .assets = defaultWasmWebAssets(b),
+        .optimize = optimize,
+        .linker = makeInternalWasmLinker(b, true),
+        .default_install = false,
+        .create_package_step = false,
+        .create_single_package_step = false,
+    });
+    for (apps) |app| step.dependOn(&app.export_check.step);
+    if (install_all) b.getInstallStep().dependOn(step);
 }
 
 /// Fail configuration when a vendored copy of build_helpers/ drifts from the original.
@@ -406,6 +471,9 @@ pub fn build(b: *std.Build) void {
         .ReleaseSmall;
     const target_os = target.result.os.tag;
     const is_wasm = target.result.cpu.arch.isWasm();
+    // Read before the wasm branch below: both branches attach the wasm harness gate to the
+    // default install step under this flag.
+    const install_all = b.option(bool, "install-all", "Install all backends for the target OS") orelse false;
     // The real harness on wasm: the observation plane a browser can drive (see docs/harness.md).
     // Off by default, because compiling it in costs about 10% of the module and a shipped page
     // does not want the control plane. It has no effect on a native target.
@@ -462,7 +530,7 @@ pub fn build(b: *std.Build) void {
         // BGRA→RGBA SIMD swizzle (same exception as makePlatformModules for wasm).
         linkCoreException(wasm_pub_shared.platform, wasm_pub_shared.pixelops, "BGRA→RGBA SIMD swizzle for wasm present");
 
-        buildWasm(b, target, wasm_optimize, wasm_harness);
+        buildWasm(b, target, wasm_optimize, wasm_harness, install_all);
         return;
     }
 
@@ -493,8 +561,6 @@ pub fn build(b: *std.Build) void {
         null;
 
     const platform_root = b.path("platform");
-
-    const install_all = b.option(bool, "install-all", "Install all backends for the target OS") orelse false;
 
     // Gamepad opt-in for external consumers. Default false.
     // The same boolean drives dep.module("platform") / platform_native_* archive / GameController link conditions.

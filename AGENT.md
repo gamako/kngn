@@ -492,6 +492,7 @@ zig build test
 zig build check-consumer      # link kit.audio / kit.midi the way an external package does (gates/consumer/)
 zig build check-template      # build template/ as an external package
 zig build check-vendor        # vendored build_helpers copies are byte-identical (check-template-vendor is an alias)
+zig build check-wasm-harness  # compile + export-check the wasm apps with -Dwasm-harness=true (nothing ships that configuration; joins -Dinstall-all=true)
 
 # The standalone gates (not registered on a Windows host: a checkout there expands the
 # build_helpers symlink, so no sample builds standalone — see docs/platform-verification.md)

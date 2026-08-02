@@ -1,10 +1,25 @@
 //! A no-op `netsync` for wasm32.
 //!
 //! Networked concurrent editing needs a TCP transport and a worker thread, neither of which a
-//! wasm module has. This module keeps the shape of the surface that `core/platform.zig`, `kit` and
-//! the applications reference — by an exhaustive grep of those call sites — so that a wasm build
-//! links, and reports "no session" for every query. Any host that wants concurrent editing in a
-//! browser needs a transport of its own; this is not a partial implementation of one.
+//! wasm module has. This module answers "no session" for every query and does nothing for every
+//! command. Any host that wants concurrent editing in a browser needs a transport of its own;
+//! this is not a partial implementation of one.
+//!
+//! **What decides the surface.** Not parity with `netsync.zig`: that module exports about a
+//! hundred declarations, most of which — the wire codecs, host and client startup, the test
+//! helpers — no wasm build reaches. What has to be here is exactly what wasm-compiled code
+//! calls, and the compiler decides that, so the surface is whatever makes a wasm build link.
+//!
+//! **What keeps it in step.** `zig build check-wasm-harness` (see `addWasmHarnessGate` in
+//! `build.zig`), because the caller most likely to grow a new call is the harness, and the
+//! shipping wasm build compiles the no-op harness stub instead. That gate is what catches a
+//! call this module has not grown yet, and a signature that has drifted with it.
+//!
+//! **What it does not catch.** Zig analyses lazily, so a declaration that no wasm application
+//! reaches is never checked — a `kit` or `libs` function nothing calls may name something here
+//! that does not exist, and every gate still passes. The guarantee is over reached calls, not
+//! over the declaration list. Requiring more than that means a parity check this module does
+//! not have.
 
 const std = @import("std");
 

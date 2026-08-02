@@ -223,12 +223,22 @@ digest audio rms=0.0770 peak=0.2147 silent=0 frames=4096
 |---|---|
 | `zig build test` | **No** (root unit tests plus the template **native** and consumer gates only) |
 | `zig build package-web` / `package-web-single` | **Yes** (root multi-file / single HTML) |
-| `zig build -Dinstall-all=true` | **Yes** — root wasm packages join the default install, plus the template native and web gates and the consumer gate |
+| `zig build -Dinstall-all=true` | **Yes** — root wasm packages join the default install, plus the template native and web gates, the consumer gate and the harness gate below |
 | `zig build check-template-web` | **Yes** (template child package only) |
+| `zig build check-wasm-harness` | **Yes** — the three wasm apps built with `-Dwasm-harness=true` compiled in |
 
 `zig build test` deliberately stays free of wasm compile time. Use `-Dinstall-all=true` or the
 explicit package steps when you touch `core/control/`, the platform facade, `libs/appshell`,
 or anything a wasm root imports.
+
+`check-wasm-harness` covers a configuration none of the other rows reach. The shipping build
+compiles the no-op harness stub, so `core/control/harness.zig` is never compiled against the
+wasm module set unless something asks for it — and a call it makes into a module with a
+wasm-only variant (`core/control/netsync_wasm.zig` above all) can go missing and break only
+that build. The gate compiles and export-checks the three apps with the harness in; it does
+not package them, because packaging is what the rows above already exercise. It resolves under
+every flag combination, and under `-Dwasm-harness=true` it rides the shipped graph instead of
+compiling a second one.
 
 ### Optimize mode
 
@@ -394,6 +404,8 @@ assert audio silent=0'
 
 `-Dwasm-harness=true` is **not** the shipping build: it adds about 10% to the module. The
 default is unchanged, so a package built without the flag is byte-for-byte what it was.
+Because nothing ships it, it is also the configuration most likely to rot unnoticed;
+`zig build check-wasm-harness` compiles it (see [Gate coverage](#gate-coverage)).
 [harness.md](harness.md) covers what the bridge does and does not offer, and
 `docs/experiments/wasm-harness-bridge/README.md` the driver's flags.
 
