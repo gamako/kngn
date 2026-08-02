@@ -164,6 +164,7 @@ kngn/
 │   ├── frame_pacing.zig # the frame pacing helper (see docs/performance-measurement.md)
 │   └── control/       # the control and observation plane (ADR-007 R3)
 │       ├── harness.zig # the headless verification harness (input injection, frame capture, a virtual clock)
+│       ├── frame_prof.zig # per-section frame timing behind the `frameprof` probe (body total and gap always reported with it)
 │       ├── action_registry.zig # the action registry (the write and operate counterpart to a probe)
 │       ├── command.zig # the semantic command execution model for co-piloting (a human and an AI together)
 │       ├── copilot.zig # the copilot transport: a third control plane coexisting with the ordinary UX (KNGN_COPILOT_*)
@@ -457,6 +458,32 @@ all implemented:
   `libs/modular/src/modules.zig`)
 - SIMD bit-identical to a scalar reference (`libs/pixelops`)
 
+#### Asserting on a whole frame, not a microbenchmark
+
+The three above pin a component. To pin **the assembled frame**, assert on the `frameprof`
+probe (`core/control/frame_prof.zig`; the pixel editor and the patch canvas are wired). It
+works in a replay script and against a live process alike:
+
+```bash
+KNGN_FRAME_PROF=1 KNGN_HARNESS_SCRIPT=/tmp/s.txt zig build run-pixie -Doptimize=ReleaseFast
+#   step 300
+#   expect frameprof body_ms<16.7
+```
+
+**Assert on `body_ms`, and read `gap_ms` before believing it.** A section's measured cost
+tracks how idle the loop is, not only how much work it does, so a frame body that grew may
+mean more work or may only mean the loop got slower — `gap_ms` on the same line is what
+separates the two. The probe reports both totals next to every section for exactly this
+reason, and `frame_ms == body_ms + gap_ms` holds by construction.
+[docs/harness.md](docs/harness.md) has the key list and
+[docs/performance-measurement.md](docs/performance-measurement.md) the measurements behind
+the rule. Reserve `frame_ms` assertions for a frame rate claim; use `body_ms` for a claim
+about the work.
+
+A caveat that applies to any number this produces: these are wall-clock values on the
+machine that ran them. **Do not put a frame-time assertion in a build gate** — the drift
+between runs on one machine is already the size of the effects worth catching.
+
 ### Measure
 
 A change made for performance records **a before-and-after comparison** from
@@ -515,6 +542,7 @@ zig build test-synth            # libs/synth (the SPSC ring, atomics, Voice, Voi
 zig build test-spectrogram      # the spectrogram (the FFT column logic)
 zig build test-scope            # the oscilloscope and level meter
 zig build test-harness          # the harness (parser, execution model, virtual clock, inject midi)
+zig build test-frame-prof       # the frame section profiler (scripted clock: the body/gap identity, aborted frames, percentile, digest truncation)
 zig build test-appshell         # libs/appshell (Preferences, WindowState, RecentFiles, DocumentHost)
 zig build test-midi             # the core/midi facade plus the null backend
 zig build test-sound            # libs/sound (WAV decode, zero allocation in SoundPlayer's real-time path)
@@ -533,6 +561,7 @@ zig build bench-fill            # u32 fill strategies: @memset vs a @Vector stor
 zig build bench-swizzle         # BGRA->RGBA swizzle: the load forms (vector pointer / array deref / u32 lanes) vs scalar and a plain copy
 zig build bench-synth           # Synth(16 voices).render and MasterEffects.process: ns/block and × realtime
 zig build bench-gui-frame       # a full gui Context frame (beginFrame → build → endFrame → render; 500/1000 rows, avg/min/p95)
+zig build bench-frameprof       # what the frame section profiler costs per frame (disabled / bookkeeping only / with real clock reads)
 
 # The pixel editor (-Dplatform switches objc/swift/metal)
 zig build run-pixie

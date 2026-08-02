@@ -516,8 +516,10 @@ not separate the remaining factors.
   780x600 and 60 Hz is about 92 µs of work at full rate; deleting it would not return 682 µs,
   because the rest of the frame would then run with more idle in front of it.
 - **Report the idle gap next to any section table.** Without it, a reader cannot tell a
-  workload difference from a rate difference. A profiler wired into the observation plane
-  should carry the frame gap and the frame body total alongside its sections for this reason.
+  workload difference from a rate difference. This is why `digest frameprof` reports
+  `gap_ms` and `body_ms` on the same line as its sections and makes
+  `frame_ms == body_ms + gap_ms` hold by construction — the harness probe cannot emit a
+  section table that omits them (see [harness.md](harness.md)).
 - **When comparing two variants, hold the frame's total work as close as possible** — or
   compare unpaced, which removes the pacing-induced rate difference and brings the numbers
   closer to the work (thermal state and scheduling still move them).
@@ -527,7 +529,8 @@ not separate the remaining factors.
   the frame body total and frame start-to-start; an environment override for the window size
   and for the frame cap so one build can sweep them; and, in the browser, a host-side driver
   that re-registers the animation frame every tick but calls the application only every Nth.
-  None of it is in the build, for the same reason.
+  Only the environment overrides and the browser driver are still temporary: the per-section
+  accumulators, the body total and the gap are now `digest frameprof`.
 
 ### On wasm, how the bytes are loaded decides whether SIMD happens
 

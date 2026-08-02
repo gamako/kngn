@@ -52,6 +52,13 @@ pub fn isEnabled() bool {
     return false;
 }
 
+/// A wasm module has no environment, so every variable reads as unset. The real module's
+/// `readEnv` carries the reasoning; here it exists so that a caller which reads a switch out
+/// of the environment (`frame_prof`) compiles for wasm without a branch of its own.
+pub fn readEnv(_: [*:0]const u8) ?[]const u8 {
+    return null;
+}
+
 pub fn isManualClock() bool {
     return false;
 }

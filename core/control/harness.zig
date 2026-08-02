@@ -521,17 +521,17 @@ pub fn parseConfig() void {
     if (config_parsed) return;
     config_parsed = true;
 
-    pending_script_path = getEnv("KNGN_HARNESS_SCRIPT");
-    pending_listen_raw = getEnv("KNGN_HARNESS_LISTEN");
-    pending_manual_clock = if (getEnv("KNGN_HARNESS_MANUAL_CLOCK")) |v| std.mem.eql(u8, v, "1") else false;
-    if (getEnv("KNGN_HARNESS_OUT")) |d| out_dir = d;
+    pending_script_path = readEnv("KNGN_HARNESS_SCRIPT");
+    pending_listen_raw = readEnv("KNGN_HARNESS_LISTEN");
+    pending_manual_clock = if (readEnv("KNGN_HARNESS_MANUAL_CLOCK")) |v| std.mem.eql(u8, v, "1") else false;
+    if (readEnv("KNGN_HARNESS_OUT")) |d| out_dir = d;
 
-    capture_synthetic_requested = getEnv("KNGN_HARNESS_CAPTURE_SYNTHETIC") != null;
+    capture_synthetic_requested = readEnv("KNGN_HARNESS_CAPTURE_SYNTHETIC") != null;
     // The frame copy is the one setting the host bridge also owns, and the bridge settles it before
     // this runs. A wasm module has no environment, so reading an always-unset variable here would
     // overwrite the page's choice with the default and make every observed frame pay the memcpy.
     if (comptime !is_wasm) {
-        skip_frame_copy = if (getEnv("KNGN_HARNESS_SKIP_FRAME_COPY")) |v| std.mem.eql(u8, v, "1") else false;
+        skip_frame_copy = if (readEnv("KNGN_HARNESS_SKIP_FRAME_COPY")) |v| std.mem.eql(u8, v, "1") else false;
     }
 }
 
@@ -639,7 +639,7 @@ fn startNativeTransport() void {
         std.debug.print("[harness] listen failed: {s}\n", .{@errorName(err)});
         return; // left disabled
     };
-    record_path = getEnv("KNGN_HARNESS_RECORD");
+    record_path = readEnv("KNGN_HARNESS_RECORD");
     mode = .live;
     action_registry.setEnabled(true);
     const chosen = server.socket.address.getPort();
@@ -1361,7 +1361,7 @@ fn recordRequest(bytes: []const u8) void {
 }
 
 fn writePortFile(port: u16) void {
-    const path = getEnv("KNGN_HARNESS_PORT_FILE") orelse (std.fmt.bufPrint(&port_file_buf, "{s}/harness.port", .{out_dir}) catch return);
+    const path = readEnv("KNGN_HARNESS_PORT_FILE") orelse (std.fmt.bufPrint(&port_file_buf, "{s}/harness.port", .{out_dir}) catch return);
     var pbuf: [16]u8 = undefined;
     const txt = std.fmt.bufPrint(&pbuf, "{d}\n", .{port}) catch return;
     std.Io.Dir.cwd().writeFile(io_val, .{ .sub_path = path, .data = txt }) catch |err| {
@@ -3540,7 +3540,11 @@ fn warnLine(msg: []const u8) void {
 /// (the platform module is always built with `link_libc`).
 /// A wasm module has no environment: every variable reads as unset, and the host bridge configures
 /// the harness instead (`kngn_harness_enable`).
-fn getEnv(name: [*:0]const u8) ?[]const u8 {
+///
+/// Public because the observation plane is where the "how do I read an environment variable
+/// here" question is already answered — `frame_prof` reads its own switch through this rather
+/// than repeating the libc-versus-wasm split and dragging `link_libc` onto a second module.
+pub fn readEnv(name: [*:0]const u8) ?[]const u8 {
     if (comptime is_wasm) {
         return null;
     } else {

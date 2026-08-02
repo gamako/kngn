@@ -1009,6 +1009,19 @@ pub fn build(b: *std.Build) void {
     const test_harness_step = b.step("test-harness", "Run harness unit tests (parser / execution model / virtual clock)");
     test_harness_step.dependOn(&run_harness_test.step);
 
+    // frame_prof unit tests. A scripted clock is injected, so every average, percentile and
+    // abort-handling case has an exact expected value (no display, no backend, no timing luck).
+    const frame_prof_test_mod = b.createModule(.{
+        .root_source_file = b.path("core/control/frame_prof.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true, // through harness, whose readEnv uses libc getenv
+    });
+    frame_prof_test_mod.addImport("harness", shared_modules.harness.mod);
+    const frame_prof_test = b.addTest(.{ .root_module = frame_prof_test_mod });
+    const test_frame_prof_step = b.step("test-frame-prof", "Run frame section profiler unit tests (scripted clock)");
+    test_frame_prof_step.dependOn(&b.addRunArtifact(frame_prof_test).step);
+
     // `kngn mcp` unit tests (schema convert / serialize / fail extract / collision resolve / contract; std only)
     const mcp_test_mod = b.createModule(.{
         .root_source_file = b.path("cli/mcp.zig"),
@@ -2620,6 +2633,7 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(test_platform_wayland_csd_step);
     test_step.dependOn(test_platform_windows_input_step);
     test_step.dependOn(test_harness_step);
+    test_step.dependOn(test_frame_prof_step);
     test_step.dependOn(test_mcp_step);
     test_step.dependOn(test_command_step);
     test_step.dependOn(test_command_types_step);
@@ -2699,6 +2713,36 @@ pub fn build(b: *std.Build) void {
     const bench_fill_exe = b.addExecutable(.{ .name = "bench_fill", .root_module = bench_fill_root });
     const bench_fill_step = b.step("bench-fill", "Run u32 fill (framebuffer clear / rect fill) micro-benchmark (ReleaseFast)");
     bench_fill_step.dependOn(&b.addRunArtifact(bench_fill_exe).step);
+
+    // bench-frameprof: what the frame section profiler costs per frame, disabled vs enabled,
+    // split into bookkeeping and clock reads.
+    const bench_frame_prof_root = b.createModule(.{
+        .root_source_file = b.path("bench/frame_prof.zig"),
+        .target = target,
+        .optimize = .ReleaseFast,
+    });
+    const bench_frame_prof_harness = b.createModule(.{
+        .root_source_file = b.path("core/control/harness.zig"),
+        .target = target,
+        .optimize = .ReleaseFast,
+        .link_libc = true,
+    });
+    bench_frame_prof_harness.addImport("png", shared_modules.png.mod);
+    bench_frame_prof_harness.addImport("platform_types", shared_modules.types.mod);
+    bench_frame_prof_harness.addImport("command_types", shared_modules.command_types.mod);
+    bench_frame_prof_harness.addImport("capture_synthetic", shared_modules.capture_synthetic.mod);
+    bench_frame_prof_harness.addImport("dsp", shared_modules.dsp.mod);
+    const bench_frame_prof_mod = b.createModule(.{
+        .root_source_file = b.path("core/control/frame_prof.zig"),
+        .target = target,
+        .optimize = .ReleaseFast,
+        .link_libc = true,
+    });
+    bench_frame_prof_mod.addImport("harness", bench_frame_prof_harness);
+    bench_frame_prof_root.addImport("frame_prof", bench_frame_prof_mod);
+    const bench_frame_prof_exe = b.addExecutable(.{ .name = "bench_frame_prof", .root_module = bench_frame_prof_root });
+    const bench_frame_prof_step = b.step("bench-frameprof", "Run frame section profiler overhead micro-benchmark (ReleaseFast)");
+    bench_frame_prof_step.dependOn(&b.addRunArtifact(bench_frame_prof_exe).step);
 
     // bench-swizzle: compare the ways the BGRA→RGBA swizzle can move its 16 bytes
     // (a vector pointer, an array deref, u32 lanes) against a scalar reference and a plain copy.
@@ -3038,6 +3082,7 @@ const PlatformModules = struct {
 fn wireKitImports(kit: TaggedModule, platform_mod: TaggedModule, common: *const SharedModules, app_runtime: TaggedModule) void {
     link(kit, platform_mod);
     link(kit, common.harness); // kit.control
+    link(kit, common.frame_prof); // kit.frame_prof
     link(kit, common.types); // kit.types
     link(kit, common.command_types); // kit.command_types
     link(kit, common.audio);
@@ -3178,6 +3223,7 @@ const SharedModules = struct {
     modular: TaggedModule,
     dsp: TaggedModule,
     harness: TaggedModule,
+    frame_prof: TaggedModule, // core/control/frame_prof.zig (per-section frame timing for the observation plane)
     types: TaggedModule,
     pixelops: TaggedModule,
     gmath: TaggedModule,
@@ -3413,6 +3459,15 @@ const SharedModules = struct {
         // The audio facade (core/audio.zig) calls onAudioSamples via `@import("harness")`.
         link(audio, harness);
 
+        // frame_prof (core/control; the observation plane): per-section frame timing. It reads the
+        // harness for its enable rule and for `readEnv`, and takes its clock from the caller — so it
+        // does not depend on the platform facade, and a unit test of it needs no backend.
+        const frame_prof: TaggedModule = .{ .layer = .core, .name = "frame_prof", .mod = b.createModule(.{
+            .root_source_file = b.path("core/control/frame_prof.zig"),
+            .single_threaded = if (is_wasm) platform.wasm_single_threaded else null,
+        }) };
+        link(frame_prof, harness);
+
         // MIDI facade (L1). macOS selects CoreMIDI; other OSes select midi_null; under harness, read the synthetic FIFO.
         // platform_types and harness share the same named-module instance.
         const midi: TaggedModule = .{ .layer = .core, .name = "midi", .mod = b.createModule(.{
@@ -3531,6 +3586,7 @@ const SharedModules = struct {
             .modular = modular,
             .dsp = dsp,
             .harness = harness,
+            .frame_prof = frame_prof,
             .types = types,
             .pixelops = pixelops,
             .gmath = gmath,

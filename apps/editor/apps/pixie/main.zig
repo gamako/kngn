@@ -49,6 +49,38 @@ const history_summary = @import("history_summary.zig");
 const history_thumbnail = @import("history_thumbnail.zig");
 const history_persist = @import("history_persist.zig");
 
+/// The sections `appFrameInner` is split into for `digest frameprof`. Order matches the order
+/// the marks run in; the digest prints `@tagName`, so inserting one renumbers nothing.
+const FrameSection = enum {
+    /// Acquiring the framebuffer and opening the GUI frame. A backend that paces by withholding
+    /// the framebuffer blocks here.
+    begin,
+    /// Rebuilding the command table, draining the event queue, syncing composition state.
+    events,
+    /// Laying out and building the widget tree, through `endFrame`.
+    ui_build,
+    /// Overlay append, popup menus, input dispatch, cursor and hover.
+    overlays_pre,
+    /// Filling the physical framebuffer with the window background.
+    clear,
+    /// The transparency checkerboard under the canvas.
+    checker,
+    /// Resolving the layer composite, plus onion skin when it is on.
+    composite,
+    /// Scaling the composite into the window, plus the minimap.
+    canvas_blit,
+    /// Presence, bezier, selection, grid and loupe overlays.
+    overlays_post,
+    /// Rasterising the GUI draw list into the framebuffer.
+    gui_render,
+    /// Handing the frame to the backend.
+    present,
+};
+
+/// Reads the real clock, not `platform.getTime`: under a replay that one is virtual and would
+/// report every section as zero.
+const Prof = kit.frame_prof.Profiler(FrameSection, platform.getRealTime);
+
 // Layer-name max length is defined independently in libs/paint (save side) and pixie (edit buffer)
 // (avoids a cyclic import; see the top of layer_rename_input.zig). Comptime-assert they match.
 comptime {
@@ -7262,6 +7294,20 @@ fn appInit(gpa: std.mem.Allocator, io: std.Io) !*App {
     platform.registerProbe(.{ .name = "menu", .ctx = self, .ext = "txt", .digest = menuDigest, .desc = "menu open/items/enabled/checked/pending_file_op" });
     platform.registerProbe(.{ .name = "appshell", .ctx = self, .ext = "txt", .digest = appshellDigest, .desc = "pixie appshell dirty/recent/recovery/modal/autosave/title/geometry state", .input_blocker = pixieInputBlocker });
     platform.registerProbe(.{ .name = "presence", .ctx = self, .ext = "txt", .digest = presenceDigest, .desc = "ephemeral presence overlay: count/point/highlight/suggest + per-peer coords" });
+    platform.registerProbe(.{
+        .name = Prof.probe_name,
+        .ctx = self,
+        .ext = "txt",
+        .digest = Prof.probeDigest,
+        .desc = "frame section timing: frames/aborted/frame_ms/body_ms/gap_ms/body_p95_ms/body_max_ms + per-section ms",
+    });
+    platform.registerAction(.{
+        .name = Prof.reset_action_name,
+        .ctx = self,
+        .run = Prof.resetAction,
+        .network_policy = .local_only,
+        .desc = "drop the frame section profiler window",
+    });
     registerActions(self);
     registerStateSync(self);
     return self;
@@ -7328,6 +7374,11 @@ fn appFrameInner(self: *App, win: *platform.Window) !void {
     if (self.in_frame) return;
     self.in_frame = true;
     defer self.in_frame = false;
+    // Frame section timing. There is deliberately no `defer Prof.end(...)`: the one call sits
+    // right after present, so "completed frame" means "presented". A path that leaves early —
+    // no framebuffer, or an error on the way — never reaches it, and the next begin() records
+    // the attempt as aborted rather than letting a partial frame into the statistics.
+    Prof.begin();
     // Close frame work in an inner block and unlock the framebuffer when leaving that block.
     // File dialogs (modal) are unsafe to call while locked (re-entrancy), so only set pending here
     // and run at the post-unlock safe point (runPendingFileOp below).
@@ -7344,6 +7395,7 @@ fn appFrameInner(self: *App, win: *platform.Window) !void {
         const phys_h = fb.height;
 
         self.ctx.beginFrame(logical_w, logical_h);
+        Prof.mark(.begin);
 
         // Refresh the Command table before event handling (shortcut matching / probes; checked state).
         self.rebuildMenuCommands();
@@ -7401,6 +7453,7 @@ fn appFrameInner(self: *App, win: *platform.Window) !void {
         }
 
         self.syncComposition(win);
+        Prof.mark(.events);
 
         // canvas rect is the previous frame's layout result (null on the first frame).
         // canvasBlitRect clamps the camera origin to the current area, writes it back into app, and updates last_area.
@@ -7410,6 +7463,7 @@ fn appFrameInner(self: *App, win: *platform.Window) !void {
 
         try buildUi(&self.ctx, self, canvas_rect);
         self.ctx.endFrame();
+        Prof.mark(.ui_build);
         self.cachePanelsProbe();
         // After endFrame has finalized GUI draw commands, append so the confirmation UI sits on top.
         try drawAppshellOverlay(&self.ctx, self);
@@ -7669,12 +7723,14 @@ fn appFrameInner(self: *App, win: *platform.Window) !void {
         // Placed after input dispatch so a newly started stroke this frame correctly updates the busy check
         // (isPointerBusy) and the draw path does not flash a footprint ring.
         updateCursorAndHover(self, win.*, &self.ctx, canvas_rect);
+        Prof.mark(.overlays_pre);
 
         // ── Draw: bg → checker → canvas blit (α src-over) → GUI (on top) ──
         // Clear the physical fb. canvas is logical Zoom rect → physical nearest.
         // `fill32`, not `@memset`: the four bytes of COLOR_WINDOW_BG differ, and this is the
         // largest single write of the frame at a HiDPI physical size.
         pixelops.fill32(fb.pixels, COLOR_WINDOW_BG);
+        Prof.mark(.clear);
         if (canvas_rect) |rect| {
             if (self.last_area) |area| {
                 const zoom = self.view_zoom;
@@ -7688,6 +7744,7 @@ fn appFrameInner(self: *App, win: *platform.Window) !void {
                     .h = zoom.displayExtent(ch),
                 };
                 blit.drawCheckerboardPhysical(fb.pixels, phys_w, phys_h, screen_rect, area, content_scale);
+                Prof.mark(.checker);
                 const base_composite = self.resolveDisplayComposite(self.gpa);
                 const display_composite: []const u32 = if (self.onion_enabled and self.doc.frames.items.len > 1) blk: {
                     const cnt = @min(self.onion_count, core.onion_skin.max_count);
@@ -7695,11 +7752,16 @@ fn appFrameInner(self: *App, win: *platform.Window) !void {
                     break :blk self.onion_buf;
                 } else base_composite;
                 self.loupe_source_composite = display_composite;
+                Prof.mark(.composite);
                 blit.blitCanvasZoomPhysical(fb.pixels, phys_w, phys_h, display_composite, cw, ch, rect, zoom, area, content_scale);
                 // Minimap (right after canvas blit; below other overlays)
                 drawMinimapOverlay(self, fb.pixels, phys_w, phys_h, area, content_scale);
             }
         }
+        // Outside the branch on purpose: on a frame with no canvas rect (only the first one,
+        // before layout has run) `checker` and `composite` then read exactly zero instead of
+        // having the skipped time attributed to them.
+        Prof.mark(.canvas_blit);
         // Pixel grid overlays — fine (1px, zoom>=4x only) and coarse (user-chosen spacing, any
         // zoom) — are independent toggles sharing one clip_area/minimap_rect computation (view-only;
         // draw_list-based, so they paint on top of the raw-pixel canvas/minimap regardless of call
@@ -7832,6 +7894,7 @@ fn appFrameInner(self: *App, win: *platform.Window) !void {
                 }
             }
         }
+        Prof.mark(.overlays_post);
         // GUI DrawList stays in logical coords. Inject scale at the render exit.
         gui.render(
             .{ .pixels = fb.pixels, .width = phys_w, .height = phys_h },
@@ -7839,7 +7902,9 @@ fn appFrameInner(self: *App, win: *platform.Window) !void {
             self.ctx.font,
             content_scale,
         );
+        Prof.mark(.gui_render);
         win.present();
+        Prof.end(.present);
     } // ← framebuffer unlock here
 }
 

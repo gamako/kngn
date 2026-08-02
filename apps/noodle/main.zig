@@ -27,6 +27,40 @@ const gui = kit.gui;
 const appshell = kit.appshell;
 const stepgrid = gui.stepgrid;
 const modular = @import("modular");
+
+/// The sections the main loop is split into for `digest frameprof`. Order matches the order the
+/// marks run in; the digest prints `@tagName`, so inserting one renumbers nothing.
+const FrameSection = enum {
+    /// Draining the MIDI FIFO. Ahead of the framebuffer lock, unlike every other section.
+    midi,
+    /// Acquiring the framebuffer and opening the GUI frame.
+    lock,
+    /// Draining the master audio tap into the spectrum, scope and level meter.
+    audio_tap,
+    /// Rebuilding the command table and draining the window event queue.
+    events,
+    /// Publishing control-rate scalars to the graph and refreshing the inspector target.
+    controls,
+    /// Filling the physical framebuffer with the background.
+    clear,
+    /// Building the patch-canvas draw list (nodes, cables, selection).
+    canvas_build,
+    /// The visualisation strip: bitmap, background and the draw pass that burns it in.
+    viz_render,
+    /// Laying out and building the widget tree, through `endFrame`.
+    ui_build,
+    /// Menu popup, parameter capture, ghost markers and visualisation labels.
+    overlays,
+    /// Rasterising the GUI draw list into the framebuffer.
+    gui_render,
+    /// Handing the frame to the backend.
+    present,
+};
+
+/// Reads the real clock, not `platform.getTime`: under a replay that one is virtual and would
+/// report every section as zero.
+const Prof = kit.frame_prof.Profiler(FrameSection, platform.getRealTime);
+
 const pixelops = kit.pixelops;
 const audio = kit.audio;
 const synth = kit.synth; // SampleTap (Audio→GUI output tap; C master visualisation)
@@ -3458,6 +3492,20 @@ pub fn main(init: std.process.Init) !void {
     platform.registerProbe(.{ .name = "params", .ctx = &app, .ext = "json", .snapshot = paramsSnapshot, .digest = paramsDigest });
     platform.registerProbe(.{ .name = "menu", .ctx = &app, .ext = "txt", .digest = menuDigest, .desc = "menu open/items/enabled/checked/pending/last_op/native" });
     platform.registerProbe(.{ .name = "midi_map", .ctx = &app, .ext = "txt", .snapshot = null, .digest = midiMapDigest, .desc = "fixed MIDI CC map v1" });
+    platform.registerProbe(.{
+        .name = Prof.probe_name,
+        .ctx = &app,
+        .ext = "txt",
+        .digest = Prof.probeDigest,
+        .desc = "frame section timing: frames/aborted/frame_ms/body_ms/gap_ms/body_p95_ms/body_max_ms + per-section ms",
+    });
+    platform.registerAction(.{
+        .name = Prof.reset_action_name,
+        .ctx = &app,
+        .run = Prof.resetAction,
+        .network_policy = .local_only,
+        .desc = "drop the frame section profiler window",
+    });
     // Register harness custom actions (no-op when harness is off).
     app.cmd_exec = platform.command.Executor.init(.{ .ctx = &app, .run = dispatchModularAction });
     app.cmd_exec.log = &app.cmd_log;
@@ -3491,8 +3539,15 @@ pub fn main(init: std.process.Init) !void {
         // inner block's fb.unlock() — never sleep while the framebuffer is locked.
         const frame_t0 = platform.getTime();
         defer platform.framePaceUntil(frame_t0 + FRAME_PERIOD_S);
+        // Frame section timing. There is deliberately no `defer Prof.end(...)`: the one call sits
+        // right after present, so "completed frame" means "presented". A frame that finds no
+        // framebuffer never reaches it, and the next begin() records the attempt as aborted
+        // rather than letting a partial frame into the statistics. The pacing defer above stays
+        // untouched — it runs after end(), so the sleep lands in `gap_ms` where it belongs.
+        Prof.begin();
         // Event only: drain the MIDI FIFO (return immediately if empty. Not a per-frame always-on scan).
         drainMidiEvents(&app, &midi_device);
+        Prof.mark(.midi);
         {
             const fb = window.lockFramebuffer() orelse continue :main_loop;
             defer fb.unlock();
@@ -3505,6 +3560,7 @@ pub fn main(init: std.process.Init) !void {
             app.fb_w = logical_w;
             app.fb_h = logical_h;
             gui_ctx.beginFrame(logical_w, logical_h);
+            Prof.mark(.lock);
 
             // C: read the master tap → mono downmix → feed spec/osc/meter. Latch latest-block rms/peak.
             var frame_sumsq: f64 = 0;
@@ -3528,6 +3584,7 @@ pub fn main(init: std.process.Init) !void {
                 app.master_rms = @floatCast(@sqrt(frame_sumsq / @as(f64, @floatFromInt(frame_n))));
                 app.master_peak = frame_peak;
             }
+            Prof.mark(.audio_tap);
 
             app.rebuildMenuCommands();
             app.syncNativeMenu(&window);
@@ -3619,17 +3676,22 @@ pub fn main(init: std.process.Init) !void {
                 }
             }
 
+            Prof.mark(.events);
+
             // A/D: update activity + select/publish tap targets (just before draw, after event handling).
             // Generation-layer scalars: atomic-publish the latest GUI/action values at control rate.
             publishControls(app.patch, app.params);
             updateViz(&app);
             app.syncInspectorTarget();
             app.beginParamFrame();
+            Prof.mark(.controls);
 
             // Whole-framebuffer clear: `fill32` rather than `@memset` (the four bytes of BG differ).
             pixelops.fill32(fb.pixels, BG);
+            Prof.mark(.clear);
             dl.reset(logical_w, logical_h);
             drawFrame(&app, &dl);
+            Prof.mark(.canvas_build);
 
             // Layer A: logical viz bitmap → DrawList.image (first render nearest-scales it).
             // PanelHost assumes content_h = logical_h - menu - VIS_H and does not draw into the VIS_H band
@@ -3655,6 +3717,7 @@ pub fn main(init: std.process.Init) !void {
 
             const target: gui.RenderTarget = .{ .pixels = fb.pixels, .width = phys_w, .height = phys_h };
             gui.render(target, &dl, gui_ctx.font, content_scale);
+            Prof.mark(.viz_render);
 
             // menu → PanelHost content (above VIS_H) → VIS_H spacer. Logical-size basis.
             const mtop_i: i32 = @intFromFloat(app.menuTopH());
@@ -3694,6 +3757,7 @@ pub fn main(init: std.process.Init) !void {
             gui_ctx.endBox();
             if (!gui_ctx.input.mouse_buttons.left) app.releaseParamEdits();
             gui_ctx.endFrame();
+            Prof.mark(.ui_build);
             app.syncCanvasRect();
             // Bake auto-layout on the first frame the GUI rect cache is valid.
             // (centerRect is always null at init → canvas would stay full-width and the palette would overlap again)
@@ -3712,9 +3776,12 @@ pub fn main(init: std.process.Init) !void {
             app.drawGhostMarkers(&gui_ctx.draw_list);
             // Layer B: labels at the end of the second render (after layer A's nearest scale; physical font).
             drawVizLabels(&app, &gui_ctx.draw_list, spec);
+            Prof.mark(.overlays);
             gui.render(target, &gui_ctx.draw_list, gui_ctx.font, content_scale);
+            Prof.mark(.gui_render);
 
             window.present();
+            Prof.end(.present);
         }
         // Dialogs at the safe point after framebuffer unlock (platform.h contract).
         if (app.running) app.runPendingMenuFileOp();

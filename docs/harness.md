@@ -166,9 +166,66 @@ built-in. Currently:
 - The synth: `voices`
   (`{"active":N,"capacity":16,"voices":[{"note":..,"stage":".."}]}`) and `patch`
   (the current patch as JSON).
+- The editor and the patch canvas both: `frameprof` (frame section timing — see
+  "Frame section timing" below).
 
 **The framework does not interpret the contents of a custom probe** (it only routes
 raw bytes and a one-line digest).
+
+### Frame section timing (`frameprof`)
+
+`digest frameprof` breaks one frame body into named sections, so a performance question can
+be asked of the whole application rather than of a microbenchmark. It comes from
+`core/control/frame_prof.zig`; an application picks the sections and marks them, and the
+framework does not know what any of them mean.
+
+```text
+frames=309 aborted=0 frame_ms=19.825 body_ms=4.477 gap_ms=15.348 body_p95_ms=4.774
+body_max_ms=4.966 begin=0.002 events=0.003 ui_build=0.145 … present=0.680
+```
+
+| key | meaning |
+|---|---|
+| `frames` | frames in the window |
+| `aborted` | frames that began and never presented (they contribute nothing) |
+| `frame_ms` | the whole frame period |
+| `body_ms` | the profiled frame body |
+| `gap_ms` | everything outside the body |
+| `body_p95_ms`, `body_max_ms` | body spread |
+| everything else | one per section, in the order the marks run |
+
+**Read the sections against the totals, never alone.** `frame_ms == body_ms + gap_ms`, and
+the sections sum to `body_ms`; both hold by construction, so the line always says what
+fraction of the frame each section is. That matters because **a section's cost is not a
+measure of its work**: the same work measures several times longer in a loop that idles
+between frames than in one that does not
+([performance-measurement.md](performance-measurement.md) has the numbers). A section that
+grew might mean more work, or might only mean the loop got slower — `gap_ms` on the same
+line is what tells the two apart.
+
+`gap_ms` is **not** idle time. It is whatever happens between one frame's `end` and the
+next frame's `begin`: pacing sleep, the application's post-present work, the framebuffer
+unlock, OS scheduling. Blocking inside `present` counts towards the body, not the gap.
+
+Two more things to know before reading a number off this line:
+
+- **`body_p95_ms` uses a different window** from everything else — the last 256 frames,
+  where the averages, `body_max_ms` and the section values cover the whole window since the
+  last reset.
+- **With `frames=0` the line stops after `aborted`**, rather than reporting zeroed averages.
+  An assertion on a key that is not there fails, which is the right answer for "there is no
+  data yet"; zeros would read as "very fast".
+
+`action frameprof_reset` drops the window. The frame right after a reset is excluded from
+the statistics (it has no predecessor to measure a period against), as is the frame after an
+abort.
+
+**Turning it on.** `KNGN_FRAME_PROF=1` forces it on and `=0` forces it off; unset, it
+follows the harness, so `digest frameprof` works in an ordinary harness run with no extra
+configuration. The explicit `0` is what makes it possible to measure the profiler's own cost:
+reading frame rate needs the harness, which would otherwise switch the profiler on too. On
+wasm there is no environment, so it comes on only in a `-Dwasm-harness=true` build driven by
+the host bridge, and a shipping wasm page never measures.
 
 ### DrawList observability (`drawlist`)
 

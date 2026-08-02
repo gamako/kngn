@@ -859,6 +859,17 @@ pub fn getTime() f64 {
     // Only a manual clock (replay, or LISTEN+MANUAL_CLOCK) is virtual; free-run reads the backend's real
     // time (clock ownership is kept separate from the control channel).
     if (harness.isManualClock()) return harness.now();
+    return getRealTime();
+}
+
+/// The backend's monotonic clock, in seconds. Unlike `getTime` it is never the harness's
+/// virtual clock, so it still measures real elapsed time under a replay.
+///
+/// **For observation only.** Application logic that reads this instead of `getTime` stops
+/// replaying deterministically, because its behaviour then depends on how fast the machine
+/// happened to run. The frame-section profiler (`core/control/frame_prof.zig`) is the caller
+/// it exists for: a profiler that reported virtual time would report nothing at all.
+pub fn getRealTime() f64 {
     if (runtime_null) {
         if (comptime null_runtime_supported) return null_backend.getTime();
         return 0;
