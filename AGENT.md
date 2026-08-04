@@ -233,6 +233,12 @@ kngn/
 | Windows | install zig 0.16.0 locally and build natively (`flake.nix` does not cover it) |
 | direnv | entering the directory activates the nix devShell automatically (recommended) |
 
+The macOS backend's Swift runtime autolinking (`build_helpers/swift.zig`) has been
+checked against SDK major versions 15–16 (`macos.checked_sdk_major_range`). An SDK
+outside that range prints a build-time warning naming the exact range; if the build
+then fails with an undefined `__swift_FORCE_LOAD_$_<name>` symbol, add `<name>` to
+`optional_libs` in that file.
+
 ```bash
 direnv allow                     # once, to allow .envrc
 zig version                      # → 0.16.0

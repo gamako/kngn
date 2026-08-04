@@ -10,7 +10,20 @@ const std = @import("std");
 pub const MacOSSDKPaths = struct {
     sdk_path: []const u8,
     toolchain_path: []const u8,
+    /// The SDK version reported by `xcrun --show-sdk-version` (e.g. "15.2"), or "unknown"
+    /// when `sdk_override` bypassed `xcrun`. See `checked_sdk_major_range` for what this
+    /// is used for.
+    sdk_version: []const u8,
 };
+
+/// The macOS SDK major version range this project's Swift runtime autolinking
+/// (`build_helpers/swift.zig`'s `optional_libs`) is checked against. `swiftc` changes
+/// which overlay libraries it force-loads across SDK versions, so a host outside this
+/// range is the first thing to suspect when a build fails with an undefined
+/// `__swift_FORCE_LOAD_$_<name>` symbol. This is a coarse, SDK-major-only boundary, not a
+/// guarantee: a new `swiftc` on an SDK inside the range can still force-load a name this
+/// project has not seen yet.
+pub const checked_sdk_major_range = .{ .min = 15, .max = 26 };
 
 /// Resolve macOS SDK / toolchain paths.
 /// Use overrides when given; otherwise toolchain=`xcode-select -p`, SDK=`xcrun --show-sdk-path`.
@@ -39,7 +52,88 @@ pub fn resolveMacOSSDKPaths(
         break :blk std.mem.trim(u8, output, " \n\r");
     };
 
-    return .{ .sdk_path = sdk_path, .toolchain_path = toolchain_path };
+    // An overridden SDK path may not match what `xcrun` defaults to, so the version
+    // reported here would be misleading; `warnIfSdkVersionUnchecked` reports this case
+    // on its own rather than comparing "unknown" against `checked_sdk_major_range`.
+    const sdk_version = if (sdk_override != null)
+        "unknown"
+    else blk: {
+        const output = b.run(&.{ "xcrun", "--show-sdk-version" });
+        break :blk std.mem.trim(u8, output, " \n\r");
+    };
+    warnIfSdkVersionUnchecked(sdk_override != null, sdk_version);
+
+    return .{ .sdk_path = sdk_path, .toolchain_path = toolchain_path, .sdk_version = sdk_version };
+}
+
+/// The leading integer of a dotted version string ("15.2" -> 15), or `null` if it does
+/// not start with one.
+fn majorVersion(version: []const u8) ?u32 {
+    const dot = std.mem.indexOfScalar(u8, version, '.') orelse version.len;
+    return std.fmt.parseInt(u32, version[0..dot], 10) catch null;
+}
+
+/// Printed at most once per process: a `-Dinstall-all=true` build resolves SDK paths
+/// many times over, and repeating this warning for each one is noise, not signal.
+var warned_about_sdk_version = false;
+
+fn warnIfSdkVersionUnchecked(sdk_overridden: bool, sdk_version: []const u8) void {
+    if (warned_about_sdk_version) return;
+    if (sdk_overridden) {
+        warned_about_sdk_version = true;
+        std.debug.print(
+            "warning: macOS SDK version could not be checked because the SDK path was " ++
+                "overridden. If this build fails with an undefined " ++
+                "`__swift_FORCE_LOAD_$_<name>` symbol, add <name> to `optional_libs` in " ++
+                "build_helpers/swift.zig.\n",
+            .{},
+        );
+        return;
+    }
+    const major = majorVersion(sdk_version) orelse {
+        warned_about_sdk_version = true;
+        std.debug.print(
+            "warning: macOS SDK version '{s}' could not be parsed, so it could not be " ++
+                "checked against the range this project's Swift runtime autolinking is " ++
+                "checked against ({d}-{d}). If this build fails with an undefined " ++
+                "`__swift_FORCE_LOAD_$_<name>` symbol, add <name> to `optional_libs` in " ++
+                "build_helpers/swift.zig.\n",
+            .{ sdk_version, checked_sdk_major_range.min, checked_sdk_major_range.max },
+        );
+        return;
+    };
+    if (major >= checked_sdk_major_range.min and major <= checked_sdk_major_range.max) return;
+    warned_about_sdk_version = true;
+    std.debug.print(
+        "warning: macOS SDK {s} is outside the range this project's Swift runtime " ++
+            "autolinking is checked against ({d}-{d}). If this build fails with " ++
+            "an undefined `__swift_FORCE_LOAD_$_<name>` symbol, add <name> to " ++
+            "`optional_libs` in build_helpers/swift.zig.\n",
+        .{ sdk_version, checked_sdk_major_range.min, checked_sdk_major_range.max },
+    );
+}
+
+test "majorVersion parses the leading dotted component" {
+    try std.testing.expectEqual(@as(?u32, 15), majorVersion("15.2"));
+    try std.testing.expectEqual(@as(?u32, 16), majorVersion("16.99"));
+    try std.testing.expectEqual(@as(?u32, 26), majorVersion("26.5"));
+    try std.testing.expectEqual(@as(?u32, 14), majorVersion("14.9"));
+    try std.testing.expectEqual(@as(?u32, 17), majorVersion("17.0"));
+}
+
+test "majorVersion rejects input with no parseable leading integer" {
+    try std.testing.expectEqual(@as(?u32, null), majorVersion("unknown"));
+    try std.testing.expectEqual(@as(?u32, null), majorVersion(""));
+    try std.testing.expectEqual(@as(?u32, null), majorVersion(".5"));
+}
+
+test "checked_sdk_major_range boundaries" {
+    const min = checked_sdk_major_range.min;
+    const max = checked_sdk_major_range.max;
+    try std.testing.expect(majorVersion("15.0").? >= min);
+    try std.testing.expect(majorVersion("26.5").? <= max);
+    try std.testing.expect(majorVersion("14.9").? < min);
+    try std.testing.expect(majorVersion("27.0").? > max);
 }
 
 /// Link macOS frameworks into the exe.

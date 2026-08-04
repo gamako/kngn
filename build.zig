@@ -1291,6 +1291,20 @@ pub fn build(b: *std.Build) void {
     const test_frame_pacing_step = b.step("test-frame-pacing", "Run frame pacing (deadline + overshoot EWMA) unit tests");
     test_frame_pacing_step.dependOn(&b.addRunArtifact(frame_pacing_test).step);
 
+    // Pure SDK-version-string parsing behind the macOS SDK version check
+    // (build_helpers/macos.zig). No display / build graph needed to exercise it; the
+    // file's other functions take *std.Build only in signatures, which typechecks
+    // without an active build.
+    const macos_build_helper_test = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("build_helpers/macos.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    const test_macos_build_helper_step = b.step("test-macos-build-helper", "Run build_helpers/macos.zig unit tests (SDK version parsing)");
+    test_macos_build_helper_step.dependOn(&b.addRunArtifact(macos_build_helper_test).step);
+
     // MIDI facade/null/CoreMIDI backend unit tests (ADR-010).
     // On macOS the facade relative-imports midi_macos, so CoreMIDI is linked.
     // A dedicated addTest rooted at midi_macos.zig also runs the native-side tests
@@ -2645,6 +2659,7 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(test_netsync_step);
     test_step.dependOn(test_audio_null_step);
     test_step.dependOn(test_platform_types_step);
+    test_step.dependOn(test_macos_build_helper_step);
     test_step.dependOn(test_platform_wasm_step);
     test_step.dependOn(test_capture_types_step);
     test_step.dependOn(test_pixelops_step);
