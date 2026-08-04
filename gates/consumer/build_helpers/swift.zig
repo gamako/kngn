@@ -31,8 +31,16 @@ pub fn linkSwiftRuntime(
         .{sdk_paths.sdk_path},
     ) catch unreachable;
 
-    exe.root_module.addLibraryPath(.{ .cwd_relative = toolchain_swift_lib_path });
-    exe.root_module.addLibraryPath(.{ .cwd_relative = sdk_swift_lib_path });
+    // A Command Line Tools-only toolchain has no nested
+    // `Toolchains/XcodeDefault.xctoolchain/usr/lib/swift/macosx`; passing a `-L` for a
+    // directory that does not exist earns a linker warning zig reports as a build
+    // failure even though linking still succeeds, so only add a path that is there.
+    if (pathExists(b, toolchain_swift_lib_path)) {
+        exe.root_module.addLibraryPath(.{ .cwd_relative = toolchain_swift_lib_path });
+    }
+    if (pathExists(b, sdk_swift_lib_path)) {
+        exe.root_module.addLibraryPath(.{ .cwd_relative = sdk_swift_lib_path });
+    }
 
     const runtime_libs = [_][]const u8{
         "swiftCore",
