@@ -17,7 +17,7 @@ error classification — and never becomes a shared runtime base type.
 | Shared types (type-only, the single source) | `core/capture_types.zig` (`@import("capture_types")`) |
 | Microphone facade | the capture section of `core/audio.zig` |
 | Camera facade | `core/camera.zig` |
-| Backends | macOS: `core/camera_macos.zig` (AVFoundation) and the `capture` namespace of `core/audio_macos.zig` (AUHAL). Linux: `core/camera_v4l2.zig` (V4L2) and the `capture` namespace of `core/audio_linux.zig` (ALSA). Anywhere else: `core/camera_stub.zig` and `core/audio_capture_stub.zig`, where every verb returns `error.Unsupported` |
+| Backends | macOS: `core/camera_macos.zig` (AVFoundation) and the `capture` namespace of `core/audio_macos.zig` (AUHAL). Linux: `core/camera_v4l2.zig` (V4L2) and the `capture` namespace of `core/audio_linux.zig` (ALSA). Windows: the `capture` namespace of `core/audio_windows.zig` (WASAPI); camera capture on Windows is not yet implemented and still goes through `core/camera_stub.zig`. Anywhere else (and the camera side, elsewhere than macOS/Linux): `core/camera_stub.zig` and `core/audio_capture_stub.zig`, where every verb returns `error.Unsupported` |
 | Synthetic source | `core/capture_synthetic.zig`, driven by the harness (see [harness.md](harness.md)) |
 
 `capture_types` is a **named module linked into both `camera` and `audio`**. A relative
@@ -34,6 +34,7 @@ types, so sharing it as a named module is what makes `camera`'s and `audio`'s
 | `requestPermission()` | request permission and return the settled state (blocking) | `CaptureError!PermissionState` |
 | `open(allocator, config)` | open a device, negotiating the format internally | `CaptureError!Device` |
 | `device.config()` | read the effective values | `EffectiveConfig` |
+| `CaptureDevice.status()` | read whether the microphone is stopped, running or lost | `DeviceStatus` |
 | `device.start()` | begin capturing | `CaptureError!void` |
 | `device.stop()` | stop capturing (a no-op when already stopped) | `void` |
 | `device.close()` | dispose of it | `void` |
@@ -67,12 +68,19 @@ Renegotiating an already-open device (say changing resolution while running) is 
 
 `(unopened) → open() → opened → start() → running → stop() → opened → close() → (end)`
 
+While running, a microphone backend failure transitions the device to `device_lost`. The capture
+thread stops delivering frames, `CaptureDevice.status()` reports the loss, and the caller must
+close the old device and open a new one before retrying. `stop()` preserves
+`device_lost`, so an application does not accidentally turn a hardware failure into a
+normal stop.
+
 Misuse — `start()` while running, `stop()` before starting — is held to the same
 strength of contract as the existing audio output: **a double start or stop is ignored**
 (`core/audio_null.zig` is the worked example), and no explicit state-machine enum or
 error is added. Reusing a device after `close()` is undefined and the caller's
-responsibility. There is deliberately no state query such as `isRunning()`, since the
-existing audio output has none.
+responsibility. For microphone capture, `DeviceStatus` is intentionally a small status query rather than an
+`isRunning()` bool: it distinguishes an ordinary stop from a backend/device failure.
+The values are shared by the native microphone backends.
 
 ## The allocator contract for enumerate
 
@@ -102,6 +110,12 @@ pub const CaptureError = error{
   makes it unchangeable. macOS's `authorizationStatus` really does return these four
   values, and a UI needs the distinction to choose between "open Settings" and "this
   cannot be changed", so `restricted` is never folded into `denied`.
+- **Windows has no TCC-style prompt or `restricted` state.** A classic Win32 application only observes the
+  "Let apps access your microphone" privacy toggle indirectly, as an `E_ACCESSDENIED` from WASAPI's
+  `IAudioClient::Activate` or `Initialize`. `core/audio_windows.zig`'s `requestPermission()` is therefore a
+  trial negotiation of the default capture endpoint (the same style as the ALSA backend's trial open),
+  classifying `E_ACCESSDENIED` as `denied` and any other failure (no enumerator, no default device) as
+  `not_determined` rather than guessing at a refusal. `restricted` is never returned on Windows.
 - **A silent refusal must never be treated as normal.** A privacy toggle can express refusal
   by returning no error and delivering empty or silent data indefinitely. This is a rule
   binding on a backend: where it detects such a refusal it must surface it as
@@ -118,6 +132,12 @@ pub const CaptureError = error{
 (rather than a flat argument list, so that adding a field does not add a parameter).
 The callback is bound by the real-time contract — no malloc, locking, IO or panic —
 exactly as audio output is; see [audio-and-synth.md](audio-and-synth.md).
+
+The public microphone sample format is interleaved `f32`; `AudioInFrame.sample_rate`
+and `device.config().sample_rate` carry the effective device rate. Backends may receive
+another native format internally, but must normalize it before invoking the callback.
+The Windows WASAPI backend currently handles native f32 and PCM 16/32-bit mix formats
+without allocating in the capture thread.
 
 **Camera** frames are always normalised to canonical BGRA (`u32` `0xAARRGGBB`, memory
 `[B,G,R,A]`), the same

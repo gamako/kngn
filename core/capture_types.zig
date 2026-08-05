@@ -51,6 +51,21 @@ pub fn freeDeviceList(allocator: std.mem.Allocator, devices: []DeviceInfo) void 
 ///   `authorizationStatus` really does return these four values). It gives a UI the basis to choose between prompting to open Settings and saying it cannot be changed.
 pub const PermissionState = enum { not_determined, granted, denied, restricted };
 
+/// Runtime state of an opened capture device. Backends publish this through an atomic
+/// byte so an asynchronous capture thread can report a terminal device loss without
+/// calling user code from the real-time path.
+pub const DeviceStatus = enum(u8) {
+    stopped,
+    running,
+    device_lost,
+};
+
+test "device status values are stable for native and wasm bridges" {
+    try std.testing.expectEqual(@as(u8, 0), @intFromEnum(DeviceStatus.stopped));
+    try std.testing.expectEqual(@as(u8, 1), @intFromEnum(DeviceStatus.running));
+    try std.testing.expectEqual(@as(u8, 2), @intFromEnum(DeviceStatus.device_lost));
+}
+
 /// The error set the microphone and camera facades share (what the unified control plane actually consists of).
 /// An allocator failure (an alloc inside `enumerate` or `open`) is folded into `OpenFailed` (the same conversion
 /// convention as the existing output backends' `allocator.create(State) catch return error.OpenFailed;`. `OutOfMemory` is

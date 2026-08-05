@@ -1405,6 +1405,7 @@ pub fn build(b: *std.Build) void {
     audio_capture_test_mod.addImport("capture_types", shared_modules.capture_types.mod);
     audio_capture_test_mod.addImport("objc_runtime", shared_modules.objc_runtime.mod); // macOS: audio_macos.zig references via named import
     if (target.result.os.tag == .linux) platform.linkAudioBackend(audio_capture_test_mod, .linux);
+    if (target.result.os.tag == .windows) platform.linkAudioBackend(audio_capture_test_mod, .windows);
     const audio_capture_test = b.addTest(.{ .root_module = audio_capture_test_mod });
     // On macOS mic capture (AUHAL input) uses AudioToolbox/CoreAudio + permission-check
     // AVFoundation (ObjC), so frameworks are linked explicitly (other OSes stay on audio_capture_stub.zig
@@ -1504,6 +1505,22 @@ pub fn build(b: *std.Build) void {
         platform.linkAudioBackend(audio_linux_capture_test_mod, .linux);
         const audio_linux_capture_test = b.addTest(.{ .root_module = audio_linux_capture_test_mod });
         test_capture_types_step.dependOn(&b.addRunArtifact(audio_linux_capture_test).step);
+    }
+
+    if (target_os == .windows) {
+        // Same "root file only" test-collection rule as the macOS/Linux blocks above: a dedicated addTest
+        // rooted directly at core/audio_windows.zig, so its capture tests (lpwstrOf, enumerate/requestPermission
+        // against the real WASAPI, and the manual full-cycle smoke test) actually run.
+        const audio_windows_capture_test_mod = b.createModule(.{
+            .root_source_file = b.path("core/audio_windows.zig"),
+            .target = target,
+            .optimize = optimize,
+            .link_libc = true, // std.c.getenv in the capture smoke tests (same reason as the ALSA test module)
+        });
+        audio_windows_capture_test_mod.addImport("capture_types", shared_modules.capture_types.mod);
+        platform.linkAudioBackend(audio_windows_capture_test_mod, .windows);
+        const audio_windows_capture_test = b.addTest(.{ .root_module = audio_windows_capture_test_mod });
+        test_capture_types_step.dependOn(&b.addRunArtifact(audio_windows_capture_test).step);
     }
 
     // core/capture_synthetic.zig (harness-built-in synthetic capture source).

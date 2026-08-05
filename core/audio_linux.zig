@@ -312,7 +312,11 @@ pub const capture = struct {
         capture_callback: CaptureCallback,
         userdata: ?*anyopaque,
         effective: capture.EffectiveConfig,
-        running: std.atomic.Value(bool),
+        // Each is written from more than one thread (the app thread via start()/stop(), the capture
+        // thread via markDeviceLost()), so they are cache_line-separated to avoid false sharing between
+        // the app thread's core and the capture thread's core.
+        running: std.atomic.Value(bool) align(std.atomic.cache_line),
+        status: std.atomic.Value(u8) align(std.atomic.cache_line),
         thread: ?std.Thread,
         scratch: []f32,
         xrun_count: std.atomic.Value(u32),
@@ -326,13 +330,20 @@ pub const capture = struct {
             return self.state.effective;
         }
 
+        pub fn status(self: CaptureDevice) types.DeviceStatus {
+            return @enumFromInt(self.state.status.load(.acquire));
+        }
+
         pub fn start(self: CaptureDevice) types.CaptureError!void {
             const state = self.state;
+            if (self.status() == .device_lost) return error.DeviceLost;
             if (state.thread != null) return;
             if (c.snd_pcm_prepare(state.pcm) < 0) return error.StartFailed;
             state.running.store(true, .release);
+            state.status.store(@intFromEnum(types.DeviceStatus.running), .release);
             state.thread = std.Thread.spawn(.{}, captureThread, .{state}) catch {
                 state.running.store(false, .release);
+                state.status.store(@intFromEnum(types.DeviceStatus.stopped), .release);
                 _ = c.snd_pcm_drop(state.pcm);
                 return error.StartFailed;
             };
@@ -346,6 +357,9 @@ pub const capture = struct {
                 _ = c.snd_pcm_drop(state.pcm);
                 thread.join();
                 state.thread = null;
+                if (self.status() != .device_lost) {
+                    state.status.store(@intFromEnum(types.DeviceStatus.stopped), .release);
+                }
             }
         }
 
@@ -426,7 +440,10 @@ pub const capture = struct {
             if (n < 0) {
                 const err: c_int = @intCast(n);
                 if (err == -c.EPIPE) _ = state.xrun_count.fetchAdd(1, .monotonic); // capture overrun
-                if (c.snd_pcm_recover(state.pcm, err, 1) < 0) state.running.store(false, .release);
+                if (c.snd_pcm_recover(state.pcm, err, 1) < 0) {
+                    state.running.store(false, .release);
+                    state.status.store(@intFromEnum(types.DeviceStatus.device_lost), .release);
+                }
                 continue;
             }
             if (n == 0) continue;
@@ -486,6 +503,7 @@ pub const capture = struct {
             .userdata = cfg.userdata,
             .effective = effective,
             .running = .init(false),
+            .status = .init(@intFromEnum(types.DeviceStatus.stopped)),
             .thread = null,
             .scratch = scratch,
             .xrun_count = .init(0),

@@ -44,6 +44,11 @@ pub const CaptureDevice = struct {
         unreachable; // unreachable, open always failing
     }
 
+    pub fn status(self: CaptureDevice) types.DeviceStatus {
+        _ = self;
+        return .stopped;
+    }
+
     pub fn start(self: CaptureDevice) types.CaptureError!void {
         _ = self;
         return error.Unsupported;

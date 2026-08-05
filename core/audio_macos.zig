@@ -398,12 +398,16 @@ pub const capture = struct {
     };
 
     /// The state passed to the real-time thread's callback at a stable address (the same approach as the output side's `State`).
+    /// Unlike the output side (whose `running` has no concurrent writer), `status` alone is the single
+    /// source of truth for whether capture is running: it is written from more than one thread (the app
+    /// thread via start()/stop(), CoreAudio's own real-time thread via inputTrampoline's device-loss path),
+    /// and a second boolean tracking the same thing would only reopen the TOCTOU race a lone atomic closes.
     const CState = struct {
         unit: c.AudioUnit,
         capture_callback: CaptureCallback,
         userdata: ?*anyopaque,
         effective: capture.EffectiveConfig,
-        running: bool,
+        status: std.atomic.Value(u8) align(std.atomic.cache_line),
         allocator: std.mem.Allocator,
         scratch: []f32, // the fixed interleaved buffer of max_frames_per_slice*channels (allocated only at open)
     };
@@ -415,25 +419,45 @@ pub const capture = struct {
             return self.state.effective;
         }
 
-        pub fn start(self: CaptureDevice) types.CaptureError!void {
-            if (c.AudioOutputUnitStart(self.state.unit) != 0) return error.StartFailed;
-            self.state.running = true;
+        pub fn status(self: CaptureDevice) types.DeviceStatus {
+            return @enumFromInt(self.state.status.load(.acquire));
         }
 
-        pub fn stop(self: CaptureDevice) void {
-            if (self.state.running) {
-                _ = c.AudioOutputUnitStop(self.state.unit);
-                self.state.running = false;
+        pub fn start(self: CaptureDevice) types.CaptureError!void {
+            if (self.status() == .device_lost) return error.DeviceLost;
+            if (c.AudioOutputUnitStart(self.state.unit) != 0) return error.StartFailed;
+            // inputTrampoline may already be running on CoreAudio's real-time thread by the time
+            // AudioOutputUnitStart returns, and could have raced ahead to report a device loss. A
+            // compare-exchange loop on the single `status` atomic closes the TOCTOU window a load-then-store
+            // (or a second, separately-updated `running` flag) would leave open: only a status that is not
+            // yet device_lost is advanced to running, as one atomic transition.
+            var cur = self.state.status.load(.acquire);
+            while (cur != @intFromEnum(types.DeviceStatus.device_lost)) {
+                cur = self.state.status.cmpxchgWeak(cur, @intFromEnum(types.DeviceStatus.running), .release, .acquire) orelse break;
             }
         }
 
-        /// When running: stop, then uninitialize, then dispose, then free the scratch, then destroy the State.
+        /// A no-op before the first start() (`status == .stopped`), per docs/capture.md's "a double start
+        /// or stop is ignored". Otherwise (running, or lost while running) `AudioOutputUnitStop` is called
+        /// unconditionally: a device loss reported by `inputTrampoline` already moves `status` to
+        /// `device_lost` on its own real-time thread, and skipping Stop in that case would leave the
+        /// callback still firing after `stop()` returns, contrary to what "stop" promises.
+        pub fn stop(self: CaptureDevice) void {
+            if (self.status() == .stopped) return;
+            _ = c.AudioOutputUnitStop(self.state.unit);
+            if (self.status() != .device_lost) {
+                self.state.status.store(@intFromEnum(types.DeviceStatus.stopped), .release);
+            }
+        }
+
+        /// Stop unconditionally, then uninitialize, then dispose, then free the scratch, then destroy the
+        /// State. `AudioOutputUnitStop` is always called: a device loss reported by `inputTrampoline`
+        /// already moves `status` to `device_lost` on its own real-time thread, and skipping Stop in that
+        /// case would let `AudioUnitUninitialize`/`AudioComponentInstanceDispose` race a callback that has
+        /// not actually quiesced yet. Stop on an already-stopped unit is harmless.
         pub fn close(self: CaptureDevice) void {
             const state = self.state;
-            if (state.running) {
-                _ = c.AudioOutputUnitStop(state.unit);
-                state.running = false;
-            }
+            _ = c.AudioOutputUnitStop(state.unit);
             _ = c.AudioUnitUninitialize(state.unit);
             _ = c.AudioComponentInstanceDispose(state.unit);
             state.allocator.free(state.scratch);
@@ -578,7 +602,10 @@ pub const capture = struct {
             }},
         };
         const status = c.AudioUnitRender(state.unit, io_action_flags, in_time_stamp, in_bus_number, frames, &buf_list);
-        if (status != 0) return status;
+        if (status != 0) {
+            state.status.store(@intFromEnum(types.DeviceStatus.device_lost), .release);
+            return status;
+        }
 
         const count = @as(usize, frames) * @as(usize, channels);
         state.capture_callback(.{
@@ -716,7 +743,7 @@ pub const capture = struct {
             .capture_callback = cfg.capture_callback,
             .userdata = cfg.userdata,
             .effective = effective,
-            .running = false,
+            .status = .init(@intFromEnum(types.DeviceStatus.stopped)),
             .allocator = allocator,
             .scratch = scratch,
         };
