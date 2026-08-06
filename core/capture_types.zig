@@ -88,9 +88,19 @@ pub const CaptureError = error{
 /// Asymmetric with the output `RenderCallback`, which hands over a buffer to write into: an input hands over a finished product.
 /// `samples` is valid only while the callback runs (the same lifetime convention as the output `RenderCallback`'s `buf`).
 ///
-/// `CaptureCallback` (the callback function pointer type) and `Config`/`EffectiveConfig` do not live in capture_types
-/// but in the microphone-side backend file (`core/audio_capture_stub.zig`), following the same placement convention by which
-/// the output's `RenderCallback` and `Config` live in a backend file such as `audio_macos.zig`.
+/// `CaptureCallback` is the function-pointer type that receives one `AudioInFrame` plus `userdata`.
+/// The real-time call rules — no malloc, locking, IO or panic — are the same on every platform.
+/// The **execution context** differs: native backends invoke the callback from a dedicated capture
+/// real-time thread at the hardware capture period; a wasm backend has no dedicated capture thread
+/// and invokes it from the application's main-thread frame tick (so the call rate tracks the frame
+/// rate and is asynchronous with the hardware capture clock). Calling `start()`, `stop()` or
+/// `close()` on the same device synchronously from inside the callback is undefined behaviour on
+/// every platform.
+///
+/// `CaptureCallback` and `Config`/`EffectiveConfig` do not live in capture_types but in the
+/// microphone-side backend file (`core/audio_capture_stub.zig`), following the same placement
+/// convention by which the output's `RenderCallback` and `Config` live in a backend file such as
+/// `audio_macos.zig`.
 pub const AudioInFrame = struct {
     samples: []const f32, // interleaved
     frames: u32,

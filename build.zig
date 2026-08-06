@@ -139,6 +139,10 @@ fn makeInternalWasmLinker(b: *std.Build, wasm_harness: bool) platform.WasmLinker
                 link(root, shared.spectrogram);
                 link(root, shared.scope);
                 link(root, shared.serde);
+            } else if (std.mem.eql(u8, link_ctx.spec.name, "mic_demo")) {
+                // Scaffold for wasm microphone capture (kit only; capture logic lands later).
+                const root = TaggedModule{ .mod = link_ctx.app_module, .layer = .app, .name = "mic_demo" };
+                link(root, pm.base().kit);
             } else {
                 std.debug.panic("internal wasm linker: unknown app '{s}'", .{link_ctx.spec.name});
             }
@@ -150,9 +154,9 @@ fn makeInternalWasmLinker(b: *std.Build, wasm_harness: bool) platform.WasmLinker
     return .{ .context = ctx, .apply = Ctx.apply };
 }
 
-/// pixie + synth (shared) + synth_postmessage WasmAppSpec values for the in-tree web package.
+/// pixie + synth (shared) + synth_postmessage + mic_demo WasmAppSpec values for the in-tree web package.
 /// When `with_single_html` is true, pixie and the postMessage synth produce `*.single.html`.
-fn makeWasmAppSpecs(b: *std.Build, base_target: std.Build.ResolvedTarget, with_single_html: bool) [3]platform.WasmAppSpec {
+fn makeWasmAppSpecs(b: *std.Build, base_target: std.Build.ResolvedTarget, with_single_html: bool) [4]platform.WasmAppSpec {
     // Keep the caller's CPU / OS / ABI / existing feature set; add simd128 for pixelops @Vector paths.
     var pixie_query = base_target.query;
     pixie_query.cpu_features_add.addFeatureSet(std.Target.wasm.featureSet(&.{.simd128}));
@@ -230,10 +234,31 @@ fn makeWasmAppSpecs(b: *std.Build, base_target: std.Build.ResolvedTarget, with_s
             .single_html = with_single_html,
             .single_html_basename = "synth",
         },
+        .{
+            .name = "mic_demo",
+            .target_query = synth_shared_query,
+            .app_source = b.path("apps/mic_demo/main.zig"),
+            .wasm_root_source = b.path("apps/mic_demo/wasm_root.zig"),
+            .wasm_root_import_name = "mic_demo_app",
+            .single_threaded = platform.wasm_single_threaded,
+            .audio = .worklet_shared,
+            .capture = true,
+            .shared_memory = true,
+            .import_memory = true,
+            .export_memory = false,
+            .initial_memory = 16 * 1024 * 1024,
+            .max_memory = 64 * 1024 * 1024,
+            .stack_size = 2 * 1024 * 1024,
+            .export_symbol_names = &.{"__stack_pointer"},
+            .html_source = b.path("web/mic-demo.html"),
+            .html_install_path = "web/mic-demo.html",
+            // worklet_shared × single HTML is a build error (COOP/COEP required).
+            .single_html = false,
+        },
     };
 }
 
-/// wasm32-wasi-only build (pixie + synth audio).
+/// wasm32-wasi-only build (pixie + synth audio + mic_demo).
 /// Root is wasm_root.zig (no main) to avoid the wasi command/_start path (reactor = export-driven).
 fn buildWasm(
     b: *std.Build,
@@ -250,13 +275,14 @@ fn buildWasm(
         .linker = makeInternalWasmLinker(b, wasm_harness),
         .default_install = true,
         .create_package_step = true,
-        .package_step_description = "Package wasm web deploy bundle to zig-out/web/ (pixie + synth + static assets)",
+        .package_step_description = "Package wasm web deploy bundle to zig-out/web/ (pixie + synth + mic_demo + static assets)",
         .create_single_package_step = true,
         .single_package_step_description = "Package single-file HTML (pixie + postMessage synth) to zig-out/web/",
     });
     addBuildStep(b, "build-pixie", "Build Pixie wasm (wasm32-wasi)", apps[0].exe);
     addBuildStep(b, "build-synth-wasm", "Build Synth wasm (shared memory + AudioWorklet)", apps[1].exe);
     addBuildStep(b, "build-synth-postmessage-wasm", "Build Synth wasm (postMessage audio, no shared memory)", apps[2].exe);
+    addBuildStep(b, "build-mic-demo-wasm", "Build mic_demo wasm (shared memory + mic capture scaffold)", apps[3].exe);
     addWasmHarnessGate(b, target, optimize, wasm_harness, install_all, apps);
 }
 
@@ -276,19 +302,20 @@ fn packageWebFromNative(b: *std.Build, optimize: std.builtin.OptimizeMode, insta
         .linker = makeInternalWasmLinker(b, wasm_harness),
         .default_install = install_all,
         .create_package_step = true,
-        .package_step_description = "Package wasm web deploy bundle to zig-out/web/ (pixie + synth + static assets)",
+        .package_step_description = "Package wasm web deploy bundle to zig-out/web/ (pixie + synth + mic_demo + static assets)",
         .create_single_package_step = true,
         .single_package_step_description = "Package single-file HTML (pixie + postMessage synth) to zig-out/web/",
     });
     addBuildStep(b, "build-pixie-wasm", "Build Pixie wasm for web (wasm32-wasi)", apps[0].exe);
     addBuildStep(b, "build-synth-wasm", "Build Synth wasm for web (shared memory + AudioWorklet)", apps[1].exe);
     addBuildStep(b, "build-synth-postmessage-wasm", "Build Synth wasm for web (postMessage audio, no shared memory)", apps[2].exe);
+    addBuildStep(b, "build-mic-demo-wasm", "Build mic_demo wasm for web (shared memory + mic capture scaffold)", apps[3].exe);
     addWasmHarnessGate(b, wasi_target, optimize, wasm_harness, install_all, apps);
 }
 
 /// Gate the wasm build that carries the real harness (`-Dwasm-harness=true`).
 ///
-/// What it asserts: the three wasm apps still **compile and link** with the observation
+/// What it asserts: the wasm apps still **compile and link** with the observation
 /// plane compiled in, and their export tables still pass `check-wasm-exports`. Packaging
 /// (HTML and the shared static assets) is not in scope — `package-web` already covers it.
 ///
@@ -2826,6 +2853,23 @@ pub fn build(b: *std.Build) void {
     const bench_yuyv_exe = b.addExecutable(.{ .name = "bench_yuyv", .root_module = bench_yuyv_root });
     const bench_yuyv_step = b.step("bench-yuyv", "Run YUYV to BGRA micro-benchmark (ReleaseFast)");
     bench_yuyv_step.dependOn(&b.addRunArtifact(bench_yuyv_exe).step);
+
+    // bench-capture-ring: Zig-side mic capture submit (scratch copy + SPSC push). No device/display.
+    const bench_capture_ring_root = b.createModule(.{
+        .root_source_file = b.path("bench/capture_ring.zig"),
+        .target = target,
+        .optimize = .ReleaseFast,
+    });
+    const bench_audio_capture_web_mod = b.createModule(.{
+        .root_source_file = b.path("core/audio_capture_web.zig"),
+        .target = target,
+        .optimize = .ReleaseFast,
+    });
+    bench_audio_capture_web_mod.addImport("capture_types", shared_modules.capture_types.mod);
+    bench_capture_ring_root.addImport("audio_capture_web", bench_audio_capture_web_mod);
+    const bench_capture_ring_exe = b.addExecutable(.{ .name = "bench_capture_ring", .root_module = bench_capture_ring_root });
+    const bench_capture_ring_step = b.step("bench-capture-ring", "Run mic capture ring submit micro-benchmark (ReleaseFast)");
+    bench_capture_ring_step.dependOn(&b.addRunArtifact(bench_capture_ring_exe).step);
 
     // Peak-memory measuring allocator shared by bench-gui/-gui-frame/-blit/-viz
     const bench_peak_allocator_mod = b.createModule(.{

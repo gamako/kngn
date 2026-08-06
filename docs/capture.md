@@ -17,7 +17,7 @@ error classification — and never becomes a shared runtime base type.
 | Shared types (type-only, the single source) | `core/capture_types.zig` (`@import("capture_types")`) |
 | Microphone facade | the capture section of `core/audio.zig` |
 | Camera facade | `core/camera.zig` |
-| Backends | macOS: `core/camera_macos.zig` (AVFoundation) and the `capture` namespace of `core/audio_macos.zig` (AUHAL). Linux: `core/camera_v4l2.zig` (V4L2) and the `capture` namespace of `core/audio_linux.zig` (ALSA). Windows: the `capture` namespace of `core/audio_windows.zig` (WASAPI); camera capture on Windows is not yet implemented and still goes through `core/camera_stub.zig`. Anywhere else (and the camera side, elsewhere than macOS/Linux): `core/camera_stub.zig` and `core/audio_capture_stub.zig`, where every verb returns `error.Unsupported` |
+| Backends | macOS: `core/camera_macos.zig` (AVFoundation) and the `capture` namespace of `core/audio_macos.zig` (AUHAL). Linux: `core/camera_v4l2.zig` (V4L2) and the `capture` namespace of `core/audio_linux.zig` (ALSA). Windows: the `capture` namespace of `core/audio_windows.zig` (WASAPI); camera capture on Windows is not yet implemented and still goes through `core/camera_stub.zig`. wasm (microphone): `core/audio_capture_web.zig` on the shared-memory AudioWorklet path (see [ADR-027](adr/027_wasm-microphone-capture.md)). Anywhere else (and the camera side, elsewhere than macOS/Linux): `core/camera_stub.zig` and `core/audio_capture_stub.zig`, where every verb returns `error.Unsupported` |
 | Synthetic source | `core/capture_synthetic.zig`, driven by the harness (see [harness.md](harness.md)) |
 
 `capture_types` is a **named module linked into both `camera` and `audio`**. A relative
@@ -31,7 +31,7 @@ types, so sharing it as a named module is what makes `camera`'s and `audio`'s
 | Verb | Meaning | Type |
 |---|---|---|
 | `enumerate(allocator)` | list the connected devices | `CaptureError![]DeviceInfo` |
-| `requestPermission()` | request permission and return the settled state (blocking) | `CaptureError!PermissionState` |
+| `requestPermission()` | request permission and return the current state (idempotent; `not_determined` while still unsettled) | `CaptureError!PermissionState` |
 | `open(allocator, config)` | open a device, negotiating the format internally | `CaptureError!Device` |
 | `device.config()` | read the effective values | `EffectiveConfig` |
 | `CaptureDevice.status()` | read whether the microphone is stopped, running or lost | `DeviceStatus` |
@@ -87,7 +87,15 @@ The values are shared by the native microphone backends.
 `enumerate()` returns `[]DeviceInfo` in which **the slice and each `DeviceInfo.id` and
 `.name` are all allocated with the allocator passed in**, and the caller owns them.
 `capture_types.zig` provides the symmetric `freeDeviceList(allocator, devices)`, and
-every backend follows the same allocation convention.
+every backend follows the same allocation convention. The same ownership applies to the
+microphone's `enumerateCaptureDevices(allocator)`.
+
+`enumerate()` is **not** part of the idempotent permission-polling contract of
+`requestPermission()`. Its return type and allocator ownership do not change. On a wasm
+backend, each call returns a **fresh clone** — allocated with the caller's allocator — of
+the most recently resolved device-list snapshot. An empty list while permission is still
+unsettled means "not known yet", not "zero devices settled"; a caller that needs a reliable
+list re-enumerates after permission is `granted`.
 
 `enumerate()` and `open()` return `CaptureError` only — `std.mem.Allocator.Error` is not
 unioned in — so an internal allocation failure is **folded into `error.OpenFailed`**.
@@ -105,11 +113,28 @@ pub const CaptureError = error{
 };
 ```
 
+- **`requestPermission()` is idempotent.** Each call returns the current
+  `PermissionState`. While the value is `not_determined`, permission is still unsettled;
+  any other value (`granted`, `denied`, `restricted`) means it has settled. Callers may
+  poll by calling again. Native backends (macOS, Linux, Windows) settle on the first call
+  and already match this contract. A wasm backend starts the asynchronous browser
+  permission request (`getUserMedia`) and returns `not_determined` until that request
+  resolves. The microphone name is `requestCapturePermission()`; the camera name is
+  `requestPermission()` — same semantics.
 - **`denied` and `restricted` are distinct.** `denied` means the user refused and can
   change it in a settings application; `restricted` means policy (an MDM profile, say)
   makes it unchangeable. macOS's `authorizationStatus` really does return these four
   values, and a UI needs the distinction to choose between "open Settings" and "this
   cannot be changed", so `restricted` is never folded into `denied`.
+- **Browser `getUserMedia` failures map as follows.** A `NotAllowedError` is always
+  `PermissionState.denied` (or `CaptureError.PermissionDenied`). A Permissions Policy
+  rejection can also surface as `NotAllowedError`, and `DOMException.name` alone cannot
+  tell a user refusal from a policy refusal after the fact, so there is no reclassification
+  after the error arrives. `NotFoundError` is `CaptureError.NoDevice`. Pre-call checks that
+  already reject the path — not a secure context, the API missing, or Permissions Policy
+  forbidding the feature — map to `CaptureError.Unsupported`. Any remaining exception that
+  those checks did not catch is `OpenFailed` like other open failures (`SecurityError` is
+  not a dedicated classification).
 - **Windows has no TCC-style prompt or `restricted` state.** A classic Win32 application only observes the
   "Let apps access your microphone" privacy toggle indirectly, as an `E_ACCESSDENIED` from WASAPI's
   `IAudioClient::Activate` or `Initialize`. `core/audio_windows.zig`'s `requestPermission()` is therefore a

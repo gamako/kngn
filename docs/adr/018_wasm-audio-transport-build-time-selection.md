@@ -113,3 +113,4 @@ page loads (no `audio_probe` query) never inject notes.
 
 - [docs/wasm-deploy.md](../wasm-deploy.md) — deploy matrix and artefact names
 - [ADR-015](015_real-time-audio-contract.md) — RT callback region
+- [ADR-027](027_wasm-microphone-capture.md) — browser mic input on the shared-memory Worklet path

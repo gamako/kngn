@@ -2,6 +2,7 @@
 // import table:
 //   env: kngn_now / kngn_present / kngn_log / kngn_set_cursor / kngn_device_pixel_ratio
 //        + kngn_audio_open / kngn_audio_start / kngn_audio_stop / kngn_audio_close (audio app)
+//        + kngn_capture_* (mic capture; temporary stubs until the full JS path lands)
 //        + kngn_request_open / kngn_clipboard_write / kngn_request_paste (file dialog / clipboard)
 //   wasi_snapshot_preview1: hand-written shim + in-memory FS (path_open/fd_read/write/seek/close)
 //
@@ -9,6 +10,7 @@
 //   wasm: filename (default pixie.wasm)
 //   audioTransport: "none" | "worklet_shared" | "worklet_postmessage"
 //   sharedMemory: true only with worklet_shared (COOP/COEP required)
+//   capture: true enables mic input (requires worklet_shared; data-capture="true")
 //   embedded + wasmBase64: single-HTML package (no fetch of .wasm)
 //   workletSource: embedded worklet text for postMessage single-HTML
 //
@@ -70,6 +72,52 @@ let audioGestureBound = false;
 let audioReady = false;
 const WORKLET_READY_TIMEOUT_MS = 5000;
 const SENTINEL_MAGIC = 0x4B4E4153;
+
+// ---- mic capture state (data-capture="true" / opts.capture) ----
+/** @type {boolean} */
+let captureEnabled = false;
+/**
+ * Settled permission cache for the capture path.
+ * Codes returned to Zig: 0=not_determined, 1=granted, 2=denied, 3=restricted.
+ * Constraint: browser NotFoundError has no dedicated code and is folded into denied (2);
+ * Zig maps that to PermissionDenied, not NoDevice (0/1/2/3 cannot express NoDevice).
+ * @type {"not_determined"|"granted"|"denied"|"restricted"}
+ */
+let capturePermState = "not_determined";
+/** True while a getUserMedia call is in flight (idempotent poll returns not_determined). */
+let capturePermInFlight = false;
+/** @type {MediaStream | null} */
+let captureMediaStream = null;
+/** @type {MediaStreamAudioSourceNode | null} */
+let captureSourceNode = null;
+/** Cached audioinput devices (labels filled after permission). Capped at 8. */
+const CAPTURE_MAX_DEVICES = 8;
+/** @type {Array<{ id: string, name: string }>} */
+let captureDeviceList = [];
+/** @type {Array<{ nameLen: number, idLen: number }>} */
+let captureDeviceLens = [];
+let captureDeviceListenerBound = false;
+/** Last capture stats logged to console (throttle ~1s for headless e2e). */
+let captureStatsLogAt = 0;
+let captureLastLoggedMismatches = -1;
+let captureLastLoggedDetached = -1;
+/**
+ * When the page is opened with ?e2e=1, also POST log lines to /__e2e_log so a
+ * local e2e server can capture them (Chrome headless often hides console.log).
+ */
+function micDemoLog(msg) {
+  const line = msg.startsWith("[mic_demo]") ? msg : "[mic_demo] " + msg;
+  console.log(line);
+  try {
+    if (typeof location !== "undefined" && /(?:\?|&)e2e=1(?:&|$)/.test(location.search || "")) {
+      void fetch("/__e2e_log", {
+        method: "POST",
+        body: line,
+        keepalive: true,
+      }).catch(() => {});
+    }
+  } catch (_) {}
+}
 
 // ---- WASI preview1 errno / clockid (minimal surface for the measured imports) ----
 const WASI_ESUCCESS = 0;
@@ -1270,6 +1318,28 @@ function pmOnWorkletMessage(data) {
     if (data.renderErrors > 0) {
       showAudioError("audio worklet render errors: " + data.renderErrors);
     }
+    // Capture e2e: throttle console so headless Chrome can assert submit health.
+    if (captureEnabled) {
+      const now =
+        typeof performance !== "undefined" && performance.now
+          ? performance.now()
+          : Date.now();
+      const mismatches =
+        typeof data.captureMismatches === "number" ? data.captureMismatches : 0;
+      const detached =
+        typeof data.captureViewDetached === "number" ? data.captureViewDetached : 0;
+      if (now - captureStatsLogAt >= 1000) {
+        captureStatsLogAt = now;
+        captureLastLoggedMismatches = mismatches;
+        captureLastLoggedDetached = detached;
+        micDemoLog(
+          "capture stats captureMismatches=" +
+            mismatches +
+            " captureViewDetached=" +
+            detached,
+        );
+      }
+    }
     return;
   }
 }
@@ -1369,8 +1439,10 @@ function prepareSharedWorkletNode(channels) {
         } catch (_) {}
         audioNode = null;
       }
-      audioNode = new AudioWorkletNode(audioCtx, "kngn-audio-processor", {
-        numberOfInputs: 0,
+      // Capture packages need one mono input so MediaStreamAudioSourceNode can feed process().
+      // Output still connects to destination so the graph pulls process() (Web Audio contract).
+      const nodeOpts = {
+        numberOfInputs: captureEnabled ? 1 : 0,
         numberOfOutputs: 1,
         outputChannelCount: [audioChannels],
         processorOptions: {
@@ -1380,8 +1452,15 @@ function prepareSharedWorkletNode(channels) {
           stackTop: stackTop,
           channels: audioChannels,
           sampleRate: actualSr,
+          capture: captureEnabled,
         },
-      });
+      };
+      if (captureEnabled) {
+        nodeOpts.channelCount = 1;
+        nodeOpts.channelCountMode = "explicit";
+        nodeOpts.channelInterpretation = "discrete";
+      }
+      audioNode = new AudioWorkletNode(audioCtx, "kngn-audio-processor", nodeOpts);
       audioNode.port.onmessage = (ev) => {
         const data = ev.data || {};
         if (data.type === "ready") {
@@ -1684,6 +1763,326 @@ function envAudioClose() {
   }
 }
 
+// ---------------------------------------------------------------------------
+// Mic capture env imports (`core/audio_capture_web.zig`)
+// Permission codes: 0=not_determined, 1=granted, 2=denied, 3=restricted.
+// ---------------------------------------------------------------------------
+
+/**
+ * Secure-context + mediaDevices presence. Failure is reported via open() returning 0
+ * (not a dedicated permission code). Permissions Policy is checked separately.
+ * @returns {boolean}
+ */
+function captureApiAvailable() {
+  return !!(
+    globalThis.isSecureContext &&
+    navigator.mediaDevices &&
+    typeof navigator.mediaDevices.getUserMedia === "function"
+  );
+}
+
+/**
+ * Permissions Policy for microphone. When the feature is forbidden, getUserMedia is not
+ * started and permission is treated as denied (same code as user refusal — cannot reclassify).
+ * @returns {boolean}
+ */
+function capturePolicyAllowsMic() {
+  try {
+    const pp = document.permissionsPolicy;
+    if (pp && typeof pp.allowsFeature === "function") {
+      return pp.allowsFeature("microphone");
+    }
+  } catch (_) {}
+  return true;
+}
+
+/** @returns {number} Zig PermissionState code */
+function capturePermCode() {
+  switch (capturePermState) {
+    case "granted":
+      return 1;
+    case "denied":
+      return 2;
+    case "restricted":
+      return 3;
+    default:
+      return 0;
+  }
+}
+
+/**
+ * @param {MediaStream | null} stream
+ * @returns {boolean}
+ */
+function captureStreamHasLiveTrack(stream) {
+  if (!stream) return false;
+  const tracks = stream.getAudioTracks();
+  for (let i = 0; i < tracks.length; i++) {
+    if (tracks[i].readyState === "live") return true;
+  }
+  return false;
+}
+
+/**
+ * Start getUserMedia once (idempotent while in-flight). Used by requestPermission and by
+ * open when permission is already granted but the stream was released on close.
+ * @param {{ fromPermissionPoll?: boolean }} [opts]
+ */
+function startGetUserMedia(opts) {
+  const fromPermissionPoll = !!(opts && opts.fromPermissionPoll);
+  if (capturePermInFlight) return;
+  if (!captureApiAvailable()) return;
+  if (!capturePolicyAllowsMic()) {
+    if (fromPermissionPoll || capturePermState === "not_determined") {
+      capturePermState = "denied";
+    }
+    return;
+  }
+  capturePermInFlight = true;
+  navigator.mediaDevices
+    .getUserMedia({
+      audio: {
+        channelCount: 1,
+        echoCancellation: false,
+        noiseSuppression: false,
+        autoGainControl: false,
+      },
+    })
+    .then((stream) => {
+      captureMediaStream = stream;
+      capturePermState = "granted";
+      capturePermInFlight = false;
+      micDemoLog("permission granted");
+      void refreshCaptureDevices();
+    })
+    .catch((err) => {
+      capturePermInFlight = false;
+      // NotAllowedError (user or Permissions Policy) and NotFoundError both map to denied:
+      // the 0/1/2/3 surface has no NoDevice code (see capturePermState comment).
+      const name = err && err.name ? String(err.name) : "unknown";
+      capturePermState = "denied";
+      captureMediaStream = null;
+      micDemoLog("permission denied (" + name + ")");
+    });
+}
+
+/**
+ * Write UTF-8 into Zig fixed device storage. Truncates at strCap bytes (not code points).
+ * @param {number} ptr
+ * @param {number} strCap
+ * @param {string} text
+ * @returns {number} bytes written
+ */
+function writeUtf8ToWasm(ptr, strCap, text) {
+  if (!memory || !ptr || strCap <= 0) return 0;
+  const enc = new TextEncoder();
+  const bytes = enc.encode(text || "");
+  const n = Math.min(bytes.length, strCap);
+  const view = new Uint8Array(memory.buffer, ptr, n);
+  view.set(bytes.subarray(0, n));
+  return n;
+}
+
+/**
+ * Push the current captureDeviceList into Zig name/id storage and refresh lens.
+ * Safe when instance/exports are missing (no-op).
+ */
+function syncCaptureDevicesToWasm() {
+  captureDeviceLens = [];
+  if (!instance || typeof instance.exports.kngn_capture_device_name_storage_ptr !== "function") {
+    return;
+  }
+  const strCap =
+    typeof instance.exports.kngn_capture_device_str_cap === "function"
+      ? instance.exports.kngn_capture_device_str_cap() >>> 0
+      : 256;
+  for (let i = 0; i < captureDeviceList.length; i++) {
+    const dev = captureDeviceList[i];
+    const namePtr = instance.exports.kngn_capture_device_name_storage_ptr(i) >>> 0;
+    const idPtr = instance.exports.kngn_capture_device_id_storage_ptr(i) >>> 0;
+    const nameLen = writeUtf8ToWasm(namePtr, strCap, dev.name);
+    const idLen = writeUtf8ToWasm(idPtr, strCap, dev.id);
+    captureDeviceLens.push({ nameLen, idLen });
+  }
+}
+
+/**
+ * Enumerate audioinput devices into the JS cache (async). Labels need permission.
+ * @returns {Promise<void>}
+ */
+async function refreshCaptureDevices() {
+  if (!captureEnabled || !captureApiAvailable()) {
+    captureDeviceList = [];
+    captureDeviceLens = [];
+    return;
+  }
+  try {
+    const all = await navigator.mediaDevices.enumerateDevices();
+    const inputs = [];
+    for (let i = 0; i < all.length; i++) {
+      const d = all[i];
+      if (d.kind !== "audioinput") continue;
+      inputs.push({
+        id: d.deviceId || "",
+        name: d.label || d.deviceId || "Microphone",
+      });
+      if (inputs.length >= CAPTURE_MAX_DEVICES) break;
+    }
+    captureDeviceList = inputs;
+    syncCaptureDevicesToWasm();
+  } catch (e) {
+    console.warn("capture enumerateDevices failed:", e);
+  }
+}
+
+function ensureCaptureDeviceListener() {
+  if (captureDeviceListenerBound || !navigator.mediaDevices) return;
+  captureDeviceListenerBound = true;
+  try {
+    navigator.mediaDevices.addEventListener("devicechange", () => {
+      void refreshCaptureDevices();
+    });
+  } catch (_) {}
+}
+
+/**
+ * Zig `kngn_capture_open` — confirm permission + AudioContext and return sample rate.
+ * Does not connect the MediaStream (that is `kngn_capture_connect_source` on start).
+ * @param {number} sampleRate
+ * @returns {number}
+ */
+function envCaptureOpen(sampleRate) {
+  void sampleRate;
+  if (!captureEnabled) return 0;
+  // Unsupported (insecure / no mediaDevices / policy): fail open, not a permission code.
+  if (!captureApiAvailable() || !capturePolicyAllowsMic()) return 0;
+  if (capturePermState !== "granted") return 0;
+  if (!captureStreamHasLiveTrack(captureMediaStream)) {
+    // Stream released on a previous close: re-acquire without resetting the settled grant.
+    startGetUserMedia({ fromPermissionPoll: false });
+    return 0;
+  }
+  if (!audioReady || !audioCtx || !audioNode) {
+    console.error("kngn_capture_open: AudioContext/worklet not ready");
+    return 0;
+  }
+  ensureAudioGestureResume();
+  return audioCtx.sampleRate | 0;
+}
+
+/**
+ * Zig `kngn_capture_close` — stop tracks and drop the MediaStream.
+ * AudioContext teardown is driven by Zig refcount via `kngn_audio_close`.
+ */
+function envCaptureClose() {
+  envCaptureDisconnectSource();
+  if (captureSourceNode) {
+    try {
+      captureSourceNode.disconnect();
+    } catch (_) {}
+    captureSourceNode = null;
+  }
+  if (captureMediaStream) {
+    const tracks = captureMediaStream.getTracks();
+    for (let i = 0; i < tracks.length; i++) {
+      try {
+        tracks[i].stop();
+      } catch (_) {}
+    }
+    captureMediaStream = null;
+  }
+}
+
+/**
+ * Connect held MediaStream → MediaStreamAudioSourceNode → AudioWorkletNode input.
+ */
+function envCaptureConnectSource() {
+  if (!audioCtx || !audioNode || !captureStreamHasLiveTrack(captureMediaStream)) return;
+  try {
+    if (!captureSourceNode) {
+      captureSourceNode = audioCtx.createMediaStreamSource(captureMediaStream);
+    }
+    captureSourceNode.connect(audioNode);
+    // Capture-only apps never call output start(); still want the graph to run.
+    audioWantRunning = true;
+    ensureAudioGestureResume();
+    if (audioCtx.state === "suspended") {
+      void audioCtx.resume().then(() => {
+        micDemoLog("capture started (source connected, context=" + audioCtx.state + ")");
+      }).catch((e) => console.warn("capture resume:", e));
+    } else {
+      micDemoLog("capture started (source connected, context=" + audioCtx.state + ")");
+    }
+  } catch (e) {
+    console.error("kngn_capture_connect_source failed:", e);
+    micDemoLog("capture connect failed: " + String(e && e.message ? e.message : e));
+  }
+}
+
+/**
+ * Disconnect the source from the worklet without stopping tracks (close does that).
+ */
+function envCaptureDisconnectSource() {
+  if (!captureSourceNode) return;
+  try {
+    captureSourceNode.disconnect();
+  } catch (_) {}
+}
+
+/**
+ * Idempotent permission poll. First call starts getUserMedia; in-flight and unsettled
+ * return not_determined (0). Settled results are cached (no second getUserMedia).
+ * @returns {number}
+ */
+function envCaptureRequestPermission() {
+  if (!captureEnabled) return 0;
+  const code = capturePermCode();
+  if (code !== 0) return code;
+  if (capturePermInFlight) return 0;
+
+  // Pre-checks: policy denial is denied; missing API stays not_determined (open fails with 0).
+  if (!captureApiAvailable()) return 0;
+  if (!capturePolicyAllowsMic()) {
+    capturePermState = "denied";
+    micDemoLog("permission denied (Permissions Policy)");
+    return 2;
+  }
+
+  startGetUserMedia({ fromPermissionPoll: true });
+  return 0;
+}
+
+/** @returns {number} */
+function envCaptureDeviceCount() {
+  return captureDeviceList.length | 0;
+}
+
+/** @param {number} index @returns {number} */
+function envCaptureDeviceNamePtr(index) {
+  if (!instance || index < 0 || index >= captureDeviceList.length) return 0;
+  if (typeof instance.exports.kngn_capture_device_name_storage_ptr !== "function") return 0;
+  return instance.exports.kngn_capture_device_name_storage_ptr(index) >>> 0;
+}
+
+/** @param {number} index @returns {number} */
+function envCaptureDeviceNameLen(index) {
+  const e = captureDeviceLens[index];
+  return e ? e.nameLen | 0 : 0;
+}
+
+/** @param {number} index @returns {number} */
+function envCaptureDeviceIdPtr(index) {
+  if (!instance || index < 0 || index >= captureDeviceList.length) return 0;
+  if (typeof instance.exports.kngn_capture_device_id_storage_ptr !== "function") return 0;
+  return instance.exports.kngn_capture_device_id_storage_ptr(index) >>> 0;
+}
+
+/** @param {number} index @returns {number} */
+function envCaptureDeviceIdLen(index) {
+  const e = captureDeviceLens[index];
+  return e ? e.idLen | 0 : 0;
+}
+
 function makeImportObject() {
   return {
     env: {
@@ -1746,6 +2145,17 @@ function makeImportObject() {
       kngn_audio_start: envAudioStart,
       kngn_audio_stop: envAudioStop,
       kngn_audio_close: envAudioClose,
+      // Mic capture (getUserMedia + device list + connect/disconnect on start/stop)
+      kngn_capture_open: envCaptureOpen,
+      kngn_capture_close: envCaptureClose,
+      kngn_capture_connect_source: envCaptureConnectSource,
+      kngn_capture_disconnect_source: envCaptureDisconnectSource,
+      kngn_capture_request_permission: envCaptureRequestPermission,
+      kngn_capture_device_count: envCaptureDeviceCount,
+      kngn_capture_device_name_ptr: envCaptureDeviceNamePtr,
+      kngn_capture_device_name_len: envCaptureDeviceNameLen,
+      kngn_capture_device_id_ptr: envCaptureDeviceIdPtr,
+      kngn_capture_device_id_len: envCaptureDeviceIdLen,
       // file dialog / clipboard
       kngn_request_open: envRequestOpen,
       kngn_clipboard_write: envClipboardWrite,
@@ -1818,6 +2228,7 @@ function base64ToArrayBuffer(b64) {
  *   sharedMemory?: boolean,
  *   audio?: boolean,
  *   audioTransport?: string,
+ *   capture?: boolean,
  *   embedded?: boolean,
  *   wasmBase64?: string,
  *   workletSource?: string,
@@ -1831,6 +2242,7 @@ export async function boot(opts = {}) {
   // transport is none or postmessage (contradictory options → hard error).
   const transport = opts.audioTransport || (opts.audio ? "worklet_shared" : "none");
   audioTransport = transport;
+  captureEnabled = !!opts.capture;
   if (opts.sharedMemory && transport !== "worklet_shared") {
     throw new Error(
       "invalid boot options: sharedMemory=true requires audioTransport=worklet_shared (got " +
@@ -1838,8 +2250,16 @@ export async function boot(opts = {}) {
         ")",
     );
   }
+  if (captureEnabled && transport !== "worklet_shared") {
+    throw new Error(
+      "invalid boot options: capture=true requires audioTransport=worklet_shared (got " +
+        transport +
+        ")",
+    );
+  }
   const useShared = transport === "worklet_shared";
   const usePostMessage = transport === "worklet_postmessage";
+  // Capture-only apps still need a worklet graph (process is destination-driven).
   const useAudio = useShared || usePostMessage;
   const initialPages = opts.initialPages || 256; // 16 MiB
   const maxPages = opts.maxPages || 1024; // 64 MiB
@@ -1847,6 +2267,8 @@ export async function boot(opts = {}) {
 
   canvas.focus();
   audioReady = false;
+  // Reset capture session state for a clean boot (permission cache is process-lifetime).
+  captureSourceNode = null;
 
   if (useShared) {
     // Hard fail: do not start the app without isolation (no silent fallback).
@@ -1921,6 +2343,11 @@ export async function boot(opts = {}) {
     maybeStartAudioProbe();
   }
 
+  if (captureEnabled) {
+    ensureCaptureDeviceListener();
+    void refreshCaptureDevices();
+  }
+
   primeDeclaredWindowSize();
   bindInput();
   bindResize();
@@ -1931,6 +2358,10 @@ export async function boot(opts = {}) {
   instance.exports.kngn_init();
   // kngn_init may grow SharedArrayBuffer memory and detach the worklet's prebuilt view.
   requestSharedViewRebuild();
+  // Device labels/storage may only be writable after exports exist; re-sync after init.
+  if (captureEnabled) {
+    syncCaptureDevicesToWasm();
+  }
 
   function loop(ts) {
     instance.exports.kngn_frame(ts); // rAF ms. Zig divides by 1000
@@ -1954,6 +2385,7 @@ function defaultOptsFromPage() {
       audioTransport: transport,
       audio: transport === "worklet_shared" || transport === "worklet_postmessage",
       sharedMemory: !!emb.sharedMemory,
+      capture: !!emb.capture,
       embedded: true,
       wasmBase64: emb.wasmBase64,
       workletSource: emb.workletSource,
@@ -1972,11 +2404,17 @@ function defaultOptsFromPage() {
     params.get("shared") === "1" ||
     body?.dataset?.shared === "1" ||
     transport === "worklet_shared";
+  // data-capture="true" (dataset.capture === "true") or ?capture=1
+  const capture =
+    params.get("capture") === "1" ||
+    body?.dataset?.capture === "true" ||
+    body?.dataset?.capture === "1";
   return {
     wasm,
     audioTransport: transport,
     audio: transport === "worklet_shared" || transport === "worklet_postmessage",
     sharedMemory,
+    capture,
   };
 }
 

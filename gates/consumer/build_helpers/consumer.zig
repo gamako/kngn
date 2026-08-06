@@ -444,6 +444,9 @@ pub const WasmAppSpec = struct {
     single_threaded: bool = true,
 
     audio: WasmAudio = .none,
+    /// When true, the app uses browser microphone capture. Requires `audio = .worklet_shared`
+    /// (shared memory for the capture path). The matching HTML must carry `data-capture="true"`.
+    capture: bool = false,
 
     shared_memory: bool = false,
     import_memory: bool = false,
@@ -614,12 +617,56 @@ pub fn validateWasmAppSpec(spec: *const WasmAppSpec, target: std.Build.ResolvedT
         },
     }
 
+    if (spec.capture and spec.audio != .worklet_shared) {
+        std.log.err(
+            "wasm app '{s}': capture=true requires audio=worklet_shared",
+            .{spec.name},
+        );
+        std.process.exit(1);
+    }
+
     // Single-HTML: shared audio needs response headers (impossible for file:// / single file).
     // none and worklet_postmessage are allowed (postmessage embeds the worklet source).
     if (spec.single_html and spec.audio == .worklet_shared) {
         std.log.err(
             "wasm app '{s}': single_html cannot use audio=worklet_shared (needs COOP/COEP headers)",
             .{spec.name},
+        );
+        std.process.exit(1);
+    }
+}
+
+/// Marker that must appear in the app HTML when `WasmAppSpec.capture` is true, and must not
+/// appear when it is false. Exact string match (same spelling as the glue reads).
+const html_capture_attr_marker = "data-capture=\"true\"";
+
+/// Fail configuration when the HTML's `data-capture` attribute disagrees with `spec.capture`.
+/// Reads the HTML source path at build-graph configuration time (same timing as
+/// `validateWasmAppSpec` and the vendored-helper identity check).
+fn checkHtmlCaptureAttribute(b: *std.Build, spec: *const WasmAppSpec) void {
+    const path = spec.html_source.getPath2(b, null);
+    const io = b.graph.io;
+    const html = std.Io.Dir.cwd().readFileAlloc(io, path, b.allocator, .limited(4 * 1024 * 1024)) catch |err| {
+        std.log.err(
+            "wasm app '{s}': failed to read HTML for capture attribute check ({s}): {s}",
+            .{ spec.name, path, @errorName(err) },
+        );
+        std.process.exit(1);
+    };
+    defer b.allocator.free(html);
+
+    const has_capture = std.mem.indexOf(u8, html, html_capture_attr_marker) != null;
+    if (spec.capture and !has_capture) {
+        std.log.err(
+            "wasm app '{s}': capture=true requires HTML attribute data-capture=\"true\" ({s})",
+            .{ spec.name, path },
+        );
+        std.process.exit(1);
+    }
+    if (!spec.capture and has_capture) {
+        std.log.err(
+            "wasm app '{s}': capture=false but HTML has data-capture=\"true\" ({s})",
+            .{ spec.name, path },
         );
         std.process.exit(1);
     }
@@ -638,6 +685,7 @@ pub fn addWasmApp(
 ) WasmAppBuild {
     const target = b.resolveTargetQuery(spec.target_query);
     validateWasmAppSpec(spec, target);
+    checkHtmlCaptureAttribute(b, spec);
 
     const app_module = b.createModule(.{
         .root_source_file = spec.app_source,

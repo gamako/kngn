@@ -146,6 +146,19 @@ Audio transport comes from `data-audio-transport` or embedded options; the glue 
 | `.worklet_shared` | AudioWorklet (2nd wasm Instance) | **yes** (COOP/COEP) | Live keyboard synth |
 | `.worklet_postmessage` | **main thread**, worklet plays ring | no | file:// / GitHub Pages |
 
+**`enableWebAudioExports()` is required for every `worklet_shared` package, including
+capture-only apps.** Boot of the shared-memory AudioWorklet always calls
+`kngn_audio_set_sentinel` / `kngn_audio_check_sentinel` (and uses stack top / render buf)
+to prove the second wasm Instance shares linear memory with the main one. Those symbols
+are only kept against DCE when the app calls `audio.enableWebAudioExports()` (or the
+equivalent `enableAudioExports()` hook) from its wasm root / init. Calling
+`enableWebCaptureExports()` alone is not enough: a capture-only app that never opens
+output still needs the audio export hook, or `prepareSharedWorkletNode` fails with
+`missing kngn_audio_set_sentinel`. Opening output is optional — without `audio.open()` the
+render path stays stopped and silent. Architecture decisions for browser mic capture
+(generation quiescence, permission poll, shared context refcounting) are
+[ADR-027](adr/027_wasm-microphone-capture.md).
+
 **postMessage contract**: main-thread `kngn_audio_render` shares the rAF thread with drawing.
 Heavy frames underrun audio. Queue = 8 blocks × 128 frames (~21 ms @ 48 kHz prefill);
 refill when ≤4 blocks remain. Larger queue raises latency. Underruns surface on `#kngn-error`

@@ -162,8 +162,8 @@ pub fn open(allocator: std.mem.Allocator, cfg: Config) Error!AudioDevice {
 //
 // A section wholly independent of the existing output path (the `Error`, `Config`, `EffectiveConfig`, `AudioDevice` and `open` above).
 // The existing output backends (`audio_{macos,linux,windows}.zig`) are untouched. macOS, Linux and Windows
-// each expose a real capture backend of their own (the `capture` namespace of their own file); everything else
-// goes through `audio_capture_stub.zig` (an explicit stub shared by every other OS).
+// each expose a real capture backend of their own (the `capture` namespace of their own file); wasm goes
+// through `audio_capture_web.zig`; everything else goes through `audio_capture_stub.zig`.
 // That the mic and camera facades share the same verb concepts and the same type shapes (`CaptureError`,
 // `PermissionState`, `EffectiveConfig`) is what the unified control plane actually consists of
 // (see `docs/capture.md`). The naming inserts `Capture` to avoid colliding with the existing output API
@@ -180,7 +180,7 @@ pub fn open(allocator: std.mem.Allocator, cfg: Config) Error!AudioDevice {
 
 const capture_types = @import("capture_types");
 const capture_backend = if (builtin.cpu.arch.isWasm())
-    @import("audio_capture_stub.zig")
+    @import("audio_capture_web.zig")
 else switch (builtin.os.tag) {
     .macos => @import("audio_macos.zig").capture,
     .linux => @import("audio_linux.zig").capture,
@@ -190,6 +190,20 @@ else switch (builtin.os.tag) {
 
 fn hasRealCaptureBackendOs() bool {
     return builtin.os.tag == .macos or builtin.os.tag == .linux or builtin.os.tag == .windows;
+}
+
+/// wasm: keep capture exports in the link. A no-op on native.
+pub fn enableWebCaptureExports() void {
+    if (comptime builtin.cpu.arch.isWasm()) {
+        capture_backend.enableCaptureExports();
+    }
+}
+
+/// wasm: drain the capture ring on the main-thread frame tick. A no-op on native.
+pub fn drainCaptureIfActive() void {
+    if (comptime builtin.cpu.arch.isWasm()) {
+        capture_backend.drainCaptureIfActive();
+    }
 }
 
 // Re-publish the capture_types types so they can be used straight from the audio module (symmetrical with
@@ -241,10 +255,12 @@ test "the audio capture extension: it delegates to the stub while harness is dis
     // A real backend (AUHAL, ALSA or WASAPI) touches a real device in permission and open, so it is out of scope for an automated test.
     // The backend's compile and link is covered by the backend's own tests (audio_macos_capture_test, audio_linux_capture_test
     // and audio_windows_capture_test), which check the config too.
+    // wasm uses `audio_capture_web` (env-backed), not the stub — skip this stub-only check there.
     // `comptime` is required: making it a runtime call stops Zig dead-code-eliminating the rest of the body, so the real
     // backend's capture enumerate and open would be compiled through this facade test even on macOS and Linux (the capture
     // path of audio_macos.zig is one such case, and this facade test only means to check the delegation to the stub).
     if (comptime hasRealCaptureBackendOs()) return error.SkipZigTest;
+    if (comptime builtin.cpu.arch.isWasm()) return error.SkipZigTest;
     try testing.expectError(error.Unsupported, enumerateCaptureDevices(testing.allocator));
     try testing.expectError(error.Unsupported, requestCapturePermission());
     try testing.expectError(error.Unsupported, openCapture(testing.allocator, .{ .capture_callback = noopCaptureCallback }));

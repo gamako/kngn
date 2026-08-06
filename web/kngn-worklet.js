@@ -35,6 +35,9 @@ const PM_SAMPLES = PM_FRAMES * PM_CHANNELS;
 const SHARED_FRAMES = 128;
 const SHARED_CHANNELS = 2;
 const SHARED_SAMPLES = SHARED_FRAMES * SHARED_CHANNELS;
+// Mic capture scratch is mono, one quantum (matches core/audio_capture_web.zig).
+const CAPTURE_FRAMES = 128;
+const CAPTURE_SAMPLES = CAPTURE_FRAMES;
 
 class KngnAudioProcessor extends AudioWorkletProcessor {
   /**
@@ -45,6 +48,7 @@ class KngnAudioProcessor extends AudioWorkletProcessor {
    *   stackTop?: number,
    *   channels?: number,
    *   sampleRate?: number,
+   *   capture?: boolean,
    * }}} options
    */
   constructor(options) {
@@ -54,12 +58,15 @@ class KngnAudioProcessor extends AudioWorkletProcessor {
     this._ready = false;
     this._channels = opts.channels || 2;
     this._sampleRate = opts.sampleRate || sampleRate;
+    this._captureWanted = !!opts.capture;
     // RT-safe counters (process only increments; main polls via poll-stats).
     this._underruns = 0;
     this._quantumMismatches = 0;
     this._renderErrors = 0;
     this._viewDetached = 0;
     this._drops = 0;
+    this._captureMismatches = 0;
+    this._captureViewDetached = 0;
 
     if (this._transport === "postmessage") {
       this._initPostMessage();
@@ -127,6 +134,7 @@ class KngnAudioProcessor extends AudioWorkletProcessor {
    *   stackTop?: number,
    *   channels?: number,
    *   sampleRate?: number,
+   *   capture?: boolean,
    * }} opts
    */
   _initShared(opts) {
@@ -135,15 +143,20 @@ class KngnAudioProcessor extends AudioWorkletProcessor {
     this._outPtr = 0;
     /** @type {Float32Array|null} fixed view built once for SHARED_SAMPLES */
     this._f32View = null;
+    /** @type {((frames: number, sampleRate: number) => number)|null} */
+    this._captureSubmit = null;
+    this._captureScratchPtr = 0;
+    this._captureScratchLen = CAPTURE_SAMPLES;
+    /** @type {Float32Array|null} fixed mono scratch view for capture submit */
+    this._captureView = null;
 
     try {
       if (!opts.module || !opts.memory) {
         throw new Error("kngn-worklet: missing module/memory");
       }
-      // This instance only ever runs `kngn_audio_render`, so every host function outside the
-      // audio path is a no-op here. The ones below are named because their return value matters;
-      // the rest are filled in from the module's own import list, so that adding a host function
-      // on the main-thread side cannot silently make this instantiation fail.
+      // This instance only ever runs `kngn_audio_render` / `kngn_capture_submit`, so every
+      // host function outside those paths is a no-op here. The ones below are named because
+      // their return value matters; the rest are filled in from the module's own import list.
       const env = {
         memory: opts.memory,
         kngn_now: () => currentTime,
@@ -197,6 +210,28 @@ class KngnAudioProcessor extends AudioWorkletProcessor {
       }
       // Prebuild the only TypedArray process() will touch (fixed 128-frame quantum).
       this._f32View = new Float32Array(this._memory.buffer, this._outPtr, SHARED_SAMPLES);
+
+      // Optional mic capture path (exports absent on packages without capture).
+      if (
+        this._captureWanted &&
+        typeof exp.kngn_capture_submit === "function" &&
+        typeof exp.kngn_capture_scratch_ptr === "function"
+      ) {
+        this._captureSubmit = exp.kngn_capture_submit;
+        this._captureScratchPtr = exp.kngn_capture_scratch_ptr() >>> 0;
+        this._captureScratchLen =
+          typeof exp.kngn_capture_scratch_len === "function"
+            ? exp.kngn_capture_scratch_len() >>> 0
+            : CAPTURE_SAMPLES;
+        if (this._captureScratchPtr && this._captureScratchLen > 0) {
+          this._captureView = new Float32Array(
+            this._memory.buffer,
+            this._captureScratchPtr,
+            this._captureScratchLen,
+          );
+        }
+      }
+
       this.port.onmessage = (ev) => this._onMessageShared(ev);
       this._ready = true;
       this.port.postMessage({ type: "ready", transport: "shared", sentinel: got });
@@ -217,15 +252,40 @@ class KngnAudioProcessor extends AudioWorkletProcessor {
     if (!this._memory || !this._outPtr) return false;
     if (this._f32View && this._f32View.buffer === this._memory.buffer) {
       this._viewDetached = 0;
+    } else {
+      try {
+        this._f32View = new Float32Array(this._memory.buffer, this._outPtr, SHARED_SAMPLES);
+        this._viewDetached = 0;
+      } catch (_) {
+        this._f32View = null;
+        this._viewDetached = 1;
+      }
+    }
+    this._rebuildCaptureViewIfNeeded();
+    return !!(this._f32View && this._f32View.buffer === this._memory.buffer);
+  }
+
+  /**
+   * Non-RT only: rebuild the mono capture scratch view after memory growth.
+   * @returns {boolean}
+   */
+  _rebuildCaptureViewIfNeeded() {
+    if (!this._captureSubmit || !this._memory || !this._captureScratchPtr) return false;
+    if (this._captureView && this._captureView.buffer === this._memory.buffer) {
+      this._captureViewDetached = 0;
       return true;
     }
     try {
-      this._f32View = new Float32Array(this._memory.buffer, this._outPtr, SHARED_SAMPLES);
-      this._viewDetached = 0;
+      this._captureView = new Float32Array(
+        this._memory.buffer,
+        this._captureScratchPtr,
+        this._captureScratchLen,
+      );
+      this._captureViewDetached = 0;
       return true;
     } catch (_) {
-      this._f32View = null;
-      this._viewDetached = 1;
+      this._captureView = null;
+      this._captureViewDetached = 1;
       return false;
     }
   }
@@ -246,16 +306,18 @@ class KngnAudioProcessor extends AudioWorkletProcessor {
         quantumMismatches: this._quantumMismatches,
         renderErrors: this._renderErrors,
         viewDetached: this._viewDetached,
+        captureMismatches: this._captureMismatches,
+        captureViewDetached: this._captureViewDetached,
       });
     }
   }
 
   /**
-   * @param {Float32Array[][]} _inputs
+   * @param {Float32Array[][]} inputs
    * @param {Float32Array[][]} outputs
    * @returns {boolean}
    */
-  process(_inputs, outputs) {
+  process(inputs, outputs) {
     const output = outputs[0];
     if (!output || output.length === 0) return true;
     const frames = output[0].length;
@@ -263,7 +325,39 @@ class KngnAudioProcessor extends AudioWorkletProcessor {
     if (this._transport === "postmessage") {
       return this._processPostMessage(output, frames);
     }
+    this._processCaptureInput(inputs);
     return this._processShared(output, frames);
+  }
+
+  /**
+   * Copy mono Worklet input into the fixed capture scratch and submit one block.
+   * No allocation; wrong shapes are counted and skipped (no silent downmix).
+   * @param {Float32Array[][]} inputs
+   */
+  _processCaptureInput(inputs) {
+    if (!this._captureSubmit) return;
+    const input = inputs[0];
+    // No edge connected yet: empty inputs are expected — do not count as a mismatch.
+    if (!input || input.length === 0) return;
+    if (input.length !== 1 || !input[0] || input[0].length !== CAPTURE_FRAMES) {
+      this._captureMismatches += 1;
+      return;
+    }
+    // Detached buffer after memory growth: never allocate on the RT path.
+    if (!this._captureView || this._captureView.buffer !== this._memory.buffer) {
+      this._captureViewDetached = 1;
+      return;
+    }
+    const src = input[0];
+    const dst = this._captureView;
+    const n = Math.min(src.length, dst.length, CAPTURE_FRAMES);
+    for (let i = 0; i < n; i++) dst[i] = src[i];
+    try {
+      this._captureSubmit(n, this._sampleRate | 0);
+    } catch (_) {
+      // Count against render errors so a misbehaving export is visible on poll-stats.
+      this._renderErrors += 1;
+    }
   }
 
   /**

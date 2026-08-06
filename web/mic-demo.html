@@ -1,0 +1,52 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Mic capture demo (wasm)</title>
+  <style>
+    html, body { margin: 0; height: 100%; background: #101018; color: #ccc; font-family: system-ui, sans-serif; }
+    #wrap { display: flex; flex-direction: column; align-items: center; justify-content: center; height: 100%; gap: 8px; }
+    canvas {
+      background: #181820;
+      outline: none;
+      image-rendering: pixelated;
+      cursor: default;
+    }
+    #kngn-audio-hint {
+      display: none;
+      padding: 8px 14px;
+      background: #3a3020;
+      border: 1px solid #c8a040;
+      border-radius: 6px;
+      color: #ffe8a0;
+      cursor: pointer;
+      user-select: none;
+    }
+    #kngn-error {
+      display: none;
+      max-width: 40rem;
+      padding: 10px;
+      background: #401818;
+      border: 1px solid #c04040;
+      color: #ffc0c0;
+      white-space: pre-wrap;
+    }
+    .note { font-size: 12px; opacity: 0.7; }
+  </style>
+</head>
+<body data-wasm="mic_demo.wasm"
+      data-audio="1"
+      data-audio-transport="worklet_shared"
+      data-capture="true"
+      data-shared="1">
+  <div id="wrap">
+    <canvas id="kngn-canvas" width="640" height="360" tabindex="0"></canvas>
+    <div id="kngn-audio-hint">Click or press a key to enable audio / mic (browser autoplay and permission policy)</div>
+    <div id="kngn-error"></div>
+    <div class="note">Microphone capture demo scaffold · requires COOP/COEP (scripts/serve-web.py)</div>
+  </div>
+  <!-- kngn:inline-module -->
+  <script type="module" src="./kngn.js"></script>
+</body>
+</html>

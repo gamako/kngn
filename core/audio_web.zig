@@ -40,6 +40,7 @@
 
 const std = @import("std");
 const builtin = @import("builtin");
+const capture_web = @import("audio_capture_web.zig");
 
 pub const Error = error{
     OpenFailed,
@@ -162,6 +163,11 @@ export fn kngn_audio_render(out_ptr: u32, frames: u32, channels: u32, sample_rat
     return 1;
 }
 
+/// Whether the output device currently holds the shared AudioContext open.
+pub fn isOutputOpen() bool {
+    return g_state.opened;
+}
+
 pub const AudioDevice = struct {
     effective: EffectiveConfig,
 
@@ -183,8 +189,12 @@ pub const AudioDevice = struct {
     pub fn close(self: AudioDevice) void {
         self.stop();
         if (g_state.opened) {
-            kngn_audio_close();
             g_state.opened = false;
+            capture_web.setOutputOpen(false);
+            // Shared AudioContext: destroy only when capture is not also holding it open.
+            if (!capture_web.isOpen()) {
+                kngn_audio_close();
+            }
         }
         g_state.callback = undefined;
         g_state.userdata = null;
@@ -213,6 +223,7 @@ pub fn open(_: std.mem.Allocator, cfg: Config) Error!AudioDevice {
 
     g_state.sample_rate = actual_sr;
     g_state.opened = true;
+    capture_web.setOutputOpen(true);
 
     // max_frames_per_slice: the worklet quantum is normally 128. The bound is the larger of the requested buffer_frames and 128.
     // The real process is called with 128 (and even on a mismatch it renders as it is, without chunking).
