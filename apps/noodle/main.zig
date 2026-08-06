@@ -2329,7 +2329,7 @@ fn onMouseUp(app: *App) void {
         const pend = app.drag.cable;
         var node_buf: [MAX_MODULES]NodeGeom = undefined;
         const nodes = node_buf[0..app.buildNodes(&node_buf)];
-        const mw = app.camera.screenToWorld(app.mouse);
+        const mw = app.mouseWorld();
         if (canvas.hitTestPort(mw, nodes)) |target_raw| {
             if (app.ledger.resolvePort(pend.origin)) |origin_real| {
                 if (app.ledger.resolvePort(target_raw)) |target_real| {
