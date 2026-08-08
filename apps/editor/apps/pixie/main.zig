@@ -6575,31 +6575,38 @@ fn panelBuildToolOptions(ctx: *gui.Context, user_data: *anyopaque) anyerror!void
     if (ctx.toggle("Coarse Grid", &coarse_grid_on)) {
         app.coarse_grid_enabled = coarse_grid_on;
     }
+    // Coarse Grid's Spacing, the brush parameters and Fill's tolerance share one
+    // slider group so their label / track / value columns line up regardless of
+    // which of these rows the active tool currently shows. Opening the group only
+    // when a row will actually appear keeps a tool with none of them (Pen, Select,
+    // ...) from leaving a blank slider-height gap behind the toggles above.
+    const show_sliders = app.coarse_grid_enabled or
+        app.active_kind == .brush or app.active_kind == .bezier or app.active_kind == .fill;
+    if (show_sliders) ctx.beginSliderGroup(.{});
     if (app.coarse_grid_enabled) {
         var spacing = app.coarse_grid_spacing;
-        ctx.beginSliderGroup(.{});
         if (ctx.sliderI32Id(0xB0_0004, "Spacing", &spacing, .{
             .min = @intCast(actions.MIN_GRID_SPACING),
             .max = @intCast(actions.MAX_GRID_SPACING),
         })) {
             app.setCoarseGridSpacing(spacing);
         }
-        ctx.endSliderGroup();
     }
     if (app.active_kind == .brush or app.active_kind == .bezier) {
-        _ = ctx.sliderI32Id(0xB0_0001, "Size", &app.brush_size_i32, .{ .min = 1, .max = 64, .track_w = 90 });
-        _ = ctx.sliderI32Id(0xB0_0002, "Opac", &app.brush_opacity_i32, .{ .min = 0, .max = 255, .track_w = 90 });
-        _ = ctx.sliderF32Id(0xB0_0003, "Hard", &app.brush_hardness_f32, .{ .min = 0, .max = 1, .step = 0.05, .track_w = 90 });
+        _ = ctx.sliderI32Id(0xB0_0001, "Size", &app.brush_size_i32, .{ .min = 1, .max = 64 });
+        _ = ctx.sliderI32Id(0xB0_0002, "Opac", &app.brush_opacity_i32, .{ .min = 0, .max = 255 });
+        _ = ctx.sliderF32Id(0xB0_0003, "Hard", &app.brush_hardness_f32, .{ .min = 0, .max = 1, .step = 0.05 });
     }
+    if (app.active_kind == .fill) {
+        _ = ctx.sliderI32Id(0xFEED_0001, "Tol", &app.fill_tolerance_i32, .{ .min = 0, .max = 255 });
+    }
+    if (show_sliders) ctx.endSliderGroup();
     if (app.active_kind == .bezier) {
         const n = app.bezier_editor.path.anchors.items.len;
         ctx.labelEx(
             std.fmt.allocPrint(ctx.allocator(), "anchors: {d}", .{n}) catch "anchors: ?",
             ctx.style.text_subtle,
         );
-    }
-    if (app.active_kind == .fill) {
-        _ = ctx.sliderI32Id(0xFEED_0001, "Tol", &app.fill_tolerance_i32, .{ .min = 0, .max = 255, .track_w = 90 });
     }
 }
 
