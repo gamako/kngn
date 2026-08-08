@@ -1,0 +1,17 @@
+# Headless replay smoke test for the GUI event-forwarding path (KNGN_HEADLESS=1;
+# see docs/harness.md "Fully display-less"). Drives the template's one button
+# purely from the keyboard, so the script has no window coordinates to keep in
+# sync with layout: Tab moves focus onto the button (settling one frame later,
+# per ADR-021), then Space activates it.
+#
+# step 1: the button's first frame has no rect cache yet (a synchronous
+#   hit-test miss by design), so this warm-up frame establishes it.
+step 1
+inject key_down TAB
+step 1
+inject key_down SPACE
+step 1
+digest state
+assert state color=#88C0D0
+snapshot fb
+quit

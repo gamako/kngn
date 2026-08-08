@@ -7,7 +7,7 @@
 //! The surface an App provides:
 //! - `pub const window = .{ .w: u32, .h: u32, .title: [:0]const u8 }`
 //! - `pub fn init(gpa: Allocator, io: std.Io) !*App`
-//! - `pub fn frame(self: *App, win: *platform.Window, now: f64) bool` (running)
+//! - `pub fn frame(self: *App, win: *platform.Window, now: f64) !bool` (running)
 //! - `pub fn deinit(self: *App) void`
 //!
 //! opt-in:

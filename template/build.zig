@@ -58,6 +58,23 @@ pub fn build(b: *std.Build) void {
     const test_step = b.step("test", "Run template unit tests");
     test_step.dependOn(&run_unit_tests.step);
 
+    // ----- GUI event-forwarding smoke test (headless harness replay) -----
+    // Drives the native exe with a scripted key sequence under KNGN_HEADLESS=1, so it needs
+    // no display and stays deterministic (docs/harness.md "Fully display-less"). This is what
+    // catches a GUI frame-lifecycle regression that a plain unit test cannot: the script's
+    // `assert` exits non-zero the instant the event-forwarding order breaks (a `pushEvent`
+    // outside `beginFrame`/`endFrame` panics on the library's own debug assert), which fails
+    // this Run step and therefore `gate`.
+    const smoke_run = b.addRunArtifact(exe);
+    smoke_run.setEnvironmentVariable("KNGN_HEADLESS", "1");
+    smoke_run.setEnvironmentVariable("KNGN_HARNESS_SCRIPT", b.path("tests/gui_smoke.txt").getPath(b));
+    // The script's trailing `snapshot fb` lands in the install directory (already created by
+    // the dependency below), so the gate needs no extra directory of its own to manage.
+    smoke_run.setEnvironmentVariable("KNGN_HARNESS_OUT", b.install_path);
+    smoke_run.step.dependOn(b.getInstallStep());
+    const smoke_step = b.step("test-harness-smoke", "Replay a headless GUI key-event smoke test (KNGN_HEADLESS=1)");
+    smoke_step.dependOn(&smoke_run.step);
+
     // ----- compile-only diagnostics (the step editors look for on save) -----
     // Semantic analysis without linking or installing: it reports the same compile errors as a build
     // but skips the native link, so an editor can run it on every save. Nothing depends on this step,
@@ -78,9 +95,10 @@ pub fn build(b: *std.Build) void {
     check_step.dependOn(&check_exe.step);
 
     // ----- native gate (no wasm) -----
-    const gate_step = b.step("gate", "Native gate: compile the app and run its unit tests");
+    const gate_step = b.step("gate", "Native gate: compile the app, run its unit tests, and replay the GUI smoke test");
     gate_step.dependOn(build_native_step);
     gate_step.dependOn(test_step);
+    gate_step.dependOn(&smoke_run.step);
 
     // ----- wasm web package (existing WasmAppSpec / addWasmWebPackage) -----
     // Wasm packaging defaults to ReleaseSmall when neither -Doptimize nor --release is given.
