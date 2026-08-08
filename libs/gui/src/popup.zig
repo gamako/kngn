@@ -408,7 +408,7 @@ pub fn popupMenu(ctx: *Context, id: Id, items: []const PopupItem) PopupResult {
 /// `popupMenu` with `PopupMenuOpts` (a persistent, checked-item popup passes
 /// `.{ .keep_open_on_select = true }`; `popupMenu` itself is `popupMenuEx(ctx, id, items, .{})`).
 pub fn popupMenuEx(ctx: *Context, id: Id, items: []const PopupItem, opts: PopupMenuOpts) PopupResult {
-    std.debug.assert(!ctx.frame_active);
+    ctx.requireNoFrame("popupMenu");
     const state = ctx.popup_state orelse return .{};
     if (state.id != id) return .{};
 
@@ -429,7 +429,7 @@ pub fn popupMenuEx(ctx: *Context, id: Id, items: []const PopupItem, opts: PopupM
 /// follows call order (call the one that should appear on top last), the same rule the ordinary
 /// layout tree already follows.
 pub fn popupMenuStacked(ctx: *Context, id: Id, items: []const PopupItem, opts: PopupMenuOpts) PopupResult {
-    std.debug.assert(!ctx.frame_active);
+    ctx.requireNoFrame("popupMenuStacked");
     const idx = ctx.popup_stack.indexOf(id) orelse return .{};
     const pos = ctx.popup_stack.items[idx].pos;
 

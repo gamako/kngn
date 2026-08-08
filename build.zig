@@ -2340,6 +2340,54 @@ pub fn build(b: *std.Build) void {
     const test_gui_leak_step = b.step("test-gui-leak", "Run GUI PerIdStateStore leak measurement");
     test_gui_leak_step.dependOn(&run_gui_leak_test.step);
 
+    // check-gui-contract: the GUI lifecycle checks must survive optimisation.
+    // Unit tests can only exercise the paths that keep the contract — breaking one ends the
+    // process — so each case runs as its own child process and the gate asserts on how it died.
+    // Built with optimisation on, where `std.debug.assert` would compile the check away.
+    const gui_contract_step = b.step(
+        "check-gui-contract",
+        "Assert GUI lifecycle violations are detected in optimised builds",
+    );
+    for ([_]std.builtin.OptimizeMode{ .ReleaseFast, .ReleaseSmall }) |guard_optimize| {
+        // The gui module is rebuilt at the guard's optimisation mode rather than reusing the
+        // module built for the tests: the whole point of this gate is what libs/gui compiles to
+        // with optimisation on, and a module carries its own optimize setting.
+        const guard_gui = b.createModule(.{
+            .root_source_file = b.path("libs/gui/src/gui.zig"),
+            .target = target,
+            .optimize = guard_optimize,
+        });
+        guard_gui.addImport("font", shared_modules.font.mod);
+        guard_gui.addImport("pixelops", shared_modules.pixelops.mod);
+        guard_gui.addImport("command_types", shared_modules.command_types.mod);
+        const guard_mod = b.createModule(.{
+            .root_source_file = b.path("tests/gui-contract-guard/main.zig"),
+            .target = target,
+            .optimize = guard_optimize,
+        });
+        guard_mod.addImport("gui", guard_gui);
+        const guard_exe = b.addExecutable(.{
+            .name = b.fmt("gui-contract-guard-{s}", .{@tagName(guard_optimize)}),
+            .root_module = guard_mod,
+        });
+        // Each case names the contract it breaks and the message it must produce.
+        const cases = [_]struct { case: []const u8, message: []const u8 }{
+            .{ .case = "widget_outside_frame", .message = "labelEx requires an open frame" },
+            .{ .case = "popup_inside_frame", .message = "popupMenu must be called with no frame open" },
+            .{ .case = "menu_inside_frame", .message = "menuBarPopup must be called with no frame open" },
+            .{ .case = "unclosed_box", .message = "endFrame with a box still open" },
+            .{ .case = "unclosed_slider_group", .message = "endFrame with a slider group still open" },
+            .{ .case = "double_begin_frame", .message = "beginFrame must be called with no frame open" },
+        };
+        for (cases) |c| {
+            const run_guard = b.addRunArtifact(guard_exe);
+            run_guard.addArg(c.case);
+            run_guard.expectExitCode(42); // matches violation_exit_code in the guard
+            run_guard.addCheck(.{ .expect_stderr_match = c.message });
+            gui_contract_step.dependOn(&run_guard.step);
+        }
+    }
+
     // libs/font tests (geom / color / Font IF + coverage draw path + BMFont)
     const font_test_mod = b.createModule(.{
         .root_source_file = b.path("libs/font/src/lib.zig"),
@@ -2675,6 +2723,7 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(test_font_step);
     test_step.dependOn(test_gui_step);
     test_step.dependOn(test_gui_leak_step);
+    test_step.dependOn(gui_contract_step);
     test_step.dependOn(test_synth_step);
     test_step.dependOn(test_modular_step);
     test_step.dependOn(test_app_modular_step);

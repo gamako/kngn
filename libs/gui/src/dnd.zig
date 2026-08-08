@@ -121,7 +121,7 @@ fn pointHitsVisible(rect: Rect, clip: Rect, p: Vec2) bool {
 /// primitive, not a button. A widget must not be both a `dragSource` and a `buttonBehavior`-based
 /// widget under the same id.
 pub fn dragSource(ctx: *Context, id: Id, payload: DragPayload) DragSourceResult {
-    std.debug.assert(ctx.frame_active);
+    ctx.requireFrame("dragSource");
     std.debug.assert(id != 0);
     if (ctx.isDisabled()) {
         ctx.clearDisabledInteraction(id);
@@ -181,7 +181,7 @@ pub const DropResult = struct {
 /// whole drag. No-op (returns `.{}`) unless a drag is actually `.dragging` (an armed-but-not-yet-
 /// dragging press does not make targets light up).
 pub fn dropTarget(ctx: *Context, id: Id, can_accept: bool) DropResult {
-    std.debug.assert(ctx.frame_active);
+    ctx.requireFrame("dropTarget");
     std.debug.assert(id != 0);
     if (ctx.isDisabled()) {
         ctx.clearDisabledInteraction(id);

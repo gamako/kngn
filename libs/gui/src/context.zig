@@ -354,7 +354,7 @@ pub const Context = struct {
     }
 
     fn beginFrameAtInternal(self: *Context, screen_w: u32, screen_h: u32, now_s: f64) void {
-        std.debug.assert(!self.frame_active);
+        self.requireNoFrame("beginFrame");
         self.frame_active = true;
         self.screen_w = screen_w;
         self.screen_h = screen_h;
@@ -395,17 +395,45 @@ pub const Context = struct {
         if (self.staged_input.drain(&self.input)) |staged| self.composition = staged;
     }
 
+    /// Fail on a broken lifecycle contract, in every optimisation mode.
+    ///
+    /// These are not internal consistency checks a release build can afford to drop. A Context
+    /// driven out of phase — widgets built with no frame open, a box left unclosed, a post-frame
+    /// API called mid-frame — cannot produce a meaningful frame, and carrying on yields a wrong
+    /// interface rather than a slow one. `std.debug.assert` compiles to `unreachable`, which is
+    /// removed under `ReleaseFast` and `ReleaseSmall`, so the checks below panic explicitly.
+    ///
+    /// Only the failure handling is shared here. The predicates stay where they can be read: the
+    /// phase ones in `requireFrame`/`requireNoFrame`, the state ones at the call site.
+    ///
+    /// Runs while widgets are built — proportional to the number of widgets, never to pixels or
+    /// samples. One bool test on the success path, `noreturn` on the failure path.
+    pub inline fn requireContract(ok: bool, comptime what: []const u8) void {
+        if (!ok) @panic("gui: " ++ what);
+    }
+
+    /// Require an open frame: `beginFrame` has run and `endFrame` has not.
+    pub inline fn requireFrame(self: *const Context, comptime what: []const u8) void {
+        requireContract(self.frame_active, what ++ " requires an open frame");
+    }
+
+    /// Require that no frame is open — the contract of the post-frame APIs (popups, menu bar)
+    /// and of opening a frame in the first place.
+    pub inline fn requireNoFrame(self: *const Context, comptime what: []const u8) void {
+        requireContract(!self.frame_active, what ++ " must be called with no frame open");
+    }
+
     pub fn endFrame(self: *Context) void {
-        std.debug.assert(self.frame_active);
+        self.requireFrame("endFrame");
         // Every beginDisabled needs a matching endDisabled within the same frame (immediate-mode
         // begin/end nesting rule, the same contract beginCollapsible's body depth follows).
-        std.debug.assert(self.disabled_depth == 0);
+        requireContract(self.disabled_depth == 0, "endFrame with a beginDisabled scope still open");
         // Likewise every beginSliderGroup needs its endSliderGroup: the group's column widths are
         // written back there, so an unclosed group would leave its rows at zero-width columns.
-        std.debug.assert(self.slider_group == null);
+        requireContract(self.slider_group == null, "endFrame with a slider group still open");
         const root = self.layout_root.?;
         // Detect beginBox / endBox mismatches
-        std.debug.assert(self.layout_current == root);
+        requireContract(self.layout_current == root, "endFrame with a box still open");
         // Frames that never use the layout API (empty root) skip layout / emit / cache update
         // entirely: compatible with manual DrawList use (examples 08/09). rect_cache keeps the previous values.
         if (root.first_child != null) {
@@ -511,14 +539,14 @@ pub const Context = struct {
     /// `endDisabled`). Popup/menu items keep their own, unrelated `enabled` field — this scope is
     /// for ordinary widgets outside a popup (see popup.zig).
     pub fn beginDisabled(self: *Context) void {
-        std.debug.assert(self.frame_active);
+        self.requireFrame("beginDisabled");
         self.disabled_depth += 1;
     }
 
     /// Leave a disabled scope opened by `beginDisabled`.
     pub fn endDisabled(self: *Context) void {
-        std.debug.assert(self.frame_active);
-        std.debug.assert(self.disabled_depth > 0);
+        self.requireFrame("endDisabled");
+        requireContract(self.disabled_depth > 0, "endDisabled without a matching beginDisabled");
         self.disabled_depth -= 1;
     }
 
@@ -553,7 +581,7 @@ pub const Context = struct {
     /// The focus this gives is not "focus-visible": no ring is drawn, because the caller already
     /// knows where it put the focus. Only Tab traversal raises the ring.
     pub fn claimFocus(self: *Context, id: Id) bool {
-        std.debug.assert(self.frame_active);
+        self.requireFrame("claimFocus");
         if (id == 0) return false;
         self.state.focused_id = id;
         self.state.focus_visible = false;
@@ -564,7 +592,7 @@ pub const Context = struct {
     /// Clear the current keyboard focus. Actual outside-click clear happens in endFrame when no
     /// widget claimed focus this frame.
     pub fn releaseFocus(self: *Context) void {
-        std.debug.assert(self.frame_active);
+        self.requireFrame("releaseFocus");
         self.state.focused_id = 0;
         self.state.focus_visible = false;
     }
@@ -589,7 +617,7 @@ pub const Context = struct {
     /// Runs once per focusable widget per frame; the append is amortised free after the first
     /// frame because `focus_order` keeps its capacity.
     pub fn registerFocusable(self: *Context, id: Id) void {
-        std.debug.assert(self.frame_active);
+        self.requireFrame("registerFocusable");
         if (id == 0 or self.popup_state != null or self.popup_stack.len != 0) return;
         self.focus_order.append(self.gpa, id) catch @panic("Context.registerFocusable: OOM");
     }
@@ -692,7 +720,7 @@ pub const Context = struct {
     /// Record the last interactive widget (called additively from behaviorFromCache).
     /// Even without a rect cache yet, record hovered=false so tooltip() can no-op.
     pub fn noteLastInteractive(self: *Context, id: Id, rect: Rect, hovered: bool) void {
-        std.debug.assert(self.frame_active);
+        self.requireFrame("noteLastInteractive");
         self.tooltip_last_id = id;
         self.tooltip_last_rect = rect;
         self.tooltip_last_hovered = hovered;
@@ -702,7 +730,7 @@ pub const Context = struct {
     /// No-op if not hovered this frame. When the same id+rect has been continuous for >= `tooltip_delay_s`,
     /// raise an overlay candidate at the end of endFrame. text is duped onto the frame arena.
     pub fn tooltip(self: *Context, text: []const u8) void {
-        std.debug.assert(self.frame_active);
+        self.requireFrame("tooltip");
         if (!self.tooltip_last_hovered or self.tooltip_last_id == 0) return;
 
         const id = self.tooltip_last_id;
@@ -739,7 +767,7 @@ pub const Context = struct {
     /// Passing an explicit ID (non-zero from IdStack etc.) makes it subject to getNodeRect /
     /// rect_cache (for hit-test) after endFrame.
     pub fn beginBox(self: *Context, cfg: BoxConfig) void {
-        std.debug.assert(self.frame_active);
+        self.requireFrame("beginBox");
         layout.assertSizingValid(cfg.width);
         layout.assertSizingValid(cfg.height);
         const parent = self.layout_current.?;
@@ -760,15 +788,14 @@ pub const Context = struct {
     /// widths at `endSliderGroup`, once every row has declared what it needs. Valid only until the
     /// frame ends, because the node lives on the frame arena.
     pub fn openBox(self: *Context) *layout.Node {
-        std.debug.assert(self.frame_active);
+        self.requireFrame("openBox");
         return self.layout_current.?;
     }
 
     pub fn endBox(self: *Context) void {
-        std.debug.assert(self.frame_active);
+        self.requireFrame("endBox");
         const cur = self.layout_current.?;
-        // Trying to pop the root = beginBox / endBox imbalance
-        std.debug.assert(cur.parent != null);
+        requireContract(cur.parent != null, "endBox without a matching beginBox");
         self.layout_current = cur.parent;
     }
 
@@ -779,7 +806,7 @@ pub const Context = struct {
     }
 
     pub fn labelEx(self: *Context, str: []const u8, col: Color) void {
-        std.debug.assert(self.frame_active);
+        self.requireFrame("labelEx");
         const dup = self.allocator().dupe(u8, str) catch @panic("Context.labelEx: OOM");
         self.addLeaf(.{ .text = .{ .str = dup, .color = col, .font = null } });
     }
@@ -787,7 +814,7 @@ pub const Context = struct {
     /// custom leaf. size is used as the measure result; draw_fn is called with the final rect
     /// after endFrame finalizes layout (DrawList OOM is catch @panic inside the callback).
     pub fn custom(self: *Context, size: Vec2, draw_fn: layout.CustomDrawFn, ctx_ptr: *anyopaque) void {
-        std.debug.assert(self.frame_active);
+        self.requireFrame("custom");
         self.addLeaf(.{ .custom = .{ .measured = size, .draw_fn = draw_fn, .ctx = ctx_ptr } });
     }
 
@@ -926,7 +953,7 @@ pub fn pointHitsVisible(rect: Rect, clip: Rect, p: Vec2) bool {
 /// steal active. Click on release succeeds only when `pointHitsVisible` (inside the visible region).
 /// Contract that keeps TextInput range select, slider, and ScrollArea thumb drags working.
 pub fn buttonBehavior(ctx: *Context, id: Id, rect: Rect, clip: Rect) ButtonResult {
-    std.debug.assert(ctx.frame_active);
+    ctx.requireFrame("buttonBehavior");
     // Modal absorption: while a popup is open (the classic slot or a stacked one — see
     // popup.zig's PopupStack), background widgets get no hover/hot/active at all.
     // popup.openPopup()/openPopupStacked() always reset active_id/hot_id/next_hot_id to 0 on
@@ -2256,4 +2283,42 @@ test "Context: composition set before the frame opens survives the caller's buff
     ctx.beginFrame(800, 600);
     try std.testing.expect(!ctx.composition.active);
     ctx.endFrame();
+}
+
+test "Context: the lifecycle contracts hold for ordinary use" {
+    var ctx = testCtx();
+    defer ctx.deinit();
+
+    // A frame that opens and closes, with matched box, disabled and slider-group scopes, passes
+    // every check on the way through.
+    ctx.beginFrame(800, 600);
+    ctx.beginBox(.{});
+    ctx.beginDisabled();
+    ctx.label("disabled");
+    ctx.endDisabled();
+    ctx.endBox();
+    ctx.endFrame();
+    try std.testing.expect(!ctx.frame_active);
+
+    // The post-frame APIs are legal exactly where the frame is closed.
+    _ = ctx.popupMenu(1, &.{});
+
+    // And the next frame opens cleanly after all of it.
+    ctx.beginFrame(800, 600);
+    ctx.endFrame();
+}
+
+test "Context: a slider group opened and closed in one frame leaves no state behind" {
+    var ctx = testCtx();
+    defer ctx.deinit();
+
+    ctx.beginFrame(800, 600);
+    ctx.beginSliderGroup(.{});
+    var value: i32 = 5;
+    _ = ctx.sliderI32Id(1, "value", &value, .{ .min = 0, .max = 10 });
+    ctx.endSliderGroup();
+    ctx.endFrame();
+
+    try std.testing.expect(ctx.slider_group == null);
+    try std.testing.expectEqual(@as(u32, 0), ctx.disabled_depth);
 }

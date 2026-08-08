@@ -247,7 +247,7 @@ pub fn menuBar(ctx: *Context, commands: []const Command, state: *MenuBarState) v
 
 /// After `endFrame`: draw the open dropdown and return the selected CommandId.
 pub fn menuBarPopup(ctx: *Context, commands: []const Command, state: *MenuBarState) MenuBarResult {
-    std.debug.assert(!ctx.frame_active);
+    ctx.requireNoFrame("menuBarPopup");
     const title = state.open_title orelse {
         if (popup.isPopupOpen(ctx, MENU_BAR_POPUP_ID)) popup.closePopup(ctx);
         return .{};

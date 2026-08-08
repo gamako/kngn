@@ -94,14 +94,12 @@ building widgets outside a frame, leaving a box, a disabled scope or a slider gr
 and the frame-boundary rules of the popup and menu APIs — remain violations, because a Context
 in that state cannot produce a meaningful frame.
 
-**Those are out of scope here, and still written with `std.debug.assert`.** They therefore
-still vanish under `ReleaseFast` and `ReleaseSmall`, exactly as input did before this change.
-That is a real defect and it is deliberately not fixed in this decision: unlike input ordering,
-it cannot be answered by accepting the call, so it needs a different mechanism (a check that
-survives optimisation, and a way to test that a shipped build still has it). Scoping the two
-together would have made this decision about a mechanism rather than about a contract. The
-boundary is drawn where the answers differ: input is accepted, structure is rejected, and only
-the first is settled here.
+**Those are out of scope here.** Unlike input ordering, they cannot be answered by accepting
+the call, so they need a different mechanism — a check that survives optimisation, and a way to
+test that a shipped build still has it. Scoping the two together would have made this decision
+about a mechanism rather than about a contract. The boundary is drawn where the answers differ:
+input is accepted, structure is rejected, and only the first is settled here. The second is
+settled in [ADR-029](029_gui-lifecycle-violations-fail-in-every-build.md).
 
 ## Verification
 

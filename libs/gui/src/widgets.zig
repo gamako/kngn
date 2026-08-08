@@ -385,7 +385,7 @@ pub fn selectableLabelId(
     text: []const u8,
     opts: SelectableLabelOpts,
 ) SelectableLabelResult {
-    std.debug.assert(ctx.frame_active);
+    ctx.requireFrame("selectableLabel");
     std.debug.assert(id != 0);
 
     if (opts.focusable) ctx.registerFocusable(id);
@@ -515,7 +515,7 @@ pub fn textInputId(
     buffer: *TextBuffer,
     opts: TextInputOpts,
 ) TextInputResult {
-    std.debug.assert(ctx.frame_active);
+    ctx.requireFrame("textInput");
     std.debug.assert(id != 0);
 
     const disabled = ctx.isDisabled();
@@ -988,13 +988,14 @@ pub const SliderGroupOpts = struct {
 /// A slider built outside any group keeps its own `[label][track_w][value]` row exactly as before.
 /// Groups do not nest.
 pub fn beginSliderGroup(ctx: *Context, opts: SliderGroupOpts) void {
-    std.debug.assert(ctx.slider_group == null);
+    Context.requireContract(ctx.slider_group == null, "beginSliderGroup inside another slider group");
     ctx.slider_group = .{ .column_gap = opts.column_gap };
     ctx.beginBox(.{ .direction = .column, .width = opts.width, .gap = opts.row_gap });
 }
 
 /// Close a group opened by `beginSliderGroup`, settling its column widths.
 pub fn endSliderGroup(ctx: *Context) void {
+    Context.requireContract(ctx.slider_group != null, "endSliderGroup without a matching beginSliderGroup");
     const group = ctx.slider_group.?;
     ctx.slider_group = null;
     // Layout has not run yet (it runs in endFrame), so widening the cells here settles the columns
@@ -1730,7 +1731,7 @@ pub fn beginCollapsible(ctx: *Context, id: Id, title: []const u8, open: *bool) b
 /// Body `endBox` (every frame but O(1). Call only when `beginCollapsible` returned true).
 /// Calling while closed mis-pops the parent — contract violation.
 pub fn endCollapsible(ctx: *Context) void {
-    std.debug.assert(collapsible_body_depth > 0);
+    Context.requireContract(collapsible_body_depth > 0, "endCollapsible without an open collapsible body");
     collapsible_body_depth -= 1;
     ctx.endBox();
 }
