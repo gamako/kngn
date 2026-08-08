@@ -24,11 +24,44 @@ Immediate-mode GUI library for KNGN. Standalone and platform-independent;
 ## Frame flow
 
 ```zig
-ctx.beginFrame(fb.width, fb.height);
+ctx.beginFrame(logical_w, logical_h); // logical size, not the physical framebuffer
 // pushEvent → widgets (sync hit-test against previous-frame rects) → beginBox/label/endBox builds the tree
 ctx.endFrame(); // finalize layout + emit draw cmds + update rect cache
-gui.render(target, &ctx.draw_list, ctx.font);
+gui.render(target, &ctx.draw_list, ctx.font, scale);
 ```
+
+The size passed to `beginFrame` is the **logical** size. Under a physical framebuffer it differs
+from `fb.width`/`fb.height`, and `gui.render`'s `scale` has to agree with it — see
+[app-authoring.md](../../docs/app-authoring.md) for how the two relate to `content_scale` and
+the framebuffer mode.
+
+### What may be called when
+
+| | Before the first frame | Frame open | After `endFrame` |
+|---|---|---|---|
+| `pushEvent`, `setComposition` | yes — staged | yes — applies now | yes — staged |
+| Widgets, `ctx.custom`, `beginBox`/`endBox`, `beginDisabled`, `tooltip`, `claimFocus`, `endFrame` | no | yes | no |
+| `popupMenu`, `popupMenuStacked`, `menuBarPopup` | no — nothing to draw over yet | no | yes |
+| `beginFrame` | yes | no | yes |
+
+**Input may be handed over at any point in the loop.** Outside a frame it is staged and applied
+by the next `beginFrame`, in arrival order, before any widget reads it — so draining the
+window's events before opening the frame is as correct as draining them after
+([ADR-028](../../docs/adr/028_gui-input-staging-outside-a-frame.md)). Staging is bounded rather
+than unlimited: a full buffer collapses redundant events first, and it panics only if collapsing
+cannot free a slot. Collapsing keeps what applying the events one by one would have produced —
+consecutive motion becomes the latest position, consecutive wheel events keep the latest position
+while their deltas add up — and it only merges neighbours, so presses and keystrokes never
+disappear into it.
+
+**Everything else in that table is a contract, and breaking one panics in every build** —
+`Debug`, `ReleaseFast` and `ReleaseSmall` alike — with a message naming what broke
+(`gui: endBox requires an open frame`, `gui: endFrame with a box still open`,
+`gui: menuBarPopup must be called with no frame open`); see
+[ADR-029](../../docs/adr/029_gui-lifecycle-violations-fail-in-every-build.md). So every
+`beginFrame` needs its `endFrame`, and every begin/end scope — `beginBox`, `beginDisabled`,
+`beginSliderGroup`, `beginCollapsible`, `beginScrollArea` and the rest — needs its closing call
+within the same frame.
 
 ## Widgets (`src/widgets.zig`; call as `ctx.<name>(...)`)
 
@@ -118,6 +151,57 @@ classic slot under the hood and are unaffected by any of the above.
 Full write-up of the sizing rules above, the two-pass measure/place model behind them, a worked
 example, and where the fit/grow interaction shows up in practice (`ScrollArea`'s `content_width`):
 [docs/layout.md](docs/layout.md).
+
+## Custom drawing (`ctx.custom`)
+
+When no widget fits — a meter, a waveform, a preview — `ctx.custom` puts a leaf in the layout
+tree that draws itself:
+
+```zig
+const Meter = struct {
+    level: f32,
+    color: gui.Color,
+    fn draw(ptr: *anyopaque, dl: *gui.DrawList, rect: gui.Rect) void {
+        const self: *Meter = @ptrCast(@alignCast(ptr));
+        const filled: i32 = @intFromFloat(@as(f32, @floatFromInt(rect.w)) * self.level);
+        dl.rectFilled(.{ .x = rect.x, .y = rect.y, .w = filled, .h = rect.h }, self.color) catch
+            @panic("meter: OOM");
+    }
+};
+
+const meter = ctx.allocator().create(Meter) catch @panic("meter: OOM");
+meter.* = .{ .level = level, .color = ctx.style.bg_active };
+ctx.custom(.{ .x = 120, .y = 12 }, Meter.draw, meter);
+```
+
+`CustomDrawFn` is `*const fn (ctx: *anyopaque, dl: *DrawList, rect: Rect) void`
+(`src/layout.zig`). The contract:
+
+- **`size` is the leaf's natural measured size**, not the size it will be drawn at. The parent's
+  `fixed` / `grow` / `percent` sizing can change the final rect, which is why the callback is
+  given a `rect` rather than trusting `size`.
+- **The callback runs during `endFrame`**, after layout has settled, with the final rect.
+- **`ctx_ptr` is neither copied nor owned by the library.** It only has to stay valid until the
+  callback has run. The frame arena (`ctx.allocator()`) is the natural home — it is reset at the
+  *next* `beginFrame`, which is after the callback — but any storage that outlives `endFrame`
+  works. What does not work is holding an arena pointer across frames: that reset invalidates it.
+- **What the callback hands to the `DrawList` must stay valid until `gui.render` has run**:
+  `text` and `image` commands keep the slice and the pixel buffer and read them at render time,
+  not at the time of the call.
+- **`DrawList` methods return errors and the callback returns `void`**, so allocation failure is
+  handled inside it — the library's own leaves use `catch @panic(...)`.
+- **`ctx.custom` draws and nothing else**: no id, no hit-test, no focus. Interaction comes from
+  the box around it plus `behaviorFromCache`, which is how `colorSwatchId` and `iconButtonId`
+  are built (`src/widgets.zig`, with `SwatchDraw` / `IconButtonDraw` as the leaves) — read those
+  two for a working custom-drawn widget.
+
+**Draw order.** Layout draw commands are appended to `draw_list` *after* anything the caller
+pushed onto it directly during the frame, so the interface draws over a hand-drawn background. A
+custom leaf sits where the layout puts it, inside its parent's emit order of background →
+children → border: the parent's background is under it and the parent's border is drawn over it.
+An ancestor's clip applies where that ancestor sets `clip_children = true`.
+The popup and menu-bar overlays are emitted after `endFrame` and land on top of everything
+(`src/popup.zig`, `src/menu.zig`).
 
 ## Frame order and hit-test timing
 
