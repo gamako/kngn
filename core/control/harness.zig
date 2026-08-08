@@ -32,11 +32,11 @@
 
 const std = @import("std");
 const builtin = @import("builtin");
-const posix = std.posix;
 const types = @import("platform_types");
 const png = @import("png");
 const dsp = @import("dsp"); // magnitudeSpectrum (band, centroid, onset). Never called on a real-time path
 const capture_synthetic = @import("capture_synthetic"); // the synthetic capture source
+const socket_poll = @import("socket_poll.zig"); // socket readiness, one primitive per OS
 pub const action_registry = @import("action_registry.zig"); // the Action and registry split
 
 /// wasm32 has no sockets, no threads and no environment, so the transport, the copilot server and
@@ -752,7 +752,7 @@ pub fn pollGateWithPump(native_continue: bool, pump: ?NativePump) bool {
     }
 }
 
-/// The free-run gate: a non-blocking drain. When empty it does one listener poll(0) only, and never calls NativePump.
+/// The free-run gate: a non-blocking drain. When empty it does one zero-timeout readiness check on the listener, and never calls NativePump.
 pub fn pollGateFreeRun(native_continue: bool) bool {
     if (quit_requested or !native_continue) {
         if (live_req_open) finishLiveRequest();
@@ -850,7 +850,7 @@ fn runFreeRunCommands() bool {
     return true;
 }
 
-/// The free-run non-blocking drain. When empty it polls the listener exactly once with poll(0).
+/// The free-run non-blocking drain. When empty it checks the listener's readiness exactly once, without waiting.
 fn drainFreeRunTransport() void {
     if (comptime is_wasm) drainHostBridge() else drainFreeRunTransportNative();
 }
@@ -878,32 +878,12 @@ fn drainFreeRunTransportNative() void {
     }
 }
 
-const PollReady = enum { ready, not_ready, err };
+const PollReady = socket_poll.Ready;
 
+/// The immediate half of the readiness question, asked once per frame by the free-run drain.
 fn pollFdReady(fd: net.Socket.Handle) PollReady {
-    // wasm has no poll(2). Its transport is the host bridge, which never reaches here.
-    if (comptime is_wasm) return .not_ready else switch (comptime builtin.os.tag) {
-        .windows => {
-            // Windows: the non-blocking contract is a different API. The free-run unit test assumes POSIX and is skipped.
-            // Attempting an accept could block, so an empty drain treats it as not_ready.
-            test_poll_zero_count += 1;
-            return .not_ready;
-        },
-        else => {
-            test_poll_zero_count += 1;
-            var pfds = [_]posix.pollfd{.{
-                .fd = fd,
-                .events = posix.POLL.IN | posix.POLL.ERR | posix.POLL.HUP,
-                .revents = 0,
-            }};
-            const n = posix.poll(&pfds, 0) catch return .err;
-            if (n == 0) return .not_ready;
-            const revents = pfds[0].revents;
-            if (revents & (posix.POLL.ERR | posix.POLL.NVAL) != 0) return .err;
-            if (revents & (posix.POLL.IN | posix.POLL.HUP) != 0) return .ready;
-            return .not_ready;
-        },
-    }
+    test_poll_zero_count += 1;
+    return socket_poll.readable(fd, 0);
 }
 
 fn tryReadFreeRunRequest() void {
@@ -1213,33 +1193,19 @@ fn runNativePump(pump: ?NativePump) bool {
     return p.poll();
 }
 
-/// Polls until the fd is readable, running the native pump on each timeout.
+/// Waits until the fd is readable, running the native pump between the bounded waits.
 /// `false` = the pump reported a window close, or the fd errored.
+///
+/// Hot path declaration: event time only (a peer connecting, or the rest of a request arriving).
 fn waitFdReadable(fd: net.Socket.Handle, pump: ?NativePump) bool {
-    // wasm has no poll(2), and its host bridge is free-run only, so no caller reaches here.
-    if (comptime is_wasm) return false else switch (comptime builtin.os.tag) {
-        .windows => unreachable,
-        else => return waitFdReadablePosix(fd, pump),
-    }
-}
-
-fn waitFdReadablePosix(fd: net.Socket.Handle, pump: ?NativePump) bool {
-    const events: i16 = posix.POLL.IN | posix.POLL.ERR | posix.POLL.HUP;
+    // wasm has no sockets, and its host bridge is free-run only, so no caller reaches here.
+    if (comptime is_wasm) return false;
     while (true) {
-        var pfds = [_]posix.pollfd{.{
-            .fd = fd,
-            .events = events,
-            .revents = 0,
-        }};
-        const n = posix.poll(&pfds, livePollTimeoutMs()) catch return false;
-        if (n == 0) {
-            if (!runNativePump(pump)) return false;
-            continue;
+        switch (socket_poll.readable(fd, livePollTimeoutMs())) {
+            .ready => return true,
+            .err => return false,
+            .not_ready => if (!runNativePump(pump)) return false,
         }
-        const revents = pfds[0].revents;
-        if (revents & (posix.POLL.ERR | posix.POLL.NVAL) != 0) return false;
-        // POLLHUP is used to read the data left after a half-close (a read is attempted whether it comes with IN or alone).
-        if (revents & (posix.POLL.IN | posix.POLL.HUP) != 0) return true;
     }
 }
 
@@ -1274,7 +1240,7 @@ fn readLiveRequestBody(stream: net.Stream, pump: ?NativePump) ReadLiveRequestErr
 /// Accepts one connection and reads the whole request (up to the client's half-close) into cmd_buf.
 /// A false return = the accept is impossible (the server has finished) → so the application exits.
 fn acceptLiveRequest(pump: ?NativePump) bool {
-    const use_poll = pump != null and builtin.os.tag != .windows;
+    const use_poll = pump != null;
 
     while (true) {
         const stream = if (use_poll) blk: {
@@ -3559,6 +3525,7 @@ pub fn readEnv(name: [*:0]const u8) ?[]const u8 {
 const testing = std.testing;
 
 fn resetForTest() void {
+    test_peer_failed.store(false, .release);
     mode = .replay; // Settle the behaviour at EOF as a replay would (the tests amount to a file source)
     clock_mode = .manual;
     cmd_buf = "";
@@ -6086,11 +6053,12 @@ test "harness onLock and onPresent: the observation copy goes from the borrowed 
     try testing.expectEqual(@as(u32, 0xFF112233), frame_pixels[3]);
 }
 
-fn testSleepMs(ms: u64) void {
-    const sec: i64 = @intCast(ms / 1000);
-    const nsec: i64 = @intCast((ms % 1000) * 1_000_000);
-    const req = std.posix.timespec{ .sec = sec, .nsec = nsec };
-    _ = std.c.nanosleep(&req, null);
+/// A test peer's pause, taken through the same `Io` it does its socket work with, so it holds
+/// on every target rather than only where a POSIX `nanosleep` exists.
+fn testSleepMs(io: std.Io, ms: u64) void {
+    const ns: i96 = @intCast(ms * std.time.ns_per_ms);
+    const timeout: std.Io.Timeout = .{ .duration = .{ .raw = .{ .nanoseconds = ns }, .clock = .awake } };
+    timeout.sleep(io) catch {};
 }
 
 fn initLiveServerForTest() !u16 {
@@ -6156,9 +6124,33 @@ test "pollGateWithPump: under replay the fake pump is not called" {
     try testing.expectEqual(@as(usize, 0), pump_count);
 }
 
-test "pollGateWithPump: a false from the fake pump breaks off the live accept wait" {
-    if (builtin.os.tag == .windows) return error.SkipZigTest;
+/// How many times a fake pump answers before it reports "stop waiting". A wait that would
+/// otherwise never end — a peer that failed to connect, or a readiness check that never
+/// becomes ready — then fails its test instead of hanging it.
+const test_pump_call_limit: usize = 2000;
 
+/// Set by a test peer thread that could not complete its side of the exchange.
+var test_peer_failed: std.atomic.Value(bool) = .init(false);
+
+/// Called by a test peer that cannot connect or write. Shutting the listener down turns a
+/// blocked `accept` into an error return (`std` documents shutdown as the concurrent
+/// cancellation mechanism for accept), so the test fails rather than waiting forever for a
+/// peer that is never coming.
+fn testPeerFail() void {
+    test_peer_failed.store(true, .release);
+    io_val.vtable.netShutdown(io_val.userdata, server.socket.handle, .both) catch {};
+}
+
+/// Fails the current test when the peer thread reported a failure, so that a broken
+/// exchange is not mistaken for a broken harness.
+fn expectTestPeerOk() !void {
+    try testing.expect(!test_peer_failed.load(.acquire));
+}
+
+test "waitListenerReadable: a false from the fake pump breaks off the wait" {
+    // Calls the wait directly rather than through pollGateWithPump: this test deliberately
+    // starts no peer, so an implementation that skipped the pump and blocked in accept would
+    // hang here instead of failing.
     resetForTest();
     test_live_poll_timeout_ms = 5;
     _ = initLiveServerForTest() catch return error.SkipZigTest;
@@ -6172,12 +6164,10 @@ test "pollGateWithPump: a false from the fake pump breaks off the live accept wa
             }
         }.poll,
     };
-    try testing.expect(!pollGateWithPump(true, pump));
+    try testing.expect(!waitListenerReadable(pump));
 }
 
 test "the live pump: the fake pump is called while waiting on an accept" {
-    if (builtin.os.tag == .windows) return error.SkipZigTest;
-
     resetForTest();
     test_live_poll_timeout_ms = 5;
     const port = initLiveServerForTest() catch return error.SkipZigTest;
@@ -6192,7 +6182,7 @@ test "the live pump: the fake pump is called while waiting on an accept" {
             fn poll(p: *anyopaque) bool {
                 const c: *PumpCtx = @ptrCast(@alignCast(p));
                 c.count.* += 1;
-                return true;
+                return c.count.* < test_pump_call_limit;
             }
         }.poll,
     };
@@ -6201,27 +6191,27 @@ test "the live pump: the fake pump is called while waiting on an accept" {
         fn run(port_val: u16) void {
             var client_threaded = std.Io.Threaded.init(gpa, .{});
             const client_io = client_threaded.io();
-            testSleepMs(50);
+            testSleepMs(client_io, 50);
             const addr = net.IpAddress{ .ip4 = net.Ip4Address.loopback(port_val) };
-            const stream = addr.connect(client_io, .{ .mode = .stream }) catch return;
+            const stream = addr.connect(client_io, .{ .mode = .stream }) catch return testPeerFail();
             defer stream.close(client_io);
             var wbuf: [64]u8 = undefined;
             var writer = stream.writer(client_io, &wbuf);
-            writer.interface.writeAll("step 1\n") catch return;
-            writer.interface.flush() catch return;
+            writer.interface.writeAll("step 1\n") catch return testPeerFail();
+            writer.interface.flush() catch return testPeerFail();
             stream.shutdown(client_io, .send) catch {};
         }
     };
     const t = std.Thread.spawn(.{}, Connect.run, .{port}) catch return error.SkipZigTest;
     defer t.join();
 
-    try testing.expect(pollGateWithPump(true, pump));
+    const gate = pollGateWithPump(true, pump);
+    try expectTestPeerOk();
+    try testing.expect(gate);
     try testing.expect(pump_count >= 3);
 }
 
 test "the live pump: the fake pump is called while reading a request too" {
-    if (builtin.os.tag == .windows) return error.SkipZigTest;
-
     resetForTest();
     test_live_poll_timeout_ms = 5;
     const port = initLiveServerForTest() catch return error.SkipZigTest;
@@ -6236,7 +6226,7 @@ test "the live pump: the fake pump is called while reading a request too" {
             fn poll(p: *anyopaque) bool {
                 const c: *PumpCtx = @ptrCast(@alignCast(p));
                 c.count.* += 1;
-                return true;
+                return c.count.* < test_pump_call_limit;
             }
         }.poll,
     };
@@ -6246,38 +6236,43 @@ test "the live pump: the fake pump is called while reading a request too" {
             var client_threaded = std.Io.Threaded.init(gpa, .{});
             const client_io = client_threaded.io();
             const addr = net.IpAddress{ .ip4 = net.Ip4Address.loopback(port_val) };
-            const stream = addr.connect(client_io, .{ .mode = .stream }) catch return;
+            const stream = addr.connect(client_io, .{ .mode = .stream }) catch return testPeerFail();
             defer stream.close(client_io);
             var wbuf: [4096]u8 = undefined;
             var writer = stream.writer(client_io, &wbuf);
-            writer.interface.writeAll("step") catch return;
-            writer.interface.flush() catch return;
-            testSleepMs(50);
-            writer.interface.writeAll(" 1\n") catch return;
-            writer.interface.flush() catch return;
+            writer.interface.writeAll("step") catch return testPeerFail();
+            writer.interface.flush() catch return testPeerFail();
+            testSleepMs(client_io, 50);
+            writer.interface.writeAll(" 1\n") catch return testPeerFail();
+            writer.interface.flush() catch return testPeerFail();
             stream.shutdown(client_io, .send) catch {};
         }
     };
     const t = std.Thread.spawn(.{}, SlowConnect.run, .{port}) catch return error.SkipZigTest;
     defer t.join();
 
-    try testing.expect(pollGateWithPump(true, pump));
+    const gate = pollGateWithPump(true, pump);
+    try expectTestPeerOk();
+    try testing.expect(gate);
     try testing.expect(pump_count >= 3);
 }
 
 test "the live pump: the next connection can still be accepted after a request goes over 1 MiB" {
-    if (builtin.os.tag == .windows) return error.SkipZigTest;
-
     resetForTest();
     test_live_poll_timeout_ms = 5;
     const port = initLiveServerForTest() catch return error.SkipZigTest;
     defer deinitLiveServerForTest();
 
+    var pump_count: usize = 0;
+    const PumpCtx = struct { count: *usize };
+    var ctx = PumpCtx{ .count = &pump_count };
     const always_pump = NativePump{
-        .ptr = undefined,
+        .ptr = @ptrCast(&ctx),
         .pollFn = struct {
-            fn poll(_: *anyopaque) bool {
-                return true;
+            fn poll(p: *anyopaque) bool {
+                const c: *PumpCtx = @ptrCast(@alignCast(p));
+                c.count.* += 1;
+                return c.count.* < test_pump_call_limit;
             }
         }.poll,
     };
@@ -6288,7 +6283,7 @@ test "the live pump: the next connection can still be accepted after a request g
             const client_io = client_threaded.io();
             {
                 const addr = net.IpAddress{ .ip4 = net.Ip4Address.loopback(port_val) };
-                const stream = addr.connect(client_io, .{ .mode = .stream }) catch return;
+                const stream = addr.connect(client_io, .{ .mode = .stream }) catch return testPeerFail();
                 var wbuf: [8192]u8 = undefined;
                 var writer = stream.writer(client_io, &wbuf);
                 var chunk: [65536]u8 = undefined;
@@ -6297,20 +6292,20 @@ test "the live pump: the next connection can still be accepted after a request g
                 const over = (1 << 20) + 1;
                 while (sent < over) : (sent += chunk.len) {
                     const n = @min(chunk.len, over - sent);
-                    writer.interface.writeAll(chunk[0..n]) catch return;
+                    writer.interface.writeAll(chunk[0..n]) catch return testPeerFail();
                 }
-                writer.interface.flush() catch return;
+                writer.interface.flush() catch return testPeerFail();
                 stream.shutdown(client_io, .send) catch {};
                 stream.close(client_io);
             }
             {
                 const addr = net.IpAddress{ .ip4 = net.Ip4Address.loopback(port_val) };
-                const stream = addr.connect(client_io, .{ .mode = .stream }) catch return;
+                const stream = addr.connect(client_io, .{ .mode = .stream }) catch return testPeerFail();
                 defer stream.close(client_io);
                 var wbuf: [64]u8 = undefined;
                 var writer = stream.writer(client_io, &wbuf);
-                writer.interface.writeAll("step 1\n") catch return;
-                writer.interface.flush() catch return;
+                writer.interface.writeAll("step 1\n") catch return testPeerFail();
+                writer.interface.flush() catch return testPeerFail();
                 stream.shutdown(client_io, .send) catch {};
             }
         }
@@ -6318,7 +6313,9 @@ test "the live pump: the next connection can still be accepted after a request g
     const t = std.Thread.spawn(.{}, HugeThenStep.run, .{port}) catch return error.SkipZigTest;
     defer t.join();
 
-    try testing.expect(pollGateWithPump(true, always_pump));
+    const gate = pollGateWithPump(true, always_pump);
+    try expectTestPeerOk();
+    try testing.expect(gate);
 }
 
 test "the netsync probe: unregistered while disabled, and expect role=host on an enabled host" {
@@ -6432,9 +6429,7 @@ test "decideTransport: SCRIPT/LISTEN/MANUAL_CLOCK exclusivity and clock defaults
     }
 }
 
-test "free-run: empty drain does poll(0) exactly once and returns true" {
-    if (builtin.os.tag == .windows) return error.SkipZigTest;
-
+test "free-run: an empty drain checks readiness exactly once and returns true" {
     resetForTest();
     _ = initLiveServerForTest() catch return error.SkipZigTest;
     defer deinitLiveServerForTest();
@@ -6445,6 +6440,47 @@ test "free-run: empty drain does poll(0) exactly once and returns true" {
     try testing.expectEqual(@as(usize, 1), test_poll_zero_count);
     try testing.expect(!live_req_open);
     try testing.expect(!freerun_reading);
+}
+
+test "free-run: a waiting peer is accepted and its request runs" {
+    // The empty-drain test above cannot see a listener that never reports a waiting peer,
+    // because it never creates one. This one connects for real, so a readiness check that
+    // always answers "nothing there" leaves the request unread and fails the loop below.
+    // Single threaded: a loopback connect completes against the listen backlog without
+    // anyone accepting it, so no ordering between a peer thread and the drain is needed.
+    resetForTest();
+    const port = initLiveServerForTest() catch return error.SkipZigTest;
+    defer deinitLiveServerForTest();
+    clock_mode = .free_run;
+
+    var client_threaded = std.Io.Threaded.init(gpa, .{});
+    defer client_threaded.deinit();
+    const client_io = client_threaded.io();
+    const addr = net.IpAddress{ .ip4 = net.Ip4Address.loopback(port) };
+    const client = addr.connect(client_io, .{ .mode = .stream }) catch return error.SkipZigTest;
+    defer client.close(client_io);
+
+    var wbuf: [64]u8 = undefined;
+    var writer = client.writer(client_io, &wbuf);
+    try writer.interface.writeAll("step 2\n");
+    try writer.interface.flush();
+    try client.shutdown(client_io, .send);
+
+    // Bounded: the request may need several frames to be accepted and read to end of stream,
+    // but it must not need an unbounded number of them. Reaching the frame barrier is the
+    // proof that the request was not merely received but executed.
+    const max_frames = 200;
+    var frames: usize = 0;
+    while (frames < max_frames and !(pending_wait == .frame_barrier)) : (frames += 1) {
+        try testing.expect(pollGateFreeRun(true));
+    }
+    try testing.expect(frames < max_frames);
+
+    // Reaching the barrier runs the request out and finishes it.
+    frame_index = pending_wait.frame_barrier.target_frame;
+    try testing.expect(pollGateFreeRun(true));
+    try testing.expect(pending_wait == .none);
+    try testing.expect(!live_req_open);
 }
 
 test "step dual: manual uses steps_remaining, free-run uses frame barrier" {
@@ -6462,8 +6498,6 @@ test "step dual: manual uses steps_remaining, free-run uses frame barrier" {
     try testing.expect(!pollGate(true)); // quit
 
     // the free-run barrier (a live server plus an in-memory request)
-    if (builtin.os.tag == .windows) return;
-
     resetForTest();
     _ = initLiveServerForTest() catch return;
     defer deinitLiveServerForTest();
@@ -6556,7 +6590,6 @@ test "parseAwaitExpr: optional timeout and surplus reject" {
 }
 
 test "the free-run execution model: true every frame even with no agent present" {
-    if (builtin.os.tag == .windows) return error.SkipZigTest;
     resetForTest();
     _ = initLiveServerForTest() catch return error.SkipZigTest;
     defer deinitLiveServerForTest();

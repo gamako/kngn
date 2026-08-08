@@ -520,13 +520,12 @@ signal worth chasing.
 > transport per process). MANUAL_CLOCK alone, without LISTEN, is also invalid. With
 > none of them set, every hook passes straight through.
 
-> **Free-run LISTEN is not supported on Windows (a known limitation)**: the
-> non-blocking accept of free-run currently exists only as a POSIX `poll(0)`
-> implementation, and the Windows branch always reports `not_ready` (a silent no-op
-> that never accepts a connection — the port file and the listen log appear, but
-> `kngn ctl` cannot connect). **On Windows, add `KNGN_HARNESS_MANUAL_CLOCK=1`** to use the
-> old step-driven path (a blocking accept). macOS and Linux are fine with the free-run
-> default.
+> The free-run default works the same on every platform. Readiness — the question both
+> the non-blocking drain and the manual-clock wait ask — is one primitive with a POSIX
+> `poll` and a Windows AFD backend (`core/control/socket_poll.zig`), so a Windows
+> host accepts a connection and runs the native event pump while waiting exactly as
+> macOS and Linux do. On Windows, `kngn ctl` is the built executable
+> (`zig-out\bin\kngn.exe`); the `scripts/kngn` wrapper is a shell script.
 
 ## Fully display-less
 
@@ -685,7 +684,8 @@ Rules and limits:
   `frame_index >= X+N` that waits for the application to present. `await` re-evaluates
   the same predicate as `expect` within a frame budget (a timeout of 0 means compare
   once). While listening in free-run, the application keeps running even with no
-  commands outstanding, and an empty drain is a single `poll(0)` on the listener.
+  commands outstanding, and an empty drain is a single zero-timeout readiness check on the
+  listener.
   Under **manual LISTEN** (`KNGN_HARNESS_MANUAL_CLOCK=1`), it blocks on accepting and
   reading the next connection, as before. With **a real display plus manual**, the
   native `pollEvents()` is pumped at a short interval through the facade even while
