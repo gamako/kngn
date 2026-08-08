@@ -86,6 +86,130 @@ pub const CompositionState = struct {
     cursor: usize = 0,
 };
 
+/// Input that arrived while no frame was active.
+///
+/// Forwarding platform events before opening the frame is the natural order for a native
+/// loop (poll the window, then build the interface), so pushing input is not restricted to
+/// the inside of a frame. Outside one it is held here and applied by the next `beginFrame`,
+/// in arrival order, immediately after the previous frame's edges are cleared — a click or a
+/// keystroke can therefore never be lost to the order in which a caller drives its frames.
+///
+/// Runs at event time only: a handful of events per frame, never over pixels or samples.
+/// Storage is fixed, so staging allocates nothing and cannot grow without bound.
+pub const StagedInput = struct {
+    /// Bound on how much input one gap between frames may hold. This is a memory limit and an
+    /// anomaly boundary, not a claim about how many events a system can deliver in a frame.
+    pub const capacity = 256;
+    /// Preedit text is display-only, so an over-long composition is clamped to this many bytes
+    /// at a codepoint boundary instead of being rejected.
+    pub const composition_text_capacity = 512;
+
+    events: [capacity]InputEvent = undefined,
+    len: usize = 0,
+    /// Staged preedit, latest wins. `text` points into `composition_buf`, which this struct
+    /// owns — a caller's slice is only valid through the frame it was handed to, and staging
+    /// outlives that, so the bytes are copied rather than referenced.
+    composition: ?CompositionState = null,
+    composition_buf: [composition_text_capacity]u8 = undefined,
+    /// How often the clamp above dropped preedit bytes. Internal diagnostics: not a probe and
+    /// not part of the published surface.
+    composition_truncations: u32 = 0,
+
+    /// Hold one event until the next frame opens.
+    ///
+    /// A full buffer is compacted first (see `coalesce`, which merges adjacent pairs only, so a
+    /// buffer alternating motion and presses has nothing to merge). If nothing can be freed the
+    /// call panics, because the events left are ones whose loss would corrupt input state — a
+    /// dropped `mouse_up` leaves a button held down for the rest of the run — and failing here
+    /// is the only way that does not surface later as unexplained input behaviour.
+    pub fn pushEvent(self: *StagedInput, ev: InputEvent) void {
+        if (self.len == capacity and self.coalesce() == 0) {
+            @panic("gui: staged input capacity exceeded before a frame was opened");
+        }
+        self.events[self.len] = ev;
+        self.len += 1;
+    }
+
+    /// Hold the preedit until the next frame opens, copying its bytes.
+    pub fn setComposition(self: *StagedInput, state: CompositionState) void {
+        const kept = boundaryAtOrBefore(state.text, composition_text_capacity);
+        if (kept < state.text.len) self.composition_truncations += 1;
+        @memcpy(self.composition_buf[0..kept], state.text[0..kept]);
+        self.composition = .{
+            .active = state.active,
+            .text = self.composition_buf[0..kept],
+            // The caret is a byte offset into the text, so it follows the text through the clamp
+            // and, like it, has to land on a codepoint boundary.
+            .cursor = boundaryAtOrBefore(state.text[0..kept], @min(state.cursor, kept)),
+        };
+    }
+
+    /// Apply everything held to `input`, in arrival order, and hand back the staged preedit if
+    /// there was one. Call after `Input.beginFrame` has cleared the previous frame's edges, and
+    /// before any widget reads input.
+    pub fn drain(self: *StagedInput, input: *Input) ?CompositionState {
+        for (self.events[0..self.len]) |ev| input.pushEvent(ev);
+        self.len = 0;
+        const staged = self.composition;
+        self.composition = null;
+        return staged;
+    }
+
+    /// Merge adjacent events that carry no information apart from their newest value, and
+    /// report how many slots that freed. Motion collapses to where the pointer ended up and
+    /// wheel deltas add, which is exactly what applying them one by one would have produced;
+    /// presses, releases, keys and characters are discrete and never merge.
+    fn coalesce(self: *StagedInput) usize {
+        var write: usize = 0;
+        for (self.events[0..self.len]) |ev| {
+            if (write > 0) {
+                if (merge(&self.events[write - 1], ev)) continue;
+            }
+            self.events[write] = ev;
+            write += 1;
+        }
+        const freed = self.len - write;
+        self.len = write;
+        return freed;
+    }
+
+    /// Fold `next` into `prev` when the pair is redundant. Returns false if they must both stay.
+    fn merge(prev: *InputEvent, next: InputEvent) bool {
+        switch (prev.*) {
+            .mouse_move => switch (next) {
+                .mouse_move => {
+                    prev.* = next;
+                    return true;
+                },
+                else => return false,
+            },
+            .mouse_scroll => |p| switch (next) {
+                .mouse_scroll => |n| {
+                    prev.* = .{ .mouse_scroll = .{
+                        .x = n.x,
+                        .y = n.y,
+                        .dx = p.dx + n.dx,
+                        .dy = p.dy + n.dy,
+                        .modifiers = n.modifiers,
+                    } };
+                    return true;
+                },
+                else => return false,
+            },
+            else => return false,
+        }
+    }
+};
+
+/// The largest offset into `text` that is at most `limit` and does not split a UTF-8 sequence.
+/// Continuation bytes are 0b10xxxxxx, so walking back off them lands on the start of the
+/// codepoint the offset fell inside. An offset at or past the end of the text is the end.
+fn boundaryAtOrBefore(text: []const u8, limit: usize) usize {
+    var end = @min(limit, text.len);
+    while (end > 0 and end < text.len and text[end] & 0xC0 == 0x80) end -= 1;
+    return end;
+}
+
 /// long-lived. keys_* are GPA-backed ArrayLists (unmanaged).
 pub const Input = struct {
     alloc: Allocator,
@@ -487,4 +611,134 @@ test "Input: preserves char_input and key_down order, and resets each frame" {
 
     in.beginFrame();
     try std.testing.expectEqual(@as(usize, 0), in.orderedTextEvents().len);
+}
+
+test "StagedInput: events held outside a frame arrive in order once it opens" {
+    var in = Input.init(std.testing.allocator);
+    defer in.deinit();
+    var staged: StagedInput = .{};
+
+    staged.pushEvent(.{ .mouse_move = .{ .x = 10, .y = 20, .modifiers = 0 } });
+    staged.pushEvent(.{ .mouse_down = .{ .x = 10, .y = 20, .button = 0, .modifiers = 0 } });
+    staged.pushEvent(.{ .mouse_up = .{ .x = 12, .y = 22, .button = 0, .modifiers = 0 } });
+    staged.pushEvent(.{ .key_down = .{ .code = key.enter, .modifiers = 0, .repeat = false } });
+
+    // Nothing reaches Input before the frame opens.
+    try std.testing.expect(!in.mouse_pressed.left);
+
+    in.beginFrame();
+    try std.testing.expectEqual(@as(?CompositionState, null), staged.drain(&in));
+
+    // The press and release edges survive the frame boundary that used to discard them.
+    try std.testing.expect(in.mouse_pressed.left);
+    try std.testing.expect(in.mouse_released.left);
+    try std.testing.expect(in.wasPressed(key.enter));
+    try std.testing.expectEqual(@as(i32, 12), in.mouse_pos.x);
+    try std.testing.expectEqual(@as(i32, 10), in.mouse_pressed_pos.x);
+    try std.testing.expectEqual(@as(usize, 0), staged.len);
+}
+
+test "StagedInput: staging before a frame matches pushing inside it" {
+    const events = [_]InputEvent{
+        .{ .mouse_move = .{ .x = 5, .y = 5, .modifiers = 0 } },
+        .{ .mouse_down = .{ .x = 5, .y = 5, .button = 0, .modifiers = 0 } },
+        .{ .mouse_scroll = .{ .x = 5, .y = 5, .dx = 0, .dy = -3, .modifiers = 0 } },
+        .{ .char_input = .{ .codepoint = 'a', .modifiers = 0 } },
+    };
+
+    var direct = Input.init(std.testing.allocator);
+    defer direct.deinit();
+    direct.beginFrame();
+    for (events) |ev| direct.pushEvent(ev);
+
+    var through_staging = Input.init(std.testing.allocator);
+    defer through_staging.deinit();
+    var staged: StagedInput = .{};
+    for (events) |ev| staged.pushEvent(ev);
+    through_staging.beginFrame();
+    _ = staged.drain(&through_staging);
+
+    try std.testing.expectEqual(direct.mouse_pos, through_staging.mouse_pos);
+    try std.testing.expectEqual(direct.mouse_pressed.left, through_staging.mouse_pressed.left);
+    try std.testing.expectEqual(direct.scroll_delta.y, through_staging.scroll_delta.y);
+    try std.testing.expectEqual(direct.orderedTextEvents().len, through_staging.orderedTextEvents().len);
+}
+
+test "StagedInput: a full buffer of motion coalesces to the latest position" {
+    var staged: StagedInput = .{};
+    for (0..StagedInput.capacity) |i| {
+        staged.pushEvent(.{ .mouse_move = .{ .x = @intCast(i), .y = 0, .modifiers = 0 } });
+    }
+    try std.testing.expectEqual(StagedInput.capacity, staged.len);
+
+    // Pushing into a full buffer of motion collapses it rather than dropping anything.
+    staged.pushEvent(.{ .mouse_move = .{ .x = 999, .y = 0, .modifiers = 0 } });
+    try std.testing.expectEqual(@as(usize, 2), staged.len);
+
+    var in = Input.init(std.testing.allocator);
+    defer in.deinit();
+    in.beginFrame();
+    _ = staged.drain(&in);
+    try std.testing.expectEqual(@as(i32, 999), in.mouse_pos.x);
+}
+
+test "StagedInput: coalesced wheel keeps the total delta" {
+    var staged: StagedInput = .{};
+    for (0..StagedInput.capacity) |_| {
+        staged.pushEvent(.{ .mouse_scroll = .{ .x = 0, .y = 0, .dx = 0, .dy = -1, .modifiers = 0 } });
+    }
+    staged.pushEvent(.{ .mouse_scroll = .{ .x = 0, .y = 0, .dx = 0, .dy = -1, .modifiers = 0 } });
+
+    var in = Input.init(std.testing.allocator);
+    defer in.deinit();
+    in.beginFrame();
+    _ = staged.drain(&in);
+    const total: f32 = -@as(f32, @floatFromInt(StagedInput.capacity + 1));
+    try std.testing.expectEqual(total, in.scroll_delta.y);
+}
+
+test "StagedInput: discrete events are never merged away" {
+    var staged: StagedInput = .{};
+    // Motion between presses cannot merge across them, so the sequence keeps every edge.
+    for (0..StagedInput.capacity / 2) |i| {
+        staged.pushEvent(.{ .mouse_move = .{ .x = @intCast(i), .y = 0, .modifiers = 0 } });
+        staged.pushEvent(.{ .mouse_down = .{ .x = @intCast(i), .y = 0, .button = 0, .modifiers = 0 } });
+    }
+    const freed = staged.coalesce();
+    try std.testing.expectEqual(@as(usize, 0), freed);
+    try std.testing.expectEqual(StagedInput.capacity, staged.len);
+}
+
+test "StagedInput: composition is copied, latest wins, and clamps on a codepoint boundary" {
+    var staged: StagedInput = .{};
+    {
+        var scratch: [7]u8 = "preedit".*;
+        staged.setComposition(.{ .active = true, .text = &scratch, .cursor = 3 });
+        // Overwrite the caller's buffer: staging must not be looking at it any more.
+        @memset(&scratch, 'x');
+    }
+    try std.testing.expectEqualStrings("preedit", staged.composition.?.text);
+    try std.testing.expectEqual(@as(usize, 3), staged.composition.?.cursor);
+
+    const long = "あ" ** 300; // 900 bytes of 3-byte codepoints
+    staged.setComposition(.{ .active = true, .text = long, .cursor = long.len });
+    const kept = staged.composition.?.text;
+    try std.testing.expect(kept.len <= StagedInput.composition_text_capacity);
+    try std.testing.expectEqual(@as(usize, 0), kept.len % 3); // no split sequence
+    try std.testing.expectEqual(kept.len, staged.composition.?.cursor);
+    try std.testing.expectEqual(@as(u32, 1), staged.composition_truncations);
+}
+
+test "StagedInput: a caret inside a codepoint moves back to its start" {
+    var staged: StagedInput = .{};
+    // Byte 1 and byte 2 are continuation bytes of the first codepoint.
+    staged.setComposition(.{ .active = true, .text = "あい", .cursor = 2 });
+    try std.testing.expectEqual(@as(usize, 0), staged.composition.?.cursor);
+
+    staged.setComposition(.{ .active = true, .text = "あい", .cursor = 3 });
+    try std.testing.expectEqual(@as(usize, 3), staged.composition.?.cursor);
+
+    // A caret past the end lands on the end, which is always a boundary.
+    staged.setComposition(.{ .active = true, .text = "あい", .cursor = 99 });
+    try std.testing.expectEqual(@as(usize, 6), staged.composition.?.cursor);
 }

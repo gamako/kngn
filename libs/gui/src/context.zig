@@ -9,6 +9,11 @@
 //   beginFrame(w,h): arena.reset → input/id_stack/state.beginFrame → per_id_state.beginFrame
 //                    → draw_list.reset(w,h)  ※ w/h are logical size (not the physical fb)
 //                    → allocate the implicit layout-tree root on the arena (not yet measure/place this frame)
+//                    → apply input staged since the last frame (arrival order, edges already cleared)
+//   input:           pushEvent / setComposition may be called at any point in the loop. Inside a
+//                    frame they apply immediately; outside one they are staged and applied by the
+//                    next beginFrame, so forwarding platform events before opening the frame is
+//                    just as correct as forwarding them after (see StagedInput in input.zig).
 //   widget calls: sync hit-test against the previous-frame rect_cache (never the layout rects still under construction)
 //   endFrame():      measure → place → rect_cache.clearRetainingCapacity → updateRectCache
 //                    → emitNode (emit draw cmds) → frame_active=false
@@ -208,6 +213,9 @@ pub const Context = struct {
     /// Frame-local IME composition (preedit) state. Cleared in beginFrame;
     /// the app sets it every frame via setComposition before widget calls.
     composition: input_mod.CompositionState = .{},
+    /// Input pushed while no frame was open, waiting for the next beginFrame to apply it.
+    /// See `StagedInput` in input.zig for the contract.
+    staged_input: input_mod.StagedInput = .{},
     /// Nesting depth of `beginDisabled`/`endDisabled` (0 = not disabled). A scope, not a per-call
     /// option, because several widgets (checkbox/toggle/radio/textInputId) take no options struct
     /// today; wrapping a group of widgets is also the common case ("disable this whole section").
@@ -381,6 +389,10 @@ pub const Context = struct {
         } };
         self.layout_root = root;
         self.layout_current = root;
+        // Input that arrived before the frame opened. Applied here — after input.beginFrame has
+        // cleared the previous frame's edges, before any widget reads input — so that a caller
+        // may forward events either side of beginFrame and see the same result.
+        if (self.staged_input.drain(&self.input)) |staged| self.composition = staged;
     }
 
     pub fn endFrame(self: *Context) void {
@@ -456,16 +468,28 @@ pub const Context = struct {
         // Neither the arena nor draw_list is reset here (Context is the contract guardian).
     }
 
+    /// Hand one input event to the GUI. Callable at any point in the loop: inside a frame it
+    /// applies at once, outside one it is staged and applied by the next beginFrame, in arrival
+    /// order (see `StagedInput` in input.zig). Note that staged input reaches `ctx.input` only
+    /// when that frame opens, so reading `ctx.input` before beginFrame does not see it yet.
     pub fn pushEvent(self: *Context, ev: InputEvent) void {
-        std.debug.assert(self.frame_active);
-        self.input.pushEvent(ev);
+        if (self.frame_active) {
+            self.input.pushEvent(ev);
+        } else {
+            self.staged_input.pushEvent(ev);
+        }
     }
 
-    /// Set frame-local IME composition state. `text` is a borrowed slice owned by the caller
-    /// (valid through endFrame drawing). Does not accept platform types (ADR-007).
+    /// Set IME composition state. Inside a frame `text` is a borrowed slice owned by the caller
+    /// (valid through endFrame drawing); outside one the bytes are copied into the staging buffer
+    /// and applied by the next beginFrame, so the caller keeps no obligation past the call.
+    /// Does not accept platform types (ADR-007).
     pub fn setComposition(self: *Context, state: input_mod.CompositionState) void {
-        std.debug.assert(self.frame_active);
-        self.composition = state;
+        if (self.frame_active) {
+            self.composition = state;
+        } else {
+            self.staged_input.setComposition(state);
+        }
     }
 
     /// While a popup is open, background widgets' buttonBehavior never raises hover and
@@ -2197,4 +2221,39 @@ test "focus traversal: with the focus outside the order, next takes the first an
     tabEvent(&ctx, mod_bits.shift);
     ctx.endFrame();
     try std.testing.expectEqual(@as(Id, 3), ctx.state.focused_id);
+}
+
+test "Context: a click forwarded before the frame opens still reaches a widget" {
+    var ctx = testCtx();
+    defer ctx.deinit();
+
+    // The order a native loop makes natural: take the window's events, then open the frame.
+    ctx.pushEvent(.{ .mouse_move = .{ .x = 10, .y = 10, .modifiers = 0 } });
+    ctx.pushEvent(.{ .mouse_down = .{ .x = 10, .y = 10, .button = 0, .modifiers = 0 } });
+    ctx.pushEvent(.{ .mouse_up = .{ .x = 10, .y = 10, .button = 0, .modifiers = 0 } });
+
+    ctx.beginFrame(800, 600);
+    const r = buttonBehavior(&ctx, 1, btn_rect, full_clip);
+    try std.testing.expect(r.clicked);
+    ctx.endFrame();
+}
+
+test "Context: composition set before the frame opens survives the caller's buffer" {
+    var ctx = testCtx();
+    defer ctx.deinit();
+
+    {
+        var scratch: [7]u8 = "preedit".*;
+        ctx.setComposition(.{ .active = true, .text = &scratch, .cursor = 7 });
+        @memset(&scratch, 'x');
+    }
+    ctx.beginFrame(800, 600);
+    try std.testing.expect(ctx.composition.active);
+    try std.testing.expectEqualStrings("preedit", ctx.composition.text);
+    ctx.endFrame();
+
+    // Frame-local: the next frame starts with no preedit unless the caller sets one again.
+    ctx.beginFrame(800, 600);
+    try std.testing.expect(!ctx.composition.active);
+    ctx.endFrame();
 }
