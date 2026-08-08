@@ -194,6 +194,98 @@ because core cannot depend on libs (ADR-007 R2).
   returns `null` when no frame has arrived yet, and frames may be dropped. The `pixels`
   it returns stay valid **until the next `pollLatestFrame()` call**.
 
+## Getting started: opening the microphone
+
+The verbs table above names the shared convention generically (`requestPermission`,
+`open`); on the microphone these are the concrete names `audio.requestCapturePermission()`
+and `audio.openCapture()` (`audio` is `core/audio.zig`, reached as `kit.audio` — see the
+asymmetric names table above for the full correspondence with the camera facade).
+
+```zig
+const std = @import("std");
+const kit = @import("kit");
+const audio = kit.audio;
+
+/// Moves samples off the real-time capture callback so analysis (a tuner's pitch
+/// detector, an FFT, anything heavier than updating one atomic) runs on an ordinary
+/// frame instead. `kit.synth.SpscRing` is the same lock-free SPSC ring the GUI→Audio
+/// note queue uses (see docs/audio-and-synth.md), and the design the wasm capture
+/// backend's internal ring also uses to move blocks off its own real-time boundary.
+/// Capacity must be a power of two.
+const SampleRing = kit.synth.SpscRing(f32, 4096);
+var g_ring: SampleRing = .{};
+
+/// Runs on the capture callback. The execution context differs by backend: an
+/// OS-managed real-time thread on macOS (CoreAudio), a backend-owned real-time thread
+/// on Linux and Windows, and the application's own main-thread frame tick on wasm (see
+/// "The data plane" above). **No malloc, locking, IO or panic** on every backend — the
+/// same real-time contract as audio output (see docs/audio-and-synth.md and ADR-015).
+///
+/// `frame.samples` is a borrowed view, valid only for the duration of this call, so it
+/// is pushed onto the ring sample by sample rather than stored. It is already sized
+/// `frame.frames * frame.channels` and interleaved (`ch0,ch1,ch0,ch1,...` per frame
+/// when `channels > 1`), so it can be iterated directly.
+fn onAudioIn(frame: audio.AudioInFrame, userdata: ?*anyopaque) void {
+    _ = userdata;
+    for (frame.samples) |s| {
+        _ = g_ring.push(s); // never blocks; a full ring drops the newest sample instead
+    }
+}
+
+/// Opens the microphone for a native caller, where `requestCapturePermission()`
+/// settles synchronously on the first call (see "Permissions and errors" above). A
+/// wasm caller instead polls once per frame until that call stops returning
+/// `not_determined`, and only then opens the device — `apps/mic_demo/main.zig`'s
+/// `pollCaptureLifecycle` is the running version of that shape.
+pub fn openMicrophone(allocator: std.mem.Allocator) audio.CaptureError!audio.CaptureDevice {
+    const perm = try audio.requestCapturePermission();
+    if (perm != .granted) return error.PermissionDenied;
+
+    var device = try audio.openCapture(allocator, .{
+        .sample_rate = 48_000, // a hint; the actual value is read back below
+        .channels = 1,
+        .capture_callback = onAudioIn,
+    });
+
+    // `sample_rate` above is a hint — `device.config()` reports what the backend
+    // actually negotiated (a macOS microphone reports the hardware rate, for instance).
+    const effective = device.config();
+    std.debug.print("capturing at {d} Hz\n", .{effective.sample_rate});
+
+    device.start() catch |err| {
+        device.close(); // do not leak the opened device on a failed start()
+        return err;
+    };
+    return device;
+}
+```
+
+Outside the callback — in the ordinary per-frame code, never inside `onAudioIn` — drain
+the ring and feed whatever analysis the application runs:
+
+```zig
+fn drainAndAnalyze(analyzer: *Analyzer) void {
+    // wasm has no dedicated capture thread; `drainCaptureIfActive()` (a no-op on
+    // native) is what actually delivers buffered blocks into `onAudioIn` on that
+    // backend, so this call belongs here regardless of platform.
+    audio.drainCaptureIfActive();
+    while (g_ring.pop()) |sample| {
+        analyzer.feed(sample);
+    }
+}
+```
+
+`device.close()` disposes of the device once capture is done (see "Lifecycle" above);
+call it from the same thread that opened it, never from inside `onAudioIn` — calling
+`start()`, `stop()` or `close()` synchronously from the callback that is delivering for
+that same device is undefined behaviour on every backend.
+
+`apps/mic_demo/main.zig` is a complete, running version of this shape. It publishes a
+single RMS scalar through an atomic rather than a ring, because a level meter needs
+only the latest value; the ring shown here suits an analysis that processes accepted
+samples in order but can tolerate samples being dropped when the ring is full, such as
+a tuner's pitch tracker — not one that needs a bit-exact reconstruction of the input.
+
 ## The synthetic source
 
 `core/capture_synthetic.zig` is a fake microphone and camera reached **only through the
