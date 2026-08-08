@@ -36,7 +36,7 @@ apps  →  kit  →  libs  →  core  →  platform
 
 Do not import internal `platform.zig`, flux libraries (`paint`, `modular`, `viz`, …), or
 other non-kit modules from application sources. Build-time linking helpers under
-`build_helpers/` are the exception (see §4).
+`build_helpers/` are the exception (see §5).
 
 ## 3. The `Runtime(App)` shape
 
@@ -86,12 +86,96 @@ pub fn main(init: std.process.Init) !void {
 Wasm: a root with **no `main`** that only calls `enableWasmRuntime()` (see
 `template/src/wasm_root.zig`). Exports (`kngn_init` / `kngn_frame`) come from the runtime.
 
+### Native vs wasm at a glance
+
+| | Native | Wasm |
+|---|---|---|
+| Entry point | `pub fn main(init: std.process.Init) !void` calling `Rt.runNative(init)` | No `main`; the wasm root only calls `enableWasmRuntime()`. The runtime exports `kngn_init` / `kngn_frame`, driven by the browser's `requestAnimationFrame` |
+| Frame drive | `runNative`'s own loop calls `win.pollEvents()`, then `app.frame(...)`, paced once per iteration by `framePaceUntil` | `kngn_frame(now_ms)` calls `win.pollEvents()` itself before `app.frame(...)`; no pacing call — the browser paces through rAF |
+| CLI arguments | Available as `init.minimal.args` (`std.process.Args`), but only inside `main` — `Runtime(App)` forwards `init`'s `gpa`/`io` to `App.init`, not the arguments, so an app that wants them reads `init.minimal.args` in its own `main` before calling `Rt.runNative` | None: a page has no argv |
+| Microphone permission | `kit.audio.requestCapturePermission()` / `openCapture()`; the native backend prompts the OS directly and settles on the first call | The same two facade calls; internally poll-driven — the first call starts the browser's `getUserMedia()`, returns `.not_determined` while its promise is in flight, and a later poll observes the settled `.granted`/`.denied`. Requires `audio = .worklet_shared` (`SharedArrayBuffer`, COOP/COEP) at build time; output transport and microphone capture are separate concerns that happen to share that one build choice (see [`docs/capture.md`](capture.md) and [ADR-027](adr/027_wasm-microphone-capture.md)) |
+| Window size source | The OS window's client size, fixed by `Window.create`/`createWithOptions` until something resizes it | The canvas element's live CSS box, reported continuously through `kngn_resize` (see §8) |
+
+**Where a configuration value comes from is a different question on each side.** Native has a
+command line the parent process controls; wasm has none, so a setting an app wants to vary per
+deployment moves to one of these instead:
+
+- **Page markup**: an HTML `data-*` attribute or a query-string parameter the page's own script
+  reads and forwards through an export — the audio transport selection in `WasmAppSpec` follows
+  this shape (see [`docs/wasm-deploy.md`](wasm-deploy.md)).
+- **`comptime` / a build option**: baked into the wasm module at `zig build` time (`-D...`), the
+  same mechanism a native build already has, just resolved once per artefact instead of once per
+  process.
+- **An explicit export**: a Zig `export fn` the JS glue calls after `kngn_init`, for a value that
+  is only known in the browser (`devicePixelRatio`, a permission result, a canvas id).
+
+There is no argv equivalent on wasm; each setting picks one of the three above individually.
+
 The framebuffer's pixel format is canonical BGRA: each `u32` in `fb.pixels` is `0xAARRGGBB`
 (little-endian memory order `[B,G,R,A]`), the same format on every backend including wasm.
 
 Full-pixel fills use `kit.pixelops.fill32` (never `@memset` on the framebuffer).
 
-## 4. Native build
+## 4. Runtime + GUI + event forwarding order
+
+A GUI application layers `libs/gui`'s `Context` on top of `Runtime(App)`'s `frame` callback. The
+two halves have their own lifecycle rules — `Context.beginFrame`/`endFrame` bracket a frame,
+independently of how often `frame` itself is called — and getting the order wrong compiles
+cleanly and fails only once a real event lands.
+
+**`pollEvents()` is the runtime's job, not the app's.** `runNative`'s loop calls it once before
+every `app.frame(...)`, and `kngn_frame` does the same on wasm; `App.frame` never calls it. What
+`App.frame` does own is everything from there to `present`:
+
+```text
+Runtime (already done before app.frame runs):
+  win.pollEvents()
+
+App.frame(win, now):
+  win.lockFramebuffer()                     -> fb, or null: return early, retry next frame
+  ctx.beginFrame(                            -- logical size (see §7); opens the window
+    fb.logical_size.width,                  -- pushEvent/setComposition need
+    fb.logical_size.height,
+  )
+    while (win.nextEvent()) |ev| {
+      ...                                    -- the app's own switch on ev, if it wants one
+      ctx.pushEvent(toGuiEvent(ev))          -- and/or ctx.setComposition(ime_state)
+    }
+    ctx.<widget calls>                       -- Button/Label/Slider/... build this frame's tree
+  ctx.endFrame()                             -- closes the window; layout and draw cmds are final
+  gui.render(target, &ctx.draw_list, ctx.font, scale)
+                                              -- scale: fb.content_scale under .physical, 1.0 under .logical
+  win.present()
+  fb.unlock()                                -- via defer, right after lockFramebuffer
+```
+
+**Where input may be handed over**: anywhere in the loop. `pushEvent` and `setComposition`
+called inside a frame apply to that frame; called outside one they are staged and applied by
+the next `beginFrame`, in arrival order, before any widget reads input
+([ADR-028](adr/028_gui-input-staging-outside-a-frame.md)). Draining the window's event queue
+before opening the frame — the order a native loop makes natural — is therefore correct, and so
+is draining it after. What follows from that:
+
+- An event forwarded after `endFrame` is not lost; it takes effect on the next frame, which is
+  the earliest frame that could have shown a response to it anyway.
+- The frame itself still has a lifecycle: once `beginFrame` has run, `endFrame` always follows
+  before `frame` returns — never skipped, never called twice in a row. (A `frame` call that
+  returns early because `lockFramebuffer` found no slot, as in the pseudocode above, never
+  enters this pair at all — there is nothing to close.)
+- Widget calls, unlike input, belong strictly between the two. Building widgets outside a frame
+  is a contract violation with no meaningful behaviour to fall back on.
+
+Staging is bounded (a fixed buffer): a caller that forwards input but stops opening frames
+eventually exceeds it and gets a panic rather than a queue that grows forever or silently
+discarded clicks. Opening a frame each time round the loop is all it takes to stay clear of it.
+
+**The runnable reference** is [`template/src/main.zig`](../template/src/main.zig), which wires
+this exact order end to end and is compiled and unit-tested by `zig build gate` in `template/`
+(part of this repository's own `-Dinstall-all=true`). Read it rather than keeping a second copy
+here — a doc-only example drifts the moment either side changes, while a compiled one is caught
+by the gate.
+
+## 5. Native build
 
 - `.path` (or fetch) dependency on kngn with matching `target` / `optimize` / `platform`
 - `exe.root_module.addImport("kit", dep.module("kit"))`
@@ -129,7 +213,7 @@ Full-pixel fills use `kit.pixelops.fill32` (never `@memset` on the framebuffer).
 Do not restate the full `build.zig` here — copy and read [`template/build.zig`](../template/build.zig).
 Backend matrix and host packages: [`docs/build.md`](build.md).
 
-## 5. Harness probes and actions
+## 6. Harness probes and actions
 
 Register observation and control through `kit.platform`:
 
@@ -151,7 +235,41 @@ snapshot fb
 quit
 ```
 
-## 6. Wasm and web packaging
+## 7. HiDPI: five concepts, one relationship
+
+Five quantities interact once a window's content scale is not 1, each documented in full on its
+own elsewhere: the coordinate model and the framebuffer modes are
+[ADR-011](adr/011_high-dpi-coordinates-and-fb-modes.md); the web's DPR and clamping contract is
+in [`docs/wasm-deploy.md`](wasm-deploy.md). This section only states how the five relate, so an
+app author does not have to reconstruct that relationship from two other documents.
+
+| Quantity | What it is | Where it comes from |
+|---|---|---|
+| Logical size | What the GUI lays out and hit-tests against | `fb.logical_size` (or `window.logicalSize()` outside a frame) |
+| `fb.width` / `fb.height` | The framebuffer `lockFramebuffer()` hands back, in physical pixels | Equal to the logical size under `.logical`; `round(logical size × content_scale)` under `.physical` |
+| `content_scale` | The window's real content scale (device pixel ratio) — independent of `fb_mode`, unlike the row above | `fb.content_scale` (or `window.contentScale()` outside a frame) |
+| `WindowOptions.fb_mode` | `.logical` (default; the OS/browser upscales the rendered framebuffer) or `.physical` (allocate at `content_scale`, crisp) | A `windowBootstrap` choice (§3) |
+| `gui.render`'s `scale` argument | Where the logical draw list is baked to physical pixels | That same frame's `fb.content_scale` under `.physical`; `1.0` under `.logical` (the renderer stays 1:1 and lets the OS/browser do the upscale) |
+
+**The rule**: `ctx.beginFrame` always takes the **logical** size — `fb.logical_size.width` /
+`.height`, not `fb.width` / `fb.height` — so application and GUI code stay in logical
+coordinates throughout, under either mode. `content_scale` reports the real device pixel ratio
+under **both** modes (a retina display still reports `2.0` while `fb_mode` is `.logical`); only
+the framebuffer's *own size* — and what `gui.render`'s `scale` argument must be — depends on the
+mode. Under `.physical`, `fb.width`/`.height` is `round(logical size × content_scale)` and `render`'s
+`scale` must be that same frame's `fb.content_scale`; passing a mismatched value still produces
+an internally consistent draw list, just baked at the wrong physical size, so it under- or
+over-fills the framebuffer it was just handed. Under `.logical`, `fb.width`/`.height` **is** the
+logical size regardless of `content_scale`, and `render`'s `scale` is the constant `1.0` — the
+renderer draws once at logical resolution and leaves the upscale to the OS or browser, which is
+also why a `.logical`-only app never needs to look at `content_scale` at all.
+
+If manual drawing writes into `fb.pixels` directly instead of going through `gui.render` (games,
+`33_camera`), the same physical-pixel framebuffer is what is written; `libs/gfx`'s
+`ScreenTransform` (ADR-011 R6) is the shared helper for that logical-to-physical conversion, kept
+separate from `gfx.Camera` so a scale change never alters how much of the world is visible.
+
+## 8. Wasm and web packaging
 
 Use the shared helpers in vendored `build_helpers/consumer.zig` — do **not** fork
 pixie/synth linker internals.
@@ -198,7 +316,47 @@ to match it, or give it neither a `width`/`height` attribute nor a CSS box at al
 `template/web/template.html` does — within the `[320, 8192]` clamp range: see
 [`docs/wasm-deploy.md`](wasm-deploy.md) for that and the rest of the DPR/clamping contract.
 
-## 7. Verification and iteration
+### `web/*.html` vs `zig-out/web/*.html`, and why `file://` does not open the multi-file build
+
+`template/web/template.html` is the **source** you edit. `zig build package-web` copies it
+(with the compiled wasm and the shared JS glue) into `zig-out/web/` — the **built artefact**
+you actually run; edits to the source only take effect after the next `package-web`.
+
+Opening that built HTML directly (`file:///.../zig-out/web/template.html`) does not run the
+app: the page loads its glue with `<script type="module" src="./kngn.js">`, and a browser's ES
+module loader refuses to fetch a relative `file://` path as a cross-origin request, so `kngn.js`
+never loads. Serve the directory over HTTP instead:
+
+```bash
+cd template
+zig build package-web              # writes template/zig-out/web/
+cd zig-out/web
+python3 -m http.server 8080
+# open http://localhost:8080/template.html
+```
+
+Confirm it actually ran by checking the server's access log for a **200 GET of `template.wasm`**
+(the exit code of `zig build package-web` alone does not prove the page loaded — see
+[`docs/wasm-deploy.md`](wasm-deploy.md)).
+
+The template itself needs nothing more than `http.server`. An app whose audio transport needs
+`SharedArrayBuffer` (`.worklet_shared`) needs cross-origin isolation instead, so it serves the
+same directory with the packaged `serve-coop-coep.py` in place of `http.server`:
+
+```bash
+python3 serve-coop-coep.py 8080
+```
+
+`zig build package-web-single` instead embeds the wasm and glue into one self-contained
+`*.single.html`, which **does** open directly from `file://` — but only because it makes no
+external fetch, and that only holds for an audio transport that does not need
+`SharedArrayBuffer` (`.none`, the template's own choice, or `.worklet_postmessage`).
+`.worklet_shared` needs cross-origin isolation headers that a single local file can never carry,
+so pairing it with `package-web-single` is a **build-time error**, not something to debug at
+run time (the full delivery matrix, including GitHub Pages and Cloudflare/Netlify, is in
+[`docs/wasm-deploy.md`](wasm-deploy.md)).
+
+## 9. Verification and iteration
 
 | Command | What it checks |
 |---|---|
@@ -223,7 +381,7 @@ GET of the `.wasm` file (see [`docs/wasm-deploy.md`](wasm-deploy.md)).
 When reporting problems, include target OS, `-Dplatform` backend, Zig version, and the
 exact command line.
 
-## 8. Editor-shaped applications
+## 10. Editor-shaped applications
 
 If the application has documents, edits and undo, there is a further rail — a command model
 with actors and transactions, a contract for what an operation may refer to, storage for
