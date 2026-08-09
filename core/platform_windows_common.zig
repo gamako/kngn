@@ -13,13 +13,15 @@
 //! What is backend specific (the presentation resources, the lock and present that produce a
 //! `Framebuffer`, the resource lifecycle) stays in each backend's file. `Core` is stored in GWLP_USERDATA and fetched as a `*Core` from the WndProc.
 //!
-//! Nothing here changes behaviour: it is a pure move out of the earlier single-file GDI implementation.
-//!
 //! `WM_DROPFILES` is a stub: neither the registration nor the handling is implemented.
 //! `Event.file_drop` exists as a type, but this backend never produces one.
 //!
 //! HiDPI and `.physical`:
-//! - `SetThreadDpiAwarenessContext(PMv2)` is applied temporarily, only while creating a `.physical` window (`.logical` keeps the start-up awareness).
+//! - `SetThreadDpiAwarenessContext(PMv2)` is applied temporarily around **any** geometry work on a
+//!   `.physical` window (`.logical` keeps the start-up awareness): creation holds it until the
+//!   post-creation measurements are done, and a fullscreen transition takes it again. Win32
+//!   geometry APIs speak the calling thread's DPI space, so a window measured or moved from the
+//!   wrong context is off by the scale.
 //! - Making input raw, and content_scale, branch on the real awareness (`GetWindowDpiAwarenessContext`), not on fb_mode.
 //! - When `.logical` degrades onto PMv2, content_scale is forced to 1.0 (the size contract).
 //! - WM_SIZE and WM_DPICHANGED only mark things pending → they are committed together at the `lockFramebuffer` boundary.
@@ -340,6 +342,41 @@ pub fn roundToPhysicalPx(logical_px: u32, scale: f32) u32 {
     return @intFromFloat(v);
 }
 
+/// A DPI reading with the platform's fallback applied: every DPI query answers 0 when it cannot
+/// tell, and 96 is the value the whole Win32 DPI story is defined against.
+fn dpiOr96(dpi: UINT) UINT {
+    return if (dpi == 0) 96 else dpi;
+}
+
+/// The system-wide DPI, with the same fallback.
+fn systemDpiOr96() UINT {
+    return dpiOr96(GetDpiForSystem());
+}
+
+/// Grows a client size into the outer window frame that `style` and `ex_style` need around it.
+///
+/// `dpi` selects which metrics apply: a per-monitor-aware window passes the DPI it lives at, and
+/// null takes the system-wide metrics, which is what a window that is not per-monitor aware gets.
+/// Passing the wrong one produces decorations sized for a different display — a window that misses
+/// the size it was asked for. Returns null when the platform refuses to compute the frame; each
+/// caller decides what that means for it.
+///
+/// Hot path declaration: window creation and fullscreen transitions only.
+fn frameForClient(client_w: u32, client_h: u32, style: DWORD, ex_style: DWORD, dpi: ?UINT) ?RECT {
+    var rect = RECT{
+        .left = 0,
+        .top = 0,
+        .right = @intCast(client_w),
+        .bottom = @intCast(client_h),
+    };
+    const ok = if (dpi) |d|
+        AdjustWindowRectExForDpi(&rect, style, 0, ex_style, d)
+    else
+        AdjustWindowRectEx(&rect, style, 0, ex_style);
+    if (ok == 0) return null;
+    return rect;
+}
+
 /// The window style a set of options asks for. Fullscreen and borderless are undecorated
 /// (`WS_POPUP`), where resizing has no frame to grab in the first place; a decorated window drops
 /// `WS_THICKFRAME` (the resizing border) and `WS_MAXIMIZEBOX` (which would resize it another way)
@@ -392,6 +429,28 @@ fn scaleFromDpi(dpi: UINT) f32 {
 
 fn isPmv2Context(ctx: DPI_AWARENESS_CONTEXT) bool {
     return AreDpiAwarenessContextsEqual(ctx, DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2) != 0;
+}
+
+/// Runs geometry work in the DPI context the window itself lives in, and gives back what was there.
+///
+/// Every Win32 geometry API — `SetWindowPos`, `GetWindowRect`, `GetSystemMetrics` — reads and
+/// reports coordinates in the **calling thread's** DPI space, not the window's. Driving a
+/// per-monitor-aware window from a thread that is not doubles physical pixels on the way in and
+/// halves them on the way out, so a window asked for 3866px wide is placed at 7732 and then
+/// clamped to the monitor. Creation already avoids this by holding the aware context until its own
+/// geometry work is finished; anything that moves or measures the window later has to do the same.
+///
+/// Hot path declaration: event time only (a fullscreen transition).
+fn enterWindowDpiScope(is_pmv2: bool) DPI_AWARENESS_CONTEXT {
+    if (!is_pmv2) return null;
+    return SetThreadDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
+}
+
+/// The other half of `enterWindowDpiScope`. A null previous context means the switch never
+/// happened (the window is not per-monitor aware, or the platform refused), so nothing is undone.
+fn leaveWindowDpiScope(previous: DPI_AWARENESS_CONTEXT) void {
+    if (previous == null) return;
+    _ = SetThreadDpiAwarenessContext(previous);
 }
 
 /// Restore the thread awareness that was switched while creating a `.physical` window back to the context held at init.
@@ -615,11 +674,12 @@ pub const Core = struct {
             create_as_pmv2 = isPmv2Context(GetThreadDpiAwarenessContext());
         }
 
-        // The initial scale estimate (before creation). Only `.physical` plus PMv2 uses it for the physical client. GetDpiForWindow settles it after creation.
-        var create_scale: f32 = 1.0;
-        if (create_as_pmv2) {
-            create_scale = scaleFromDpi(GetDpiForSystem());
-        }
+        // One DPI snapshot taken before the window exists, used for everything creation derives from
+        // it: the scale estimate below and the non-client metrics of every frame computed here. A
+        // window that is not per-monitor aware has no DPI of its own, so `null` selects the
+        // system-wide metrics instead. `GetDpiForWindow` settles the real value after creation.
+        const frame_dpi: ?UINT = if (create_as_pmv2) systemDpiOr96() else null;
+        const create_scale: f32 = if (frame_dpi) |d| scaleFromDpi(d) else 1.0;
 
         // Fullscreen resolves its own size from the primary monitor, and the metrics are read
         // **after** the awareness switch above: DPI virtualisation makes what GetSystemMetrics
@@ -658,24 +718,11 @@ pub const Core = struct {
                 pos_y = pos.y;
             }
             if (!borderless) {
-                // Compute the outer size so that the client area is client_w×client_h.
-                // `.physical` (PMv2) uses the DPI-aware variant, and everything else the ordinary AdjustWindowRectEx.
-                var rect = RECT{ .left = 0, .top = 0, .right = @intCast(client_w), .bottom = @intCast(client_h) };
-                if (create_as_pmv2) {
-                    const dpi: UINT = blk: {
-                        const d = GetDpiForSystem();
-                        break :blk if (d == 0) 96 else d;
-                    };
-                    if (AdjustWindowRectExForDpi(&rect, style, 0, ex_style, dpi) == 0) {
-                        restoreThreadDpiAwareness();
-                        return error.WindowCreationFailed;
-                    }
-                } else {
-                    if (AdjustWindowRectEx(&rect, style, 0, 0) == 0) {
-                        restoreThreadDpiAwareness();
-                        return error.WindowCreationFailed;
-                    }
-                }
+                // Grow the requested client area into the outer size the decorations need.
+                const rect = frameForClient(client_w, client_h, style, ex_style, frame_dpi) orelse {
+                    restoreThreadDpiAwareness();
+                    return error.WindowCreationFailed;
+                };
                 outer_w = rect.right - rect.left;
                 outer_h = rect.bottom - rect.top;
             }
@@ -689,9 +736,15 @@ pub const Core = struct {
         const windowed_style: DWORD = windowStyleFor(false, borderless, opts.resizable);
         const windowed_client_w: u32 = if (!fullscreen) client_w else if (create_as_pmv2) roundToPhysicalPx(logical_w, create_scale) else logical_w;
         const windowed_client_h: u32 = if (!fullscreen) client_h else if (create_as_pmv2) roundToPhysicalPx(logical_h, create_scale) else logical_h;
+        // The same metrics the creation frame above is computed with: a seed that disagreed with them
+        // would put the window back at a size the caller never asked for.
         var windowed_frame = RECT{ .left = 0, .top = 0, .right = @intCast(windowed_client_w), .bottom = @intCast(windowed_client_h) };
         // Best effort: when the frame cannot be computed the client rect stands in for it.
-        if (!borderless) _ = AdjustWindowRectEx(&windowed_frame, windowed_style, 0, ex_style);
+        if (!borderless) {
+            if (frameForClient(windowed_client_w, windowed_client_h, windowed_style, ex_style, frame_dpi)) |fr| {
+                windowed_frame = fr;
+            }
+        }
         if (opts.position) |pos| {
             const fw = windowed_frame.right - windowed_frame.left;
             const fh = windowed_frame.bottom - windowed_frame.top;
@@ -835,19 +888,11 @@ pub const Core = struct {
                 const cur_w: u32 = @intCast(@max(cr0.right - cr0.left, 0));
                 const cur_h: u32 = @intCast(@max(cr0.bottom - cr0.top, 0));
                 if (cur_w != final_fb.width or cur_h != final_fb.height) {
-                    const dpi: UINT = blk: {
-                        const d = GetDpiForWindow(hwnd);
-                        break :blk if (d == 0) 96 else d;
-                    };
+                    // The settled DPI, not the estimate: the window exists now and can be asked directly.
+                    const dpi: UINT = dpiOr96(GetDpiForWindow(hwnd));
                     var wr = RECT{ .left = 0, .top = 0, .right = 0, .bottom = 0 };
                     if (GetWindowRect(hwnd, &wr) != 0) {
-                        var rect = RECT{
-                            .left = 0,
-                            .top = 0,
-                            .right = @intCast(final_fb.width),
-                            .bottom = @intCast(final_fb.height),
-                        };
-                        if (AdjustWindowRectExForDpi(&rect, style, 0, ex_style, dpi) != 0) {
+                        if (frameForClient(final_fb.width, final_fb.height, style, ex_style, dpi)) |rect| {
                             const ow = rect.right - rect.left;
                             const oh = rect.bottom - rect.top;
                             _ = SetWindowPos(hwnd, null, wr.left, wr.top, ow, oh, SWP_NOZORDER | SWP_NOACTIVATE);
@@ -981,6 +1026,13 @@ pub const Core = struct {
         if (self.fullscreen == enable) return;
         if (self.transparent) return;
         if (enable) {
+            // Read outside the scope below: the geometry an application persists is logical, and
+            // `getGeometry` reports the position in the calling thread's space.
+            const windowed_geo = self.getGeometry();
+
+            const dpi_scope = enterWindowDpiScope(self.is_pmv2);
+            defer leaveWindowDpiScope(dpi_scope);
+
             const sw = GetSystemMetrics(SM_CXSCREEN);
             const sh = GetSystemMetrics(SM_CYSCREEN);
             if (sw <= 0 or sh <= 0) return; // the monitor metrics are unreadable: stay windowed
@@ -989,7 +1041,6 @@ pub const Core = struct {
             var wr = RECT{ .left = 0, .top = 0, .right = 0, .bottom = 0 };
             if (GetWindowRect(self.hwnd, &wr) != 0) self.windowed_frame = wr;
             self.windowed_style = @truncate(@as(usize, @bitCast(GetWindowLongPtrW(self.hwnd, GWL_STYLE))));
-            const windowed_geo = self.getGeometry();
             self.restore.observe(false, windowed_geo); // the last windowed geometry
             self.restore.observe(true, windowed_geo); // from here on the window is the screen
             self.fullscreen = true;
@@ -998,6 +1049,9 @@ pub const Core = struct {
             _ = SetWindowLongPtrW(self.hwnd, GWL_STYLE, @bitCast(@as(usize, windowStyleFor(true, false, true) | WS_VISIBLE)));
             _ = SetWindowPos(self.hwnd, null, 0, 0, sw, sh, SWP_FRAMECHANGED | SWP_NOACTIVATE);
         } else {
+            const dpi_scope = enterWindowDpiScope(self.is_pmv2);
+            defer leaveWindowDpiScope(dpi_scope);
+
             self.fullscreen = false;
             _ = SetWindowLongPtrW(self.hwnd, GWL_STYLE, @bitCast(@as(usize, self.windowed_style | WS_VISIBLE)));
             const fr = self.windowed_frame;
@@ -1777,4 +1831,39 @@ test "windowStyleFor: only a decorated resizable window carries the resizing sty
     try std.testing.expectEqual(BORDERLESS_STYLE, windowStyleFor(true, false, false));
     try std.testing.expectEqual(BORDERLESS_STYLE, windowStyleFor(false, true, true));
     try std.testing.expectEqual(BORDERLESS_STYLE, windowStyleFor(false, true, false));
+}
+
+test "frameForClient: the decoration a frame gets is sized by the DPI it is asked for" {
+    const style = windowStyleFor(false, false, true);
+    const client_w: u32 = 640;
+    const client_h: u32 = 480;
+
+    // These are always-present Win32 entry points: a null here is a failure to report, not a
+    // reason to pass the test quietly.
+    const at_96 = frameForClient(client_w, client_h, style, 0, 96) orelse return error.TestUnexpectedResult;
+    const at_192 = frameForClient(client_w, client_h, style, 0, 192) orelse return error.TestUnexpectedResult;
+
+    // A decorated window is larger than its client area at any DPI, and the decoration scales with
+    // the DPI: an implementation that ignored the argument would produce two identical frames.
+    try std.testing.expect(at_96.right - at_96.left > @as(i32, @intCast(client_w)));
+    try std.testing.expect(at_192.right - at_192.left > at_96.right - at_96.left);
+    try std.testing.expect(at_192.bottom - at_192.top > at_96.bottom - at_96.top);
+}
+
+test "frameForClient: an undecorated window is its client area, at every DPI" {
+    const style = windowStyleFor(false, true, true);
+    const client_w: u32 = 640;
+    const client_h: u32 = 480;
+
+    for ([_]?UINT{ null, 96, 144, 192 }) |dpi| {
+        const frame = frameForClient(client_w, client_h, style, 0, dpi) orelse return error.TestUnexpectedResult;
+        try std.testing.expectEqual(@as(i32, @intCast(client_w)), frame.right - frame.left);
+        try std.testing.expectEqual(@as(i32, @intCast(client_h)), frame.bottom - frame.top);
+    }
+}
+
+test "dpiOr96 substitutes the reference DPI for a reading the platform could not make" {
+    try std.testing.expectEqual(@as(UINT, 96), dpiOr96(0));
+    try std.testing.expectEqual(@as(UINT, 96), dpiOr96(96));
+    try std.testing.expectEqual(@as(UINT, 192), dpiOr96(192));
 }
