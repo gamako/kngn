@@ -1,0 +1,22 @@
+# Drives the fullscreen transition both ways, through the action and through a key, and observes
+# each result with the probe. Run it display-less:
+#   KNGN_HEADLESS=1 KNGN_HARNESS_SCRIPT=examples/23_fullscreen/e2e.txt zig build run-example_23
+# Each request is followed by `await`, not a fixed number of frames: a backend whose transition is
+# asynchronous (a macOS window transition, a Wayland configure) settles when it settles, and a fixed
+# wait would either race it or slow every other backend down to its worst case.
+expect fullscreen state=on
+
+action fullscreen off
+await fullscreen state=off 60
+
+action fullscreen on
+await fullscreen state=on 60
+
+# The same transition from the key the demo binds, so the toggle branch is covered too.
+inject key_down F
+await fullscreen state=off 60
+
+inject key_down F
+await fullscreen state=on 60
+
+quit

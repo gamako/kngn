@@ -428,6 +428,14 @@ for a shared command unit across undo and networking.
   `apps/editor/apps/pixie/main.zig` (dispatch plus `registerActions`) and `actions.zig`
   (a pure parser, testable without App or kit). The detailed action-to-undo-command
   table is in the doc comment of that section of `main.zig`.
+- **The fullscreen example's pair** (`examples/23_fullscreen`): the `fullscreen` probe
+  reports `state=on|off fb=<w>x<h>`, and the `fullscreen` action takes `on` or `off` and
+  answers `ok state=<reached>`. Both read the window rather than a remembered value, so a
+  backend whose transition is asynchronous never reports a state it has not reached. The
+  argument vocabulary is declared for discovery but checked in the callback, since the
+  registry interprets nothing. `examples/23_fullscreen/e2e.txt` drives the transition both
+  ways — once through the action and once through the key the demo binds — and is the
+  display-less way to exercise leaving fullscreen.
 
 ## Using it: replay (the file transport)
 
