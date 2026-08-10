@@ -300,24 +300,46 @@ pub inline fn srcOverStraight4(dst: Vec16u8, src: Vec16u8, opacity: u8) Vec16u8 
 // `@memset` on a `[]u32` becomes the target's bulk fill (libc `memset`, wasm `memory.fill`)
 // only when the compiler can see that the four bytes of the value are equal. Any other
 // pattern — a background colour such as `0xFF12161B`, or *any* value that is not a
-// compile-time constant — becomes a scalar four-byte store loop, which runs at a fraction
-// of the achievable store bandwidth (`zig build bench-fill` reports both). `fill32`
-// therefore picks its lowering itself: a byte-wide `@memset` when the bytes repeat,
-// otherwise one seeded block replicated by `@memcpy`, which is the target's bulk copy and
-// reads a source block small enough to stay in cache, so only the writes reach memory.
-// `fillRect32` is the strided form and replicates the first row.
+// compile-time constant — cannot be expressed as one byte-valued fill, and on the
+// configuration `bench-fill` measures it becomes a scalar four-byte store loop instead,
+// which runs at a fraction of the achievable store bandwidth (`zig build bench-fill`
+// reports both). For the patterns measured, what differs is the lowering the compiler
+// picks, not what the scalar loop's own store costs for one value rather than another.
+// `fill32` therefore picks its lowering itself: a byte-wide `@memset` when the bytes
+// repeat, otherwise one seeded block replicated by `@memcpy`, which is the target's bulk
+// copy and reads a source block small enough to stay in cache, so only the writes reach
+// memory. `fillRect32` is the strided form and replicates the first row.
+//
+// **How much it wins depends on the length of each contiguous run.** For a value that is
+// not byte-repeated, one call is a seed of up to `fill_block_px` pixels followed by a bulk
+// copy of the rest, so the seed is a fixed cost *per call*, not per area. A run of about
+// one block gains nothing; the ratio approaches the bulk copy's as a run grows to several
+// blocks. Two fills covering the same area therefore differ by how they are called:
+// `fillRect32` seeds once per rectangle — a full-width one is a single contiguous run —
+// and copies the remainder, while a gradient whose colour changes every row is one run per
+// row and pays the seed on every one of them. A byte-repeated value is outside this model
+// — it is a single byte-wide `@memset`. The measured ratio against run length is
+// `zig build bench-fill`'s "contiguous runs" section, and docs/performance-measurement.md
+// records it.
 //
 // **Which call sites to convert.** `@memset(dst, <constant whose four bytes are equal>)`
 // — `0`, `0xFFFFFFFF` — is already the fastest form there is; leave those alone. Every
 // other large u32 write is worth converting: a framebuffer clear, a full-width strip
-// background, a wide opaque rectangle. Small regions lose nothing by going through
-// `fill32` (below one block it *is* a single `@memset`), so a caller that cannot know its
-// value or size up front can always call it.
+// background, a wide opaque rectangle. A small region going through `fill32` does not pay
+// for a replicated block (below one block it *is* a single `@memset`), so a caller that
+// cannot know its value or size up front can always call it.
+//
+// **Replacing it with something narrower.** A caller that can fix the target and knows the
+// shape of its fill may beat this; the two things to check are that the disassembly really
+// contains the store width intended (writing a vector form is not the same as getting one)
+// and that the result beats `bench-fill` for the same run length.
 
 /// Size of the source block `fill32` replicates: small enough to stay in the nearest cache,
 /// large enough to amortise a bulk-copy call. A run shorter than this is filled by the
-/// seeding `@memset` alone. It is a tuned default, not a proven optimum — the measurements
-/// behind the number are in docs/performance-measurement.md.
+/// seeding `@memset` alone. That seed is the `@memset` phase, and for a value that is not
+/// byte-repeated it is the scalar path on the measured configuration, which is why the gain
+/// depends on how long each run is. It is a tuned default, not a proven optimum — the
+/// measurements behind the number are in docs/performance-measurement.md.
 const fill_block_px: usize = 1024;
 
 /// True when the four bytes of `value` are equal, so the region can be filled by a

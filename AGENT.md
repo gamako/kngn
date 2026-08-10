@@ -415,8 +415,9 @@ loop.
 **Filling a large area with one u32: use `pixelops.fill32` / `fillRect32`, not `@memset`.**
 `@memset` on a `[]u32` becomes the target's bulk fill (libc `memset`, wasm `memory.fill`)
 only when the compiler can see that the four bytes of the value are equal; a background
-colour such as `0xFF12161B`, or any value that is not a compile-time constant, becomes a
-scalar four-byte store loop instead. Measured
+colour such as `0xFF12161B`, or any value that is not a compile-time constant, cannot be
+expressed as one byte-valued fill, and on the configuration below it becomes a scalar
+four-byte store loop instead. Measured
 with `zig build bench-fill` on aarch64-macos at 21.1MB: `@memset` 1.79ms (11.8 GB/s)
 against `fill32` 0.35ms (60 GB/s). The decision rule:
 
@@ -426,8 +427,13 @@ against `fill32` 0.35ms (60 GB/s). The decision rule:
 | Anything else over a large area (a framebuffer clear, a strip background, a wide opaque rectangle) | `pixelops.fill32` / `fillRect32` |
 | A run of a few dozen pixels | either; below one block `fill32` *is* a single `@memset` |
 
-`fill32` takes the byte-repeating case to a byte-wide `memset` itself, so a caller that
-cannot know its value up front never loses by calling it.
+`fill32` takes the byte-repeating case to a byte-wide `memset` itself, so a caller whose
+value happens to be byte-repeated reaches that path without knowing the value up front.
+
+For a value that is **not** byte-repeated, the gain scales with the length of **each
+contiguous run**, not the area, because the seed costs the same per call — a fill whose
+colour changes every row pays it per row
+([docs/performance-measurement.md](docs/performance-measurement.md) measures the ratio).
 
 ### Extra rules for real-time and cross-thread sharing
 

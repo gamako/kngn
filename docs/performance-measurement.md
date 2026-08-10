@@ -135,6 +135,37 @@ paced. objc's figure is 60.8GB/s, the rate `bench-fill` measures for a replicate
   rather than a proven optimum. A `@Vector(16, u32)` store loop measures the same 60-62GB/s
   as the replicated block, and the block was chosen because the same shape also fills the
   rows of `fillRect32` and because it delegates to a bulk copy the target tunes itself.
+- **What `fill32` wins scales with the length of each contiguous run, not with the area
+  filled.** The seed is a fixed cost per call, so a caller that fills one long run gets the
+  whole ratio and a caller that fills many short runs gets a fraction of it. Every row below
+  comes from one section of one `bench-fill` run — "contiguous runs", which calls `fill32`
+  directly and passes `@memset` its value at run time (the same section measures a
+  compile-time constant separately) — as the avg over the benchmark's iterations, on
+  aarch64-macos with zig 0.16 and ReleaseFast at `0xFF12161B`. **It is a separate run from
+  the 21.1MB figures above, which come from the whole-framebuffer section, so the two sets
+  are not directly comparable:**
+
+  | One contiguous run | `@memset` | `pixelops.fill32` | ratio |
+  |---|---:|---:|---:|
+  | 1024 px | 342ns | 335ns | 1.02x |
+  | 4096 px | 1398ns | 500ns | 2.80x |
+  | 65536 px | 20670ns | 4203ns | 4.92x |
+  | 1048576 px | 346us | 59.5us | 5.82x |
+
+  The practical consequence is that **two fills covering the same area differ by how they
+  are called**: a vertical gradient whose colour changes every row is one run per row and
+  pays the seed on each, whereas the same area in one colour through `fillRect32` seeds
+  once. The same run's "short rectangles" section measures that per-row shape directly — a
+  single 3024px row is 987ns against 442ns, a ratio of 2.23x, against the 5.82x a run of
+  1048576 px reaches. A fullscreen gradient demo built on the per-row shape measured +7.0%
+  on the whole frame (156.32 → 167.22 fps, 6.397 → 5.980 ms/frame; objc, ReleaseFast,
+  unpaced, 3008x1692, three 10s windows per condition) — a real gain, but well short of
+  what the longest run in the table would suggest.
+- **Two things about the fill are measured but not explained**, and anyone optimising here
+  should start by settling them. A `@Vector(16, u32)` store loop drops to 12.4GB/s at a
+  4096px run while reaching 56.4GB/s over 21.1MB; the measurements above do not explain
+  that. And seeding with vector stores instead of `@memset` would remove the scalar phase
+  from every call, but it is unmeasured and is not a basis for changing the implementation.
 - **A `fill32` clear costs the same on objc, swift and metal**, so none of them shows a
   measurable extra cost for the first write to a page of the framebuffer (objc 0.441ms
   against metal 0.510ms at 6.70Mpx: 60.8GB/s, the rate `bench-fill` measures, against
