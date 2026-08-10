@@ -715,8 +715,8 @@ pub fn build(b: *std.Build) void {
 
         // ----- Sample programs -----
         // Declare the modules each example needs.
-        // Every entry must share the same field set (name / path / needs_*) so anonymous struct types
-        // match (avoids type mismatch in inline for).
+        // Every entry supplies the required fields (name / path / the needs_* listed here); the
+        // optional ones are read with @hasField below, so an entry that does not use them omits them.
         inline for (.{
             .{ .name = "example_01", .path = "examples/01_timed_window/main.zig", .needs_sprite = false, .needs_fps_counter = false, .needs_fixed_timestep = false, .needs_text = false, .needs_gui = false, .needs_png = false, .needs_font = false, .needs_audio = false, .needs_gamepad = false, .needs_gmath = false, .needs_sound = false },
             .{ .name = "example_02", .path = "examples/02_keyboard_input/main.zig", .needs_sprite = false, .needs_fps_counter = false, .needs_fixed_timestep = false, .needs_text = false, .needs_gui = false, .needs_png = false, .needs_font = false, .needs_audio = false, .needs_gamepad = false, .needs_gmath = false, .needs_sound = false },
@@ -775,6 +775,7 @@ pub fn build(b: *std.Build) void {
                 .needs_midi = std.mem.eql(u8, example.name, "example_29"),
                 .needs_gmath = example.needs_gmath,
                 .needs_sound = example.needs_sound,
+                .needs_pixelops = std.mem.eql(u8, example.name, "example_23"),
                 .platform_features = if (@hasField(@TypeOf(example), "platform_features")) example.platform_features else exe_features.base,
                 .needs_kit = std.mem.eql(u8, example.name, "example_31") or std.mem.eql(u8, example.name, "example_32") or std.mem.eql(u8, example.name, "example_33") or std.mem.eql(u8, example.name, "example_34") or std.mem.eql(u8, example.name, "example_36") or std.mem.eql(u8, example.name, "example_38") or std.mem.startsWith(u8, example.name, "example_26"),
             };
@@ -3749,6 +3750,7 @@ const ExampleNeeds = struct {
     needs_midi: bool, // true only for examples/29_midi_monitor
     needs_gmath: bool, // true only for examples/25_collision_demo
     needs_sound: bool, // true only for examples/30_sound_demo
+    needs_pixelops: bool = false, // true only for examples/23_fullscreen
     needs_kit: bool = false, // example_31/32/33/34/36/38 / example_26
     /// The macOS backend feature set (`exe_features`). `needs_gamepad` folds into it in
     /// `exampleFeatures`, so an example states its gamepad need once.
@@ -3821,6 +3823,7 @@ fn addExampleExe(
     }
     if (needs.needs_gmath) exe.root_module.addImport("gmath", common.gmath.mod);
     if (needs.needs_sound) exe.root_module.addImport("sound", common.sound.mod);
+    if (needs.needs_pixelops) exe.root_module.addImport("pixelops", common.pixelops.mod);
     if (needs.needs_kit) {
         // needs_gamepad kit examples use kit_gamepad wired to platform_gamepad.
         exe.root_module.addImport("kit", variant.kit.mod);

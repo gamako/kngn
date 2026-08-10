@@ -1,5 +1,6 @@
 const std = @import("std");
 const platform = @import("platform");
+const pixelops = @import("pixelops");
 
 const FRAME_PERIOD_S: f64 = 1.0 / 60.0;
 
@@ -54,9 +55,11 @@ fn fullscreenAction(ctx: *anyopaque, args: []const u8, buf: []u8) ![]const u8 {
 /// transition can be driven and observed headlessly; `e2e.txt` next to this file is that script.
 ///
 /// Hot path declaration: paints every pixel each frame, but computes colour **once per row** (vertical gradient)
-/// and bulk-writes the row slice with `@memset`. No per-pixel division or floating point (`/denom` is
+/// and bulk-writes the row slice with `pixelops.fill32`. No per-pixel division or floating point (`/denom` is
 /// per-row = O(height)); row-major access; row-start offset via `y*w` in the loop.
-/// Follows the all-pixel-loop `@memset` fast-path rule (no new per-pixel division/branches).
+/// The colour is computed at run time and is not byte-repeated, which is the case where `@memset`
+/// on a `[]u32` lowers to a scalar four-byte store loop rather than a bulk fill, so the row goes
+/// through the shared fill primitive instead.
 /// The toggle, the action and the probe are event time only.
 pub fn main() !void {
     try platform.init();
@@ -130,7 +133,7 @@ pub fn main() !void {
                 // canonical BGRA(0xAARRGGBB): A=FF, R, G, B (same packing as examples/01).
                 const color: u32 = 0xFF00_0000 | (r << 16) | (g << 8) | b;
                 const row_start: usize = @as(usize, y) * w; // usize accumulation rules out a theoretical u32 overflow
-                @memset(fb.pixels[row_start .. row_start + w], color);
+                pixelops.fill32(fb.pixels[row_start .. row_start + w], color);
             }
             window.present();
         }
