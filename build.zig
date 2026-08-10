@@ -2823,6 +2823,18 @@ pub fn build(b: *std.Build) void {
     const bench_fill_step = b.step("bench-fill", "Run u32 fill (framebuffer clear / rect fill) micro-benchmark (ReleaseFast)");
     bench_fill_step.dependOn(&b.addRunArtifact(bench_fill_exe).step);
 
+    // bench-upscale: what a nearest-neighbour upscale costs at present time, against one write
+    // pass over the same destination (the trade a fixed-size framebuffer makes).
+    const bench_upscale_root = b.createModule(.{
+        .root_source_file = b.path("bench/upscale.zig"),
+        .target = target,
+        .optimize = .ReleaseFast,
+    });
+    bench_upscale_root.addImport("pixelops", bench_pixelops_mod);
+    const bench_upscale_exe = b.addExecutable(.{ .name = "bench_upscale", .root_module = bench_upscale_root });
+    const bench_upscale_step = b.step("bench-upscale", "Run nearest-neighbour upscale (fixed framebuffer present) micro-benchmark (ReleaseFast)");
+    bench_upscale_step.dependOn(&b.addRunArtifact(bench_upscale_exe).step);
+
     // bench-frameprof: what the frame section profiler costs per frame, disabled vs enabled,
     // split into bookkeeping and clock reads.
     const bench_frame_prof_root = b.createModule(.{

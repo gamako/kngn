@@ -1,6 +1,6 @@
 # ADR-002: The blocking behaviour of platform_present()
 
-**Status:** Accepted, implemented. Revised 2026-06-27 — present stays non-blocking; the detailed contracts for frame pacing, buffer ownership and support tiers are delegated to [ADR-005](005_platform-support-tiers-and-frame-pacing.md)
+**Status:** Accepted, implemented. Revised 2026-06-27 — present stays non-blocking; the detailed contracts for frame pacing, buffer ownership and support tiers are delegated to [ADR-005](005_platform-support-tiers-and-frame-pacing.md). Revised 2026-08-10 — under the fixed framebuffer mode of [ADR-030](030_fixed-framebuffer-and-letterboxed-present.md) present also **maps**: it magnifies the framebuffer into a letterboxed destination rectangle. Everything below about blocking, ownership and the frame commit point is unchanged
 **Date:** 2025-10-25
 **Category:** Rendering, frame rate control
 
@@ -420,6 +420,7 @@ The definitions this discussion settled:
 |---------|------|---------|
 | 1.0 | 2025-10-25 | First recorded; documentation corrected |
 | 1.1 | 2026-06-27 | Present organised as submit and the frame commit point. The detailed contracts for frame pacing, buffer ownership and support tiers delegated to [ADR-005](005_platform-support-tiers-and-frame-pacing.md). Added the distinction between `lockFramebuffer()==null` (frame slot unavailable) and fatal, and made the unconditional tearing claim tier-dependent. |
+| 1.2 | 2026-08-10 | Present gains a mapping stage under the fixed framebuffer mode of [ADR-030](030_fixed-framebuffer-and-letterboxed-present.md): it magnifies the framebuffer into a destination rectangle and fills the letterbox, and on a backend doing that in software the cost of the pass belongs to present. Blocking behaviour, pixel ownership after the call, and the meaning of a `null` from `lockFramebuffer` are unchanged. |
 
 ### Files changed by the original decision
 

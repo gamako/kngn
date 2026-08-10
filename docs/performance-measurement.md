@@ -183,6 +183,12 @@ paced. objc's figure is 60.8GB/s, the rate `bench-fill` measures for a replicate
 - These are measurements of the editor at one window size and one scale (2x), and are
   **not** a substitute for the performance matrix ADR-011 R10 asks for
   (1x/1.5x/2x × gui/font/canvas/viz × frame time and peak memory).
+- **The way out of a budget that grows with the window** is a fixed-size framebuffer,
+  which makes the per-frame cost independent of the display area and pays for it with
+  one magnification pass at present time. `zig build bench-upscale` measures that pass
+  against a single write over the same destination, and
+  [adr/030](adr/030_fixed-framebuffer-and-letterboxed-present.md) R6 records the
+  numbers and the implementation they require.
 
 ## Frame-cap measurement (`-Dframe-cap`, free-run)
 

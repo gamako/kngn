@@ -1,6 +1,6 @@
 # ADR-011: The high-DPI (retina) coordinate model and framebuffer modes
 
-**Status:** Accepted (R1–R11 stand; the staged implementation of R1–R10 has landed — see Implementation status)
+**Status:** Accepted (R1–R11 stand; the staged implementation of R1–R10 has landed — see Implementation status). Revised 2026-08-10 — [ADR-030](030_fixed-framebuffer-and-letterboxed-present.md) adds a third framebuffer mode with a coordinate model of its own; the rules below describe `.logical` and `.physical`
 **Date:** 2026-07-20
 **Category:** platform / gui / gfx, coordinate systems, the drawing pipeline
 
@@ -38,6 +38,13 @@ An application chooses the framebuffer mode when creating a `Window`. The defaul
 |---|---|---|
 | `.logical` (default) | A logical framebuffer, scaled by the OS. **The framebuffer layout, the API and the crc stay bit-identical** (under the conditions in R9; note that the display *filter* may change under R8, so pixel-identical OS screenshots are not promised) | Retro and pixel-art games, quick prototypes. Text is soft but everything is simple |
 | `.physical` (HiDPI) | Allocates a physical framebuffer (`w*scale × h*scale`) and sets `contentsScale=scale` | Crisp UI applications (the editor, the patch canvas), high-resolution games |
+| `.fixed` ([030](030_fixed-framebuffer-and-letterboxed-present.md)) | A framebuffer of a size the application names, magnified into a letterbox at present time. Neither the window size nor the display density changes it | An application that needs its per-pixel cost bounded, or its snapshots reproducible, and accepts a magnified result |
+
+Both rules below and the whole coordinate model of R3–R7 concern `.logical` and
+`.physical`, which relate a *logical* space to a *physical* one. `.fixed` relates a
+*framebuffer* space to a physical one with no logical space between them, so 030 R2
+states what the snapshot reports under it and 030 R4 states who transforms
+coordinates.
 
 **Backends without a scale accept it too**: a backend with no notion of scale still
 **accepts** `.physical`, reporting `contentScale()=1.0` (it is not rejected with
@@ -70,10 +77,16 @@ break. To make the chosen coordinate model work, platform gains this contract:
 - **Who converts input coordinates, and when (settled)**: the loop order is
   `pollEvents()` (enqueue) → `lockFramebuffer()` (latch the scale) → `nextEvent()`
   (dequeue). At enqueue time this frame's latch does not exist yet, so **the backend
-  only enqueues raw (native, physical) coordinates plus an event epoch**, and **the
-  facade (`core/platform.zig`) normalises them to logical coordinates when
-  `nextEvent()` dequeues them**, using the current frame's latched scale. The facade
-  is the only thing that converts; backends do not. `nextEvent()` is expected to be
+  only enqueues raw (native, physical) coordinates**, and **the facade
+  (`core/platform.zig`) normalises them to logical coordinates when `nextEvent()`
+  dequeues them**, using the current frame's latched scale. The facade is the only
+  thing that converts; backends do not. An event therefore carries no epoch of its
+  own: it is converted with the latch of the frame that dequeues it, so an event
+  generated before a scale change is converted with the new scale — the same
+  one-frame tolerance this rule already accepts for the frame boundary above. Under
+  the fixed framebuffer mode the conversion factor changes far more often, and
+  [030](030_fixed-framebuffer-and-letterboxed-present.md) R4 states what that means
+  there. `nextEvent()` is expected to be
   called after `lockFramebuffer()`, but on the rare path where it comes first, **the
   most recently latched scale** is used (the content scale on the first frame).
   Derived coordinates such as `mouse_pressed_pos` are built from the
@@ -94,8 +107,9 @@ the conversion to physical pixels is applied only at the drawing exit.
   converts view coordinates to logical points in `platform_macos.m`; Linux and
   Windows may be returning client pixels and need checking).
 - **There is exactly one place that converts to logical coordinates** (as settled in
-  R2: the backend passes raw coordinates plus an event epoch, and **the facade is the
-  sole normaliser at `nextEvent()` dequeue time**; backends do not convert).
+  R2: the backend passes raw physical coordinates, and **the facade is the sole
+  normaliser at `nextEvent()` dequeue time**, using the latch of the frame that
+  dequeues them; backends do not convert).
 - Derived coordinates such as `mouse_pressed_pos` and `mouse_released_pos` **go
   through the same conversion**, so none is missed.
 
@@ -379,3 +393,13 @@ Factual (not a decision change). Verified against the tree as of this revision:
 - 2026-08-01 R11 added: fullscreen is orthogonal to the framebuffer mode, and with
   `.physical` a self-resolved fullscreen size is physical, so the logical size is the
   derived value. R1–R10 unchanged.
+- 2026-08-10 R2's input paragraph drops the event epoch it described but that was never
+  implemented, and states the rule the facade actually follows: an event is converted
+  with the latch of the frame that dequeues it, accepting the same one-frame tolerance
+  the surrounding rule already accepts.
+- 2026-08-10 R1's mode table lists the `.fixed` mode added by
+  [ADR-030](030_fixed-framebuffer-and-letterboxed-present.md), and states that the
+  coordinate model of R3–R7 describes `.logical` and `.physical`; `.fixed` has one of
+  its own, in 030 R2 and R4. R11's derivation of a logical size from a self-resolved
+  fullscreen size does not apply under `.fixed`, where the framebuffer size is an
+  input. R1–R11 are otherwise unchanged.

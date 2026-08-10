@@ -95,6 +95,15 @@ verification. Tiers correspond to the build-time backend selection (`-Dplatform`
 but this ADR defines what a tier **means** (what is guaranteed); it changes no build
 wiring.
 
+**A tier ranks frame pacing and nothing else.**
+[ADR-030](030_fixed-framebuffer-and-letterboxed-present.md) R7 adds a second,
+independent axis — which processor pays for magnifying a fixed-size framebuffer at
+present time — and the two do not correlate. A best-effort backend can get the
+magnification for free from the compositor (macOS CALayer) while a first-class one
+needs a shader for it (Windows D3D11), and the two backends that pay for it on the
+CPU every frame (Windows GDI, Linux X11) are both best-effort. Read the tier for
+pacing guarantees and 030 R7 for presentation cost.
+
 ## The frame pacing contract (shared by first-class backends)
 
 1. **Frame availability**: only a frame for which `lockFramebuffer()` succeeded
@@ -452,3 +461,4 @@ The cache lives in `core/platform.zig` (same main-thread ownership as the pacer)
 | 1.4 | 2026-07-27 | Resize contract wording distinguishes buffer dimensions (`fb.width/height`) from GUI layout size (`logical_size` / `logicalSize()`), citing [ADR-011](011_high-dpi-coordinates-and-fb-modes.md). The decision itself is unchanged. |
 | 1.5 | 2026-07-29 | Caller-side target period: display-refresh follow, `-Dframe-cap`, 64ms EWMA hold with period/4 utilisation (remaining/4 only when the period is unknown), XRandR via DynLib, and known multi-monitor / judder / input-latency limits. |
 | 1.6 | 2026-08-02 | Resize contract states what the caller owes: `fb.pixels` is not cached across frames, and the event pump is not run while a `Framebuffer` is held — the obligations the single lock-boundary commit point rests on. The conditional "once resize is supported" is dropped, resize being implemented on every backend. The decision itself is unchanged. |
+| 1.7 | 2026-08-10 | The support tier section states that a tier ranks frame pacing only, and points at [ADR-030](030_fixed-framebuffer-and-letterboxed-present.md) R7 for the independent axis of who pays to magnify a fixed-size framebuffer. The tiers and the pacing contract are unchanged. |
