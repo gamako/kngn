@@ -173,12 +173,18 @@ pub const Window = struct {
     /// The single window creation entry point of this backend (ADR-019 R1).
     pub fn createWithOptions(width: u32, height: u32, title: [:0]const u8, opts: WindowOptions) Error!Window {
         _ = title;
-        // No scale support: .physical is accepted too, with contentScale=1 and logical==framebuffer (never Unsupported).
-        _ = opts.fb_mode;
         // Nothing displays the window, so there is no user to resize it.
         _ = opts.resizable;
-        const w = if (opts.size) |s| s.width else width;
-        const h = if (opts.size) |s| s.height else height;
+        // No scale support: `.physical` is accepted too, with contentScale=1 and
+        // logical==framebuffer (never Unsupported). `.fixed` names the framebuffer outright, and
+        // with no display to letterbox against it is simply that size — which is what makes this
+        // backend the display-free way to exercise a fixed framebuffer end to end.
+        const requested: ?types.WindowSize = switch (opts.fb_mode) {
+            .fixed => |size| size,
+            .logical, .physical => opts.size,
+        };
+        const w = if (requested) |s| s.width else width;
+        const h = if (requested) |s| s.height else height;
         var win = try allocBuffer(w, h);
         // There is no screen here, so fullscreen has no size of its own to resolve: the requested
         // size is honoured as-is (ADR-019 R3, the third class). The state is still recorded, so that
@@ -229,6 +235,19 @@ pub const Window = struct {
             .framebuffer_size = size,
             .content_scale = 1.0,
             .scale_epoch = 0,
+        };
+    }
+
+    /// The framebuffer is the window here, so it maps onto it one to one: no letterbox, no
+    /// magnification. Supplying it rather than letting the facade synthesise one keeps
+    /// "a fixed framebuffer's mapping comes from its backend" true without an exception.
+    pub fn presentMapping(self: Window) types.PresentMapping {
+        const size: types.WindowSize = .{ .width = self.width, .height = self.height };
+        return .{
+            .origin = .{ .x = 0, .y = 0 },
+            .dst_size = size,
+            .fb_size = size,
+            .app_size = size,
         };
     }
 
@@ -426,4 +445,45 @@ test "null .logical keeps the size on the width/height/pixels CRC path, snapshot
     defer fb2.unlock();
     try testing.expectEqual(@as(u32, 0xFFAABBCC), fb2.pixels[0]);
     try testing.expectEqual(@as(u32, 0xFFAABBCC), fb2.pixels[7]);
+}
+
+test "null window: a fixed framebuffer is the size it names, whatever size was requested" {
+    var win = try Window.createWithOptions(1280, 720, "t", .{
+        .fb_mode = .{ .fixed = .{ .width = 640, .height = 400 } },
+    });
+    defer win.destroy();
+    const fb = win.lockFramebuffer() orelse return error.TestUnexpectedResult;
+    defer fb.unlock();
+    // The framebuffer is the fixed size, and the application is told one space at scale 1.0.
+    try testing.expectEqual(@as(u32, 640), fb.width);
+    try testing.expectEqual(@as(u32, 400), fb.height);
+    try testing.expectEqual(@as(u32, 640), fb.framebuffer_size.width);
+    try testing.expectEqual(@as(u32, 640), fb.logical_size.width);
+    try testing.expectEqual(@as(f32, 1.0), fb.content_scale);
+    try testing.expectEqual(@as(u64, 0), fb.scale_epoch);
+    try testing.expectEqual(@as(usize, 640 * 400), fb.pixels.len);
+}
+
+test "null window: a fixed framebuffer beats an explicit size, since it names the framebuffer itself" {
+    var win = try Window.createWithOptions(100, 100, "t", .{
+        .size = .{ .width = 300, .height = 200 },
+        .fb_mode = .{ .fixed = .{ .width = 640, .height = 400 } },
+    });
+    defer win.destroy();
+    try testing.expectEqual(@as(u32, 640), win.framebufferSize().width);
+    try testing.expectEqual(@as(u32, 400), win.framebufferSize().height);
+}
+
+test "null window: the mapping it supplies is the identity, so a fixed framebuffer needs no exception" {
+    var win = try Window.createWithOptions(640, 400, "t", .{
+        .fb_mode = .{ .fixed = .{ .width = 640, .height = 400 } },
+    });
+    defer win.destroy();
+    const m = win.presentMapping();
+    try testing.expectEqual(@as(i32, 0), m.origin.x);
+    try testing.expectEqual(@as(i32, 0), m.origin.y);
+    try testing.expectEqual(@as(u32, 640), m.dst_size.width);
+    // Nothing is magnified here, so both directions are the identity.
+    try testing.expectEqual(@as(i32, 123), m.framebufferToPhysical(123, 45).x);
+    try testing.expectEqual(@as(i32, 45), m.physicalToApp(123, 45).y);
 }

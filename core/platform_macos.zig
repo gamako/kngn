@@ -471,6 +471,9 @@ pub const Window = struct {
     /// and borderlessness need the mascot opt-in, and fullscreen needs the fullscreen opt-in.
     /// Hot path declaration: initialisation only (a single window creation).
     pub fn createWithOptions(width: u32, height: u32, title: [:0]const u8, opts: types.WindowOptions) Error!Window {
+        // No present here magnifies a framebuffer into a letterbox yet, so a fixed one is refused
+        // rather than quietly behaving like another mode (ADR-030 R5).
+        try types.refuseFixedFramebuffer(opts.fb_mode);
         if (comptime !mascot_enabled) {
             if (opts.transparent or opts.borderless) return error.Unsupported;
         }
@@ -480,7 +483,13 @@ pub const Window = struct {
         var flags: u32 = 0;
         if (opts.transparent) flags |= c.PLATFORM_WINDOW_TRANSPARENT;
         if (opts.borderless) flags |= c.PLATFORM_WINDOW_BORDERLESS;
-        if (opts.fb_mode == .physical) flags |= c.PLATFORM_WINDOW_FRAMEBUFFER_PHYSICAL;
+        // Exhaustive rather than `== .physical`: a tagged union compares equal to an enum literal,
+        // so a mode with no flag of its own would silently be sent across as `.logical`.
+        switch (opts.fb_mode) {
+            .physical => flags |= c.PLATFORM_WINDOW_FRAMEBUFFER_PHYSICAL,
+            .logical => {},
+            .fixed => unreachable, // refused at the top of this function
+        }
         if (!opts.resizable) flags |= c.PLATFORM_WINDOW_NOT_RESIZABLE;
         var copts = c.PlatformWindowOptions{ .flags = flags, .reserved = 0, .x = 0, .y = 0 };
         if (opts.position) |pos| {
@@ -605,8 +614,9 @@ pub const Window = struct {
         };
     }
 
-    /// Supply the caret rect the IME candidate window is anchored to, in framebuffer pixels (event time only).
-    /// A no-op without the text input opt-in.
+    /// Supply the caret rect the IME candidate window is anchored to, in **physical window pixels**
+    /// with a top-left origin (event time only). The facade has already mapped it out of framebuffer
+    /// space. A no-op without the text input opt-in.
     pub fn setCompositionRect(self: Window, x: i32, y: i32, w: i32, h: i32) void {
         if (comptime !text_input_c_abi) return;
         c.platform_set_composition_rect(self.handle, x, y, w, h);

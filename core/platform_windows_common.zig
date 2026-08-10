@@ -404,7 +404,13 @@ pub fn logicalFromPhysicalPx(physical_px: u32, scale: f32) u32 {
 /// fullscreen window is created and when a resize or DPI change is latched, so that the logical
 /// size cannot differ between the first frame and the first settled metrics (ADR-011 R11).
 pub fn logicalSizeForPhysical(fb_mode: FramebufferMode, physical: WindowSize, scale: f32) WindowSize {
-    if (fb_mode == .logical) return physical;
+    // Exhaustive rather than `== .logical`: a tagged union compares equal to an enum literal, so a
+    // mode this backend has not implemented would silently take the wrong branch here.
+    switch (fb_mode) {
+        .logical => return physical,
+        .fixed => return physical, // refused at creation; stated rather than left to fall through
+        .physical => {},
+    }
     return .{
         .width = logicalFromPhysicalPx(physical.width, scale),
         .height = logicalFromPhysicalPx(physical.height, scale),
@@ -413,7 +419,11 @@ pub fn logicalSizeForPhysical(fb_mode: FramebufferMode, physical: WindowSize, sc
 
 /// The physical framebuffer size. Under .logical it is always the logical size itself (which is where the structural guarantee lives).
 pub fn effectiveFramebufferSize(fb_mode: FramebufferMode, logical: WindowSize, scale: f32) WindowSize {
-    if (fb_mode == .logical) return logical;
+    switch (fb_mode) {
+        .logical => return logical,
+        .fixed => |size| return size, // refused at creation; stated rather than left to fall through
+        .physical => {},
+    }
     return .{
         .width = roundToPhysicalPx(logical.width, scale),
         .height = roundToPhysicalPx(logical.height, scale),
@@ -635,6 +645,9 @@ pub const Core = struct {
     /// whose size the backend resolves itself, so the width and height are ignored (ADR-019 R3).
     /// Hot path declaration: initialisation only.
     pub fn createWithOptions(width: u32, height: u32, title: [:0]const u8, opts: types.WindowOptions) Error!*Core {
+        // No present here magnifies a framebuffer into a letterbox yet, so a fixed one is refused
+        // rather than quietly behaving like another mode (ADR-030 R5).
+        try types.refuseFixedFramebuffer(opts.fb_mode);
         return createInternal(width, height, title, opts.fullscreen, opts);
     }
 
@@ -668,7 +681,7 @@ pub const Core = struct {
         // `.physical`: the thread awareness is switched to PMv2 only for the duration of the creation call. A failure falls back to a no-op.
         // `.logical`: the start-up awareness is kept (no context switch).
         var create_as_pmv2 = false;
-        if (fb_mode == .physical) {
+        if (fb_mode.tracksPhysicalPixels()) {
             // Create continues even when the Set fails (returning null). Whether the thread really is PMv2 decides whether a physical size is possible.
             _ = SetThreadDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
             create_as_pmv2 = isPmv2Context(GetThreadDpiAwarenessContext());
@@ -850,7 +863,10 @@ pub const Core = struct {
         core.is_pmv2 = is_pmv2;
 
         var scale: f32 = 1.0;
-        if (fb_mode == .physical) {
+        // Refused at the top of this function, so the branch below is a two-way choice and its
+        // `else` really is `.logical`.
+        std.debug.assert(fb_mode.tracksPhysicalPixels() or fb_mode.tracksLogicalPoints());
+        if (fb_mode.tracksPhysicalPixels()) {
             if (is_pmv2) {
                 scale = scaleFromDpi(GetDpiForWindow(hwnd));
             } else {
@@ -882,7 +898,7 @@ pub const Core = struct {
             // On an OOM the old size is kept (the window survives).
         }
         // `.physical` plus PMv2: when the GetDpiForSystem estimate at creation and the settled GetDpiForWindow disagree, the client is corrected to the physical size.
-        if (fb_mode == .physical and is_pmv2 and !fullscreen and !borderless) {
+        if (fb_mode.tracksPhysicalPixels() and is_pmv2 and !fullscreen and !borderless) {
             var cr0 = RECT{ .left = 0, .top = 0, .right = 0, .bottom = 0 };
             if (GetClientRect(hwnd, &cr0) != 0) {
                 const cur_w: u32 = @intCast(@max(cr0.right - cr0.left, 0));
@@ -915,7 +931,7 @@ pub const Core = struct {
             }
             // Under `.physical` the logical size is held independently (the argument's logical value). The difference from the client is the scale's rounding.
             // Under `.logical` the logical size is the client size itself.
-            if (fb_mode == .logical) {
+            if (fb_mode.tracksLogicalPoints()) {
                 core.logical_width = cw;
                 core.logical_height = ch;
             }
@@ -926,7 +942,7 @@ pub const Core = struct {
         // Fullscreen under `.physical`: the settled framebuffer is the monitor's physical size, so
         // the logical size is derived from it with the settled scale (ADR-011 R11). `.logical`
         // already took the client size above.
-        if (fullscreen and fb_mode == .physical) {
+        if (fullscreen and fb_mode.tracksPhysicalPixels()) {
             const fs_logical = logicalSizeForPhysical(fb_mode, .{ .width = core.width, .height = core.height }, scale);
             core.logical_width = fs_logical.width;
             core.logical_height = fs_logical.height;
@@ -1364,7 +1380,9 @@ fn wndProc(hwnd: HWND, msg: UINT, wparam: WPARAM, lparam: LPARAM) callconv(.wina
             const wp: usize = @bitCast(wparam);
             const dpi_x: UINT = @truncate(wp & 0xFFFF);
             // A `.logical` window that degraded onto PMv2 keeps content_scale fixed at 1.0 (the real DPI is ignored).
-            if (!(core.fb_mode == .logical and core.is_pmv2)) {
+            // A fixed framebuffer never reaches here: this backend refuses one at window creation.
+            std.debug.assert(core.fb_mode.tracksPhysicalPixels() or core.fb_mode.tracksLogicalPoints());
+            if (!(core.fb_mode.tracksLogicalPoints() and core.is_pmv2)) {
                 core.pending_content_scale = scaleFromDpi(dpi_x);
                 core.metrics_dirty = true;
             }

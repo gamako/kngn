@@ -593,10 +593,6 @@ class MetalFramebufferView: MTKView, PlatformBackendView {
         renderer.metricsOwner = self
         metalRenderer = renderer
         self.delegate = renderer
-        // Apply the framebuffer size used to convert the IME firstRect from pixels into bounds
-#if KNGN_ENABLE_TEXT_INPUT
-        imeState.updateFramebufferSize(width: fw, height: fh)
-#endif
         NSLog("[\(IMPLEMENTATION_TYPE)] Framebuffer metrics: logical=\(logicalWidth)x\(logicalHeight) fb=\(fw)x\(fh) scale=\(String(format: "%.2f", Double(scale))) physical=\(physical ? 1 : 0)")
     }
 
@@ -651,7 +647,6 @@ class MetalFramebufferView: MTKView, PlatformBackendView {
             }
             platformWindow?.currentFramebuffer = renderer.getCurrentBuffer()
 #if KNGN_ENABLE_TEXT_INPUT
-            imeState.updateFramebufferSize(width: renderer.getWidth(), height: renderer.getHeight())
 #endif
         }
         logicalWidth = lw
@@ -718,7 +713,6 @@ class MetalFramebufferView: MTKView, PlatformBackendView {
             logicalHeight = renderer.getHeight()
             platformWindow?.currentFramebuffer = renderer.getCurrentBuffer()
 #if KNGN_ENABLE_TEXT_INPUT
-            imeState.updateFramebufferSize(width: renderer.getWidth(), height: renderer.getHeight())
 #endif
             if let cb = redrawCallback {
                 cb(redrawUserdata)

@@ -156,9 +156,8 @@ class FramebufferView: NSView, PlatformBackendView {
         super.init(frame: frame)
 
 #if KNGN_ENABLE_TEXT_INPUT
-        // Hand the host view and the framebuffer size to the IME state (firstRect converts with them)
+        // Hand the host view to the IME state (firstRect converts against its bounds and backing scale)
         imeState.hostView = self
-        imeState.updateFramebufferSize(width: fw, height: fh)
 #endif
 
         // Make it a layer-backed view
@@ -724,7 +723,6 @@ class FramebufferView: NSView, PlatformBackendView {
             }
             platformWindow?.currentFramebuffer = currentBuffer
 #if KNGN_ENABLE_TEXT_INPUT
-            imeState.updateFramebufferSize(width: width, height: height)
 #endif
         }
         // only on success are the logical size, the latched scale and the epoch committed together
@@ -794,7 +792,6 @@ class FramebufferView: NSView, PlatformBackendView {
             // Point the handle at the new write buffer after reallocation (so the next lock and present use the right one).
             platformWindow?.currentFramebuffer = currentBuffer
 #if KNGN_ENABLE_TEXT_INPUT
-            imeState.updateFramebufferSize(width: width, height: height)
 #endif
             if let cb = redrawCallback {
                 cb(redrawUserdata)

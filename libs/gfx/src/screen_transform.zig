@@ -3,7 +3,7 @@
 //! Do not mix scale into the camera's view math. Keep `visibleRect` etc. in the logical viewport,
 //! and physicalize only at the draw exit via this module.
 //!
-//! Does not own the physical→logical inverse for input (that is the facade = `core/platform.normalizeEventWithScale`).
+//! Does not own the physical→logical inverse for input (that is the facade = `core/platform.normalizeEventWithMapping`).
 //!
 //! Hot-path declaration: per-primitive constant-time ops only. No full-pixel loops, allocation, or input handling.
 //! Floor rule matches `gui.render` scaleRect (independent implementation; does not import libs/gui).

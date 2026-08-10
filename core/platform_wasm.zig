@@ -346,7 +346,13 @@ fn physicalDimChecked(logical_px: u32, scale: f32) Error!u32 {
 /// The framebuffer size that goes with a logical size under fb_mode: itself under `.logical`,
 /// `round(logical * scale)` per dimension under `.physical`.
 fn effectiveFramebufferSize(mode: FramebufferMode, logical: WindowSize, scale: f32) Error!WindowSize {
-    if (mode == .logical) return logical;
+    // Exhaustive rather than `== .logical`: a tagged union compares equal to an enum literal, so a
+    // mode this backend has not implemented would silently take the wrong branch here.
+    switch (mode) {
+        .logical => return logical,
+        .fixed => |size| return size, // refused at creation; stated rather than left to fall through
+        .physical => {},
+    }
     return .{
         .width = try physicalDimChecked(logical.width, scale),
         .height = try physicalDimChecked(logical.height, scale),
@@ -439,6 +445,9 @@ pub const Window = struct {
     /// (ADR-019 R4). An option documented as having no effect is not the same as one ignored
     /// silently.
     pub fn createWithOptions(width: u32, height: u32, _: [:0]const u8, opts: types.WindowOptions) Error!Window {
+        // No present here magnifies a framebuffer into a letterbox yet, so a fixed one is refused
+        // rather than quietly behaving like another mode (ADR-030 R5).
+        try types.refuseFixedFramebuffer(opts.fb_mode);
         _ = opts.transparent;
         _ = opts.borderless;
         _ = opts.position;

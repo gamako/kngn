@@ -517,7 +517,7 @@ static size_t utf8SafePrefixLen(const char* s, size_t len, size_t cap) {
     uint32_t compositionLen;
     uint32_t compositionRevision;
     uint32_t compositionCursor; // the UTF-8 byte offset within the preedit
-    NSRect compositionRectPixels; // framebuffer pixels, origin at the content's top-left
+    NSRect compositionRectPixels; // physical window pixels, origin at the content's top-left
     BOOL compositionRectSet;
 
     // IME document access. With no callback registered it stays NSNotFound/nil/char_input, as before.
@@ -1582,17 +1582,19 @@ static size_t utf8SafePrefixLen(const char* s, size_t len, size_t cap) {
 
 - (NSRect)firstRectForCharacterRange:(NSRange)range actualRange:(NSRangePointer)actualRange {
     if (actualRange) *actualRange = range;
-    // Convert the application's framebuffer pixel rect into view points. The framebuffer is not a Retina
-    // backing: contentLayer scales it across the whole of bounds, so the conversion is the bounds ratio (the inverse of the mouse conversion).
+    // The rect arrives in physical window pixels, with a top-left origin: the facade has already
+    // mapped it out of framebuffer space, which is the only place that knows how the framebuffer
+    // sits inside the window. All that is left here is the backing scale, and the flip to this
+    // view's bottom-left origin.
     NSRect r;
     if (compositionRectSet && compositionRectPixels.size.width > 0 && compositionRectPixels.size.height > 0) {
         const NSRect bounds = self.bounds;
-        CGFloat sx = (width > 0) ? bounds.size.width / (CGFloat)width : 1.0;
-        CGFloat sy = (height > 0) ? bounds.size.height / (CGFloat)height : 1.0;
-        CGFloat x = compositionRectPixels.origin.x * sx;
-        CGFloat top = compositionRectPixels.origin.y * sy;
-        CGFloat w = compositionRectPixels.size.width * sx;
-        CGFloat h = compositionRectPixels.size.height * sy;
+        CGFloat backing = self.window ? self.window.backingScaleFactor : 1.0;
+        if (!(backing > 0.0)) backing = 1.0;
+        CGFloat x = compositionRectPixels.origin.x / backing;
+        CGFloat top = compositionRectPixels.origin.y / backing;
+        CGFloat w = compositionRectPixels.size.width / backing;
+        CGFloat h = compositionRectPixels.size.height / backing;
         x = MAX(bounds.origin.x, MIN(x, NSMaxX(bounds)));
         top = MAX(0.0, MIN(top, bounds.size.height));
         w = MIN(w, MAX(0.0, NSMaxX(bounds) - x));

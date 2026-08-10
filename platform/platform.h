@@ -52,7 +52,7 @@ typedef struct PlatformWindowOptions {
 #define PLATFORM_WINDOW_TRANSPARENT (1u << 0)  // honour the framebuffer alpha (the desktop shows through)
 #define PLATFORM_WINDOW_BORDERLESS  (1u << 1)  // no title bar and no frame (borderless)
 #define PLATFORM_WINDOW_POSITION    (1u << 2)  // apply x/y as the initial position
-#define PLATFORM_WINDOW_FRAMEBUFFER_PHYSICAL (1u << 3)  // opt in to a physical framebuffer; unset = .logical
+#define PLATFORM_WINDOW_FRAMEBUFFER_PHYSICAL (1u << 3)  // opt in to a physical framebuffer; unset = .logical (a fixed-size framebuffer has no flag here yet)
 #define PLATFORM_WINDOW_NOT_RESIZABLE (1u << 4)  // drop the resizing affordance; unset = freely resizable
 
 // The current window geometry. The size is the content/client area; the position is in OS screen coordinates.
@@ -532,8 +532,9 @@ typedef struct PlatformCompositionMeta {
 // meta is filled in even when cap==0 or buf==NULL (only the text is not written).
 uint32_t platform_get_composition_snapshot(PlatformWindow* window, char* buf, uint32_t cap, PlatformCompositionMeta* meta);
 
-// Set the caret rect the IME candidate window is anchored to, in framebuffer pixels with the origin at the window content's top-left.
-// The backend applies the backing scale when it answers firstRectForCharacterRange.
+// Set the caret rect the IME candidate window is anchored to, in physical window pixels with the origin at the window content's top-left.
+// The caller maps it out of framebuffer space, which is the only place that knows how the framebuffer sits inside the window;
+// the backend applies the backing scale when it answers firstRectForCharacterRange.
 void platform_set_composition_rect(PlatformWindow* window, int32_t x, int32_t y, int32_t w, int32_t h);
 
 // Tell the platform whether a text editing widget currently has focus.

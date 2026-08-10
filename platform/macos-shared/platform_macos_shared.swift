@@ -645,8 +645,8 @@ func platform_menu_enqueue_command(_ window: UnsafeMutableRawPointer?, _ command
 //
 // The NSTextInputClient logic and the composition and document-access state are gathered into PlatformIMEState.
 // Each backend's view holds `let imeState = PlatformIMEState()` and forwards the NSTextInputClient
-// methods and the custom IME methods to it. firstRect is computed from hostView.bounds and the
-// framebuffer size (updated through updateFramebufferSize).
+// methods and the custom IME methods to it. firstRect converts the caret rect the application
+// supplied — already in physical window pixels — into view points.
 
 // The capacity of the fixed composition preedit buffer (in UTF-8 bytes)
 let compositionUtf8Cap = 1024
@@ -675,10 +675,6 @@ final class PlatformIMEState {
     weak var platformWindow: PlatformWindowHandle?
     weak var hostView: NSView?
 
-    // the current framebuffer size, used to convert firstRect from pixels into bounds (updated on a resize)
-    private var fbWidth: Int = 0
-    private var fbHeight: Int = 0
-
     // The IME composition state
     private var markedTextStorage = NSMutableString()
     private var imeSelectedRange = NSRange(location: 0, length: 0)
@@ -698,12 +694,6 @@ final class PlatformIMEState {
     private var docAccessEnabled = false
     private var hasPendingReplacement = false
     private var pendingReplacement = NSRange(location: NSNotFound, length: 0)
-
-    // Update the framebuffer size (the backend calls it right after init and on a resize). It is used by the firstRect conversion.
-    func updateFramebufferSize(width: Int, height: Int) {
-        fbWidth = width
-        fbHeight = height
-    }
 
     func copyCompositionSnapshot(buf: UnsafeMutablePointer<CChar>?, cap: UInt32, meta: UnsafeMutablePointer<PlatformCompositionMeta>?) -> UInt32 {
         // latest-wins: always the current preedit. event.revision only detects a missed update (an older revision cannot be read).
@@ -1057,18 +1047,18 @@ final class PlatformIMEState {
             return .zero
         }
         let bounds = hostView.bounds
-        let width = fbWidth
-        let height = fbHeight
         var r: NSRect
         if compositionRectSet && compositionRectPixels.width > 0 && compositionRectPixels.height > 0 {
-            // The framebuffer is not a Retina backing: the layer scales it across the whole of bounds, so the
-            // conversion is the bounds ratio (the inverse of the mouse conversion).
-            let sx = width > 0 ? bounds.width / CGFloat(width) : 1.0
-            let sy = height > 0 ? bounds.height / CGFloat(height) : 1.0
-            var x = compositionRectPixels.origin.x * sx
-            var top = compositionRectPixels.origin.y * sy
-            var w = compositionRectPixels.width * sx
-            var h = compositionRectPixels.height * sy
+            // The rect arrives in physical window pixels, with a top-left origin: the facade has
+            // already mapped it out of framebuffer space, which is the only place that knows how the
+            // framebuffer sits inside the window. All that is left here is the backing scale, and
+            // the flip to this view's bottom-left origin.
+            var backing = hostView.window?.backingScaleFactor ?? 1.0
+            if !(backing > 0.0) { backing = 1.0 }
+            var x = compositionRectPixels.origin.x / backing
+            var top = compositionRectPixels.origin.y / backing
+            var w = compositionRectPixels.width / backing
+            var h = compositionRectPixels.height / backing
             x = max(bounds.minX, min(x, bounds.maxX))
             top = max(0.0, min(top, bounds.height))
             w = min(w, max(0.0, bounds.maxX - x))

@@ -22,7 +22,7 @@
 //! - content_scale is tracked through a `wl_output` bind plus its scale and `wl_surface.enter|leave` (at event time only).
 //! - The registry bind happens at initialisation, and on a hotplug registry event. Pending → latched at the `lockFramebuffer` boundary (incrementing `scale_epoch`).
 //! - Only under `.physical` is the shm allocated in physical pixels plus `wl_surface_set_buffer_scale` (a compositor at v3 or above; below that it is a no-op).
-//! - Raw physical input = surface-local × content_scale (independent of fb_mode; buffer_scale is not used).
+//! - Raw physical input = surface-local × content_scale (independent of the framebuffer mode; buffer_scale is not used).
 //! - Hot path declaration: detecting the scale, resizing and committing at the lock boundary happen at event time
 //!   only, and the registry bind at initialisation and on hotplug registry events (neither per frame nor real time).
 //!
@@ -93,7 +93,13 @@ fn roundToPhysicalPx(logical_px: u32, scale: f32) u32 {
 
 /// The physical framebuffer size. Under .logical it is always the logical size itself (which is where the structural guarantee lives).
 fn effectiveFramebufferSize(fb_mode: FramebufferMode, logical: WindowSize, scale: f32) WindowSize {
-    if (fb_mode == .logical) return logical;
+    // Exhaustive rather than `== .logical`: a tagged union compares equal to an enum literal, so a
+    // mode this backend has not implemented would silently take the wrong branch here.
+    switch (fb_mode) {
+        .logical => return logical,
+        .fixed => |size| return size, // refused at creation, but stated rather than left to fall through
+        .physical => {},
+    }
     return .{
         .width = roundToPhysicalPx(logical.width, scale),
         .height = roundToPhysicalPx(logical.height, scale),
@@ -102,13 +108,13 @@ fn effectiveFramebufferSize(fb_mode: FramebufferMode, logical: WindowSize, scale
 
 /// The scale used to allocate a `.physical` buffer. Below compositor (wl_surface) v3 it is 1.0, which avoids a protocol error.
 fn framebufferSizeScale(st: *const State) f32 {
-    if (st.fb_mode != .physical or st.compositor_version < 3) return 1.0;
+    if (!st.fb_mode.tracksPhysicalPixels() or st.compositor_version < 3) return 1.0;
     return effectiveContentScale(st.pending_content_scale);
 }
 
 /// The integer scale passed to `wl_surface_set_buffer_scale` (1 under `.logical`, and below compositor v3).
 fn bufferScaleInt(st: *const State) i32 {
-    if (st.fb_mode != .physical or st.compositor_version < 3) return 1;
+    if (!st.fb_mode.tracksPhysicalPixels() or st.compositor_version < 3) return 1;
     const s = effectiveContentScale(st.content_scale);
     const v = @round(@as(f64, s));
     if (!(v >= 1.0) or !std.math.isFinite(v)) return 1;
@@ -1555,6 +1561,9 @@ pub const Window = struct {
     /// from the compositor, so the width and height are ignored in that case (ADR-019 R3).
     /// Hot path declaration: initialisation only.
     pub fn createWithOptions(width: u32, height: u32, title: [:0]const u8, opts: types.WindowOptions) Error!Window {
+        // No present here magnifies a framebuffer into a letterbox yet, so a fixed one is refused
+        // rather than quietly behaving like another mode (ADR-030 R5).
+        try types.refuseFixedFramebuffer(opts.fb_mode);
         return createInternal(width, height, title, opts.fullscreen, opts);
     }
 

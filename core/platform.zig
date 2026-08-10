@@ -150,7 +150,8 @@ pub const WindowOptions = types.WindowOptions; // fullscreen, transparency, bord
 pub const WindowPosition = types.WindowPosition; // a position in OS screen coordinates
 pub const WindowSize = types.WindowSize; // a width and a height
 pub const WindowGeometry = types.WindowGeometry; // a position plus a size
-pub const FramebufferMode = types.FramebufferMode; // .logical or .physical
+pub const FramebufferMode = types.FramebufferMode; // .logical, .physical or .fixed
+pub const PresentMapping = types.PresentMapping; // how the framebuffer maps onto the window, both ways
 pub const FramebufferSnapshot = types.FramebufferSnapshot; // the per-frame size and scale snapshot
 pub const MAX_GAMEPADS = types.MAX_GAMEPADS;
 pub const GamepadButton = types.GamepadButton;
@@ -212,23 +213,29 @@ fn snapshotFromBackendFb(fb: anytype) FramebufferSnapshot {
     };
 }
 
-/// Normalise a native mouse/scroll event's raw physical coordinates in place into logical points, using the latched scale.
-/// Harness-injected events do not pass through here. A scale <= 0 is corrected to 1.0.
-/// pub so that unit tests (platform_clipboard_test and friends) can call it too.
-pub fn normalizeEventWithScale(scale_in: f32, event: Event) Event {
-    const scale: f32 = if (scale_in > 0) scale_in else 1.0;
-    if (scale == 1.0) return event;
+/// Normalise a native mouse/scroll event's raw physical coordinates into the application's
+/// coordinate space, through the mapping this frame latched.
+///
+/// A **scroll delta takes the same divisor as a position**: it is a movement of a position, and
+/// scaling the two differently is what stops the content under the pointer from staying under the
+/// pointer. Positions over the letterbox come out negative or past the framebuffer and are left
+/// that way — clamping would invent a press the user did not make, and dropping would swallow the
+/// release that ends a drag (ADR-030 R4).
+pub fn normalizeEventWithMapping(mapping: PresentMapping, event: Event) Event {
     var ev = event;
     switch (ev) {
         .mouse_move, .mouse_down, .mouse_up => |*m| {
-            m.x = @intFromFloat(@floor(@as(f32, @floatFromInt(m.x)) / scale));
-            m.y = @intFromFloat(@floor(@as(f32, @floatFromInt(m.y)) / scale));
+            const p = mapping.physicalToApp(m.x, m.y);
+            m.x = p.x;
+            m.y = p.y;
         },
         .mouse_scroll => |*s| {
-            s.x = @intFromFloat(@floor(@as(f32, @floatFromInt(s.x)) / scale));
-            s.y = @intFromFloat(@floor(@as(f32, @floatFromInt(s.y)) / scale));
-            s.dx /= scale;
-            s.dy /= scale;
+            const p = mapping.physicalToApp(s.x, s.y);
+            s.x = p.x;
+            s.y = p.y;
+            const d = mapping.deltaToApp(s.dx, s.dy);
+            s.dx = d.dx;
+            s.dy = d.dy;
         },
         else => {},
     }
@@ -260,20 +267,30 @@ fn fullscreenRequest() FullscreenRequest {
 /// - `transparent`: on Windows transparency selects a layered-window present, which is not viable
 ///   for a whole screen every frame; the D3D11 backend refuses transparency outright.
 ///
+/// A `.fixed` framebuffer with a zero side is refused here too, so that the one impossible value
+/// the mode can carry is rejected in the facade rather than in each backend (ADR-030 R1). It is
+/// checked **before** the fullscreen early return below, which the rest of this function is about,
+/// so that an ordinary window is checked as well.
+///
 /// Every other combination is accepted, including `fullscreen` with `.physical` (ADR-011 R11).
 /// Hot path declaration: initialisation only (once per window creation).
 pub fn validateWindowOptions(opts: WindowOptions) Error!void {
+    switch (opts.fb_mode) {
+        .fixed => |size| if (size.width == 0 or size.height == 0) return error.Unsupported,
+        .logical, .physical => {},
+    }
     if (!opts.fullscreen) return;
     if (opts.position != null or opts.borderless or opts.transparent) return error.Unsupported;
 }
 
 /// The Window facade. The four hooks are inserted only while the harness is enabled; with it disabled every call passes straight through to the backend.
 /// Under the **null runtime**, `inner` holds a `null_backend.Window`, which owns the primary framebuffer.
-/// `lockFramebuffer`/`nextEvent` take a `*Window` because they hold the latched snapshot.
-/// The loop contract: `pollEvents` → `lockFramebuffer` → `nextEvent` (native input is normalised with the latched scale).
+/// `lockFramebuffer`/`nextEvent` take a `*Window` because they hold the latched snapshot and mapping.
+/// The loop contract: `pollEvents` → `lockFramebuffer` → `nextEvent` (native input is transformed with the latched mapping).
 pub const Window = struct {
     inner: Inner,
-    /// The frame snapshot latched by the most recent `lockFramebuffer` (the only source of scale for input normalisation).
+    /// The frame snapshot latched by the most recent `lockFramebuffer`: the sizes and scale an
+    /// application reads for that frame, and what the mapping beside it is built from.
     latched_snapshot: FramebufferSnapshot = .{
         .logical_size = .{ .width = 0, .height = 0 },
         .framebuffer_size = .{ .width = 0, .height = 0 },
@@ -281,6 +298,15 @@ pub const Window = struct {
         .scale_epoch = 0,
     },
     has_latched: bool = false,
+    /// The framebuffer mode the window was created with. Kept because the mapping below cannot be
+    /// recovered from the snapshot alone: under `.physical` the framebuffer is `round(logical *
+    /// scale)`, so dividing back out lands beside 1.0 rather than on it.
+    fb_mode: FramebufferMode = .logical,
+    /// How this frame's framebuffer maps onto the window, latched with the snapshot and **not
+    /// published**: the application is told a scale of 1.0 under `.fixed`, and the real
+    /// magnification stays here (ADR-030 R2, R4). A window that is moved or resized changes this
+    /// and leaves `scale_epoch` alone, because the framebuffer did not change.
+    latched_mapping: PresentMapping = .{},
 
     const Inner = if (null_runtime_supported) union(enum) {
         native: native_backend.Window,
@@ -331,17 +357,36 @@ pub const Window = struct {
         return 1.0;
     }
 
-    fn eventScale(self: *const Window) f32 {
-        if (self.has_latched) {
-            const s = self.latched_snapshot.content_scale;
-            return if (s > 0) s else 1.0;
+    /// The mapping to convert this frame's input with. Before the first `lockFramebuffer` there is
+    /// nothing latched, so one is built from the live size and scale — through the same path a
+    /// latched one comes from, so that a backend which supplies its own mapping is asked here too
+    /// rather than having a covering one synthesised behind its back.
+    fn eventMapping(self: *const Window) PresentMapping {
+        if (self.has_latched) return self.latched_mapping;
+        return self.mappingForSnapshot(.{
+            .logical_size = self.logicalSize(),
+            .framebuffer_size = self.framebufferSize(),
+            .content_scale = self.contentScale(),
+            .scale_epoch = 0,
+        });
+    }
+
+    /// The mapping the backend reports for this frame, or one synthesised from the mode when the
+    /// backend supplies none. A backend only needs to supply one when the framebuffer does not
+    /// cover the window, which is `.fixed`.
+    fn mappingForSnapshot(self: *const Window, snap: FramebufferSnapshot) PresentMapping {
+        if (comptime null_runtime_supported) {
+            if (self.inner == .null_win) {
+                if (@hasDecl(null_backend.Window, "presentMapping")) return self.inner.null_win.presentMapping();
+                return PresentMapping.covering(self.fb_mode, snap);
+            }
         }
-        const s = self.contentScale();
-        return if (s > 0) s else 1.0;
+        if (@hasDecl(native_backend.Window, "presentMapping")) return self.inner.native.presentMapping();
+        return PresentMapping.covering(self.fb_mode, snap);
     }
 
     fn normalizeNativeEvent(self: *Window, event: Event) Event {
-        return normalizeEventWithScale(self.eventScale(), event);
+        return normalizeEventWithMapping(self.eventMapping(), event);
     }
 
     /// Create an ordinary window. A documented wrapper over `createWithOptions` with default
@@ -386,10 +431,16 @@ pub const Window = struct {
         const h = if (opts.size) |s| s.height else height;
         if (comptime null_runtime_supported) {
             if (runtime_null) {
-                return .{ .inner = .{ .null_win = try null_backend.Window.createWithOptions(w, h, title, opts) } };
+                return .{
+                    .inner = .{ .null_win = try null_backend.Window.createWithOptions(w, h, title, opts) },
+                    .fb_mode = opts.fb_mode,
+                };
             }
         }
-        return .{ .inner = .{ .native = try native_backend.Window.createWithOptions(w, h, title, opts) } };
+        return .{
+            .inner = .{ .native = try native_backend.Window.createWithOptions(w, h, title, opts) },
+            .fb_mode = opts.fb_mode,
+        };
     }
 
     /// Return the current window geometry. It never fails, and falls back to safe defaults.
@@ -521,7 +572,7 @@ pub const Window = struct {
     }
 
     pub fn nextEvent(self: *Window) ?Event {
-        // Hot path declaration: event time only. A native mouse/scroll is a scalar division by the latched scale, nothing more.
+        // Hot path declaration: event time only. A native mouse/scroll is a handful of integer operations through the latched mapping, nothing more.
         // A harness injection is already in logical units, so it does not go through normalisation.
         if (self.isNull()) return harness.nextInjectedEvent(); // only injected events, since there is no native pump
         if (!harness.isEnabled()) {
@@ -562,6 +613,7 @@ pub const Window = struct {
                 const fb = self.inner.null_win.lockFramebuffer() orelse return null;
                 const snap = snapshotFromBackendFb(fb);
                 self.latched_snapshot = snap;
+                self.latched_mapping = self.mappingForSnapshot(snap);
                 self.has_latched = true;
                 if (harness.isEnabled()) harness.onLock(fb.pixels, fb.width, fb.height, snap);
                 return .{
@@ -582,6 +634,7 @@ pub const Window = struct {
         };
         const snap = snapshotFromBackendFb(fb);
         self.latched_snapshot = snap;
+        self.latched_mapping = self.mappingForSnapshot(snap);
         self.has_latched = true;
         if (harness.isEnabled()) harness.onLock(fb.pixels, fb.width, fb.height, snap);
         return .{
@@ -755,10 +808,17 @@ pub const Window = struct {
 
     /// Supply the caret rect the IME candidate window is anchored to, in framebuffer pixels with the origin at the content's top-left.
     /// null and a backend without support are no-ops. Called at event time only, such as when the layout changes.
-    pub fn setCompositionRect(self: Window, x: i32, y: i32, w: i32, h: i32) void {
+    ///
+    /// The facade converts the rectangle into **physical window pixels** through this frame's
+    /// mapping and hands the backend that; a backend converts on from there into its own unit.
+    /// Fixing the unit at the boundary is what keeps the conversion from being applied twice —
+    /// a backend that derived the ratio from the framebuffer size would be right only while the
+    /// framebuffer covers the window (ADR-030 R4).
+    pub fn setCompositionRect(self: *const Window, x: i32, y: i32, w: i32, h: i32) void {
         if (self.isNull()) return;
         if (comptime @hasDecl(native_backend.Window, "setCompositionRect")) {
-            self.inner.native.setCompositionRect(x, y, w, h);
+            const r = types.framebufferRectToPhysical(self.eventMapping(), x, y, w, h);
+            self.inner.native.setCompositionRect(r.x, r.y, r.w, r.h);
         }
     }
 
@@ -1352,7 +1412,14 @@ test "activeBackend matches harness capabilities backend after seeding" {
     try std.testing.expect(std.mem.indexOf(u8, payload, needle) != null);
 }
 
-test "normalizeEventWithScale floors the divide (scale=2 raw to logical)" {
+test "a covering mapping at scale 2 floors the divide, negatives included" {
+    // `.logical` at a content scale of 2: an 800-point framebuffer shown across 1600 physical pixels.
+    const m = PresentMapping.covering(.logical, .{
+        .logical_size = .{ .width = 800, .height = 600 },
+        .framebuffer_size = .{ .width = 800, .height = 600 },
+        .content_scale = 2.0,
+        .scale_epoch = 1,
+    });
     const raw_move: Event = .{ .mouse_move = .{
         .x = 20,
         .y = 10,
@@ -1360,7 +1427,7 @@ test "normalizeEventWithScale floors the divide (scale=2 raw to logical)" {
         .buttons = .{},
         .modifiers = .{},
     } };
-    const logical = normalizeEventWithScale(2.0, raw_move);
+    const logical = normalizeEventWithMapping(m, raw_move);
     try std.testing.expectEqual(@as(i32, 10), logical.mouse_move.x);
     try std.testing.expectEqual(@as(i32, 5), logical.mouse_move.y);
 
@@ -1371,7 +1438,7 @@ test "normalizeEventWithScale floors the divide (scale=2 raw to logical)" {
         .buttons = .{ .left = true },
         .modifiers = .{},
     } };
-    const neg_l = normalizeEventWithScale(2.0, neg);
+    const neg_l = normalizeEventWithMapping(m, neg);
     try std.testing.expectEqual(@as(i32, -2), neg_l.mouse_down.x); // floor(-3/2)=floor(-1.5)=-2
     try std.testing.expectEqual(@as(i32, 3), neg_l.mouse_down.y);
 
@@ -1384,14 +1451,14 @@ test "normalizeEventWithScale floors the divide (scale=2 raw to logical)" {
         .buttons = .{},
         .modifiers = .{},
     } };
-    const scroll_l = normalizeEventWithScale(2.0, scroll);
+    const scroll_l = normalizeEventWithMapping(m, scroll);
     try std.testing.expectEqual(@as(i32, 20), scroll_l.mouse_scroll.x);
     try std.testing.expectEqual(@as(i32, 10), scroll_l.mouse_scroll.y);
     try std.testing.expectEqual(@as(f32, 2.0), scroll_l.mouse_scroll.dx);
     try std.testing.expectEqual(@as(f32, -3.0), scroll_l.mouse_scroll.dy);
 }
 
-test "normalizeEventWithScale is the identity at scale=1 and corrects scale<=0" {
+test "a covering mapping at scale 1 leaves an event alone, and a broken scale is corrected" {
     const ev: Event = .{ .mouse_move = .{
         .x = 11,
         .y = 22,
@@ -1399,10 +1466,20 @@ test "normalizeEventWithScale is the identity at scale=1 and corrects scale<=0" 
         .buttons = .{},
         .modifiers = .{},
     } };
-    const same = normalizeEventWithScale(1.0, ev);
-    try std.testing.expectEqual(@as(i32, 11), same.mouse_move.x);
-    const fixed = normalizeEventWithScale(0.0, ev);
-    try std.testing.expectEqual(@as(i32, 11), fixed.mouse_move.x);
+    const one = PresentMapping.covering(.logical, .{
+        .logical_size = .{ .width = 100, .height = 100 },
+        .framebuffer_size = .{ .width = 100, .height = 100 },
+        .content_scale = 1.0,
+        .scale_epoch = 0,
+    });
+    try std.testing.expectEqual(@as(i32, 11), normalizeEventWithMapping(one, ev).mouse_move.x);
+    const broken = PresentMapping.covering(.logical, .{
+        .logical_size = .{ .width = 100, .height = 100 },
+        .framebuffer_size = .{ .width = 100, .height = 100 },
+        .content_scale = 0.0,
+        .scale_epoch = 0,
+    });
+    try std.testing.expectEqual(@as(i32, 11), normalizeEventWithMapping(broken, ev).mouse_move.x);
 }
 
 test "FramebufferSnapshot logical and physical size contract" {
@@ -1481,4 +1558,61 @@ test "createFullscreen requests the documented size, fullscreen, and nothing els
     try std.testing.expectEqual(FramebufferMode.logical, req.opts.fb_mode);
     // And the request must be one the combination rules accept.
     try validateWindowOptions(req.opts);
+}
+
+test "validateWindowOptions: a fixed framebuffer with a zero side is refused, fullscreen or not" {
+    // The check has to sit before the fullscreen early return, or an ordinary window skips it.
+    try std.testing.expectError(error.Unsupported, validateWindowOptions(.{
+        .fb_mode = .{ .fixed = .{ .width = 0, .height = 400 } },
+    }));
+    try std.testing.expectError(error.Unsupported, validateWindowOptions(.{
+        .fb_mode = .{ .fixed = .{ .width = 640, .height = 0 } },
+    }));
+    try std.testing.expectError(error.Unsupported, validateWindowOptions(.{
+        .fullscreen = true,
+        .fb_mode = .{ .fixed = .{ .width = 0, .height = 0 } },
+    }));
+    // A usable size is accepted, with or without fullscreen.
+    try validateWindowOptions(.{ .fb_mode = .{ .fixed = .{ .width = 640, .height = 400 } } });
+    try validateWindowOptions(.{ .fullscreen = true, .fb_mode = .{ .fixed = .{ .width = 640, .height = 400 } } });
+}
+
+test "normalizeEventWithMapping: a position and the scroll delta beside it take the same ratio" {
+    // A 640x400 framebuffer inside a 5120x2880 window: 7.2x, with bars 256 wide.
+    const m = PresentMapping.letterbox(.{ .width = 5120, .height = 2880 }, .{ .width = 640, .height = 400 });
+    const ev = normalizeEventWithMapping(m, .{ .mouse_scroll = .{
+        .x = m.origin.x + 720,
+        .y = 360,
+        .dx = 72.0,
+        .dy = -36.0,
+        .is_precise = true,
+        .buttons = .{},
+        .modifiers = .{},
+    } });
+    try std.testing.expectEqual(@as(i32, 100), ev.mouse_scroll.x);
+    try std.testing.expectEqual(@as(i32, 50), ev.mouse_scroll.y);
+    // The delta is a movement of that position, so it is divided by the same magnification.
+    try std.testing.expectApproxEqAbs(@as(f32, 10.0), ev.mouse_scroll.dx, 0.001);
+    try std.testing.expectApproxEqAbs(@as(f32, -5.0), ev.mouse_scroll.dy, 0.001);
+}
+
+test "normalizeEventWithMapping: a press on the letterbox stays outside the framebuffer" {
+    const m = PresentMapping.letterbox(.{ .width = 5120, .height = 2880 }, .{ .width = 640, .height = 400 });
+    // Neither clamped to the edge nor dropped: the application sees where the pointer actually was.
+    const left = normalizeEventWithMapping(m, .{ .mouse_down = .{
+        .x = 0,
+        .y = 100,
+        .button = .left,
+        .buttons = .{},
+        .modifiers = .{},
+    } });
+    try std.testing.expect(left.mouse_down.x < 0);
+    const right = normalizeEventWithMapping(m, .{ .mouse_down = .{
+        .x = 5119,
+        .y = 100,
+        .button = .left,
+        .buttons = .{},
+        .modifiers = .{},
+    } });
+    try std.testing.expect(right.mouse_down.x >= 640);
 }

@@ -58,7 +58,7 @@ const WindowSize = types.WindowSize;
 // Hot path declaration: initialisation and event time only (neither per frame nor real time).
 // ============================================================================
 
-/// The real scale used for input normalisation (for a query; re-read each time, before a lock). Independent of fb_mode.
+/// The real scale used for input normalisation (for a query; re-read each time, before a lock). Independent of the framebuffer mode.
 fn effectiveContentScale(raw_scale: f32) f32 {
     return if (raw_scale > 0 and std.math.isFinite(raw_scale)) raw_scale else 1.0;
 }
@@ -89,7 +89,13 @@ fn logicalFromPhysicalPx(physical_px: u32, scale: f32) u32 {
 /// a fullscreen window is created and when a resize notification arrives, so that the logical size
 /// cannot differ between the first frame and the first configure (ADR-011 R11).
 fn logicalSizeForPhysical(fb_mode: FramebufferMode, physical: WindowSize, scale: f32) WindowSize {
-    if (fb_mode == .logical) return physical;
+    // Exhaustive rather than `== .logical`: a tagged union compares equal to an enum literal, so a
+    // mode this backend has not implemented would silently take the wrong branch here.
+    switch (fb_mode) {
+        .logical => return physical,
+        .fixed => return physical, // refused at creation; the framebuffer never reaches this size path
+        .physical => {},
+    }
     return .{
         .width = logicalFromPhysicalPx(physical.width, scale),
         .height = logicalFromPhysicalPx(physical.height, scale),
@@ -98,7 +104,11 @@ fn logicalSizeForPhysical(fb_mode: FramebufferMode, physical: WindowSize, scale:
 
 /// The physical framebuffer size. Under .logical it is always the logical size itself (which is where the structural guarantee lives).
 fn effectiveFramebufferSize(fb_mode: FramebufferMode, logical: WindowSize, scale: f32) WindowSize {
-    if (fb_mode == .logical) return logical;
+    switch (fb_mode) {
+        .logical => return logical,
+        .fixed => |size| return size, // refused at creation, but stated rather than left to fall through
+        .physical => {},
+    }
     return .{
         .width = roundToPhysicalPx(logical.width, scale),
         .height = roundToPhysicalPx(logical.height, scale),
@@ -320,6 +330,9 @@ pub const Window = struct {
     /// own size, so the width and height are ignored in that case (ADR-019 R3).
     /// Hot path declaration: initialisation only.
     pub fn createWithOptions(width: u32, height: u32, title: [:0]const u8, opts: types.WindowOptions) Error!Window {
+        // No present here magnifies a framebuffer into a letterbox yet, so a fixed one is refused
+        // rather than quietly behaving like another mode (ADR-030 R5).
+        try types.refuseFixedFramebuffer(opts.fb_mode);
         return createInternal(width, height, title, opts.fullscreen, opts);
     }
 
@@ -1020,8 +1033,12 @@ fn mouseEvent(st: *State, x: c_int, y: c_int, button: MouseButton, state: u32) M
 
 /// X11 native (real window pixel coordinates) → raw physical event coordinates.
 fn nativeToRawPhysical(st: *const State, native_x: c_int, native_y: c_int) struct { x: i32, y: i32 } {
-    if (st.fb_mode == .physical) {
-        return .{ .x = native_x, .y = native_y };
+    switch (st.fb_mode) {
+        .physical => return .{ .x = native_x, .y = native_y },
+        .logical => {},
+        // Refused by `refuseFixedFramebuffer` at window creation, because this backend has no
+        // present that magnifies. Its input would need the letterbox mapping, not this one.
+        .fixed => unreachable,
     }
     // `.logical`: the window is at the logical size, so native is a logical value. It is multiplied into raw physical, which pairs with the facade's normalisation.
     const s = effectiveContentScale(st.pending_content_scale);

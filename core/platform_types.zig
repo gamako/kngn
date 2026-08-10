@@ -65,12 +65,271 @@ pub const RestoreGeometryLatch = struct {
     }
 };
 
-/// The framebuffer resolution mode (ADR-011 R1). The default `.logical` keeps today's behaviour;
-/// `.physical` is opt-in (a framebuffer in physical pixels while the coordinates stay logical).
-pub const FramebufferMode = enum {
+/// The framebuffer resolution mode. The default `.logical` and the opt-in `.physical` size the
+/// framebuffer from the display area (ADR-011 R1); `.fixed` sizes it from the value it carries and
+/// leaves present to magnify it into a letterbox (ADR-030 R1).
+///
+/// It is a union rather than an enum plus a separate size field so that selecting `.fixed` makes
+/// the size mandatory and attaching a size to another mode is not a program: the contract lives in
+/// the type instead of being split between the type and `validateWindowOptions`.
+pub const FramebufferMode = union(enum) {
+    /// A framebuffer the size of the window in logical points; the display scales it up.
     logical,
+    /// A framebuffer in physical pixels, while application coordinates stay logical.
     physical,
+    /// A framebuffer of exactly this size, whatever the window does. The application sees one
+    /// coordinate space at scale 1.0 and present magnifies into a letterbox (ADR-030 R2, R3).
+    fixed: WindowSize,
+
+    /// True when the framebuffer is sized in physical pixels and follows the window.
+    ///
+    /// This and the predicate below are how a backend asks which space its framebuffer is in.
+    /// **A fixed framebuffer is in neither**, so both answer false for it, and these two exhaustive
+    /// switches are the only place that decides. Comparing the mode against a tag at the call site
+    /// instead would put a fixed framebuffer on whichever branch the comparison happened to leave
+    /// it on, silently — a tagged union compares equal to an enum literal perfectly happily.
+    pub fn tracksPhysicalPixels(self: FramebufferMode) bool {
+        return switch (self) {
+            .physical => true,
+            .logical, .fixed => false,
+        };
+    }
+
+    /// True when the framebuffer is sized in logical points and follows the window.
+    pub fn tracksLogicalPoints(self: FramebufferMode) bool {
+        return switch (self) {
+            .logical => true,
+            .physical, .fixed => false,
+        };
+    }
 };
+
+/// How a framebuffer maps onto the window, in both directions (ADR-030 R3, R4).
+///
+/// **The two directions do not share a denominator**, and merging them silently breaks `.physical`.
+/// The forward direction leaves *framebuffer* space; the inverse arrives in the *application's*
+/// coordinate space, and under `.physical` those are different spaces — the framebuffer is in
+/// physical pixels while the application still thinks in logical points (ADR-011 R3):
+///
+/// | Mode | origin | fb_size (forward) | app_size (inverse) | dst_size |
+/// |---|---|---|---|---|
+/// | `.logical` | 0 | the framebuffer | the same, and equal to it | the window in physical pixels |
+/// | `.physical` | 0 | the framebuffer | the logical size, which is smaller | the framebuffer |
+/// | `.fixed` | the letterbox origin | the fixed size | the same, and equal to it | the magnified rectangle |
+///
+/// Everything is a ratio of integers, computed the way a nearest-neighbour upscale computes
+/// `sx = x * src_w / dst_w`. That is not an implementation detail: doing it in floating point makes
+/// the forward and the inverse disagree at the edges by a pixel — enough to leave the outermost
+/// column of the framebuffer impossible to point at — and makes both disagree with the present that
+/// magnifies the pixels. Integers make the three exact by construction.
+///
+/// Coordinates use a **pixel-edge** convention: framebuffer pixel `k` covers the destination range
+/// `[k * dst / fb, (k + 1) * dst / fb)`. The inverse is the floored division a nearest-neighbour
+/// upscale performs, and the forward is the **ceiling** of the same ratio — the first whole
+/// destination pixel that lands inside `k`'s range, which is what makes the inverse undo it. Taking
+/// the floor there instead would name a pixel belonging to `k - 1` whenever the magnification is
+/// fractional, and the round trip would drift by one.
+pub const PresentMapping = struct {
+    /// Top-left of the destination rectangle, in physical window pixels. Zero unless `.fixed`.
+    origin: WindowPosition = .{ .x = 0, .y = 0 },
+    /// The destination rectangle, in physical window pixels.
+    dst_size: WindowSize = .{ .width = 1, .height = 1 },
+    /// The framebuffer, and so the denominator of the forward direction.
+    fb_size: WindowSize = .{ .width = 1, .height = 1 },
+    /// The application's coordinate space, and so the numerator of the inverse direction.
+    app_size: WindowSize = .{ .width = 1, .height = 1 },
+
+    /// The letterboxed destination rectangle of `.fixed`: the aspect ratio preserved, the
+    /// magnification arbitrary, everything floored, and all of it computed in physical pixels so
+    /// that this and its inverse agree exactly (ADR-030 R3).
+    ///
+    /// A window with no area gets a mapping with no area, which present skips. Otherwise the
+    /// destination is at least one pixel on each axis — **the one case that does not preserve the
+    /// aspect ratio**, taken because a mapping that exists beats a rule that holds.
+    ///
+    /// Hot path declaration: window-size changes only (never per frame, never per pixel).
+    pub fn letterbox(win_physical: WindowSize, fb: WindowSize) PresentMapping {
+        if (win_physical.width == 0 or win_physical.height == 0 or fb.width == 0 or fb.height == 0) {
+            return .{ .dst_size = .{ .width = 0, .height = 0 }, .fb_size = fb, .app_size = fb };
+        }
+        // The axis that runs out first sets the magnification. Comparing the two candidate
+        // destinations by cross-multiplication keeps the choice exact and integral.
+        const win_w: u64 = win_physical.width;
+        const win_h: u64 = win_physical.height;
+        const fb_w: u64 = fb.width;
+        const fb_h: u64 = fb.height;
+        var dst_w: u64 = undefined;
+        var dst_h: u64 = undefined;
+        if (win_w * fb_h <= win_h * fb_w) {
+            dst_w = win_w;
+            dst_h = win_w * fb_h / fb_w;
+        } else {
+            dst_h = win_h;
+            dst_w = win_h * fb_w / fb_h;
+        }
+        const w: u32 = @intCast(std.math.clamp(dst_w, 1, win_w));
+        const h: u32 = @intCast(std.math.clamp(dst_h, 1, win_h));
+        return .{
+            .origin = .{
+                .x = @intCast((win_physical.width - w) / 2),
+                .y = @intCast((win_physical.height - h) / 2),
+            },
+            .dst_size = .{ .width = w, .height = h },
+            .fb_size = fb,
+            // Under a fixed framebuffer the application's space *is* the framebuffer (ADR-030 R2).
+            .app_size = fb,
+        };
+    }
+
+    /// The mapping for a framebuffer that covers the window, synthesised from the mode the window
+    /// was created with and this frame's snapshot. **Never used for `.fixed`**, whose mapping comes
+    /// from the backend.
+    ///
+    /// The mode has to be passed in because the snapshot cannot be divided back out: a `.physical`
+    /// framebuffer is `round(logical * scale)`, so recovering the scale lands beside 1.0 rather than
+    /// on it. Told the mode, the answer is exact.
+    ///
+    /// Hot path declaration: once per frame (a handful of scalar operations).
+    pub fn covering(mode: FramebufferMode, snap: FramebufferSnapshot) PresentMapping {
+        const fb = atLeastOne(snap.framebuffer_size);
+        const logical = atLeastOne(snap.logical_size);
+        return switch (mode) {
+            // The framebuffer is in logical points and the display scales it up, so the window in
+            // physical pixels is what the framebuffer becomes on screen.
+            .logical => .{
+                .dst_size = scaleSize(fb, snap.content_scale),
+                .fb_size = fb,
+                .app_size = logical,
+            },
+            // The framebuffer is already the window in physical pixels.
+            .physical => .{
+                .dst_size = fb,
+                .fb_size = fb,
+                .app_size = logical,
+            },
+            // A fixed framebuffer never reaches here: the backend owns its mapping, and a backend
+            // that cannot supply one refuses to create the window.
+            .fixed => .{
+                .dst_size = fb,
+                .fb_size = fb,
+                .app_size = fb,
+            },
+        };
+    }
+
+    /// Map a framebuffer coordinate to physical window pixels: the first whole destination pixel
+    /// that falls inside the range this framebuffer pixel covers.
+    pub fn framebufferToPhysical(self: PresentMapping, x: i32, y: i32) WindowPosition {
+        return .{
+            .x = saturate(@as(i128, self.origin.x) + ratioCeil(x, self.dst_size.width, self.fb_size.width)),
+            .y = saturate(@as(i128, self.origin.y) + ratioCeil(y, self.dst_size.height, self.fb_size.height)),
+        };
+    }
+
+    /// Map a physical window coordinate into the application's coordinate space.
+    ///
+    /// **A position over the letterbox is not pulled back inside**: it comes out negative, or past
+    /// the framebuffer's last row or column, and says so (ADR-030 R4). The only limit applied is the
+    /// range of the result type, which no real window comes near.
+    pub fn physicalToApp(self: PresentMapping, x: i32, y: i32) WindowPosition {
+        return .{
+            .x = saturate(ratio(@as(i128, x) - @as(i128, self.origin.x), self.app_size.width, self.dst_size.width)),
+            .y = saturate(ratio(@as(i128, y) - @as(i128, self.origin.y), self.app_size.height, self.dst_size.height)),
+        };
+    }
+
+    /// Scale a scroll delta into the application's coordinate space. A delta is a movement of a
+    /// position and takes the same ratio the position takes: scaling the two differently is what
+    /// stops the content under the pointer from staying under the pointer.
+    ///
+    /// **Each axis takes its own ratio.** Flooring the destination rectangle leaves the two axes
+    /// with ratios that are close but not equal — a 300x200 framebuffer in a 1000x999 window
+    /// becomes 1000x666, so `dy` divides by 666/200 while `dx` divides by 1000/300.
+    pub fn deltaToApp(self: PresentMapping, dx: f32, dy: f32) struct { dx: f32, dy: f32 } {
+        return .{
+            .dx = scaleDelta(dx, self.app_size.width, self.dst_size.width),
+            .dy = scaleDelta(dy, self.app_size.height, self.dst_size.height),
+        };
+    }
+
+    fn scaleDelta(d: f32, num: u32, den: u32) f32 {
+        if (den == 0) return d;
+        return d * @as(f32, @floatFromInt(num)) / @as(f32, @floatFromInt(den));
+    }
+
+    /// `floor(v * num / den)`, floored towards minus infinity so that a position outside the
+    /// destination rectangle keeps going the way it was heading.
+    ///
+    /// The product is taken in `i128`. A coordinate is bounded only by `i32` and a size only by
+    /// `u32`, so their product does not fit an `i64` and Zig traps on the overflow rather than
+    /// wrapping. A size that large is a bug in whatever supplied it, and it should surface as a
+    /// wrong number rather than as a crash inside a coordinate transform.
+    fn ratio(v: i128, num: u32, den: u32) i128 {
+        if (den == 0) return v;
+        return @divFloor(v * @as(i128, num), @as(i128, den));
+    }
+
+    pub fn saturate(v: i128) i32 {
+        return @intCast(std.math.clamp(v, std.math.minInt(i32), std.math.maxInt(i32)));
+    }
+
+    /// `ceil(v * num / den)`, the same arithmetic rounded the other way.
+    fn ratioCeil(v: i128, num: u32, den: u32) i128 {
+        if (den == 0) return v;
+        const d = @as(i128, den);
+        return @divFloor(v * @as(i128, num) + d - 1, d);
+    }
+
+    fn atLeastOne(size: WindowSize) WindowSize {
+        return .{ .width = @max(size.width, 1), .height = @max(size.height, 1) };
+    }
+
+    fn scaleSize(size: WindowSize, scale_in: f32) WindowSize {
+        const scale: f64 = if (std.math.isFinite(scale_in) and scale_in > 0) scale_in else 1.0;
+        return .{ .width = scaleDim(size.width, scale), .height = scaleDim(size.height, scale) };
+    }
+
+    /// `round(dim * scale)`, clamped into the range a size can hold: a scale big enough to leave it
+    /// is nonsense rather than a number worth propagating, and `@intFromFloat` would trap on it.
+    fn scaleDim(dim: u32, scale: f64) u32 {
+        const v = @round(@as(f64, @floatFromInt(dim)) * scale);
+        if (!(v >= 1)) return 1;
+        if (v >= @as(f64, std.math.maxInt(u32))) return std.math.maxInt(u32);
+        return @intFromFloat(v);
+    }
+};
+
+/// Map a whole framebuffer rectangle to physical window pixels. **Both edges are converted and the
+/// extent taken as their difference** rather than the extent being scaled on its own, so that
+/// adjacent rectangles stay adjacent — no gap, no overlap — under the pixel-edge convention.
+pub fn framebufferRectToPhysical(m: PresentMapping, x: i32, y: i32, w: i32, h: i32) struct {
+    x: i32,
+    y: i32,
+    w: i32,
+    h: i32,
+} {
+    const near = m.framebufferToPhysical(x, y);
+    const far = m.framebufferToPhysical(x +| w, y +| h);
+    return .{
+        .x = near.x,
+        .y = near.y,
+        .w = PresentMapping.saturate(@as(i128, far.x) - @as(i128, near.x)),
+        .h = PresentMapping.saturate(@as(i128, far.y) - @as(i128, near.y)),
+    };
+}
+
+/// The guard a backend calls while it has no present that magnifies a framebuffer into a letterbox
+/// (ADR-030 R3). Called at the very top of `createWithOptions` — before a display is opened or
+/// anything is allocated — so the caller is told `Unsupported` rather than being handed a
+/// framebuffer of a size it did not ask for, or a creation failure that says nothing.
+///
+/// A backend that gains that present deletes its call, which is the one line that marks the change.
+pub fn refuseFixedFramebuffer(mode: FramebufferMode) Error!void {
+    switch (mode) {
+        .fixed => return error.Unsupported,
+        .logical, .physical => {},
+    }
+}
 
 /// The scale and size snapshot of one frame, returned by `lockFramebuffer` (ADR-011 R2).
 pub const FramebufferSnapshot = struct {
@@ -910,4 +1169,235 @@ test "TextInputRange NOT_FOUND sentinel is UINT64_MAX" {
     try std.testing.expect(nf.isNotFound());
     const ok: TextInputRange = .{ .location = 0, .length = 3 };
     try std.testing.expect(!ok.isNotFound());
+}
+
+// ============================================================================
+// PresentMapping (ADR-030 R3, R4)
+// ============================================================================
+
+// The scenarios the upscale benchmark measures, so that the mapping the benchmark assumes and the
+// mapping the platform computes cannot drift apart.
+test "PresentMapping.letterbox: the destination rectangle and its origin, in physical pixels" {
+    const fb: WindowSize = .{ .width = 640, .height = 400 };
+    const Case = struct { win: WindowSize, dst: WindowSize, origin: WindowPosition };
+    const cases = [_]Case{
+        // A wider window than the framebuffer's aspect: bars on the left and right.
+        .{ .win = .{ .width = 5120, .height = 2880 }, .dst = .{ .width = 4608, .height = 2880 }, .origin = .{ .x = 256, .y = 0 } },
+        .{ .win = .{ .width = 3840, .height = 2160 }, .dst = .{ .width = 3456, .height = 2160 }, .origin = .{ .x = 192, .y = 0 } },
+        // The same aspect ratio: no bars, a whole-number magnification.
+        .{ .win = .{ .width = 2560, .height = 1600 }, .dst = .{ .width = 2560, .height = 1600 }, .origin = .{ .x = 0, .y = 0 } },
+        .{ .win = .{ .width = 1280, .height = 800 }, .dst = .{ .width = 1280, .height = 800 }, .origin = .{ .x = 0, .y = 0 } },
+        // Taller than the framebuffer's aspect: bars above and below.
+        .{ .win = .{ .width = 900, .height = 1600 }, .dst = .{ .width = 900, .height = 562 }, .origin = .{ .x = 0, .y = 519 } },
+        // Smaller than the framebuffer: the same rule with a magnification below one.
+        .{ .win = .{ .width = 400, .height = 400 }, .dst = .{ .width = 400, .height = 250 }, .origin = .{ .x = 0, .y = 75 } },
+    };
+    for (cases) |c| {
+        const m = PresentMapping.letterbox(c.win, fb);
+        try std.testing.expectEqual(c.dst.width, m.dst_size.width);
+        try std.testing.expectEqual(c.dst.height, m.dst_size.height);
+        try std.testing.expectEqual(c.origin.x, m.origin.x);
+        try std.testing.expectEqual(c.origin.y, m.origin.y);
+        // The rectangle always fits inside the window it was derived from.
+        try std.testing.expect(m.origin.x >= 0 and m.origin.y >= 0);
+        try std.testing.expect(m.dst_size.width + @as(u32, @intCast(m.origin.x)) <= c.win.width);
+        try std.testing.expect(m.dst_size.height + @as(u32, @intCast(m.origin.y)) <= c.win.height);
+    }
+}
+
+test "PresentMapping.letterbox: a window with no area maps nothing" {
+    const fb: WindowSize = .{ .width = 640, .height = 400 };
+    for ([_]WindowSize{
+        .{ .width = 0, .height = 600 },
+        .{ .width = 800, .height = 0 },
+        .{ .width = 0, .height = 0 },
+    }) |win| {
+        const m = PresentMapping.letterbox(win, fb);
+        try std.testing.expectEqual(@as(u32, 0), m.dst_size.width);
+        try std.testing.expectEqual(@as(u32, 0), m.dst_size.height);
+    }
+}
+
+test "PresentMapping.letterbox: the one-pixel clamp is the only case that drops the aspect ratio" {
+    const fb: WindowSize = .{ .width = 640, .height = 400 };
+    // A window one pixel tall cannot hold a 640x400 aspect at any whole size, so the clamp decides.
+    const m = PresentMapping.letterbox(.{ .width = 640, .height = 1 }, fb);
+    try std.testing.expectEqual(@as(u32, 1), m.dst_size.height);
+    try std.testing.expect(m.dst_size.width >= 1);
+    // A mapping that exists beats a rule that holds: the aspect ratio is not preserved here.
+    const aspect_fb = @as(f64, 640.0) / 400.0;
+    const aspect_dst = @as(f64, @floatFromInt(m.dst_size.width)) / @as(f64, @floatFromInt(m.dst_size.height));
+    try std.testing.expect(aspect_dst != aspect_fb);
+}
+
+test "PresentMapping: magnifying, the inverse undoes the forward for every framebuffer pixel" {
+    const fb: WindowSize = .{ .width = 64, .height = 40 };
+    for ([_]WindowSize{
+        .{ .width = 512, .height = 288 }, // bars left and right, a fractional magnification
+        .{ .width = 256, .height = 160 }, // exactly 4x, no bars
+        .{ .width = 90, .height = 160 }, // bars above and below
+    }) |win| {
+        const m = PresentMapping.letterbox(win, fb);
+        try std.testing.expect(m.dst_size.width >= m.fb_size.width);
+        var x: i32 = 0;
+        while (x < @as(i32, @intCast(fb.width))) : (x += 1) {
+            var y: i32 = 0;
+            while (y < @as(i32, @intCast(fb.height))) : (y += 1) {
+                const p = m.framebufferToPhysical(x, y);
+                const back = m.physicalToApp(p.x, p.y);
+                try std.testing.expectEqual(x, back.x);
+                try std.testing.expectEqual(y, back.y);
+            }
+        }
+    }
+}
+
+test "PresentMapping: magnifying, the first and last destination pixels reach the framebuffer's edges" {
+    // The defect this pins: an inverse that disagrees with the forward by one pixel leaves the
+    // outermost column or row of the framebuffer impossible to point at.
+    const fb: WindowSize = .{ .width = 640, .height = 400 };
+    for ([_]WindowSize{
+        .{ .width = 5120, .height = 2880 },
+        .{ .width = 1280, .height = 800 },
+        .{ .width = 900, .height = 1600 },
+    }) |win| {
+        const m = PresentMapping.letterbox(win, fb);
+        const first = m.physicalToApp(m.origin.x, m.origin.y);
+        try std.testing.expectEqual(@as(i32, 0), first.x);
+        try std.testing.expectEqual(@as(i32, 0), first.y);
+        const last = m.physicalToApp(
+            m.origin.x + @as(i32, @intCast(m.dst_size.width)) - 1,
+            m.origin.y + @as(i32, @intCast(m.dst_size.height)) - 1,
+        );
+        try std.testing.expectEqual(@as(i32, @intCast(fb.width)) - 1, last.x);
+        try std.testing.expectEqual(@as(i32, @intCast(fb.height)) - 1, last.y);
+    }
+}
+
+test "PresentMapping: minifying, the inverse stays in range and never goes backwards" {
+    // Several framebuffer pixels share one destination pixel here, so the round trip is not the
+    // identity and the endpoint assertion above does not hold. What must hold is that every
+    // destination pixel names a framebuffer pixel that exists, in order.
+    const fb: WindowSize = .{ .width = 640, .height = 400 };
+    const m = PresentMapping.letterbox(.{ .width = 320, .height = 200 }, fb);
+    try std.testing.expect(m.dst_size.width < m.fb_size.width);
+    var prev: i32 = -1;
+    var x: i32 = 0;
+    while (x < @as(i32, @intCast(m.dst_size.width))) : (x += 1) {
+        const app = m.physicalToApp(m.origin.x + x, m.origin.y);
+        try std.testing.expect(app.x >= 0 and app.x < @as(i32, @intCast(fb.width)));
+        try std.testing.expect(app.x >= prev);
+        prev = app.x;
+    }
+}
+
+test "PresentMapping: over the letterbox the result is outside the framebuffer, not clamped" {
+    const fb: WindowSize = .{ .width = 640, .height = 400 };
+    const m = PresentMapping.letterbox(.{ .width = 5120, .height = 2880 }, fb);
+    try std.testing.expect(m.origin.x > 0);
+    // A pixel to the left of the destination rectangle is a negative framebuffer coordinate.
+    const left = m.physicalToApp(m.origin.x - 1, m.origin.y);
+    try std.testing.expect(left.x < 0);
+    // One past the right edge is past the framebuffer's last column.
+    const right = m.physicalToApp(m.origin.x + @as(i32, @intCast(m.dst_size.width)), m.origin.y);
+    try std.testing.expect(right.x >= @as(i32, @intCast(fb.width)));
+}
+
+test "PresentMapping.covering: the mode decides, because the snapshot cannot be divided back out" {
+    // `.physical` allocates round(logical * scale), so recovering the scale by division lands beside
+    // 1.0 rather than on it. 801 x 1.5 -> 1201.5 -> 1202 is the case that shows it.
+    const physical: FramebufferSnapshot = .{
+        .logical_size = .{ .width = 801, .height = 601 },
+        .framebuffer_size = .{ .width = 1202, .height = 902 },
+        .content_scale = 1.5,
+        .scale_epoch = 1,
+    };
+    const pm = PresentMapping.covering(.physical, physical);
+    // The framebuffer is the window, exactly: forward is the identity.
+    try std.testing.expectEqual(@as(i32, 1201), pm.framebufferToPhysical(1201, 0).x);
+    // And the inverse still divides by the real scale, because the application is in logical points.
+    try std.testing.expectEqual(@as(i32, 800), pm.physicalToApp(1201, 0).x);
+    try std.testing.expectEqual(@as(u32, 1202), pm.dst_size.width);
+
+    const logical: FramebufferSnapshot = .{
+        .logical_size = .{ .width = 801, .height = 601 },
+        .framebuffer_size = .{ .width = 801, .height = 601 },
+        .content_scale = 1.5,
+        .scale_epoch = 1,
+    };
+    const lm = PresentMapping.covering(.logical, logical);
+    // The framebuffer is in logical points, so the forward direction magnifies by the scale, and
+    // the two directions still undo one another.
+    try std.testing.expectEqual(@as(u32, 1202), lm.dst_size.width);
+    const lp = lm.framebufferToPhysical(800, 0);
+    try std.testing.expectEqual(@as(i32, 800), lm.physicalToApp(lp.x, 0).x);
+    try std.testing.expectEqual(@as(i32, 0), lm.origin.x);
+
+    // A fullscreen window resolves its own size in physical pixels and derives the logical one, so
+    // the two do not round-trip; the mode still answers exactly.
+    const fs: FramebufferSnapshot = .{
+        .logical_size = .{ .width = 1707, .height = 960 },
+        .framebuffer_size = .{ .width = 2560, .height = 1440 },
+        .content_scale = 1.5,
+        .scale_epoch = 2,
+    };
+    const fsm = PresentMapping.covering(.physical, fs);
+    try std.testing.expectEqual(@as(i32, 2559), fsm.framebufferToPhysical(2559, 0).x);
+}
+
+test "PresentMapping.covering: a content scale that is not a usable number falls back to 1.0" {
+    const snap: FramebufferSnapshot = .{
+        .logical_size = .{ .width = 320, .height = 200 },
+        .framebuffer_size = .{ .width = 320, .height = 200 },
+        .content_scale = 0.0,
+        .scale_epoch = 0,
+    };
+    try std.testing.expectEqual(@as(u32, 320), PresentMapping.covering(.logical, snap).dst_size.width);
+    const nan_snap: FramebufferSnapshot = .{
+        .logical_size = .{ .width = 320, .height = 200 },
+        .framebuffer_size = .{ .width = 320, .height = 200 },
+        .content_scale = std.math.nan(f32),
+        .scale_epoch = 0,
+    };
+    try std.testing.expectEqual(@as(u32, 320), PresentMapping.covering(.logical, nan_snap).dst_size.width);
+}
+
+test "framebufferRectToPhysical: both edges are converted, so adjacent rectangles stay adjacent" {
+    const m = PresentMapping.letterbox(.{ .width = 1000, .height = 1000 }, .{ .width = 300, .height = 300 });
+    // 1000/300 is not a whole number, which is where scaling an extent on its own drifts.
+    const a = framebufferRectToPhysical(m, 0, 0, 7, 7);
+    const b = framebufferRectToPhysical(m, 7, 7, 7, 7);
+    try std.testing.expectEqual(a.x + a.w, b.x);
+    try std.testing.expectEqual(a.y + a.h, b.y);
+    // And the whole framebuffer maps onto the whole destination rectangle.
+    const all = framebufferRectToPhysical(m, 0, 0, 300, 300);
+    try std.testing.expectEqual(m.origin.x, all.x);
+    try std.testing.expectEqual(@as(i32, @intCast(m.dst_size.width)), all.w);
+}
+
+test "FramebufferMode: a fixed framebuffer carries its size" {
+    const opts: WindowOptions = .{ .fb_mode = .{ .fixed = .{ .width = 640, .height = 400 } } };
+    switch (opts.fb_mode) {
+        .fixed => |size| {
+            try std.testing.expectEqual(@as(u32, 640), size.width);
+            try std.testing.expectEqual(@as(u32, 400), size.height);
+        },
+        .logical, .physical => return error.TestUnexpectedResult,
+    }
+}
+
+test "refuseFixedFramebuffer: only a fixed framebuffer is refused" {
+    try std.testing.expectError(error.Unsupported, refuseFixedFramebuffer(.{ .fixed = .{ .width = 640, .height = 400 } }));
+    try refuseFixedFramebuffer(.logical);
+    try refuseFixedFramebuffer(.physical);
+}
+
+test "FramebufferMode: a fixed framebuffer follows neither the window's pixels nor its points" {
+    try std.testing.expect((FramebufferMode{ .physical = {} }).tracksPhysicalPixels());
+    try std.testing.expect(!(FramebufferMode{ .physical = {} }).tracksLogicalPoints());
+    try std.testing.expect((FramebufferMode{ .logical = {} }).tracksLogicalPoints());
+    try std.testing.expect(!(FramebufferMode{ .logical = {} }).tracksPhysicalPixels());
+    const fixed: FramebufferMode = .{ .fixed = .{ .width = 640, .height = 400 } };
+    try std.testing.expect(!fixed.tracksPhysicalPixels());
+    try std.testing.expect(!fixed.tracksLogicalPoints());
 }
