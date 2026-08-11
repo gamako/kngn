@@ -760,6 +760,7 @@ pub fn build(b: *std.Build) void {
             .{ .name = "example_41", .path = "examples/41_panel_host/main.zig", .needs_sprite = false, .needs_fps_counter = false, .needs_fixed_timestep = false, .needs_text = false, .needs_gui = true, .needs_png = false, .needs_font = false, .needs_audio = false, .needs_gamepad = false, .needs_gmath = false, .needs_sound = false },
             .{ .name = "example_42", .path = "examples/42_tracker_grid/main.zig", .needs_sprite = false, .needs_fps_counter = false, .needs_fixed_timestep = false, .needs_text = false, .needs_gui = true, .needs_png = false, .needs_font = false, .needs_audio = false, .needs_gamepad = false, .needs_gmath = false, .needs_sound = false },
             .{ .name = "example_43", .path = "examples/43_game_inventory/main.zig", .needs_sprite = false, .needs_fps_counter = false, .needs_fixed_timestep = false, .needs_text = false, .needs_gui = true, .needs_png = false, .needs_font = false, .needs_audio = false, .needs_gamepad = true, .needs_gmath = false, .needs_sound = false },
+            .{ .name = "example_44", .path = "examples/44_fixed_framebuffer/main.zig", .needs_sprite = false, .needs_fps_counter = false, .needs_fixed_timestep = false, .needs_text = false, .needs_gui = false, .needs_png = false, .needs_font = false, .needs_audio = false, .needs_gamepad = false, .needs_gmath = false, .needs_sound = false },
         }) |example| {
             const needs: ExampleNeeds = .{
                 .needs_sprite = example.needs_sprite,
@@ -775,7 +776,7 @@ pub fn build(b: *std.Build) void {
                 .needs_midi = std.mem.eql(u8, example.name, "example_29"),
                 .needs_gmath = example.needs_gmath,
                 .needs_sound = example.needs_sound,
-                .needs_pixelops = std.mem.eql(u8, example.name, "example_23"),
+                .needs_pixelops = std.mem.eql(u8, example.name, "example_23") or std.mem.eql(u8, example.name, "example_44"),
                 .platform_features = if (@hasField(@TypeOf(example), "platform_features")) example.platform_features else exe_features.base,
                 .needs_kit = std.mem.eql(u8, example.name, "example_31") or std.mem.eql(u8, example.name, "example_32") or std.mem.eql(u8, example.name, "example_33") or std.mem.eql(u8, example.name, "example_34") or std.mem.eql(u8, example.name, "example_36") or std.mem.eql(u8, example.name, "example_38") or std.mem.startsWith(u8, example.name, "example_26"),
             };

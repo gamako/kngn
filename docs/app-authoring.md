@@ -248,7 +248,7 @@ app author does not have to reconstruct that relationship from two other documen
 | Logical size | What the GUI lays out and hit-tests against | `fb.logical_size` (or `window.logicalSize()` outside a frame) |
 | `fb.width` / `fb.height` | The framebuffer `lockFramebuffer()` hands back, in physical pixels | Equal to the logical size under `.logical`; `round(logical size × content_scale)` under `.physical` |
 | `content_scale` | The window's real content scale (device pixel ratio) — independent of `fb_mode`, unlike the row above | `fb.content_scale` (or `window.contentScale()` outside a frame) |
-| `WindowOptions.fb_mode` | `.logical` (default; the OS/browser upscales the rendered framebuffer) or `.physical` (allocate at `content_scale`, crisp) | A `windowBootstrap` choice (§3) |
+| `WindowOptions.fb_mode` | `.logical` (default; the OS/browser upscales the rendered framebuffer), `.physical` (allocate at `content_scale`, crisp) or `.fixed` (a framebuffer of exactly the size it carries, magnified into a letterbox; below) | A `windowBootstrap` choice (§3) |
 | `gui.render`'s `scale` argument | Where the logical draw list is baked to physical pixels | That same frame's `fb.content_scale` under `.physical`; `1.0` under `.logical` (the renderer stays 1:1 and lets the OS/browser do the upscale) |
 
 **The rule**: `ctx.beginFrame` always takes the **logical** size — `fb.logical_size.width` /
@@ -268,6 +268,32 @@ If manual drawing writes into `fb.pixels` directly instead of going through `gui
 `33_camera`), the same physical-pixel framebuffer is what is written; `libs/gfx`'s
 `ScreenTransform` (ADR-011 R6) is the shared helper for that logical-to-physical conversion, kept
 separate from `gfx.Camera` so a scale change never alters how much of the world is visible.
+
+### `.fixed`: one resolution, whatever the window does
+
+`.fb_mode = .{ .fixed = .{ .width = 640, .height = 400 } }` asks for a framebuffer of exactly that
+size. The window can be any size and any aspect ratio; present magnifies the framebuffer to fit,
+preserving the aspect ratio, and paints the remainder as a letterbox — black in an opaque window,
+fully transparent in a `transparent` one. `44_fixed_framebuffer` is the worked example, and the
+contract is [ADR-030](adr/030_fixed-framebuffer-and-letterboxed-present.md).
+
+What it changes for the app is that the three quantities above stop moving:
+
+- `fb.width` / `fb.height` and `fb.logical_size` are all **the fixed size**, and stay there across
+  every resize and every move between displays. `scale_epoch` does not advance either, because the
+  framebuffer did not change.
+- `content_scale` is **1.0**, and so is `gui.render`'s `scale`. There is one coordinate space and
+  the app draws in it, which is why nothing has to be recomputed when the window changes.
+- Pointer positions arrive in that same space. A position **over a letterbox bar** comes through
+  negative, or past the last row or column, rather than being clamped inside the content — an app
+  that treats a press outside the framebuffer as "not on anything" needs no other handling.
+
+The cost is that the result is not sharp: rendering happens at the fixed size and is magnified,
+which is the intended look for pixel art and the wrong choice for a text-heavy interface. An app
+that wants the display's resolution wants `.physical`.
+
+A zero side is `error.Unsupported`, and a backend that cannot magnify while presenting refuses the
+window rather than quietly handing back a framebuffer of another size.
 
 ## 8. Wasm and web packaging
 

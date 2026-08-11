@@ -371,18 +371,33 @@ pub const Window = struct {
         });
     }
 
-    /// The mapping the backend reports for this frame, or one synthesised from the mode when the
-    /// backend supplies none. A backend only needs to supply one when the framebuffer does not
-    /// cover the window, which is `.fixed`.
+    /// This frame's mapping: under `.fixed` the letterbox that the window the backend reports puts
+    /// the framebuffer in, and otherwise a covering mapping synthesised from the mode.
+    ///
+    /// **The facade composes it, and a backend reports only the one fact it alone knows** — its
+    /// content area in physical pixels (ADR-030 R4). Asking each backend for the finished mapping
+    /// instead would ask it to reproduce `covering` for the other two modes as well, and getting
+    /// that wrong is invisible: the mapping would simply stop coming from here.
     fn mappingForSnapshot(self: *const Window, snap: FramebufferSnapshot) PresentMapping {
+        switch (self.fb_mode) {
+            // No viewport means a backend with no window to measure — the headless null runtime,
+            // where the framebuffer is all there is, so it maps onto itself.
+            .fixed => |fixed| return PresentMapping.letterbox(self.presentViewport() orelse fixed, fixed),
+            .logical, .physical => return PresentMapping.covering(self.fb_mode, snap),
+        }
+    }
+
+    /// The window's content area in physical pixels, from a backend that reports it, and `null` from
+    /// one that does not. Only `.fixed` needs it, so a backend that refuses `.fixed` need not have it.
+    fn presentViewport(self: *const Window) ?WindowSize {
         if (comptime null_runtime_supported) {
             if (self.inner == .null_win) {
-                if (@hasDecl(null_backend.Window, "presentMapping")) return self.inner.null_win.presentMapping();
-                return PresentMapping.covering(self.fb_mode, snap);
+                if (@hasDecl(null_backend.Window, "presentViewport")) return self.inner.null_win.presentViewport();
+                return null;
             }
         }
-        if (@hasDecl(native_backend.Window, "presentMapping")) return self.inner.native.presentMapping();
-        return PresentMapping.covering(self.fb_mode, snap);
+        if (@hasDecl(native_backend.Window, "presentViewport")) return self.inner.native.presentViewport();
+        return null;
     }
 
     fn normalizeNativeEvent(self: *Window, event: Event) Event {

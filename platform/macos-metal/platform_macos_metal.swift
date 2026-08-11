@@ -468,7 +468,10 @@ class MetalFramebufferView: MTKView, PlatformBackendView {
 
     // present: does the existing presentManual(view:) plus refreshClickThrough, and returns the next buffer to write into.
     // The size argument is taken for compatibility but ignored; the renderer's internal size is used.
-    func present(framebuffer: UnsafeMutablePointer<UInt32>, width: Int, height: Int) -> UnsafeMutablePointer<UInt32>? {
+    // `mapping` is unused: this backend accepts only a framebuffer that covers the window, so the
+    // destination rectangle is the whole drawable. Magnifying a fixed framebuffer here needs a quad in
+    // the renderer, and until that exists the factory refuses the mode outright (docs/adr/030 R5).
+    func present(framebuffer: UnsafeMutablePointer<UInt32>, width: Int, height: Int, mapping: PlatformPresentMapping) -> UnsafeMutablePointer<UInt32>? {
         guard let renderer = metalRenderer else { return nil }
         // Draw manually
         renderer.presentManual(view: self)
@@ -582,7 +585,7 @@ class MetalFramebufferView: MTKView, PlatformBackendView {
         contentScale = scale
         pendingContentScale = scale
         let (fw, fh) = effectiveFramebufferSize(
-            physicalMode: physical,
+            sizing: physical ? .physical : .logical,
             logicalWidth: logicalWidth,
             logicalHeight: logicalHeight,
             scale: scale
@@ -667,6 +670,17 @@ class MetalFramebufferView: MTKView, PlatformBackendView {
         let scale = forQuery ? pendingContentScale : contentScale
         out.pointee.content_scale = Float(effectiveContentScale(scale))
         out.pointee.scale_epoch = scaleEpoch
+        // This backend accepts only a framebuffer that covers the window, so the viewport follows from
+        // the framebuffer rather than being measured: it *is* the window, in physical pixels under
+        // .physical and scaled up by the display under .logical.
+        if physicalMode {
+            out.pointee.viewport_width = UInt32(fw)
+            out.pointee.viewport_height = UInt32(fh)
+        } else {
+            let s = Double(effectiveContentScale(pendingContentScale))
+            out.pointee.viewport_width = UInt32((Double(fw) * s).rounded())
+            out.pointee.viewport_height = UInt32((Double(fh) * s).rounded())
+        }
     }
 
     func nativeEventScale() -> CGFloat {
@@ -965,8 +979,20 @@ func makePlatformBackendView(
     callback: FrameCallback?,
     userdata: UnsafeMutableRawPointer?,
     transparent: Bool,
-    physical: Bool
+    sizing: PlatformFramebufferSizing
 ) -> (any PlatformBackendView)? {
+    // A fixed framebuffer has to be magnified into a destination rectangle, which on this backend means
+    // a quad in the renderer rather than a layer frame. Until that exists the window is refused, so the
+    // caller is told the mode is unavailable rather than handed one that covers the window
+    // (docs/adr/030 R5).
+    var physical = false
+    switch sizing {
+    case .logical: break
+    case .physical: physical = true
+    case .fixed:
+        NSLog("[\(IMPLEMENTATION_TYPE)] A fixed-size framebuffer is not supported by this backend")
+        return nil
+    }
     // Create the view for Metal
     guard let metalDevice = MTLCreateSystemDefaultDevice() else {
         NSLog("[\(IMPLEMENTATION_TYPE)] Failed to create Metal device")

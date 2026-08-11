@@ -134,6 +134,14 @@ pub const PresentMapping = struct {
     origin: WindowPosition = .{ .x = 0, .y = 0 },
     /// The destination rectangle, in physical window pixels.
     dst_size: WindowSize = .{ .width = 1, .height = 1 },
+    /// The window's content area this mapping was worked out against, in physical window pixels.
+    ///
+    /// **It cannot be recovered from the fields above**: the origin is floored, so a letterbox whose
+    /// two bars differ by a pixel makes `origin * 2 + dst` a pixel short of the window. Carrying it
+    /// is what lets a backend place the rectangle and paint the bars from the mapping alone, instead
+    /// of reading its own window size again — which would be a *different* window size whenever a
+    /// resize landed in between, and would put the content somewhere the mapping does not describe.
+    viewport: WindowSize = .{ .width = 1, .height = 1 },
     /// The framebuffer, and so the denominator of the forward direction.
     fb_size: WindowSize = .{ .width = 1, .height = 1 },
     /// The application's coordinate space, and so the numerator of the inverse direction.
@@ -150,7 +158,12 @@ pub const PresentMapping = struct {
     /// Hot path declaration: window-size changes only (never per frame, never per pixel).
     pub fn letterbox(win_physical: WindowSize, fb: WindowSize) PresentMapping {
         if (win_physical.width == 0 or win_physical.height == 0 or fb.width == 0 or fb.height == 0) {
-            return .{ .dst_size = .{ .width = 0, .height = 0 }, .fb_size = fb, .app_size = fb };
+            return .{
+                .dst_size = .{ .width = 0, .height = 0 },
+                .viewport = win_physical,
+                .fb_size = fb,
+                .app_size = fb,
+            };
         }
         // The axis that runs out first sets the magnification. Comparing the two candidate
         // destinations by cross-multiplication keeps the choice exact and integral.
@@ -175,6 +188,7 @@ pub const PresentMapping = struct {
                 .y = @intCast((win_physical.height - h) / 2),
             },
             .dst_size = .{ .width = w, .height = h },
+            .viewport = win_physical,
             .fb_size = fb,
             // Under a fixed framebuffer the application's space *is* the framebuffer (ADR-030 R2).
             .app_size = fb,
@@ -198,19 +212,23 @@ pub const PresentMapping = struct {
             // physical pixels is what the framebuffer becomes on screen.
             .logical => .{
                 .dst_size = scaleSize(fb, snap.content_scale),
+                // The framebuffer covers the window, so the destination *is* the window.
+                .viewport = scaleSize(fb, snap.content_scale),
                 .fb_size = fb,
                 .app_size = logical,
             },
             // The framebuffer is already the window in physical pixels.
             .physical => .{
                 .dst_size = fb,
+                .viewport = fb,
                 .fb_size = fb,
                 .app_size = logical,
             },
-            // A fixed framebuffer never reaches here: the backend owns its mapping, and a backend
-            // that cannot supply one refuses to create the window.
+            // A fixed framebuffer reaches here only with no window to measure — the headless null
+            // runtime, where the framebuffer is all there is and maps onto itself.
             .fixed => .{
                 .dst_size = fb,
+                .viewport = fb,
                 .fb_size = fb,
                 .app_size = fb,
             },

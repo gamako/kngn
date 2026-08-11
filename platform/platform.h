@@ -47,13 +47,22 @@ typedef struct PlatformWindowOptions {
     uint32_t reserved;  // reserved for future use (zero-filled; a non-zero value returns NULL)
     int32_t x;          // OS screen coordinates
     int32_t y;
+    // The framebuffer size, read only when PLATFORM_WINDOW_FRAMEBUFFER_FIXED is set, and then
+    // required to be non-zero on both axes. They are separate fields rather than a reuse of
+    // reserved: reserved means "must be zero", and a size that must not be zero cannot share it.
+    uint32_t fb_width;
+    uint32_t fb_height;
 } PlatformWindowOptions;
 
 #define PLATFORM_WINDOW_TRANSPARENT (1u << 0)  // honour the framebuffer alpha (the desktop shows through)
 #define PLATFORM_WINDOW_BORDERLESS  (1u << 1)  // no title bar and no frame (borderless)
 #define PLATFORM_WINDOW_POSITION    (1u << 2)  // apply x/y as the initial position
-#define PLATFORM_WINDOW_FRAMEBUFFER_PHYSICAL (1u << 3)  // opt in to a physical framebuffer; unset = .logical (a fixed-size framebuffer has no flag here yet)
+#define PLATFORM_WINDOW_FRAMEBUFFER_PHYSICAL (1u << 3)  // opt in to a physical framebuffer; unset = .logical
 #define PLATFORM_WINDOW_NOT_RESIZABLE (1u << 4)  // drop the resizing affordance; unset = freely resizable
+// A framebuffer of exactly fb_width x fb_height, whatever the window does; present magnifies it into a
+// letterbox (docs/adr/030). Mutually exclusive with PLATFORM_WINDOW_FRAMEBUFFER_PHYSICAL: asking for both,
+// or for this with a zero side, returns NULL rather than picking one.
+#define PLATFORM_WINDOW_FRAMEBUFFER_FIXED (1u << 5)
 
 // The current window geometry. The size is the content/client area; the position is in OS screen coordinates.
 // When flags lacks PLATFORM_GEOMETRY_POSITION_VALID, x/y are undefined (position unsupported, or unreadable).
@@ -204,6 +213,12 @@ typedef struct PlatformFramebufferMetrics {
     uint32_t framebuffer_height;
     float content_scale;
     uint64_t scale_epoch;
+    // The window's content area in physical pixels. It equals the framebuffer under a physical
+    // framebuffer and logical x content_scale under a logical one, and under a fixed one it is
+    // **independent of the framebuffer** and is what the caller works the letterbox out from
+    // (docs/adr/030 R4: the mapping is composed above this ABI, from this number).
+    uint32_t viewport_width;
+    uint32_t viewport_height;
 } PlatformFramebufferMetrics;
 
 bool platform_get_framebuffer_metrics(
@@ -277,10 +292,16 @@ typedef struct PlatformPresentMapping {
     uint32_t dst_height;
     uint32_t fb_width;      // the framebuffer being magnified
     uint32_t fb_height;
+    uint32_t window_width;  // the content area this mapping was worked out against
+    uint32_t window_height;
 } PlatformPresentMapping;
 
-// The window's own size is deliberately absent: the backend already knows it, and deriving it from
-// the origin would be wrong by a pixel whenever the letterbox is not exactly even on both sides.
+// The window size is carried rather than left to the implementation to look up again, for two
+// reasons. It cannot be derived from the fields above (the origin is floored, so origin * 2 + dst is
+// a pixel short whenever the two bars differ), and looking it up at present time would read a size
+// that may have moved since the mapping was worked out — placing the content somewhere this mapping
+// does not describe. Everything an implementation needs to place the rectangle and paint the bars is
+// therefore in here.
 
 // mapping must not be NULL. It is read during the call and not retained.
 void platform_present(PlatformWindow* window, const PlatformPresentMapping* mapping);

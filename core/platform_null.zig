@@ -238,17 +238,12 @@ pub const Window = struct {
         };
     }
 
-    /// The framebuffer is the window here, so it maps onto it one to one: no letterbox, no
-    /// magnification. Supplying it rather than letting the facade synthesise one keeps
-    /// "a fixed framebuffer's mapping comes from its backend" true without an exception.
-    pub fn presentMapping(self: Window) types.PresentMapping {
-        const size: types.WindowSize = .{ .width = self.width, .height = self.height };
-        return .{
-            .origin = .{ .x = 0, .y = 0 },
-            .dst_size = size,
-            .fb_size = size,
-            .app_size = size,
-        };
+    /// There is no window to display in, and a fixed framebuffer is the whole of what exists here, so
+    /// the viewport is that framebuffer and the mapping the facade builds from it is the identity: no
+    /// letterbox, no magnification. Reporting it rather than leaving the facade to fall back keeps
+    /// "the backend supplies the window size" true here too, with no exception for the null runtime.
+    pub fn presentViewport(self: Window) types.WindowSize {
+        return .{ .width = self.width, .height = self.height };
     }
 
     /// Nothing is displayed, so there is nowhere to map onto.
@@ -475,12 +470,15 @@ test "null window: a fixed framebuffer beats an explicit size, since it names th
     try testing.expectEqual(@as(u32, 400), win.framebufferSize().height);
 }
 
-test "null window: the mapping it supplies is the identity, so a fixed framebuffer needs no exception" {
+test "null window: the viewport it reports equals the fixed framebuffer, so the mapping is the identity" {
     var win = try Window.createWithOptions(640, 400, "t", .{
         .fb_mode = .{ .fixed = .{ .width = 640, .height = 400 } },
     });
     defer win.destroy();
-    const m = win.presentMapping();
+    const vp = win.presentViewport();
+    try testing.expectEqual(@as(u32, 640), vp.width);
+    try testing.expectEqual(@as(u32, 400), vp.height);
+    const m = types.PresentMapping.letterbox(vp, .{ .width = 640, .height = 400 });
     try testing.expectEqual(@as(i32, 0), m.origin.x);
     try testing.expectEqual(@as(i32, 0), m.origin.y);
     try testing.expectEqual(@as(u32, 640), m.dst_size.width);

@@ -30,6 +30,13 @@ const macos_native_backend = std.mem.eql(u8, build_options.platform_backend, "ob
 /// (objc/swift/metal), which structurally prevents an undefined symbol in an executable without them.
 const menu_c_abi = build_options.enable_menu and macos_native_backend;
 
+/// Whether this build's present can magnify a framebuffer into a letterbox. The two CALayer
+/// implementations place the content layer at the destination rectangle and let Core Animation
+/// magnify; Metal presents through a GPU drawable instead, and the quad that would do the same job
+/// there is not written yet, so a fixed framebuffer is refused rather than silently covering the
+/// window (ADR-030 R5, R8).
+const fixed_framebuffer_supported = !std.mem.eql(u8, build_options.platform_backend, "metal");
+
 // ============================================================================
 // The optional feature gates (ADR-013)
 // ============================================================================
@@ -471,9 +478,7 @@ pub const Window = struct {
     /// and borderlessness need the mascot opt-in, and fullscreen needs the fullscreen opt-in.
     /// Hot path declaration: initialisation only (a single window creation).
     pub fn createWithOptions(width: u32, height: u32, title: [:0]const u8, opts: types.WindowOptions) Error!Window {
-        // No present here magnifies a framebuffer into a letterbox yet, so a fixed one is refused
-        // rather than quietly behaving like another mode (ADR-030 R5).
-        try types.refuseFixedFramebuffer(opts.fb_mode);
+        if (comptime !fixed_framebuffer_supported) try types.refuseFixedFramebuffer(opts.fb_mode);
         if (comptime !mascot_enabled) {
             if (opts.transparent or opts.borderless) return error.Unsupported;
         }
@@ -483,15 +488,26 @@ pub const Window = struct {
         var flags: u32 = 0;
         if (opts.transparent) flags |= c.PLATFORM_WINDOW_TRANSPARENT;
         if (opts.borderless) flags |= c.PLATFORM_WINDOW_BORDERLESS;
+        var fb_size: types.WindowSize = .{ .width = 0, .height = 0 };
         // Exhaustive rather than `== .physical`: a tagged union compares equal to an enum literal,
         // so a mode with no flag of its own would silently be sent across as `.logical`.
         switch (opts.fb_mode) {
             .physical => flags |= c.PLATFORM_WINDOW_FRAMEBUFFER_PHYSICAL,
             .logical => {},
-            .fixed => unreachable, // refused at the top of this function
+            .fixed => |size| {
+                flags |= c.PLATFORM_WINDOW_FRAMEBUFFER_FIXED;
+                fb_size = size;
+            },
         }
         if (!opts.resizable) flags |= c.PLATFORM_WINDOW_NOT_RESIZABLE;
-        var copts = c.PlatformWindowOptions{ .flags = flags, .reserved = 0, .x = 0, .y = 0 };
+        var copts = c.PlatformWindowOptions{
+            .flags = flags,
+            .reserved = 0,
+            .x = 0,
+            .y = 0,
+            .fb_width = fb_size.width,
+            .fb_height = fb_size.height,
+        };
         if (opts.position) |pos| {
             copts.flags |= c.PLATFORM_WINDOW_POSITION;
             copts.x = pos.x;
@@ -669,6 +685,8 @@ pub const Window = struct {
             .framebuffer_height = 0,
             .content_scale = 1.0,
             .scale_epoch = 0,
+            .viewport_width = 0,
+            .viewport_height = 0,
         };
         const px = c.platform_lock_framebuffer_ex(self.handle, &metrics) orelse return null;
         const fw = metrics.framebuffer_width;
@@ -702,6 +720,17 @@ pub const Window = struct {
         return if (m.content_scale > 0) m.content_scale else 1.0;
     }
 
+    /// The window's content area in physical pixels, which is what the facade works the letterbox of
+    /// a fixed framebuffer out from (ADR-030 R4).
+    ///
+    /// It is read here and travels back down inside the mapping, rather than being looked up again at
+    /// present time: a resize between the two would otherwise leave the implementation placing the
+    /// content against a window the mapping was not computed for.
+    pub fn presentViewport(self: Window) types.WindowSize {
+        const m = getMetrics(self) orelse return .{ .width = 0, .height = 0 };
+        return .{ .width = m.viewport_width, .height = m.viewport_height };
+    }
+
     /// The mapping crosses the C ABI as a flat struct: the backend needs it to place the
     /// destination rectangle and to sample click-through alpha, both of which happen in present.
     pub fn present(self: Window, mapping: types.PresentMapping) void {
@@ -712,6 +741,8 @@ pub const Window = struct {
             .dst_height = mapping.dst_size.height,
             .fb_width = mapping.fb_size.width,
             .fb_height = mapping.fb_size.height,
+            .window_width = mapping.viewport.width,
+            .window_height = mapping.viewport.height,
         };
         c.platform_present(self.handle, &m);
     }
@@ -959,6 +990,8 @@ fn getMetrics(win: Window) ?c.PlatformFramebufferMetrics {
         .framebuffer_height = 0,
         .content_scale = 1.0,
         .scale_epoch = 0,
+        .viewport_width = 0,
+        .viewport_height = 0,
     };
     if (!c.platform_get_framebuffer_metrics(win.handle, &metrics)) return null;
     return metrics;

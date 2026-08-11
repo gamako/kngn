@@ -448,6 +448,15 @@ static size_t utf8SafePrefixLen(const char* s, size_t len, size_t cap) {
 }
 #endif // KNGN_ENABLE_TEXT_INPUT
 
+// How the framebuffer is sized. It is an enum rather than a pair of booleans because every site that
+// branches on it has to decide for all three, and -Wswitch is what says so: a boolean leaves the
+// third case on whichever branch it happened to fall.
+typedef enum {
+    KNGN_FB_SIZING_LOGICAL = 0, // the window, in logical points
+    KNGN_FB_SIZING_PHYSICAL,    // the window, in physical pixels
+    KNGN_FB_SIZING_FIXED,       // a size of its own, magnified into a letterbox at present time
+} KngnFramebufferSizing;
+
 // A custom NSView: fast CALayer-based drawing plus NSTextInputClient (the IME)
 #if defined(KNGN_ENABLE_TEXT_INPUT)
 @interface FramebufferView : NSView <NSTextInputClient, NSDraggingDestination> {
@@ -458,10 +467,21 @@ static size_t utf8SafePrefixLen(const char* s, size_t len, size_t cap) {
     int height;  // framebuffer pixel height
     int logicalWidth;
     int logicalHeight;
-    BOOL physicalMode;
+    KngnFramebufferSizing sizing;
+    // The display's backing scale, latched and pending. **It is not what a fixed framebuffer reports**:
+    // there the application is told 1.0 and this stays the real scale, because the layer geometry is in
+    // points and the mapping is in physical pixels, so something has to know the ratio between them.
     CGFloat contentScale;        // latched (committed by lock; used by present and the lock snapshot)
     CGFloat pendingContentScale; // the detected current negotiated scale (for a metrics query and for raw input)
     uint64_t scaleEpoch;         // the latched epoch, incremented only atomically with the buffer and scale
+    // Where the framebuffer goes inside the window for the frame being presented, handed over at
+    // present time because the arithmetic lives above this ABI. Read by the layer geometry and by the
+    // click-through sample, and used by neither while the framebuffer covers the window.
+    PlatformPresentMapping currentMapping;
+    // The content area in physical pixels, as of the most recent refresh. Under a fixed framebuffer it
+    // is the value that moves on a resize while the framebuffer stays where it is.
+    int viewportWidth;
+    int viewportHeight;
     BOOL hasPendingResize;
     int pendingLogicalWidth;
     int pendingLogicalHeight;
@@ -536,10 +556,13 @@ static size_t utf8SafePrefixLen(const char* s, size_t len, size_t cap) {
     NSEvent* lastMouseDownEvent; // the most recent left-button mouse-down (retained for beginDrag; consumed one-shot)
 #endif
 }
+// w/h are the window's logical size. fbW/fbH are read only for KNGN_FB_SIZING_FIXED, where they are
+// the framebuffer's size; the other two sizings derive the framebuffer from the window.
 - (id)initWithFrame:(NSRect)frame width:(int)w height:(int)h
            callback:(FrameCallback)cb userdata:(void*)ud
      platformWindow:(PlatformWindow*)pw
-       physicalMode:(BOOL)physical;
+             sizing:(KngnFramebufferSizing)fbSizing
+            fbWidth:(int)fbW fbHeight:(int)fbH;
 - (void)startDisplayLink;
 - (void)stopDisplayLink;
 - (void)displayLinkFired:(CADisplayLink*)link;
@@ -549,7 +572,7 @@ static size_t utf8SafePrefixLen(const char* s, size_t len, size_t cap) {
 - (int)getWidth;
 - (int)getHeight;
 - (uint32_t*)getCurrentBuffer;
-- (void)presentManual;
+- (void)presentManualWithMapping:(const PlatformPresentMapping*)mapping;
 
 // Called on destroy. Invalidates the view's back-reference.
 - (void)clearPlatformWindow;
@@ -586,6 +609,13 @@ static size_t utf8SafePrefixLen(const char* s, size_t len, size_t cap) {
 - (CGFloat)nativeEventScale;
 - (void)refreshPendingContentScale;
 
+// The content area in physical pixels, recomputed from the current bounds and backing scale.
+// Returns YES when it changed, which is when a fixed framebuffer's mapping needs recomputing.
+- (BOOL)refreshViewportSize;
+// Place the content layer: the destination rectangle under a fixed framebuffer, and the whole window
+// otherwise. **The single place the layer's frame is written**, so that no path can leave it stretched.
+- (void)applyContentLayerGeometry;
+
 @end
 
 @implementation FramebufferView
@@ -593,10 +623,11 @@ static size_t utf8SafePrefixLen(const char* s, size_t len, size_t cap) {
 - (id)initWithFrame:(NSRect)frame width:(int)w height:(int)h
            callback:(FrameCallback)cb userdata:(void*)ud
      platformWindow:(PlatformWindow*)pw
-       physicalMode:(BOOL)physical {
+             sizing:(KngnFramebufferSizing)fbSizing
+            fbWidth:(int)fbW fbHeight:(int)fbH {
     self = [super initWithFrame:frame];
     if (self) {
-        physicalMode = physical;
+        sizing = fbSizing;
         logicalWidth = w;
         logicalHeight = h;
         hasPendingResize = NO;
@@ -615,14 +646,38 @@ static size_t utf8SafePrefixLen(const char* s, size_t len, size_t cap) {
 
         int fw = w;
         int fh = h;
-        if (physicalMode) {
-            fw = (int)lround((double)w * (double)scale);
-            fh = (int)lround((double)h * (double)scale);
-            if (fw < 1) fw = 1;
-            if (fh < 1) fh = 1;
+        switch (sizing) {
+            case KNGN_FB_SIZING_LOGICAL:
+                break; // the framebuffer is the window in points
+            case KNGN_FB_SIZING_PHYSICAL:
+                fw = (int)lround((double)w * (double)scale);
+                fh = (int)lround((double)h * (double)scale);
+                break;
+            case KNGN_FB_SIZING_FIXED:
+                fw = fbW;
+                fh = fbH;
+                // The application sees one space at scale 1.0, and that space is the framebuffer:
+                // the logical size it reads is the fixed size, not the window's (docs/adr/030 R2).
+                logicalWidth = fw;
+                logicalHeight = fh;
+                pendingLogicalWidth = fw;
+                pendingLogicalHeight = fh;
+                break;
         }
+        if (fw < 1) fw = 1;
+        if (fh < 1) fh = 1;
         width = fw;
         height = fh;
+        // Until the first present the framebuffer maps onto itself, so the layer geometry and the
+        // click-through sample have something coherent to read.
+        currentMapping = (PlatformPresentMapping){
+            .origin_x = 0, .origin_y = 0,
+            .dst_width = (uint32_t)fw, .dst_height = (uint32_t)fh,
+            .fb_width = (uint32_t)fw, .fb_height = (uint32_t)fh,
+            .window_width = (uint32_t)fw, .window_height = (uint32_t)fh,
+        };
+        viewportWidth = 0;
+        viewportHeight = 0;
         callback = cb;
         userdata = ud;
         platformWindow = pw;
@@ -693,15 +748,30 @@ static size_t utf8SafePrefixLen(const char* s, size_t len, size_t cap) {
 
         // Create the content layer (its frame is always in logical points)
         contentLayer = [CALayer layer];
-        contentLayer.frame = CGRectMake(0, 0, logicalWidth, logicalHeight);
         contentLayer.opaque = YES;
         contentLayer.geometryFlipped = YES;  // Flip the Y axis, once
         [self.layer addSublayer:contentLayer];
         contentLayer.magnificationFilter = kCAFilterNearest;
         contentLayer.minificationFilter = kCAFilterNearest;
-        if (physicalMode) {
-            contentLayer.contentsScale = contentScale;
+        switch (sizing) {
+            case KNGN_FB_SIZING_LOGICAL:
+                break; // the layer's backing store is in points and Core Animation scales it to the display
+            case KNGN_FB_SIZING_PHYSICAL:
+            case KNGN_FB_SIZING_FIXED:
+                // Give the layer a backing store at the display's resolution, so the framebuffer is
+                // resampled once, straight into the destination rectangle, rather than into a
+                // point-sized store that is then scaled again.
+                contentLayer.contentsScale = contentScale;
+                break;
         }
+        // The letterbox is the view layer showing through around the content layer: black in an opaque
+        // window, and fully transparent in one created transparent (docs/adr/030 R9). Only a fixed
+        // framebuffer leaves any of it visible, so the other sizings keep the layer's default.
+        if (sizing == KNGN_FB_SIZING_FIXED) {
+            self.layer.backgroundColor = CGColorGetConstantColor(kCGColorBlack);
+        }
+        [self refreshViewportSize];
+        [self applyContentLayerGeometry];
 
         // Initialise the performance measurement
         lastFrameTime = CFAbsoluteTimeGetCurrent();
@@ -711,8 +781,8 @@ static size_t utf8SafePrefixLen(const char* s, size_t len, size_t cap) {
         // OS file drag and drop (file URLs only; the objc backend leads)
         [self registerForDraggedTypes:@[NSPasteboardTypeFileURL]];
 
-        NSLog(@"[%s] Framebuffer initialized: logical=%dx%d fb=%dx%d scale=%.2f physical=%d",
-              IMPLEMENTATION_TYPE, logicalWidth, logicalHeight, width, height, contentScale, physicalMode ? 1 : 0);
+        NSLog(@"[%s] Framebuffer initialized: logical=%dx%d fb=%dx%d scale=%.2f sizing=%d",
+              IMPLEMENTATION_TYPE, logicalWidth, logicalHeight, width, height, contentScale, (int)sizing);
     }
     return self;
 }
@@ -883,7 +953,13 @@ static size_t utf8SafePrefixLen(const char* s, size_t len, size_t cap) {
     return currentBuffer;
 }
 
-- (void)presentManual {
+- (void)presentManualWithMapping:(const PlatformPresentMapping*)mapping {
+    currentMapping = *mapping;
+    // Only a fixed framebuffer has a rectangle that moves without the framebuffer changing, so only it
+    // is reapplied per frame. The covering sizings keep the layer through the paths that resize it, and
+    // pay nothing here beyond this test.
+    if (sizing == KNGN_FB_SIZING_FIXED) [self applyContentLayerGeometry];
+
     // Swap the buffers (zero copy)
     uint32_t* temp = currentBuffer;
     currentBuffer = displayBuffer;
@@ -953,18 +1029,37 @@ static size_t utf8SafePrefixLen(const char* s, size_t len, size_t cap) {
     NSPoint winPt = [win convertPointFromScreen:screenPt];
     NSPoint local = [self convertPoint:winPt fromView:nil]; // window → view (not flipped: the origin is bottom-left)
     NSRect b = self.bounds;
-    BOOL passThrough = YES; // let it fall through when the cursor is outside the window or unknown
+    BOOL passThrough = YES; // let it fall through when the cursor is outside the window, unknown, or over a letterbox bar
     // only look at the alpha while the cursor is inside the view rect (outside it stays passThrough=YES)
     if (b.size.width > 0 && b.size.height > 0 &&
         local.x >= 0 && local.x < b.size.width && local.y >= 0 && local.y < b.size.height) {
-        int px = (int)(local.x / b.size.width * (CGFloat)width);
-        int py = (int)((1.0 - local.y / b.size.height) * (CGFloat)height); // to a top-left origin
-        if (px >= width) px = width - 1; // clamp what rounding at the right and bottom edges would push out of range (it would drop the last row)
-        if (py >= height) py = height - 1;
-        if (px < 0) px = 0;
-        if (py < 0) py = 0;
-        uint8_t alpha = (uint8_t)(buf[py * width + px] >> 24); // canonical BGRA: the top 8 bits are alpha
-        passThrough = (alpha == 0);
+        int px = -1, py = -1;
+        if (sizing == KNGN_FB_SIZING_FIXED) {
+            // Invert the mapping with the same integer ratio the caller's inverse transform uses, so
+            // that the pixel consulted here is the pixel the application is told the pointer is on.
+            // A position over a bar falls outside the destination rectangle and is left to pass
+            // through, which is what the bars do to input everywhere (docs/adr/030 R4).
+            const CGFloat scale = (pendingContentScale > 0.0) ? pendingContentScale : 1.0;
+            const long dx = (long)floor(local.x * scale) - (long)currentMapping.origin_x;
+            const long dy = (long)floor((b.size.height - local.y) * scale) - (long)currentMapping.origin_y;
+            if (dx >= 0 && dy >= 0 &&
+                dx < (long)currentMapping.dst_width && dy < (long)currentMapping.dst_height) {
+                px = (int)((dx * (long)currentMapping.fb_width) / (long)currentMapping.dst_width);
+                py = (int)((dy * (long)currentMapping.fb_height) / (long)currentMapping.dst_height);
+            }
+        } else {
+            // The framebuffer covers the window, so the view rectangle is the whole of it.
+            px = (int)(local.x / b.size.width * (CGFloat)width);
+            py = (int)((1.0 - local.y / b.size.height) * (CGFloat)height); // to a top-left origin
+            if (px >= width) px = width - 1; // clamp what rounding at the right and bottom edges would push out of range (it would drop the last row)
+            if (py >= height) py = height - 1;
+            if (px < 0) px = 0;
+            if (py < 0) py = 0;
+        }
+        if (px >= 0 && py >= 0 && px < width && py < height) {
+            uint8_t alpha = (uint8_t)(buf[py * width + px] >> 24); // canonical BGRA: the top 8 bits are alpha
+            passThrough = (alpha == 0);
+        }
     }
     if (passThrough != clickThroughState) { // only write the WindowServer state when the value has changed
         win.ignoresMouseEvents = passThrough;
@@ -976,6 +1071,11 @@ static size_t utf8SafePrefixLen(const char* s, size_t len, size_t cap) {
 - (void)setTransparentMode:(BOOL)on {
     transparentMode = on;
     contentLayer.opaque = on ? NO : YES;
+    // The letterbox is fully transparent in a transparent window and black in an opaque one
+    // (docs/adr/030 R9); only a fixed framebuffer leaves any of it showing.
+    if (sizing == KNGN_FB_SIZING_FIXED) {
+        self.layer.backgroundColor = on ? NULL : CGColorGetConstantColor(kCGColorBlack);
+    }
     [self setNeedsDisplay:YES];
 }
 - (void)setClickThrough:(BOOL)on {
@@ -996,6 +1096,62 @@ static size_t utf8SafePrefixLen(const char* s, size_t len, size_t cap) {
 }
 
 #endif // KNGN_ENABLE_MASCOT
+
+// ========================================
+// The window-to-framebuffer geometry
+// ========================================
+
+// Called only under a fixed framebuffer, which is the one sizing whose window size does not follow
+// from the framebuffer: at every lock, and at every settled geometry change.
+// Hot path declaration: a handful of scalar operations and no allocation.
+- (BOOL)refreshViewportSize {
+    CGFloat scale = (pendingContentScale > 0.0) ? pendingContentScale : 1.0;
+    const NSSize b = self.bounds.size;
+    int vw = (int)lround((double)b.width * (double)scale);
+    int vh = (int)lround((double)b.height * (double)scale);
+    if (vw < 0) vw = 0;
+    if (vh < 0) vh = 0;
+    const BOOL changed = (vw != viewportWidth || vh != viewportHeight);
+    viewportWidth = vw;
+    viewportHeight = vh;
+    return changed;
+}
+
+// The destination rectangle in points, from the mapping's physical pixels. The rectangle is worked out
+// in physical pixels and converted only here (docs/adr/030 R3), so a rounding difference of at most
+// half a point can appear on screen while the coordinate transforms stay exact.
+//
+// Hot path declaration: once per present under a fixed framebuffer, and at every settled geometry
+// change under the other two. The assignment itself is skipped when the rectangle has not moved.
+- (void)applyContentLayerGeometry {
+    if (!contentLayer) return;
+    CGRect target;
+    switch (sizing) {
+        case KNGN_FB_SIZING_LOGICAL:
+        case KNGN_FB_SIZING_PHYSICAL:
+            // The framebuffer covers the window, so the layer is the whole content area.
+            target = CGRectMake(0, 0, logicalWidth, logicalHeight);
+            break;
+        case KNGN_FB_SIZING_FIXED: {
+            CGFloat scale = (pendingContentScale > 0.0) ? pendingContentScale : 1.0;
+            // Everything but the scale comes from the mapping, including the window it was worked out
+            // against, so a resize that landed after it cannot move the content out of the rectangle the
+            // mapping describes. The scale is the one live read left, and a change to it takes effect on
+            // the next frame's mapping — the frame-boundary tolerance ADR-030 R4 already states.
+            //
+            // The mapping's origin is measured from the top-left; the parent layer's is at the
+            // bottom-left, so the *bottom* gap is what the origin becomes. Deriving it as the top gap
+            // would misplace the content by a pixel whenever the two bars differ in width.
+            const int bottom = (int)currentMapping.window_height - (int)currentMapping.origin_y - (int)currentMapping.dst_height;
+            target = CGRectMake((CGFloat)currentMapping.origin_x / scale,
+                                (CGFloat)bottom / scale,
+                                (CGFloat)currentMapping.dst_width / scale,
+                                (CGFloat)currentMapping.dst_height / scale);
+            break;
+        }
+    }
+    if (!CGRectEqualToRect(contentLayer.frame, target)) contentLayer.frame = target;
+}
 
 // ========================================
 // Resizing
@@ -1046,11 +1202,23 @@ static size_t utf8SafePrefixLen(const char* s, size_t len, size_t cap) {
     displayBuffer = buffer1;
     width = w;
     height = h;
-    if (!physicalMode) {
-        // .logical: framebuffer == logical, and the layer frame has the same size (as before).
-        logicalWidth = w;
-        logicalHeight = h;
-        contentLayer.frame = CGRectMake(0, 0, w, h);
+    switch (sizing) {
+        case KNGN_FB_SIZING_LOGICAL:
+            // The framebuffer is the window in points, so the logical size follows it.
+            logicalWidth = w;
+            logicalHeight = h;
+            [self applyContentLayerGeometry];
+            break;
+        case KNGN_FB_SIZING_PHYSICAL:
+            // The caller commits the logical size, the scale and the epoch together; see
+            // applyLatchedMetricsIfNeeded.
+            break;
+        case KNGN_FB_SIZING_FIXED:
+            // Unreachable: the framebuffer's size is the one the window was created with, and no path
+            // asks for another. Should one ever appear, the logical size still has to equal it (R2).
+            logicalWidth = w;
+            logicalHeight = h;
+            break;
     }
     return YES;
 }
@@ -1071,8 +1239,21 @@ static size_t utf8SafePrefixLen(const char* s, size_t len, size_t cap) {
     const CGFloat newScale = (pendingContentScale > 0.0) ? pendingContentScale : 1.0;
     const BOOL scaleChanging = fabs(newScale - contentScale) > 1e-6;
 
-    if (!physicalMode) {
-        // .logical: the buffer size is left alone. Only when the scale changes are the epoch and the latched scale committed atomically.
+    if (sizing == KNGN_FB_SIZING_FIXED) {
+        // Nothing the application reads can change: the framebuffer keeps its size, the logical size
+        // equals it, and the reported scale is 1.0, so the epoch stays put (docs/adr/030 R2). What a
+        // scale change does move is the layer's backing store and the mapping, and the mapping is
+        // recomputed by the caller from the viewport in the metrics.
+        if (scaleChanging) {
+            contentScale = newScale;
+            contentLayer.contentsScale = newScale;
+        }
+        hasPendingResize = NO;
+        return;
+    }
+
+    if (sizing == KNGN_FB_SIZING_LOGICAL) {
+        // The buffer size is left alone. Only when the scale changes are the epoch and the latched scale committed atomically.
         if (scaleChanging) {
             contentScale = newScale;
             scaleEpoch += 1;
@@ -1107,7 +1288,7 @@ static size_t utf8SafePrefixLen(const char* s, size_t len, size_t cap) {
     if (scaleChanging) scaleEpoch += 1;
     contentScale = newScale;
     hasPendingResize = NO;
-    contentLayer.frame = CGRectMake(0, 0, logicalWidth, logicalHeight);
+    [self applyContentLayerGeometry];
     contentLayer.contentsScale = contentScale;
 }
 
@@ -1116,13 +1297,32 @@ static size_t utf8SafePrefixLen(const char* s, size_t len, size_t cap) {
 - (void)fillMetrics:(PlatformFramebufferMetrics*)out forQuery:(BOOL)forQuery {
     if (!out) return;
     if (forQuery) [self refreshPendingContentScale];
+    // Only a fixed framebuffer has a window size that has to be measured: under the covering sizings the
+    // framebuffer *is* the window, so the viewport follows from what is already known and the view's
+    // bounds are left alone (this runs at every lock).
+    if (sizing == KNGN_FB_SIZING_FIXED) {
+        [self refreshViewportSize];
+    } else {
+        viewportWidth = width;
+        viewportHeight = height;
+        if (sizing == KNGN_FB_SIZING_LOGICAL) {
+            const CGFloat s = (pendingContentScale > 0.0) ? pendingContentScale : 1.0;
+            viewportWidth = (int)lround((double)width * (double)s);
+            viewportHeight = (int)lround((double)height * (double)s);
+        }
+    }
     out->logical_width = (uint32_t)logicalWidth;
     out->logical_height = (uint32_t)logicalHeight;
     out->framebuffer_width = (uint32_t)width;
     out->framebuffer_height = (uint32_t)height;
     const CGFloat scale = forQuery ? pendingContentScale : contentScale;
-    out->content_scale = (float)((scale > 0.0) ? scale : 1.0);
+    // A fixed framebuffer reports 1.0 whatever the display does: the application is given one
+    // coordinate space and no way to render at the display's resolution (docs/adr/030 R2). The real
+    // scale stays in contentScale, where the layer geometry needs it.
+    out->content_scale = (sizing == KNGN_FB_SIZING_FIXED) ? 1.0f : (float)((scale > 0.0) ? scale : 1.0);
     out->scale_epoch = scaleEpoch;
+    out->viewport_width = (uint32_t)viewportWidth;
+    out->viewport_height = (uint32_t)viewportHeight;
 }
 
 - (CGFloat)nativeEventScale {
@@ -1140,7 +1340,12 @@ static size_t utf8SafePrefixLen(const char* s, size_t len, size_t cap) {
     // Only the pending value is updated. The epoch, the latched scale and the buffer are committed atomically on the next successful lock.
     if (fabs(s - pendingContentScale) > 1e-6) {
         pendingContentScale = s;
-        if (physicalMode && redrawCallback) {
+        if (sizing == KNGN_FB_SIZING_FIXED) [self refreshViewportSize];
+        // A logical framebuffer has nothing to redo: it stays the window in points and the display
+        // scales it. The other two have work waiting at the next lock — a reallocation under a physical
+        // framebuffer, a new destination rectangle under a fixed one — so the application is prompted
+        // to run a frame.
+        if (sizing != KNGN_FB_SIZING_LOGICAL && redrawCallback) {
             redrawCallback(redrawUserdata);
         }
     }
@@ -1151,7 +1356,13 @@ static size_t utf8SafePrefixLen(const char* s, size_t len, size_t cap) {
 // screen even inside AppKit's live-resize tracking run loop).
 - (void)setFrameSize:(NSSize)newSize {
     [super setFrameSize:newSize];
-    if (physicalMode) {
+    if (sizing == KNGN_FB_SIZING_FIXED) {
+        // The framebuffer is untouched — only where it lands changes. The mapping is recomputed by the
+        // caller on the next frame, so all this needs to do is ask for that frame.
+        if ([self refreshViewportSize] && redrawCallback) redrawCallback(redrawUserdata);
+        return;
+    }
+    if (sizing == KNGN_FB_SIZING_PHYSICAL) {
         int nw = (int)newSize.width;
         int nh = (int)newSize.height;
         if (nw < 1) nw = 1;
@@ -2015,13 +2226,15 @@ PlatformWindow* platform_create_window_ex(int width, int height, const char* tit
                                           FrameCallback callback, void* userdata,
                                           const PlatformWindowOptions* opts) {
     // Unknown flags or reserved!=0 give NULL (never ignored silently; the Zig side reports it as error.WindowCreationFailed)
-    BOOL transparent = NO, borderless = NO, has_position = NO, physical = NO, not_resizable = NO;
+    BOOL transparent = NO, borderless = NO, has_position = NO, not_resizable = NO;
+    KngnFramebufferSizing sizing = KNGN_FB_SIZING_LOGICAL;
+    int fb_w = 0, fb_h = 0;
     int pos_x = 0, pos_y = 0;
     if (opts) {
         // Without the mascot opt-in TRANSPARENT and BORDERLESS are not known flags, so asking for
         // one fails the same way an unknown flag does rather than yielding an ordinary window.
         const uint32_t known = PLATFORM_WINDOW_POSITION | PLATFORM_WINDOW_FRAMEBUFFER_PHYSICAL |
-                               PLATFORM_WINDOW_NOT_RESIZABLE
+                               PLATFORM_WINDOW_FRAMEBUFFER_FIXED | PLATFORM_WINDOW_NOT_RESIZABLE
 #if defined(KNGN_ENABLE_MASCOT)
                                | PLATFORM_WINDOW_TRANSPARENT | PLATFORM_WINDOW_BORDERLESS
 #endif
@@ -2031,7 +2244,19 @@ PlatformWindow* platform_create_window_ex(int width, int height, const char* tit
         transparent = (opts->flags & PLATFORM_WINDOW_TRANSPARENT) != 0;
         borderless = (opts->flags & PLATFORM_WINDOW_BORDERLESS) != 0;
 #endif
-        physical = (opts->flags & PLATFORM_WINDOW_FRAMEBUFFER_PHYSICAL) != 0;
+        const BOOL want_physical = (opts->flags & PLATFORM_WINDOW_FRAMEBUFFER_PHYSICAL) != 0;
+        const BOOL want_fixed = (opts->flags & PLATFORM_WINDOW_FRAMEBUFFER_FIXED) != 0;
+        // The two name different framebuffers, so a request for both is a caller error rather than
+        // something to resolve here, and a fixed framebuffer with a zero side has no destination
+        // rectangle to magnify into.
+        if (want_physical && want_fixed) return NULL;
+        if (want_fixed && (opts->fb_width == 0 || opts->fb_height == 0)) return NULL;
+        if (want_physical) sizing = KNGN_FB_SIZING_PHYSICAL;
+        if (want_fixed) {
+            sizing = KNGN_FB_SIZING_FIXED;
+            fb_w = (int)opts->fb_width;
+            fb_h = (int)opts->fb_height;
+        }
         not_resizable = (opts->flags & PLATFORM_WINDOW_NOT_RESIZABLE) != 0;
         if ((opts->flags & PLATFORM_WINDOW_POSITION) != 0) {
             has_position = YES;
@@ -2109,7 +2334,8 @@ PlatformWindow* platform_create_window_ex(int width, int height, const char* tit
                                                             callback:callback
                                                              userdata:userdata
                                                      platformWindow:platformWindow
-                                                       physicalMode:physical];
+                                                             sizing:sizing
+                                                            fbWidth:fb_w fbHeight:fb_h];
         QuitWindowDelegate* quitDelegate = [[QuitWindowDelegate alloc] init];
         quitDelegate.platformWindow = platformWindow;
         platformWindow->quit_delegate = quitDelegate;
@@ -2503,7 +2729,7 @@ void platform_present(PlatformWindow* platformWindow, const PlatformPresentMappi
         FramebufferView* view = platformWindow->view;
 
         // Draw manually, through the accessors
-        [view presentManual];
+        [view presentManualWithMapping:mapping];
     }
 }
 

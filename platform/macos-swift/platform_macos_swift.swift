@@ -24,10 +24,20 @@ class FramebufferView: NSView, PlatformBackendView {
     var height: Int  // framebuffer pixel height
     private var logicalWidth: Int
     private var logicalHeight: Int
-    private let physicalMode: Bool
+    private let sizing: PlatformFramebufferSizing
+    // The display's backing scale, latched and pending. **It is not what a fixed framebuffer reports**:
+    // there the application is told 1.0 and this stays the real scale, because the layer geometry is in
+    // points while the mapping is in physical pixels, so something has to know the ratio between them.
     private var contentScale: CGFloat        // latched (committed by lock)
     private var pendingContentScale: CGFloat // the detected current negotiated scale
     private var scaleEpoch: UInt64 = 0
+    // Where the framebuffer goes inside the window for the frame being presented, handed over at present
+    // time because the arithmetic lives above this ABI. Read by the layer geometry and by the
+    // click-through sample, and used by neither while the framebuffer covers the window.
+    private var currentMapping: PlatformPresentMapping
+    // The content area in physical pixels, as of the most recent refresh.
+    private var viewportWidth: Int = 0
+    private var viewportHeight: Int = 0
     private var hasPendingResize = false
     private var pendingLogicalWidth: Int
     private var pendingLogicalHeight: Int
@@ -90,8 +100,8 @@ class FramebufferView: NSView, PlatformBackendView {
     private var lastMouseDownEvent: NSEvent?    // the most recent left-button mouse-down (for beginDrag; consumed one-shot)
 #endif
 
-    init(frame: NSRect, width w: Int, height h: Int, callback: FrameCallback?, userdata: UnsafeMutableRawPointer?, physical: Bool) {
-        self.physicalMode = physical
+    init(frame: NSRect, width w: Int, height h: Int, callback: FrameCallback?, userdata: UnsafeMutableRawPointer?, sizing fbSizing: PlatformFramebufferSizing) {
+        self.sizing = fbSizing
         self.logicalWidth = max(1, w)
         self.logicalHeight = max(1, h)
         self.pendingLogicalWidth = self.logicalWidth
@@ -105,13 +115,29 @@ class FramebufferView: NSView, PlatformBackendView {
         self.contentScale = scale
         self.pendingContentScale = scale
         let (fw, fh) = effectiveFramebufferSize(
-            physicalMode: physical,
+            sizing: fbSizing,
             logicalWidth: self.logicalWidth,
             logicalHeight: self.logicalHeight,
             scale: scale
         )
         self.width = fw
         self.height = fh
+        if case .fixed = fbSizing {
+            // The application sees one space at scale 1.0, and that space is the framebuffer: the
+            // logical size it reads is the fixed size, not the window's (docs/adr/030 R2).
+            self.logicalWidth = fw
+            self.logicalHeight = fh
+            self.pendingLogicalWidth = fw
+            self.pendingLogicalHeight = fh
+        }
+        // Until the first present the framebuffer maps onto itself, so the layer geometry and the
+        // click-through sample have something coherent to read.
+        self.currentMapping = PlatformPresentMapping(
+            origin_x: 0, origin_y: 0,
+            dst_width: UInt32(fw), dst_height: UInt32(fh),
+            fb_width: UInt32(fw), fb_height: UInt32(fh),
+            window_width: UInt32(fw), window_height: UInt32(fh)
+        )
         self.callback = callback
         self.userdata = userdata
 
@@ -164,20 +190,33 @@ class FramebufferView: NSView, PlatformBackendView {
         self.wantsLayer = true
 
         // Create the content layer (its frame is always in logical points)
-        self.contentLayer.frame = CGRect(x: 0, y: 0, width: CGFloat(self.logicalWidth), height: CGFloat(self.logicalHeight))
         self.contentLayer.isOpaque = true
         self.contentLayer.isGeometryFlipped = true  // Flip the Y axis, once
         self.contentLayer.magnificationFilter = .nearest
         self.contentLayer.minificationFilter = .nearest
-        if physical {
+        switch fbSizing {
+        case .logical:
+            break // the layer's backing store is in points and Core Animation scales it to the display
+        case .physical, .fixed:
+            // Give the layer a backing store at the display's resolution, so the framebuffer is
+            // resampled once, straight into the destination rectangle, rather than into a point-sized
+            // store that is then scaled again.
             self.contentLayer.contentsScale = scale
         }
+        // The letterbox is the view layer showing through around the content layer: black in an opaque
+        // window, and fully transparent in one created transparent (docs/adr/030 R9). Only a fixed
+        // framebuffer leaves any of it visible.
+        if case .fixed = fbSizing {
+            self.layer?.backgroundColor = CGColor(gray: 0.0, alpha: 1.0)
+        }
         self.layer?.addSublayer(self.contentLayer)
+        _ = self.refreshViewportSize()
+        self.applyContentLayerGeometry()
 
         // OS file drag and drop (file URLs only, following the objc backend)
         self.registerForDraggedTypes([.fileURL])
 
-        NSLog("[\(IMPLEMENTATION_TYPE)] Framebuffer initialized: logical=\(self.logicalWidth)x\(self.logicalHeight) fb=\(fw)x\(fh) scale=\(String(format: "%.2f", Double(scale))) physical=\(physical ? 1 : 0)")
+        NSLog("[\(IMPLEMENTATION_TYPE)] Framebuffer initialized: logical=\(self.logicalWidth)x\(self.logicalHeight) fb=\(fw)x\(fh) scale=\(String(format: "%.2f", Double(scale))) sizing=\(fbSizing)")
     }
 
     required init?(coder: NSCoder) {
@@ -192,7 +231,12 @@ class FramebufferView: NSView, PlatformBackendView {
 
     // present: the same swap and layer update as presentManual, returning the next buffer to write into.
     // The size argument is taken for compatibility but ignored; the internal size is used.
-    func present(framebuffer: UnsafeMutablePointer<UInt32>, width: Int, height: Int) -> UnsafeMutablePointer<UInt32>? {
+    func present(framebuffer: UnsafeMutablePointer<UInt32>, width: Int, height: Int, mapping: PlatformPresentMapping) -> UnsafeMutablePointer<UInt32>? {
+        currentMapping = mapping
+        // Only a fixed framebuffer has a rectangle that moves without the framebuffer changing, so only
+        // it is reapplied per frame. The covering sizings keep the layer through the paths that resize
+        // it, and pay nothing here beyond this test.
+        if case .fixed = sizing { applyContentLayerGeometry() }
         presentManual()
         return currentBuffer
     }
@@ -411,17 +455,37 @@ class FramebufferView: NSView, PlatformBackendView {
         let winPt = win.convertPoint(fromScreen: screenPt)
         let local = convert(winPt, from: nil) // window → view (not flipped: the origin is bottom-left)
         let b = bounds
-        var passThrough = true // let it fall through when the cursor is outside the window or unknown
+        var passThrough = true // let it fall through when the cursor is outside the window, unknown, or over a letterbox bar
         if b.width > 0 && b.height > 0 &&
            local.x >= 0 && local.x < b.width && local.y >= 0 && local.y < b.height {
-            var px = Int(local.x / b.width * CGFloat(width))
-            var py = Int((1.0 - local.y / b.height) * CGFloat(height)) // to a top-left origin
-            if px >= width { px = width - 1 } // clamp what rounding at the right and bottom edges would push out (it would drop the last row)
-            if py >= height { py = height - 1 }
-            if px < 0 { px = 0 }
-            if py < 0 { py = 0 }
-            let alpha = UInt8((displayBuffer[py * width + px] >> 24) & 0xFF)
-            passThrough = (alpha == 0)
+            var px = -1
+            var py = -1
+            switch sizing {
+            case .fixed:
+                // Invert the mapping with the same integer ratio the caller's inverse transform uses, so
+                // that the pixel consulted here is the pixel the application is told the pointer is on.
+                // A position over a bar falls outside the destination rectangle and is left to pass
+                // through, which is what the bars do to input everywhere (docs/adr/030 R4).
+                let scale = effectiveContentScale(pendingContentScale)
+                let dx = Int(floor(local.x * scale)) - Int(currentMapping.origin_x)
+                let dy = Int(floor((b.height - local.y) * scale)) - Int(currentMapping.origin_y)
+                if dx >= 0 && dy >= 0 && dx < Int(currentMapping.dst_width) && dy < Int(currentMapping.dst_height) {
+                    px = dx * Int(currentMapping.fb_width) / Int(currentMapping.dst_width)
+                    py = dy * Int(currentMapping.fb_height) / Int(currentMapping.dst_height)
+                }
+            case .logical, .physical:
+                // The framebuffer covers the window, so the view rectangle is the whole of it.
+                px = Int(local.x / b.width * CGFloat(width))
+                py = Int((1.0 - local.y / b.height) * CGFloat(height)) // to a top-left origin
+                if px >= width { px = width - 1 } // clamp what rounding at the right and bottom edges would push out (it would drop the last row)
+                if py >= height { py = height - 1 }
+                if px < 0 { px = 0 }
+                if py < 0 { py = 0 }
+            }
+            if px >= 0 && py >= 0 && px < width && py < height {
+                let alpha = UInt8((displayBuffer[py * width + px] >> 24) & 0xFF)
+                passThrough = (alpha == 0)
+            }
         }
         if passThrough != clickThroughState { // only write the WindowServer state when the value has changed
             win.ignoresMouseEvents = passThrough
@@ -433,6 +497,11 @@ class FramebufferView: NSView, PlatformBackendView {
     func setTransparentMode(_ on: Bool) {
         transparentMode = on
         contentLayer.isOpaque = !on
+        // The letterbox is fully transparent in a transparent window and black in an opaque one
+        // (docs/adr/030 R9); only a fixed framebuffer leaves any of it showing.
+        if case .fixed = sizing {
+            layer?.backgroundColor = on ? nil : CGColor(gray: 0.0, alpha: 1.0)
+        }
         needsDisplay = true
     }
     func setClickThrough(_ on: Bool) {
@@ -670,11 +739,21 @@ class FramebufferView: NSView, PlatformBackendView {
         displayBuffer = buffer1
         width = w
         height = h
-        if !physicalMode {
-            // .logical: framebuffer == logical, and the layer frame has the same size (as before).
+        switch sizing {
+        case .logical:
+            // The framebuffer is the window in points, so the logical size follows it.
             logicalWidth = w
             logicalHeight = h
-            contentLayer.frame = CGRect(x: 0, y: 0, width: CGFloat(w), height: CGFloat(h))
+            applyContentLayerGeometry()
+        case .physical:
+            // The caller commits the logical size, the scale and the epoch together; see
+            // applyLatchedMetricsIfNeeded.
+            break
+        case .fixed:
+            // Unreachable: the framebuffer's size is the one the window was created with, and no path
+            // asks for another. Should one ever appear, the logical size still has to equal it (R2).
+            logicalWidth = w
+            logicalHeight = h
         }
         return true
     }
@@ -694,13 +773,27 @@ class FramebufferView: NSView, PlatformBackendView {
         let newScale = effectiveContentScale(pendingContentScale)
         let scaleChanging = abs(newScale - contentScale) > 1e-6
 
-        if !physicalMode {
-            // .logical: the buffer size is left alone. Only when the scale changes are the epoch and the latched scale committed atomically.
+        switch sizing {
+        case .fixed:
+            // Nothing the application reads can change: the framebuffer keeps its size, the logical size
+            // equals it, and the reported scale is 1.0, so the epoch stays put (docs/adr/030 R2). What a
+            // scale change does move is the layer's backing store and the mapping, and the mapping is
+            // recomputed by the caller from the viewport in the metrics.
+            if scaleChanging {
+                contentScale = newScale
+                contentLayer.contentsScale = newScale
+            }
+            hasPendingResize = false
+            return
+        case .logical:
+            // The buffer size is left alone. Only when the scale changes are the epoch and the latched scale committed atomically.
             if scaleChanging {
                 contentScale = newScale
                 scaleEpoch &+= 1
             }
             return
+        case .physical:
+            break
         }
 
         var lw = hasPendingResize ? pendingLogicalWidth : logicalWidth
@@ -731,19 +824,88 @@ class FramebufferView: NSView, PlatformBackendView {
         if scaleChanging { scaleEpoch &+= 1 }
         contentScale = newScale
         hasPendingResize = false
-        contentLayer.frame = CGRect(x: 0, y: 0, width: CGFloat(logicalWidth), height: CGFloat(logicalHeight))
+        applyContentLayerGeometry()
         contentLayer.contentsScale = contentScale
     }
 
     func fillMetrics(_ out: UnsafeMutablePointer<PlatformFramebufferMetrics>, forQuery: Bool) {
         if forQuery { refreshPendingContentScale() }
+        // Only a fixed framebuffer has a window size that has to be measured: under the covering sizings
+        // the framebuffer *is* the window, so the viewport follows from what is already known and the
+        // view's bounds are left alone (this runs at every lock).
+        switch sizing {
+        case .fixed:
+            refreshViewportSize()
+        case .physical:
+            viewportWidth = width
+            viewportHeight = height
+        case .logical:
+            let s = Double(effectiveContentScale(pendingContentScale))
+            viewportWidth = Int((Double(width) * s).rounded())
+            viewportHeight = Int((Double(height) * s).rounded())
+        }
         out.pointee.logical_width = UInt32(logicalWidth)
         out.pointee.logical_height = UInt32(logicalHeight)
         out.pointee.framebuffer_width = UInt32(width)
         out.pointee.framebuffer_height = UInt32(height)
         let scale = forQuery ? pendingContentScale : contentScale
-        out.pointee.content_scale = Float(effectiveContentScale(scale))
+        // A fixed framebuffer reports 1.0 whatever the display does: the application is given one
+        // coordinate space and no way to render at the display's resolution (docs/adr/030 R2). The real
+        // scale stays in contentScale, where the layer geometry needs it.
+        if case .fixed = sizing {
+            out.pointee.content_scale = 1.0
+        } else {
+            out.pointee.content_scale = Float(effectiveContentScale(scale))
+        }
         out.pointee.scale_epoch = scaleEpoch
+        out.pointee.viewport_width = UInt32(viewportWidth)
+        out.pointee.viewport_height = UInt32(viewportHeight)
+    }
+
+    // The content area in physical pixels, recomputed from the current bounds and backing scale.
+    // Returns true when it changed, which is when a fixed framebuffer's mapping needs recomputing.
+    // Called only under a fixed framebuffer, which is the one sizing whose window size does not follow
+    // from the framebuffer: at every lock, and at every settled geometry change.
+    // Hot path declaration: a handful of scalar operations and no allocation.
+    @discardableResult
+    func refreshViewportSize() -> Bool {
+        let (vw, vh) = viewportPhysicalSize(self, scale: pendingContentScale)
+        let changed = (vw != viewportWidth || vh != viewportHeight)
+        viewportWidth = vw
+        viewportHeight = vh
+        return changed
+    }
+
+    // The destination rectangle in points, from the mapping's physical pixels. The rectangle is worked
+    // out in physical pixels and converted only here (docs/adr/030 R3), so a rounding difference of at
+    // most half a point can appear on screen while the coordinate transforms stay exact.
+    //
+    // **The single place the layer's frame is written**, so that no path can leave it stretched.
+    // Hot path declaration: once per present under a fixed framebuffer, and at every settled geometry
+    // change under the other two. The assignment itself is skipped when the rectangle has not moved.
+    func applyContentLayerGeometry() {
+        var target: CGRect
+        switch sizing {
+        case .logical, .physical:
+            // The framebuffer covers the window, so the layer is the whole content area.
+            target = CGRect(x: 0, y: 0, width: CGFloat(logicalWidth), height: CGFloat(logicalHeight))
+        case .fixed:
+            // Everything but the scale comes from the mapping, including the window it was worked out
+            // against, so a resize that landed after it cannot move the content out of the rectangle the
+            // mapping describes. The scale is the one live read left, and a change to it takes effect on
+            // the next frame's mapping — the frame-boundary tolerance ADR-030 R4 already states.
+            //
+            // The mapping's origin is measured from the top-left; the parent layer's is at the
+            // bottom-left, so the *bottom* gap is what the origin becomes. Deriving it as the top gap
+            // would misplace the content by a pixel whenever the two bars differ in width.
+            let scale = effectiveContentScale(pendingContentScale)
+            let bottom = Int(currentMapping.window_height) - Int(currentMapping.origin_y) - Int(currentMapping.dst_height)
+            target = CGRect(x: CGFloat(Int(currentMapping.origin_x)) / scale,
+                            y: CGFloat(bottom) / scale,
+                            width: CGFloat(Int(currentMapping.dst_width)) / scale,
+                            height: CGFloat(Int(currentMapping.dst_height)) / scale)
+        }
+        if contentLayer.frame != target { contentLayer.frame = target }
     }
 
     func nativeEventScale() -> CGFloat {
@@ -761,7 +923,12 @@ class FramebufferView: NSView, PlatformBackendView {
         // Only the pending value is updated. The epoch, the latched scale and the buffer are committed atomically on the next successful lock.
         if abs(s - pendingContentScale) > 1e-6 {
             pendingContentScale = s
-            if physicalMode, let cb = redrawCallback {
+            if case .fixed = sizing { refreshViewportSize() }
+            // A logical framebuffer has nothing to redo: it stays the window in points and the display
+            // scales it. The other two have work waiting at the next lock — a reallocation under a
+            // physical framebuffer, a new destination rectangle under a fixed one — so the application
+            // is prompted to run a frame.
+            if case .logical = sizing {} else if let cb = redrawCallback {
                 cb(redrawUserdata)
             }
         }
@@ -772,7 +939,15 @@ class FramebufferView: NSView, PlatformBackendView {
     // .logical resizes at once, and the redraw callback fires only on success.
     override func setFrameSize(_ newSize: NSSize) {
         super.setFrameSize(newSize)
-        if physicalMode {
+        if case .fixed = sizing {
+            // The framebuffer is untouched — only where it lands changes. The mapping is recomputed by
+            // the caller on the next frame, so all this needs to do is ask for that frame.
+            if refreshViewportSize(), let cb = redrawCallback {
+                cb(redrawUserdata)
+            }
+            return
+        }
+        if case .physical = sizing {
             var nw = Int(newSize.width)
             var nh = Int(newSize.height)
             if nw < 1 { nw = 1 }
@@ -839,7 +1014,7 @@ func makePlatformBackendView(
     callback: FrameCallback?,
     userdata: UnsafeMutableRawPointer?,
     transparent: Bool,
-    physical: Bool
+    sizing: PlatformFramebufferSizing
 ) -> (any PlatformBackendView)? {
     let view = FramebufferView(
         frame: frame,
@@ -847,7 +1022,7 @@ func makePlatformBackendView(
         height: height,
         callback: callback,
         userdata: userdata,
-        physical: physical
+        sizing: sizing
     )
 #if KNGN_ENABLE_MASCOT
     if transparent {

@@ -180,10 +180,40 @@ func roundToPhysicalPx(_ logicalPx: Int, scale: CGFloat) -> Int {
     return Int(v)
 }
 
-/// The physical framebuffer size. Under .logical it is always the logical size itself.
-func effectiveFramebufferSize(physicalMode: Bool, logicalWidth: Int, logicalHeight: Int, scale: CGFloat) -> (Int, Int) {
-    if !physicalMode { return (max(1, logicalWidth), max(1, logicalHeight)) }
-    return (roundToPhysicalPx(logicalWidth, scale: scale), roundToPhysicalPx(logicalHeight, scale: scale))
+/// How the framebuffer is sized. It carries the size in the `.fixed` case so that selecting that case
+/// makes the size mandatory, and every site that branches on it has to answer for all three: a boolean
+/// pair would leave the third case wherever it happened to fall.
+enum PlatformFramebufferSizing {
+    /// The window, in logical points.
+    case logical
+    /// The window, in physical pixels.
+    case physical
+    /// This size, whatever the window does; present magnifies it into a letterbox (docs/adr/030 R1).
+    case fixed(width: Int, height: Int)
+}
+
+/// The framebuffer size the sizing calls for. Only `.physical` depends on the scale, and `.fixed`
+/// depends on neither the window nor the scale — which is the whole point of it.
+func effectiveFramebufferSize(sizing: PlatformFramebufferSizing, logicalWidth: Int, logicalHeight: Int, scale: CGFloat) -> (Int, Int) {
+    switch sizing {
+    case .logical:
+        return (max(1, logicalWidth), max(1, logicalHeight))
+    case .physical:
+        return (roundToPhysicalPx(logicalWidth, scale: scale), roundToPhysicalPx(logicalHeight, scale: scale))
+    case .fixed(let w, let h):
+        return (max(1, w), max(1, h))
+    }
+}
+
+/// The window's content area in physical pixels, measured from the view. It is the basis the letterbox
+/// of a fixed framebuffer is worked out from (docs/adr/030 R4); a framebuffer that covers the window
+/// has no need of it, because there the framebuffer already says what the window is.
+func viewportPhysicalSize(_ view: NSView, scale: CGFloat) -> (Int, Int) {
+    let s = Double(effectiveContentScale(scale))
+    let b = view.bounds.size
+    let w = (Double(b.width) * s).rounded()
+    let h = (Double(b.height) * s).rounded()
+    return (w.isFinite && w > 0 ? Int(w) : 0, h.isFinite && h > 0 ? Int(h) : 0)
 }
 
 // Convert NSEvent.locationInWindow into raw physical pixels with the origin at the view's top-left (floored to an integer).
@@ -372,10 +402,13 @@ protocol PlatformBackendView: AnyObject {
     var initialFramebuffer: UnsafeMutablePointer<UInt32>? { get }
     // Present the current write buffer (a swap or a submit) and return the next buffer to write into.
     // The size argument is taken for compatibility, but the implementation uses its internal size.
+    // `mapping` says where the framebuffer lands inside the window; the arithmetic behind it lives
+    // above this ABI, so an implementation reads it rather than deriving its own (docs/adr/030 R3).
     func present(
         framebuffer: UnsafeMutablePointer<UInt32>,
         width: Int,
-        height: Int
+        height: Int,
+        mapping: PlatformPresentMapping
     ) -> UnsafeMutablePointer<UInt32>?
     var implementationType: String { get }
 #if KNGN_ENABLE_CURSOR
@@ -1141,7 +1174,7 @@ func platform_init() -> Bool {
 
 @_cdecl("platform_create_window")
 func platform_create_window(width: Int32, height: Int32, title: UnsafePointer<CChar>, callback: FrameCallback?, userdata: UnsafeMutableRawPointer?) -> UnsafeMutableRawPointer? {
-    return createWindowImpl(width: width, height: height, title: title, callback: callback, userdata: userdata, transparent: false, borderless: false, position: nil, physical: false)
+    return createWindowImpl(width: width, height: height, title: title, callback: callback, userdata: userdata, transparent: false, borderless: false, position: nil, sizing: .logical)
 }
 
 // Create a window with options. opts==NULL keeps the previous behaviour, and unknown flags or reserved!=0 give NULL.
@@ -1149,7 +1182,7 @@ func platform_create_window(width: Int32, height: Int32, title: UnsafePointer<CC
 func platform_create_window_ex(width: Int32, height: Int32, title: UnsafePointer<CChar>, callback: FrameCallback?, userdata: UnsafeMutableRawPointer?, opts: UnsafePointer<PlatformWindowOptions>?) -> UnsafeMutableRawPointer? {
     var transparent = false
     var borderless = false
-    var physical = false
+    var sizing: PlatformFramebufferSizing = .logical
     var notResizable = false
     var position: (x: Int32, y: Int32)? = nil
     if let opts = opts {
@@ -1157,27 +1190,38 @@ func platform_create_window_ex(width: Int32, height: Int32, title: UnsafePointer
         // Without the mascot opt-in TRANSPARENT and BORDERLESS are not known flags, so asking for
         // one fails the same way an unknown flag does rather than yielding an ordinary window.
 #if KNGN_ENABLE_MASCOT
-        let known = UInt32(PLATFORM_WINDOW_TRANSPARENT) | UInt32(PLATFORM_WINDOW_BORDERLESS) | UInt32(PLATFORM_WINDOW_POSITION) | UInt32(PLATFORM_WINDOW_FRAMEBUFFER_PHYSICAL) | UInt32(PLATFORM_WINDOW_NOT_RESIZABLE)
+        let known = UInt32(PLATFORM_WINDOW_TRANSPARENT) | UInt32(PLATFORM_WINDOW_BORDERLESS) | UInt32(PLATFORM_WINDOW_POSITION) | UInt32(PLATFORM_WINDOW_FRAMEBUFFER_PHYSICAL) | UInt32(PLATFORM_WINDOW_FRAMEBUFFER_FIXED) | UInt32(PLATFORM_WINDOW_NOT_RESIZABLE)
 #else
-        let known = UInt32(PLATFORM_WINDOW_POSITION) | UInt32(PLATFORM_WINDOW_FRAMEBUFFER_PHYSICAL) | UInt32(PLATFORM_WINDOW_NOT_RESIZABLE)
+        let known = UInt32(PLATFORM_WINDOW_POSITION) | UInt32(PLATFORM_WINDOW_FRAMEBUFFER_PHYSICAL) | UInt32(PLATFORM_WINDOW_FRAMEBUFFER_FIXED) | UInt32(PLATFORM_WINDOW_NOT_RESIZABLE)
 #endif
         if (flags & ~known) != 0 || opts.pointee.reserved != 0 { return nil }
 #if KNGN_ENABLE_MASCOT
         transparent = (flags & UInt32(PLATFORM_WINDOW_TRANSPARENT)) != 0
         borderless = (flags & UInt32(PLATFORM_WINDOW_BORDERLESS)) != 0
 #endif
-        physical = (flags & UInt32(PLATFORM_WINDOW_FRAMEBUFFER_PHYSICAL)) != 0
+        let wantPhysical = (flags & UInt32(PLATFORM_WINDOW_FRAMEBUFFER_PHYSICAL)) != 0
+        let wantFixed = (flags & UInt32(PLATFORM_WINDOW_FRAMEBUFFER_FIXED)) != 0
+        // The two name different framebuffers, so asking for both is a caller error rather than
+        // something to resolve here, and a fixed framebuffer with a zero side has no destination
+        // rectangle to magnify into.
+        if wantPhysical && wantFixed { return nil }
+        if wantFixed {
+            if opts.pointee.fb_width == 0 || opts.pointee.fb_height == 0 { return nil }
+            sizing = .fixed(width: Int(opts.pointee.fb_width), height: Int(opts.pointee.fb_height))
+        } else if wantPhysical {
+            sizing = .physical
+        }
         notResizable = (flags & UInt32(PLATFORM_WINDOW_NOT_RESIZABLE)) != 0
         if (flags & UInt32(PLATFORM_WINDOW_POSITION)) != 0 {
             position = (opts.pointee.x, opts.pointee.y)
         }
     }
-    return createWindowImpl(width: width, height: height, title: title, callback: callback, userdata: userdata, transparent: transparent, borderless: borderless, position: position, physical: physical, notResizable: notResizable)
+    return createWindowImpl(width: width, height: height, title: title, callback: callback, userdata: userdata, transparent: transparent, borderless: borderless, position: position, sizing: sizing, notResizable: notResizable)
 }
 
 // The shared skeleton of window creation. Creating the backend-specific view is delegated to the
 // makePlatformBackendView() factory (defined in each backend file). The window-level style, transparency and placement are shared.
-private func createWindowImpl(width: Int32, height: Int32, title: UnsafePointer<CChar>, callback: FrameCallback?, userdata: UnsafeMutableRawPointer?, transparent: Bool, borderless: Bool, position: (x: Int32, y: Int32)?, physical: Bool, notResizable: Bool = false) -> UnsafeMutableRawPointer? {
+private func createWindowImpl(width: Int32, height: Int32, title: UnsafePointer<CChar>, callback: FrameCallback?, userdata: UnsafeMutableRawPointer?, transparent: Bool, borderless: Bool, position: (x: Int32, y: Int32)?, sizing: PlatformFramebufferSizing, notResizable: Bool = false) -> UnsafeMutableRawPointer? {
     let app = NSApplication.shared
     app.setActivationPolicy(.regular)
 
@@ -1231,7 +1275,7 @@ private func createWindowImpl(width: Int32, height: Int32, title: UnsafePointer<
         callback: callback,
         userdata: userdata,
         transparent: transparent,
-        physical: physical
+        sizing: sizing
     ) else {
         return nil
     }
@@ -1608,7 +1652,9 @@ func platform_lock_framebuffer(platformWindow: UnsafeMutableRawPointer?, out_wid
         framebuffer_width: 0,
         framebuffer_height: 0,
         content_scale: 1.0,
-        scale_epoch: 0
+        scale_epoch: 0,
+        viewport_width: 0,
+        viewport_height: 0
     )
     guard let px = platform_lock_framebuffer_ex(platformWindow: platformWindow, out: &metrics) else { return nil }
     if let out_width = out_width {
@@ -1661,7 +1707,7 @@ func platform_present(platformWindow: UnsafeMutableRawPointer?, mapping: UnsafeP
     let view = handle.backendView
 
     // Present, then receive and store the next write buffer (swift: a swap; metal: a submit plus a slot advance)
-    if let next = view.present(framebuffer: fb, width: view.width, height: view.height) {
+    if let next = view.present(framebuffer: fb, width: view.width, height: view.height, mapping: mapping.pointee) {
         handle.currentFramebuffer = next
     }
 }
