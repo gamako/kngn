@@ -25,6 +25,12 @@
 //     re-reading the other quantity too, so it never applies half of a stale combination.
 //   - Mouse/wheel coordinates are raw physical (CSS × devicePixelRatio) regardless of fb_mode; the
 //     Zig facade divides by the frame-latched content_scale to recover logical points.
+//   - A fixed-size framebuffer (fb_mode = .fixed, docs/adr/030) needs nothing from this file: the
+//     canvas bitmap becomes the framebuffer's size at present as it always does, and the host page's
+//     CSS (object-fit: contain, image-rendering: pixelated, a black background) is what fits it into
+//     the element and shows the letterbox. Coordinates stay relative to the *element* box, which is
+//     the box the mapping is worked out from, so a position over a bar correctly lands outside the
+//     framebuffer. Deriving the ratio from the bitmap instead would break exactly that.
 //
 // File I/O:
 //   - open: <input type=file> → register bytes at virtual path `pick/<name>` → kngn_file_picked

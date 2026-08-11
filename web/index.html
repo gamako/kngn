@@ -17,8 +17,16 @@
       display: block;
       width: 100vw;
       height: 100vh;
-      background: #242020;
+      /* The letterbox of a fixed-size framebuffer, and the backdrop of the canvas otherwise:
+         black, which is what an opaque window promises (docs/adr/030 R9). */
+      background: #000;
       outline: none;
+      /* The element fills the viewport while the bitmap keeps its own size, so the two need not share
+         an aspect ratio. `contain` fits the bitmap inside the element preserving its ratio and leaves
+         the rest showing the background above; without it the bitmap is stretched to the element and a
+         fixed-size framebuffer comes out distorted. `pixelated` makes the magnification
+         nearest-neighbour, which is what a low-resolution framebuffer is for. */
+      object-fit: contain;
       image-rendering: pixelated;
       cursor: default;
     }

@@ -72,14 +72,43 @@ initial framebuffer matches `App.window`, clamped to the range below — the sam
 point `zig build run` gives a native app. `template/web/template.html` gives its canvas
 neither for exactly this reason, so it stays at `App.window`'s size (320x240) by default.
 
-**DPR (`WindowOptions.fb_mode`)**: `content_scale` always reports the real
-`devicePixelRatio`, under either mode (mirroring the native backends' `effectiveContentScale`,
-which is independent of `fb_mode` too). Only the framebuffer's own size depends on the mode:
+**DPR (`WindowOptions.fb_mode`)**: `content_scale` reports the real `devicePixelRatio` under
+`.logical` and `.physical` (mirroring the native backends' `effectiveContentScale`, which is
+independent of `fb_mode` too), and 1.0 under `.fixed`. Only the framebuffer's own size depends
+on the mode:
 
 | Mode | Framebuffer size | Appearance |
 |---|---|---|
 | `.logical` (default) | The canvas's CSS-pixel box, unchanged | The browser's own bitmap upscale on HiDPI (soft, like today) |
 | `.physical` | `round(CSS box × devicePixelRatio)` | A native-resolution present, as crisp as a native `.physical` window |
+| `.fixed` | Exactly the size the mode carries, whatever the canvas does | Magnified into a letterbox by the browser, nearest-neighbour (below) |
+
+**`.fixed` needs three CSS declarations from the host page**, because on the web the magnification is
+the browser's (docs/adr/030 R5). The canvas bitmap becomes the framebuffer's size at every
+present, while the element keeps whatever box the page's layout gives it, so the two need not
+share an aspect ratio:
+
+```css
+canvas {
+  object-fit: contain;          /* fit the bitmap inside the element, preserving its ratio */
+  image-rendering: pixelated;   /* magnify nearest-neighbour */
+  background: #000;             /* the letterbox: black, as an opaque window promises (030 R9) */
+}
+```
+
+Without `object-fit` the bitmap is stretched to the element and a fixed-size framebuffer comes
+out distorted. `web/index.html` carries all three; a host page of your own has to as well.
+Two consequences worth stating:
+
+- **Pointer positions are unaffected**, because they are taken relative to the *element* box
+  (`getBoundingClientRect`), which is the same box the mapping is worked out from — not relative
+  to the fitted content. A position over a bar therefore comes out beyond the framebuffer, which
+  is what 030 R4 says it should.
+- The browser's fit is computed in the layout engine's floating point while the mapping floors,
+  so where the two disagree it is by half a pixel at the edge of the content.
+
+`transparent` is a documented no-op on the web (ADR-019 R4), so a web window is always opaque
+and so are its bars.
 
 The initial ratio is queried synchronously from JS at window creation
 (`kngn_device_pixel_ratio`), so the first frame already draws at the real ratio. A

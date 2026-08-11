@@ -298,6 +298,13 @@ var fb_mode: FramebufferMode = .logical;
 var logical_w: u32 = 0;
 var logical_h: u32 = 0;
 var content_scale: f32 = 1.0;
+/// The canvas element's box in physical pixels (its CSS box times the device pixel ratio), committed
+/// with the pair above. Under the two covering modes it follows the framebuffer; under `.fixed` it is
+/// the one thing that moves while the framebuffer does not, and it is what the letterbox is worked out
+/// from (ADR-030 R4). It is also the space a pointer position arrives in, which is what keeps the
+/// mapping and its inverse agreeing here.
+var viewport_w: u32 = 0;
+var viewport_h: u32 = 0;
 var scale_epoch: u64 = 0;
 /// 0 = nothing pending. kngn_resize sets these (and pending_scale) together, and the top of the
 /// next lockFramebuffer applies them (at a frame boundary).
@@ -350,9 +357,33 @@ fn effectiveFramebufferSize(mode: FramebufferMode, logical: WindowSize, scale: f
     // mode this backend has not implemented would silently take the wrong branch here.
     switch (mode) {
         .logical => return logical,
-        .fixed => |size| return size, // refused at creation; stated rather than left to fall through
+        // The whole point of the mode: the size it carries, whatever the canvas is doing.
+        .fixed => |size| return size,
         .physical => {},
     }
+    return .{
+        .width = try physicalDimChecked(logical.width, scale),
+        .height = try physicalDimChecked(logical.height, scale),
+    };
+}
+
+/// The content scale to report to the application: the real ratio, except under `.fixed`, where it is
+/// 1.0 (ADR-030 R2). The real ratio stays in `content_scale`, because the viewport is derived from it.
+fn reportedContentScale() f32 {
+    return switch (fb_mode) {
+        .fixed => 1.0,
+        .logical, .physical => content_scale,
+    };
+}
+
+/// The canvas box in physical pixels: its CSS box times the device pixel ratio. It fails rather than
+/// clamping if the product is not a plausible size, because a wrong viewport is a wrong letterbox — the
+/// framebuffer would be magnified into a rectangle that is not where the canvas is.
+///
+/// It computes and does not store, so that a caller works out **every** part of a change before writing
+/// any of it. Half a change is the one state that produces a mapping describing neither the old geometry
+/// nor the new one.
+fn viewportForBox(logical: WindowSize, scale: f32) Error!WindowSize {
     return .{
         .width = try physicalDimChecked(logical.width, scale),
         .height = try physicalDimChecked(logical.height, scale),
@@ -399,8 +430,31 @@ fn applyPendingResize() void {
         pending_h = 0;
         return;
     }
+    switch (fb_mode) {
+        // Nothing the application reads changes: the framebuffer keeps its size, the logical size
+        // equals it and the reported scale is 1.0, so there is no reallocation and the epoch stays put
+        // (ADR-030 R2). What moved is the canvas box, and that is the viewport.
+        .fixed => {
+            // On failure the pending pair is left set, so the next lock retries with the whole change
+            // still ahead of it rather than half applied.
+            const vp = viewportForBox(new_logical, new_scale) catch return;
+            viewport_w = vp.width;
+            viewport_h = vp.height;
+            content_scale = new_scale;
+            pending_w = 0;
+            pending_h = 0;
+            return;
+        },
+        .logical, .physical => {},
+    }
+    // Everything the new state needs is worked out first, and only then written: a viewport that cannot
+    // be expressed, or a framebuffer that cannot be allocated, leaves the whole change pending for the
+    // next lock instead of pairing a new viewport with the old framebuffer.
     const target = effectiveFramebufferSize(fb_mode, new_logical, new_scale) catch return;
+    const vp = viewportForBox(new_logical, new_scale) catch return;
     ensureFramebuffer(target.width, target.height) catch return;
+    viewport_w = vp.width;
+    viewport_h = vp.height;
     logical_w = new_logical.width;
     logical_h = new_logical.height;
     if (new_scale != content_scale) scale_epoch +%= 1;
@@ -445,9 +499,6 @@ pub const Window = struct {
     /// (ADR-019 R4). An option documented as having no effect is not the same as one ignored
     /// silently.
     pub fn createWithOptions(width: u32, height: u32, _: [:0]const u8, opts: types.WindowOptions) Error!Window {
-        // No present here magnifies a framebuffer into a letterbox yet, so a fixed one is refused
-        // rather than quietly behaving like another mode (ADR-030 R5).
-        try types.refuseFixedFramebuffer(opts.fb_mode);
         _ = opts.transparent;
         _ = opts.borderless;
         _ = opts.position;
@@ -467,10 +518,24 @@ pub const Window = struct {
         const initial_scale = effectiveContentScale(queryInitialDevicePixelRatio());
         const logical: WindowSize = .{ .width = clamped.w, .height = clamped.h };
         const target = try effectiveFramebufferSize(fb_mode, logical, initial_scale);
+        // Before anything is allocated: a window whose canvas box cannot be expressed in physical pixels
+        // has no letterbox to present into, and failing here leaves no framebuffer behind.
+        const vp = try viewportForBox(logical, initial_scale);
         try ensureFramebuffer(target.width, target.height);
         logical_w = logical.width;
         logical_h = logical.height;
         content_scale = initial_scale;
+        viewport_w = vp.width;
+        viewport_h = vp.height;
+        switch (fb_mode) {
+            // The application sees one space and it is the framebuffer, at a scale of 1.0
+            // (ADR-030 R2). The canvas's own box lives in the viewport above instead.
+            .fixed => {
+                logical_w = fb_w;
+                logical_h = fb_h;
+            },
+            .logical, .physical => {},
+        }
         // Mirrors the just-committed value, so a same-ratio kngn_resize renotify right after
         // creation is not mistaken for a runtime change (scale_epoch stays 0 until it truly moves).
         pending_scale = initial_scale;
@@ -518,7 +583,7 @@ pub const Window = struct {
             .height = fb_h,
             .logical_size = .{ .width = logical_w, .height = logical_h },
             .framebuffer_size = .{ .width = fb_w, .height = fb_h },
-            .content_scale = content_scale,
+            .content_scale = reportedContentScale(),
             .scale_epoch = scale_epoch,
         };
     }
@@ -533,13 +598,30 @@ pub const Window = struct {
         return .{ .width = fb_w, .height = fb_h };
     }
 
-    /// The currently negotiated content scale (the real devicePixelRatio, whether `.logical` or `.physical`).
+    /// The currently negotiated content scale: the real devicePixelRatio under `.logical` and
+    /// `.physical`, and 1.0 under `.fixed`, where the application is given one coordinate space and no
+    /// way to render at the display's resolution (ADR-030 R2). The real ratio stays in the variable,
+    /// because the viewport is worked out from it.
     pub fn contentScale(_: Window) f32 {
-        return content_scale;
+        return reportedContentScale();
     }
 
-    /// The mapping is applied by the host page's CSS rather than here: this hands the browser the
-    /// framebuffer, and the page decides where inside the canvas element it lands.
+    /// The canvas element's box in physical pixels, which is what the facade works the letterbox out
+    /// from. It travels back down inside the mapping, so nothing recomputes it later from a box that
+    /// may have moved since.
+    pub fn presentViewport(_: Window) WindowSize {
+        return .{ .width = viewport_w, .height = viewport_h };
+    }
+
+    /// The magnification is the browser's: this hands over the framebuffer, the canvas bitmap becomes
+    /// its size, and the page's CSS (`object-fit: contain` plus `image-rendering: pixelated`) fits it
+    /// into the element preserving the aspect ratio and shows the element's background as the letterbox
+    /// — the host obligation of ADR-030 R5, documented in docs/wasm-deploy.md.
+    ///
+    /// The mapping is therefore unused here, and the one place it can disagree with the browser is the
+    /// half-pixel: the fit is computed in the layout engine's floating point while the mapping floors.
+    /// A pointer position is unaffected, because it arrives relative to the element box the mapping was
+    /// built from rather than to the fitted content.
     pub fn present(_: Window, _: types.PresentMapping) void {
         if (pixels_buf.len == 0 or rgba_buf.len == 0) return;
         const src = std.mem.sliceAsBytes(pixels_buf);
@@ -850,6 +932,8 @@ fn testResetFramebufferState() void {
     fb_mode = .logical;
     logical_w = 0;
     logical_h = 0;
+    viewport_w = 0;
+    viewport_h = 0;
     content_scale = 1.0;
     scale_epoch = 0;
     pending_w = 0;
@@ -941,6 +1025,73 @@ test "kngn_resize: the framebuffer keeps its old size while the pending value is
 }
 
 // ---- DPR / fb_mode (ADR-011) ----
+// ---- .fixed (ADR-030) ----
+
+test ".fixed: the framebuffer is the size the mode carries, and the canvas box is the viewport" {
+    testResetFramebufferState();
+    defer testResetFramebufferState();
+    test_initial_dpr_override = 2.0;
+
+    var win = try Window.createWithOptions(800, 600, "t", .{
+        .fb_mode = .{ .fixed = .{ .width = 640, .height = 400 } },
+    });
+    defer win.destroy();
+
+    const fb = win.lockFramebuffer() orelse unreachable;
+    try std.testing.expectEqual(@as(u32, 640), fb.width);
+    try std.testing.expectEqual(@as(u32, 400), fb.height);
+    // One coordinate space, at 1.0: the logical size is the framebuffer and not the canvas box.
+    try std.testing.expectEqual(@as(u32, 640), fb.logical_size.width);
+    try std.testing.expectEqual(@as(u32, 400), fb.logical_size.height);
+    try std.testing.expectEqual(@as(f32, 1.0), fb.content_scale);
+    try std.testing.expectEqual(@as(f32, 1.0), win.contentScale());
+    // The canvas box in physical pixels, which the real ratio is applied to.
+    try std.testing.expectEqual(@as(u32, 1600), win.presentViewport().width);
+    try std.testing.expectEqual(@as(u32, 1200), win.presentViewport().height);
+}
+
+test ".fixed: a resize moves the viewport and leaves the framebuffer, the snapshot and the epoch alone" {
+    testResetFramebufferState();
+    defer testResetFramebufferState();
+
+    var win = try Window.createWithOptions(800, 600, "t", .{
+        .fb_mode = .{ .fixed = .{ .width = 640, .height = 400 } },
+    });
+    defer win.destroy();
+    _ = win.lockFramebuffer() orelse unreachable;
+    const buf_before = pixels_buf.ptr;
+
+    kngn_resize(1024, 400, 1.0);
+    const fb = win.lockFramebuffer() orelse unreachable;
+    try std.testing.expectEqual(@as(u32, 640), fb.width);
+    try std.testing.expectEqual(@as(u32, 400), fb.height);
+    try std.testing.expectEqual(@as(u32, 640), fb.logical_size.width);
+    try std.testing.expectEqual(@as(u64, 0), fb.scale_epoch);
+    try std.testing.expectEqual(buf_before, pixels_buf.ptr); // not reallocated
+    try std.testing.expectEqual(@as(u32, 1024), win.presentViewport().width);
+    try std.testing.expectEqual(@as(u32, 400), win.presentViewport().height);
+}
+
+test ".fixed: a device pixel ratio change moves the viewport and still leaves the epoch alone" {
+    testResetFramebufferState();
+    defer testResetFramebufferState();
+
+    var win = try Window.createWithOptions(800, 600, "t", .{
+        .fb_mode = .{ .fixed = .{ .width = 640, .height = 400 } },
+    });
+    defer win.destroy();
+    _ = win.lockFramebuffer() orelse unreachable;
+    try std.testing.expectEqual(@as(u32, 800), win.presentViewport().width);
+
+    kngn_resize(800, 600, 2.0);
+    const fb = win.lockFramebuffer() orelse unreachable;
+    // The framebuffer tracks nothing about the display, so the epoch — which exists to say the
+    // framebuffer changed — must not move (ADR-030 R2).
+    try std.testing.expectEqual(@as(u64, 0), fb.scale_epoch);
+    try std.testing.expectEqual(@as(f32, 1.0), fb.content_scale);
+    try std.testing.expectEqual(@as(u32, 1600), win.presentViewport().width);
+    try std.testing.expectEqual(@as(u32, 1200), win.presentViewport().height);
+}
 
 test "createWithOptions: the initial devicePixelRatio is committed without bumping scale_epoch" {
     testResetFramebufferState();
