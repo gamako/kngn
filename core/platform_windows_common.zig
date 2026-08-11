@@ -1097,7 +1097,7 @@ pub const Core = struct {
     /// Hot path declaration: per frame. The DIB and the DC are cached in Core, though, and **rebuilt only when
     /// the size changes** (which avoids a temporary allocation per frame, keeping the performance rules). Every
     /// frame does nothing but one @memcpy from the backing into the DIB plus UpdateLayeredWindow: no new per-pixel loop and no allocation.
-    pub fn presentLayered(self: *Core) void {
+    pub fn presentLayered(self: *Core, _: types.PresentMapping) void {
         if (!self.ensureLayerResources()) return;
         const dst = self.layer_bits orelse return;
         @memcpy(dst[0..self.backing.len], self.backing); // the premultiplied BGRA goes into the DIB as it is

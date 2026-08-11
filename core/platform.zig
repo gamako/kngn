@@ -652,20 +652,30 @@ pub const Window = struct {
     /// Submit the most recently locked frame to the display queue (the frame commit point; not a vsync wait).
     /// After present the pixels are owned by the backend; the caller must not touch them until the next lock.
     /// Contract: docs/adr/002 (revised) and docs/adr/005.
-    pub fn present(self: Window) void {
+    /// The backend is handed this frame's mapping, because present is where the framebuffer meets
+    /// the window and only the mapping says where inside it the framebuffer goes (ADR-030 R3).
+    /// Recomputing it per backend would put a different rounding in every one of them, and the
+    /// pointer would stop landing where the pixel is.
+    ///
+    /// The harness hook runs first, unchanged: it copies the framebuffer for observation and has
+    /// no use for the mapping.
+    pub fn present(self: *const Window) void {
         // Hot path declaration: while the harness is enabled, onStats→onPresent (an owned observation copy) runs before the backend present.
         // A null present is a no-op. There is no per-frame allocation and no per-pixel work.
         if (harness.isEnabled()) {
             harness.onStats(self.getEventStats());
             harness.onPresent();
         }
+        // A present before the first successful lock has nothing latched; synthesising from the
+        // live size beats handing the backend an empty mapping.
+        const mapping = if (self.has_latched) self.latched_mapping else self.eventMapping();
         if (comptime null_runtime_supported) {
             if (self.inner == .null_win) {
-                self.inner.null_win.present();
+                self.inner.null_win.present(mapping);
                 return;
             }
         }
-        self.inner.native.present();
+        self.inner.native.present(mapping);
     }
 
     /// Set the cursor shape (the system cursor).

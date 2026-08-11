@@ -265,7 +265,25 @@ void platform_set_redraw_callback(PlatformWindow* window, PlatformRedrawCallback
 // Notes:
 // - Rate control of a game loop is the caller's responsibility (platform_get_time() and sleep(), or a future beginFrame/waitFrame)
 // - The authority on the present / lockFramebuffer / frame pacing contracts is docs/adr/002 (revised) and docs/adr/005
-void platform_present(PlatformWindow* window);
+// Where the framebuffer goes inside the window, for the frame being presented.
+// The caller owns the arithmetic (core/platform_types.zig's PresentMapping); this is the flat form that crosses the ABI.
+// Everything is in physical window pixels except the framebuffer size, which is in framebuffer pixels.
+// A framebuffer that covers the window has origin 0 and dst == window == fb, which is what every mode but a fixed
+// framebuffer produces. The contract is docs/adr/030.
+typedef struct PlatformPresentMapping {
+    int32_t origin_x;       // top-left of the destination rectangle
+    int32_t origin_y;
+    uint32_t dst_width;     // the destination rectangle, which the framebuffer is magnified into
+    uint32_t dst_height;
+    uint32_t fb_width;      // the framebuffer being magnified
+    uint32_t fb_height;
+} PlatformPresentMapping;
+
+// The window's own size is deliberately absent: the backend already knows it, and deriving it from
+// the origin would be wrong by a pixel whenever the letterbox is not exactly even on both sides.
+
+// mapping must not be NULL. It is read during the call and not retained.
+void platform_present(PlatformWindow* window, const PlatformPresentMapping* mapping);
 
 // ========================================
 // The event API

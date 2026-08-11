@@ -512,7 +512,9 @@ pub const Window = struct {
 
     /// Upload the canonical BGRA backing most recently locked to the GPU and submit it to the swap chain (the frame commit point).
     /// upload (a DEFAULT texture) → CopyResource (the backbuffer) → Present(1,0), i.e. fifo.
-    pub fn present(self: Window) void {
+    /// The mapping is unused while this backend refuses a fixed framebuffer: its framebuffer
+    /// always covers the window, so the destination rectangle is the window.
+    pub fn present(self: Window, _: types.PresentMapping) void {
         const core = self.core;
         const d3d = self.d3d;
         // Following a resize: bring the swap chain and upload_tex up to core's size, lazily.

@@ -2496,8 +2496,8 @@ void platform_unlock_framebuffer(PlatformWindow* platformWindow) {
 }
 
 // Update the screen
-void platform_present(PlatformWindow* platformWindow) {
-    if (!platformWindow) return;
+void platform_present(PlatformWindow* platformWindow, const PlatformPresentMapping* mapping) {
+    if (!platformWindow || !mapping) return;
 
     @autoreleasepool {
         FramebufferView* view = platformWindow->view;

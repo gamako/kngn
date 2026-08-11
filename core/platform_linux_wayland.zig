@@ -1887,7 +1887,9 @@ pub const Window = struct {
         return effectiveContentScale(self.state.pending_content_scale);
     }
 
-    pub fn present(self: Window) void {
+    /// The mapping is unused while this backend refuses a fixed framebuffer: its framebuffer
+    /// always covers the window, so the destination rectangle is the window.
+    pub fn present(self: Window, _: types.PresentMapping) void {
         const st = self.state;
         if (!st.configured or st.closing) return;
         const i = st.locked_index orelse return;

@@ -166,9 +166,9 @@ pub const Window = struct {
         };
     }
 
-    pub fn present(self: Window) void {
+    pub fn present(self: Window, mapping: types.PresentMapping) void {
         const core = self.core;
-        if (core.transparent) return core.presentLayered(); // Transparency goes through UpdateLayeredWindow
+        if (core.transparent) return core.presentLayered(mapping); // Transparency goes through UpdateLayeredWindow
         const hdc = GetDC(core.hwnd) orelse return;
         defer _ = ReleaseDC(core.hwnd, hdc);
         const w: c_int = @intCast(core.width);

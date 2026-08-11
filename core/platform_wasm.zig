@@ -538,7 +538,9 @@ pub const Window = struct {
         return content_scale;
     }
 
-    pub fn present(_: Window) void {
+    /// The mapping is applied by the host page's CSS rather than here: this hands the browser the
+    /// framebuffer, and the page decides where inside the canvas element it lands.
+    pub fn present(_: Window, _: types.PresentMapping) void {
         if (pixels_buf.len == 0 or rgba_buf.len == 0) return;
         const src = std.mem.sliceAsBytes(pixels_buf);
         pixelops.swizzleBgraToRgba(rgba_buf, src);

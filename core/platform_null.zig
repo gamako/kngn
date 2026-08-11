@@ -251,7 +251,8 @@ pub const Window = struct {
         };
     }
 
-    pub fn present(self: Window) void {
+    /// Nothing is displayed, so there is nowhere to map onto.
+    pub fn present(self: Window, _: types.PresentMapping) void {
         _ = self;
     }
 
@@ -315,7 +316,7 @@ test "null window: create→lock→write→present→lock keeps the contents" {
     defer fb1.unlock();
     try testing.expectEqual(@as(usize, 8), fb1.pixels.len);
     for (fb1.pixels) |*p| p.* = 0xFF112233;
-    win.present();
+    win.present(.{});
 
     const fb2 = win.lockFramebuffer() orelse return error.TestUnexpectedResult;
     defer fb2.unlock();
@@ -329,7 +330,7 @@ test "null window: zeroed right after create, and present does not change the si
     const fb = win.lockFramebuffer() orelse return error.TestUnexpectedResult;
     defer fb.unlock();
     try testing.expectEqual(@as(u32, 0), fb.pixels[0]);
-    win.present();
+    win.present(.{});
     try testing.expectEqual(@as(u32, 3), win.width);
     try testing.expectEqual(@as(u32, 1), win.height);
 }
@@ -440,7 +441,7 @@ test "null .logical keeps the size on the width/height/pixels CRC path, snapshot
     try testing.expectEqual(@as(u32, 2), fb.height);
     try testing.expectEqual(fb.logical_size.width, fb.framebuffer_size.width);
     for (fb.pixels) |*p| p.* = 0xFFAABBCC;
-    win.present();
+    win.present(.{});
     const fb2 = win.lockFramebuffer() orelse return error.TestUnexpectedResult;
     defer fb2.unlock();
     try testing.expectEqual(@as(u32, 0xFFAABBCC), fb2.pixels[0]);

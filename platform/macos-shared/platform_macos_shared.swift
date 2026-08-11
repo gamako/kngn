@@ -1653,8 +1653,8 @@ func platform_unlock_framebuffer(platformWindow: UnsafeMutableRawPointer?) -> Vo
 }
 
 @_cdecl("platform_present")
-func platform_present(platformWindow: UnsafeMutableRawPointer?) -> Void {
-    guard let platformWindow = platformWindow else { return }
+func platform_present(platformWindow: UnsafeMutableRawPointer?, mapping: UnsafePointer<PlatformPresentMapping>?) -> Void {
+    guard let platformWindow = platformWindow, let mapping = mapping else { return }
 
     let handle = Unmanaged<PlatformWindowHandle>.fromOpaque(platformWindow).takeUnretainedValue()
     guard let fb = handle.currentFramebuffer else { return }

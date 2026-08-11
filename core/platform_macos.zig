@@ -702,8 +702,18 @@ pub const Window = struct {
         return if (m.content_scale > 0) m.content_scale else 1.0;
     }
 
-    pub fn present(self: Window) void {
-        c.platform_present(self.handle);
+    /// The mapping crosses the C ABI as a flat struct: the backend needs it to place the
+    /// destination rectangle and to sample click-through alpha, both of which happen in present.
+    pub fn present(self: Window, mapping: types.PresentMapping) void {
+        const m: c.PlatformPresentMapping = .{
+            .origin_x = mapping.origin.x,
+            .origin_y = mapping.origin.y,
+            .dst_width = mapping.dst_size.width,
+            .dst_height = mapping.dst_size.height,
+            .fb_width = mapping.fb_size.width,
+            .fb_height = mapping.fb_size.height,
+        };
+        c.platform_present(self.handle, &m);
     }
 
     /// Set the cursor shape. Expected to be called at event time only (so the performance rules do not apply).
