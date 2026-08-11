@@ -476,6 +476,19 @@ backend cycles through several buffers, that means once per buffer (R6 measures 
 one repaint costs). Stating both the colour and the moment here is what stops the
 backends from diverging over them.
 
+**One backend departs from the moment, and only that one: the opaque GDI present.** It
+draws straight into the window's device context and retains no surface of its own, so
+there is nowhere for a painted bar to persist and the bars are filled every frame. The
+alternative is a retained client-sized DIB plus a memory DC, painted once and blitted
+per frame; it would honour the rule, and it is not taken because a best-effort backend
+would carry a second full-window buffer for good to save filling the area the
+framebuffer does *not* cover — on the backend that already writes the whole window from
+the CPU every frame (R7). The transparent GDI present is **not** part of the departure:
+`UpdateLayeredWindow` needs a client-sized surface anyway, so it clears that surface
+when the destination rectangle moves and leaves the bars alone otherwise, exactly as the
+rule says. A bar that is alpha 0 stays alpha 0, because writing the destination never
+reaches it.
+
 ### R10. What this changes in 002, 005 and 011
 
 - **002 (present)**: present is defined as submitting the drawn frame to the display

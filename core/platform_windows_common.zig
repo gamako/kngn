@@ -155,6 +155,8 @@ const WM_NULL: UINT = 0x0000;
 extern "gdi32" fn CreateCompatibleDC(hdc: ?win.HDC) callconv(.winapi) ?win.HDC;
 extern "gdi32" fn DeleteDC(hdc: win.HDC) callconv(.winapi) BOOL;
 extern "gdi32" fn CreateDIBSection(hdc: ?win.HDC, pbmi: *const BITMAPINFO, usage: UINT, ppvBits: *?*anyopaque, hSection: ?*anyopaque, offset: DWORD) callconv(.winapi) ?HGDIOBJ;
+extern "gdi32" fn StretchDIBits(hdc: win.HDC, xDest: c_int, yDest: c_int, DestWidth: c_int, DestHeight: c_int, xSrc: c_int, ySrc: c_int, SrcWidth: c_int, SrcHeight: c_int, lpBits: ?*const anyopaque, lpbmi: *const BITMAPINFO, iUsage: UINT, rop: DWORD) callconv(.winapi) c_int;
+const SRCCOPY: DWORD = 0x00CC0020;
 extern "gdi32" fn SelectObject(hdc: win.HDC, h: HGDIOBJ) callconv(.winapi) ?HGDIOBJ;
 extern "gdi32" fn DeleteObject(ho: HGDIOBJ) callconv(.winapi) BOOL;
 const CW_USEDEFAULT: c_int = @bitCast(@as(u32, 0x80000000));
@@ -408,7 +410,10 @@ pub fn logicalSizeForPhysical(fb_mode: FramebufferMode, physical: WindowSize, sc
     // mode this backend has not implemented would silently take the wrong branch here.
     switch (fb_mode) {
         .logical => return physical,
-        .fixed => return physical, // refused at creation; stated rather than left to fall through
+        // A fixed framebuffer's logical size is the framebuffer, not anything derived from the window
+        // (ADR-030 R2), so no caller under that mode asks this. Answering with the physical size keeps
+        // the function total; it is not a size to store.
+        .fixed => return physical,
         .physical => {},
     }
     return .{
@@ -421,7 +426,8 @@ pub fn logicalSizeForPhysical(fb_mode: FramebufferMode, physical: WindowSize, sc
 pub fn effectiveFramebufferSize(fb_mode: FramebufferMode, logical: WindowSize, scale: f32) WindowSize {
     switch (fb_mode) {
         .logical => return logical,
-        .fixed => |size| return size, // refused at creation; stated rather than left to fall through
+        // The whole point of the mode: the size it carries, whatever the window is doing.
+        .fixed => |size| return size,
         .physical => {},
     }
     return .{
@@ -568,6 +574,14 @@ pub const Core = struct {
     /// The logical size, held independently (never derived back from `physical/scale`, since lround is lossy).
     logical_width: u32,
     logical_height: u32,
+    /// The client area in real window pixels, as of the last settled metrics.
+    ///
+    /// It equals `width`/`height` under the two covering modes, where the framebuffer *is* the client
+    /// area. Under `.fixed` the two part company — the framebuffer keeps the size it was created with
+    /// while this follows the window — and this is the one the present mapping is worked out from
+    /// (ADR-030 R4). `pending_client_w/h` is the unsettled value on its way here.
+    client_w: u32,
+    client_h: u32,
 
     // HiDPI and `.physical`
     fb_mode: FramebufferMode,
@@ -617,6 +631,12 @@ pub const Core = struct {
     layer_bits: ?[*]u32 = null,
     layer_w: u32 = 0,
     layer_h: u32 = 0,
+    /// The destination rectangle the layered surface was last cleared for. The transparent letterbox is
+    /// already alpha 0 once cleared, and a destination write never touches it, so it is repainted only
+    /// when the rectangle moves (ADR-030 R9) rather than every frame.
+    layer_dst: types.WindowPosition = .{ .x = 0, .y = 0 },
+    layer_dst_w: u32 = 0,
+    layer_dst_h: u32 = 0,
 
     // Fullscreen (ADR-019 R10). Fullscreen here is an undecorated window covering the monitor, put
     // there by this code, and Win32 offers the user no way to toggle it — so this flag *is* the
@@ -644,10 +664,10 @@ pub const Core = struct {
     /// fullscreen → an undecorated (WS_POPUP) window at (0,0) covering the whole primary monitor,
     /// whose size the backend resolves itself, so the width and height are ignored (ADR-019 R3).
     /// Hot path declaration: initialisation only.
+    /// A fixed framebuffer is accepted here, because what it needs — a destination rectangle and a
+    /// letterbox — is the presenting backend's work, not this window's. The backend that cannot do it
+    /// refuses the mode in its own `createWithOptions` (ADR-030 R5).
     pub fn createWithOptions(width: u32, height: u32, title: [:0]const u8, opts: types.WindowOptions) Error!*Core {
-        // No present here magnifies a framebuffer into a letterbox yet, so a fixed one is refused
-        // rather than quietly behaving like another mode (ADR-030 R5).
-        try types.refuseFixedFramebuffer(opts.fb_mode);
         return createInternal(width, height, title, opts.fullscreen, opts);
     }
 
@@ -773,13 +793,24 @@ pub const Core = struct {
         // The initial backing is the framebuffer size derived from the logical size (physical under `.physical` plus PMv2). It is reallocated after creation if the settled scale demands it.
         // Fullscreen uses the resolved monitor size verbatim: it is already the physical size, and
         // recomputing it from a logical value would apply the scale twice.
-        const init_fb = if (fullscreen)
+        // A fixed framebuffer takes its size from the mode in every case, fullscreen included: the
+        // monitor decides how far it is magnified, not how large it is.
+        const fixed_fb: ?WindowSize = switch (fb_mode) {
+            .fixed => |size| size,
+            .logical, .physical => null,
+        };
+        const init_fb = if (fixed_fb) |size|
+            size
+        else if (fullscreen)
             fs_size
         else
             effectiveFramebufferSize(fb_mode, .{ .width = logical_w, .height = logical_h }, if (create_as_pmv2) create_scale else 1.0);
         // Fullscreen's logical size is derived from the physical monitor size; the estimate at
         // creation is replaced once the real scale settles below.
-        const init_logical: WindowSize = if (fullscreen)
+        const init_logical: WindowSize = if (fixed_fb) |size|
+            // The application sees one space and it is the framebuffer (ADR-030 R2).
+            size
+        else if (fullscreen)
             logicalSizeForPhysical(fb_mode, fs_size, if (create_as_pmv2) create_scale else 1.0)
         else
             .{ .width = logical_w, .height = logical_h };
@@ -800,13 +831,15 @@ pub const Core = struct {
             .height = init_fb.height,
             .logical_width = init_logical.width,
             .logical_height = init_logical.height,
+            .client_w = client_w,
+            .client_h = client_h,
             .fb_mode = fb_mode,
             .is_pmv2 = false, // settled after Create
             .pending_content_scale = 1.0,
             .content_scale = 1.0,
             .scale_epoch = 0,
-            .pending_client_w = init_fb.width,
-            .pending_client_h = init_fb.height,
+            .pending_client_w = client_w,
+            .pending_client_h = client_h,
             .metrics_dirty = false,
             .backing = backing,
             .closing = false,
@@ -863,9 +896,10 @@ pub const Core = struct {
         core.is_pmv2 = is_pmv2;
 
         var scale: f32 = 1.0;
-        // Refused at the top of this function, so the branch below is a two-way choice and its
-        // `else` really is `.logical`.
-        std.debug.assert(fb_mode.tracksPhysicalPixels() or fb_mode.tracksLogicalPoints());
+        // A fixed framebuffer keeps the start-up awareness, like `.logical`: it reports a content
+        // scale of 1.0 to the application (ADR-030 R2), and the client size it letterboxes into is
+        // whatever this thread's awareness makes GetClientRect report — the same space the pointer
+        // arrives in, which is what keeps the mapping and its inverse agreeing.
         if (fb_mode.tracksPhysicalPixels()) {
             if (is_pmv2) {
                 scale = scaleFromDpi(GetDpiForWindow(hwnd));
@@ -889,7 +923,9 @@ pub const Core = struct {
         // The framebuffer size implied by the settled scale. Under `.physical`, a difference from the estimate at creation brings the window and the backing into line.
         // Fullscreen is exempt: its framebuffer is the monitor size the window manager gives it, so
         // there is nothing to recompute from a logical value (the real client size is read below).
-        const final_fb: WindowSize = if (fullscreen)
+        const final_fb: WindowSize = if (fixed_fb) |size|
+            size
+        else if (fullscreen)
             .{ .width = core.width, .height = core.height }
         else
             effectiveFramebufferSize(fb_mode, .{ .width = logical_w, .height = logical_h }, scale);
@@ -924,9 +960,12 @@ pub const Core = struct {
             const ch: u32 = @intCast(@max(cr.bottom - cr.top, 1));
             core.pending_client_w = cw;
             core.pending_client_h = ch;
+            core.client_w = cw;
+            core.client_h = ch;
             // Once the client is settled, the backing is brought into line with it
             // (which absorbs a 1px difference between effectiveFramebufferSize and the OS client; `.logical` also contracts client == logical).
-            if (cw != core.width or ch != core.height) {
+            // **A fixed framebuffer is exempt**: it does not follow the client, which is the mode.
+            if (fixed_fb == null and (cw != core.width or ch != core.height)) {
                 core.resizeBacking(cw, ch);
             }
             // Under `.physical` the logical size is held independently (the argument's logical value). The difference from the client is the scale's rounding.
@@ -936,8 +975,8 @@ pub const Core = struct {
                 core.logical_height = ch;
             }
         } else {
-            core.pending_client_w = core.width;
-            core.pending_client_h = core.height;
+            core.pending_client_w = core.client_w;
+            core.pending_client_h = core.client_h;
         }
         // Fullscreen under `.physical`: the settled framebuffer is the monitor's physical size, so
         // the logical size is derived from it with the settled scale (ADR-011 R11). `.logical`
@@ -976,6 +1015,22 @@ pub const Core = struct {
             return;
         }
 
+        switch (self.fb_mode) {
+            .fixed => {
+                // Nothing the application reads changes: the framebuffer keeps its size, the logical
+                // size equals it and the reported scale is 1.0, so there is no reallocation to do and
+                // the epoch stays put (ADR-030 R2). What moved is where the framebuffer lands, and that
+                // is the client size — recorded here, and turned into a mapping above this layer.
+                self.client_w = cw;
+                self.client_h = ch;
+                self.content_scale = new_scale;
+                self.metrics_dirty = false;
+                self.restore.observe(self.fullscreen, self.getGeometry());
+                return;
+            },
+            .logical, .physical => {},
+        }
+
         // The client size is the real window pixel size = the framebuffer.
         // `.logical`: client = logical = fb. `.physical`: client = physical = fb, and logical is
         // derived back — through the same helper window creation uses, so a window created
@@ -986,6 +1041,8 @@ pub const Core = struct {
 
         const old_w = self.width;
         const old_h = self.height;
+        self.client_w = cw;
+        self.client_h = ch;
         if (cw != self.width or ch != self.height) {
             self.resizeBacking(cw, ch);
             // When the backing cannot be updated (an OOM, say) dirty is left set and the next lock retries.
@@ -1004,8 +1061,61 @@ pub const Core = struct {
         self.restore.observe(self.fullscreen, self.getGeometry());
     }
 
+    /// The factor between this window's native coordinates and the raw physical ones the event queue
+    /// carries. It is 1 on a PMv2 window, whose native values already are physical; on any other window
+    /// the OS virtualises everything to 96 DPI and `nativeToRawPhysical` multiplies by the scale, so the
+    /// two spaces differ by exactly that. **It branches on the real awareness, never on `fb_mode`.**
+    ///
+    /// It reads the **latched** scale, the one the frame's snapshot was built from, so that the mapping
+    /// and the present that consumes it agree with each other. The event queue builds its raw values
+    /// from the live scale instead, which is the frame-boundary tolerance ADR-011 R2 already accepts: a
+    /// DPI change lands in the mapping one frame later.
+    fn rawPhysicalFactor(self: *const Core) f32 {
+        return if (self.is_pmv2) 1.0 else effectiveContentScale(self.content_scale);
+    }
+
+    /// The content area in the space the mapping is built in: raw physical pixels, the space a pointer
+    /// position arrives in (ADR-030 R4). On a virtualised window that is **not** the client rectangle
+    /// Win32 reports, and handing the facade the client rectangle instead would letterbox against a
+    /// window a scale factor away from the one the pointer lives in.
+    pub fn presentViewportPhysical(self: *const Core) WindowSize {
+        const f = self.rawPhysicalFactor();
+        if (f == 1.0) return .{ .width = self.client_w, .height = self.client_h };
+        return .{
+            .width = roundToPhysicalPx(self.client_w, f),
+            .height = roundToPhysicalPx(self.client_h, f),
+        };
+    }
+
+    /// The mapping converted from raw physical pixels into this window's native coordinates, which is
+    /// what every Win32 drawing call takes. It is the exact counterpart of `nativeToRawPhysical` on the
+    /// input side, and on a PMv2 window it is the identity.
+    ///
+    /// It converts the *whole* mapping rather than each field at its use site, so the destination
+    /// rectangle and the bars cannot end up in different spaces. Under a framebuffer that covers the
+    /// window this lands back on the framebuffer's own size — `.logical`'s destination is
+    /// `framebuffer × scale`, and dividing by the same scale is what makes present blit 1:1 as it did
+    /// before there was a mapping at all.
+    pub fn mappingInWindowSpace(self: *const Core, m: types.PresentMapping) types.PresentMapping {
+        return m.dividedByScale(self.rawPhysicalFactor());
+    }
+
+    /// The content scale to report to the application: the real one, except under `.fixed`, where the
+    /// application is given one coordinate space at 1.0 and no way to render at the display's resolution
+    /// (ADR-030 R2). The real scale stays in the field, because input normalisation and the window
+    /// geometry still need it.
+    pub fn reportedContentScale(self: *Core, raw: f32) f32 {
+        return switch (self.fb_mode) {
+            .fixed => 1.0,
+            .logical, .physical => effectiveContentScale(raw),
+        };
+    }
+
     /// The current window geometry. The position comes from GetWindowRect.
-    /// The size is the logical size (`self.logical_width/height`).
+    /// The size is the logical size (`self.logical_width/height`), except under `.fixed`, where that
+    /// is the framebuffer rather than anything about the window (ADR-030 R2) and the window's own size
+    /// is its client area. Persisting the framebuffer's size instead would make a window that reopens at
+    /// the framebuffer's size whatever the user had resized it to.
     /// **It must never return physical pixels** (`GetClientRect` or `self.width/height`). A caller such as the
     /// pixel editor's `window_state` persistence passes `getGeometry().size` straight into the next run's
     /// `WindowOptions.size`, a value that is read as logical. Returning physical pixels here would therefore
@@ -1015,9 +1125,15 @@ pub const Core = struct {
     pub fn getGeometry(self: *Core) types.WindowGeometry {
         var wr = RECT{ .left = 0, .top = 0, .right = 0, .bottom = 0 };
         const have_pos = GetWindowRect(self.hwnd, &wr) != 0;
+        const size: types.WindowSize = switch (self.fb_mode) {
+            // The client area is already in the space `.logical` calls logical: a fixed framebuffer keeps
+            // the start-up DPI awareness, so what GetClientRect reports is what a window is created with.
+            .fixed => .{ .width = self.client_w, .height = self.client_h },
+            .logical, .physical => .{ .width = self.logical_width, .height = self.logical_height },
+        };
         return .{
             .position = if (have_pos) .{ .x = wr.left, .y = wr.top } else null,
-            .size = .{ .width = self.logical_width, .height = self.logical_height },
+            .size = size,
         };
     }
 
@@ -1094,35 +1210,85 @@ pub const Core = struct {
     /// The present of a transparent window: it displays the premultiplied BGRA backing by compositing it with
     /// per-pixel alpha (UpdateLayeredWindow). gdi's and d3d11's present call it instead of StretchDIBits or the
     /// swap chain while core.transparent.
-    /// Hot path declaration: per frame. The DIB and the DC are cached in Core, though, and **rebuilt only when
-    /// the size changes** (which avoids a temporary allocation per frame, keeping the performance rules). Every
-    /// frame does nothing but one @memcpy from the backing into the DIB plus UpdateLayeredWindow: no new per-pixel loop and no allocation.
-    pub fn presentLayered(self: *Core, _: types.PresentMapping) void {
-        if (!self.ensureLayerResources()) return;
+    /// **The surface is the window, not the framebuffer.** UpdateLayeredWindow takes a bitmap the size
+    /// of the layered window and does not scale, so a framebuffer that covers the window goes in with one
+    /// @memcpy, while a fixed one is magnified into its destination rectangle and the rest of the surface
+    /// is the transparent letterbox.
+    ///
+    /// Hot path declaration: per frame. The DIB and the DC are cached in Core and **rebuilt only when the
+    /// window size changes**, and the letterbox is cleared only when the destination rectangle moves
+    /// (ADR-030 R9) - a transparent bar stays transparent, and a destination write never reaches it. Every
+    /// frame does one copy or one StretchDIBits plus UpdateLayeredWindow: no allocation.
+    pub fn presentLayered(self: *Core, mapping: types.PresentMapping) void {
+        // UpdateLayeredWindow works in the window's native coordinates, so the mapping is converted out
+        // of raw physical pixels first — the same conversion the opaque present makes.
+        const m = self.mappingInWindowSpace(mapping);
+        const surface: WindowSize = .{
+            .width = @max(m.viewport.width, 1),
+            .height = @max(m.viewport.height, 1),
+        };
+        if (!self.ensureLayerResources(surface)) return;
         const dst = self.layer_bits orelse return;
-        @memcpy(dst[0..self.backing.len], self.backing); // the premultiplied BGRA goes into the DIB as it is
-        const w: c_int = @intCast(self.width);
-        const h: c_int = @intCast(self.height);
-        var size = SIZE{ .cx = w, .cy = h };
+        // The framebuffer covers the window: the one case where the surface and the backing are the same
+        // shape, and the copy stays exactly what it was.
+        const covering = m.origin.x == 0 and m.origin.y == 0 and
+            m.dst_size.width == self.width and m.dst_size.height == self.height and
+            surface.width == self.width and surface.height == self.height;
+        if (covering) {
+            @memcpy(dst[0..self.backing.len], self.backing); // the premultiplied BGRA goes into the DIB as it is
+            // The copy has just overwritten the whole surface, so whatever letterbox was on it is gone.
+            // Forgetting the rectangle is what makes the next letterboxed present clear again instead of
+            // leaving this frame's pixels standing where the bars belong.
+            self.layer_dst_w = 0;
+            self.layer_dst_h = 0;
+        } else {
+            if (m.dst_size.width == 0 or m.dst_size.height == 0) return;
+            const moved = self.layer_dst.x != m.origin.x or self.layer_dst.y != m.origin.y or
+                self.layer_dst_w != m.dst_size.width or self.layer_dst_h != m.dst_size.height;
+            if (moved) {
+                // Alpha 0 across the whole surface: the letterbox of a transparent window (ADR-030 R9).
+                // Zero is the one value @memset expresses as a bulk fill, so the shared fill primitive
+                // would add nothing here.
+                @memset(dst[0 .. @as(usize, surface.width) * @as(usize, surface.height)], 0);
+                self.layer_dst = m.origin;
+                self.layer_dst_w = m.dst_size.width;
+                self.layer_dst_h = m.dst_size.height;
+            }
+            const dc = self.layer_dc orelse return;
+            const bmi = layerBitmapInfo(self.width, self.height);
+            // Both sides are 32bpp BI_RGB DIBs, so the alpha byte travels with the colour rather than
+            // being recomputed - which is what UpdateLayeredWindow then composites with.
+            _ = StretchDIBits(
+                dc,
+                m.origin.x,
+                m.origin.y,
+                @intCast(m.dst_size.width),
+                @intCast(m.dst_size.height),
+                0,
+                0,
+                @intCast(self.width),
+                @intCast(self.height),
+                self.backing.ptr,
+                &bmi,
+                DIB_RGB_COLORS,
+                SRCCOPY,
+            );
+        }
+        var size = SIZE{ .cx = @intCast(surface.width), .cy = @intCast(surface.height) };
         var src_pt = POINT{ .x = 0, .y = 0 };
         var blend = BLENDFUNCTION{ .BlendOp = AC_SRC_OVER, .BlendFlags = 0, .SourceConstantAlpha = 255, .AlphaFormat = AC_SRC_ALPHA };
         // hdcSrc is a memory DC with the DIB already selected. hdcDst=null means the whole screen is the reference.
         _ = UpdateLayeredWindow(self.hwnd, null, null, &size, self.layer_dc, &src_pt, 0, &blend, ULW_ALPHA);
     }
 
-    /// Prepare the memory DC and the top-down 32bpp DIB section for the transparent present, at the given size.
-    /// When one already exists at that size it stays and returns true. A size change destroys and rebuilds it. A failed creation gives false (present skips).
-    fn ensureLayerResources(self: *Core) bool {
-        if (self.layer_dc != null and self.layer_w == self.width and self.layer_h == self.height) return true;
-        self.freeLayerResources();
-        const screen_dc = GetDC(null) orelse return false;
-        defer _ = ReleaseDC(null, screen_dc);
-        const mem_dc = CreateCompatibleDC(screen_dc) orelse return false;
-        var bmi = BITMAPINFO{
+    /// A top-down 32bpp BI_RGB header for a buffer of this size, which is what both sides of the layered
+    /// blit are.
+    fn layerBitmapInfo(w: u32, h: u32) BITMAPINFO {
+        return .{
             .bmiHeader = .{
                 .biSize = @sizeOf(BITMAPINFOHEADER),
-                .biWidth = @intCast(self.width),
-                .biHeight = -@as(LONG, @intCast(self.height)), // top-down (the start of the backing is the top-left)
+                .biWidth = @intCast(w),
+                .biHeight = -@as(LONG, @intCast(h)), // top-down (the start of the buffer is the top-left)
                 .biPlanes = 1,
                 .biBitCount = 32,
                 .biCompression = BI_RGB,
@@ -1133,6 +1299,17 @@ pub const Core = struct {
                 .biClrImportant = 0,
             },
         };
+    }
+
+    /// Prepare the memory DC and the top-down 32bpp DIB section for the transparent present, at the given size.
+    /// When one already exists at that size it stays and returns true. A size change destroys and rebuilds it. A failed creation gives false (present skips).
+    fn ensureLayerResources(self: *Core, size: WindowSize) bool {
+        if (self.layer_dc != null and self.layer_w == size.width and self.layer_h == size.height) return true;
+        self.freeLayerResources();
+        const screen_dc = GetDC(null) orelse return false;
+        defer _ = ReleaseDC(null, screen_dc);
+        const mem_dc = CreateCompatibleDC(screen_dc) orelse return false;
+        var bmi = layerBitmapInfo(size.width, size.height);
         var bits: ?*anyopaque = null;
         const dib = CreateDIBSection(mem_dc, &bmi, DIB_RGB_COLORS, &bits, null, 0) orelse {
             _ = DeleteDC(mem_dc);
@@ -1147,8 +1324,12 @@ pub const Core = struct {
         self.layer_dc = mem_dc;
         self.layer_dib = dib;
         self.layer_bits = @ptrCast(@alignCast(raw));
-        self.layer_w = self.width;
-        self.layer_h = self.height;
+        self.layer_w = size.width;
+        self.layer_h = size.height;
+        // A fresh surface has nothing painted on it, so the next present clears it for whatever
+        // destination rectangle it is handed.
+        self.layer_dst_w = 0;
+        self.layer_dst_h = 0;
         return true;
     }
 
@@ -1361,8 +1542,10 @@ fn wndProc(hwnd: HWND, msg: UINT, wparam: WPARAM, lparam: LPARAM) callconv(.wina
                 const new_w = lw & 0xFFFF;
                 const new_h = (lw >> 16) & 0xFFFF;
                 if (new_w != 0 and new_h != 0) {
-                    const old_w = if (core.metrics_dirty) core.pending_client_w else core.width;
-                    const old_h = if (core.metrics_dirty) core.pending_client_h else core.height;
+                    // Compared against the client size, not the framebuffer: under a fixed framebuffer
+                    // they are different numbers, and the framebuffer is the one that does not move.
+                    const old_w = if (core.metrics_dirty) core.pending_client_w else core.client_w;
+                    const old_h = if (core.metrics_dirty) core.pending_client_h else core.client_h;
                     core.pending_client_w = new_w;
                     core.pending_client_h = new_h;
                     core.metrics_dirty = true;
@@ -1380,8 +1563,9 @@ fn wndProc(hwnd: HWND, msg: UINT, wparam: WPARAM, lparam: LPARAM) callconv(.wina
             const wp: usize = @bitCast(wparam);
             const dpi_x: UINT = @truncate(wp & 0xFFFF);
             // A `.logical` window that degraded onto PMv2 keeps content_scale fixed at 1.0 (the real DPI is ignored).
-            // A fixed framebuffer never reaches here: this backend refuses one at window creation.
-            std.debug.assert(core.fb_mode.tracksPhysicalPixels() or core.fb_mode.tracksLogicalPoints());
+            // A fixed framebuffer records the DPI like any other window: the value it reports to the
+            // application stays 1.0 (ADR-030 R2), and the resize that follows this message is what moves
+            // its destination rectangle.
             if (!(core.fb_mode.tracksLogicalPoints() and core.is_pmv2)) {
                 core.pending_content_scale = scaleFromDpi(dpi_x);
                 core.metrics_dirty = true;

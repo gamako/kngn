@@ -64,6 +64,13 @@ const BITMAPINFO = extern struct {
 
 extern "user32" fn GetDC(hWnd: ?HWND) callconv(.winapi) ?HDC;
 extern "user32" fn ReleaseDC(hWnd: ?HWND, hDC: HDC) callconv(.winapi) c_int;
+/// A GDI object handle (std.os.windows has no HGDIOBJ alias, so HANDLE stands in, as in the shared layer).
+const HGDIOBJ = win.HANDLE;
+extern "user32" fn FillRect(hDC: HDC, lprc: *const common.RECT, hbr: ?HGDIOBJ) callconv(.winapi) c_int;
+extern "gdi32" fn GetStockObject(i: c_int) callconv(.winapi) ?HGDIOBJ;
+
+/// The stock black brush, which needs no deleting (`BLACK_BRUSH` from wingdi.h).
+const BLACK_BRUSH: c_int = 4;
 
 extern "gdi32" fn StretchDIBits(
     hdc: HDC,
@@ -145,7 +152,14 @@ pub const Window = struct {
 
     /// The currently negotiated content scale (for a query; the pending value, matching input normalisation before a lock).
     pub fn contentScale(self: Window) f32 {
-        return common.effectiveContentScale(self.core.pending_content_scale);
+        return self.core.reportedContentScale(self.core.pending_content_scale);
+    }
+
+    /// The client area in physical pixels, which is what the facade works the letterbox of a fixed
+    /// framebuffer out from (ADR-030 R4). It travels back down inside the mapping, so present places
+    /// the destination rectangle against the window this was read from rather than looking it up again.
+    pub fn presentViewport(self: Window) types.WindowSize {
+        return self.core.presentViewportPhysical();
     }
 
     pub fn lockFramebuffer(self: Window) ?Framebuffer {
@@ -160,23 +174,76 @@ pub const Window = struct {
             .height = core.height,
             .logical_size = logical,
             .framebuffer_size = fb_size,
-            .content_scale = common.effectiveContentScale(core.content_scale),
+            .content_scale = core.reportedContentScale(core.content_scale),
             .scale_epoch = core.scale_epoch,
             .state = core,
         };
     }
 
+    /// Blit the framebuffer into the destination rectangle the mapping names, and paint whatever is
+    /// left of the client area as the letterbox.
+    ///
+    /// `StretchDIBits` magnifies, so the destination rectangle costs nothing to place here — but it
+    /// writes the whole rectangle from the CPU every frame either way, which is what makes this the
+    /// backend that pays most for a fixed framebuffer (ADR-030 R7).
+    ///
+    /// Hot path declaration: once per frame. **The bars are repainted every frame**, which is a
+    /// deliberate departure from ADR-030 R9's "when the mapping changes": this present draws straight
+    /// into the window's DC and keeps no surface of its own, so there is nowhere for a painted bar to
+    /// persist. The alternative — a retained client-sized DIB, painted once and blitted per frame —
+    /// costs a second full-window buffer on a best-effort backend to save a fill of the area the
+    /// framebuffer does *not* cover, and is not taken.
     pub fn present(self: Window, mapping: types.PresentMapping) void {
         const core = self.core;
         if (core.transparent) return core.presentLayered(mapping); // Transparency goes through UpdateLayeredWindow
+        // Win32 draws in the window's native coordinates, so the mapping is converted out of raw
+        // physical pixels once, here, exactly as the input path converts the other way.
+        const m = core.mappingInWindowSpace(mapping);
         const hdc = GetDC(core.hwnd) orelse return;
         defer _ = ReleaseDC(core.hwnd, hdc);
-        const w: c_int = @intCast(core.width);
-        const h: c_int = @intCast(core.height);
+        const src_w: c_int = @intCast(core.width);
+        const src_h: c_int = @intCast(core.height);
+        const dst_w: c_int = @intCast(m.dst_size.width);
+        const dst_h: c_int = @intCast(m.dst_size.height);
+        if (dst_w <= 0 or dst_h <= 0) return; // a window with no area: nothing to present into
+        // The letterbox first, so the framebuffer is never briefly covered by it.
+        paintLetterbox(hdc, m);
         // bmi is rebuilt from core's size every time (so it follows a resize; StretchDIBits is stateless).
-        // biHeight is negative (top-down), so src(0,0) is the top-left. dest and src are the same size (no scaling).
+        // biHeight is negative (top-down), so src(0,0) is the top-left.
         const bmi = makeBitmapInfo(core.width, core.height);
-        _ = StretchDIBits(hdc, 0, 0, w, h, 0, 0, w, h, core.backing.ptr, &bmi, DIB_RGB_COLORS, SRCCOPY);
+        _ = StretchDIBits(
+            hdc,
+            m.origin.x,
+            m.origin.y,
+            dst_w,
+            dst_h,
+            0,
+            0,
+            src_w,
+            src_h,
+            core.backing.ptr,
+            &bmi,
+            DIB_RGB_COLORS,
+            SRCCOPY,
+        );
+    }
+
+    /// Paint the client area outside the destination rectangle black (ADR-030 R9). The rectangles come
+    /// from the shared decomposition, which is where the guarantee that they tile the window without a
+    /// seam or an overlap is tested; a framebuffer that covers the window yields none.
+    fn paintLetterbox(hdc: HDC, mapping: types.PresentMapping) void {
+        const bars = types.letterboxBars(mapping);
+        if (bars.count == 0) return;
+        const brush = GetStockObject(BLACK_BRUSH);
+        for (bars.rects[0..bars.count]) |r| {
+            const rc = common.RECT{
+                .left = r.x,
+                .top = r.y,
+                .right = r.x + @as(i32, @intCast(r.width)),
+                .bottom = r.y + @as(i32, @intCast(r.height)),
+            };
+            _ = FillRect(hdc, &rc, brush);
+        }
     }
 
     /// Set the cursor shape. Delegated to Core: the cursor is a window property, independent of the

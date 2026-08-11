@@ -235,6 +235,79 @@ pub const PresentMapping = struct {
         };
     }
 
+    /// The same mapping expressed in a coordinate space `scale` times coarser than physical pixels —
+    /// the native space of a window system that reports a virtualised or point-based geometry (Win32
+    /// under DPI virtualisation, and view points on macOS).
+    ///
+    /// A backend converts the **whole** mapping at once, so that its destination rectangle and its
+    /// letterbox cannot end up in different spaces. `fb_size` and `app_size` are untouched: they are
+    /// the framebuffer and the application's space, neither of which is a window measurement.
+    ///
+    /// **Both edges of the rectangle are converted and the extent taken as their difference**, the same
+    /// rule `framebufferRectToPhysical` follows and for the same reason: rounding the origin and the
+    /// extent separately would let their errors add up, leaving the far edge up to a whole unit from
+    /// where the physical rectangle ends. Converted this way each edge lands within half a unit, and the
+    /// two bars around the content therefore differ by at most one unit. They still tile the window
+    /// exactly whatever the rounding does, because `letterboxBars` derives them from these same numbers.
+    ///
+    /// A framebuffer that covers the window survives the trip: `.logical`'s destination is
+    /// `framebuffer × scale`, so dividing by the same scale lands back on the framebuffer's own size and
+    /// present blits one to one. That round trip is exact while the native space is the coarser of the
+    /// two — which is what a scale of at least 1 means, and every window system this runs on. A scale
+    /// below 1 is still converted rather than refused, because the input side multiplies by whatever the
+    /// window system reports and the two have to agree; there the round trip can land a pixel out.
+    pub fn dividedByScale(self: PresentMapping, scale: f32) PresentMapping {
+        const s: f64 = if (std.math.isFinite(scale) and scale > 0) scale else 1.0;
+        if (s == 1.0) return self;
+        const near_x = divRound(self.origin.x, s);
+        const near_y = divRound(self.origin.y, s);
+        const far_x = divRound(saturate(@as(i128, self.origin.x) + self.dst_size.width), s);
+        const far_y = divRound(saturate(@as(i128, self.origin.y) + self.dst_size.height), s);
+        return .{
+            .origin = .{ .x = near_x, .y = near_y },
+            .dst_size = .{
+                .width = extentFromEdges(near_x, far_x, self.dst_size.width),
+                .height = extentFromEdges(near_y, far_y, self.dst_size.height),
+            },
+            // An extent measured from the window's own origin, so its near edge is zero and converting
+            // the extent *is* converting the far edge.
+            .viewport = .{
+                .width = divRoundSize(self.viewport.width, s),
+                .height = divRoundSize(self.viewport.height, s),
+            },
+            .fb_size = self.fb_size,
+            .app_size = self.app_size,
+        };
+    }
+
+    /// The converted extent between two converted edges. A rectangle that had area keeps at least one
+    /// unit of it — a destination that rounded away entirely would present nothing — and one that had
+    /// none stays empty rather than gaining a unit.
+    fn extentFromEdges(near: i32, far: i32, original: u32) u32 {
+        if (original == 0) return 0;
+        const d = @as(i64, far) - @as(i64, near);
+        if (d < 1) return 1;
+        if (d > std.math.maxInt(u32)) return std.math.maxInt(u32);
+        return @intCast(d);
+    }
+
+    /// `round(v / s)` for a coordinate, which unlike a size can be negative: an origin outside the
+    /// window is a real value and keeps its sign.
+    fn divRound(v: i32, s: f64) i32 {
+        const r = @round(@as(f64, @floatFromInt(v)) / s);
+        return saturate(@as(i128, @intFromFloat(std.math.clamp(r, @as(f64, std.math.minInt(i32)), @as(f64, std.math.maxInt(i32))))));
+    }
+
+    /// `round(v / s)` for an extent measured from zero. Zero stays zero, and anything else keeps at
+    /// least one unit.
+    fn divRoundSize(v: u32, s: f64) u32 {
+        if (v == 0) return 0;
+        const r = @round(@as(f64, @floatFromInt(v)) / s);
+        if (!(r >= 1)) return 1;
+        if (r >= @as(f64, std.math.maxInt(u32))) return std.math.maxInt(u32);
+        return @intFromFloat(r);
+    }
+
     /// Map a framebuffer coordinate to physical window pixels: the first whole destination pixel
     /// that falls inside the range this framebuffer pixel covers.
     pub fn framebufferToPhysical(self: PresentMapping, x: i32, y: i32) WindowPosition {
@@ -334,6 +407,58 @@ pub fn framebufferRectToPhysical(m: PresentMapping, x: i32, y: i32, w: i32, h: i
         .w = PresentMapping.saturate(@as(i128, far.x) - @as(i128, near.x)),
         .h = PresentMapping.saturate(@as(i128, far.y) - @as(i128, near.y)),
     };
+}
+
+/// A rectangle in physical window pixels: the origin can be negative, the extent cannot.
+pub const WindowRect = struct {
+    x: i32,
+    y: i32,
+    width: u32,
+    height: u32,
+};
+
+/// The parts of the window the framebuffer does not cover — the letterbox, as up to four
+/// non-overlapping rectangles in physical window pixels (ADR-030 R9).
+///
+/// It lives here rather than in a backend for the same reason the mapping does: every backend that
+/// paints bars needs exactly this decomposition, and four rectangles worked out separately in each
+/// would be four chances to leave a seam or to paint over the content. A framebuffer that covers the
+/// window produces none, so a caller can paint unconditionally.
+///
+/// The two side bars take the full height and the top and bottom take only the middle, which is what
+/// makes them disjoint. An aspect-preserving letterbox fills one axis exactly and so yields either no
+/// bars or one pair; the general form is kept because the one-pixel clamp of `letterbox` can leave a
+/// window with area on both axes.
+///
+/// Hot path declaration: once per mapping change, or once per frame on a backend with no surface to
+/// retain a painted bar in. A handful of scalar operations, no allocation.
+pub fn letterboxBars(m: PresentMapping) struct { rects: [4]WindowRect, count: usize } {
+    var out: [4]WindowRect = undefined;
+    var n: usize = 0;
+    const win_w: i32 = @intCast(m.viewport.width);
+    const win_h: i32 = @intCast(m.viewport.height);
+    // Clamped into the window: a destination rectangle reaching past its edge covers up to it and no
+    // further, and the bar on that side is simply absent.
+    const x0 = std.math.clamp(m.origin.x, 0, win_w);
+    const y0 = std.math.clamp(m.origin.y, 0, win_h);
+    const x1 = std.math.clamp(PresentMapping.saturate(@as(i128, m.origin.x) + m.dst_size.width), 0, win_w);
+    const y1 = std.math.clamp(PresentMapping.saturate(@as(i128, m.origin.y) + m.dst_size.height), 0, win_h);
+    appendRect(&out, &n, 0, 0, x0, win_h); // left, full height
+    appendRect(&out, &n, x1, 0, win_w, win_h); // right, full height
+    appendRect(&out, &n, x0, 0, x1, y0); // top, between the side bars
+    appendRect(&out, &n, x0, y1, x1, win_h); // bottom, between the side bars
+    return .{ .rects = out, .count = n };
+}
+
+fn appendRect(out: *[4]WindowRect, n: *usize, left: i32, top: i32, right: i32, bottom: i32) void {
+    if (right <= left or bottom <= top) return; // an empty bar is not a rectangle
+    out[n.*] = .{
+        .x = left,
+        .y = top,
+        .width = @intCast(right - left),
+        .height = @intCast(bottom - top),
+    };
+    n.* += 1;
 }
 
 /// The guard a backend calls while it has no present that magnifies a framebuffer into a letterbox
@@ -1402,6 +1527,158 @@ test "FramebufferMode: a fixed framebuffer carries its size" {
         },
         .logical, .physical => return error.TestUnexpectedResult,
     }
+}
+
+// ---- letterboxBars (ADR-030 R9) ----
+
+/// The bars plus the destination must tile the window exactly: areas summing to the window's, and no
+/// two rectangles overlapping. Asserted by area rather than by eye, so a seam or an overlap fails.
+fn expectBarsTileTheWindow(m: PresentMapping) !void {
+    const bars = letterboxBars(m);
+    var area: u64 = 0;
+    for (bars.rects[0..bars.count]) |r| area += @as(u64, r.width) * @as(u64, r.height);
+    const dst_area = @as(u64, m.dst_size.width) * @as(u64, m.dst_size.height);
+    try std.testing.expectEqual(@as(u64, m.viewport.width) * @as(u64, m.viewport.height), area + dst_area);
+    for (bars.rects[0..bars.count], 0..) |a, i| {
+        for (bars.rects[0..bars.count], 0..) |b, j| {
+            if (i >= j) continue;
+            const overlap_x = @max(a.x, b.x) < @min(a.x + @as(i32, @intCast(a.width)), b.x + @as(i32, @intCast(b.width)));
+            const overlap_y = @max(a.y, b.y) < @min(a.y + @as(i32, @intCast(a.height)), b.y + @as(i32, @intCast(b.height)));
+            try std.testing.expect(!(overlap_x and overlap_y));
+        }
+    }
+}
+
+test "PresentMapping.dividedByScale: a scale of 1, and a nonsense scale, leave the mapping alone" {
+    const m = PresentMapping.letterbox(.{ .width = 1024, .height = 400 }, .{ .width = 640, .height = 400 });
+    try std.testing.expectEqual(m, m.dividedByScale(1.0));
+    try std.testing.expectEqual(m, m.dividedByScale(0.0));
+    try std.testing.expectEqual(m, m.dividedByScale(std.math.nan(f32)));
+}
+
+test "PresentMapping.dividedByScale: a covering mapping lands back on the framebuffer's own size" {
+    // `.logical` at a ratio of 1.5: the destination is the framebuffer scaled up, so dividing by the
+    // same ratio is what makes a present in the window's native space blit one to one.
+    const fb: WindowSize = .{ .width = 800, .height = 600 };
+    const m = PresentMapping.covering(.logical, .{
+        .logical_size = fb,
+        .framebuffer_size = fb,
+        .content_scale = 1.5,
+        .scale_epoch = 0,
+    });
+    try std.testing.expectEqual(@as(u32, 1200), m.dst_size.width);
+    const native = m.dividedByScale(1.5);
+    try std.testing.expectEqual(@as(u32, 800), native.dst_size.width);
+    try std.testing.expectEqual(@as(u32, 600), native.dst_size.height);
+    try std.testing.expectEqual(@as(u32, 800), native.viewport.width);
+    // The framebuffer and the application's space are not window measurements and do not move.
+    try std.testing.expectEqual(fb, native.fb_size);
+    try std.testing.expectEqual(fb, native.app_size);
+}
+
+test "PresentMapping.dividedByScale: a letterbox keeps its shape, and the bars still tile the window" {
+    // A 1536x600 window at a ratio of 1.5 is 1024x400 native; a 640x400 framebuffer letterboxes into it.
+    const m = PresentMapping.letterbox(.{ .width = 1536, .height = 600 }, .{ .width = 640, .height = 400 });
+    const native = m.dividedByScale(1.5);
+    try std.testing.expectEqual(@as(u32, 1024), native.viewport.width);
+    try std.testing.expectEqual(@as(u32, 400), native.viewport.height);
+    try std.testing.expectEqual(@as(u32, 640), native.dst_size.width);
+    try std.testing.expectEqual(@as(u32, 400), native.dst_size.height);
+    try std.testing.expectEqual(@as(i32, 192), native.origin.x);
+    try expectBarsTileTheWindow(native);
+}
+
+test "PresentMapping.dividedByScale: the far edge is converted, not the origin plus a converted extent" {
+    // Rounding the origin and the extent separately puts the bottom edge at 25 + 201 = 226; converting
+    // the edge itself gives round(248 / 1.1) = 225, which is where the physical rectangle ends.
+    const m: PresentMapping = .{
+        .origin = .{ .x = 0, .y = 27 },
+        .dst_size = .{ .width = 100, .height = 221 },
+        .viewport = .{ .width = 100, .height = 275 },
+        .fb_size = .{ .width = 50, .height = 110 },
+        .app_size = .{ .width = 50, .height = 110 },
+    };
+    const native = m.dividedByScale(1.1);
+    try std.testing.expectEqual(@as(i32, 25), native.origin.y);
+    try std.testing.expectEqual(@as(u32, 200), native.dst_size.height);
+    try std.testing.expectEqual(@as(i32, 225), native.origin.y + @as(i32, @intCast(native.dst_size.height)));
+    try expectBarsTileTheWindow(native);
+}
+
+test "PresentMapping.dividedByScale: a native space finer than physical still converts, and still tiles" {
+    // A scale below 1 is not what the conversion is for, but the input side multiplies by whatever the
+    // window system reports, so it has to be handled rather than refused. The tiling invariant holds;
+    // only the round trip through a covering mapping can land a pixel out.
+    const m = PresentMapping.letterbox(.{ .width = 320, .height = 200 }, .{ .width = 640, .height = 400 });
+    const native = m.dividedByScale(0.5);
+    try std.testing.expectEqual(@as(u32, 640), native.viewport.width);
+    try std.testing.expectEqual(@as(u32, 640), native.dst_size.width);
+    try expectBarsTileTheWindow(native);
+}
+
+test "PresentMapping.dividedByScale: a rectangle with no area stays empty rather than gaining a pixel" {
+    const m = PresentMapping.letterbox(.{ .width = 0, .height = 0 }, .{ .width = 640, .height = 400 });
+    const native = m.dividedByScale(2.0);
+    try std.testing.expectEqual(@as(u32, 0), native.dst_size.width);
+    try std.testing.expectEqual(@as(u32, 0), native.dst_size.height);
+}
+
+test "letterboxBars: a framebuffer that covers the window leaves nothing to paint" {
+    const fb: WindowSize = .{ .width = 640, .height = 400 };
+    try std.testing.expectEqual(@as(usize, 0), letterboxBars(PresentMapping.letterbox(fb, fb)).count);
+    const snap: FramebufferSnapshot = .{
+        .logical_size = fb,
+        .framebuffer_size = fb,
+        .content_scale = 1.0,
+        .scale_epoch = 0,
+    };
+    try std.testing.expectEqual(@as(usize, 0), letterboxBars(PresentMapping.covering(.logical, snap)).count);
+    try std.testing.expectEqual(@as(usize, 0), letterboxBars(PresentMapping.covering(.physical, snap)).count);
+}
+
+test "letterboxBars: a window wider than the framebuffer gets two side bars, and no others" {
+    // 1024x400 against 640x400: height-limited, so the destination is 640x400 with 192px each side.
+    const m = PresentMapping.letterbox(.{ .width = 1024, .height = 400 }, .{ .width = 640, .height = 400 });
+    const bars = letterboxBars(m);
+    try std.testing.expectEqual(@as(usize, 2), bars.count);
+    try std.testing.expectEqual(@as(i32, 0), bars.rects[0].x);
+    try std.testing.expectEqual(@as(u32, 192), bars.rects[0].width);
+    try std.testing.expectEqual(@as(u32, 400), bars.rects[0].height);
+    try std.testing.expectEqual(@as(i32, 832), bars.rects[1].x);
+    try std.testing.expectEqual(@as(u32, 192), bars.rects[1].width);
+    try expectBarsTileTheWindow(m);
+}
+
+test "letterboxBars: a window taller than the framebuffer gets two bars above and below" {
+    // 500x900 against 640x400: width-limited, so the destination is 500x312 and 588px is left over.
+    const m = PresentMapping.letterbox(.{ .width = 500, .height = 900 }, .{ .width = 640, .height = 400 });
+    const bars = letterboxBars(m);
+    try std.testing.expectEqual(@as(usize, 2), bars.count);
+    for (bars.rects[0..bars.count]) |r| try std.testing.expectEqual(@as(u32, 500), r.width);
+    try expectBarsTileTheWindow(m);
+}
+
+test "letterboxBars: the tiling holds for an odd split, where the two bars differ by a pixel" {
+    // Odd on both axes: the origin is floored, so one bar is a pixel wider than the other.
+    const m = PresentMapping.letterbox(.{ .width = 1001, .height = 401 }, .{ .width = 640, .height = 400 });
+    try expectBarsTileTheWindow(m);
+    const bars = letterboxBars(m);
+    try std.testing.expect(bars.count >= 2);
+    // The bars are what the destination does not cover, so their widths differ by exactly the rounding.
+    var widest: u32 = 0;
+    var narrowest: u32 = std.math.maxInt(u32);
+    for (bars.rects[0..bars.count]) |r| {
+        if (r.height == 401) { // a side bar
+            widest = @max(widest, r.width);
+            narrowest = @min(narrowest, r.width);
+        }
+    }
+    try std.testing.expect(widest - narrowest <= 1);
+}
+
+test "letterboxBars: a window with no area produces no rectangles rather than a negative one" {
+    const m = PresentMapping.letterbox(.{ .width = 0, .height = 0 }, .{ .width = 640, .height = 400 });
+    try std.testing.expectEqual(@as(usize, 0), letterboxBars(m).count);
 }
 
 test "refuseFixedFramebuffer: only a fixed framebuffer is refused" {

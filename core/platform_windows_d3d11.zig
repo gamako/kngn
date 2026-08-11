@@ -328,6 +328,10 @@ pub const Window = struct {
     /// error.Unsupported (use the gdi backend, or a future layered path; borderless, an opaque window with no frame, is supported).
     pub fn createWithOptions(width: u32, height: u32, title: [:0]const u8, opts: @import("platform_types").WindowOptions) Error!Window {
         if (opts.transparent) return error.Unsupported; // transparency on d3d11 is follow-up work (use gdi)
+        // This present uploads the framebuffer into a back buffer of the window's size and copies it,
+        // so magnifying a fixed framebuffer into a destination rectangle means drawing a quad through a
+        // shader — follow-up work. The mode is refused rather than quietly covering the window (ADR-030 R5).
+        try types.refuseFixedFramebuffer(opts.fb_mode);
         return finishFromCore(try common.Core.createWithOptions(width, height, title, opts));
     }
 
