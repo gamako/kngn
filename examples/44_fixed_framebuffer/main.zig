@@ -31,9 +31,10 @@
 //! outermost row of the framebuffer.
 //!
 //! **A backend whose present cannot magnify refuses the window** rather than handing back a framebuffer
-//! of a size that was not asked for (docs/adr/030 R5), so this sample needs one that can: on macOS the
-//! two CALayer backends (`-Dplatform=objc` or `-Dplatform=swift`), on Windows `-Dplatform=gdi`, and on
-//! the web any browser. It says so and exits when the window is refused.
+//! of a size that was not asked for (docs/adr/030 R5), so this sample needs one that can: every macOS
+//! backend, both Windows backends, wayland on Linux, and any browser on the web. X11 is the exception
+//! until its software upscale exists, and a wayland compositor without `wp_viewporter` refuses too. It
+//! says so and exits when the window is refused.
 
 const std = @import("std");
 const platform = @import("platform");

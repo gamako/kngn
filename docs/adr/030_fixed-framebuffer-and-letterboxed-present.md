@@ -476,7 +476,14 @@ backend cycles through several buffers, that means once per buffer (R6 measures 
 one repaint costs). Stating both the colour and the moment here is what stops the
 backends from diverging over them.
 
-**One backend departs from the moment, and only that one: the opaque GDI present.** It
+**A backend that presents through a GPU render target clears the whole target every
+frame, and that is not a departure.** Metal, D3D11 and the like begin a render pass by
+clearing the drawable or the back buffer, which is work the frame already does and which
+the letterbox rides along with at no extra cost; a discard swap chain does not even retain
+the previous frame's bars to preserve. The rule exists to stop a backend from repainting
+the bars **on the CPU** once per frame, and these do not.
+
+**One backend departs from the moment in the sense the rule means: the opaque GDI present.** It
 draws straight into the window's device context and retains no surface of its own, so
 there is nowhere for a painted bar to persist and the bars are filled every frame. The
 alternative is a retained client-sized DIB plus a memory DC, painted once and blitted
