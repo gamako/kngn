@@ -44,7 +44,25 @@ const c = @cImport({
     @cInclude("xkbcommon/xkbcommon.h");
     @cInclude("xdg-shell-client-protocol.h");
     @cInclude("xdg-decoration-unstable-v1-client-protocol.h"); // requesting SSD, with a CSD fallback
+    @cInclude("viewporter-client-protocol.h"); // arbitrary buffer→surface scale for .fixed letterbox present
 });
+
+/// `wl_fixed_from_int` is a static inline in wayland-util.h; `@cImport` does not always expose it.
+/// 256 units per integer, matching the protocol's 24.8 fixed-point definition.
+/// Caller must keep `i` in the encodable range (`0..max_wl_fixed_int` for non-negative extents).
+fn wlFixedFromInt(i: i32) c.wl_fixed_t {
+    return i * 256;
+}
+
+/// Largest non-negative integer that `wlFixedFromInt` can encode without overflowing `wl_fixed_t`.
+const max_wl_fixed_int: i32 = std.math.maxInt(c.wl_fixed_t) / 256;
+
+/// True when a fixed framebuffer's full-buffer source rectangle `(0,0,w,h)` fits in `wl_fixed_t`.
+/// Sizes beyond this would overflow `i * 256` and send a corrupt `wp_viewport.set_source`; refuse at creation instead.
+fn fixedSourceFitsWlFixed(size: WindowSize) bool {
+    return size.width <= @as(u32, @intCast(max_wl_fixed_int)) and
+        size.height <= @as(u32, @intCast(max_wl_fixed_int));
+}
 
 const csd = @import("platform_wayland_csd.zig"); // the pure decoration logic (the layout, the hit testing and the drawing)
 
@@ -92,12 +110,13 @@ fn roundToPhysicalPx(logical_px: u32, scale: f32) u32 {
 }
 
 /// The physical framebuffer size. Under .logical it is always the logical size itself (which is where the structural guarantee lives).
+/// Under `.fixed` it is the size carried by the mode, independent of the window and of output scale.
 fn effectiveFramebufferSize(fb_mode: FramebufferMode, logical: WindowSize, scale: f32) WindowSize {
     // Exhaustive rather than `== .logical`: a tagged union compares equal to an enum literal, so a
     // mode this backend has not implemented would silently take the wrong branch here.
     switch (fb_mode) {
         .logical => return logical,
-        .fixed => |size| return size, // refused at creation, but stated rather than left to fall through
+        .fixed => |size| return size,
         .physical => {},
     }
     return .{
@@ -106,20 +125,62 @@ fn effectiveFramebufferSize(fb_mode: FramebufferMode, logical: WindowSize, scale
     };
 }
 
+fn isFixedMode(fb_mode: FramebufferMode) bool {
+    return switch (fb_mode) {
+        .fixed => true,
+        .logical, .physical => false,
+    };
+}
+
 /// The scale used to allocate a `.physical` buffer. Below compositor (wl_surface) v3 it is 1.0, which avoids a protocol error.
+/// Under `.fixed` the framebuffer is not scaled by the output: magnification lives in the viewport destination only.
 fn framebufferSizeScale(st: *const State) f32 {
+    if (isFixedMode(st.fb_mode)) return 1.0;
     if (!st.fb_mode.tracksPhysicalPixels() or st.compositor_version < 3) return 1.0;
     return effectiveContentScale(st.pending_content_scale);
 }
 
-/// The integer scale passed to `wl_surface_set_buffer_scale` (1 under `.logical`, and below compositor v3).
+/// The integer scale passed to `wl_surface_set_buffer_scale` (1 under `.logical` and `.fixed`, and below compositor v3).
+/// `.fixed` keeps buffer scale at 1 so viewport destination is not compounded with a second scale factor.
 fn bufferScaleInt(st: *const State) i32 {
+    if (isFixedMode(st.fb_mode)) return 1;
     if (!st.fb_mode.tracksPhysicalPixels() or st.compositor_version < 3) return 1;
     const s = effectiveContentScale(st.content_scale);
     const v = @round(@as(f64, s));
     if (!(v >= 1.0) or !std.math.isFinite(v)) return 1;
     if (v > @as(f64, @floatFromInt(std.math.maxInt(i32)))) return std.math.maxInt(i32);
     return @intFromFloat(v);
+}
+
+/// Content scale reported to the application: always 1.0 under `.fixed` (ADR-030 R2).
+fn reportedContentScale(st: *const State, raw: f32) f32 {
+    return switch (st.fb_mode) {
+        .fixed => 1.0,
+        .logical, .physical => effectiveContentScale(raw),
+    };
+}
+
+/// The content area in physical pixels for the facade's letterbox mapping (ADR-030 R4).
+fn presentViewportPhysical(st: *const State) WindowSize {
+    const s = effectiveContentScale(st.pending_content_scale);
+    return .{
+        .width = roundToPhysicalPx(st.logical_width, s),
+        .height = roundToPhysicalPx(st.logical_height, s),
+    };
+}
+
+/// Convert a physical mapping into surface-local units via `PresentMapping.dividedByScale`.
+/// Both edges of the destination are converted and the extent is their difference — not a float
+/// framebuffer/window ratio recomputed in the backend.
+fn mappingInSurfaceLocal(mapping: types.PresentMapping, scale: f32) types.PresentMapping {
+    return mapping.dividedByScale(scale);
+}
+
+/// True when the parts of a mapping that drive viewport destination / subsurface position differ.
+fn presentMappingPlacementChanged(a: types.PresentMapping, b: types.PresentMapping) bool {
+    return a.origin.x != b.origin.x or a.origin.y != b.origin.y or
+        a.dst_size.width != b.dst_size.width or a.dst_size.height != b.dst_size.height or
+        a.viewport.width != b.viewport.width or a.viewport.height != b.viewport.height;
 }
 
 /// Recompute `st.width`/`st.height` (the physical framebuffer) from the logical content size.
@@ -154,12 +215,23 @@ fn recomputePendingContentScale(st: *State) void {
 }
 
 /// pending → latched. When the scale or the physical size changes, `scale_epoch` is incremented (at the next lock boundary, which is effectively event time).
+/// Under `.fixed` the framebuffer, reported scale and epoch stay put: only the physical viewport moves, and present remaps into it.
 fn applyLatchedMetricsIfNeeded(st: *State) void {
     const new_scale = effectiveContentScale(st.pending_content_scale);
     const old_scale = effectiveContentScale(st.content_scale);
     const prev_w = st.width;
     const prev_h = st.height;
     st.content_scale = new_scale;
+    if (isFixedMode(st.fb_mode)) {
+        // Fixed framebuffer size never follows the window or the output scale.
+        if (new_scale != old_scale) {
+            st.ct_region_valid = false;
+            st.parent_dst_dirty = true;
+            st.fixed_dst_dirty = true;
+            st.buffer_scale_dirty = true;
+        }
+        return;
+    }
     refreshPhysicalSizeFromLogical(st);
     if (new_scale != old_scale or st.width != prev_w or st.height != prev_h) {
         st.scale_epoch +%= 1;
@@ -168,8 +240,18 @@ fn applyLatchedMetricsIfNeeded(st: *State) void {
     }
 }
 
+/// Integer rectangle used by input-region construction (surface-local or child-local).
+/// Separate from `types.WindowRect` (`width`/`height` as u32): here extents stay signed `i32`
+/// so they line up with `wl_region_add` and with `framebufferRectToPhysical`'s `w`/`h`.
+const SurfaceRect = struct {
+    x: i32,
+    y: i32,
+    w: i32,
+    h: i32,
+};
+
 /// Wayland surface-local (effectively logical) → raw physical event coordinates. Always × content_scale, independent of fb_mode.
-fn nativeToRawPhysical(st: *const State, native_x: i32, native_y: i32) struct { x: i32, y: i32 } {
+fn nativeToRawPhysical(st: *const State, native_x: i32, native_y: i32) types.WindowPosition {
     const s = effectiveContentScale(st.pending_content_scale);
     return .{
         .x = @intFromFloat(@floor(@as(f64, @floatFromInt(native_x)) * @as(f64, s))),
@@ -317,10 +399,13 @@ const ShmBuffer = struct {
 
 // ---- CSD (client-side decoration) ----
 
-/// What the pointer is focused on (tracked through the surface argument of ptrEnter). content = the window itself, deco = a decoration subsurface, other = unknown.
+/// What the pointer is focused on (tracked through the surface argument of ptrEnter).
+/// content = the toplevel content surface (covering modes, or the letterbox parent under `.fixed`);
+/// fixed_content = the fixed framebuffer subsurface; deco = a decoration subsurface; other = unknown.
 /// An event on the decoration (a motion, button, axis or frame) is routed to the decoration rather than into the application's EventQueue.
 const PtrFocus = union(enum) {
     content,
+    fixed_content,
     deco: csd.DecoPart,
     other,
 };
@@ -348,7 +433,22 @@ const State = struct {
     toplevel: ?*c.struct_xdg_toplevel = null,
 
     // The window decoration: SSD is requested, and CSD is drawn by hand when it is refused.
-    subcompositor: ?*c.struct_wl_subcompositor = null, // for the CSD subsurfaces
+    subcompositor: ?*c.struct_wl_subcompositor = null, // for the CSD subsurfaces and the fixed content subsurface
+    viewporter: ?*c.struct_wp_viewporter = null, // for `.fixed` letterbox magnification (parent + child viewports)
+    // Parent surface viewport and 1×1 background buffer (letterbox bars under `.fixed`).
+    parent_viewport: ?*c.struct_wp_viewport = null,
+    parent_bg: ShmBuffer = .{},
+    parent_bg_attached: bool = false,
+    parent_source_configured: bool = false,
+    parent_dst_dirty: bool = true,
+    // Fixed content subsurface: holds the fixed framebuffer buffer and its viewport.
+    fixed_surface: ?*c.struct_wl_surface = null,
+    fixed_subsurface: ?*c.struct_wl_subsurface = null,
+    fixed_viewport: ?*c.struct_wp_viewport = null,
+    fixed_source_configured: bool = false,
+    fixed_dst_dirty: bool = true,
+    /// Last physical mapping applied (or received) under `.fixed`; used for input origin and region conversion.
+    fixed_mapping: types.PresentMapping = .{},
     deco_manager: ?*c.struct_zxdg_decoration_manager_v1 = null,
     deco_manager_version: u32 = 1,
     deco_obj: ?*c.struct_zxdg_toplevel_decoration_v1 = null,
@@ -499,8 +599,14 @@ fn registryGlobal(data: ?*anyopaque, registry: ?*c.struct_wl_registry, name: u32
         st.seat = @ptrCast(c.wl_registry_bind(registry, name, &c.wl_seat_interface, v));
         if (st.seat) |seat| _ = c.wl_seat_add_listener(seat, &seat_listener, st);
     } else if (std.mem.eql(u8, ifn, "wl_subcompositor")) {
-        // For the CSD subsurfaces (fixed at version 1; nothing to negotiate). Without it, no CSD is built.
+        // For the CSD subsurfaces and the fixed content subsurface (fixed at version 1; nothing to negotiate).
+        // Without it, no CSD is built and `.fixed` is refused at creation.
         st.subcompositor = @ptrCast(c.wl_registry_bind(registry, name, &c.wl_subcompositor_interface, 1));
+    } else if (std.mem.eql(u8, ifn, "wp_viewporter")) {
+        // Arbitrary buffer→surface scale for `.fixed` letterbox present. Bound at version 1.
+        // Absence is fine for `.logical` / `.physical`; `.fixed` refuses at creation when this is null.
+        const v = @min(version, 1);
+        st.viewporter = @ptrCast(c.wl_registry_bind(registry, name, &c.wp_viewporter_interface, v));
     } else if (std.mem.eql(u8, ifn, "zxdg_decoration_manager_v1")) {
         // For requesting SSD. It binds at min(advertised, 2) (v1 and v2 differ only in how set_mode is handled).
         const v = @min(version, 2);
@@ -692,6 +798,8 @@ fn xdgSurfaceConfigure(data: ?*anyopaque, xdg_surface: ?*c.struct_xdg_surface, s
         if (st.pending_width != 0 and st.pending_height != 0) {
             const prev_w = st.width;
             const prev_h = st.height;
+            const prev_logical_w = st.logical_width;
+            const prev_logical_h = st.logical_height;
             var logical_w: u32 = undefined;
             var logical_h: u32 = undefined;
             if (st.deco_state == .csd) {
@@ -705,8 +813,18 @@ fn xdgSurfaceConfigure(data: ?*anyopaque, xdg_surface: ?*c.struct_xdg_surface, s
             st.logical_width = logical_w;
             st.logical_height = logical_h;
             refreshPhysicalSizeFromLogical(st);
-            // A size change makes the click-through input region be recomputed (the old bounding box is stale).
-            if (st.width != prev_w or st.height != prev_h) st.ct_region_valid = false;
+            // Covering modes: a framebuffer size change makes the click-through region stale.
+            // `.fixed`: the framebuffer is unchanged, so detect a window surface-local size change instead
+            // and dirty the parent/child viewport destinations plus the input region.
+            if (isFixedMode(st.fb_mode)) {
+                if (logical_w != prev_logical_w or logical_h != prev_logical_h) {
+                    st.ct_region_valid = false;
+                    st.parent_dst_dirty = true;
+                    st.fixed_dst_dirty = true;
+                }
+            } else if (st.width != prev_w or st.height != prev_h) {
+                st.ct_region_valid = false;
+            }
         }
     }
     // Fullscreen and the geometry to persist (ADR-019 R10). The state and the size travel in the
@@ -1007,10 +1125,26 @@ fn mouseEvent(st: *State, button: MouseButton) types.MouseEvent {
 fn resolveFocus(st: *State, surface: ?*c.struct_wl_surface) PtrFocus {
     if (surface == null) return .other;
     if (surface == st.surface) return .content;
+    if (st.fixed_surface != null and surface == st.fixed_surface) return .fixed_content;
     for (&st.csd_surfaces) |*cs| {
         if (cs.surface != null and surface == cs.surface) return .{ .deco = cs.part };
     }
     return .other;
+}
+
+/// Map pointer coordinates on a content surface into raw physical window pixels for the event queue.
+/// Parent content: surface-local × content_scale. Fixed child: child-local × content_scale, then add the
+/// physical mapping origin (origin is a position, never applied to scroll deltas).
+fn pointerToRawPhysical(st: *State, focus: PtrFocus, lx: i32, ly: i32) types.WindowPosition {
+    const raw = nativeToRawPhysical(st, lx, ly);
+    return switch (focus) {
+        .fixed_content => .{
+            .x = types.PresentMapping.saturate(@as(i128, raw.x) + st.fixed_mapping.origin.x),
+            .y = types.PresentMapping.saturate(@as(i128, raw.y) + st.fixed_mapping.origin.y),
+        },
+        .content => raw,
+        .deco, .other => raw,
+    };
 }
 
 fn ptrEnter(data: ?*anyopaque, ptr: ?*c.struct_wl_pointer, serial: u32, surface: ?*c.struct_wl_surface, sx: c.wl_fixed_t, sy: c.wl_fixed_t) callconv(.c) void {
@@ -1021,9 +1155,9 @@ fn ptrEnter(data: ?*anyopaque, ptr: ?*c.struct_wl_pointer, serial: u32, surface:
     const focus = resolveFocus(st, surface);
     st.ptr_focus = focus;
     switch (focus) {
-        .content => {
-            // surface-local → raw physical (always × content_scale; a decoration needs no conversion).
-            const raw = nativeToRawPhysical(st, lx, ly);
+        .content, .fixed_content => {
+            // surface-local (or child-local) → raw physical (always × content_scale; a decoration needs no conversion).
+            const raw = pointerToRawPhysical(st, focus, lx, ly);
             st.pointer_x = raw.x;
             st.pointer_y = raw.y;
             // Keep the serial of the moment the pointer entered the content and apply the current cursor_shape
@@ -1071,8 +1205,8 @@ fn ptrMotion(data: ?*anyopaque, ptr: ?*c.struct_wl_pointer, time: u32, sx: c.wl_
     const lx = wlinput.fixedToI32(sx);
     const ly = wlinput.fixedToI32(sy);
     switch (st.ptr_focus) {
-        .content => {
-            const raw = nativeToRawPhysical(st, lx, ly);
+        .content, .fixed_content => {
+            const raw = pointerToRawPhysical(st, st.ptr_focus, lx, ly);
             st.pointer_x = raw.x;
             st.pointer_y = raw.y;
             st.queue.enqueue(.{ .mouse_move = mouseEvent(st, .none) });
@@ -1093,7 +1227,7 @@ fn ptrButton(data: ?*anyopaque, ptr: ?*c.struct_wl_pointer, serial: u32, time: u
     const mb = wlinput.evdevButtonToMouseButton(button) orelse return;
     const pressed = state != 0; // WL_POINTER_BUTTON_STATE_PRESSED=1
     switch (st.ptr_focus) {
-        .content => {
+        .content, .fixed_content => {
             // Keep the serial of a left press on the content for beginDrag (xdg_toplevel_move).
             if (pressed and mb == .left) st.last_button_serial = serial;
             setButton(st, mb, pressed); // bring it to the post-state before building the event
@@ -1128,6 +1262,42 @@ fn handleDecoPress(st: *State, part: csd.DecoPart, serial: u32) void {
     }
 }
 
+/// Convert a physical rectangle relative to the fixed destination origin into child surface-local
+/// units by converting both edges with `PresentMapping.dividedByScale` (no backend float ratio).
+fn childLocalRectFromPhysicalRelative(x: i32, y: i32, w: i32, h: i32, scale: f32) SurfaceRect {
+    const uw: u32 = if (w > 0) @intCast(w) else 0;
+    const uh: u32 = if (h > 0) @intCast(h) else 0;
+    const m = (types.PresentMapping{
+        .origin = .{ .x = x, .y = y },
+        .dst_size = .{ .width = uw, .height = uh },
+        .viewport = .{ .width = uw, .height = uh },
+        .fb_size = .{ .width = 1, .height = 1 },
+        .app_size = .{ .width = 1, .height = 1 },
+    }).dividedByScale(scale);
+    return .{
+        .x = m.origin.x,
+        .y = m.origin.y,
+        .w = @intCast(m.dst_size.width),
+        .h = @intCast(m.dst_size.height),
+    };
+}
+
+/// Map a framebuffer opaque span to a child surface-local input rectangle:
+/// framebuffer → physical (includes origin) → subtract origin → surface-local.
+fn fixedInputRectFromFramebufferSpan(
+    mapping: types.PresentMapping,
+    scale: f32,
+    fb_x: i32,
+    fb_y: i32,
+    fb_w: i32,
+    fb_h: i32,
+) SurfaceRect {
+    const phys = types.framebufferRectToPhysical(mapping, fb_x, fb_y, fb_w, fb_h);
+    const rel_x = types.PresentMapping.saturate(@as(i128, phys.x) - mapping.origin.x);
+    const rel_y = types.PresentMapping.saturate(@as(i128, phys.y) - mapping.origin.y);
+    return childLocalRectFromPhysicalRelative(rel_x, rel_y, phys.w, phys.h, scale);
+}
+
 /// Set the click-through input region. Each row's runs of opaque pixels (alpha>0) are added to a wl_region
 /// as 1px-high rectangles (per-row spans), and that becomes the wl_surface's input region.
 /// A click on the transparent margin and the corners then falls through, following the outline of a round
@@ -1136,10 +1306,18 @@ fn handleDecoPress(st: *State, part: csd.DecoPart, serial: u32) void {
 /// first present after click_through is turned on (never an all-pixel loop per frame, so the three rules do not apply).
 /// A still mascot is assumed. Where the silhouette changes, calling setClickThrough again invalidates it.
 /// buf.pixels is canonical BGRA (u32 0xAARRGGBB) whose alpha is the top 8 bits. The caller's present does the commit.
-/// The input region is in surface-local (logical) coordinates. Under `.physical` opacity is decided on the
-/// logical grid (a logical pixel is opaque when any of its scale×scale physical pixels is), and the region is built in logical coordinates.
+///
+/// Covering modes: the input region is in surface-local (logical) coordinates. Under `.physical` opacity is
+/// decided on the logical grid (a logical pixel is opaque when any of its scale×scale physical pixels is).
+///
+/// `.fixed`: the parent letterbox surface gets an empty input region (bars are click-through); opaque spans
+/// are placed on the fixed child after subtracting the mapping origin so they sit in child-local space.
 fn refreshInputRegion(st: *State, buf: *ShmBuffer, surface: *c.struct_wl_surface) void {
     if (st.ct_region_valid) return; // Once set, nothing is scanned (which avoids an all-pixel loop per frame)
+    if (isFixedMode(st.fb_mode)) {
+        refreshFixedInputRegion(st, buf);
+        return;
+    }
     const compositor = st.compositor orelse return;
     const scale_i = bufferScaleInt(st);
     const lw: i32 = @intCast(st.logical_width);
@@ -1224,12 +1402,61 @@ fn refreshInputRegion(st: *State, buf: *ShmBuffer, surface: *c.struct_wl_surface
     st.ct_region_valid = true; // settled only once it has been set successfully (on failure the orelse return above leaves valid alone)
 }
 
+/// Click-through input regions for `.fixed`: empty parent (letterbox passes through) plus opaque spans
+/// on the fixed child, converted framebuffer → physical → origin-subtracted → child surface-local.
+/// Both regions are built fully before either surface is updated, so a failure leaves both input
+/// regions unchanged and `ct_region_valid` false for a retry on the next present.
+fn refreshFixedInputRegion(st: *State, buf: *ShmBuffer) void {
+    const compositor = st.compositor orelse return;
+    const parent = st.surface orelse return;
+    const child = st.fixed_surface orelse return;
+    const bw: i32 = @intCast(st.width);
+    const bh: i32 = @intCast(st.height);
+    const px = buf.pixels;
+    if (px.len < @as(usize, @intCast(bw)) * @as(usize, @intCast(bh))) return;
+
+    // Create both regions first (parent stays empty; child gets opaque spans). Apply only after both exist.
+    const parent_region = c.wl_compositor_create_region(compositor) orelse return;
+    const child_region = c.wl_compositor_create_region(compositor) orelse {
+        c.wl_region_destroy(parent_region);
+        return;
+    };
+
+    const scale = effectiveContentScale(st.content_scale);
+    const mapping = st.fixed_mapping;
+    var y: i32 = 0;
+    while (y < bh) : (y += 1) {
+        const row = @as(usize, @intCast(y)) * @as(usize, @intCast(bw));
+        var x: i32 = 0;
+        while (x < bw) {
+            if ((px[row + @as(usize, @intCast(x))] >> 24) == 0) {
+                x += 1;
+                continue;
+            }
+            const run_start = x;
+            while (x < bw and (px[row + @as(usize, @intCast(x))] >> 24) != 0) : (x += 1) {}
+            const r = fixedInputRectFromFramebufferSpan(mapping, scale, run_start, y, x - run_start, 1);
+            if (r.w > 0 and r.h > 0) {
+                c.wl_region_add(child_region, r.x, r.y, r.w, r.h);
+            }
+        }
+    }
+
+    // Parent letterbox: empty input region so clicks on the bars fall through.
+    c.wl_surface_set_input_region(parent, parent_region);
+    c.wl_region_destroy(parent_region);
+    c.wl_surface_set_input_region(child, child_region);
+    c.wl_region_destroy(child_region);
+    st.ct_region_valid = true;
+}
+
 fn ptrAxis(data: ?*anyopaque, ptr: ?*c.struct_wl_pointer, time: u32, axis: u32, value: c.wl_fixed_t) callconv(.c) void {
     _ = ptr;
     _ = time;
     const st: *State = @ptrCast(@alignCast(data.?));
     switch (st.ptr_focus) {
-        .content => st.scroll_cont.add(wlinput.continuousScroll(axis, value)),
+        // Scroll deltas are displacements, not positions: the fixed child origin is not added.
+        .content, .fixed_content => st.scroll_cont.add(wlinput.continuousScroll(axis, value)),
         else => {}, // a scroll over a decoration is ignored
     }
 }
@@ -1238,7 +1465,7 @@ fn ptrAxisDiscrete(data: ?*anyopaque, ptr: ?*c.struct_wl_pointer, axis: u32, dis
     _ = ptr;
     const st: *State = @ptrCast(@alignCast(data.?));
     switch (st.ptr_focus) {
-        .content => st.scroll_disc.add(wlinput.discreteScroll(axis, discrete)),
+        .content, .fixed_content => st.scroll_disc.add(wlinput.discreteScroll(axis, discrete)),
         else => {},
     }
 }
@@ -1261,7 +1488,7 @@ fn ptrFrame(data: ?*anyopaque, ptr: ?*c.struct_wl_pointer) callconv(.c) void {
     const st: *State = @ptrCast(@alignCast(data.?));
     // No scroll accumulates over a decoration, so the accumulator is dropped (which prevents it carrying across frames).
     switch (st.ptr_focus) {
-        .content => {},
+        .content, .fixed_content => {},
         else => {
             st.scroll_disc = .{};
             st.scroll_cont = .{};
@@ -1561,9 +1788,8 @@ pub const Window = struct {
     /// from the compositor, so the width and height are ignored in that case (ADR-019 R3).
     /// Hot path declaration: initialisation only.
     pub fn createWithOptions(width: u32, height: u32, title: [:0]const u8, opts: types.WindowOptions) Error!Window {
-        // No present here magnifies a framebuffer into a letterbox yet, so a fixed one is refused
-        // rather than quietly behaving like another mode (ADR-030 R5).
-        try types.refuseFixedFramebuffer(opts.fb_mode);
+        // `.fixed` is accepted when `wp_viewporter` and `wl_subcompositor` are available; creation
+        // refuses with `error.Unsupported` after the registry roundtrip if either is missing.
         return createInternal(width, height, title, opts.fullscreen, opts);
     }
 
@@ -1618,6 +1844,19 @@ pub const Window = struct {
 
         if (st.compositor == null or st.shm == null or st.wm_base == null) return error.WindowCreationFailed;
 
+        // `.fixed` needs viewporter (arbitrary magnification) and subcompositor (content subsurface).
+        // Refuse explicitly rather than falling back to another mode or attaching the fixed buffer to the parent.
+        // Also refuse sizes whose full-buffer `set_source` cannot be encoded as wl_fixed_t (24.8), so present
+        // never issues a silently truncated source rectangle (ADR-030: design how it fails).
+        if (isFixedMode(opts.fb_mode)) {
+            if (st.viewporter == null or st.subcompositor == null) return error.Unsupported;
+            const fixed_size = switch (opts.fb_mode) {
+                .fixed => |s| s,
+                .logical, .physical => unreachable,
+            };
+            if (!fixedSourceFitsWlFixed(fixed_size)) return error.Unsupported;
+        }
+
         // Choosing the shm format. Transparency requires ARGB8888 (to honour the alpha). Without it XRGB8888 is preferred, as before.
         if (opts.transparent) {
             if (st.has_argb8888) {
@@ -1633,7 +1872,8 @@ pub const Window = struct {
             return error.WindowCreationFailed;
         }
 
-        // surface → xdg_surface → toplevel.
+        // surface → xdg_surface → toplevel. Under `.fixed` this parent surface is the letterbox background;
+        // the fixed framebuffer lives on a synchronized subsurface created immediately after.
         st.surface = c.wl_compositor_create_surface(st.compositor) orelse return error.WindowCreationFailed;
         // The content surface's enter and leave track the set of outputs (the CSD subsurfaces get no such listener).
         _ = c.wl_surface_add_listener(st.surface, &surface_listener, st);
@@ -1642,6 +1882,10 @@ pub const Window = struct {
         st.toplevel = c.xdg_surface_get_toplevel(st.xdg_surface) orelse return error.WindowCreationFailed;
         _ = c.xdg_toplevel_add_listener(st.toplevel, &toplevel_listener, st);
         c.xdg_toplevel_set_title(st.toplevel, title.ptr);
+
+        if (isFixedMode(opts.fb_mode)) {
+            try setupFixedSurfaceStructure(st);
+        }
 
         if (fullscreen) {
             // output=null (the compositor matches the output the surface is on). It is requested before the first commit.
@@ -1871,6 +2115,7 @@ pub const Window = struct {
     }
 
     /// The currently negotiated logical size. Drawing within a frame uses the Framebuffer snapshot.
+    /// Under `.fixed` this is the window's surface-local content size (not the fixed framebuffer).
     pub fn logicalSize(self: Window) WindowSize {
         const st = self.state;
         return .{ .width = st.logical_width, .height = st.logical_height };
@@ -1882,18 +2127,31 @@ pub const Window = struct {
         return .{ .width = st.width, .height = st.height };
     }
 
-    /// The currently negotiated content scale (the real output scale whether `.logical` or `.physical`; 1.0 before any enter).
+    /// The currently negotiated content scale: the real output scale under `.logical` / `.physical`,
+    /// and 1.0 under `.fixed` (ADR-030 R2). The real scale stays in state for viewport conversion.
     pub fn contentScale(self: Window) f32 {
-        return effectiveContentScale(self.state.pending_content_scale);
+        return reportedContentScale(self.state, self.state.pending_content_scale);
     }
 
-    /// The mapping is unused while this backend refuses a fixed framebuffer: its framebuffer
-    /// always covers the window, so the destination rectangle is the window.
-    pub fn present(self: Window, _: types.PresentMapping) void {
+    /// The content area in physical pixels for the facade's letterbox mapping under `.fixed` (ADR-030 R4).
+    pub fn presentViewport(self: Window) WindowSize {
+        return presentViewportPhysical(self.state);
+    }
+
+    /// Present the locked framebuffer. Under covering modes the buffer fills the parent surface.
+    /// Under `.fixed` the parent is a letterbox background and the fixed buffer is attached to a
+    /// synchronized subsurface, scaled by `wp_viewport.set_destination` from the facade's mapping.
+    pub fn present(self: Window, mapping: types.PresentMapping) void {
         const st = self.state;
         if (!st.configured or st.closing) return;
         const i = st.locked_index orelse return;
         const buf = &st.buffers[i];
+
+        if (isFixedMode(st.fb_mode)) {
+            presentFixed(st, buf, mapping);
+            return;
+        }
+
         const surface = st.surface.?;
         const buf_w: i32 = @intCast(st.width);
         const buf_h: i32 = @intCast(st.height);
@@ -1950,6 +2208,7 @@ pub const Window = struct {
     /// Set click-through (approximated per pixel). Turning it on invalidates it, and the next present scans the
     /// opaque pixels' bounding box exactly once and sets it as the input region (so a click on the transparent
     /// margin falls through). Off puts the input region back to null (the whole surface receives clicks).
+    /// Under `.fixed`, both the parent letterbox surface and the fixed content child are reset.
     /// Hot path declaration: event time only. The all-pixel bounding box scan runs exactly once at the present
     /// after an invalidate (gated by ct_region_valid) and is never an all-pixel loop per frame.
     pub fn setClickThrough(self: Window, on: bool) void {
@@ -1959,7 +2218,12 @@ pub const Window = struct {
         if (!on) {
             if (st.surface) |s| {
                 c.wl_surface_set_input_region(s, null); // receive over the whole surface
-                c.wl_surface_commit(s);
+            }
+            if (st.fixed_surface) |s| {
+                c.wl_surface_set_input_region(s, null);
+            }
+            if (st.surface) |s| {
+                c.wl_surface_commit(s); // parent commit also applies the synchronized fixed child
             }
         }
     }
@@ -2136,19 +2400,130 @@ fn freeBufferIndex(st: *State) ?usize {
 
 fn lockAt(st: *State, i: usize) Framebuffer {
     st.locked_index = i;
-    const logical: types.WindowSize = .{ .width = st.logical_width, .height = st.logical_height };
     const fb_size: types.WindowSize = .{ .width = st.width, .height = st.height };
-    const scale = effectiveContentScale(st.content_scale);
+    // Under `.fixed` the application sees one space at scale 1.0: logical size equals the framebuffer
+    // (ADR-030 R2). The window's surface-local size stays in st.logical_* for geometry and CSD.
+    const logical: types.WindowSize = switch (st.fb_mode) {
+        .fixed => fb_size,
+        .logical, .physical => .{ .width = st.logical_width, .height = st.logical_height },
+    };
     return .{
         .pixels = st.buffers[i].pixels,
         .width = st.width,
         .height = st.height,
         .logical_size = logical,
         .framebuffer_size = fb_size,
-        .content_scale = scale,
+        .content_scale = reportedContentScale(st, st.content_scale),
         .scale_epoch = st.scale_epoch,
         .state = st,
     };
+}
+
+/// Present path for `.fixed`: parent 1×1 letterbox background + synchronized fixed content subsurface.
+/// Viewport destinations and subsurface position are issued only when the mapping placement changes.
+fn presentFixed(st: *State, buf: *ShmBuffer, mapping: types.PresentMapping) void {
+    const parent = st.surface orelse return;
+    const parent_vp = st.parent_viewport orelse return;
+    const child = st.fixed_surface orelse return;
+    const child_sub = st.fixed_subsurface orelse return;
+    const child_vp = st.fixed_viewport orelse return;
+
+    // A window with no area: skip protocol requests for this frame; unlock without marking the buffer busy
+    // (nothing was submitted to the compositor, so no release will arrive).
+    if (mapping.dst_size.width == 0 or mapping.dst_size.height == 0) {
+        st.locked_index = null;
+        return;
+    }
+
+    const scale = effectiveContentScale(st.content_scale);
+    const sl = mappingInSurfaceLocal(mapping, scale);
+    if (sl.dst_size.width == 0 or sl.dst_size.height == 0 or sl.viewport.width == 0 or sl.viewport.height == 0) {
+        st.locked_index = null;
+        return;
+    }
+
+    const placement_dirty = st.parent_dst_dirty or st.fixed_dst_dirty or
+        presentMappingPlacementChanged(st.fixed_mapping, mapping);
+    st.fixed_mapping = mapping;
+
+    // Parent and child buffer scale are fixed at 1 under `.fixed` (magnification is viewport-only).
+    if (st.compositor_version >= 3 and st.buffer_scale_dirty) {
+        c.wl_surface_set_buffer_scale(parent, 1);
+        c.wl_surface_set_buffer_scale(child, 1);
+        st.buffer_scale_dirty = false;
+    }
+
+    // Source rectangles: once each. Parent is the 1×1 background; child is the full framebuffer.
+    if (!st.parent_source_configured) {
+        c.wp_viewport_set_source(parent_vp, wlFixedFromInt(0), wlFixedFromInt(0), wlFixedFromInt(1), wlFixedFromInt(1));
+        st.parent_source_configured = true;
+    }
+    if (!st.fixed_source_configured) {
+        const fb_w: i32 = @intCast(st.width);
+        const fb_h: i32 = @intCast(st.height);
+        c.wp_viewport_set_source(child_vp, wlFixedFromInt(0), wlFixedFromInt(0), wlFixedFromInt(fb_w), wlFixedFromInt(fb_h));
+        st.fixed_source_configured = true;
+    }
+
+    // Destination and position: only when the mapping (or a dirty flag from resize/scale) changes.
+    if (placement_dirty) {
+        const parent_w: i32 = @intCast(sl.viewport.width);
+        const parent_h: i32 = @intCast(sl.viewport.height);
+        const dst_w: i32 = @intCast(sl.dst_size.width);
+        const dst_h: i32 = @intCast(sl.dst_size.height);
+        c.wp_viewport_set_destination(parent_vp, parent_w, parent_h);
+        c.wp_viewport_set_destination(child_vp, dst_w, dst_h);
+        c.wl_subsurface_set_position(child_sub, sl.origin.x, sl.origin.y);
+        st.parent_dst_dirty = false;
+        st.fixed_dst_dirty = false;
+        st.ct_region_valid = false; // mapping moved: recompute click-through against the new placement
+    }
+
+    // Parent background buffer: attach once (pixel data is constant); destination updates alone thereafter.
+    if (!st.parent_bg_attached) {
+        if (st.parent_bg.buffer) |bg| {
+            c.wl_surface_attach(parent, bg, 0, 0);
+            if (st.compositor_version >= 4) {
+                c.wl_surface_damage_buffer(parent, 0, 0, 1, 1);
+            } else {
+                c.wl_surface_damage(parent, 0, 0, @intCast(sl.viewport.width), @intCast(sl.viewport.height));
+            }
+            st.parent_bg_attached = true;
+        }
+    } else if (placement_dirty) {
+        // Destination size changed: damage the parent surface in surface-local units.
+        c.wl_surface_damage(parent, 0, 0, @intCast(sl.viewport.width), @intCast(sl.viewport.height));
+    }
+
+    // Fixed framebuffer → child surface every frame.
+    const buf_w: i32 = @intCast(st.width);
+    const buf_h: i32 = @intCast(st.height);
+    c.wl_surface_attach(child, buf.buffer, 0, 0);
+    if (st.compositor_version >= 4) {
+        c.wl_surface_damage_buffer(child, 0, 0, buf_w, buf_h);
+    } else {
+        c.wl_surface_damage(child, 0, 0, @intCast(sl.dst_size.width), @intCast(sl.dst_size.height));
+    }
+
+    // Frame callback on the parent, same pacing rules as the covering path.
+    if (!st.frame_pending) {
+        if (c.wl_surface_frame(parent)) |cb| {
+            _ = c.wl_callback_add_listener(cb, &frame_listener, st);
+            st.frame_callback = cb;
+            st.frame_pending = true;
+            st.frame_deadline = common.getTime() + frame_timeout_secs;
+        }
+    }
+
+    if (st.click_through) refreshInputRegion(st, buf, parent);
+
+    // Child is synchronized: its pending state applies with the parent commit.
+    c.wl_surface_commit(child);
+    c.wl_surface_commit(parent);
+    _ = c.wl_display_flush(st.display);
+
+    buf.busy = true;
+    st.locked_index = null;
 }
 
 /// The size of an shm buffer (already checked for overflow and against wl_shm's int32 protocol boundary).
@@ -2284,6 +2659,44 @@ fn reallocBuffer(st: *State, i: usize) bool {
     return true;
 }
 
+/// Build the `.fixed` parent viewport, 1×1 letterbox background buffer, and synchronized content subsurface.
+/// Call after the parent `wl_surface` exists and before CSD subsurfaces are created.
+fn setupFixedSurfaceStructure(st: *State) Error!void {
+    const viewporter = st.viewporter orelse return error.Unsupported;
+    const subc = st.subcompositor orelse return error.Unsupported;
+    const comp = st.compositor orelse return error.WindowCreationFailed;
+    const parent = st.surface orelse return error.WindowCreationFailed;
+
+    st.parent_viewport = c.wp_viewporter_get_viewport(viewporter, parent) orelse return error.WindowCreationFailed;
+
+    // 1×1 background: opaque black, or fully transparent when the window is transparent.
+    if (!allocShmBufferSized(st, &st.parent_bg, 1, 1)) return error.WindowCreationFailed;
+    if (st.parent_bg.pixels.len > 0) {
+        st.parent_bg.pixels[0] = if (st.transparent) 0x00000000 else 0xFF000000;
+    }
+
+    const fixed_surf = c.wl_compositor_create_surface(comp) orelse return error.WindowCreationFailed;
+    const fixed_sub = c.wl_subcompositor_get_subsurface(subc, fixed_surf, parent) orelse {
+        c.wl_surface_destroy(fixed_surf);
+        return error.WindowCreationFailed;
+    };
+    // Synchronized so attach / damage / viewport / position apply with the parent commit.
+    c.wl_subsurface_set_sync(fixed_sub);
+    const fixed_vp = c.wp_viewporter_get_viewport(viewporter, fixed_surf) orelse {
+        c.wl_subsurface_destroy(fixed_sub);
+        c.wl_surface_destroy(fixed_surf);
+        return error.WindowCreationFailed;
+    };
+    st.fixed_surface = fixed_surf;
+    st.fixed_subsurface = fixed_sub;
+    st.fixed_viewport = fixed_vp;
+    st.parent_source_configured = false;
+    st.fixed_source_configured = false;
+    st.parent_dst_dirty = true;
+    st.fixed_dst_dirty = true;
+    st.parent_bg_attached = false;
+}
+
 /// Free the allocated resources, null-checking each. Shared by create's errdefer and by destroy.
 fn teardown(st: *State) void {
     if (st.frame_callback) |cb| {
@@ -2296,6 +2709,12 @@ fn teardown(st: *State) void {
         if (b.fd >= 0) _ = close(b.fd);
         b.* = .{};
     }
+    // Destroy fixed parent background buffer with the other shm buffers (before shm itself).
+    if (st.parent_bg.buffer) |b| c.wl_buffer_destroy(b);
+    if (st.parent_bg.map_ptr) |p| _ = munmap(p, st.parent_bg.map_size);
+    if (st.parent_bg.fd >= 0) _ = close(st.parent_bg.fd);
+    st.parent_bg = .{};
+    st.parent_bg_attached = false;
     // the input resources
     if (st.keyboard) |k| c.wl_keyboard_destroy(k);
     if (st.pointer) |p| c.wl_pointer_destroy(p);
@@ -2323,6 +2742,13 @@ fn teardown(st: *State) void {
     if (st.cursor_theme) |t| c.wl_cursor_theme_destroy(t);
     st.cursor_surface = null;
     st.cursor_theme = null;
+    // Fixed content: viewport → subsurface → surface, before CSD and the parent surface.
+    if (st.fixed_viewport) |vp| c.wp_viewport_destroy(vp);
+    if (st.fixed_subsurface) |ss| c.wl_subsurface_destroy(ss);
+    if (st.fixed_surface) |s| c.wl_surface_destroy(s);
+    st.fixed_viewport = null;
+    st.fixed_subsurface = null;
+    st.fixed_surface = null;
     // The decoration: children first. The decoration object is destroyed before the xdg_toplevel.
     if (st.deco_obj) |d| c.zxdg_toplevel_decoration_v1_destroy(d);
     st.deco_obj = null;
@@ -2330,7 +2756,12 @@ fn teardown(st: *State) void {
     if (st.xdg_surface) |x| c.xdg_surface_destroy(x);
     // The CSD subsurfaces are destroyed before the parent content surface.
     destroyCsd(st);
+    // Parent viewport before the parent surface; viewporter manager after every viewport.
+    if (st.parent_viewport) |vp| c.wp_viewport_destroy(vp);
+    st.parent_viewport = null;
     if (st.surface) |s| c.wl_surface_destroy(s);
+    if (st.viewporter) |vp| c.wp_viewporter_destroy(vp);
+    st.viewporter = null;
     if (st.deco_manager) |m| c.zxdg_decoration_manager_v1_destroy(m);
     if (st.subcompositor) |sc| c.wl_subcompositor_destroy(sc);
     st.deco_manager = null;
@@ -2388,4 +2819,85 @@ test "effectiveContentScale corrects a non-positive or non-finite value to 1.0" 
     try std.testing.expectEqual(@as(f32, 1.0), effectiveContentScale(-1.0));
     try std.testing.expectEqual(@as(f32, 1.0), effectiveContentScale(std.math.nan(f32)));
     try std.testing.expectEqual(@as(f32, 1.0), effectiveContentScale(std.math.inf(f32)));
+}
+
+test "effectiveFramebufferSize .fixed returns the carried size, independent of scale" {
+    const fixed: FramebufferMode = .{ .fixed = .{ .width = 640, .height = 400 } };
+    const logical: WindowSize = .{ .width = 1920, .height = 1080 };
+    for ([_]f32{ 1.0, 1.5, 2.0, 3.0 }) |s| {
+        const fb = effectiveFramebufferSize(fixed, logical, s);
+        try std.testing.expectEqual(@as(u32, 640), fb.width);
+        try std.testing.expectEqual(@as(u32, 400), fb.height);
+    }
+}
+
+test "mappingInSurfaceLocal converts both edges rather than a float framebuffer ratio" {
+    // Physical letterbox 180,60..820,540 in a 1000×600 window at scale 2 → surface-local by edge conversion.
+    const physical: types.PresentMapping = .{
+        .origin = .{ .x = 180, .y = 60 },
+        .dst_size = .{ .width = 640, .height = 480 },
+        .viewport = .{ .width = 1000, .height = 600 },
+        .fb_size = .{ .width = 320, .height = 240 },
+        .app_size = .{ .width = 320, .height = 240 },
+    };
+    const sl = mappingInSurfaceLocal(physical, 2.0);
+    try std.testing.expectEqual(@as(i32, 90), sl.origin.x);
+    try std.testing.expectEqual(@as(i32, 30), sl.origin.y);
+    try std.testing.expectEqual(@as(u32, 320), sl.dst_size.width);
+    try std.testing.expectEqual(@as(u32, 240), sl.dst_size.height);
+    try std.testing.expectEqual(@as(u32, 500), sl.viewport.width);
+    try std.testing.expectEqual(@as(u32, 300), sl.viewport.height);
+    // Framebuffer size is not a window measurement and is left alone.
+    try std.testing.expectEqual(@as(u32, 320), sl.fb_size.width);
+}
+
+test "fixedInputRectFromFramebufferSpan subtracts the mapping origin" {
+    const mapping = types.PresentMapping.letterbox(.{ .width = 1000, .height = 600 }, .{ .width = 320, .height = 200 });
+    // Full framebuffer maps onto the destination; after origin subtract the child-local physical
+    // rectangle starts at 0,0 and has the destination size.
+    const full = fixedInputRectFromFramebufferSpan(mapping, 1.0, 0, 0, 320, 200);
+    try std.testing.expectEqual(@as(i32, 0), full.x);
+    try std.testing.expectEqual(@as(i32, 0), full.y);
+    try std.testing.expectEqual(@as(i32, @intCast(mapping.dst_size.width)), full.w);
+    try std.testing.expectEqual(@as(i32, @intCast(mapping.dst_size.height)), full.h);
+
+    // A one-pixel span at the top-left of the framebuffer stays near the child origin.
+    const corner = fixedInputRectFromFramebufferSpan(mapping, 1.0, 0, 0, 1, 1);
+    try std.testing.expectEqual(@as(i32, 0), corner.x);
+    try std.testing.expectEqual(@as(i32, 0), corner.y);
+    try std.testing.expect(corner.w >= 1);
+    try std.testing.expect(corner.h >= 1);
+}
+
+test "presentMappingPlacementChanged ignores only identical placement fields" {
+    const a = types.PresentMapping.letterbox(.{ .width = 800, .height = 600 }, .{ .width = 320, .height = 200 });
+    var b = a;
+    try std.testing.expect(!presentMappingPlacementChanged(a, b));
+    b.origin.x += 1;
+    try std.testing.expect(presentMappingPlacementChanged(a, b));
+}
+
+test "zero-area mapping is detected before issuing viewport destinations" {
+    const empty = types.PresentMapping.letterbox(.{ .width = 0, .height = 0 }, .{ .width = 640, .height = 400 });
+    try std.testing.expectEqual(@as(u32, 0), empty.dst_size.width);
+    try std.testing.expectEqual(@as(u32, 0), empty.dst_size.height);
+}
+
+test "wlFixedFromInt matches the 24.8 protocol unit" {
+    try std.testing.expectEqual(@as(c.wl_fixed_t, 0), wlFixedFromInt(0));
+    try std.testing.expectEqual(@as(c.wl_fixed_t, 256), wlFixedFromInt(1));
+    try std.testing.expectEqual(@as(c.wl_fixed_t, 640 * 256), wlFixedFromInt(640));
+}
+
+test "fixedSourceFitsWlFixed accepts ordinary sizes and rejects beyond the 24.8 integer range" {
+    try std.testing.expect(fixedSourceFitsWlFixed(.{ .width = 640, .height = 400 }));
+    try std.testing.expect(fixedSourceFitsWlFixed(.{ .width = @intCast(max_wl_fixed_int), .height = 1 }));
+    try std.testing.expect(!fixedSourceFitsWlFixed(.{ .width = @as(u32, @intCast(max_wl_fixed_int)) + 1, .height = 1 }));
+    try std.testing.expect(!fixedSourceFitsWlFixed(.{ .width = 1, .height = @as(u32, @intCast(max_wl_fixed_int)) + 1 }));
+}
+
+test "isFixedMode is true only for the fixed tag" {
+    try std.testing.expect(isFixedMode(.{ .fixed = .{ .width = 1, .height = 1 } }));
+    try std.testing.expect(!isFixedMode(.logical));
+    try std.testing.expect(!isFixedMode(.physical));
 }

@@ -289,6 +289,24 @@ pub fn generateXdgDecorationPrivateCode(b: *std.Build) std.Build.LazyPath {
     return cmd.addOutputFileArg("xdg-decoration-unstable-v1-protocol.c");
 }
 
+/// Generate `viewporter-client-protocol.h` and return its parent directory.
+pub fn generateViewporterClientHeaderDir(b: *std.Build) std.Build.LazyPath {
+    const cmd = b.addSystemCommand(&.{
+        "sh",                                                                                                                              "-c",
+        "wayland-scanner client-header \"$(pkg-config --variable=pkgdatadir wayland-protocols)/stable/viewporter/viewporter.xml\" \"$1\"", "sh",
+    });
+    return cmd.addOutputFileArg("viewporter-client-protocol.h").dirname();
+}
+
+/// Generate `viewporter-protocol.c` (marshalling body).
+pub fn generateViewporterPrivateCode(b: *std.Build) std.Build.LazyPath {
+    const cmd = b.addSystemCommand(&.{
+        "sh",                                                                                                                             "-c",
+        "wayland-scanner private-code \"$(pkg-config --variable=pkgdatadir wayland-protocols)/stable/viewporter/viewporter.xml\" \"$1\"", "sh",
+    });
+    return cmd.addOutputFileArg("viewporter-protocol.c");
+}
+
 // ============================================================================
 // Shared executable-side link helpers
 //
@@ -309,6 +327,7 @@ pub fn linkWaylandExe(b: *std.Build, exe: *std.Build.Step.Compile) void {
     exe.root_module.linkSystemLibrary("wayland-cursor", .{});
     exe.root_module.addCSourceFile(.{ .file = generateXdgShellPrivateCode(b) });
     exe.root_module.addCSourceFile(.{ .file = generateXdgDecorationPrivateCode(b) });
+    exe.root_module.addCSourceFile(.{ .file = generateViewporterPrivateCode(b) });
 }
 
 /// Windows: system libs + GUI subsystem. `backend` must be `.gdi` or `.d3d11`.

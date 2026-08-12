@@ -1150,7 +1150,7 @@ pub fn build(b: *std.Build) void {
     // Rooting each test module directly at its backend file and building it with the same
     // `createPlatformModule` helper the production module uses applies the `linkSystemLibrary`
     // calls (X11/Xext for x11; wayland-client/wayland-cursor/xkbcommon plus the generated
-    // xdg-shell/xdg-decoration client headers for wayland) that resolving each backend's
+    // xdg-shell/xdg-decoration/viewporter client headers for wayland) that resolving each backend's
     // `@cImport` needs, with no extra native archive.
     if (target_os == .linux) {
         const platform_linux_x11_test_mod = platform.createPlatformModule(

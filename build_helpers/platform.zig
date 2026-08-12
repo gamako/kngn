@@ -121,12 +121,13 @@ pub fn configurePlatformModule(
         },
         .wayland => {
             // platform_linux_wayland.zig `@cImport`s wayland-client / cursor / xkbcommon
-            // plus generated xdg-shell / xdg-decoration headers.
+            // plus generated xdg-shell / xdg-decoration / viewporter headers.
             mod.linkSystemLibrary("wayland-client", .{});
             mod.linkSystemLibrary("wayland-cursor", .{});
             mod.linkSystemLibrary("xkbcommon", .{});
             mod.addIncludePath(consumer.generateXdgShellClientHeaderDir(b));
             mod.addIncludePath(consumer.generateXdgDecorationClientHeaderDir(b));
+            mod.addIncludePath(consumer.generateViewporterClientHeaderDir(b));
         },
         // macOS uses platform.h via the include path already on the module; native .o is exe-side.
         // Windows uses extern fn (no @cImport); system libs are exe-side.
