@@ -100,7 +100,8 @@ class MetalRenderer: NSObject, MTKViewDelegate {
     private var callback: FrameCallback?
     private var userdata: UnsafeMutableRawPointer?
 
-    // drawableSizeWillChange only records a pending value on the view side (resources are reallocated on the next lock).
+    // drawableSizeWillChange notifies the view: .logical/.physical may resize framebuffer resources;
+    // .fixed only remeasures the viewport (CPU buffer and texture stay fixed).
     weak var metricsOwner: MetalFramebufferView?
 
     // ========================================
@@ -121,6 +122,11 @@ class MetalRenderer: NSObject, MTKViewDelegate {
 
     // The flag telling draw(in:) that this is a manual present (starting from present() → view.draw()).
     private var manualPresentPending = false
+
+    // Manual-present handoff only: set by presentManual, taken and cleared in draw(in:) before
+    // submitFrame. Not read by the callback path. Failed submits do not retain it for later frames;
+    // the facade supplies a fresh mapping on every present.
+    private var pendingPresentMapping: PlatformPresentMapping? = nil
 
     // performance measurement
     private var lastFrameTime: CFAbsoluteTime
@@ -191,7 +197,7 @@ class MetalRenderer: NSObject, MTKViewDelegate {
         }
     }
 
-    // Only the new pending size and scale are recorded. The CPU buffer and the texture are reallocated on the next lock.
+    // Forwards drawable size changes to the view (viewport remeasure; resource resize depends on sizing).
     func mtkView(_ view: MTKView, drawableSizeWillChange size: CGSize) {
         metricsOwner?.notePendingDrawableChange(size: size)
     }
@@ -206,13 +212,17 @@ class MetalRenderer: NSObject, MTKViewDelegate {
 
         if isManual {
             // manual mode: the caller has already written into the current slot obtained from lockFramebuffer().
-            if submitFrame(view: view, slotIndex: currentSlotIndex) {
+            // Take the mapping before submit so a failed encode cannot leave it for a later callback frame.
+            let mapping = pendingPresentMapping
+            pendingPresentMapping = nil
+            if submitFrame(view: view, slotIndex: currentSlotIndex, mapping: mapping) {
                 currentSlotIndex = (currentSlotIndex + 1) % slotCount
             }
         } else if let callback = callback {
             // The callback / display-link path (unused by the Zig facade, whose callback is nil; kept for symmetry with objc and swift).
+            // Always pass nil: this path never reads manual-present state.
             callback(slotBuffers[currentSlotIndex], Int32(width), Int32(height), userdata)
-            if submitFrame(view: view, slotIndex: currentSlotIndex) {
+            if submitFrame(view: view, slotIndex: currentSlotIndex, mapping: nil) {
                 currentSlotIndex = (currentSlotIndex + 1) % slotCount
             }
 #if KNGN_ENABLE_MASCOT
@@ -225,9 +235,11 @@ class MetalRenderer: NSObject, MTKViewDelegate {
     }
 
     // The shared path that submits the given slot to the GPU. Called from both manual and callback.
+    // `mapping` is non-nil only for manual present (facade destination). nil draws the full drawable
+    // without setViewport. A non-nil zero-area destination clears only (no quad).
     // Returns: true once it really submitted (then the caller advances the slot index).
     @discardableResult
-    private func submitFrame(view: MTKView, slotIndex: Int) -> Bool {
+    private func submitFrame(view: MTKView, slotIndex: Int, mapping: PlatformPresentMapping?) -> Bool {
         guard let pipelineState = self.pipelineState,
               let commandQueue = self.commandQueue,
               let texture = slotTextures[slotIndex] else {
@@ -258,7 +270,25 @@ class MetalRenderer: NSObject, MTKViewDelegate {
 
         renderEncoder.setRenderPipelineState(pipelineState)
         renderEncoder.setFragmentTexture(texture, index: 0)
-        renderEncoder.drawPrimitives(type: .triangleStrip, vertexStart: 0, vertexCount: 4)
+        // Clear covers the whole drawable (letterbox bars under a mapped present).
+        if let m = mapping {
+            // Manual present: facade-owned destination. Zero area → clear only (no quad).
+            if m.dst_width > 0 && m.dst_height > 0 {
+                // Origin is top-left in both the mapping and Metal's viewport.
+                renderEncoder.setViewport(MTLViewport(
+                    originX: Double(m.origin_x),
+                    originY: Double(m.origin_y),
+                    width: Double(m.dst_width),
+                    height: Double(m.dst_height),
+                    znear: 0.0,
+                    zfar: 1.0
+                ))
+                renderEncoder.drawPrimitives(type: .triangleStrip, vertexStart: 0, vertexCount: 4)
+            }
+        } else {
+            // No mapping: default viewport is the full drawable (Retina .logical upscale included).
+            renderEncoder.drawPrimitives(type: .triangleStrip, vertexStart: 0, vertexCount: 4)
+        }
         renderEncoder.endEncoding()
 
         // 4. present(drawable): displayed at the next display refresh (fifo).
@@ -322,8 +352,10 @@ class MetalRenderer: NSObject, MTKViewDelegate {
     }
 
     // The manual present. It does not touch the drawable but merely starts MTKView's draw cycle.
-    // The actual upload, encode and present happen inside draw(in:) → submitFrame().
-    func presentManual(view: MTKView) {
+    // The actual upload, encode and present happen inside draw(in:) → submitFrame(mapping:).
+    // `mapping` is handed to draw(in:) via pendingPresentMapping and cleared there before submit.
+    func presentManual(view: MTKView, mapping: PlatformPresentMapping) {
+        pendingPresentMapping = mapping
         manualPresentPending = true
         view.draw()
     }
@@ -398,7 +430,20 @@ class MetalFramebufferView: MTKView, PlatformBackendView {
     // logical and framebuffer sizes kept apart, plus the scale latch (the same shape as objc's Framebuffer)
     private var logicalWidth: Int = 1
     private var logicalHeight: Int = 1
-    private var physicalMode: Bool = false
+    private var sizing: PlatformFramebufferSizing = .logical
+    // Where the framebuffer goes inside the window for the frame being presented. Read by
+    // click-through sampling; the renderer receives the same value at present.
+    private var currentMapping = PlatformPresentMapping(
+        origin_x: 0, origin_y: 0,
+        dst_width: 1, dst_height: 1,
+        fb_width: 1, fb_height: 1,
+        window_width: 1, window_height: 1
+    )
+    // The content area in physical pixels, as of the most recent refresh (used by .fixed metrics).
+    private var viewportWidth: Int = 0
+    private var viewportHeight: Int = 0
+    // Real display backing scale. Under .fixed the public metrics report 1.0 instead; this stays the
+    // live scale for viewport measurement, input physicalisation, and drawable geometry.
     private var contentScale: CGFloat = 1.0
     private var pendingContentScale: CGFloat = 1.0
     private var scaleEpoch: UInt64 = 0
@@ -466,15 +511,15 @@ class MetalFramebufferView: MTKView, PlatformBackendView {
     var height: Int { return metalRenderer?.getHeight() ?? 0 }
     var initialFramebuffer: UnsafeMutablePointer<UInt32>? { return metalRenderer?.getCurrentBuffer() }
 
-    // present: does the existing presentManual(view:) plus refreshClickThrough, and returns the next buffer to write into.
-    // The size argument is taken for compatibility but ignored; the renderer's internal size is used.
-    // `mapping` is unused: this backend accepts only a framebuffer that covers the window, so the
-    // destination rectangle is the whole drawable. Magnifying a fixed framebuffer here needs a quad in
-    // the renderer, and until that exists the factory refuses the mode outright (docs/adr/030 R5).
+    // present: stores the facade mapping, drives presentManual, refreshes click-through, and returns
+    // the next CPU buffer to write into. The size argument is taken for compatibility but ignored.
     func present(framebuffer: UnsafeMutablePointer<UInt32>, width: Int, height: Int, mapping: PlatformPresentMapping) -> UnsafeMutablePointer<UInt32>? {
+        _ = framebuffer
+        _ = width
+        _ = height
         guard let renderer = metalRenderer else { return nil }
-        // Draw manually
-        renderer.presentManual(view: self)
+        currentMapping = mapping
+        renderer.presentManual(view: self, mapping: mapping)
 #if KNGN_ENABLE_MASCOT
         // Update the cursor-position test for click-through (returns immediately while clickThrough is off)
         refreshClickThrough()
@@ -568,8 +613,8 @@ class MetalFramebufferView: MTKView, PlatformBackendView {
 #endif
     }
 
-    func setupRenderer(width w: Int, height h: Int, callback: FrameCallback?, userdata: UnsafeMutableRawPointer?, physical: Bool) {
-        physicalMode = physical
+    func setupRenderer(width w: Int, height h: Int, callback: FrameCallback?, userdata: UnsafeMutableRawPointer?, sizing fbSizing: PlatformFramebufferSizing) {
+        sizing = fbSizing
         logicalWidth = max(1, w)
         logicalHeight = max(1, h)
         pendingLogicalWidth = logicalWidth
@@ -585,10 +630,25 @@ class MetalFramebufferView: MTKView, PlatformBackendView {
         contentScale = scale
         pendingContentScale = scale
         let (fw, fh) = effectiveFramebufferSize(
-            sizing: physical ? .physical : .logical,
+            sizing: fbSizing,
             logicalWidth: logicalWidth,
             logicalHeight: logicalHeight,
             scale: scale
+        )
+        if case .fixed = fbSizing {
+            // The application sees one space at scale 1.0, and that space is the framebuffer: the
+            // logical size it reads is the fixed size, not the window's.
+            logicalWidth = fw
+            logicalHeight = fh
+            pendingLogicalWidth = fw
+            pendingLogicalHeight = fh
+        }
+        // Until the first present the framebuffer maps onto itself, so click-through has something coherent.
+        currentMapping = PlatformPresentMapping(
+            origin_x: 0, origin_y: 0,
+            dst_width: UInt32(fw), dst_height: UInt32(fh),
+            fb_width: UInt32(fw), fb_height: UInt32(fh),
+            window_width: UInt32(fw), window_height: UInt32(fh)
         )
 
         guard let device = self.device else { return }
@@ -596,15 +656,21 @@ class MetalFramebufferView: MTKView, PlatformBackendView {
         renderer.metricsOwner = self
         metalRenderer = renderer
         self.delegate = renderer
-        NSLog("[\(IMPLEMENTATION_TYPE)] Framebuffer metrics: logical=\(logicalWidth)x\(logicalHeight) fb=\(fw)x\(fh) scale=\(String(format: "%.2f", Double(scale))) physical=\(physical ? 1 : 0)")
+        _ = refreshViewportSize()
+        NSLog("[\(IMPLEMENTATION_TYPE)] Framebuffer metrics: logical=\(logicalWidth)x\(logicalHeight) fb=\(fw)x\(fh) scale=\(String(format: "%.2f", Double(scale))) sizing=\(fbSizing)")
     }
 
-    // The pending record coming from mtkView drawableSizeWillChange (no resource is touched).
+    // The pending record coming from mtkView drawableSizeWillChange (no framebuffer resource is touched).
     func notePendingDrawableChange(size: CGSize) {
         _ = size
         refreshPendingContentScale()
         // For the size, setFrameSize (in logical points) is the primary source.
-        // Here only a missed scale change is caught (applyLatched re-checks on the next lock).
+        // A drawable change under .fixed remeasures the viewport so the next mapping matches the drawable.
+        if case .fixed = sizing {
+            if refreshViewportSize(), let cb = redrawCallback {
+                cb(redrawUserdata)
+            }
+        }
     }
 
     func refreshPendingContentScale() {
@@ -614,18 +680,42 @@ class MetalFramebufferView: MTKView, PlatformBackendView {
         pendingContentScale = live
     }
 
+    // The content area in physical pixels, recomputed from the current bounds and backing scale.
+    // Returns true when it changed. Called on geometry changes and at the lock boundary under .fixed;
+    // ordinary frames use the cached value from fillMetrics.
+    @discardableResult
+    func refreshViewportSize() -> Bool {
+        let (vw, vh) = viewportPhysicalSize(self, scale: pendingContentScale)
+        let changed = (vw != viewportWidth || vh != viewportHeight)
+        viewportWidth = vw
+        viewportHeight = vh
+        return changed
+    }
+
     func applyLatchedMetricsIfNeeded() {
         refreshPendingContentScale()
 
         let newScale = effectiveContentScale(pendingContentScale)
         let scaleChanging = abs(newScale - contentScale) > 1e-6
 
-        if !physicalMode {
+        switch sizing {
+        case .fixed:
+            // Framebuffer size, reported scale (1.0), and scale_epoch stay fixed. Only the real
+            // backing scale and the measured viewport may move, so the next mapping can track them.
+            if scaleChanging {
+                contentScale = newScale
+            }
+            refreshViewportSize()
+            hasPendingResize = false
+            return
+        case .logical:
             if scaleChanging {
                 contentScale = newScale
                 scaleEpoch &+= 1
             }
             return
+        case .physical:
+            break
         }
 
         guard let renderer = metalRenderer else { return }
@@ -668,19 +758,28 @@ class MetalFramebufferView: MTKView, PlatformBackendView {
         out.pointee.framebuffer_width = UInt32(fw)
         out.pointee.framebuffer_height = UInt32(fh)
         let scale = forQuery ? pendingContentScale : contentScale
-        out.pointee.content_scale = Float(effectiveContentScale(scale))
-        out.pointee.scale_epoch = scaleEpoch
-        // This backend accepts only a framebuffer that covers the window, so the viewport follows from
-        // the framebuffer rather than being measured: it *is* the window, in physical pixels under
-        // .physical and scaled up by the display under .logical.
-        if physicalMode {
-            out.pointee.viewport_width = UInt32(fw)
-            out.pointee.viewport_height = UInt32(fh)
+        // A fixed framebuffer reports 1.0 whatever the display does: the application is given one
+        // coordinate space. The real scale stays in contentScale for viewport and input physicalisation.
+        if case .fixed = sizing {
+            out.pointee.content_scale = 1.0
+            out.pointee.viewport_width = UInt32(viewportWidth)
+            out.pointee.viewport_height = UInt32(viewportHeight)
         } else {
-            let s = Double(effectiveContentScale(pendingContentScale))
-            out.pointee.viewport_width = UInt32((Double(fw) * s).rounded())
-            out.pointee.viewport_height = UInt32((Double(fh) * s).rounded())
+            out.pointee.content_scale = Float(effectiveContentScale(scale))
+            // Covering sizings: the framebuffer *is* the window, so the viewport follows from it.
+            switch sizing {
+            case .physical:
+                out.pointee.viewport_width = UInt32(fw)
+                out.pointee.viewport_height = UInt32(fh)
+            case .logical:
+                let s = Double(effectiveContentScale(pendingContentScale))
+                out.pointee.viewport_width = UInt32((Double(fw) * s).rounded())
+                out.pointee.viewport_height = UInt32((Double(fh) * s).rounded())
+            case .fixed:
+                break // handled above
+            }
         }
+        out.pointee.scale_epoch = scaleEpoch
     }
 
     func nativeEventScale() -> CGFloat {
@@ -697,16 +796,26 @@ class MetalFramebufferView: MTKView, PlatformBackendView {
         }
         if abs(s - pendingContentScale) > 1e-6 {
             pendingContentScale = s
-            if physicalMode, let cb = redrawCallback {
+            if case .fixed = sizing { refreshViewportSize() }
+            // .logical has nothing to redo. .physical rebinds at the next lock; .fixed needs a new mapping.
+            if case .logical = sizing {} else if let cb = redrawCallback {
                 cb(redrawUserdata)
             }
         }
     }
 
-    // Called by NSView on a resize. .physical only records the pending value, .logical resizes at once (the same shape as objc).
+    // Called by NSView on a resize.
+    // .fixed leaves the framebuffer alone and only remeasures the viewport.
+    // .physical records the pending value; .logical resizes at once (the same shape as objc/swift).
     override func setFrameSize(_ newSize: NSSize) {
         super.setFrameSize(newSize)
-        if physicalMode {
+        if case .fixed = sizing {
+            if refreshViewportSize(), let cb = redrawCallback {
+                cb(redrawUserdata)
+            }
+            return
+        }
+        if case .physical = sizing {
             var nw = Int(newSize.width)
             var nh = Int(newSize.height)
             if nw < 1 { nw = 1 }
@@ -892,16 +1001,35 @@ class MetalFramebufferView: MTKView, PlatformBackendView {
         let b = bounds
         let w = r.getWidth()
         let h = r.getHeight()
-        var passThrough = true // let it fall through when the cursor is outside the window or unknown
+        var passThrough = true // let it fall through when the cursor is outside the window, unknown, or over a letterbox bar
         if b.width > 0 && b.height > 0 &&
            local.x >= 0 && local.x < b.width && local.y >= 0 && local.y < b.height {
-            var px = Int(local.x / b.width * CGFloat(w))
-            var py = Int((1.0 - local.y / b.height) * CGFloat(h)) // to a top-left origin
-            if px >= w { px = w - 1 } // clamp what rounding at the right and bottom edges would push out (it would drop the last row)
-            if py >= h { py = h - 1 }
-            if px < 0 { px = 0 }
-            if py < 0 { py = 0 }
-            passThrough = (r.sampleAlpha(x: px, y: py) == 0)
+            var px = -1
+            var py = -1
+            switch sizing {
+            case .fixed:
+                // Invert the mapping with the same integer ratio the caller's inverse transform uses.
+                // A position over a bar falls outside the destination and passes through.
+                let scale = effectiveContentScale(pendingContentScale)
+                let dx = Int(floor(local.x * scale)) - Int(currentMapping.origin_x)
+                let dy = Int(floor((b.height - local.y) * scale)) - Int(currentMapping.origin_y)
+                if dx >= 0 && dy >= 0 &&
+                   dx < Int(currentMapping.dst_width) && dy < Int(currentMapping.dst_height) {
+                    px = dx * Int(currentMapping.fb_width) / Int(currentMapping.dst_width)
+                    py = dy * Int(currentMapping.fb_height) / Int(currentMapping.dst_height)
+                }
+            case .logical, .physical:
+                // The framebuffer covers the window, so the view rectangle is the whole of it.
+                px = Int(local.x / b.width * CGFloat(w))
+                py = Int((1.0 - local.y / b.height) * CGFloat(h)) // to a top-left origin
+                if px >= w { px = w - 1 } // clamp what rounding at the right and bottom edges would push out
+                if py >= h { py = h - 1 }
+                if px < 0 { px = 0 }
+                if py < 0 { py = 0 }
+            }
+            if px >= 0 && py >= 0 && px < w && py < h {
+                passThrough = (r.sampleAlpha(x: px, y: py) == 0)
+            }
         }
         if passThrough != clickThroughState { // only write the WindowServer state when the value has changed
             win.ignoresMouseEvents = passThrough
@@ -981,19 +1109,8 @@ func makePlatformBackendView(
     transparent: Bool,
     sizing: PlatformFramebufferSizing
 ) -> (any PlatformBackendView)? {
-    // A fixed framebuffer has to be magnified into a destination rectangle, which on this backend means
-    // a quad in the renderer rather than a layer frame. Until that exists the window is refused, so the
-    // caller is told the mode is unavailable rather than handed one that covers the window
-    // (docs/adr/030 R5).
-    var physical = false
-    switch sizing {
-    case .logical: break
-    case .physical: physical = true
-    case .fixed:
-        NSLog("[\(IMPLEMENTATION_TYPE)] A fixed-size framebuffer is not supported by this backend")
-        return nil
-    }
-    // Create the view for Metal
+    // Create the view for Metal. .fixed is accepted: the fixed size is handed to setupRenderer, and
+    // present applies the facade mapping as a Metal viewport over a full-drawable clear (letterbox).
     guard let metalDevice = MTLCreateSystemDefaultDevice() else {
         NSLog("[\(IMPLEMENTATION_TYPE)] Failed to create Metal device")
         return nil
@@ -1020,8 +1137,9 @@ func makePlatformBackendView(
     // defaults to true, so it changes no behaviour, but it makes the first-class backend contract of ADR-005 explicit.
     (metalView.layer as? CAMetalLayer)?.displaySyncEnabled = true
 
-    // Set up the renderer (under .physical the CPU buffer and the texture are allocated at the physical size)
-    metalView.setupRenderer(width: width, height: height, callback: callback, userdata: userdata, physical: physical)
+    // Set up the renderer from the full sizing (fixed width/height are not collapsed to a boolean).
+    // Drawable auto-resize stays at MTKView defaults so the drawable tracks the view, not the fb size.
+    metalView.setupRenderer(width: width, height: height, callback: callback, userdata: userdata, sizing: sizing)
 
     return metalView
 }

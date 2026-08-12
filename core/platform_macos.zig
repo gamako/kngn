@@ -30,13 +30,6 @@ const macos_native_backend = std.mem.eql(u8, build_options.platform_backend, "ob
 /// (objc/swift/metal), which structurally prevents an undefined symbol in an executable without them.
 const menu_c_abi = build_options.enable_menu and macos_native_backend;
 
-/// Whether this build's present can magnify a framebuffer into a letterbox. The two CALayer
-/// implementations place the content layer at the destination rectangle and let Core Animation
-/// magnify; Metal presents through a GPU drawable instead, and the quad that would do the same job
-/// there is not written yet, so a fixed framebuffer is refused rather than silently covering the
-/// window (ADR-030 R5, R8).
-const fixed_framebuffer_supported = !std.mem.eql(u8, build_options.platform_backend, "metal");
-
 // ============================================================================
 // The optional feature gates (ADR-013)
 // ============================================================================
@@ -478,7 +471,6 @@ pub const Window = struct {
     /// and borderlessness need the mascot opt-in, and fullscreen needs the fullscreen opt-in.
     /// Hot path declaration: initialisation only (a single window creation).
     pub fn createWithOptions(width: u32, height: u32, title: [:0]const u8, opts: types.WindowOptions) Error!Window {
-        if (comptime !fixed_framebuffer_supported) try types.refuseFixedFramebuffer(opts.fb_mode);
         if (comptime !mascot_enabled) {
             if (opts.transparent or opts.borderless) return error.Unsupported;
         }
