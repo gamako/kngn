@@ -22,6 +22,14 @@
 //! last row or column: a position outside the framebuffer is delivered as it is rather than clamped
 //! into the content (docs/adr/030 R4).
 //!
+//! `KNGN_FIXED_FB_TRANSPARENT=1` asks for a **transparent, borderless** window instead, with
+//! click-through on. That is the only way to see what the letterbox really is: in an opaque window it is
+//! black, and here it is *nothing* — the desktop shows through it, and a click over it falls through to
+//! whatever is behind rather than reaching this window (docs/adr/030 R4, R9). Clicks over the content
+//! still arrive and still print, so the two halves can be compared in one run. It is borderless because
+//! a frame would cover the bars, and because a resizable frame's edge swallows a click aimed at the
+//! outermost row of the framebuffer.
+//!
 //! **A backend whose present cannot magnify refuses the window** rather than handing back a framebuffer
 //! of a size that was not asked for (docs/adr/030 R5), so this sample needs one that can: on macOS the
 //! two CALayer backends (`-Dplatform=objc` or `-Dplatform=swift`), on Windows `-Dplatform=gdi`, and on
@@ -126,6 +134,10 @@ pub fn main() !void {
         }
     }
 
+    // A transparent window is where the letterbox stops being black and becomes nothing at all, which is
+    // the half of the contract an opaque window cannot show. Borderless goes with it (see the header).
+    const transparent = std.c.getenv("KNGN_FIXED_FB_TRANSPARENT") != null;
+
     try platform.init();
     defer platform.shutdown();
 
@@ -133,17 +145,21 @@ pub fn main() !void {
         window_size.width,
         window_size.height,
         "44: Fixed Framebuffer",
-        .{ .fb_mode = .{ .fixed = .{ .width = FB_WIDTH, .height = FB_HEIGHT } } },
+        .{
+            .fb_mode = .{ .fixed = .{ .width = FB_WIDTH, .height = FB_HEIGHT } },
+            .transparent = transparent,
+            .borderless = transparent,
+        },
     ) catch |err| {
         if (err == error.Unsupported) {
             // The one refusal this sample provokes, and the message says which builds can run it —
             // "Unsupported" on its own reads like a broken sample rather than a backend without a
             // letterboxed present yet.
             std.debug.print(
-                "This backend has no present that magnifies a framebuffer into a letterbox, so a fixed" ++
-                    " framebuffer is refused.\nRun it on one that has: macOS -Dplatform=objc or" ++
-                    " -Dplatform=swift, Windows -Dplatform=gdi, or the web.\n",
-                .{},
+                "Refused: this backend has no present that magnifies a framebuffer into a letterbox{s}.\n" ++
+                    "Run it on one that has: macOS -Dplatform=objc or -Dplatform=swift," ++
+                    " Windows -Dplatform=gdi, or the web.\n",
+                .{if (transparent) ", or no transparent window" else ""},
             );
             return;
         }
@@ -156,6 +172,12 @@ pub fn main() !void {
         "window {d}x{d} points, framebuffer {d}x{d} fixed. Resize the window: the framebuffer does not change.\n",
         .{ window_size.width, window_size.height, FB_WIDTH, FB_HEIGHT },
     );
+    if (transparent) {
+        // Per-pixel click-through: over a pixel the window has not drawn — every pixel of the letterbox —
+        // the click goes to the application behind instead of here (docs/adr/030 R4).
+        window.setClickThrough(true);
+        std.debug.print("transparent: the bars show the desktop through them, and swallow no clicks.\n", .{});
+    }
     std.debug.print("Click to print the framebuffer coordinate. ESC or Q quits.\n", .{});
 
     main_loop: while (window.pollEvents()) {

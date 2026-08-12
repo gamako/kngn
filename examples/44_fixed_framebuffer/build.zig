@@ -25,6 +25,9 @@ pub fn build(b: *std.Build) void {
         .platform_source = .{ .cwd_relative = PROJECT_ROOT ++ "/core/platform.zig" },
         .platform_include = .{ .cwd_relative = PROJECT_ROOT ++ "/platform" },
         .platform_root = b.path(PROJECT_ROOT ++ "/platform"),
+        // The transparent, borderless variant of the letterbox check needs the mascot opt-in; nothing
+        // else here does, and text input is off because this sample reads keys rather than characters.
+        .platform_features = .{ .enable_mascot = true, .enable_text_input = false },
         .extra = &.{
             .{ .name = "pixelops", .module = pixelops },
         },
