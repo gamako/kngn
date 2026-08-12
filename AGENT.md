@@ -187,6 +187,7 @@ kngn/
 │   ├── recipe/        # saving and replaying a sequence of command records (std plus serde). In kit
 │   ├── gui/           # the immediate-mode GUI (input, an ID stack, flex layout, drawing, widgets)
 │   ├── font/          # fonts (TrueType/OpenType outlines via sfnt/glyf/cff, plus bmfont; BDF lives in src/text.zig)
+│   ├── vector/        # analytic coverage rasterizer (area/cover, adaptive flatten). Not in kit
 │   ├── synth/         # the synth (Voice, VoicePool, Patch, the lock-free handover)
 │   ├── sound/         # in-memory playback (WAV decode plus an SE one-shot and BGM loop mixer). In kit
 │   ├── appshell/      # headless application state persistence (Preferences, WindowState, RecentFiles, DocumentHost). In kit
@@ -290,7 +291,7 @@ are implemented:
   gamepads, fullscreen, tilemaps, a GUI gallery and a torture suite, and more.
 - **Helpers**: sprite, animation, atlas, tilemap, camera, action_map, screen_transform,
   fixed_timestep, fps_counter and keyboard (`libs/gfx`), plus text (`src/`).
-- **Libraries**: `libs/png`, `libs/gui`, `libs/font`, `libs/synth`, `libs/sound`,
+- **Libraries**: `libs/png`, `libs/gui`, `libs/font`, `libs/vector`, `libs/synth`, `libs/sound`,
   `libs/pixelops`, `libs/gfx`, `libs/gmath`, `libs/serde`, `libs/recipe`,
   `libs/appshell`, `libs/modular`, `libs/paint`, `libs/viz`.
 - **Applications**: the pixel editor, the synth, and noodle (the modular patch canvas).
@@ -545,6 +546,7 @@ zig build test-png-roundtrip    # a PNG encode/decode round trip (plus the canva
 zig build test-png-format       # PNG format conversion
 zig build test-text             # the BDF parser plus text drawing
 zig build test-font             # libs/font (bmfont and so on)
+zig build test-vector           # libs/vector (analytic coverage rasterizer, adaptive flatten)
 zig build test-sprite           # sprite blending and drawing
 zig build test-pixelops         # libs/pixelops (SIMD versus scalar, div255 identities, clipBlit boundaries, fill32/fillRect32)
 zig build test-serde            # libs/serde (a container round trip, corruption detection, forward compatibility, fixed fixtures)

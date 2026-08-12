@@ -2398,10 +2398,23 @@ pub fn build(b: *std.Build) void {
     });
     font_test_mod.addImport("png", shared_modules.png.mod); // used by bmfont.zig
     font_test_mod.addImport("pixelops", shared_modules.pixelops.mod); // used by color.zig
+    font_test_mod.addImport("vector", shared_modules.vector.mod); // outline coverage rasterizer
     const font_test = b.addTest(.{ .root_module = font_test_mod });
     const run_font_test = b.addRunArtifact(font_test);
     const test_font_step = b.step("test-font", "Run libs/font unit tests");
     test_font_step.dependOn(&run_font_test.step);
+
+    // libs/vector tests (analytic coverage rasterizer + adaptive flatten)
+    const vector_test = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("libs/vector/src/lib.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    const run_vector_test = b.addRunArtifact(vector_test);
+    const test_vector_step = b.step("test-vector", "Run libs/vector coverage-rasterizer tests");
+    test_vector_step.dependOn(&run_vector_test.step);
 
     // libs/synth tests (SPSC ring / NoteQueue / atomic params / output tap)
     const synth_test_mod = b.createModule(.{
@@ -2723,6 +2736,7 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(test_gfx_step);
     test_step.dependOn(test_kit_step);
     test_step.dependOn(test_font_step);
+    test_step.dependOn(test_vector_step);
     test_step.dependOn(test_gui_step);
     test_step.dependOn(test_gui_leak_step);
     test_step.dependOn(gui_contract_step);
@@ -2800,6 +2814,7 @@ pub fn build(b: *std.Build) void {
     });
     bench_font_mod.addImport("png", bench_png_mod);
     bench_font_mod.addImport("pixelops", bench_pixelops_mod);
+    bench_font_mod.addImport("vector", shared_modules.vector.mod);
     const bench_canvas_core = b.createModule(.{
         .root_source_file = b.path("libs/paint/src/canvas.zig"),
         .target = target,
@@ -3371,6 +3386,7 @@ const SharedModules = struct {
     appshell: TaggedModule, // libs/appshell (settings / window / recent files)
     recipe: TaggedModule, // libs/recipe (CommandRecord-sequence save/replay; std + serde; kit-listed)
     paint: TaggedModule, // Former apps/editor/core (promoted to libs/paint under ADR-007 R6)
+    vector: TaggedModule, // libs/vector (analytic coverage rasterizer; not in kit)
     spectrogram: TaggedModule, // libs/viz (former apps/synth/spectrogram.zig)
     scope: TaggedModule, // libs/viz (former apps/synth/scope.zig)
     capture_types: TaggedModule, // Shared capture-input types (type-only, same pattern as platform_types)
@@ -3525,6 +3541,12 @@ const SharedModules = struct {
         link(gfx, types); // action_map MAX_GAMEPADS (type-only core)
         link(gfx, gmath); // TileMap collision queries
 
+        // libs/vector: analytic coverage rasterizer (std only). Not in kit; apps
+        // do not import it (same treatment as paint / modular / viz).
+        const vector: TaggedModule = .{ .layer = .lib, .name = "vector", .mod = b.createModule(.{
+            .root_source_file = b.path("libs/vector/src/lib.zig"),
+        }) };
+
         // libs/font: shared font abstraction + canonical pixel/geom primitives (below gui)
         // BMFont loader (bmfont.zig) depends on png to decode the PNG atlas.
         // External public module. dep.module("font"). Depends on png.
@@ -3534,6 +3556,7 @@ const SharedModules = struct {
             b.addModule("font", .{ .root_source_file = b.path("libs/font/src/lib.zig") }) };
         link(font, png);
         link(font, pixelops); // Color.blend in color.zig delegates here
+        link(font, vector); // outline coverage rasterizer
 
         // src/text.zig depends on font because it implements the shared Font IF (libs/font).
         const text_mod = b.createModule(.{
@@ -3734,6 +3757,7 @@ const SharedModules = struct {
             .appshell = appshell,
             .recipe = recipe,
             .paint = paint,
+            .vector = vector,
             .spectrogram = spectrogram,
             .scope = scope,
             .capture_types = capture_types,

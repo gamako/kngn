@@ -3591,3 +3591,41 @@ test "cache_bytes is always <= cache_cap" {
         try testing.expect(of.cache_bytes <= of.cache_cap);
     }
 }
+
+// Expected Fnv1a_32 of each glyph's 8bpp coverage. A mismatch is a
+// behaviour change in the coverage fill.
+test "glyph coverage hashes stay bit-identical" {
+    const a = testing.allocator;
+    const face = try FontFace.init(@import("text_layer.zig").default_font_bytes);
+    var of = OutlineFont.init(a, &face, 16);
+    defer of.deinit();
+
+    const W: u32 = 400;
+    const H: u32 = 80;
+    const px_buf = try a.alloc(u32, @as(usize, W) * H);
+    defer a.free(px_buf);
+    @memset(px_buf, 0xFF000000);
+    const target = RenderTarget{ .pixels = px_buf, .width = W, .height = H };
+    const clip = Rect{ .x = 0, .y = 0, .w = W, .h = H };
+    of.drawTo(target, .{ .x = 4, .y = 4 }, "ABgSO", Color.rgba(0xFF, 0xFF, 0xFF, 0xFF), clip, 1.0);
+
+    const expected = [_]struct { ch: u8, gid: u16, w: u32, h: u32, hash: u32 }{
+        .{ .ch = 'A', .gid = 4, .w = 16, .h = 15, .hash = 0x65A972AD },
+        .{ .ch = 'B', .gid = 15, .w = 16, .h = 15, .hash = 0xE6F0303D },
+        .{ .ch = 'g', .gid = 156, .w = 16, .h = 14, .hash = 0xB6980FC9 },
+        .{ .ch = 'S', .gid = 91, .w = 16, .h = 15, .hash = 0x4284E5A9 },
+        .{ .ch = 'O', .gid = 73, .w = 16, .h = 15, .hash = 0x726B97AD },
+    };
+
+    const q = of.physicalPxQ(1.0);
+    for (expected) |e| {
+        const gid = face.cmap.lookup(e.ch);
+        try testing.expectEqual(e.gid, gid);
+        const key = PhysicalGlyphKey{ .gid = gid, .physical_px_q = q };
+        const cg = of.cache.get(key) orelse return error.TestUnexpectedResult;
+        const bm = cg.bitmap orelse return error.TestUnexpectedResult;
+        try testing.expectEqual(e.w, bm.w);
+        try testing.expectEqual(e.h, bm.h);
+        try testing.expectEqual(e.hash, std.hash.Fnv1a_32.hash(bm.data));
+    }
+}
