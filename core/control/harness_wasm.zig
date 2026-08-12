@@ -146,6 +146,12 @@ pub const copilot = struct {
     pub fn setSharedExecutor(_: ?*command.Executor) void {}
     pub fn forgetSharedExecutor() void {}
     pub fn setNetsyncSessionActive(_: bool) void {}
+    pub const OverlayTextSink = struct {
+        ctx: *anyopaque,
+        apply: *const fn (ctx: *anyopaque, text: []const u8) anyerror!void,
+    };
+    pub fn setOverlayTextSink(_: ?OverlayTextSink) void {}
+    pub fn forgetOverlayTextSink() void {}
     pub fn isEnabled() bool {
         return false;
     }

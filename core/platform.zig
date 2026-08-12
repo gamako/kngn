@@ -931,6 +931,7 @@ pub fn shutdown() void {
     // The borrow is dropped first, so netsync and copilot never dereference the executor after the borrowed App is freed.
     netsync.forgetSharedExecutor();
     copilot.forgetSharedExecutor();
+    copilot.forgetOverlayTextSink();
     netsync.shutdown(); // setRouter(null) on the main thread; a no-op while disabled
     copilot.stopTransport(); // close the connected stream, then the listener (a no-op while disabled)
     if (runtime_null) {
@@ -1160,6 +1161,15 @@ pub const command_adapter = harness.command;
 pub fn setCommandExecutor(exec: ?*command.Executor) void {
     copilot.setSharedExecutor(exec);
     netsync.setSharedExecutor(exec); // applying a remote COMMIT (no_record); with none set, netsync falls back to dispatch
+}
+
+/// Where the copilot `overlay set` / `overlay clear` command delivers its text.
+/// Copilot does not parse the text; the application (typically `gui.Overlay`) does.
+/// Safe to call with copilot disabled (it only assigns a module variable).
+/// Unregister with `setOverlayTextSink(null)` before freeing the App; `shutdown` also drops the borrow.
+pub const OverlayTextSink = copilot.OverlayTextSink;
+pub fn setOverlayTextSink(sink: ?OverlayTextSink) void {
+    copilot.setOverlayTextSink(sink);
 }
 
 // ============================================================================

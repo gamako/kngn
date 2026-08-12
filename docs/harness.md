@@ -14,8 +14,8 @@ Phases, all implemented:
 - **Live control** (TCP loopback plus the `kngn ctl` CLI), the built-in
   `audio` and `stats` probes, and record → replay.
 - **A custom probe registry**: an application opts in with
-  `platform.registerProbe(...)` (the editor registers twelve, `canvas` and `undo` and
-  `tool` among them; the synth registers `voices` and `patch`). See "Adding a custom
+  `platform.registerProbe(...)` (the editor registers `canvas`, `undo`,
+  `tool` and others; the synth registers `voices` and `patch`). See "Adding a custom
   probe".
 - **Fully display-less** operation: `KNGN_HEADLESS=1` makes `platform.init()` skip
   the native `backend.init()` entirely and select `platform_null` at runtime. A
@@ -157,8 +157,9 @@ built-in. Currently:
   `bbox=none from=none to=none`), `palette`
   (`colors=N used=M top=[#RRGGBB:NN%,...]` — the palette size, the number of unique
   colours in the composite, and the top four), plus `timeline`, `panels`, `menu`,
-  `appshell`, `presence` and `drawlist` (the structure of the current frame's
-  `DrawList` — see "DrawList observability" below). Thirteen in total.
+  `appshell`, `presence`, `drawlist` (the structure of the current frame's
+  `DrawList` — see "DrawList observability" below) and `overlay` (the retained
+  AI overlay DrawList, same text form; empty is `cmds=0`). Fourteen in total.
   - `appshell` payload:
     `dirty=0|1 path=... confirm=none|close|new|open recent=N recent0=... recovery=pending|none modal=recovery|confirmation|size|none autosave=0|1 netsync=0|1 title=... geom=WxH pos=...`.
     `modal=` is the top-level modal kind (priority: recovery → confirmation → size → none).
@@ -241,7 +242,9 @@ command's line, not just as a pixel difference a human has to spot.
   / `rect_outline` / `image` carry their rect and clip; `line` carries both endpoints;
   `text` carries its position and its full string content, double-quoted and escaped
   (`\"`, `\\`, `\n`, `\r`, `\t`, `\u{XXXX}` for other control bytes) so the line stays
-  single-line even when the text itself has a literal newline. `image` never embeds
+  single-line even when the text itself has a literal newline. Colours are
+  **`#AARRGGBB` (alpha first)**: opaque yellow is `#FFFFCC00`, not `#FFCC00FF`
+  (that last form is magenta). `image` never embeds
   pixels — only `src_w`/`src_h` and a content hash (`pixfnv=#XXXXXXXX`, FNV-1a 32-bit
   over the raw pixel bytes). Every line ends with `offclip=0|1`: whether that command's
   own extent (its rect for `rect_filled`/`rect_outline`/`image`, both endpoints for
@@ -260,6 +263,38 @@ command's line, not just as a pixel difference a human has to spot.
   assert on (`expect drawlist offclip=0`, or a specific `text=N`). For a scene with
   genuinely static content (a fixed dialog, a paused canvas) asserting the full `hash`
   is fine and catches anything the counts alone would miss (e.g. a shifted rect).
+
+### Retained AI overlay (`overlay` / `overlay_set`)
+
+An agent can put arrows, highlights and labels on top of the application's own
+frame by sending the same DrawCmd text form `snapshot drawlist` writes. The list
+is **retained until an explicit clear** (copilot is an asynchronous transport,
+so resending every frame is not an option). Parse and composite live in
+`libs/gui` (`Overlay`); copilot only carries the text.
+
+- **Per-frame cost when empty**: one null check. `Overlay.render` returns at
+  once; it does not walk commands or write pixels.
+- **Command cap**: 256 commands per inject (sized to the 64 KiB wire limit).
+- **Colour**: `#AARRGGBB` (alpha first). Opaque yellow is `#FFFFCC00`.
+- **`image` cannot be injected**: the dump form does not carry pixels, so
+  `cmd=image` is an explicit parse error rather than a blank rectangle.
+- **An empty dump is an error.** Clearing is `overlay_clear` / `overlay clear`
+  only; garbage or a `cmds=N` header that does not match the command count is
+  also an error, and does not replace the retained list.
+- **Harness (replay / live)**: `action overlay_set <text>` replaces the list;
+  `action overlay_clear` clears it. `<text>` is one command fragment, so several
+  commands go on one line as repeated top-level `cmd=` groups:
+  `action overlay_set cmd=line ... color=#FFFFCC00 cmd=text ... text="label"`.
+- **Copilot**: `overlay set <text>` on one line, or `overlay set` followed by a
+  multi-line dump as the rest of the request; `overlay clear` clears. Copilot
+  does not parse the text — it hands it to the sink the application registered
+  with `platform.setOverlayTextSink`. That sink is independent of the action
+  registry, so the draw path stays up when the harness is disabled.
+- **Observe**: `digest overlay` / `snapshot overlay` use the same format as
+  `drawlist` (a stable hash plus per-kind counts, or the full dump).
+- **The draw path does not go through the action registry.** Registering
+  `overlay_set` is only an inject convenience for harness scripts. A normal run
+  (registry empty) still composites whatever the application last installed.
 
 ### Where a digest goes
 
@@ -417,8 +452,10 @@ for a shared command unit across undo and networking.
   before and is undoable), `palette_ramp <seed_hex> <n>` (an OKLCH lightness ramp,
   n=2..32, replacing the whole palette, `.reject_when_synced`),
   `palette_from_png <path>` (frequency extraction from a PNG replacing the whole
-  palette, up to 64, `.reject_when_synced`), and `palette_set <hex...>` (1..64 colours
-  replacing the whole palette, `.reject_when_synced`). The palette actions are
+  palette, up to 64, `.reject_when_synced`), `palette_set <hex...>` (1..64 colours
+  replacing the whole palette, `.reject_when_synced`), and `overlay_set` /
+  `overlay_clear` (the retained AI overlay; ephemeral, not recorded — see
+  "Retained AI overlay" above). The palette actions are
   document state (the `.pix` PLTE chunk, and part of a netsync SYNC), so a local change
   during a session is rejected. **`.pix` compatibility** is backward only: a v4 reader
   reads v2 and v3 (a v3 reader rejects schema > 3, so an older reader cannot read v4).

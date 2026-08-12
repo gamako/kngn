@@ -27,6 +27,14 @@ pub const DrawList = @import("draw.zig").DrawList;
 pub const drawlistDigest = @import("drawlist_probe.zig").digest;
 pub const drawlistDumpAlloc = @import("drawlist_probe.zig").dumpAlloc;
 
+/// Shared DrawCmd text form (verb table, serializer, parser). The dump written by
+/// `drawlistDumpAlloc` and the text an overlay inject parses are the same format.
+pub const draw_cmd_text = @import("draw_cmd_text.zig");
+
+/// Retained AI / harness overlay: parse the DrawCmd text form into an owned list
+/// and composite it after the application's own `render`. Empty is one null check.
+pub const Overlay = @import("overlay.zig").Overlay;
+
 pub const Font = @import("font.zig").Font;
 pub const Metrics = @import("font.zig").Metrics;
 pub const BitmapFont = @import("font.zig").BitmapFont;
@@ -241,4 +249,7 @@ test {
     _ = @import("stepgrid.zig");
     _ = @import("panel_host.zig");
     _ = @import("dnd.zig");
+    _ = @import("drawlist_probe.zig");
+    _ = @import("draw_cmd_text.zig");
+    _ = @import("overlay.zig");
 }

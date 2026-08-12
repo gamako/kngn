@@ -78,6 +78,25 @@ var command_log: command.CommandLog = undefined;
 var executor: command.Executor = undefined;
 /// The open transaction the wire's begin_tx, end_tx and cancel_tx manage (one at a time).
 var open_tx: ?command.TransactionHandle = null;
+/// Where an overlay inject lands. Copilot carries the text and does not parse it; the
+/// application (libs/gui's Overlay, typically) owns parse and draw. Unset means the
+/// `overlay` command fails. Safe to set with copilot disabled (it only assigns a module
+/// variable, the same no-op rule as `setSharedExecutor`).
+pub const OverlayTextSink = struct {
+    ctx: *anyopaque,
+    apply: *const fn (ctx: *anyopaque, text: []const u8) anyerror!void,
+};
+
+var overlay_sink: ?OverlayTextSink = null;
+
+pub fn setOverlayTextSink(sink: ?OverlayTextSink) void {
+    overlay_sink = sink;
+}
+
+pub fn forgetOverlayTextSink() void {
+    overlay_sink = null;
+}
+
 /// The application-owned shared executor. When it is set, neither the own executor nor the own log is used:
 /// - `action` **calls harness.findAction's run directly** (recording is centralised in the application's own wrapper;
 ///   going through the own executor would double-record against the application wrapper's executeAction, and with the
@@ -472,10 +491,13 @@ pub const ConnState = struct {
 };
 
 // ============================================================================
-// The command language (a subset of harness's, plus transaction control)
+// The command language (a subset of harness's, plus transaction control and overlay)
 //   observe: digest <probe> / snapshot <probe> <path>   … a failure is an `error: <reason>` line
 //   operate: action <name> [args...] / begin_tx [label] / end_tx / cancel_tx
 //            … success `<name> <msg>` / `ok tx=<id>` / `ok`; failure a `fail <name> <reason>` line
+//   overlay: overlay set [text] / overlay clear
+//            … the text is handed to OverlayTextSink unparsed; `set` with an empty rest
+//              of the line takes the remainder of the request (a multi-line dump)
 // ============================================================================
 
 fn executeCommand(conn_state: *ConnState, line: []const u8) void {
@@ -493,6 +515,8 @@ fn executeCommand(conn_state: *ConnState, line: []const u8) void {
         handleEndTx(conn_state);
     } else if (std.mem.eql(u8, cmd, "cancel_tx")) {
         handleCancelTx(conn_state);
+    } else if (std.mem.eql(u8, cmd, "overlay")) {
+        handleOverlayCmd(conn_state, &it);
     } else if (std.mem.eql(u8, cmd, "quit")) {
         // the application's lifetime is owned by the user (the dividing line against harness, which is for verification)
         failResp(conn_state, "quit", "unsupported (app lifetime is owned by the user)");
@@ -627,6 +651,29 @@ fn handleActionCmd(conn_state: *ConnState, it: *std.mem.TokenIterator(u8, .any))
     conn_state.appendResp("\n");
 }
 
+/// overlay set / overlay clear: the wire carries raw DrawCmd text. Copilot does not
+/// parse it. `overlay set` with nothing on the rest of the line takes the remainder
+/// of the request (so a multi-line dump can travel in one connection). An empty
+/// payload is a clear. The sink is independent of the action registry.
+fn handleOverlayCmd(conn_state: *ConnState, it: *std.mem.TokenIterator(u8, .any)) void {
+    const sub = it.next() orelse return failResp(conn_state, "overlay", "missing set or clear");
+    const sink = overlay_sink orelse return failResp(conn_state, "overlay", "no overlay sink");
+    if (std.mem.eql(u8, sub, "clear")) {
+        sink.apply(sink.ctx, "") catch |err| return failResp(conn_state, "overlay", @errorName(err));
+        conn_state.appendResp("ok\n");
+        return;
+    }
+    if (!std.mem.eql(u8, sub, "set")) return failResp(conn_state, "overlay", "unknown subcommand");
+    const rest = std.mem.trim(u8, it.rest(), " \t");
+    const payload = if (rest.len > 0) rest else blk: {
+        const rem = conn_state.req[conn_state.cursor..conn_state.req_len];
+        conn_state.cursor = conn_state.req_len;
+        break :blk rem;
+    };
+    sink.apply(sink.ctx, payload) catch |err| return failResp(conn_state, "overlay", @errorName(err));
+    conn_state.appendResp("ok\n");
+}
+
 fn handleBeginTx(conn_state: *ConnState, it: *std.mem.TokenIterator(u8, .any)) void {
     if (netsync_active) return failResp(conn_state, "begin_tx", "netsync session active (operate disabled)");
     if (open_tx != null) return failResp(conn_state, "begin_tx", "transaction already open");
@@ -675,6 +722,7 @@ fn resetCopilotForTest() void {
     netsync_active = false;
     enabled = false;
     shared_executor = null;
+    overlay_sink = null;
     harness.setExternalRegistryEnabled(false);
     // false does not reach action_registry, so disabling requires resetForTest.
     harness.action_registry.resetForTest();
@@ -1085,4 +1133,66 @@ test "copilot: 8 wiring the netsync session callback rejects an operate, and end
     const ok = handleRequest(&cs, "action ping y");
     try testing.expectEqualStrings("ping pong y\n", ok);
     try testing.expectEqual(@as(u32, 1), ac.calls);
+}
+
+const OverlaySinkCtx = struct {
+    last: [MAX_WIRE]u8 = undefined,
+    last_len: usize = 0,
+    calls: u32 = 0,
+
+    fn apply(ctx: *anyopaque, bytes: []const u8) anyerror!void {
+        const c: *OverlaySinkCtx = @ptrCast(@alignCast(ctx));
+        const n = @min(bytes.len, c.last.len);
+        @memcpy(c.last[0..n], bytes[0..n]);
+        c.last_len = n;
+        c.calls += 1;
+    }
+};
+
+test "copilot: overlay set reaches the sink when the action registry is empty" {
+    resetCopilotForTest();
+    try testing.expectEqual(@as(usize, 0), harness.action_registry.actionCount());
+    try testing.expect(!harness.action_registry.isEnabled());
+
+    var sink = OverlaySinkCtx{};
+    setOverlayTextSink(.{ .ctx = &sink, .apply = OverlaySinkCtx.apply });
+    defer setOverlayTextSink(null);
+
+    var cs: ConnState = undefined;
+    const resp = handleRequest(&cs, "overlay set cmd=rect_filled x=1 y=2 w=3 h=4 color=#FF0000FF");
+    try testing.expectEqualStrings("ok\n", resp);
+    try testing.expectEqual(@as(u32, 1), sink.calls);
+    try testing.expect(std.mem.indexOf(u8, sink.last[0..sink.last_len], "cmd=rect_filled") != null);
+    try testing.expectEqual(@as(usize, 0), harness.action_registry.actionCount());
+
+    const resp2 = handleRequest(&cs, "overlay clear");
+    try testing.expectEqualStrings("ok\n", resp2);
+    try testing.expectEqual(@as(u32, 2), sink.calls);
+    try testing.expectEqualStrings("", sink.last[0..sink.last_len]);
+}
+
+test "copilot: overlay set with an empty rest of the line takes the remainder of the request" {
+    resetCopilotForTest();
+    var sink = OverlaySinkCtx{};
+    setOverlayTextSink(.{ .ctx = &sink, .apply = OverlaySinkCtx.apply });
+    defer setOverlayTextSink(null);
+
+    var cs: ConnState = undefined;
+    const resp = handleRequest(&cs, "overlay set\ncmd=rect_filled x=1 y=2 w=3 h=4 color=#FF0000FF\ncmd=text x=0 y=0 color=#FFFFFFFF text=\"hi\"\n");
+    try testing.expectEqualStrings("ok\n", resp);
+    try testing.expect(std.mem.indexOf(u8, sink.last[0..sink.last_len], "cmd=rect_filled") != null);
+    try testing.expect(std.mem.indexOf(u8, sink.last[0..sink.last_len], "cmd=text") != null);
+}
+
+test "copilot: overlay without a sink fails, and an unknown subcommand fails" {
+    resetCopilotForTest();
+    var cs: ConnState = undefined;
+    try testing.expectEqualStrings("fail overlay no overlay sink\n", handleRequest(&cs, "overlay set cmd=line x0=0 y0=0 x1=1 y1=1 thickness=1 color=#FF000000"));
+    try testing.expectEqualStrings("fail overlay no overlay sink\n", handleRequest(&cs, "overlay clear"));
+
+    var sink = OverlaySinkCtx{};
+    setOverlayTextSink(.{ .ctx = &sink, .apply = OverlaySinkCtx.apply });
+    defer setOverlayTextSink(null);
+    try testing.expectEqualStrings("fail overlay unknown subcommand\n", handleRequest(&cs, "overlay paint"));
+    try testing.expectEqual(@as(u32, 0), sink.calls);
 }

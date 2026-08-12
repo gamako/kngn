@@ -668,6 +668,8 @@ const App = struct {
     brush_edges: brush_edge_cache.EdgeCache = .{},
     /// Ephemeral presence state (not held in Document/CommandLog).
     presence: actions.PresenceStore = .{},
+    /// Retained AI overlay (DrawCmd text via copilot/harness). Empty is a null check per frame.
+    ai_overlay: gui.Overlay = undefined,
     /// ── PanelHost. left/right/bottom + center. Persisted via Preferences ──
     panels: [6]gui.Panel = undefined,
     panel_host: gui.PanelHost = undefined,
@@ -3668,6 +3670,27 @@ fn undoDigest(ctx: *anyopaque, buf: []u8) []const u8 {
     }) catch buf[0..0];
 }
 
+/// overlay digest: the retained AI overlay DrawList (empty when unset).
+fn overlayDigest(ctx: *anyopaque, buf: []u8) []const u8 {
+    const app: *App = @ptrCast(@alignCast(ctx));
+    return gui.drawlistDigest(app.ai_overlay.retainedList(), buf);
+}
+fn overlaySnapshot(ctx: *anyopaque, allocator: std.mem.Allocator) anyerror![]u8 {
+    const app: *App = @ptrCast(@alignCast(ctx));
+    return gui.drawlistDumpAlloc(allocator, app.ai_overlay.retainedList());
+}
+
+/// Copilot overlay sink: empty text clears; otherwise replace the retained list.
+/// Does not go through the action registry (the draw path stays up when harness is off).
+fn overlayTextApply(ctx: *anyopaque, text: []const u8) anyerror!void {
+    const app: *App = @ptrCast(@alignCast(ctx));
+    if (text.len == 0) {
+        app.ai_overlay.clear();
+        return;
+    }
+    try app.ai_overlay.replaceFromText(text);
+}
+
 /// presence digest: ephemeral overlay state. Expired TTL entries are removed before output.
 fn presenceDigest(ctx: *anyopaque, buf: []u8) []const u8 {
     const app: *App = @ptrCast(@alignCast(ctx));
@@ -4630,6 +4653,22 @@ fn actionDiffMark(ctx: *anyopaque, args: []const u8, buf: []u8) anyerror![]const
     return "ok";
 }
 
+/// overlay_set / overlay_clear bypass recordedAction (ephemeral display, like presence).
+fn actionOverlaySet(ctx: *anyopaque, args: []const u8, buf: []u8) anyerror![]const u8 {
+    if (args.len == 0) return error.Empty;
+    try overlayTextApply(ctx, args);
+    const app = actionApp(ctx);
+    const n = app.ai_overlay.retainedList().cmds.items.len;
+    return std.fmt.bufPrint(buf, "ok cmds={d}", .{n}) catch "ok";
+}
+
+fn actionOverlayClear(ctx: *anyopaque, args: []const u8, buf: []u8) anyerror![]const u8 {
+    _ = buf;
+    try actions.parseNoArgs(args);
+    actionApp(ctx).ai_overlay.clear();
+    return "ok";
+}
+
 /// presence_* bypass recordedAction and do not touch Document/CommandLog/undo.
 fn actionPresencePoint(ctx: *anyopaque, args: []const u8, buf: []u8) anyerror![]const u8 {
     const app = actionApp(ctx);
@@ -5130,6 +5169,9 @@ const pixie_args_export_sheet: @FieldType(platform.Action, "args") = &.{
     .{ .name = "margin", .kind = "int", .optional = true, .desc = "gap between frames in px" },
 };
 // presence
+const pixie_args_overlay_set: @FieldType(platform.Action, "args") = &.{
+    .{ .name = "cmds", .kind = "string", .desc = "DrawList text: one or more cmd= groups" },
+};
 const pixie_args_presence_point: @FieldType(platform.Action, "args") = &.{
     .{ .name = "x", .kind = "int", .min = 0, .max = 255 },
     .{ .name = "y", .kind = "int", .min = 0, .max = 255 },
@@ -5362,6 +5404,9 @@ fn registerActions(app: *App) void {
     platform.registerAction(.{ .name = "shape", .ctx = app, .run = recordedAction("shape", .record), .network_policy = .relay, .desc = "draw shape line|rect|ellipse p0 p1 [fill]", .args = pixie_args_shape });
     platform.registerAction(.{ .name = "set_symmetry", .ctx = app, .run = recordedAction("set_symmetry", .record), .network_policy = .relay, .desc = "symmetry off|v|h|quad", .args = pixie_args_set_symmetry });
     platform.registerAction(.{ .name = "set_pixel_perfect", .ctx = app, .run = recordedAction("set_pixel_perfect", .record), .network_policy = .relay, .desc = "pixel-perfect pen 0|1", .args = pixie_args_set_pixel_perfect });
+    // retained AI overlay (bypasses recordedAction / CommandLog / undo; same path as the copilot overlay command)
+    platform.registerAction(.{ .name = "overlay_set", .ctx = app, .run = actionOverlaySet, .network_policy = .ephemeral, .desc = "replace the retained AI overlay from DrawCmd text", .args = pixie_args_overlay_set });
+    platform.registerAction(.{ .name = "overlay_clear", .ctx = app, .run = actionOverlayClear, .network_policy = .ephemeral, .desc = "clear the retained AI overlay", .args = pixie_args_none });
     // ephemeral presence (bypasses recordedAction / CommandLog / undo)
     platform.registerAction(.{ .name = "presence_point", .ctx = app, .run = actionPresencePoint, .network_policy = .ephemeral, .desc = "agent cursor / work position", .args = pixie_args_presence_point });
     platform.registerAction(.{ .name = "presence_highlight", .ctx = app, .run = actionPresenceHighlight, .network_policy = .ephemeral, .desc = "temporary canvas highlight rect", .args = pixie_args_presence_highlight });
@@ -7233,7 +7278,9 @@ fn appInit(gpa: std.mem.Allocator, io: std.Io) !*App {
             .height_buf = size_h_buf,
         },
         .size_dialog = null,
+        .ai_overlay = gui.Overlay.init(gpa),
     };
+    errdefer self.ai_overlay.deinit();
     errdefer self.preferences.deinit();
 
     // After App is finally placed, load GuiFont in-place → re-point ctx.font (self-ref lifetime).
@@ -7284,6 +7331,7 @@ fn appInit(gpa: std.mem.Allocator, io: std.Io) !*App {
     self.cmd_exec.log = &self.cmd_log;
     self.cmd_exec.adapter = .{ .ctx = self, .canUndo = adapterCanUndo, .applyUndo = adapterApplyUndo, .summarize = adapterSummarize };
     platform.setCommandExecutor(&self.cmd_exec);
+    platform.setOverlayTextSink(.{ .ctx = self, .apply = overlayTextApply });
     // history thumbnail capture after remote COMMIT apply (opaque hook).
     platform.setNetsyncPostApplyHook(self, App.netsyncPostApplyHook);
 
@@ -7301,6 +7349,7 @@ fn appInit(gpa: std.mem.Allocator, io: std.Io) !*App {
     platform.registerProbe(.{ .name = "menu", .ctx = self, .ext = "txt", .digest = menuDigest, .desc = "menu open/items/enabled/checked/pending_file_op" });
     platform.registerProbe(.{ .name = "appshell", .ctx = self, .ext = "txt", .digest = appshellDigest, .desc = "pixie appshell dirty/recent/recovery/modal/autosave/title/geometry state", .input_blocker = pixieInputBlocker });
     platform.registerProbe(.{ .name = "presence", .ctx = self, .ext = "txt", .digest = presenceDigest, .desc = "ephemeral presence overlay: count/point/highlight/suggest + per-peer coords" });
+    platform.registerProbe(.{ .name = "overlay", .ctx = self, .ext = "txt", .snapshot = overlaySnapshot, .digest = overlayDigest, .desc = "retained AI overlay DrawList (same text form as drawlist)" });
     platform.registerProbe(.{
         .name = Prof.probe_name,
         .ctx = self,
@@ -7324,6 +7373,8 @@ fn appDeinit(self: *App) void {
     const gpa = self.gpa;
     // Clear the hook before App teardown (same shape as the Executor teardown contract).
     platform.setNetsyncPostApplyHook(null, null);
+    platform.setOverlayTextSink(null);
+    self.ai_overlay.deinit();
     self.relay_chunks.deinit(gpa);
     if (self.native_menu_active) {
         if (self.os_window) |win| win.destroyMenu();
@@ -7906,6 +7957,12 @@ fn appFrameInner(self: *App, win: *platform.Window) !void {
         gui.render(
             .{ .pixels = fb.pixels, .width = phys_w, .height = phys_h },
             &self.ctx.draw_list,
+            self.ctx.font,
+            content_scale,
+        );
+        // Retained AI overlay, last so it sits on top. Empty is one null check.
+        self.ai_overlay.render(
+            .{ .pixels = fb.pixels, .width = phys_w, .height = phys_h },
             self.ctx.font,
             content_scale,
         );

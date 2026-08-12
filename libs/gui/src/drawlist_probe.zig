@@ -30,6 +30,7 @@ const std = @import("std");
 const Allocator = std.mem.Allocator;
 const draw_mod = @import("draw.zig");
 const geom = @import("geom.zig");
+const cmd_text = @import("draw_cmd_text.zig");
 
 pub const DrawCmd = draw_mod.DrawCmd;
 pub const DrawList = draw_mod.DrawList;
@@ -44,7 +45,7 @@ fn rectFullyInside(r: Rect, clip: Rect) bool {
 }
 
 fn colorBits(c: draw_mod.Color) u32 {
-    return @bitCast(c);
+    return cmd_text.colorBits(c);
 }
 
 fn hashRect(h: *std.hash.Fnv1a_32, r: Rect) void {
@@ -128,87 +129,16 @@ pub fn digest(dl: *const DrawList, buf: []u8) []const u8 {
     }) catch buf[0..0];
 }
 
-/// Appends a value formatted with `fmt` to `list`, falling back to an allocated scratch
-/// buffer for the rare field wider than the inline stack buffer (no field emitted by
-/// `appendCmdLine` is expected to exceed it; the fallback only guards against a future field).
-fn appendFmt(list: *std.ArrayList(u8), allocator: Allocator, comptime fmt: []const u8, args: anytype) !void {
-    var tmp: [128]u8 = undefined;
-    if (std.fmt.bufPrint(&tmp, fmt, args)) |s| {
-        try list.appendSlice(allocator, s);
-    } else |_| {
-        const s = try std.fmt.allocPrint(allocator, fmt, args);
-        defer allocator.free(s);
-        try list.appendSlice(allocator, s);
-    }
-}
-
-/// Appends `s` as a double-quoted, escaped token (so a `text` field with a space or a
-/// quote inside it does not break the one-line-per-command contract). The same escape
-/// table as a JSON string (`history_summary.zig`'s `appendJsonStr`), duplicated here
-/// because this file has no JSON dependency of its own.
-fn appendEscapedText(list: *std.ArrayList(u8), allocator: Allocator, s: []const u8) !void {
-    try list.append(allocator, '"');
-    for (s) |c| {
-        switch (c) {
-            '"' => try list.appendSlice(allocator, "\\\""),
-            '\\' => try list.appendSlice(allocator, "\\\\"),
-            '\n' => try list.appendSlice(allocator, "\\n"),
-            '\r' => try list.appendSlice(allocator, "\\r"),
-            '\t' => try list.appendSlice(allocator, "\\t"),
-            else => {
-                if (c < 0x20) {
-                    try appendFmt(list, allocator, "\\u{x:0>4}", .{c});
-                } else {
-                    try list.append(allocator, c);
-                }
-            },
-        }
-    }
-    try list.append(allocator, '"');
-}
-
-fn appendCmdLine(list: *std.ArrayList(u8), allocator: Allocator, cmd: DrawCmd) !void {
-    switch (cmd) {
-        .rect_filled => |c| try appendFmt(list, allocator, "cmd=rect_filled x={d} y={d} w={d} h={d} color=#{X:0>8} clip_x={d} clip_y={d} clip_w={d} clip_h={d} offclip={d}\n", .{
-            c.rect.x, c.rect.y, c.rect.w, c.rect.h, colorBits(c.color),
-            c.clip.x, c.clip.y, c.clip.w, c.clip.h, @intFromBool(!rectFullyInside(c.rect, c.clip)),
-        }),
-        .rect_outline => |c| try appendFmt(list, allocator, "cmd=rect_outline x={d} y={d} w={d} h={d} thickness={d} color=#{X:0>8} clip_x={d} clip_y={d} clip_w={d} clip_h={d} offclip={d}\n", .{
-            c.rect.x, c.rect.y, c.rect.w, c.rect.h, c.thickness,                                    colorBits(c.color),
-            c.clip.x, c.clip.y, c.clip.w, c.clip.h, @intFromBool(!rectFullyInside(c.rect, c.clip)),
-        }),
-        .line => |c| try appendFmt(list, allocator, "cmd=line x0={d} y0={d} x1={d} y1={d} thickness={d} color=#{X:0>8} clip_x={d} clip_y={d} clip_w={d} clip_h={d} offclip={d}\n", .{
-            c.p0.x,   c.p0.y,   c.p1.x,   c.p1.y,   c.thickness,                                                      colorBits(c.color),
-            c.clip.x, c.clip.y, c.clip.w, c.clip.h, @intFromBool(!(c.clip.contains(c.p0) and c.clip.contains(c.p1))),
-        }),
-        .text => |c| {
-            try appendFmt(list, allocator, "cmd=text x={d} y={d} color=#{X:0>8} font={s} clip_x={d} clip_y={d} clip_w={d} clip_h={d} offclip={d} text=", .{
-                c.pos.x,                               c.pos.y,  colorBits(c.color), if (c.font == null) "default" else "custom",
-                c.clip.x,                              c.clip.y, c.clip.w,           c.clip.h,
-                @intFromBool(!c.clip.contains(c.pos)),
-            });
-            try appendEscapedText(list, allocator, c.text);
-            try list.append(allocator, '\n');
-        },
-        .image => |c| {
-            const pixfnv = std.hash.Fnv1a_32.hash(std.mem.sliceAsBytes(c.pixels));
-            try appendFmt(list, allocator, "cmd=image x={d} y={d} w={d} h={d} src_w={d} src_h={d} pixfnv=#{X:0>8} clip_x={d} clip_y={d} clip_w={d} clip_h={d} offclip={d}\n", .{
-                c.rect.x, c.rect.y, c.rect.w, c.rect.h, c.src_w,                                        c.src_h, pixfnv,
-                c.clip.x, c.clip.y, c.clip.w, c.clip.h, @intFromBool(!rectFullyInside(c.rect, c.clip)),
-            });
-        },
-    }
-}
-
 /// Full structure dump: `cmds=<N>` then one line per command, oldest first (draw order).
 /// Unlike `digest`, `image` pixels are never embedded (only their dimensions and a content
 /// hash); `text` content is embedded in full, unescaped-length included.
+/// Each command line is emitted by walking the shared verb table in `draw_cmd_text.zig`.
 pub fn dumpAlloc(allocator: Allocator, dl: *const DrawList) Allocator.Error![]u8 {
     var list: std.ArrayList(u8) = .empty;
     errdefer list.deinit(allocator);
-    try appendFmt(&list, allocator, "cmds={d}\n", .{dl.cmds.items.len});
+    try cmd_text.appendFmt(&list, allocator, "cmds={d}\n", .{dl.cmds.items.len});
     for (dl.cmds.items) |cmd| {
-        try appendCmdLine(&list, allocator, cmd);
+        try cmd_text.appendCmd(&list, allocator, cmd);
     }
     return list.toOwnedSlice(allocator);
 }
