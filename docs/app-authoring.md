@@ -245,6 +245,36 @@ snapshot fb
 quit
 ```
 
+## 6b. Frame pacing: what your backend does and does not guarantee
+
+Backends fall into two support tiers, and the tier decides how much of the pacing you have
+to do yourself. The definitions and the reasoning are in
+[adr/005](adr/005_platform-support-tiers-and-frame-pacing.md); what an application author
+needs from them is this:
+
+| Tier | Backends | What it means for you |
+|---|---|---|
+| **first-class** | macOS Metal, Windows D3D11-DXGI, Linux Wayland | present is fifo (synchronised to display refresh) and avoiding tearing is a guarantee. Pacing still belongs to your loop, but the backend holds the frame rate |
+| **best-effort** | Linux X11, Windows GDI | **strict vsync, low jitter, freedom from tearing and frame latency control are none of them guaranteed** |
+
+Three consequences worth designing for:
+
+- **A best-effort backend can tear.** X11 and GDI blit without waiting for vblank. Reducing
+  that on X11 is planned, and it will be a reduction rather than a promotion to the
+  first-class guarantee.
+- **`lockFramebuffer()` returning `null` is not a pacing signal you can rely on.** It means
+  "no frame slot right now, retry" and only some backends ever produce it (Wayland does,
+  paced by its frame callback; X11 and GDI currently always return non-null). **Do not
+  build a frame rate on waiting for it** — pace your loop yourself, with
+  `platform.framePaceUntil(deadline)` (what `Runtime(App)` already does for you) or a fixed
+  timestep (`kit.gfx.fixed_timestep`, and `examples/04_fixed_timestep`).
+- **Jitter is a property of the tier, not of your code.** If frame intervals wobble on X11
+  or GDI while the same application is steady on a first-class backend, that is the tier
+  showing through, and no amount of caller-side pacing removes it.
+
+macOS has one backend and it is first-class, so an application there gets the guarantees
+above without choosing anything ([adr/031](adr/031_metal-only-macos-backend.md)).
+
 ## 7. HiDPI: five concepts, one relationship
 
 Five quantities interact once a window's content scale is not 1, each documented in full on its

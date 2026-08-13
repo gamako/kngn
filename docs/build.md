@@ -74,7 +74,8 @@ build error.
 | Windows | `gdi` (default) / `d3d11` | Pure Zig (Win32/GDI directly / hand-written D3D11-DXGI COM) |
 
 The frame-pacing support tiers — first-class (Metal, D3D11-DXGI, Wayland) versus
-best-effort (X11, GDI) — are in [adr/005](adr/). macOS requires a Metal-capable device
+best-effort (X11, GDI) — are in [adr/005](adr/), and what they mean for an application's
+own loop is in [app-authoring.md](app-authoring.md). macOS requires a Metal-capable device
 and has no fallback backend ([adr/031](adr/)).
 
 ## Building and running
