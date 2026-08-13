@@ -175,6 +175,16 @@ this exact order end to end and is compiled and unit-tested by `zig build gate` 
 here — a doc-only example drifts the moment either side changes, while a compiled one is caught
 by the gate.
 
+**`DrawList.line` and a stroked path are different primitives.** Use
+`DrawList.line` (and `rect_outline`) for axis-aligned 1 px rules, widget
+chrome, and anything whose pixels must stay deterministic — it is an
+integer-thickness Bresenham span with no anti-aliasing. Use a path
+stroke (`beginPath` … `stroke`) when the line can sit at an arbitrary
+angle, needs a fractional width, or needs cap/join control and a
+smooth edge. Do not implement one in terms of the other: a Bresenham
+span and an analytic coverage stroke do not agree on pixels, and
+replacing the widget path would change every existing UI frame.
+
 ## 5. Native build
 
 - `.path` (or fetch) dependency on kngn with matching `target` / `optimize` / `platform`

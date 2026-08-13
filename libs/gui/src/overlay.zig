@@ -48,6 +48,7 @@ fn cloneCmd(arena: Allocator, cmd: DrawCmd) Allocator.Error!DrawCmd {
             .winding = c.winding,
             .aa = c.aa,
             .clip = c.clip,
+            .stroke = c.stroke,
         } },
         else => cmd,
     };

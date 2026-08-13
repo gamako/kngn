@@ -5,6 +5,7 @@ const geom = @import("geom.zig");
 const color_mod = @import("color.zig");
 const draw_mod = @import("draw.zig");
 const font_mod = @import("font.zig");
+const path_stroke = @import("path_stroke.zig");
 
 pub const Rect = geom.Rect;
 pub const Vec2 = geom.Vec2;
@@ -308,8 +309,19 @@ fn drawPath(
     const clip_t = Rect.intersect(cmd.clip, target_rect);
     if (clip_t.isEmpty() or cmd.verbs.len == 0) return;
 
-    flattenPath(draw_list, cmd.verbs, cmd.points, scale);
-    const bbox = bboxFromFlat(draw_list.path_flat_pts.items, clip_t) orelse return;
+    const keep_points = if (cmd.stroke) |st| st.cap != .butt else false;
+    flattenPath(draw_list, cmd.verbs, cmd.points, scale, keep_points);
+
+    var pts: []const draw_mod.Vec2f = draw_list.path_flat_pts.items;
+    var ends: []const usize = draw_list.path_contour_ends.items;
+    if (cmd.stroke) |st| {
+        const width = st.width * scale;
+        if (!(width > 0) or !std.math.isFinite(width)) return;
+        path_stroke.strokePolylines(draw_list, width, st.join, st.cap, st.miter_limit);
+        pts = draw_list.path_stroke_pts.items;
+        ends = draw_list.path_stroke_ends.items;
+    }
+    const bbox = bboxFromFlat(pts, clip_t) orelse return;
 
     // bbox.w is the intersection of the flattened AABB with clip ∩ target, so
     // it cannot exceed target.width. One row is then at most
@@ -344,8 +356,8 @@ fn drawPath(
             .dy = -@as(f32, @floatFromInt(y)),
         };
         vector.rasterizePolylinesInto(
-            asVectorPts(draw_list.path_flat_pts.items),
-            draw_list.path_contour_ends.items,
+            asVectorPts(pts),
+            ends,
             xform,
             bbox.w,
             this_h,
@@ -383,10 +395,12 @@ fn appendFlat(dl: *DrawList, p: draw_mod.Vec2f) void {
     dl.path_flat_pts.append(dl.alloc, p) catch @panic("drawPath: OOM");
 }
 
-fn flushContour(dl: *DrawList, start: usize) void {
+fn flushContour(dl: *DrawList, start: usize, closed: bool, keep_point: bool) void {
     const end = dl.path_flat_pts.items.len;
-    if (end - start >= 2) {
+    const n = end - start;
+    if (n >= 2 or (n == 1 and keep_point)) {
         dl.path_contour_ends.append(dl.alloc, end) catch @panic("drawPath: OOM");
+        dl.path_contour_closed.append(dl.alloc, @intFromBool(closed)) catch @panic("drawPath: OOM");
     } else {
         dl.path_flat_pts.shrinkRetainingCapacity(start);
     }
@@ -394,14 +408,17 @@ fn flushContour(dl: *DrawList, start: usize) void {
 
 /// Flatten once into DrawList-owned buffers. Capacity is retained across
 /// commands and frames; growth happens only when this shape needs more.
+/// `keep_point` retains a 1-vertex contour (round/square stroke caps).
 fn flattenPath(
     dl: *DrawList,
     verbs: []const draw_mod.PathVerb,
     points: []const draw_mod.Vec2f,
     scale: f32,
+    keep_point: bool,
 ) void {
     dl.path_flat_pts.clearRetainingCapacity();
     dl.path_contour_ends.clearRetainingCapacity();
+    dl.path_contour_closed.clearRetainingCapacity();
     var pi: usize = 0;
     var cur: draw_mod.Vec2f = .{ .x = 0, .y = 0 };
     var contour_start: usize = 0;
@@ -409,7 +426,7 @@ fn flattenPath(
     for (verbs) |v| {
         switch (v) {
             .move => {
-                if (have) flushContour(dl, contour_start);
+                if (have) flushContour(dl, contour_start, false, keep_point);
                 cur = scalePt(points[pi], scale);
                 contour_start = dl.path_flat_pts.items.len;
                 appendFlat(dl, cur);
@@ -438,13 +455,13 @@ fn flattenPath(
             },
             .close => {
                 if (have) {
-                    flushContour(dl, contour_start);
+                    flushContour(dl, contour_start, true, keep_point);
                     have = false;
                 }
             },
         }
     }
-    if (have) flushContour(dl, contour_start);
+    if (have) flushContour(dl, contour_start, false, keep_point);
 }
 
 fn midPt(a: draw_mod.Vec2f, b: draw_mod.Vec2f) draw_mod.Vec2f {
@@ -1808,4 +1825,311 @@ test "path fill: banding matches an unbanded rasterize for a diagonal, a curve, 
     render(.{ .pixels = &pix_band, .width = 32, .height = 32 }, &dl_band, font_mod.default_font, 1.0);
     try std.testing.expectEqualSlices(u32, &pix_full, &pix_band);
     try std.testing.expect(dl_band.path_scratch_peak_bytes <= dl_band.path_scratch_limit);
+}
+
+test "path stroke: a 1px AA hairline is visible and is not a hollow double line" {
+    var pixels = [_]u32{0xFF000000} ** (32 * 16);
+    const target = RenderTarget{ .pixels = &pixels, .width = 32, .height = 16 };
+    var dl = DrawList.init(std.testing.allocator);
+    defer dl.deinit();
+    dl.reset(32, 16);
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var b = dl.beginPath(arena.allocator());
+    try b.moveTo(.{ .x = 4, .y = 8.5 });
+    try b.lineTo(.{ .x = 28, .y = 8.5 });
+    try b.stroke(.{ .color = Color.rgba(0xFF, 0xFF, 0xFF, 0xFF), .width = 1, .aa = true });
+    render(target, &dl, font_mod.default_font, 1.0);
+
+    const mid = pathPx(&pixels, 32, 16, 8);
+    try std.testing.expect(mid != 0xFF000000);
+    // Centered on the pixel, a 1px stroke is a solid band, not two edge
+    // traces with a dark core.
+    try std.testing.expectEqual(@as(u32, 0xFFFFFFFF), mid);
+    try std.testing.expectEqual(@as(u32, 0xFF000000), pathPx(&pixels, 32, 16, 6));
+    try std.testing.expectEqual(@as(u32, 0xFF000000), pathPx(&pixels, 32, 16, 10));
+}
+
+test "path stroke: join miter vs bevel and cap square vs butt paint different pixels" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var pix_miter = [_]u32{0xFF000000} ** (24 * 24);
+    var pix_bevel = pix_miter;
+    {
+        var dl = DrawList.init(std.testing.allocator);
+        defer dl.deinit();
+        dl.reset(24, 24);
+        var b = dl.beginPath(arena.allocator());
+        try b.moveTo(.{ .x = 4, .y = 12 });
+        try b.lineTo(.{ .x = 12, .y = 12 });
+        try b.lineTo(.{ .x = 12, .y = 4 });
+        try b.stroke(.{ .color = Color.rgba(0xFF, 0, 0, 0xFF), .width = 4, .join = .miter, .cap = .butt });
+        render(.{ .pixels = &pix_miter, .width = 24, .height = 24 }, &dl, font_mod.default_font, 1.0);
+    }
+    {
+        var dl = DrawList.init(std.testing.allocator);
+        defer dl.deinit();
+        dl.reset(24, 24);
+        var b = dl.beginPath(arena.allocator());
+        try b.moveTo(.{ .x = 4, .y = 12 });
+        try b.lineTo(.{ .x = 12, .y = 12 });
+        try b.lineTo(.{ .x = 12, .y = 4 });
+        try b.stroke(.{ .color = Color.rgba(0xFF, 0, 0, 0xFF), .width = 4, .join = .bevel, .cap = .butt });
+        render(.{ .pixels = &pix_bevel, .width = 24, .height = 24 }, &dl, font_mod.default_font, 1.0);
+    }
+    try std.testing.expect(!std.mem.eql(u32, &pix_miter, &pix_bevel));
+
+    var pix_butt = [_]u32{0xFF000000} ** (20 * 12);
+    var pix_square = pix_butt;
+    {
+        var dl = DrawList.init(std.testing.allocator);
+        defer dl.deinit();
+        dl.reset(20, 12);
+        var b = dl.beginPath(arena.allocator());
+        try b.moveTo(.{ .x = 4, .y = 6 });
+        try b.lineTo(.{ .x = 16, .y = 6 });
+        try b.stroke(.{ .color = Color.rgba(0, 0xFF, 0, 0xFF), .width = 4, .cap = .butt });
+        render(.{ .pixels = &pix_butt, .width = 20, .height = 12 }, &dl, font_mod.default_font, 1.0);
+    }
+    {
+        var dl = DrawList.init(std.testing.allocator);
+        defer dl.deinit();
+        dl.reset(20, 12);
+        var b = dl.beginPath(arena.allocator());
+        try b.moveTo(.{ .x = 4, .y = 6 });
+        try b.lineTo(.{ .x = 16, .y = 6 });
+        try b.stroke(.{ .color = Color.rgba(0, 0xFF, 0, 0xFF), .width = 4, .cap = .square });
+        render(.{ .pixels = &pix_square, .width = 20, .height = 12 }, &dl, font_mod.default_font, 1.0);
+    }
+    try std.testing.expect(!std.mem.eql(u32, &pix_butt, &pix_square));
+}
+
+test "path stroke: a closed rectangle has no gap at the start/end join" {
+    var pixels = [_]u32{0xFF000000} ** (20 * 20);
+    const target = RenderTarget{ .pixels = &pixels, .width = 20, .height = 20 };
+    var dl = DrawList.init(std.testing.allocator);
+    defer dl.deinit();
+    dl.reset(20, 20);
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var b = dl.beginPath(arena.allocator());
+    try b.moveTo(.{ .x = 4, .y = 4 });
+    try b.lineTo(.{ .x = 16, .y = 4 });
+    try b.lineTo(.{ .x = 16, .y = 16 });
+    try b.lineTo(.{ .x = 4, .y = 16 });
+    try b.close();
+    try b.stroke(.{ .color = Color.rgba(0xFF, 0xFF, 0xFF, 0xFF), .width = 2, .join = .miter });
+    render(target, &dl, font_mod.default_font, 1.0);
+
+    // Mid-edge samples on all four sides, including the first-segment start.
+    try std.testing.expectEqual(@as(u32, 0xFFFFFFFF), pathPx(&pixels, 20, 10, 4));
+    try std.testing.expectEqual(@as(u32, 0xFFFFFFFF), pathPx(&pixels, 20, 16, 10));
+    try std.testing.expectEqual(@as(u32, 0xFFFFFFFF), pathPx(&pixels, 20, 10, 16));
+    try std.testing.expectEqual(@as(u32, 0xFFFFFFFF), pathPx(&pixels, 20, 4, 10));
+    try std.testing.expectEqual(@as(u32, 0xFFFFFFFF), pathPx(&pixels, 20, 4, 4));
+}
+
+test "path stroke: a quadratic paints ink (not only the endpoints)" {
+    var pixels = [_]u32{0xFF000000} ** (32 * 24);
+    const target = RenderTarget{ .pixels = &pixels, .width = 32, .height = 24 };
+    var dl = DrawList.init(std.testing.allocator);
+    defer dl.deinit();
+    dl.reset(32, 24);
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var b = dl.beginPath(arena.allocator());
+    try b.moveTo(.{ .x = 2, .y = 20 });
+    try b.quadTo(.{ .x = 16, .y = 2 }, .{ .x = 30, .y = 20 });
+    try b.stroke(.{ .color = Color.rgba(0, 0xFF, 0, 0xFF), .width = 2, .aa = true });
+    render(target, &dl, font_mod.default_font, 1.0);
+
+    var painted: usize = 0;
+    for (pixels) |px| {
+        if (px != 0xFF000000) painted += 1;
+    }
+    try std.testing.expect(painted > 20);
+    // Mid-curve of (2,20)–(16,2)–(30,20) sits near (16, 11).
+    try std.testing.expect(pathPx(&pixels, 32, 16, 11) != 0xFF000000);
+}
+
+test "path stroke: second frame allocates nothing (FailingAllocator)" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var dl = DrawList.init(std.testing.allocator);
+    defer dl.deinit();
+    dl.reset(64, 64);
+    var b = dl.beginPath(arena.allocator());
+    try b.moveTo(.{ .x = 4, .y = 8 });
+    try b.lineTo(.{ .x = 40, .y = 8 });
+    try b.lineTo(.{ .x = 40, .y = 40 });
+    try b.quadTo(.{ .x = 20, .y = 56 }, .{ .x = 4, .y = 40 });
+    try b.close();
+    try b.stroke(.{
+        .color = Color.rgba(0x40, 0x80, 0xC0, 0xA0),
+        .width = 3,
+        .join = .miter,
+        .cap = .round,
+        .aa = true,
+    });
+
+    var pixels = [_]u32{0xFF101010} ** (64 * 64);
+    const target = RenderTarget{ .pixels = &pixels, .width = 64, .height = 64 };
+    render(target, &dl, font_mod.default_font, 1.0);
+
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
+    dl.alloc = failing.allocator();
+    render(target, &dl, font_mod.default_font, 1.0);
+    try std.testing.expectEqual(@as(usize, 0), failing.allocated_bytes);
+    dl.alloc = std.testing.allocator;
+}
+
+test "path stroke: a miter over the limit matches bevel at the corner pixel" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    const turn: f32 = 160.0 * std.math.rad_per_deg;
+    const x2 = 16.0 + 12.0 * @cos(turn);
+    const y2 = 12.0 + 12.0 * @sin(turn);
+
+    var pix_limited = [_]u32{0xFF000000} ** (40 * 28);
+    var pix_bevel = pix_limited;
+    {
+        var dl = DrawList.init(std.testing.allocator);
+        defer dl.deinit();
+        dl.reset(40, 28);
+        var b = dl.beginPath(arena.allocator());
+        try b.moveTo(.{ .x = 4, .y = 12 });
+        try b.lineTo(.{ .x = 16, .y = 12 });
+        try b.lineTo(.{ .x = x2, .y = y2 });
+        try b.stroke(.{ .color = Color.rgba(0xFF, 0xFF, 0xFF, 0xFF), .width = 4, .join = .miter, .miter_limit = 4 });
+        render(.{ .pixels = &pix_limited, .width = 40, .height = 28 }, &dl, font_mod.default_font, 1.0);
+    }
+    {
+        var dl = DrawList.init(std.testing.allocator);
+        defer dl.deinit();
+        dl.reset(40, 28);
+        var b = dl.beginPath(arena.allocator());
+        try b.moveTo(.{ .x = 4, .y = 12 });
+        try b.lineTo(.{ .x = 16, .y = 12 });
+        try b.lineTo(.{ .x = x2, .y = y2 });
+        try b.stroke(.{ .color = Color.rgba(0xFF, 0xFF, 0xFF, 0xFF), .width = 4, .join = .bevel, .miter_limit = 4 });
+        render(.{ .pixels = &pix_bevel, .width = 40, .height = 28 }, &dl, font_mod.default_font, 1.0);
+    }
+    try std.testing.expectEqualSlices(u32, &pix_bevel, &pix_limited);
+}
+
+fn countOpaqueCol(pixels: []const u32, stride: u32, x: u32, h: u32) usize {
+    var n: usize = 0;
+    var y: u32 = 0;
+    while (y < h) : (y += 1) {
+        if (pixels[y * stride + x] != 0xFF000000) n += 1;
+    }
+    return n;
+}
+
+fn strokeRightAngle(
+    dl: *DrawList,
+    arena: std.mem.Allocator,
+    join: draw_mod.PathJoin,
+    miter_limit: f32,
+) !void {
+    var b = dl.beginPath(arena);
+    try b.moveTo(.{ .x = 8, .y = 24 });
+    try b.lineTo(.{ .x = 40, .y = 24 });
+    try b.lineTo(.{ .x = 40, .y = 8 });
+    try b.stroke(.{
+        .color = Color.rgba(0xFF, 0xFF, 0xFF, 0xFF),
+        .width = 8,
+        .join = join,
+        .cap = .butt,
+        .miter_limit = miter_limit,
+        .aa = false,
+    });
+}
+
+test "path stroke: bevel keeps full width on the inner side of the corner" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var pixels = [_]u32{0xFF000000} ** (56 * 40);
+    var dl = DrawList.init(std.testing.allocator);
+    defer dl.deinit();
+    dl.reset(56, 40);
+    try strokeRightAngle(&dl, arena.allocator(), .bevel, 4);
+    render(.{ .pixels = &pixels, .width = 56, .height = 40 }, &dl, font_mod.default_font, 1.0);
+
+    // Width 8, AA off, centerline y=24 → 8 opaque rows on a straight column.
+    const straight = countOpaqueCol(&pixels, 56, 20, 40);
+    try std.testing.expectEqual(@as(usize, 8), straight);
+    // x=35 is still on the horizontal arm (inner corner is at x=36). A
+    // notched inner bevel would drop this count below the straight run.
+    try std.testing.expectEqual(straight, countOpaqueCol(&pixels, 56, 35, 40));
+}
+
+test "path stroke: a miter that falls back to bevel keeps inner width" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var pixels = [_]u32{0xFF000000} ** (56 * 40);
+    var dl = DrawList.init(std.testing.allocator);
+    defer dl.deinit();
+    dl.reset(56, 40);
+    // 90° miter ratio is √2; limit 1 forces the bevel fallback.
+    try strokeRightAngle(&dl, arena.allocator(), .miter, 1);
+    render(.{ .pixels = &pixels, .width = 56, .height = 40 }, &dl, font_mod.default_font, 1.0);
+
+    const straight = countOpaqueCol(&pixels, 56, 20, 40);
+    try std.testing.expectEqual(@as(usize, 8), straight);
+    try std.testing.expectEqual(straight, countOpaqueCol(&pixels, 56, 35, 40));
+}
+
+test "path stroke: a hairline one-point round cap still paints" {
+    var pixels = [_]u32{0xFF000000} ** (16 * 16);
+    const target = RenderTarget{ .pixels = &pixels, .width = 16, .height = 16 };
+    var dl = DrawList.init(std.testing.allocator);
+    defer dl.deinit();
+    dl.reset(16, 16);
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var b = dl.beginPath(arena.allocator());
+    try b.moveTo(.{ .x = 8.5, .y = 8.5 });
+    try b.stroke(.{
+        .color = Color.rgba(0xFF, 0xFF, 0xFF, 0xFF),
+        .width = 0.25,
+        .cap = .round,
+        .aa = true,
+    });
+    render(target, &dl, font_mod.default_font, 1.0);
+
+    var painted: usize = 0;
+    for (pixels) |px| {
+        if (px != 0xFF000000) painted += 1;
+    }
+    try std.testing.expect(painted > 0);
+}
+
+test "path stroke: a closed one-point or two-point contour paints nothing" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var pixels = [_]u32{0xFF000000} ** (16 * 16);
+    const target = RenderTarget{ .pixels = &pixels, .width = 16, .height = 16 };
+    var dl = DrawList.init(std.testing.allocator);
+    defer dl.deinit();
+    dl.reset(16, 16);
+    {
+        var b = dl.beginPath(arena.allocator());
+        try b.moveTo(.{ .x = 8, .y = 8 });
+        try b.close();
+        try b.stroke(.{ .color = Color.rgba(0xFF, 0xFF, 0xFF, 0xFF), .width = 6, .cap = .round });
+    }
+    {
+        var b = dl.beginPath(arena.allocator());
+        try b.moveTo(.{ .x = 2, .y = 8 });
+        try b.lineTo(.{ .x = 14, .y = 8 });
+        try b.close();
+        try b.stroke(.{ .color = Color.rgba(0xFF, 0xFF, 0xFF, 0xFF), .width = 6, .cap = .square });
+    }
+    render(target, &dl, font_mod.default_font, 1.0);
+    for (pixels) |px| {
+        try std.testing.expectEqual(@as(u32, 0xFF000000), px);
+    }
 }

@@ -22,6 +22,8 @@ pub const Vec2 = geom.Vec2;
 pub const Color = draw_mod.Color;
 pub const PathVerb = draw_mod.PathVerb;
 pub const PathWinding = draw_mod.PathWinding;
+pub const PathJoin = draw_mod.PathJoin;
+pub const PathCap = draw_mod.PathCap;
 pub const Vec2f = draw_mod.Vec2f;
 
 /// How many overlay commands a single inject may install. Sized so a full list still
@@ -82,6 +84,14 @@ pub const FieldRole = enum {
     derived,
     /// Path winding name (`nonzero`).
     winding,
+    /// Path paint style (`fill` or `stroke`).
+    path_style,
+    /// Stroke join name (`miter` or `bevel`).
+    path_join,
+    /// Stroke cap name (`butt`, `square`, or `round`).
+    path_cap,
+    /// Finite f32 (stroke width / miter limit).
+    f32,
     /// Compact path-verb string (`MLQCZ`).
     path_verbs,
     /// Path points as comma-separated IEEE-754 hex bits (`xxxxxxxx,yyyyyyyy,...`).
@@ -194,6 +204,11 @@ pub const verbs = [_]VerbSpec{
             .{ .name = "color", .role = .color },
             .{ .name = "aa", .role = .u32 },
             .{ .name = "winding", .role = .winding },
+            .{ .name = "style", .role = .path_style, .required = false },
+            .{ .name = "width", .role = .f32, .required = false },
+            .{ .name = "join", .role = .path_join, .required = false },
+            .{ .name = "cap", .role = .path_cap, .required = false },
+            .{ .name = "miter_limit", .role = .f32, .required = false },
             .{ .name = "verbs", .role = .path_verbs },
             .{ .name = "pts", .role = .path_points },
             .{ .name = "clip_x", .role = .i32, .required = false },
@@ -449,6 +464,39 @@ fn windingName(cmd: DrawCmd) []const u8 {
     };
 }
 
+fn styleName(cmd: DrawCmd) []const u8 {
+    return switch (cmd) {
+        .path => |c| if (c.stroke != null) "stroke" else "fill",
+        else => "fill",
+    };
+}
+
+fn joinName(cmd: DrawCmd) []const u8 {
+    return switch (cmd) {
+        .path => |c| draw_mod.pathJoinName(if (c.stroke) |s| s.join else .miter),
+        else => "miter",
+    };
+}
+
+fn capName(cmd: DrawCmd) []const u8 {
+    return switch (cmd) {
+        .path => |c| draw_mod.pathCapName(if (c.stroke) |s| s.cap else .butt),
+        else => "butt",
+    };
+}
+
+fn readF32(cmd: DrawCmd, name: []const u8) f32 {
+    return switch (cmd) {
+        .path => |c| if (std.mem.eql(u8, name, "width"))
+            if (c.stroke) |s| s.width else 0
+        else if (std.mem.eql(u8, name, "miter_limit"))
+            if (c.stroke) |s| s.miter_limit else draw_mod.path_miter_limit_default
+        else
+            unreachable,
+        else => 0,
+    };
+}
+
 fn appendPathVerbs(list: *std.ArrayList(u8), allocator: Allocator, cmd: DrawCmd) !void {
     const path_verbs = switch (cmd) {
         .path => |c| c.verbs,
@@ -530,6 +578,10 @@ pub fn appendCmd(list: *std.ArrayList(u8), allocator: Allocator, cmd: DrawCmd) !
                 }
             },
             .winding => try appendFmt(list, allocator, "{s}={s}", .{ field.name, windingName(cmd) }),
+            .path_style => try appendFmt(list, allocator, "{s}={s}", .{ field.name, styleName(cmd) }),
+            .path_join => try appendFmt(list, allocator, "{s}={s}", .{ field.name, joinName(cmd) }),
+            .path_cap => try appendFmt(list, allocator, "{s}={s}", .{ field.name, capName(cmd) }),
+            .f32 => try appendFmt(list, allocator, "{s}={d}", .{ field.name, readF32(cmd, field.name) }),
             .path_verbs => {
                 try appendFmt(list, allocator, "{s}=\"", .{field.name});
                 try appendPathVerbs(list, allocator, cmd);
@@ -663,6 +715,11 @@ const Staging = struct {
     src_h: ?u32 = null,
     aa: ?u32 = null,
     winding: ?PathWinding = null,
+    path_style: ?enum { fill, stroke } = null,
+    path_width: ?f32 = null,
+    path_join: ?PathJoin = null,
+    path_cap: ?PathCap = null,
+    path_miter_limit: ?f32 = null,
     path_verbs: ?[]const PathVerb = null,
     path_points: ?[]const Vec2f = null,
 
@@ -822,6 +879,24 @@ fn buildCmd(verb: *const VerbSpec, st: Staging, arena: Allocator) (ParseError ||
             for (points) |p| {
                 if (!std.math.isFinite(p.x) or !std.math.isFinite(p.y)) return error.InvalidValue;
             }
+            const style = st.path_style orelse .fill;
+            var stroke: ?draw_mod.PathStrokeParams = null;
+            if (style == .stroke) {
+                const width = st.path_width orelse return error.MissingField;
+                if (!std.math.isFinite(width) or width <= 0 or width > draw_mod.path_stroke_width_max) {
+                    return error.ValueOutOfRange;
+                }
+                const miter_limit = st.path_miter_limit orelse draw_mod.path_miter_limit_default;
+                if (!std.math.isFinite(miter_limit) or miter_limit < 1) {
+                    return error.ValueOutOfRange;
+                }
+                stroke = .{
+                    .width = width,
+                    .join = st.path_join orelse .miter,
+                    .cap = st.path_cap orelse .butt,
+                    .miter_limit = miter_limit,
+                };
+            }
             break :blk .{ .path = .{
                 .verbs = path_verbs,
                 .points = points,
@@ -829,6 +904,7 @@ fn buildCmd(verb: *const VerbSpec, st: Staging, arena: Allocator) (ParseError ||
                 .winding = st.winding orelse .nonzero,
                 .aa = aa != 0,
                 .clip = clip,
+                .stroke = stroke,
             } };
         },
     };
@@ -913,6 +989,32 @@ pub fn parseCmdLine(line: []const u8, arena: Allocator) (ParseError || Allocator
             .winding => {
                 if (st.winding != null) return error.DuplicateField;
                 st.winding = try parseWinding(pair.value);
+            },
+            .path_style => {
+                if (st.path_style != null) return error.DuplicateField;
+                if (std.mem.eql(u8, pair.value, "fill")) {
+                    st.path_style = .fill;
+                } else if (std.mem.eql(u8, pair.value, "stroke")) {
+                    st.path_style = .stroke;
+                } else return error.InvalidValue;
+            },
+            .path_join => {
+                if (st.path_join != null) return error.DuplicateField;
+                st.path_join = draw_mod.pathJoinFromName(pair.value) orelse return error.InvalidValue;
+            },
+            .path_cap => {
+                if (st.path_cap != null) return error.DuplicateField;
+                st.path_cap = draw_mod.pathCapFromName(pair.value) orelse return error.InvalidValue;
+            },
+            .f32 => {
+                const v = std.fmt.parseFloat(f32, pair.value) catch return error.InvalidValue;
+                if (std.mem.eql(u8, spec.name, "width")) {
+                    if (st.path_width != null) return error.DuplicateField;
+                    st.path_width = v;
+                } else if (std.mem.eql(u8, spec.name, "miter_limit")) {
+                    if (st.path_miter_limit != null) return error.DuplicateField;
+                    st.path_miter_limit = v;
+                } else return error.UnknownField;
             },
             .path_verbs => {
                 if (st.path_verbs != null) return error.DuplicateField;
@@ -1132,6 +1234,43 @@ test "draw_cmd_text: path dump parses back" {
     try testing.expect(!p.aa);
     try testing.expectEqual(src.cmds.items[0].path.points[0].x, p.points[0].x);
     try testing.expectEqual(src.cmds.items[0].path.points[0].y, p.points[0].y);
+    try testing.expect(p.stroke == null);
+}
+
+test "draw_cmd_text: stroke dump includes width join cap and parses back" {
+    var src = DrawList.init(testing.allocator);
+    defer src.deinit();
+    src.reset(64, 64);
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    var b = src.beginPath(arena.allocator());
+    try b.moveTo(.{ .x = 0, .y = 0 });
+    try b.lineTo(.{ .x = 8, .y = 0 });
+    try b.stroke(.{
+        .color = Color.rgba(0, 0x80, 0xFF, 0xFF),
+        .width = 3.5,
+        .join = .bevel,
+        .cap = .round,
+        .miter_limit = 2.5,
+    });
+
+    var dump_list: std.ArrayList(u8) = .empty;
+    defer dump_list.deinit(testing.allocator);
+    try appendCmd(&dump_list, testing.allocator, src.cmds.items[0]);
+    try testing.expect(std.mem.indexOf(u8, dump_list.items, "style=stroke") != null);
+    try testing.expect(std.mem.indexOf(u8, dump_list.items, "width=3.5") != null);
+    try testing.expect(std.mem.indexOf(u8, dump_list.items, "join=bevel") != null);
+    try testing.expect(std.mem.indexOf(u8, dump_list.items, "cap=round") != null);
+    try testing.expect(std.mem.indexOf(u8, dump_list.items, "miter_limit=2.5") != null);
+
+    var dst = DrawList.init(testing.allocator);
+    defer dst.deinit();
+    try parseDump(&dst, arena.allocator(), dump_list.items, MAX_CMDS);
+    const s = dst.cmds.items[0].path.stroke.?;
+    try testing.expectEqual(@as(f32, 3.5), s.width);
+    try testing.expectEqual(PathJoin.bevel, s.join);
+    try testing.expectEqual(PathCap.round, s.cap);
+    try testing.expectEqual(@as(f32, 2.5), s.miter_limit);
 }
 
 test "draw_cmd_text: unknown field is an explicit error" {

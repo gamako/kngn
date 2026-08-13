@@ -108,11 +108,109 @@ pub fn validatePathSequence(verbs: []const PathVerb) error{InvalidPath}!void {
 /// Fill winding. Only nonzero is defined for this vocabulary.
 pub const PathWinding = enum(u8) { nonzero };
 
+/// Corner join of a stroked path. `miter` falls back to `bevel` when the
+/// miter length / stroke width exceeds `miter_limit`.
+pub const PathJoin = enum(u8) {
+    miter,
+    bevel,
+};
+
+/// End cap of an open stroked path. `round` is a flattened semicircle
+/// (no dedicated arc verb).
+pub const PathCap = enum(u8) {
+    butt,
+    square,
+    round,
+};
+
+pub const path_join_table = [_]struct { join: PathJoin, name: []const u8 }{
+    .{ .join = .miter, .name = "miter" },
+    .{ .join = .bevel, .name = "bevel" },
+};
+
+pub const path_cap_table = [_]struct { cap: PathCap, name: []const u8 }{
+    .{ .cap = .butt, .name = "butt" },
+    .{ .cap = .square, .name = "square" },
+    .{ .cap = .round, .name = "round" },
+};
+
+comptime {
+    const joins = std.meta.tags(PathJoin);
+    if (joins.len != path_join_table.len) {
+        @compileError("path_join_table must have one entry per PathJoin");
+    }
+    for (joins, 0..) |tag, i| {
+        if (path_join_table[i].join != tag) {
+            @compileError("path_join_table must be in PathJoin declaration order");
+        }
+    }
+    const caps = std.meta.tags(PathCap);
+    if (caps.len != path_cap_table.len) {
+        @compileError("path_cap_table must have one entry per PathCap");
+    }
+    for (caps, 0..) |tag, i| {
+        if (path_cap_table[i].cap != tag) {
+            @compileError("path_cap_table must be in PathCap declaration order");
+        }
+    }
+}
+
+pub fn pathJoinName(j: PathJoin) []const u8 {
+    return path_join_table[@intFromEnum(j)].name;
+}
+
+pub fn pathCapName(c: PathCap) []const u8 {
+    return path_cap_table[@intFromEnum(c)].name;
+}
+
+pub fn pathJoinFromName(s: []const u8) ?PathJoin {
+    for (&path_join_table) |*row| {
+        if (std.mem.eql(u8, row.name, s)) return row.join;
+    }
+    return null;
+}
+
+pub fn pathCapFromName(s: []const u8) ?PathCap {
+    for (&path_cap_table) |*row| {
+        if (std.mem.eql(u8, row.name, s)) return row.cap;
+    }
+    return null;
+}
+
+/// SVG default: bevel when the miter is longer than 4× the stroke width.
+pub const path_miter_limit_default: f32 = 4.0;
+
+/// Largest accepted stroke width (logical px). Matches the integer-thickness
+/// cap used by `line` / `rect_outline` so a dump cannot overflow render.
+pub const path_stroke_width_max: f32 = 4096.0;
+
 /// Fill attributes of a path command (colour, winding, AA). Not a verb.
 pub const PathFill = struct {
     color: Color,
     winding: PathWinding = .nonzero,
     aa: bool = true,
+};
+
+/// Stroke attributes of a path command (colour, width, join, cap, AA).
+/// Not a verb. `width` is in logical pixels and must be finite and in
+/// `(0, path_stroke_width_max]`. `miter_limit` is dimensionless and must
+/// be finite and `>= 1`.
+pub const PathStroke = struct {
+    color: Color,
+    width: f32,
+    join: PathJoin = .miter,
+    cap: PathCap = .butt,
+    miter_limit: f32 = path_miter_limit_default,
+    aa: bool = true,
+};
+
+/// Geometry-only stroke parameters stored on `DrawCmd.path`. Colour and AA
+/// stay on the command's shared fields. `null` means fill.
+pub const PathStrokeParams = struct {
+    width: f32,
+    join: PathJoin = .miter,
+    cap: PathCap = .butt,
+    miter_limit: f32 = path_miter_limit_default,
 };
 
 pub const PathError = error{ InvalidPath, OutOfMemory };
@@ -128,17 +226,26 @@ pub const path_scratch_bytes_per_pixel: usize = @sizeOf(f32) * 2 + @sizeOf(u8);
 pub const DrawCmd = union(enum) {
     rect_filled: struct { rect: Rect, color: Color, clip: Rect },
     rect_outline: struct { rect: Rect, color: Color, thickness: u32, clip: Rect },
+    /// Integer-thickness Bresenham span. Widget chrome uses this. Path
+    /// stroke does not replace it: a Bresenham span and an analytic AA
+    /// offset-contour disagree on pixels, so swapping would change every
+    /// existing UI frame. The two stay separate on purpose.
     line: struct { p0: Vec2, p1: Vec2, color: Color, thickness: u32, clip: Rect },
     /// `text` must point at an arena slice that outlives the DrawList (caller responsibility).
     /// If `font` is null, draw with the default font passed to `render()` (override hook).
     text: struct { pos: Vec2, text: []const u8, color: Color, clip: Rect, font: ?Font = null },
     /// `pixels` must point at a caller-owned slice that outlives the DrawList (caller responsibility).
     image: struct { rect: Rect, pixels: []const u32, src_w: u32, src_h: u32, clip: Rect },
-    /// Filled path. `verbs` and `points` are SoA slices the caller (or the frame arena)
-    /// owns; the DrawList holds only the references. `reset` invalidates them.
-    /// The valid window is after `endFrame` until the next `beginFrame` (render and
-    /// the drawlist probe run in that window). A direct DrawList user supplies the
-    /// same lifetime. An unclosed contour is closed implicitly at fill time.
+    /// Filled or stroked path. `verbs` and `points` are SoA slices the caller
+    /// (or the frame arena) owns; the DrawList holds only the references.
+    /// `reset` invalidates them. The valid window is after `endFrame` until
+    /// the next `beginFrame` (render and the drawlist probe run in that
+    /// window). A direct DrawList user supplies the same lifetime.
+    /// `stroke == null` is a fill: an unclosed contour is closed implicitly.
+    /// `stroke != null` is a stroke: unclosed contours stay open and receive
+    /// end caps; closed contours join at the start/end vertex and never
+    /// receive caps. A closed contour that collapses to fewer than 3
+    /// points is a no-op (no disc, no square).
     path: struct {
         verbs: []const PathVerb,
         points: []const Vec2f,
@@ -146,6 +253,7 @@ pub const DrawCmd = union(enum) {
         winding: PathWinding,
         aa: bool,
         clip: Rect,
+        stroke: ?PathStrokeParams = null,
     },
 };
 
@@ -221,20 +329,48 @@ pub const PathBuilder = struct {
         try self.accept(.close);
     }
 
-    /// Appends one path command. An unclosed contour is kept as-is and closed
-    /// implicitly at fill time. Does not append on InvalidPath or OOM.
-    pub fn finish(self: *PathBuilder, fill: PathFill) PathError!void {
-        if (self.err) |e| return e;
+    fn appendPath(
+        self: *PathBuilder,
+        color: Color,
+        winding: PathWinding,
+        aa: bool,
+        stroke_params: ?PathStrokeParams,
+    ) PathError!void {
         const verbs = self.arena.dupe(PathVerb, self.verbs.items) catch |e| return self.fail(e);
         const points = self.arena.dupe(Vec2f, self.points.items) catch |e| return self.fail(e);
         self.dl.cmds.append(self.dl.alloc, .{ .path = .{
             .verbs = verbs,
             .points = points,
-            .color = fill.color,
-            .winding = fill.winding,
-            .aa = fill.aa,
+            .color = color,
+            .winding = winding,
+            .aa = aa,
             .clip = self.dl.currentClip(),
+            .stroke = stroke_params,
         } }) catch |e| return self.fail(e);
+    }
+
+    /// Appends one filled path command. An unclosed contour is kept as-is and
+    /// closed implicitly at fill time. Does not append on InvalidPath or OOM.
+    pub fn finish(self: *PathBuilder, fill: PathFill) PathError!void {
+        if (self.err) |e| return e;
+        try self.appendPath(fill.color, fill.winding, fill.aa, null);
+    }
+
+    /// Appends one stroked path command. Does not append on InvalidPath or OOM.
+    pub fn stroke(self: *PathBuilder, s: PathStroke) PathError!void {
+        if (self.err) |e| return e;
+        if (!std.math.isFinite(s.width) or s.width <= 0 or s.width > path_stroke_width_max) {
+            return self.fail(error.InvalidPath);
+        }
+        if (!std.math.isFinite(s.miter_limit) or s.miter_limit < 1) {
+            return self.fail(error.InvalidPath);
+        }
+        try self.appendPath(s.color, .nonzero, s.aa, .{
+            .width = s.width,
+            .join = s.join,
+            .cap = s.cap,
+            .miter_limit = s.miter_limit,
+        });
     }
 };
 
@@ -258,6 +394,19 @@ pub const DrawList = struct {
     /// points or contours than the last peak.
     path_flat_pts: std.ArrayList(Vec2f) = .empty,
     path_contour_ends: std.ArrayList(usize) = .empty,
+    /// Parallel to `path_contour_ends`: 1 if that contour saw an explicit
+    /// `close`, 0 if it is open. Fill ignores this (every contour is closed
+    /// at rasterize). Stroke uses it to choose joins vs end caps.
+    path_contour_closed: std.ArrayList(u8) = .empty,
+    /// Offset polygons for a stroke command. Same reuse contract as
+    /// `path_flat_pts`. `path_stroke_aux` is the collapsed centerline;
+    /// `path_stroke_left` / `path_stroke_right` are the two offset chains
+    /// while a contour is assembled.
+    path_stroke_pts: std.ArrayList(Vec2f) = .empty,
+    path_stroke_ends: std.ArrayList(usize) = .empty,
+    path_stroke_aux: std.ArrayList(Vec2f) = .empty,
+    path_stroke_left: std.ArrayList(Vec2f) = .empty,
+    path_stroke_right: std.ArrayList(Vec2f) = .empty,
     /// Requested scratch cap in bytes. The effective cap is clamped to
     /// `[@max(one_row, @min(path_scratch_limit, path_scratch_limit_bytes))]`
     /// so a value of 0 still draws (one row at a time) and a value above the
@@ -280,6 +429,12 @@ pub const DrawList = struct {
         self.path_scratch_pixels = 0;
         self.path_flat_pts.deinit(self.alloc);
         self.path_contour_ends.deinit(self.alloc);
+        self.path_contour_closed.deinit(self.alloc);
+        self.path_stroke_pts.deinit(self.alloc);
+        self.path_stroke_ends.deinit(self.alloc);
+        self.path_stroke_aux.deinit(self.alloc);
+        self.path_stroke_left.deinit(self.alloc);
+        self.path_stroke_right.deinit(self.alloc);
     }
 
     /// Call at the start of every frame. Sets root clip = Rect{0,0,w,h}.
@@ -577,4 +732,58 @@ test "validatePathSequence: line before move and segment after close are Invalid
     try std.testing.expectError(error.InvalidPath, validatePathSequence(&.{ .move, .close, .line }));
     try validatePathSequence(&.{ .move, .line, .close, .move, .line });
     try validatePathSequence(&.{});
+}
+
+test "PathBuilder: stroke appends params; non-finite or non-positive width is InvalidPath" {
+    var dl = DrawList.init(std.testing.allocator);
+    defer dl.deinit();
+    dl.reset(64, 64);
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var ok = dl.beginPath(arena.allocator());
+    try ok.moveTo(.{ .x = 0, .y = 0 });
+    try ok.lineTo(.{ .x = 8, .y = 0 });
+    try ok.stroke(.{
+        .color = Color.rgba(0, 0, 0xFF, 0xFF),
+        .width = 3,
+        .join = .bevel,
+        .cap = .square,
+        .miter_limit = 2,
+        .aa = false,
+    });
+    try std.testing.expectEqual(@as(usize, 1), dl.cmds.items.len);
+    const s = dl.cmds.items[0].path.stroke.?;
+    try std.testing.expectEqual(@as(f32, 3), s.width);
+    try std.testing.expectEqual(PathJoin.bevel, s.join);
+    try std.testing.expectEqual(PathCap.square, s.cap);
+    try std.testing.expectEqual(@as(f32, 2), s.miter_limit);
+    try std.testing.expect(!dl.cmds.items[0].path.aa);
+
+    var bad = dl.beginPath(arena.allocator());
+    try bad.moveTo(.{ .x = 0, .y = 0 });
+    try bad.lineTo(.{ .x = 1, .y = 0 });
+    try std.testing.expectError(error.InvalidPath, bad.stroke(.{
+        .color = Color.rgba(0, 0, 0, 0xFF),
+        .width = 0,
+    }));
+    try std.testing.expectEqual(@as(usize, 1), dl.cmds.items.len);
+
+    var nan_w = dl.beginPath(arena.allocator());
+    try nan_w.moveTo(.{ .x = 0, .y = 0 });
+    try nan_w.lineTo(.{ .x = 1, .y = 0 });
+    try std.testing.expectError(error.InvalidPath, nan_w.stroke(.{
+        .color = Color.rgba(0, 0, 0, 0xFF),
+        .width = std.math.nan(f32),
+    }));
+
+    var bad_limit = dl.beginPath(arena.allocator());
+    try bad_limit.moveTo(.{ .x = 0, .y = 0 });
+    try bad_limit.lineTo(.{ .x = 1, .y = 0 });
+    try std.testing.expectError(error.InvalidPath, bad_limit.stroke(.{
+        .color = Color.rgba(0, 0, 0, 0xFF),
+        .width = 1,
+        .miter_limit = 0.5,
+    }));
+    try std.testing.expectEqual(@as(usize, 1), dl.cmds.items.len);
 }

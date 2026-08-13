@@ -251,8 +251,12 @@ command's line, not just as a pixel difference a human has to spot.
   `line`, the draw position for `text`, the point AABB for `path`) is fully contained
   by its own baked-in clip rect. `offclip=1` is the same signal a truncated shape or
   a mis-placed label would leave in a screenshot, just readable without one.
-  `path` carries `color`, `aa`, `winding`, a compact `verbs="MLQCZ"` string and
-  `pts` as comma-separated IEEE-754 hex bits.
+  `path` carries `color`, `aa`, `winding`, `style=fill|stroke`, stroke
+  parameters (`width`, `join=miter|bevel`, `cap=butt|square|round`,
+  `miter_limit`), a compact `verbs="MLQCZ"` string and `pts` as
+  comma-separated IEEE-754 hex bits. Fill dumps still emit the stroke
+  columns (`width=0`, default join/cap/limit) so the field list is one
+  table for both paints.
 - `digest drawlist` hashes the same per-command dump text (plus the path-wire schema
   version) into one line:
   `hash=#XXXXXXXX rect_filled=N rect_outline=N line=N text=N image=N path=N offclip=N`.

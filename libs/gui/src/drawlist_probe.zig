@@ -14,7 +14,7 @@
 //!   `cmd=line x0=.. y0=.. x1=.. y1=.. thickness=.. color=.. clip_.. offclip=..`
 //!   `cmd=text x=.. y=.. color=.. font=default|custom clip_.. offclip=.. text="<escaped content>"`
 //!   `cmd=image x=.. y=.. w=.. h=.. src_w=.. src_h=.. pixfnv=#XXXXXXXX clip_.. offclip=..`
-//!   `cmd=path color=.. aa=0|1 winding=nonzero verbs="MLQCZ" pts="<f32-hex pairs>" clip_.. offclip=..`
+//!   `cmd=path color=.. aa=0|1 winding=nonzero style=fill|stroke width=.. join=miter|bevel cap=butt|square|round miter_limit=.. verbs="MLQCZ" pts="<f32-hex pairs>" clip_.. offclip=..`
 //! `offclip=1` means the command's own extent is not fully contained by the clip rect baked
 //! into it (for `line`/`text`, "extent" is the endpoints/the draw position — the same signal
 //! a truncated shape or a mis-placed label would produce). A scene with nothing accidentally
@@ -275,4 +275,32 @@ test "digest: a path command is counted and changes the hash" {
     const line = digest(&dl, &buf);
     try testing.expect(std.mem.indexOf(u8, line, "path=1") != null);
     try testing.expect(std.mem.indexOf(u8, line, "offclip=0") != null);
+}
+
+test "digest: a stroked path dumps width join and cap" {
+    var dl = DrawList.init(testing.allocator);
+    defer dl.deinit();
+    dl.reset(64, 64);
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    var b = dl.beginPath(arena.allocator());
+    try b.moveTo(.{ .x = 2, .y = 2 });
+    try b.lineTo(.{ .x = 20, .y = 2 });
+    try b.stroke(.{
+        .color = draw_mod.Color.rgba(0, 0, 0xFF, 0xFF),
+        .width = 4,
+        .join = .miter,
+        .cap = .square,
+    });
+
+    const dump = try dumpAlloc(testing.allocator, &dl);
+    defer testing.allocator.free(dump);
+    try testing.expect(std.mem.indexOf(u8, dump, "style=stroke") != null);
+    try testing.expect(std.mem.indexOf(u8, dump, "width=4") != null);
+    try testing.expect(std.mem.indexOf(u8, dump, "join=miter") != null);
+    try testing.expect(std.mem.indexOf(u8, dump, "cap=square") != null);
+
+    var buf: [1024]u8 = undefined;
+    const line = digest(&dl, &buf);
+    try testing.expect(std.mem.indexOf(u8, line, "path=1") != null);
 }

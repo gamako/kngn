@@ -1,8 +1,9 @@
-//! 45_path_drawing: filled paths (curves, a concave shape, a hole, AA on/off).
+//! 45_path_drawing: filled and stroked paths (curves, joins, caps, AA).
 //!
-//! A still frame. Curves, a chevron, a ring with a hole, and the same curve
-//! with anti-aliasing on and off sit side by side so the edge difference is
-//! visible. Built only from the root (`zig build run-example_45`).
+//! A still frame. The top row is fills (a curve, a chevron, a ring with a
+//! hole). The middle row compares AA on/off and a translucent fill. The
+//! bottom row is strokes: open polylines with each cap, a closed miter vs
+//! bevel, and a 1 px hairline. Built only from the root (`zig build run-example_45`).
 
 const std = @import("std");
 const platform = @import("platform");
@@ -14,7 +15,7 @@ pub fn main(init: std.process.Init) !void {
     try platform.init();
     defer platform.shutdown();
 
-    var window = try platform.Window.create(800, 520, "example_45: path drawing");
+    var window = try platform.Window.create(800, 720, "example_45: path drawing");
     defer window.destroy();
 
     var draw_list = gui.DrawList.init(gpa);
@@ -23,7 +24,7 @@ pub fn main(init: std.process.Init) !void {
     var arena = std.heap.ArenaAllocator.init(gpa);
     defer arena.deinit();
 
-    const help: []const u8 = "ESC: quit  / filled paths (curve, concave, hole, AA on/off)";
+    const help: []const u8 = "ESC: quit  / fill (curve, concave, hole, AA) + stroke (join, cap, 1px)";
 
     main_loop: while (window.pollEvents()) {
         while (window.nextEvent()) |ev| switch (ev) {
@@ -120,6 +121,53 @@ pub fn main(init: std.process.Init) !void {
             try p.lineTo(.{ .x = 580, .y = 480 });
             try p.close();
             try p.finish(.{ .color = gui.Color.rgba(0xFF, 0xFF, 0xFF, 0x90) });
+        }
+
+        try draw_list.text(.{ .x = 16, .y = 500 }, "stroke caps (butt / square / round)", gui.Color.rgba(0x88, 0x88, 0x90, 0xFF));
+        {
+            var p = draw_list.beginPath(arena.allocator());
+            try p.moveTo(.{ .x = 30, .y = 560 });
+            try p.lineTo(.{ .x = 90, .y = 530 });
+            try p.lineTo(.{ .x = 150, .y = 560 });
+            try p.stroke(.{ .color = gui.Color.rgba(0xFF, 0x90, 0x40, 0xFF), .width = 14, .join = .miter, .cap = .butt });
+        }
+        {
+            var p = draw_list.beginPath(arena.allocator());
+            try p.moveTo(.{ .x = 190, .y = 560 });
+            try p.lineTo(.{ .x = 250, .y = 530 });
+            try p.lineTo(.{ .x = 310, .y = 560 });
+            try p.stroke(.{ .color = gui.Color.rgba(0x40, 0xC0, 0xFF, 0xFF), .width = 14, .join = .miter, .cap = .square });
+        }
+        {
+            var p = draw_list.beginPath(arena.allocator());
+            try p.moveTo(.{ .x = 350, .y = 560 });
+            try p.lineTo(.{ .x = 410, .y = 530 });
+            try p.lineTo(.{ .x = 470, .y = 560 });
+            try p.stroke(.{ .color = gui.Color.rgba(0x90, 0x70, 0xFF, 0xFF), .width = 14, .join = .miter, .cap = .round });
+        }
+
+        try draw_list.text(.{ .x = 500, .y = 500 }, "miter / bevel / 1px", gui.Color.rgba(0x88, 0x88, 0x90, 0xFF));
+        {
+            var p = draw_list.beginPath(arena.allocator());
+            try p.moveTo(.{ .x = 510, .y = 620 });
+            try p.lineTo(.{ .x = 580, .y = 530 });
+            try p.lineTo(.{ .x = 650, .y = 620 });
+            try p.close();
+            try p.stroke(.{ .color = gui.Color.rgba(0x50, 0xD0, 0x70, 0xFF), .width = 10, .join = .miter, .miter_limit = 4 });
+        }
+        {
+            var p = draw_list.beginPath(arena.allocator());
+            try p.moveTo(.{ .x = 660, .y = 620 });
+            try p.lineTo(.{ .x = 720, .y = 530 });
+            try p.lineTo(.{ .x = 780, .y = 620 });
+            try p.close();
+            try p.stroke(.{ .color = gui.Color.rgba(0xF0, 0xC0, 0x40, 0xFF), .width = 10, .join = .bevel });
+        }
+        {
+            var p = draw_list.beginPath(arena.allocator());
+            try p.moveTo(.{ .x = 30, .y = 680 });
+            try p.cubicTo(.{ .x = 160, .y = 620 }, .{ .x = 320, .y = 740 }, .{ .x = 470, .y = 680 });
+            try p.stroke(.{ .color = gui.Color.rgba(0xFF, 0xFF, 0xFF, 0xFF), .width = 1, .cap = .round, .aa = true });
         }
 
         gui.render(target, &draw_list, gui.default_font, 1.0);
