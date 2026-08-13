@@ -17,17 +17,15 @@ const c = @cImport({
 });
 
 // platform.h keeps the older public C surface, and the quit cancel is an extra ABI belonging to this
-// backend alone, whose symbol the native implementations (objc/swift/metal) provide under the same name.
+// backend alone, whose symbol the native implementation provides under the same name.
 extern fn platform_cancel_quit(window: *c.PlatformWindow) void;
 
-/// Whether a macOS native backend (objc/swift/metal) supplies this build's object file. The
+/// Whether the macOS native backend (metal) supplies this build's object file. The
 /// optional features below live in that object file, so every gate is conjoined with it.
-const macos_native_backend = std.mem.eql(u8, build_options.platform_backend, "objc") or
-    std.mem.eql(u8, build_options.platform_backend, "swift") or
-    std.mem.eql(u8, build_options.platform_backend, "metal");
+const macos_native_backend = std.mem.eql(u8, build_options.platform_backend, "metal");
 
-/// The menu C symbols are referenced only with enable_menu and a macOS native backend
-/// (objc/swift/metal), which structurally prevents an undefined symbol in an executable without them.
+/// The menu C symbols are referenced only with enable_menu and the macOS native backend,
+/// which structurally prevents an undefined symbol in an executable without them.
 const menu_c_abi = build_options.enable_menu and macos_native_backend;
 
 // ============================================================================
@@ -67,22 +65,19 @@ const MenuC = if (menu_c_abi) struct {
     extern fn platform_destroy_menu(window: ?*c.PlatformWindow) void;
 } else struct {};
 
-/// The text clipboard C symbols are implemented by all three macOS backends (objc/swift/metal).
+/// The text clipboard C symbols are implemented by the macOS backend.
 /// A unit test (`builtin.is_test`) references no C symbol
 /// (the facade's in-memory fallback stands in), which prevents an undefined symbol at link time.
-/// It is false on Linux and Windows, and on a macOS backend without support.
-const clipboard_c_abi = !builtin.is_test and builtin.os.tag == .macos and
-    (std.mem.eql(u8, build_options.platform_backend, "objc") or
-        std.mem.eql(u8, build_options.platform_backend, "swift") or
-        std.mem.eql(u8, build_options.platform_backend, "metal"));
+/// It is false on Linux and Windows.
+const clipboard_c_abi = !builtin.is_test and builtin.os.tag == .macos and macos_native_backend;
 
 const ClipboardC = if (clipboard_c_abi) struct {
     extern fn platform_set_clipboard_text(utf8: [*]const u8, len: u32) void;
     extern fn platform_get_clipboard_text(out: [*]u8, cap: u32, out_len: *u32) bool;
 } else struct {};
 
-/// The text input C symbols exist only with enable_text_input, which all three macOS backends
-/// (objc/swift/metal) honour. A unit test references no C symbol (which prevents an undefined
+/// The text input C symbols exist only with enable_text_input, which the macOS backend
+/// honours. A unit test references no C symbol (which prevents an undefined
 /// symbol at link time).
 const text_input_c_abi = build_options.enable_text_input and macos_native_backend and !builtin.is_test;
 
@@ -632,7 +627,7 @@ pub const Window = struct {
 
     /// Tell the platform whether a text editing widget has focus (idempotent: a consumer may call it every
     /// frame to track focus, and a composition is discarded only when the effective path changes).
-    /// It takes effect on all three backends, objc/swift/metal (while active=false, keyDown does not reach the IME).
+    /// While active=false, keyDown does not reach the IME.
     pub fn setTextInputActive(self: Window, active: bool) void {
         if (comptime text_input_c_abi) TextInputC.platform_set_text_input_active(self.handle, active);
     }
@@ -1032,7 +1027,7 @@ fn dupePathAndFree(gpa: std.mem.Allocator, p: [*c]u8) std.mem.Allocator.Error![]
 // The OS text clipboard
 // ============================================================================
 
-/// Write UTF-8 text to the OS clipboard. A no-op on anything but the three macOS backends (objc/swift/metal).
+/// Write UTF-8 text to the OS clipboard. A no-op on anything but the macOS backend.
 pub fn setClipboardText(text: []const u8) void {
     if (comptime !clipboard_c_abi) return;
     ClipboardC.platform_set_clipboard_text(text.ptr, @intCast(text.len));
@@ -1040,7 +1035,7 @@ pub fn setClipboardText(text: []const u8) void {
 
 /// Copy the OS clipboard's UTF-8 text into the caller's buffer.
 /// An unsupported backend, no string, or a failure gives null. An empty string is `buf[0..0]`.
-/// All three macOS backends implement it through NSPasteboard.
+/// The macOS backend implements it through NSPasteboard.
 pub fn getClipboardText(buf: []u8) ?[]const u8 {
     if (comptime !clipboard_c_abi) return null;
     if (buf.len == 0) return null;

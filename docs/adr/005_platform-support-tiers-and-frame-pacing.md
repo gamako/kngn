@@ -16,10 +16,12 @@ contract** shared by first-class backends.
   - **First-class backends**: macOS **Metal**, Windows **D3D11-DXGI**, Linux
     **Wayland**. Frame pacing (fifo), buffer ownership and present semantics are
     aligned for game use, and avoiding tearing is guaranteed.
-  - **Best-effort backends** (compatibility backends): macOS **CALayer**
-    (objc/swift), Linux **X11**, Windows **GDI**. They present the same API shape,
-    but strict vsync, low jitter, freedom from tearing and frame latency control are
-    **not guaranteed**.
+  - **Best-effort backends** (compatibility backends): Linux **X11**, Windows
+    **GDI**. They present the same API shape, but strict vsync, low jitter, freedom
+    from tearing and frame latency control are **not guaranteed**.
+    (macOS had two CALayer backends in this tier when this record was written;
+    [ADR-031](031_metal-only-macos-backend.md) removed them, so **macOS is
+    first-class only**.)
 - `present()` is a **non-blocking operation and the frame commit point** that
   submits the most recently locked frame to the display queue (keeping the
   non-blocking stance of [ADR-002](002_present-blocking-behaviour.md)).
@@ -70,7 +72,7 @@ contract** shared by first-class backends.
 | Term | Definition |
 |---|---|
 | **first-class backend** | A backend where frame pacing (fifo), buffer ownership and present semantics are guaranteed for game use: Metal, D3D11-DXGI, Wayland. |
-| **best-effort backend** (compatibility backend) | A backend presenting the same API shape without guaranteeing strict vsync, low jitter, freedom from tearing or frame latency control: CALayer objc/swift, X11, GDI. |
+| **best-effort backend** (compatibility backend) | A backend presenting the same API shape without guaranteeing strict vsync, low jitter, freedom from tearing or frame latency control: X11, GDI. |
 | **frame availability** | "May this frame be drawn now?" Drawing is allowed only when `lockFramebuffer()` succeeds (returns non-null). |
 | **frame slot unavailable** | A retryable state in which no drawable backbuffer or frame slot exists right now, expressed by `lockFramebuffer() == null`. Not fatal. |
 | **present = submit** | `present()` is the non-blocking operation that sends the most recently locked frame to the display queue. It does not wait for display refresh. |
@@ -85,7 +87,6 @@ contract** shared by first-class backends.
 | **first-class** | macOS Metal | guaranteed | guaranteed | goal | promoted (triple slot + inflight semaphore) |
 | **first-class** | Windows D3D11-DXGI | guaranteed | guaranteed | goal | implemented (`core/platform_windows_d3d11.zig`; `-Dplatform=d3d11`; GDI remains the Windows default) |
 | **first-class** | Linux Wayland | guaranteed by the compositor | already achieved, paced by the frame callback | compositor dependent | frame availability already implemented |
-| **best-effort** | macOS CALayer (objc/swift) | left to the window server (effectively absent) | not guaranteed | not guaranteed | CADisplayLink runs underneath, but there is no explicit contract |
 | **best-effort** | Linux X11 | **not guaranteed** (can occur) | not guaranteed | not guaranteed | best-effort reduction planned |
 | **best-effort** | Windows GDI | **not guaranteed** (can occur) | not guaranteed | not guaranteed | software blit; migrating to D3D11 |
 
@@ -98,11 +99,12 @@ wiring.
 **A tier ranks frame pacing and nothing else.**
 [ADR-030](030_fixed-framebuffer-and-letterboxed-present.md) R7 adds a second,
 independent axis — which processor pays for magnifying a fixed-size framebuffer at
-present time — and the two do not correlate. A best-effort backend can get the
-magnification for free from the compositor (macOS CALayer) while a first-class one
-needs a shader for it (Windows D3D11), and the two backends that pay for it on the
-CPU every frame (Windows GDI, Linux X11) are both best-effort. Read the tier for
-pacing guarantees and 030 R7 for presentation cost.
+present time — and a tier does not predict it. Within first-class alone, one backend
+gets the magnification for free from the compositor (Linux Wayland, through
+`wp_viewporter`) while the others need a shader or a viewport for it (macOS Metal,
+Windows D3D11); the two backends that pay for it on the CPU every frame are Windows
+GDI and Linux X11. Read the tier for pacing guarantees and 030 R7 for presentation
+cost.
 
 ## The frame pacing contract (shared by first-class backends)
 
@@ -239,7 +241,7 @@ no explicit pacing contract for drawables and inflight buffers, and the manual
 present path touched `currentDrawable` outside `MTKView.draw(in:)`, leaving a
 CAMetalLayerDrawable lifecycle warning.
 
-`platform/macos-metal/platform_macos_metal.swift` was then brought into line with
+`platform/macos/platform_macos_metal.swift` was then brought into line with
 this contract:
 
 - **The drawable lifecycle warning is gone**: acquiring the drawable and the render
@@ -276,19 +278,17 @@ recovery, a waitable swap chain / frame-latency waitable object, and
 `beginFrame`/`waitFrame`) are still follow-up; they do not change the tier
 assignment.
 
-### GDI / X11 / CALayer — what is not guaranteed
+### GDI / X11 — what is not guaranteed
 
 For best-effort backends the following are explicitly **not guaranteed**:
 
 - Strict vsync synchronisation
 - Low jitter (stable frame intervals)
-- Freedom from tearing (X11 and GDI blit without a guard and can tear; CALayer is
-  left to the window server and effectively does not tear, but the contract does not
-  guarantee it)
+- Freedom from tearing (X11 and GDI blit without a guard and can tear)
 - Frame latency control and inflight buffer management
-- Gating frame availability via `lockFramebuffer() == null` (X11, GDI and CALayer
-  currently always return non-null, so the caller must pace itself with `sleep` or a
-  fixed timestep)
+- Gating frame availability via `lockFramebuffer() == null` (X11 and GDI currently
+  always return non-null, so the caller must pace itself with `sleep` or a fixed
+  timestep)
 
 These non-guarantees are documented for users in `AGENT.md` (the platform backends
 table and the support-tier summary) and in
@@ -422,7 +422,7 @@ the historical hard 4ms ceiling even when work has already consumed part of the 
 
 | Backend | Source | Failure → |
 |---|---|---|
-| macOS objc / swift / metal | `NSScreen.maximumFramesPerSecond` via `platform_display_refresh_hz` | facade 60Hz |
+| macOS metal | `NSScreen.maximumFramesPerSecond` via `platform_display_refresh_hz` | facade 60Hz |
 | Windows GDI / D3D11 | `GetDeviceCaps(VREFRESH)` on the primary DC | facade 60Hz |
 | Linux X11 | XRandR current rate via **`std.DynLib` (`libXrandr.so.2`)** | facade 60Hz |
 | Linux Wayland | first `wl_output.mode` with `WL_OUTPUT_MODE_CURRENT` (mHz→Hz) | facade 60Hz |

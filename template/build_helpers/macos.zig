@@ -153,8 +153,9 @@ pub fn linkMacOSFrameworks(
     const frameworks = [_][]const u8{
         "Cocoa",
         "QuartzCore",
-        // For file-dialog UTType (allowedContentTypes). The objc backend requires an explicit link.
-        // swift/metal can resolve via the swiftUniformTypeIdentifiers overlay; link uniformly for consistency.
+        // For file-dialog UTType (allowedContentTypes). Swift resolves it through the
+        // swiftUniformTypeIdentifiers overlay; it is linked explicitly so the dependency is
+        // stated at the build site rather than left to the overlay.
         "UniformTypeIdentifiers",
     };
     for (frameworks) |framework| {

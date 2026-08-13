@@ -1,5 +1,5 @@
 // The shared native menu bridge.
-// The internal connection between platform_macos_menu.m and each macOS backend (objc/swift/metal).
+// The internal connection between platform_macos_menu.m and the macOS backend.
 // The public menu ABI in platform.h is unchanged.
 #pragma once
 

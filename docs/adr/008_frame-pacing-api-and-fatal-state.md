@@ -124,7 +124,7 @@ pub fn waitFrame(self: Window, timeout_ns: u64) WaitResult;
    may still be `.unavailable` (the caller is expected to retry in a loop, because
    neither a D3D11 waitable object nor a Wayland frame callback can rule out spurious
    wakeups).
-5. **How best-effort backends degrade**: on objc/swift/X11/GDI a frame slot is always
+5. **How best-effort backends degrade**: on X11 and GDI a frame slot is always
    available, so `waitFrame` is a **no-op returning `.ready` immediately** and
    `beginFrame(.wait)` returns a framebuffer without waiting. This is consistent with
    ADR-005's tier definition of "pacing not guaranteed".
@@ -139,8 +139,8 @@ pub fn waitFrame(self: Window, timeout_ns: u64) WaitResult;
 8. **Relationship to the C ABI and the callback style**: `beginFrame` and `waitFrame`
    are **for the manual drawing API only**. They are **not exposed** to the callback
    style (`platform_run` / `FrameCallback` in `platform.h`, and the callback argument
-   of `platform_create_window`). All three macOS backends (objc/swift/metal) are
-   **no-op waits in the initial implementation**, so no new export is needed in
+   of `platform_create_window`). The macOS backend is a
+   **no-op wait in the initial implementation**, so no new export is needed in
    `platform.h` (the existing manual drawing exports are enough). Giving Metal's
    inflight semaphore wait real meaning inside `beginFrame` would require a new
    export and is treated as an **independent follow-up**, outside this ADR's scope
@@ -211,7 +211,6 @@ The **`FrameResult` tagged union** (candidate 2 in ADR-005) is adopted.
    | D3D11 | `DXGI_ERROR_DEVICE_REMOVED`/`RESET` (detected in `Present`, `GetBuffer` and similar; the reason comes from `GetDeviceRemovedReason`) |
    | Wayland | a `wl_display` error (`wl_display_get_error`), or the compositor disconnecting (socket close) |
    | X11 | a fatal I/O error equivalent to `XSetIOErrorHandler` (the display disconnecting) |
-   | macOS (objc/swift) | window close and internal CALayer errors (in practice there is no source of fatal today; the classification exists for the future) |
    | macOS (Metal) | asynchronous command buffer errors (`MTLCommandBuffer.error`), or persistent failure to acquire a drawable |
    | GDI | operating on an `hwnd` after it was destroyed |
 
@@ -282,7 +281,7 @@ typestate machine:
    `nextEvent`/`pollEvents` — see the rules above).
 3. **Staged breakdown** (the granularity of follow-up work):
    1. Add `beginFrame`, `waitFrame`, `FrameResult`, `WaitResult` and `FatalReason` to
-      the facade (`core/platform.zig`) and every backend (macOS objc/swift/metal,
+      the facade (`core/platform.zig`) and every backend (macOS metal,
       Linux x11/wayland, Windows gdi/d3d11). Best-effort backends get a no-op wait,
       and fatal is implemented only as far as each backend can detect it (many
       backends will raise no fatal for now, returning only `.framebuffer` or
@@ -293,8 +292,8 @@ typestate machine:
       `waitFrame`.
    3. (Optional) Migrate examples and applications to the new API — low priority,
       since existing code needs no changes.
-4. **How far this reaches the C ABI (`platform.h`)**: **in the initial stage all three
-   macOS backends (objc/swift/metal) are no-op waits**, so no new export is added
+4. **How far this reaches the C ABI (`platform.h`)**: **in the initial stage the
+   macOS backend is a no-op wait**, so no new export is added
    (the existing call pattern of `platform_lock_framebuffer`/`platform_present` is
    enough to implement `beginFrame`/`waitFrame` in the Zig facade and
    `core/platform_macos.zig`). Moving Metal's inflight semaphore wait — currently

@@ -3,7 +3,7 @@
 //! Not a sub-build called from the top-level build.zig;
 //! for developing and building inside the apps/editor/ directory alone.
 //!
-//!   cd apps/editor && zig build run [-Dplatform=objc|swift|metal]   (Linux: -Dplatform=x11)
+//!   cd apps/editor && zig build run   (macOS has one backend; Linux: -Dplatform=x11)
 
 const std = @import("std");
 

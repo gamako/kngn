@@ -12,6 +12,12 @@
   the policy that governs the breaking change to `FramebufferMode` is
   [020](020_kit-versioning-and-maturity-gate.md).
 
+> The per-backend tables below include the two macOS CALayer backends, which existed
+> when this record was written. [ADR-031](031_metal-only-macos-backend.md) removed them,
+> so on macOS only the Metal row is live; the CALayer rows are what the rule was reasoned
+> from. Nothing else in this record changes: Metal implements the mapping through a
+> viewport, exactly as its row states.
+
 ## Context and problem
 
 The framebuffer is the size of the display area. Both existing modes say so:

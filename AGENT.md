@@ -7,13 +7,14 @@
 
 A cross-platform environment for prototyping video and graphics. An application layer
 written in Zig sits on a low-level API layer implemented per platform (macOS:
-Objective-C / Swift / Metal; Linux: X11 / Wayland; Windows: GDI / D3D11).
+Swift / Metal; Linux: X11 / Wayland; Windows: GDI / D3D11).
 
 **Goal**: offer a minimal set of primitive APIs so that developers can build graphics
 applications flexibly.
 
-**Platforms**: macOS (Objective-C / Swift / Metal), Linux (X11 / Wayland), Windows
-(GDI / D3D11).
+**Platforms**: macOS (Swift / Metal), Linux (X11 / Wayland), Windows (GDI / D3D11).
+macOS has one backend and it requires a Metal-capable device; `docs/adr/031` records why
+the CALayer backends were removed.
 
 ## Where the details live
 
@@ -31,7 +32,7 @@ subsystems have their own documents, so read the one you need.
 | [docs/editor.md](docs/editor.md) | The editor family: `libs/paint`, `libs/gui`, and the pixel editor |
 | [docs/platform-verification.md](docs/platform-verification.md) | Building and verifying on Linux and Windows: Xvfb, a headless Wayland compositor, synthesising input, and the Windows symlink limitation |
 | [docs/performance-measurement.md](docs/performance-measurement.md) | How to measure a real frame rate, frame pacing, and the measured `.physical` 2x frame budget |
-| [docs/adr/](docs/adr/) | Architecture decision records. The layer structure is 007; the blocking behaviour of present is 002; support tiers and frame pacing are 005; frame pacing and fatal state are 008; the comment policy is 012; per-executable capability linking is 013; the netsync wire and authority model is 014; the real-time audio contract is 015; the GUI previous-frame hit-test contract is 016; app-data isolation for unattended harness runs is 017; the build-time selection of the wasm audio transport is 018; the unification of window creation (including fullscreen as a window option) is 019; the versioning and maturity gate of `kit` is 020; GUI keyboard focus traversal and the focus ring is 021; editor history persistence is 022; stable identity and the inverse-operation contract for editor applications is 023; the GUI scope boundary for multiline text editing, list virtualization and window docking is 024 (Proposed); the position a GUI drag reads on the frame it ends is 025; the macOS Swift runtime overlay list being a checked-range fixed list rather than dynamic discovery is 026; browser microphone capture on the shared-memory AudioWorklet path is 027; accepting GUI input outside a frame and staging it for the next one is 028; GUI lifecycle violations failing in every optimisation mode is 029; the fixed-size framebuffer presented as a letterboxed upscale is 030 |
+| [docs/adr/](docs/adr/) | Architecture decision records. The layer structure is 007; the blocking behaviour of present is 002; support tiers and frame pacing are 005; frame pacing and fatal state are 008; the comment policy is 012; per-executable capability linking is 013; the netsync wire and authority model is 014; the real-time audio contract is 015; the GUI previous-frame hit-test contract is 016; app-data isolation for unattended harness runs is 017; the build-time selection of the wasm audio transport is 018; the unification of window creation (including fullscreen as a window option) is 019; the versioning and maturity gate of `kit` is 020; GUI keyboard focus traversal and the focus ring is 021; editor history persistence is 022; stable identity and the inverse-operation contract for editor applications is 023; the GUI scope boundary for multiline text editing, list virtualization and window docking is 024 (Proposed); the position a GUI drag reads on the frame it ends is 025; the macOS Swift runtime overlay list being a checked-range fixed list rather than dynamic discovery is 026; browser microphone capture on the shared-memory AudioWorklet path is 027; accepting GUI input outside a frame and staging it for the next one is 028; GUI lifecycle violations failing in every optimisation mode is 029; the fixed-size framebuffer presented as a letterboxed upscale is 030; Metal being the only macOS backend is 031 |
 | [docs/wasm-deploy.md](docs/wasm-deploy.md) | Building and serving the wasm targets (COOP/COEP, the AudioWorklet, and what the usual build gates do not cover) |
 | [docs/variable-font.md](docs/variable-font.md) | Variable-font axes and how the font layer applies them |
 
@@ -144,16 +145,16 @@ upstream licence still must not carry an id.
 
 ```
 kngn/
-├── platform/           # macOS native implementations (a C ABI: platform.h plus each implementation)
+├── platform/           # the macOS native implementation (a C ABI: platform.h plus the Swift sources)
 │   ├── platform.h     # the primitive API (C ABI, for internal use)
-│   ├── macos/         # Objective-C (CALayer)
-│   ├── macos-shared/  # shared by swift and metal (EventQueue, input, IME, the window C ABI, @_cdecl)
-│   ├── macos-swift/   # Swift (CADisplayLink plus a CALayer present only)
-│   └── macos-metal/   # Metal (a GPU renderer plus a drawable present only)
+│   └── macos/         # one Swift module, split by subject, plus the shared NSMenu translation unit
+│       │              #   platform_macos_appkit.swift: the C ABI, EventQueue, input, IME, gamepads, window creation
+│       │              #   platform_macos_metal.swift:  the Metal renderer (a triple slot ring) and the drawable present
+│       │              #   platform_macos_menu.{h,m}:   NSMenu (Objective-C, compiled only with the menu opt-in)
 ├── core/              # L1, a thin base: depends on platform, never on libs (ADR-007 R1)
 │   ├── platform.zig   # the platform facade (branching on builtin.os.tag)
 │   ├── platform_types.zig      # shared types (the single source for KeyCode, Event and friends; type-only)
-│   ├── platform_macos.zig      # the macOS backend (through the C ABI; shared by objc/swift/metal)
+│   ├── platform_macos.zig      # the macOS backend (through the C ABI)
 │   ├── platform_linux*.zig     # the Linux backend (a dispatcher plus x11/wayland plus input translation; pure Zig)
 │   ├── platform_windows*.zig   # the Windows backend (a dispatcher plus gdi/d3d11 plus input translation; pure Zig)
 │   ├── platform_native_stub.zig # a stub for publishing the native .o archive
@@ -251,17 +252,17 @@ Without direnv, either enter a shell with `nix develop` or prefix each command, 
 ### Building and running
 
 The examples below are macOS. The valid values of `-Dplatform` depend on the OS
-(macOS: objc/swift/metal; Linux: x11/wayland; Windows: gdi/d3d11). See
-[docs/platform-verification.md](docs/platform-verification.md) for the other systems.
+(macOS: metal; Linux: x11/wayland; Windows: gdi/d3d11), and `zig build -h` lists them.
+See [docs/platform-verification.md](docs/platform-verification.md) for the other systems.
 
 ```bash
-zig build                        # Metal (the macOS default)
-zig build -Dplatform=swift       # Swift
-zig build -Dplatform=objc        # Objective-C
-
+zig build                        # Metal (the only macOS backend)
 zig build run                    # the default backend (macOS metal / Linux x11 / Windows gdi)
-zig build run-objc               # Objective-C (run-swift and run-metal likewise)
+zig build run-metal              # the same, named explicitly (Linux has run-x11 / run-wayland likewise)
 ```
+
+An unimplemented value is a build error naming the OS and the valid set, so a stale
+`-Dplatform=objc` in a script fails loudly rather than silently building something else.
 
 An example can also be built on its own:
 
@@ -284,7 +285,7 @@ symlink does not survive a checkout — see
 On the primitive APIs (event handling, manual drawing, reading the time), the following
 are implemented:
 
-- **Platform backends**: macOS (objc/swift/metal), Linux (x11/wayland), Windows
+- **Platform backends**: macOS (metal), Linux (x11/wayland), Windows
   (gdi/d3d11). The frame pacing support tiers are below and in `docs/adr/005`.
 - **Examples**: basic drawing, input, sprites, a fixed timestep, text, benchmarks, the
   mouse, the GUI widgets, outline fonts, audio, cursor shapes, colour emoji, capture,
@@ -308,9 +309,7 @@ are implemented:
 
 | Implementation | File | Rendering | Status |
 | --------------- | ------------------------------------------------- | ------------- | --------------------- |
-| **Objective-C** | `platform/macos/platform_macos.m` | CALayer | ✅ complete |
-| **Swift** | `platform/macos-swift/platform_macos_swift.swift` (the shared part is `platform/macos-shared/platform_macos_shared.swift`) | CADisplayLink | ✅ complete |
-| **Metal** | `platform/macos-metal/platform_macos_metal.swift` | Metal GPU | ✅ first-class frame pacing |
+| **Metal (macOS)** | `platform/macos/platform_macos_metal.swift` (the AppKit half is `platform/macos/platform_macos_appkit.swift`) | Metal GPU | ✅ first-class frame pacing |
 | **X11 (Linux)** | `core/platform_linux_x11.zig` (pure Zig, Xlib directly) | XShm/XPutImage | ✅ window, blit and input |
 | **Wayland (Linux)** | `core/platform_linux_wayland.zig` (pure Zig, wl_shm directly) | wl_shm (xdg-shell) | ✅ window, blit and input (verified on Linux hardware) |
 | **GDI (Windows)** | `core/platform_windows_gdi.zig` (pure Zig, Win32 directly) | GDI `StretchDIBits` (a software blit) | ✅ a best-effort backend |
@@ -323,9 +322,12 @@ warning. `displaySyncEnabled` is set explicitly for fifo (synchronised to displa
 refresh). Details in `docs/adr/005`.
 
 The support tiers — **first-class** (Metal, D3D11-DXGI, Wayland) versus **best-effort**
-(CALayer objc/swift, X11, GDI) — and the frame pacing, vsync and buffer ownership
-contracts are defined in `docs/adr/002` (revised) and `docs/adr/005`. How to build and
-verify each one is in
+(X11, GDI) — and the frame pacing, vsync and buffer ownership contracts are defined in
+`docs/adr/002` (revised) and `docs/adr/005`. **macOS is first-class only**: it has a single
+backend that requires a Metal-capable device, and window creation fails with
+`error.WindowCreationFailed` where no device exists (`KNGN_HEADLESS=1` is the display-less
+path). `docs/adr/031` records that decision and the measurements behind it. How to build and
+verify each backend is in
 [docs/platform-verification.md](docs/platform-verification.md).
 
 ## The main platform API
@@ -579,7 +581,7 @@ zig build bench-gui-frame       # a full gui Context frame (beginFrame → build
 zig build bench-path            # path fill: small/medium/fullscreen × AA × scale × one/many, plus scratch peak
 zig build bench-frameprof       # what the frame section profiler costs per frame (disabled / bookkeeping only / with real clock reads)
 
-# The pixel editor (-Dplatform switches objc/swift/metal)
+# The pixel editor (macOS has one backend; -Dplatform picks x11/wayland on Linux and gdi/d3d11 on Windows)
 zig build run-pixie
 # Note: the default is Debug. On retina at .physical 2x it feels slow (27.9fps measured).
 #       To judge smoothness or measure performance, use ReleaseFast:

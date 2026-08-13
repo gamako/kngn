@@ -3,6 +3,15 @@
 The rules themselves are in the "Performance rules" section of `AGENT.md`. This document
 holds the measurement procedures and the measured data behind them.
 
+> **On the `objc` and `swift` conditions below.** macOS had two CALayer backends until
+> [adr/031](adr/031_metal-only-macos-backend.md) removed them, leaving Metal as the only
+> one. Measurements taken under those conditions are kept, because what they describe is
+> the machine — memory bandwidth, timer behaviour, the cost of a fill — and re-running
+> them on Metal would not change that. Where a number is *about* the removed backends
+> (their free-run rate, the ColorSync trap, the first-touch cost of a CALayer backing),
+> the condition is named so it reads as history rather than as current behaviour. The
+> procedures themselves are written for the backends that exist.
+
 ## Measuring the application's real frame rate (required alongside a microbenchmark)
 
 A microbenchmark contains none of the presentation cost (CGImage, ColorSync and the
@@ -192,7 +201,7 @@ paced. objc's figure is 60.8GB/s, the rate `bench-fill` measures for a replicate
 
 ## Frame-cap measurement (`-Dframe-cap`, free-run)
 
-Caps are measured one at a time (rebuild per cap). Free-run harness, ReleaseFast, objc:
+Caps are measured one at a time (rebuild per cap). Free-run harness, ReleaseFast:
 
 ```bash
 for hz in 60 30 20 10; do
@@ -201,7 +210,7 @@ for hz in 60 30 20 10; do
   KNGN_HARNESS_PORT_FILE=/tmp/kngn-frame-cap-${hz}.port \
   KNGN_HARNESS_OUT=/tmp/kngn-frame-cap \
   KNGN_HARNESS_SKIP_FRAME_COPY=1 \
-    zig build run-pixie -Dplatform=objc -Doptimize=ReleaseFast -Dframe-cap=$hz &
+    zig build run-pixie -Doptimize=ReleaseFast -Dframe-cap=$hz &
   until [ -s /tmp/kngn-frame-cap-${hz}.port ]; do sleep 0.1; done
   sleep 5
   scripts/kngn ctl --port-file /tmp/kngn-frame-cap-${hz}.port 'digest stats'   # frame1
@@ -226,8 +235,10 @@ Each run prints its resolved target once, so a recorded number can be checked la
 info: frame pacing: display refresh 60 Hz, cap 30 Hz, period 33.33 ms
 ```
 
-Measured on aarch64-macos, the editor, objc, ReleaseFast, `.physical` 2x, 10s windows
-after a 5s warm-up:
+Measured on aarch64-macos, the editor, ReleaseFast, `.physical` 2x, 10s windows after a
+5s warm-up. The backend column reads `objc` because that is what the run used, on the
+CALayer backend since removed (adr/031); what the table pins down is the timer path,
+which is shared:
 
 | backend | reported refresh | cap | target fps | measured fps | error | pass |
 |---|---:|---:|---:|---:|---:|---|

@@ -334,7 +334,7 @@ pub fn effectiveContentScale(raw_scale: f32) f32 {
     return if (raw_scale > 0 and std.math.isFinite(raw_scale)) raw_scale else 1.0;
 }
 
-/// Numerically identical to objc's (int)lround((double)px * (double)scale).
+/// Rounds `px * scale` half away from zero in f64, matching the macOS backend's conversion.
 /// Clamps to a finite value in [1, the maximum u32] (below 1 → 1, above the maximum u32 → the maximum u32).
 pub fn roundToPhysicalPx(logical_px: u32, scale: f32) u32 {
     const s: f64 = if (scale > 0 and std.math.isFinite(scale)) scale else 1.0;
@@ -1947,7 +1947,7 @@ test "effectiveFramebufferSize .physical applies roundToPhysicalPx" {
     try std.testing.expectEqual(@as(u32, 900), fb15.height);
 }
 
-test "roundToPhysicalPx matches objc lround and clamps to the range" {
+test "roundToPhysicalPx rounds half away from zero and clamps to the range" {
     try std.testing.expectEqual(@as(u32, 1), roundToPhysicalPx(0, 2.0)); // 0*2→0 → clamp to 1
     try std.testing.expectEqual(@as(u32, 1600), roundToPhysicalPx(800, 2.0));
     try std.testing.expectEqual(@as(u32, 1200), roundToPhysicalPx(800, 1.5));

@@ -28,7 +28,7 @@ fullscreen size:
 
 | Backend | Fullscreen mechanism | Where the fullscreen size comes from |
 |---|---|---|
-| macOS (objc / swift / metal) | an ordinary window, then `platform_enter_fullscreen` (`NSWindow toggleFullScreen:`, **asynchronous**) | the transition of the existing `NSWindow` |
+| macOS (metal) | an ordinary window, then `platform_enter_fullscreen` (`NSWindow toggleFullScreen:`, **asynchronous**) | the transition of the existing `NSWindow` |
 | Linux x11 | the EWMH `_NET_WM_STATE_FULLSCREEN` property, set before the map | the **default screen** resolution |
 | Linux wayland | `xdg_toplevel_set_fullscreen` before the first commit | the **compositor** picks the output (`output = null`) |
 | Windows gdi / d3d11 | an undecorated `WS_POPUP` window at (0,0) covering the monitor | the **primary monitor** (`GetSystemMetrics`) |

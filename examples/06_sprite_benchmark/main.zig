@@ -137,7 +137,7 @@ pub fn main(minimal: std.process.Init.Minimal) !void {
     // -------- start banner --------
     const build_mode_name = @tagName(@import("builtin").mode);
     std.debug.print(
-        "[bench:start] platform={s} build={s} (note: performance comparison targets the objc build primarily)\n",
+        "[bench:start] platform={s} build={s}\n",
         .{ build_options.platform_name, build_mode_name },
     );
 

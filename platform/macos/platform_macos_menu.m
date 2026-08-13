@@ -2,7 +2,6 @@
 // The shared native menu implementation (NSMenu plus target-action)
 // ========================================
 //
-// objc, swift and metal all link this same translation unit.
 // Opt-in: build_helpers compiles this file only when enable_menu=true, passing
 // `-DKNGN_ENABLE_MENU`. An executable that does not use menus never links this TU (nm shows no symbol).
 // NSMenu needs no extra framework, since AppKit is linked already.

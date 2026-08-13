@@ -53,7 +53,7 @@ pub fn getTime() f64 {
 fn macosGetTime() f64 {
     const c = struct {
         extern "c" fn clock_gettime_nsec_np(clock_id: c_int) u64;
-        const CLOCK_UPTIME_RAW: c_int = 8; // macOS: matches platform_macos.m
+        const CLOCK_UPTIME_RAW: c_int = 8; // macOS: the same clock the native backend reads
     };
     return @as(f64, @floatFromInt(c.clock_gettime_nsec_np(c.CLOCK_UPTIME_RAW))) / 1e9;
 }

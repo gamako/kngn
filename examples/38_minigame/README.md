@@ -50,13 +50,13 @@ Game logic stays inside this example; no new shared ECS / Scene / GameLoop layer
 From the repository root:
 
 ```bash
-zig build run-example_38 -Dplatform=objc
+zig build run-example_38
 ```
 
 Standalone:
 
 ```bash
-cd examples/38_minigame && zig build run -Dplatform=objc
+cd examples/38_minigame && zig build run
 ```
 
 ## E2E (headless replay)
@@ -66,11 +66,11 @@ TMPD=$(mktemp -d)
 KNGN_HEADLESS=1 \
 KNGN_HARNESS_SCRIPT=examples/38_minigame/e2e.txt \
 KNGN_HARNESS_OUT=$TMPD \
-zig build run-example_38 -Dplatform=objc
+zig build run-example_38
 ```
 
 - `snapshot fb` path omitted → `$KNGN_HARNESS_OUT/frame_<n>.png`
-- `expect fb crc=...` baked from macOS objc measurements
+- `expect fb crc=...` baked from a macOS measurement
 - `game` probe asserts grounded / jump / camera / score
 
 See [`docs/harness.md`](../../docs/harness.md).
@@ -80,9 +80,9 @@ See [`docs/harness.md`](../../docs/harness.md).
 ```bash
 RUN1=$(mktemp -d); RUN2=$(mktemp -d)
 KNGN_HEADLESS=1 KNGN_HARNESS_SCRIPT=examples/38_minigame/e2e.txt \
-  KNGN_HARNESS_OUT=$RUN1 zig build run-example_38 -Dplatform=objc 2>&1 | tee $RUN1/replay.log
+  KNGN_HARNESS_OUT=$RUN1 zig build run-example_38 2>&1 | tee $RUN1/replay.log
 KNGN_HEADLESS=1 KNGN_HARNESS_SCRIPT=examples/38_minigame/e2e.txt \
-  KNGN_HARNESS_OUT=$RUN2 zig build run-example_38 -Dplatform=objc 2>&1 | tee $RUN2/replay.log
+  KNGN_HARNESS_OUT=$RUN2 zig build run-example_38 2>&1 | tee $RUN2/replay.log
 diff <(rg '\[harness\] digest fb' $RUN1/replay.log) <(rg '\[harness\] digest fb' $RUN2/replay.log)
 ```
 

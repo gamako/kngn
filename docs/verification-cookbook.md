@@ -106,16 +106,15 @@ Two things about that comparison are easy to get wrong:
 
 ### 5. Do backends agree
 
-- **Goal**: confirm that switching the rendering backend (objc / swift /
-  metal on macOS; x11 / wayland on Linux) does not change what is drawn.
-- **Steps**: run the identical script against two backends (`zig build
-  run-objc` and `zig build run-metal`, say) and compare `digest fb` crcs.
+- **Goal**: confirm that switching the rendering backend (x11 / wayland on Linux;
+  gdi / d3d11 on Windows) does not change what is drawn.
+- **Steps**: run the identical script against two backends (`zig build run-x11`
+  and `zig build run-wayland`, say) and compare `digest fb` crcs.
 - **Pass condition**: identical crcs.
-- **Limits**: this is already established as a fact for macOS backends
-  (`fb` captures the manual-drawing CPU framebuffer, which is backend
-  independent, and objc/metal crcs were measured bit-identical) — this recipe
-  is how to re-check that fact after a change that could plausibly break it,
-  not a claim that needs re-deriving from scratch each time.
+- **Limits**: **macOS has a single backend**, so this recipe applies to Linux and
+  Windows only. It is also not a claim to re-derive from scratch: `fb` captures the
+  manual-drawing CPU framebuffer, which every backend supplies alike, so the recipe
+  is how to re-check that after a change that could plausibly break it.
 
 ### 6. Is there sound, and does it look right
 

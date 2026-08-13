@@ -1,6 +1,6 @@
 //! 21_char_input: minimal sample that checks `char_input` alone (committed text characters as UTF-32 codepoints).
 //! A vehicle for "text input only" without mixing in pixie rename or the capture demo, and a base for
-//! visually confirming char_input on every backend (macOS objc/swift/metal, Linux x11/wayland, Windows gdi/d3d11)
+//! visually confirming char_input on every backend (macOS metal, Linux x11/wayland, Windows gdi/d3d11)
 //! on real hardware (also reusable on Windows and Linux x11/wayland).
 //!
 //! The font is an **OS system font loaded at runtime** (same approach as example_12. Prefer a Japanese .ttc so

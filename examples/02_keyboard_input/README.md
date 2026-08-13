@@ -53,23 +53,11 @@ zig build
 zig build run-metal
 ```
 
-### Swift / Objective-C
-
-```bash
-zig build -Dplatform=swift
-# or
-zig build run-swift
-
-zig build -Dplatform=objc
-# or
-zig build run-objc
-```
-
 From the repository root:
 
 ```bash
 zig build run-example_02
-zig build run-example_02 -Dplatform=objc
+zig build run-example_02 -Dplatform=wayland   # on Linux
 ```
 
 ## Run (standalone binaries)
@@ -77,9 +65,8 @@ zig build run-example_02 -Dplatform=objc
 ```bash
 zig build run
 
-./zig-out/bin/example_02_keyboard_input        # default (Metal on macOS)
-./zig-out/bin/example_02_keyboard_input_swift
-./zig-out/bin/example_02_keyboard_input_objc
+./zig-out/bin/example_02_keyboard_input          # default (Metal on macOS, X11 on Linux)
+./zig-out/bin/example_02_keyboard_input_wayland  # a non-default backend, on Linux
 ```
 
 ## Learning points

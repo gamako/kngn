@@ -6,20 +6,21 @@ import UniformTypeIdentifiers
 import GameController
 #endif
 
-// The shared code of the macOS Swift backends
-// It gathers the C ABI, the event queue, the IME, gamepads, the menu bridge and the window creation
-// skeleton that the swift (CALayer) and metal backends have in common. The backend-specific drawing
-// lives in platform/macos-swift/platform_macos_swift.swift (CALayer) and
-// platform/macos-metal/platform_macos_metal.swift (Metal), each conforming to PlatformBackendView
-// and created through the makePlatformBackendView() factory.
+// The AppKit half of the macOS backend
+// It holds the C ABI, the event queue, the IME, gamepads, the menu bridge and the window creation
+// skeleton. Drawing lives in platform/macos/platform_macos_metal.swift, which conforms to
+// PlatformBackendView and is created through the makePlatformBackendView() factory. Both files are
+// compiled as one Swift module (whole-module optimisation), so the split is by subject, not by linkage:
+// this file never touches Metal, and the renderer's AppKit surface is confined to the NSView overrides
+// that forward mouse, scroll and NSTextInputClient calls into the shared state defined here.
 //
 // The type definitions (PlatformEvent, PlatformEventType, PlatformKeyCode, the PLATFORM_* constants,
 //        the FrameCallback typealias and so on) come from the C header automatically, through the
 //        bridging header (-import-objc-header platform/platform.h).
 //
-// OS file drag and drop (file URLs only) is implemented on the same contract as the objc backend.
-// Each backend's view implements NSDraggingDestination and puts a single file URL onto the event_queue
-// as a PLATFORM_EVENT_FILE_DROP by inline copy (several, non-file, empty, over-limit or NUL-containing paths are rejected).
+// OS file drag and drop (file URLs only): the view implements NSDraggingDestination and puts a single
+// file URL onto the event_queue as a PLATFORM_EVENT_FILE_DROP by inline copy (several, non-file, empty,
+// over-limit or NUL-containing paths are rejected).
 // Filling the struct and validating the length and NULs are the shared helper enqueueFileDropIfValid (and beneath it platform.h's platform_fill_file_drop_event).
 
 // ========================================
@@ -128,7 +129,7 @@ class EventQueue {
 
     // Push onto the queue (when full, bump the drop counter and discard)
     // The token is used only to invalidate a gamepad connect after the fact. No other caller needs the
-    // return value, hence @discardableResult (which silences swiftc's unused-result warning, as with queue_push on the objc side).
+    // return value, hence @discardableResult (which silences swiftc's unused-result warning).
     @discardableResult
     func push(_ ev: PlatformEvent) -> EventQueueToken? {
         let next_head = (head + 1) % EVENT_QUEUE_SIZE
@@ -164,13 +165,13 @@ class EventQueue {
 // The line→points factor for a non-precise scroll (a rule of thumb)
 let SCROLL_LINE_TO_POINTS: Float = 16.0
 
-// The shared scale helpers (the same shape as objc and ADR-011).
+// The scale helpers (ADR-011).
 // The real scale used for input normalisation (for a query; independent of fb_mode).
 func effectiveContentScale(_ rawScale: CGFloat) -> CGFloat {
     return (rawScale > 0 && rawScale.isFinite) ? rawScale : 1.0
 }
 
-/// Numerically identical to objc's `(int)lround((double)px * (double)scale)`.
+/// Rounds `px * scale` half away from zero in Double, the same conversion the other platforms apply.
 /// Clamps to a finite value in [1, UInt32.max].
 func roundToPhysicalPx(_ logicalPx: Int, scale: CGFloat) -> Int {
     let s = Double(effectiveContentScale(scale))
@@ -218,7 +219,7 @@ func viewportPhysicalSize(_ view: NSView, scale: CGFloat) -> (Int, Int) {
 
 // Convert NSEvent.locationInWindow into raw physical pixels with the origin at the view's top-left (floored to an integer).
 // scale is the current native backing scale (content_scale). The real scale is applied even under
-// .logical (the same contract as objc's `event_location_to_platform_raw_coords`; the facade normalises it).
+// .logical: the backend reports raw physical coordinates and the facade is the sole normaliser (ADR-011 R2).
 func eventLocationToPlatformCoords(_ event: NSEvent, _ view: NSView, scale: CGFloat) -> (Int32, Int32) {
     let windowPt = event.locationInWindow
     let viewPt = view.convert(windowPt, from: nil)
@@ -392,9 +393,9 @@ func extractModifiers(_ nsModifiers: NSEvent.ModifierFlags) -> UInt32 {
 // The backend view abstraction
 // ========================================
 //
-// The shared protocol that the views of both the swift (CALayer) and metal backends conform to. The
-// shared C ABI drives the view only through backendView, which hides the backend-specific drawing
-// (CALayer or the Metal ring). It stays thin: drawing itself and the IME state live in each backend and in PlatformIMEState.
+// The protocol the renderer's view conforms to. The C ABI drives the view only through backendView,
+// which hides the drawing implementation (the Metal ring). It stays thin: drawing itself lives in the
+// renderer and the IME state in PlatformIMEState.
 protocol PlatformBackendView: AnyObject {
     var nativeView: NSView { get }
     var width: Int { get }
@@ -434,7 +435,7 @@ protocol PlatformBackendView: AnyObject {
     func hasMarkedText() -> Bool
     func imeRouteEnabled() -> Bool
 #endif
-    // The scale latch and metrics (the same shape as objc's fillMetrics / applyLatched / nativeEventScale)
+    // The scale latch and metrics
     // forQuery=true: the current negotiated value (the pending scale), for contentScale() and input normalisation before a lock.
     // forQuery=false: the latched snapshot (buffer, scale and epoch all belong to the same frame), for lock_ex.
     func fillMetrics(_ out: UnsafeMutablePointer<PlatformFramebufferMetrics>, forQuery: Bool)
@@ -672,12 +673,12 @@ func platform_menu_enqueue_command(_ window: UnsafeMutableRawPointer?, _ command
 #endif // KNGN_ENABLE_MENU
 
 // ========================================
-// The IME state, shared by both backends (KNGN_ENABLE_TEXT_INPUT)
+// The IME state (KNGN_ENABLE_TEXT_INPUT)
 // ========================================
 #if KNGN_ENABLE_TEXT_INPUT
 //
 // The NSTextInputClient logic and the composition and document-access state are gathered into PlatformIMEState.
-// Each backend's view holds `let imeState = PlatformIMEState()` and forwards the NSTextInputClient
+// The renderer's view holds `let imeState = PlatformIMEState()` and forwards the NSTextInputClient
 // methods and the custom IME methods to it. firstRect converts the caret rect the application
 // supplied — already in physical window pixels — into view points.
 
@@ -1129,9 +1130,9 @@ final class PlatformIMEState {
 // ========================================
 // The shared file drop helper
 // ========================================
-// The same contract as the objc backend (platform/macos/platform_macos.m): a single file URL, UTF-8,
-// with empty, over-limit (PLATFORM_FILE_DROP_PATH_BYTES) or NUL-containing paths rejected. Filling the
-// struct and validating the length and NULs are platform.h's shared helper platform_fill_file_drop_event (one source for objc/swift/metal).
+// A single file URL, UTF-8, with empty, over-limit (PLATFORM_FILE_DROP_PATH_BYTES) or NUL-containing
+// paths rejected. Filling the struct and validating the length and NULs are platform.h's shared helper
+// platform_fill_file_drop_event, so every platform states the same contract in one place.
 // Once the inline copy is done, nothing depends on the URL's lifetime.
 func enqueueFileDropIfValid(handle: PlatformWindowHandle, url: URL) -> Bool {
     guard url.isFileURL else { return false }
@@ -1219,8 +1220,8 @@ func platform_create_window_ex(width: Int32, height: Int32, title: UnsafePointer
     return createWindowImpl(width: width, height: height, title: title, callback: callback, userdata: userdata, transparent: transparent, borderless: borderless, position: position, sizing: sizing, notResizable: notResizable)
 }
 
-// The shared skeleton of window creation. Creating the backend-specific view is delegated to the
-// makePlatformBackendView() factory (defined in each backend file). The window-level style, transparency and placement are shared.
+// The skeleton of window creation. Creating the view is delegated to the makePlatformBackendView()
+// factory (defined in the renderer file). The window-level style, transparency and placement live here.
 private func createWindowImpl(width: Int32, height: Int32, title: UnsafePointer<CChar>, callback: FrameCallback?, userdata: UnsafeMutableRawPointer?, transparent: Bool, borderless: Bool, position: (x: Int32, y: Int32)?, sizing: PlatformFramebufferSizing, notResizable: Bool = false) -> UnsafeMutableRawPointer? {
     let app = NSApplication.shared
     app.setActivationPolicy(.regular)
@@ -1267,7 +1268,7 @@ private func createWindowImpl(width: Int32, height: Int32, title: UnsafePointer<
     }
 #endif
 
-    // Create the backend-specific view (CALayer or Metal). View-level settings such as transparency and physical mode are made inside the factory.
+    // Create the renderer's view (Metal). View-level settings such as transparency and physical mode are made inside the factory.
     guard let backendView = makePlatformBackendView(
         frame: frame,
         width: Int(width),
@@ -1299,7 +1300,7 @@ private func createWindowImpl(width: Int32, height: Int32, title: UnsafePointer<
     window.makeFirstResponder(backendView.nativeView)
     app.activate(ignoringOtherApps: true)
 
-    // Start driving the drawing (swift: start the CADisplayLink; metal: a no-op, since isPaused is set in the factory)
+    // Start driving the drawing (a no-op under Metal, since isPaused is set in the factory)
     backendView.startPresentation()
 
     #if KNGN_ENABLE_GAMEPAD
@@ -1467,7 +1468,7 @@ func platform_destroy_window(platformWindow: UnsafeMutableRawPointer?) -> Void {
     // gamepads: drop the reference when this window is the active one
     gamepadDetachWindow(handle)
     #endif
-    // Stop driving the drawing and cut the callback's reference to the view (swift: CADisplayLink; metal: the MTKView delegate)
+    // Stop driving the drawing and cut the callback's reference to the view (the MTKView delegate)
     handle.backendView.prepareForDestroy()
     // Detach the delegate before closing ourselves (so windowShouldClose does not wrongly push a quit)
     handle.window.delegate = nil
@@ -1511,7 +1512,7 @@ func platform_poll_events(platformWindow: UnsafeMutableRawPointer?) -> Bool {
             #if KNGN_ENABLE_MENU
             // Preventing a keyEquivalent from firing twice.
             // performKeyEquivalent is delegated to the shared menu TU, and once it is consumed no key_down is
-            // pushed and nothing goes to the inputContext either (the same semantics as objc).
+            // pushed and nothing goes to the inputContext either.
             if event.type == .keyDown {
                 if platform_menu_consume_key_equivalent(Unmanaged.passUnretained(event).toOpaque()) {
                     continue
@@ -1594,7 +1595,7 @@ func platform_set_composition_rect(platformWindow: UnsafeMutableRawPointer?, x: 
     handle.backendView.setCompositionRectPixels(x: x, y: y, w: w, h: h)
 }
 
-// Tell the platform whether a text editing widget has focus (the same semantics as objc).
+// Tell the platform whether a text editing widget has focus.
 @_cdecl("platform_set_text_input_active")
 func platform_set_text_input_active(platformWindow: UnsafeMutableRawPointer?, active: Bool) {
     guard let platformWindow = platformWindow else { return }
@@ -1685,7 +1686,7 @@ func platform_lock_framebuffer_ex(platformWindow: UnsafeMutableRawPointer?, out:
     if let out = out {
         handle.backendView.fillMetrics(out, forQuery: false)
     }
-    // Return currentBuffer (the same shape as objc's getCurrentBuffer: the write buffer after the latch)
+    // Return currentBuffer: the write buffer after the latch
     if let live = handle.backendView.initialFramebuffer {
         handle.currentFramebuffer = live
     }
@@ -1706,7 +1707,7 @@ func platform_present(platformWindow: UnsafeMutableRawPointer?, mapping: UnsafeP
     guard let fb = handle.currentFramebuffer else { return }
     let view = handle.backendView
 
-    // Present, then receive and store the next write buffer (swift: a swap; metal: a submit plus a slot advance)
+    // Present, then receive and store the next write buffer (a submit plus a slot advance)
     if let next = view.present(framebuffer: fb, width: view.width, height: view.height, mapping: mapping.pointee) {
         handle.currentFramebuffer = next
     }
@@ -1870,10 +1871,10 @@ func platform_free_path(path: UnsafeMutablePointer<CChar>?) -> Void {
 // ========================================
 // The OS text clipboard
 // ========================================
-// Bit-identical semantics to objc (platform_macos.m):
-// truncating on a UTF-8 boundary, clearContents→setString, the empty string, and the null guards.
+// The contract: truncating on a UTF-8 boundary, clearContents→setString, the empty string,
+// and the null guards.
 
-/// Step back to a UTF-8 code point boundary when cap is exceeded (identical to objc's clipboardUtf8TruncateLen).
+/// Step back to a UTF-8 code point boundary when cap is exceeded.
 private func clipboardUtf8TruncateLen(_ bytes: UnsafePointer<UInt8>, _ len: UInt32, _ cap: UInt32) -> UInt32 {
     var n = min(len, cap)
     while n > 0 && n < len && (bytes[Int(n)] & 0xC0) == 0x80 {

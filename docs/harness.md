@@ -21,15 +21,13 @@ Phases, all implemented:
   the native `backend.init()` entirely and select `platform_null` at runtime. A
   script or a listener is optional, so a display-less run needs neither. See
   "Fully display-less" below.
-  - The `fb` probe captures **the CPU framebuffer of the manual drawing API**, so
-    it is backend-independent: `snapshot fb` works on objc, swift and metal alike
-    (metal supplies the same CPU buffer, and the framebuffer crcs were measured
-    bit-identical to objc).
+  - The `fb` probe captures **the CPU framebuffer of the manual drawing API**, so it is
+    backend-independent: every backend, macOS Metal included, supplies the same CPU
+    buffer, and `snapshot fb` reads it before the backend presents.
 - **Out of scope**: reading back Metal's GPU drawable (the composited surface after
-  drawing). `snapshot fb` and `digest fb` already work in a metal build through the
-  CPU framebuffer above, with crcs measured bit-identical to objc, and a readback
-  would add nothing to what the harness is for — verifying what the application
-  drew.
+  drawing). `snapshot fb` and `digest fb` already work through the CPU framebuffer
+  above, and a readback would add nothing to what the harness is for — verifying what
+  the application drew.
 - **An action registry**: the write and operate counterpart to a probe (read). An
   application opts in with `platform.registerAction(...)` and it is invoked as
   `action <name> [args...]`. See "Adding a custom action".
@@ -106,7 +104,7 @@ JSON with a fixed top-level schema. **`backend` and `headless_active` always app
 first** (before `probes`), so they remain present even when the listing is truncated:
 
 - **`backend`**: the build-selected backend name platform passed in at init
-  (`objc` / `swift` / `metal` / `x11` / `wayland` / `gdi` / `d3d11` / `wasm`). When
+  (`metal` / `x11` / `wayland` / `gdi` / `d3d11` / `wasm`). When
   platform has not set it (unit tests), the value is `"unknown"`.
 - **`headless_active`**: `true` when `KNGN_HEADLESS=1` selected the null runtime;
   `false` when the native platform backend is running. Together with `backend`, this
@@ -768,9 +766,8 @@ Rules and limits:
   with a warm cache, or (c) read a `snapshot fb` and look at it — and judge the sound
   with `digest audio` (silent, rms, band). For an application without audio (the
   editor) the framebuffer crc stays bit-deterministic as before. Capturing `fb` goes
-  through the CPU framebuffer, so **objc, swift and metal all work** (the framebuffer
-  crc of objc and metal was measured bit-identical). Reading back Metal's GPU drawable
-  is out of scope (see above).
+  through the CPU framebuffer, so it works on every backend, macOS Metal included.
+  Reading back Metal's GPU drawable is out of scope (see above).
 - **The driver is a single `std.Io.net` implementation** shared by macOS, Linux and
   Windows (`kngn` is installed unconditionally, with no OS gate; running it on Windows
   is untested). `scripts/kngn` is a thin wrapper that execs `zig-out/bin/kngn`

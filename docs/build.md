@@ -34,9 +34,9 @@ nix is not required. Install [zig 0.16.0](https://ziglang.org/download/) and add
 the per-OS prerequisites below.
 
 **macOS** — Xcode, or the Command Line Tools. That is all: `xcrun` resolves the
-SDK and the `swiftc` path. All three macOS backends, the default `metal` included,
-build the editor (`zig build build-pixie`) with the Command Line Tools alone, as
-measured: the Metal backend compiles its shaders at
+SDK and the `swiftc` path. The macOS backend builds the editor
+(`zig build build-pixie`) with the Command Line Tools alone, as
+measured: it compiles its shaders at
 run time from source, so the offline `metal` shader compiler that only Xcode ships
 is not needed. Under the Command Line Tools the Swift runtime resolves from the SDK
 and the build prints a warning about a Swift library directory it cannot open —
@@ -69,12 +69,13 @@ build error.
 
 | OS | `-Dplatform` | Implementation |
 |----|--------------|----------------|
-| macOS | `metal` (default) / `swift` / `objc` | Metal (GPU) / Swift (CADisplayLink) / Objective-C (CALayer) |
+| macOS | `metal` (the only value) | Swift plus a Metal GPU renderer |
 | Linux | `x11` (default) / `wayland` | Pure Zig (Xlib directly / wl_shm plus xdg-shell directly) |
 | Windows | `gdi` (default) / `d3d11` | Pure Zig (Win32/GDI directly / hand-written D3D11-DXGI COM) |
 
 The frame-pacing support tiers — first-class (Metal, D3D11-DXGI, Wayland) versus
-best-effort (CALayer, X11, GDI) — are in [adr/005](adr/).
+best-effort (X11, GDI) — are in [adr/005](adr/). macOS requires a Metal-capable device
+and has no fallback backend ([adr/031](adr/)).
 
 ## Building and running
 

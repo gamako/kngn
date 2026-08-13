@@ -18,6 +18,10 @@ that scaling happened:
 | swift | Almost identical to objc (no filter, no contentsScale) | should be blurry like objc (needs re-checking on hardware) |
 | metal | The shader sampler uses `filter::nearest` (`platform_macos_metal.swift`) | crisp (but blocky nearest upscaling, not true 2x drawing) |
 
+(The two CALayer backends in that table were removed by
+[ADR-031](031_metal-only-macos-backend.md); the comparison is what the decision was
+reasoned from.)
+
 Hence the feedback from real hardware: "UI parts look coarse, as if 2x", "the font is
 too small and soft", "the objc screenshots from the OS are blurry". **Crisp text can
 only come from rasterising at physical pixels** — as long as a logical raster is
@@ -104,7 +108,7 @@ the conversion to physical pixels is applied only at the drawing exit.
 
 **The per-backend input contract** (macOS alone is not enough):
 - The unit of each backend's OS event coordinates is documented (macOS already
-  converts view coordinates to logical points in `platform_macos.m`; Linux and
+  converts view coordinates to logical points in `platform_macos_appkit.swift`; Linux and
   Windows may be returning client pixels and need checking).
 - **There is exactly one place that converts to logical coordinates** (as settled in
   R2: the backend passes raw physical coordinates, and **the facade is the sole
@@ -339,8 +343,8 @@ Factual (not a decision change). Verified against the tree as of this revision:
 
 | Stage / rule | Status | Where |
 |---|---|---|
-| R8 / Stage 0 nearest filter | **Done** | objc `contentLayer` uses `kCAFilterNearest` (`platform/macos/platform_macos.m`) |
-| R1–R3 / Stage 1 platform contract | **Done** | `FramebufferMode` / snapshot fields in `core/platform_types.zig`; facade latch + input normalisation in `core/platform.zig`; macOS objc/swift/metal and Linux/Windows backends expose `logicalSize` / `contentScale` / scale epoch |
+| R8 / Stage 0 nearest filter | **Done** | the Metal shader samples with `filter::nearest` (`platform/macos/platform_macos_metal.swift`) |
+| R1–R3 / Stage 1 platform contract | **Done** | `FramebufferMode` / snapshot fields in `core/platform_types.zig`; facade latch + input normalisation in `core/platform.zig`; the macOS, Linux and Windows backends expose `logicalSize` / `contentScale` / scale epoch |
 | R4 / Stage 2 `gui.render` scale | **Done** | `libs/gui/src/render.zig` (floor-tiling rects, thickness, images; scale≠1.0 path) |
 | R5 / Stage 3 fonts | **Done** | `Font.drawTo(..., scale)` and related paths in `libs/gui` / `libs/font` |
 | R6 / Stage 4 drawing transform | **Done** | `libs/gfx/src/screen_transform.zig` (`ScreenTransform`) |

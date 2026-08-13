@@ -1,19 +1,19 @@
 import Cocoa
 import MetalKit
 
-// The Metal-optimised backend, in Swift (the shared code lives in platform_macos_shared.swift)
+// The renderer half of the macOS backend: Metal, in Swift (the AppKit half lives in platform_macos_appkit.swift)
 // The type definitions (PlatformEvent, PlatformEventType, PlatformKeyCode, the PLATFORM_* constants,
 //        the FrameCallback typealias and so on) come from the C header automatically, through the
 //        bridging header (-import-objc-header platform/platform.h).
 //
 // This file holds only the MetalFramebufferView that conforms to PlatformBackendView (an MTKView plus
 // a triple-slot ring), MetalRenderer, and the makePlatformBackendView() factory. The C ABI, the event
-// queue, the IME state and the window creation skeleton are in platform_macos_shared.swift.
+// queue, the IME state and the window creation skeleton are in platform_macos_appkit.swift.
 //
-// OS file drag and drop (file URLs only) is implemented on the same contract as the objc backend.
+// OS file drag and drop (file URLs only):
 // MetalFramebufferView implements NSDraggingDestination and puts a single file URL onto the
 // event_queue as a PLATFORM_EVENT_FILE_DROP by inline copy (several, non-file, empty, over-limit or NUL-containing paths are rejected).
-// Filling the struct is platform.h's shared helper platform_fill_file_drop_event (one source for objc/swift/metal).
+// Filling the struct is platform.h's shared helper platform_fill_file_drop_event, one source for every platform.
 //
 // ========================================
 // The first-class frame pacing contract (ADR-005)
@@ -219,14 +219,14 @@ class MetalRenderer: NSObject, MTKViewDelegate {
                 currentSlotIndex = (currentSlotIndex + 1) % slotCount
             }
         } else if let callback = callback {
-            // The callback / display-link path (unused by the Zig facade, whose callback is nil; kept for symmetry with objc and swift).
+            // The callback / display-link path. The Zig facade passes a nil callback and never takes it.
             // Always pass nil: this path never reads manual-present state.
             callback(slotBuffers[currentSlotIndex], Int32(width), Int32(height), userdata)
             if submitFrame(view: view, slotIndex: currentSlotIndex, mapping: nil) {
                 currentSlotIndex = (currentSlotIndex + 1) % slotCount
             }
 #if KNGN_ENABLE_MASCOT
-            // Update click-through on the callback path too (symmetrical with objc and swift; returns immediately while disabled)
+            // Update click-through on the callback path too (returns immediately while disabled)
             (view as? MetalFramebufferView)?.refreshClickThrough()
 #endif
         }
@@ -427,7 +427,7 @@ extension MetalFramebufferView: NSTextInputClient {}
 class MetalFramebufferView: MTKView, PlatformBackendView {
     private var metalRenderer: MetalRenderer?
 
-    // logical and framebuffer sizes kept apart, plus the scale latch (the same shape as objc's Framebuffer)
+    // logical and framebuffer sizes kept apart, plus the scale latch (ADR-011)
     private var logicalWidth: Int = 1
     private var logicalHeight: Int = 1
     private var sizing: PlatformFramebufferSizing = .logical
@@ -495,7 +495,7 @@ class MetalFramebufferView: MTKView, PlatformBackendView {
 #endif
 
         // The delegate is set later
-        // OS file drag and drop (file URLs only, following the objc backend)
+        // OS file drag and drop (file URLs only)
         self.registerForDraggedTypes([.fileURL])
     }
 
@@ -582,8 +582,8 @@ class MetalFramebufferView: MTKView, PlatformBackendView {
     override var acceptsFirstResponder: Bool { true }
 
     // MARK: - NSDraggingDestination / file drop (hot path: event time only)
-    // The same contract as the objc backend (platform/macos/platform_macos.m). Filling the struct and
-    // validating the length and NULs are platform.h's shared helper platform_fill_file_drop_event (reached through the shared enqueueFileDropIfValid).
+    // Filling the struct and validating the length and NULs are platform.h's shared helper
+    // platform_fill_file_drop_event (reached through enqueueFileDropIfValid in the AppKit half).
 
     override func draggingEntered(_ sender: any NSDraggingInfo) -> NSDragOperation {
         let pb = sender.draggingPasteboard
@@ -806,7 +806,7 @@ class MetalFramebufferView: MTKView, PlatformBackendView {
 
     // Called by NSView on a resize.
     // .fixed leaves the framebuffer alone and only remeasures the viewport.
-    // .physical records the pending value; .logical resizes at once (the same shape as objc/swift).
+    // .physical records the pending value; .logical resizes at once.
     override func setFrameSize(_ newSize: NSSize) {
         super.setFrameSize(newSize)
         if case .fixed = sizing {
@@ -1111,8 +1111,12 @@ func makePlatformBackendView(
 ) -> (any PlatformBackendView)? {
     // Create the view for Metal. .fixed is accepted: the fixed size is handed to setupRenderer, and
     // present applies the facade mapping as a Metal viewport over a full-drawable clear (letterbox).
+    // Metal is required on macOS: it is the only backend, so there is nothing to fall back to.
+    // Window creation fails loudly instead (the C ABI returns NULL and the Zig facade reports
+    // error.WindowCreationFailed). For a display-less run without a device, use the null runtime
+    // (KNGN_HEADLESS=1) rather than expecting a software present path here.
     guard let metalDevice = MTLCreateSystemDefaultDevice() else {
-        NSLog("[\(IMPLEMENTATION_TYPE)] Failed to create Metal device")
+        NSLog("[\(IMPLEMENTATION_TYPE)] No Metal device: macOS requires a Metal-capable device and has no fallback backend (use KNGN_HEADLESS=1 for a display-less run)")
         return nil
     }
 
@@ -1131,7 +1135,7 @@ func makePlatformBackendView(
 #endif
     // On the manual drawing path (callback=nil, the Zig facade's lockFramebuffer→present path) the
     // display link is stopped and present() drives one frame at a time through view.draw(). The callback
-    // path (symmetrical with objc and swift, and unused) keeps isPaused=false and is display-link driven.
+    // path (unused by the facade) keeps isPaused=false and is display-link driven.
     metalView.isPaused = (callback == nil)
     // This states the intent of fifo (synchronised to display refresh) in the code. On macOS CAMetalLayer
     // defaults to true, so it changes no behaviour, but it makes the first-class backend contract of ADR-005 explicit.

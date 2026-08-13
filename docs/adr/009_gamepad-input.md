@@ -148,8 +148,7 @@ pub fn getGamepadState(self: Window, index: u8) ?GamepadState;
   ABI); on Linux, Windows, wasm, or macOS without the opt-in it returns `null`.
   > **Supersedes the skeleton-era note**: when this ADR was accepted every backend
   > returned `null` and the backend files were untouched. That is no longer true on
-  > macOS (`platform/macos/platform_macos.m`,
-  > `platform/macos-shared/platform_macos_shared.swift`, and
+  > macOS (`platform/macos/platform_macos_appkit.swift` and
   > `core/platform_macos.zig`). Linux / Windows / DirectInput / XInput /
   > evdev hardware backends remain follow-up.
 - **Connect and disconnect go through `Event`.** On macOS the GameController
@@ -195,7 +194,7 @@ bool platform_get_gamepad_state(PlatformWindow* window, int index, PlatformGamep
 - `PLATFORM_EVENT_GAMEPAD_CONNECTED` and `PLATFORM_EVENT_GAMEPAD_DISCONNECTED` are
   appended to `PlatformEventType`, and `gamepad{ int32_t index; char name[33]; }` is
   added to `PlatformEvent.payload` (`name` is empty for the disconnect event).
-- **macOS implements `platform_get_gamepad_state`** (objc and the shared Swift path)
+- **macOS implements `platform_get_gamepad_state`** in the AppKit half of the backend
   when gamepad support is linked. Linux and Windows still have no native
   implementation; the Zig facade returns `null` there (see §2).
 
@@ -281,8 +280,7 @@ use it directly.
 - `core/platform.zig`: `Window.getGamepadState` (harness choke point; macOS opt-in
   dispatch; otherwise `null`).
 - `core/platform_macos.zig` plus the macOS C ABI
-  (`platform/macos/platform_macos.m`,
-  `platform/macos-shared/platform_macos_shared.swift`): GameController polling and
+  (`platform/macos/platform_macos_appkit.swift`): GameController polling and
   connect/disconnect events (**implemented** after this ADR was accepted).
 - `core/control/harness.zig`: the `gamepad_states` state, four injection commands and
   the built-in `gamepad` probe.

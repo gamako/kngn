@@ -275,7 +275,7 @@ void platform_set_redraw_callback(PlatformWindow* window, PlatformRedrawCallback
 // - A first-class backend (Metal / D3D11-DXGI / Wayland) is fifo, synchronised to display refresh, and treats avoiding tearing as a guarantee
 //   * Once Metal reaches its inflight limit (a triple slot plus a semaphore), the submit can block
 //     briefly until the next frame slot frees up (that is fifo pacing, paced by display refresh); lockFramebuffer keeps returning non-null
-// - A best-effort backend (macOS CALayer objc/swift / X11 / GDI) guarantees neither strict vsync nor freedom from tearing
+// - A best-effort backend (X11 / GDI) guarantees neither strict vsync nor freedom from tearing
 //
 // Notes:
 // - Rate control of a game loop is the caller's responsibility (platform_get_time() and sleep(), or a future beginFrame/waitFrame)
@@ -539,12 +539,12 @@ typedef struct PlatformEvent {
     } payload;
 } PlatformEvent;
 
-// A contract helper, shared by objc/swift/metal, that fills in a file_drop event struct.
+// A contract helper that fills in a file_drop event struct, so every platform states the same contract once.
 // Swift's C importer cannot import an anonymous struct holding a nested array (file_drop.paths[].bytes)
-// as a field, so the Swift and Metal backends can only build a file_drop through this C helper; objc uses
-// the same function, which single-sources the contract (a single file; empty, over-long or NUL-containing
-// paths are rejected). It validates utf8[0..len), fills ev as a FILE_DROP and returns true on success, or
-// returns false with ev untouched. The caller passes a zero-initialised ev (Swift PlatformEvent(), objc memset; no string.h).
+// as a field, so the macOS backend can only build a file_drop through this C helper — which is also what
+// single-sources the contract (a single file; empty, over-long or NUL-containing paths are rejected).
+// It validates utf8[0..len), fills ev as a FILE_DROP and returns true on success, or returns false with ev
+// untouched. The caller passes a zero-initialised ev (`PlatformEvent()` from Swift; no string.h needed).
 static inline bool platform_fill_file_drop_event(PlatformEvent* ev, const char* utf8, uint32_t len) {
     if (len == 0 || len > PLATFORM_FILE_DROP_PATH_BYTES) return false;
     for (uint32_t i = 0; i < len; i++) {
@@ -653,7 +653,7 @@ void platform_get_event_stats(PlatformWindow* window, PlatformEventStats* out);
 // the enum below (a=bit0 … guide=bit14) and matches the field order of GamepadButtons on the Zig side.
 // Triggers are exposed as axes only, never as buttons. Sticks and triggers carry raw values (no deadzone).
 //
-// The macOS backends implement this behind `KNGN_ENABLE_GAMEPAD`, which build.zig passes only to an
+// The macOS backend implements this behind `KNGN_ENABLE_GAMEPAD`, which build.zig passes only to an
 // executable that uses a gamepad.
 
 // The bit-mask form of PlatformGamepadState.buttons_mask
@@ -699,7 +699,7 @@ bool platform_get_gamepad_state(PlatformWindow* window, int index, PlatformGamep
 // - Strings are UTF-8, NUL-terminated, and **valid only for the duration of the call** (the backend copies them).
 // - The hierarchy is one level of top menu plus its items (no submenus; a separator is expressed through kind).
 // - The menu bar belongs to the application, so the window argument is ignored and the last registration replaces the whole bar.
-// - Implemented by the macOS objc/swift/metal backends, compiled conditionally on `#if defined(KNGN_ENABLE_MENU)`
+// - Implemented by the macOS backend, compiled conditionally on `#if defined(KNGN_ENABLE_MENU)`
 //   (the same shape as the gamepad opt-in; the shared translation unit is platform_macos_menu.m).
 //   An executable that does not use menus references no menu symbol at all.
 
@@ -766,8 +766,7 @@ void platform_free_path(char* path);
 // ========================================
 //
 // UTF-8 text only. Images, RTF and compound formats are out of scope.
-// The implementation is NSPasteboard, provided by all three macOS backends (objc / swift / metal).
-// (objc: platform_macos.m; swift and metal: platform_macos_shared.swift. The backends link exclusively.)
+// The implementation is NSPasteboard, in platform_macos_appkit.swift.
 
 // Write UTF-8 text to the OS clipboard (len is a byte length; no NUL termination needed).
 void platform_set_clipboard_text(const char* utf8, uint32_t len);

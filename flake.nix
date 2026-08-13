@@ -39,7 +39,7 @@
           inherit (newer) version src;
         });
     in {
-      # macOS: as before (platform backends objc/swift/metal; SDK via xcrun)
+      # macOS: the Swift + Metal platform backend (SDK via xcrun)
       devShells.${darwin}.default = (pkgsFor darwin).mkShellNoCC {
         packages = [
           (zigFor darwin)

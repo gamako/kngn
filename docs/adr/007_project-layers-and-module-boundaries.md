@@ -18,8 +18,8 @@ place is prepared in advance so that incoming code (the state-model `framework/`
 
 - **R1 layers and direction**: only `apps → libs → core → platform` is allowed. No
   reverse dependencies and no skipping layers.
-  - **L0 `platform/`** — native implementations (the C ABI plus macOS
-    objc/swift/metal). Unchanged.
+  - **L0 `platform/`** — native implementations (the C ABI plus the macOS
+    Swift + Metal backend). Unchanged.
   - **L1 `core/`** — the platform facade (`platform*.zig`), the audio
     facade and backends (`audio*.zig`), and `core/control/`. A **thin base** that
     depends on platform only and never on libs.

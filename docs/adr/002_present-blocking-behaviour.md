@@ -41,7 +41,12 @@ its upstream premise: present is a non-blocking submit.
 - The old unconditional claim that "tearing never occurs, whenever you call it" is
   weakened to **depend on the backend's support tier**. First-class backends (Metal,
   D3D11-DXGI, Wayland) guarantee freedom from tearing via fifo; best-effort backends
-  (CALayer objc/swift, X11, GDI) do not.
+  (X11, GDI) do not.
+
+> The CALayer backends this record discusses (Objective-C and Swift, macOS) no longer
+> exist: [ADR-031](031_metal-only-macos-backend.md) removed them, leaving Metal as the
+> only macOS backend. Their behaviour is described here as it was, because it is what
+> the decision was reasoned from.
 
 ## Context
 
@@ -185,8 +190,8 @@ Investigation confirmed these as well:
 > the macOS backends (CALayer and Metal). X11 and GDI were added later (unguarded
 > blits with no wait for vblank), so whether tearing is avoided **depends on the
 > backend's support tier**. First-class backends (Metal, D3D11-DXGI, Wayland)
-> guarantee freedom from tearing via fifo; best-effort backends (CALayer objc/swift,
-> X11, GDI) do not guarantee strict freedom from tearing. Details in
+> guarantee freedom from tearing via fifo; best-effort backends (X11, GDI) do not
+> guarantee strict freedom from tearing. Details in
 > [ADR-005](005_platform-support-tiers-and-frame-pacing.md).
 
 **The original conclusion (assuming macOS)**: on the macOS backends below, the vblank
@@ -433,7 +438,8 @@ The definitions this discussion settled:
    - Wording corrected from "frame rate control" to "game loop rate control"
    - Comments clarified
 
-3. **platform/macos/platform_macos.m**
+3. **platform/macos/platform_macos.m** (the Objective-C backend, since removed by
+   [ADR-031](031_metal-only-macos-backend.md))
    - A duplicated comment removed
 
 4. **The project plan document** (since removed; superseded by this ADR)
@@ -443,9 +449,9 @@ The definitions this discussion settled:
 ## Related
 
 - `platform/platform.h` — the API
-- `platform/macos/platform_macos.m` — macOS Objective-C implementation
-- `platform/macos-swift/platform_macos_swift.swift` — macOS Swift implementation
-- `platform/macos-metal/platform_macos_metal.swift` — macOS Metal implementation
+- `platform/macos/platform_macos_metal.swift` — the macOS implementation (the
+  Objective-C and Swift CALayer backends this record also covered were removed by
+  [ADR-031](031_metal-only-macos-backend.md))
 - `examples/01_timed_window/main.zig` — sample usage (an example of frame rate control)
 - [ADR-001](001_monotonic-clock-choice.md) — the related timer API decision
 

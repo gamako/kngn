@@ -17,9 +17,7 @@ const macos = @import("macos.zig");
 const swift = @import("swift.zig");
 
 pub const PlatformType = enum {
-    // macOS backends (via C ABI platform.h. Zig facade/backend is shared; only the .o link differs)
-    objc,
-    swift,
+    // macOS backend (via C ABI platform.h. Swift + Metal: a GPU renderer and a drawable present)
     metal,
     // Linux backends (pure Zig. x11 and wayland)
     x11,
@@ -183,12 +181,12 @@ pub fn linkMidiBackend(mod: *std.Build.Module, target_os: std.Target.Os.Tag) voi
 /// Default backend for the OS (used when `-Dplatform` is omitted).
 pub fn defaultBackend(os: std.Target.Os.Tag) PlatformType {
     return switch (os) {
-        .macos => .metal, // Metal meets the first-class frame pacing contract of ADR-005 (vsync gating); objc and swift are best-effort
+        .macos => .metal, // The only macOS backend: it meets the first-class frame pacing contract of ADR-005 (vsync gating)
         .linux => .x11,
         .windows => .gdi, // GDI is the default for now (d3d11 is opt-in)
         .wasi => .wasm, // wasm32-wasi
         .freestanding => .wasm, // Legacy freestanding alias; the canonical target is wasi
-        else => .objc, // Unreachable in practice: build.zig's OS check rejects it first
+        else => .metal, // Unreachable in practice: build.zig's OS check rejects it first
     };
 }
 
@@ -197,7 +195,7 @@ pub fn defaultBackend(os: std.Target.Os.Tag) PlatformType {
 /// regression coverage; default is x11. wayland is also implemented)
 pub fn implementedBackends(os: std.Target.Os.Tag) []const PlatformType {
     return switch (os) {
-        .macos => &.{ .objc, .swift, .metal },
+        .macos => &.{.metal},
         .linux => &.{ .x11, .wayland },
         .windows => &.{ .gdi, .d3d11 },
         .wasi => &.{.wasm}, // wasm32-wasi-only branch is the main path
@@ -214,7 +212,7 @@ pub fn assertBackendForOs(backend: PlatformType, os: std.Target.Os.Tag) void {
         if (b == backend) return;
     }
     const valid = switch (os) {
-        .macos => "objc / swift / metal",
+        .macos => "metal",
         .linux => "x11 / wayland",
         .windows => "gdi / d3d11",
         .wasi, .freestanding => "wasm",
@@ -239,7 +237,7 @@ pub fn resolveBackend(b: *std.Build, target: std.Build.ResolvedTarget) PlatformT
     const backend = b.option(
         PlatformType,
         "platform",
-        "Platform backend (macOS: objc/swift/metal, Linux: x11/wayland, Windows: gdi/d3d11)",
+        "Platform backend (macOS: metal, Linux: x11/wayland, Windows: gdi/d3d11)",
     ) orelse defaultBackend(target_os);
     assertBackendForOs(backend, target_os);
     return backend;
@@ -360,8 +358,6 @@ pub fn linkMacosFrameworksAndRuntime(
 ) void {
     macos.linkMacOSFrameworks(b, exe, sdk, features.enable_gamepad);
     switch (backend) {
-        .objc => {},
-        .swift => swift.linkSwiftRuntime(b, exe, sdk, &.{}),
         .metal => {
             exe.root_module.linkFramework("Metal", .{});
             exe.root_module.linkFramework("MetalKit", .{});
@@ -378,13 +374,13 @@ pub fn linkMacosFrameworksAndRuntime(
 ///
 /// The public platform module already carries `@cImport`-required system libs (X11/Wayland).
 /// This helper applies what only the executable can carry:
-/// - macOS: `platform_native_*` archive + frameworks + Swift/Metal runtime
+/// - macOS: the `platform_native_metal` archive + frameworks + Swift/Metal runtime
 /// - Wayland: generated private C sources (and lib links for reliable resolve)
 /// - Windows: system libraries + `subsystem = .Windows`
 /// - X11: libc only (system libs propagate from the module)
 ///
 /// Pass the same `backend` used for `b.dependency("kngn", .{ .platform = backend })`.
-/// `sdk_paths` is required on macOS backends and ignored elsewhere.
+/// `sdk_paths` is required on the macOS backend and ignored elsewhere.
 pub fn setupConsumerExe(
     b: *std.Build,
     exe: *std.Build.Step.Compile,
@@ -394,16 +390,10 @@ pub fn setupConsumerExe(
     features: PlatformFeatures,
 ) void {
     switch (backend) {
-        .objc, .swift, .metal => {
+        .metal => {
             const sdk = sdk_paths orelse @panic("macOS backend requires SDK paths (pass resolveMacOSSDKPaths result)");
-            const native_lib_name = switch (backend) {
-                .objc => "platform_native_objc",
-                .swift => "platform_native_swift",
-                .metal => "platform_native_metal",
-                else => unreachable,
-            };
             // External path: prebuilt native archive from the kngn package.
-            exe.root_module.linkLibrary(dep.artifact(native_lib_name));
+            exe.root_module.linkLibrary(dep.artifact("platform_native_metal"));
             linkMacosFrameworksAndRuntime(b, exe, sdk, backend, features);
         },
         .x11 => linkX11Exe(exe),

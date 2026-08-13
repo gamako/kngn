@@ -561,16 +561,16 @@ pub fn build(b: *std.Build) void {
         return;
     }
 
-    // Backend selection. Valid values depend on the OS (macOS: objc/swift/metal, Linux: x11/wayland, Windows: gdi/d3d11).
+    // Backend selection. Valid values depend on the OS (macOS: metal, Linux: x11/wayland, Windows: gdi/d3d11).
     // When omitted, use the OS default. OS/backend mismatch is a build error via assertBackendForOs.
     const platform_option = b.option(
         platform.PlatformType,
         "platform",
-        "Platform backend (macOS: objc/swift/metal, Linux: x11/wayland, Windows: gdi/d3d11)",
+        "Platform backend (macOS: metal, Linux: x11/wayland, Windows: gdi/d3d11)",
     ) orelse platform.defaultBackend(target_os);
     platform.assertBackendForOs(platform_option, target_os);
 
-    // SDK / toolchain paths are needed only for macOS backends (Linux has no xcrun, so they are not resolved).
+    // SDK / toolchain paths are needed only on macOS (Linux has no xcrun, so they are not resolved).
     // When unspecified, auto-detect via xcode-select (toolchain) and xcrun (SDK).
     const swift_toolchain_path = b.option(
         []const u8,
@@ -646,7 +646,7 @@ pub fn build(b: *std.Build) void {
         wireKitImports(kit_ext, shared_modules.platform, &shared_modules, app_runtime_ext);
     }
 
-    // Backend set implemented for the target OS (macOS: objc/swift/metal, Linux: x11/wayland, Windows: gdi/d3d11)
+    // Backend set implemented for the target OS (macOS: metal, Linux: x11/wayland, Windows: gdi/d3d11)
     const backends = platform.implementedBackends(target_os);
     const default_be = platform.defaultBackend(target_os);
 
@@ -992,8 +992,6 @@ pub fn build(b: *std.Build) void {
     if (target_os == .macos) {
         // enable_gamepad_ext aligns KNGN_ENABLE_GAMEPAD on the native archive with the platform module.
         // GameController framework linking stays on the consumer side (explicit on the exe when enabled).
-        _ = addPlatformNativeLib(b, target, optimize, platform_root, .objc, "platform_native_objc", enable_gamepad_ext);
-        _ = addPlatformNativeLib(b, target, optimize, platform_root, .swift, "platform_native_swift", enable_gamepad_ext);
         _ = addPlatformNativeLib(b, target, optimize, platform_root, .metal, "platform_native_metal", enable_gamepad_ext);
     }
 
@@ -3163,7 +3161,7 @@ pub fn build(b: *std.Build) void {
 
 // ============================================================
 // exe / run-step names: default backend has no suffix; others get "_<backend>"
-// (macOS: metal=bare / swift / objc, Linux: x11=bare, Windows: gdi=bare / d3d11)
+// (macOS: metal=bare, Linux: x11=bare / wayland, Windows: gdi=bare / d3d11)
 // ============================================================
 fn artifactName(b: *std.Build, base: []const u8, be: platform.PlatformType, default_be: platform.PlatformType) []const u8 {
     return if (be == default_be) base else b.fmt("{s}_{s}", .{ base, platform.backendName(be) });
@@ -3847,7 +3845,7 @@ fn addExampleExe(
     // Every example uses platform / keyboard
     // (examples are teaching material outside R5=kit-only; keep legacy per-module wiring)
     // Gamepad opt-in: only needs_gamepad examples (22 / 34) use the
-    // opt-in-enabled platform module (GameController framework link + enable gamepad code in .m/.swift).
+    // opt-in-enabled platform module (GameController framework link + enable gamepad code in the Swift backend).
     // Other examples use the default opt-in-disabled side (existing exes unchanged).
     const variant = pm.variant(exampleFeatures(needs));
     exe.root_module.addImport("platform", variant.platform_mod.mod);
@@ -3924,7 +3922,7 @@ fn addPixieExe(
     });
     // apps are kit-only consumers (R5). paint is an editor-family shared lib (not in kit; in flux) and is direct-imported.
     // Native menu opt-in: kit_menu (enable_menu=true) + shared menu.m (-DKNGN_ENABLE_MENU).
-    // Shared across macOS objc/swift/metal. Do not change the enable_menu default of false.
+    // A translation unit of its own, next to the macOS backend. Do not change the enable_menu default of false.
     const root = appRoot(exe, "pixie");
     link(root, pm.variant(exe_features.editor).kit);
     link(root, common.paint);
@@ -4140,7 +4138,7 @@ fn addPlatformNativeLib(
     // Gamepad opt-in for the external-consumer native archive.
     // Same boolean as build_options.enable_gamepad on the SharedModules public "platform".
     // The archive is .o only and does not include the GameController framework (consumer exe links it).
-    // When enable_gamepad=true, -DKNGN_ENABLE_GAMEPAD is passed to .m/.swift and the real backend is enabled.
+    // When enable_gamepad=true, -DKNGN_ENABLE_GAMEPAD is passed to the Swift compile and the real backend is enabled.
     // The same feature set as the published platform module (`PlatformFeatures.published`):
     // the archive is what an external consumer links, and a feature missing from it while the
     // module says it is on becomes an undefined symbol in the consumer's executable.

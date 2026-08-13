@@ -19,8 +19,7 @@ From the repository root:
 
 ```bash
 zig build run-example_03
-zig build run-example_03 -Dplatform=swift
-zig build run-example_03 -Dplatform=metal
+zig build run-example_03 -Dplatform=metal   # macOS has this one backend
 ```
 
 Standalone:
@@ -28,8 +27,7 @@ Standalone:
 ```bash
 cd examples/03_sprite_rendering
 zig build run
-zig build run -Dplatform=swift
-zig build run -Dplatform=metal
+zig build run -Dplatform=metal   # macOS has this one backend
 ```
 
 ## Stack

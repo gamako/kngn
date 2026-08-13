@@ -1,4 +1,4 @@
-//! Compile helpers for the platform layer (ObjC / Swift / Metal)
+//! Compile helpers for the platform layer (the macOS Swift + Metal sources, and the shared NSMenu .m)
 //!
 //! Shared by the parent build.zig and examples/*/build.zig.
 //! Inputs are LazyPaths so they carry build-graph dependencies.
@@ -109,7 +109,7 @@ pub fn configurePlatformModule(
     platform_include_root: std.Build.LazyPath,
     backend: PlatformType,
 ) void {
-    // The macOS backends `@cImport("platform.h")`. Wasm has no `@cImport` at all, and on
+    // The macOS backend `@cImport("platform.h")`s. Wasm has no `@cImport` at all, and on
     // Linux and Windows the path is simply unused.
     if (backend != .wasm) mod.addIncludePath(platform_include_root);
     switch (backend) {
@@ -132,7 +132,7 @@ pub fn configurePlatformModule(
         // macOS uses platform.h via the include path already on the module; native .o is exe-side.
         // Windows uses extern fn (no @cImport); system libs are exe-side.
         // wasm has no system libs.
-        .objc, .swift, .metal, .gdi, .d3d11, .wasm => {},
+        .metal, .gdi, .d3d11, .wasm => {},
     }
 }
 
@@ -183,7 +183,7 @@ pub fn platformBuildOptions(
 /// the published module registers itself differently and routes its imports through the
 /// layer check in `build.zig`.
 ///
-/// `backend` is passed as `build_options.platform_backend` ("x11"/"wayland"/"objc"…) into the
+/// `backend` is passed as `build_options.platform_backend` ("x11"/"wayland"/"metal"…) into the
 /// platform module; `core/platform_linux.zig` and friends use it to pick x11/wayland.
 /// Call once per backend so each gets its own module with a distinct value.
 ///
@@ -243,8 +243,8 @@ pub fn setupExecutableForPlatform(
     features: PlatformFeatures,
 ) void {
     switch (platform_type) {
-        .objc, .swift, .metal => {
-            // macOS backends require an SDK
+        .metal => {
+            // The macOS backend requires an SDK
             const sdk = sdk_paths orelse @panic("macOS backend requires SDK paths (check the OS branch in build.zig)");
 
             // Internal path: compile the platform layer .o into this exe (not the published archive).
@@ -310,7 +310,7 @@ pub const StandaloneSpec = struct {
     /// `-DKNGN_ENABLE_GAMEPAD`, and GameController is linked. Default false
     /// (existing standalone exes unchanged). Only examples/22_gamepad opts in.
     link_gamepad: bool = false,
-    /// Native menu (NSMenu; shared across macOS objc/swift/metal). When true,
+    /// Native menu (NSMenu; a shared Objective-C translation unit next to the macOS backend). When true,
     /// `build_options.enable_menu` + shared `platform_macos_menu.m` (`-DKNGN_ENABLE_MENU`).
     /// Default false. Only pixie opts in.
     link_menu: bool = false,
@@ -497,7 +497,7 @@ fn resolvePixelops(
 }
 
 /// Create one exe per implemented backend for the target OS, plus install / `run-<backend>` /
-/// `run` (default). Resolve the SDK only for macOS backends (Linux needs no xcrun).
+/// `run` (default). Resolve the SDK only on macOS (Linux needs no xcrun).
 pub fn buildStandalone(
     b: *std.Build,
     target: std.Build.ResolvedTarget,
@@ -508,7 +508,7 @@ pub fn buildStandalone(
     const platform_option = b.option(
         PlatformType,
         "platform",
-        "Platform backend (macOS: objc/swift/metal, Linux: x11/wayland, Windows: gdi/d3d11)",
+        "Platform backend (macOS: metal, Linux: x11/wayland, Windows: gdi/d3d11)",
     ) orelse defaultBackend(target_os);
     assertBackendForOs(platform_option, target_os);
 
@@ -798,8 +798,6 @@ pub fn compilePlatformLayer(
     features: PlatformFeatures,
 ) PlatformCompileResult {
     return switch (platform_type) {
-        .objc => buildObjC(b, optimize, platform_root, features),
-        .swift => buildSwift(b, optimize, platform_root, features),
         .metal => buildMetal(b, optimize, platform_root, features),
         // Linux / Windows backends are pure Zig and need no .o compile. Only reached from
         // setupExecutableForPlatform's macOS branch, so this arm is unreachable.
@@ -809,8 +807,8 @@ pub fn compilePlatformLayer(
 
 /// Pass `-DKNGN_ENABLE_*` for each enabled feature to a macOS backend compile.
 ///
-/// Only the enabled ones are passed, so `.m` and `.swift` gate on
-/// `#if defined(KNGN_ENABLE_X)` (clang) / `#if KNGN_ENABLE_X` (swiftc) alike.
+/// Only the enabled ones are passed, so the `.swift` sources and the shared menu `.m` gate on
+/// `#if KNGN_ENABLE_X` (swiftc) / `#if defined(KNGN_ENABLE_X)` (clang) alike.
 ///
 /// Call it **before** `-import-objc-header` on a swiftc command: that flag takes the next
 /// token as the bridging-header path and would otherwise swallow a define as a path.
@@ -892,65 +890,6 @@ fn makeCompileResult(
     return .{ .compile_steps = steps, .obj_files = objs };
 }
 
-fn buildObjC(
-    b: *std.Build,
-    optimize: std.builtin.OptimizeMode,
-    platform_root: std.Build.LazyPath,
-    features: PlatformFeatures,
-) PlatformCompileResult {
-    const compile_cmd = b.addSystemCommand(&.{
-        "clang",
-        "-x",
-        "objective-c",
-    });
-    compile_cmd.addPrefixedDirectoryArg("-I", platform_root);
-    addFeatureDefines(compile_cmd, features);
-    compile_cmd.addArgs(&.{
-        "-fobjc-arc",
-        objcOptFlag(optimize),
-        "-c",
-        "-o",
-    });
-    const obj_path = compile_cmd.addOutputFileArg("platform_macos_objc.o");
-    compile_cmd.addFileArg(platform_root.path(b, "macos/platform_macos.m"));
-    return makeCompileResult(b, compile_cmd, obj_path, features, optimize, platform_root);
-}
-
-fn buildSwift(
-    b: *std.Build,
-    optimize: std.builtin.OptimizeMode,
-    platform_root: std.Build.LazyPath,
-    features: PlatformFeatures,
-) PlatformCompileResult {
-    const compile_cmd = b.addSystemCommand(&.{
-        "swiftc",
-        "-parse-as-library",
-        switch (optimize) {
-            .Debug => "-Onone",
-            .ReleaseSafe, .ReleaseFast => "-O",
-            .ReleaseSmall => "-Osize",
-        },
-        "-disable-autolinking-runtime-compatibility",
-        "-disable-autolinking-runtime-compatibility-concurrency",
-        "-disable-autolinking-runtime-compatibility-dynamic-replacements",
-        // Pack shared+backend's two .swift files into one .o (WMO required: -c -o with multiple inputs would emit multiple outputs).
-        "-whole-module-optimization",
-        "-framework",
-        "Cocoa",
-        "-framework",
-        "QuartzCore",
-    });
-    addFeatureDefines(compile_cmd, features);
-    compile_cmd.addArg("-import-objc-header");
-    compile_cmd.addFileArg(platform_root.path(b, "platform.h"));
-    compile_cmd.addArgs(&.{ "-c", "-o" });
-    const obj_path = compile_cmd.addOutputFileArg("platform_macos_swift.o");
-    // Compile shared .swift and backend-specific .swift in one swiftc invocation (one .o).
-    compile_cmd.addFileArg(platform_root.path(b, "macos-shared/platform_macos_shared.swift"));
-    compile_cmd.addFileArg(platform_root.path(b, "macos-swift/platform_macos_swift.swift"));
-    return makeCompileResult(b, compile_cmd, obj_path, features, optimize, platform_root);
-}
-
 fn buildMetal(
     b: *std.Build,
     optimize: std.builtin.OptimizeMode,
@@ -968,7 +907,7 @@ fn buildMetal(
         "-disable-autolinking-runtime-compatibility",
         "-disable-autolinking-runtime-compatibility-concurrency",
         "-disable-autolinking-runtime-compatibility-dynamic-replacements",
-        // Pack shared+backend's two .swift files into one .o (WMO required: -c -o with multiple inputs would emit multiple outputs).
+        // Pack the AppKit and Metal .swift files into one .o (WMO required: -c -o with multiple inputs would emit multiple outputs).
         "-whole-module-optimization",
         "-framework",
         "Cocoa",
@@ -983,7 +922,7 @@ fn buildMetal(
     compile_cmd.addArgs(&.{ "-c", "-o" });
     const obj_path = compile_cmd.addOutputFileArg("platform_macos_metal.o");
     // Compile shared .swift and backend-specific .swift in one swiftc invocation (one .o).
-    compile_cmd.addFileArg(platform_root.path(b, "macos-shared/platform_macos_shared.swift"));
-    compile_cmd.addFileArg(platform_root.path(b, "macos-metal/platform_macos_metal.swift"));
+    compile_cmd.addFileArg(platform_root.path(b, "macos/platform_macos_appkit.swift"));
+    compile_cmd.addFileArg(platform_root.path(b, "macos/platform_macos_metal.swift"));
     return makeCompileResult(b, compile_cmd, obj_path, features, optimize, platform_root);
 }

@@ -26,7 +26,7 @@ environment and build and initial state and input produce the same pixels**. One
 verification cycle of the bundled pixel editor takes 0.1 seconds.
 
 **pixie is about a 2.5 MB single binary (ReleaseFast, stripped)** · **zero Zig package dependencies** · **Zig 0.16** ·
-macOS (objc/swift/metal) / Linux (x11/wayland) / Windows (gdi/d3d11)
+macOS (metal) / Linux (x11/wayland) / Windows (gdi/d3d11)
 
 The base is nothing but the primitives for opening a native window and writing pixels
 into it; a GUI, fonts, a synth and a pixel editor sit on top of it optionally. The
@@ -117,8 +117,7 @@ out) — **runtime verification**, not recompile:
 > state isolated through `KNGN_APPSHELL_DIR`. The first run costs 0.6 s to page-cache
 > misses. **The numbers depend on window size and saved state** — a restored large window
 > grows both the PNG and the RSS. In headless mode `KNGN_HEADLESS=1` skips backend
-> initialisation altogether, so **time and RSS barely depend on the backend** (objc gives
-> 102 ms and 34.3 MB too).
+> initialisation altogether, so **time and RSS barely depend on the backend**.
 
 **Code-change iteration is slower than input variation.** After editing Zig sources,
 expect roughly **5–20 seconds** for a focused rebuild on a typical machine — not the
@@ -243,9 +242,9 @@ Contributor-only depth (layer checks, performance rules) is in [`AGENT.md`](AGEN
 - Public Zig import surface is **`kit` only**
 - Native linking requires vendored **`build_helpers/{consumer,macos,swift}.zig`**, kept
   **byte-identical** to `kngn/build_helpers/` (do not copy internal `platform.zig`)
-- Platforms: macOS (`objc` / `swift` / `metal`), Linux (`x11` / `wayland`), Windows
-  (`gdi` / `d3d11`). On macOS the consumer links a `platform_native_*` archive plus
-  frameworks / Swift runtime via `setupConsumerExe`
+- Platforms: macOS (`metal`), Linux (`x11` / `wayland`), Windows (`gdi` / `d3d11`).
+  On macOS the consumer links the `platform_native_metal` archive plus frameworks and the
+  Swift runtime via `setupConsumerExe`
 
 Canonical wiring: [`template/`](template/). A smaller game sample:
 [tictactoe](https://github.com/gamako/tictactoe). Longer notes:
@@ -285,7 +284,7 @@ linking — the helper owns OS differences.
 
 | Backend | Values of `-Dplatform` | Public module carries | Consumer exe (`setupConsumerExe`) |
 |---|---|---|---|
-| macOS | `objc` / `swift` / `metal` (default `metal`) | `platform.h` include, libc | `platform_native_*` archive, frameworks, Swift/Metal runtime |
+| macOS | `metal` (the only value) | `platform.h` include, libc | `platform_native_metal` archive, frameworks, Swift/Metal runtime |
 | Linux | `x11` / `wayland` (default `x11`) | X11 or Wayland system libs + Wayland generated headers | Wayland private `.c` sources (X11: libc only) |
 | Windows | `gdi` / `d3d11` (default `gdi`) | (no `@cImport`; pure Zig) | `user32` / `comdlg32` / `gdi32` (+ `d3d11`), `subsystem = .Windows` |
 
@@ -293,12 +292,13 @@ Linux needs the usual desktop development packages (`pkg-config`, X11 or Wayland
 headers and libraries). Wayland also needs `wayland-scanner` and `wayland-protocols`
 so the build can generate protocol glue at configure time.
 
-To ship several backends from one consumer tree, call `b.dependency` once per backend
-value (Zig caches package instances per option set) and wire each executable with the
-matching backend:
+To ship several backends from one consumer tree (Linux `x11` and `wayland`, Windows `gdi`
+and `d3d11`; macOS has a single backend), call `b.dependency` once per backend value (Zig
+caches package instances per option set) and wire each executable with the matching
+backend:
 
 ```zig
-inline for (.{ .objc, .swift, .metal }) |be| {
+inline for (.{ .x11, .wayland }) |be| {
     const dep = b.dependency("kngn", .{ .target = target, .optimize = optimize, .platform = be });
     // create exe, addImport("kit"), setupConsumerExe(..., be, sdk, .{})
 }
@@ -312,7 +312,7 @@ apps  →  kit  →  libs  →  core  →  platform    (one-way; build.zig enfor
 
 | Layer | Contents |
 |---|---|
-| `platform/` | The macOS native implementations (a C ABI: objc / swift / metal). The Linux and Windows backends are pure Zig and live in `core/` |
+| `platform/` | The macOS native implementation (a C ABI plus Swift + Metal). The Linux and Windows backends are pure Zig and live in `core/` |
 | `core/` | The platform facade and the per-OS backends, audio, MIDI, and the control plane (the harness) |
 | `libs/` | Optional parts — `gui` (immediate mode), `font` (TrueType/CFF/bmfont), `png`, `synth`, `sound`, `pixelops` (SIMD blending and fills), `gfx`, `gmath`, `appshell`, `paint`, `modular`, `viz`, `serde`, `recipe` |
 | `kit/` | The public umbrella module that applications and external consumers import |

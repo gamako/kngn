@@ -787,7 +787,7 @@ const App = struct {
     /// Command table rebuilt every frame (enabled/checked; same role as native updateMenu).
     menu_commands: [MENU_CMD_CAP]platform.Command = undefined,
     menu_command_count: usize = 0,
-    /// Whether native menu is enabled (set in onWindowReady; false for headless/swift/metal).
+    /// Whether the native menu is available (set in onWindowReady; false when the menu C ABI is absent, as under a headless run).
     native_menu_active: bool = false,
     /// Snapshot for the native updateMenu dirty gate (enabled/checked/id/label).
     native_menu_snap: [MENU_CMD_CAP]NativeMenuSnap = undefined,

@@ -158,8 +158,8 @@ pub fn main() !void {
             // letterboxed present yet.
             std.debug.print(
                 "Refused: this backend has no present that magnifies a framebuffer into a letterbox{s}.\n" ++
-                    "Run it on one that has: macOS -Dplatform=objc or -Dplatform=swift," ++
-                    " Windows -Dplatform=gdi, or the web.\n",
+                    "Run it on one that has: macOS, Windows (-Dplatform=gdi or -Dplatform=d3d11)," ++
+                    " Linux -Dplatform=wayland, or the web.\n",
                 .{if (transparent) ", or no transparent window" else ""},
             );
             return;

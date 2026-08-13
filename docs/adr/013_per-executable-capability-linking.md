@@ -80,7 +80,7 @@ the split would buy little while doubling the combinations to verify.
 
 **Every one of these macOS capabilities is enabled in the published surface.** The
 platform module a consumer gets as `dep.module("platform")` and the prebuilt native
-archive it links (`platform_native_objc` / `_swift` / `_metal`) are both built with
+archive it links (`platform_native_metal`) are both built with
 `PlatformFeatures.published(...)`, which turns them all on.
 
 The reason is that a consumer can influence neither. It cannot recompile the
@@ -110,7 +110,7 @@ native code carries no capability flag at all.
 
 **Why the source is gated on top of that.** For gamepad, and for the menu's bridge
 and event-poll path, the code lives in a translation unit that is compiled for
-*every* executable (`platform_macos.m`, `platform_macos_shared.swift`). Omitting
+*every* executable (`platform_macos_appkit.swift`). Omitting
 the framework is not enough there — the code would still be compiled, and would
 then fail to link against the framework that was withheld. Conditional compilation
 (`#if defined(KNGN_ENABLE_GAMEPAD)` / `#if KNGN_ENABLE_MENU`) is what removes the code
@@ -166,7 +166,9 @@ harness path keeps working.
 
 ## Measured effect
 
-Built with the `objc` backend and inspected with `otool -L` (recorded load
+Built with the `objc` backend — a CALayer backend that
+[ADR-031](031_metal-only-macos-backend.md) has since removed — and inspected with
+`otool -L` (recorded load
 dependencies) and `nm` (defined and referenced symbols). The executables below carry the
 `_objc` suffix because only the default backend gets a bare name, and the default is
 `metal`. Which capability each executable links is a property of the executable, not of

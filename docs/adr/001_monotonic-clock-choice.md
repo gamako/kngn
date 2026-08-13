@@ -219,17 +219,14 @@ double platform_get_time(void);
 The decision (double + RAW monotonic) is unchanged. The implementation files have
 moved with the platform backends:
 
-#### macOS (Objective-C)
-
-`platform/macos/platform_macos.m` — `platform_get_time` via
-`clock_gettime_nsec_np(CLOCK_UPTIME_RAW)`.
-
 #### macOS (Swift / Metal)
 
-`platform_get_time` is defined once in the shared Swift layer
-`platform/macos-shared/platform_macos_shared.swift` (same `CLOCK_UPTIME_RAW`). The
-Swift and Metal backends (`platform/macos-swift/platform_macos_swift.swift`,
-`platform/macos-metal/platform_macos_metal.swift`) do not redefine it.
+`platform_get_time` is defined once in the AppKit half of the backend,
+`platform/macos/platform_macos_appkit.swift`, via
+`clock_gettime_nsec_np(CLOCK_UPTIME_RAW)`; the Metal renderer does not redefine it.
+(The Objective-C backend this record also covered defined the same call in
+`platform/macos/platform_macos.m`, removed by
+[ADR-031](031_metal-only-macos-backend.md).)
 
 #### Windows (pure Zig)
 
@@ -284,8 +281,7 @@ pure Zig).
 ## Related
 
 - `platform/platform.h` — the C ABI declaration of `platform_get_time`
-- `platform/macos/platform_macos.m` — macOS Objective-C implementation
-- `platform/macos-shared/platform_macos_shared.swift` — macOS Swift/Metal shared `platform_get_time`
+- `platform/macos/platform_macos_appkit.swift` — the macOS `platform_get_time`
 - `core/platform_windows_common.zig` — Windows `getTime` (QueryPerformanceCounter)
 - `core/platform_linux_common.zig` — Linux `getTime` (CLOCK_MONOTONIC_RAW)
 - `examples/01_timed_window/` — sample usage

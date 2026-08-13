@@ -16,14 +16,15 @@ shared `getTime` and dialogs in `platform_linux_common.zig`). Windows has the sa
 input, dialogs, `getTime` and CPU backing in `platform_windows_common.zig`). The valid
 values of `-Dplatform` change by OS:
 
-- **macOS**: `metal` (default), `swift`, `objc`
+- **macOS**: `metal` (the only value). It requires a Metal-capable device; there is no
+  fallback backend, and `KNGN_HEADLESS=1` is the display-less path (see [adr/031](adr/)).
 - **Linux**: `x11` (default), `wayland`. Wayland has display, input and the editor
   implemented and has been verified on Linux hardware (a busy loop's flood of presents
   is handled by pacing on the frame callback, which is effectively vsync).
 - **Windows**: `gdi` (default, best-effort), `d3d11` (first-class frame pacing). Win32 is
   called directly from pure Zig with extern fn and hand-written COM vtables.
 
-A mismatch (asking for `-Dplatform=objc` on Linux) is a clear build error. The shared
+A mismatch (asking for `-Dplatform=x11` on macOS) is a clear build error. The shared
 types (`KeyCode`, `Event` and so on) have `core/platform_types.zig` as their single
 source.
 

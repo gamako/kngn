@@ -10,16 +10,15 @@ BIN="$E2E/bin"
 APPS="$E2E/apps"
 OUT="$E2E/out"
 PROJ="$E2E/projects"
-# This suite pins the objc backend, so the artifact carries the _objc suffix (only the
-# default backend gets a bare name).
-APP="$BIN/bin/pixie_objc"
+# The default backend gets a bare artifact name.
+APP="$BIN/bin/pixie"
 PNG="$ROOT/examples/image/usako.png"
 rm -rf "$E2E"
 mkdir -p "$OUT" "$PROJ"
 # Install into a dedicated prefix that was just wiped, rather than searching the build cache
 # by name: the cache keeps a binary per backend and per build, so a name search can silently
 # return an unrelated one.
-ZIG_GLOBAL_CACHE_DIR="$ROOT/.zig-global-cache" CLANG_MODULE_CACHE_PATH="$ROOT/.clang-module-cache" "$ZIG_BIN" build -Dplatform=objc build-pixie --prefix "$BIN"
+ZIG_GLOBAL_CACHE_DIR="$ROOT/.zig-global-cache" CLANG_MODULE_CACHE_PATH="$ROOT/.clang-module-cache" "$ZIG_BIN" build build-pixie --prefix "$BIN"
 test -x "$APP"
 echo "appshell e2e: running $APP"
 

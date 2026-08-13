@@ -25,7 +25,7 @@
 同じ入力なら同じピクセルが出ます**。同梱のピクセルエディタで、ヘッドレス検証 1 サイクルが 0.1 秒。
 
 **pixie は 2.6 MB の単一バイナリ** · **Zig パッケージ依存ゼロ** · **Zig 0.16** ·
-macOS (objc/swift/metal) / Linux (x11/wayland) / Windows (gdi/d3d11)
+macOS (metal) / Linux (x11/wayland) / Windows (gdi/d3d11)
 
 土台はネイティブウィンドウを開いてピクセルを直接書くためのプリミティブだけで、その上に
 GUI・フォント・シンセ・ピクセルエディタが任意で乗ります。ヘッドレス検証ハーネスが platform 層に
@@ -105,7 +105,7 @@ KNGN はそれを WebView なしでやります。ただし**タダではあり�
 > 初回のみページキャッシュミスで 0.6 s。**数字はウィンドウサイズと保存済み状態に依存します**
 > — 復元された大きなウィンドウでは PNG も RSS も増えます。
 > ヘッドレスでは `KNGN_HEADLESS=1` が backend の初期化ごと飛ばすので、**時間も RSS も backend に
-> ほとんど依存しません**（objc でも 102 ms / 34.3 MB。違うのはバイナリサイズだけで objc は 2.4 MB）。
+> ほとんど依存しません**。
 
 **ジッタ**は測定値ではなく契約の話です。Zig のランタイムに tracing GC はなく、リアルタイム音声の
 コールバック区間では allocation / lock / IO / panic を禁止する契約があります
@@ -224,7 +224,7 @@ apps  →  kit  →  libs  →  core  →  platform      （一方向依存。bu
 
 | 層 | 中身 |
 |---|---|
-| `platform/` | macOS ネイティブ実装（C ABI: objc / swift / metal）。Linux と Windows のバックエンドは pure Zig で `core/` にあります |
+| `platform/` | macOS ネイティブ実装（C ABI + Swift / Metal）。Linux と Windows のバックエンドは pure Zig で `core/` にあります |
 | `core/` | platform ファサードと OS 別バックエンド、オーディオ、MIDI、制御プレーン（ハーネス） |
 | `libs/` | 任意で使う部品 — `gui`（イミディエイトモード） `font`（TrueType/CFF/bmfont） `png` `synth` `sound` `pixelops`（SIMD ブレンド・塗り） `gfx` `gmath` `appshell` `paint` `modular` `viz` `serde` `recipe` |
 | `kit/` | アプリと外部利用者が import する公開アンブレラモジュール |

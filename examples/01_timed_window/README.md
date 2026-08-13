@@ -22,11 +22,11 @@ Basic manual-drawing API usage:
 
 ## Build
 
-Default `-Dplatform` depends on the OS (macOS=metal / Linux=x11 / Windows=gdi). The
-`run-objc` / `run-swift` / `run-metal` steps below are for macOS. On Linux/Windows use
-`zig build run` (default backend) or `-Dplatform=x11|wayland|gdi|d3d11`.
+Default `-Dplatform` depends on the OS (macOS=metal / Linux=x11 / Windows=gdi). macOS has
+the single backend `metal`; on Linux/Windows use `zig build run` (default backend) or
+`-Dplatform=x11|wayland|gdi|d3d11`.
 
-### Metal (macOS default)
+### Metal (macOS)
 
 ```bash
 cd examples/01_timed_window
@@ -35,27 +35,11 @@ zig build
 zig build run-metal
 ```
 
-### Swift
-
-```bash
-zig build -Dplatform=swift
-# or
-zig build run-swift
-```
-
-### Objective-C
-
-```bash
-zig build -Dplatform=objc
-# or
-zig build run-objc
-```
-
 From the repository root:
 
 ```bash
 zig build run-example_01
-zig build run-example_01 -Dplatform=objc
+zig build run-example_01 -Dplatform=wayland   # on Linux
 ```
 
 ## Run (standalone binaries)
@@ -64,10 +48,9 @@ zig build run-example_01 -Dplatform=objc
 # Default backend (macOS=metal / Linux=x11 / Windows=gdi)
 zig build run
 
-# Installed binaries (macOS; bare name = default backend)
-./zig-out/bin/example_01_timed_window        # default (Metal on macOS)
-./zig-out/bin/example_01_timed_window_swift  # Swift
-./zig-out/bin/example_01_timed_window_objc   # Objective-C
+# Installed binaries (bare name = default backend; a non-default backend gets a suffix)
+./zig-out/bin/example_01_timed_window          # default (Metal on macOS, X11 on Linux)
+./zig-out/bin/example_01_timed_window_wayland  # a non-default backend, on Linux
 ```
 
 ## Learning points
@@ -122,4 +105,4 @@ Linear interpolation between two colours for a smooth transition.
   remains available on Tier-1 backends.
 - `window.present()` is a non-blocking submit (frame commit point). Tier-1 backends
   (Metal / D3D11-DXGI / Wayland) target tear-free fifo; best-effort backends
-  (CALayer objc/swift / X11 / GDI) may tear or jitter. See `docs/adr/005`.
+  (X11 / GDI) may tear or jitter. See `docs/adr/005`.

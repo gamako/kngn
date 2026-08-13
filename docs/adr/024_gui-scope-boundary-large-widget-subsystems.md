@@ -63,7 +63,7 @@ planned.
   is a second top-level window, and `core/platform.zig` documents its window handling as "a
   single process and a single window" at module-storage level (the comment above `Window`'s
   module-level state). Multi-window support would have to land in `core/platform.zig` across
-  every backend (objc/swift/metal, X11/Wayland, GDI/D3D11) before floating panels are
+  every backend (macOS metal, X11/Wayland, GDI/D3D11) before floating panels are
   possible at all. The rest — an arbitrary split layout replacing the three fixed slots, a
   drop-guide overlay, tab-group compositing, and persisting the result — could in principle
   be built inside a single window, and this ADR does not claim otherwise. It bundles all of

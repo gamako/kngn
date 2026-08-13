@@ -1,7 +1,7 @@
 //! Platform abstraction layer (facade)
 //!
 //! The Zig interface layer over several backends. `builtin.os.tag` selects the backend.
-//!   - macOS → `platform_macos.zig` (through the C ABI `platform.h`; objc/swift/metal differ only in which .o is linked, and the Zig side is shared)
+//!   - macOS → `platform_macos.zig` (through the C ABI `platform.h`; the Swift + Metal implementation supplies the .o)
 //!   - Linux → `platform_linux.zig` (X11/Wayland; pure Zig calling `@cImport(Xlib)` and friends directly; x11/wayland is picked by build_options.platform_backend)
 //!   - Windows → `platform_windows.zig` (a dispatcher; pure Zig calling the Win32 API through extern fn; gdi/d3d11 is picked by build_options.platform_backend)
 //!
@@ -853,7 +853,7 @@ pub const Window = struct {
     /// an unmodified letter key arrives as a shortcut. It is **idempotent**, so a consumer may call it
     /// every frame to track focus (no effect while the effective path is unchanged; a composition is discarded only when it changes). null is a no-op.
     /// A future Linux or Windows implementation must likewise be an idempotent setter that is safe every frame (detecting the change internally).
-    /// A backend opts in through the `@hasDecl` gate; today only macOS (objc/swift/metal) implements it.
+    /// A backend opts in through the `@hasDecl` gate; today only macOS implements it.
     /// Once Linux (XIM/ibus/text-input-v3) or Windows (IMM/WM_IME) implements IME composition, adding
     /// this method to the backend Window enables it with no change to the facade or the consumer (a backend without it is a no-op).
     pub fn setTextInputActive(self: Window, active: bool) void {
@@ -878,7 +878,7 @@ pub const Window = struct {
 };
 
 /// Build-selected platform backend name as a static slice (do not free).
-/// Values: macOS `objc` / `swift` / `metal`, Linux `x11` / `wayland`, Windows `gdi` / `d3d11`, wasm `wasm`.
+/// Values: macOS `metal`, Linux `x11` / `wayland`, Windows `gdi` / `d3d11`, wasm `wasm`.
 /// Available before `init()`. Under `KNGN_HEADLESS=1` this still reports the build-selected backend;
 /// use the harness capabilities field `headless_active` to tell whether the null runtime is active.
 pub fn activeBackend() []const u8 {
@@ -1018,7 +1018,7 @@ pub fn clipboardTakePaste() ?[]const u8 {
 //
 // Hot path declaration: event time only (Cmd+C/X/V). Never called per frame or in real time.
 // The null runtime and unit tests use a fixed-length in-memory fallback; the ordinary native runtime
-// delegates to the backend (on macOS objc, NSPasteboard).
+// delegates to the backend (on macOS, NSPasteboard).
 
 const MEMORY_CLIPBOARD_CAP: usize = 4096;
 
@@ -1420,9 +1420,9 @@ pub fn framePaceUntil(deadline_seconds: f64) void {
 
 test "activeBackend returns a known build-selected backend name" {
     // This facade test module is stamped with the OS default only (not a full backend matrix).
-    // Per-backend values are checked on hardware / the macOS three-backend run; here we only
-    // assert the value is in the canonical set so empty, "unknown", and wiring typos fail fast.
-    const known = [_][]const u8{ "objc", "swift", "metal", "x11", "wayland", "gdi", "d3d11", "wasm" };
+    // Per-backend values are checked on hardware; here we only assert the value is in the
+    // canonical set so empty, "unknown", and wiring typos fail fast.
+    const known = [_][]const u8{ "metal", "x11", "wayland", "gdi", "d3d11", "wasm" };
     const got = activeBackend();
     var found = false;
     for (known) |k| {

@@ -12,7 +12,7 @@ pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
 
-    // Same OS-aware standalone build as the other examples (macOS: objc/swift/metal, Linux: x11/wayland, Windows: windows).
+    // Same OS-aware standalone build as the other examples (macOS: metal, Linux: x11/wayland, Windows: windows).
     // audio backend covers macOS(AudioToolbox)/Linux(ALSA)/Windows(WASAPI) when link_audio=true.
     // With link_audio=true, buildStandalone creates the audio facade module and wires the harness.
     // platform_types / harness / png are also derived from platform_source and shared by buildStandalone.
