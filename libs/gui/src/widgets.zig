@@ -3820,6 +3820,7 @@ test "imageBox: reserves a fixed wxh leaf and emits a 1:1 image cmd" {
             try std.testing.expectEqual(@as(u32, 20), im.rect.h);
             found = true;
         },
+        // Path commands are not produced by imageBox; ignore them.
         else => {},
     };
     try std.testing.expect(found);
@@ -4501,6 +4502,7 @@ fn countDrawText(cmds: []const draw_mod.DrawCmd, needle: []const u8) usize {
         .text => |t| if (std.mem.eql(u8, t.text, needle)) {
             n += 1;
         },
+        // Path commands are not text; ignore them.
         else => {},
     };
     return n;
@@ -4510,6 +4512,7 @@ fn countDrawLines(cmds: []const draw_mod.DrawCmd) usize {
     var n: usize = 0;
     for (cmds) |cmd| switch (cmd) {
         .line => n += 1,
+        // Path commands are not stroke lines; ignore them.
         else => {},
     };
     return n;
@@ -4792,6 +4795,7 @@ test "TextInput: uses ascent+descent for content height" {
             try std.testing.expectEqual(ln.p0.y, ln.p1.y);
             saw_underline = true;
         },
+        // Path commands are not produced by textInput; ignore them.
         else => {},
     };
     try std.testing.expect(saw_text);
@@ -4859,6 +4863,7 @@ test "selectableLabel: ink height matches selection/text y" {
                 saw_sel = true;
             }
         },
+        // Path commands are not produced by selectableLabel; ignore them.
         else => {},
     };
     try std.testing.expect(saw_text);
@@ -4915,6 +4920,7 @@ test "button label uses ink height and excludes line_gap" {
                 saw = true;
             }
         },
+        // Path commands are not produced by button; ignore them.
         else => {},
     };
     try std.testing.expect(saw);

@@ -1,5 +1,6 @@
 const std = @import("std");
 const pixelops = @import("pixelops");
+const vector = @import("vector");
 const geom = @import("geom.zig");
 const color_mod = @import("color.zig");
 const draw_mod = @import("draw.zig");
@@ -16,7 +17,7 @@ pub const Font = font_mod.Font;
 /// font = default font. Each text cmd may carry a font override that takes priority.
 /// scale: conversion factor from logical DrawList → physical target (1.0 = logical=physical, fast path).
 /// `.text` keeps logical coordinates when scale==1.0; when scale!=1.0 it physicalizes pos/clip and passes scale to Font.drawTo.
-pub fn render(target: RenderTarget, draw_list: *const DrawList, font: Font, scale: f32) void {
+pub fn render(target: RenderTarget, draw_list: *DrawList, font: Font, scale: f32) void {
     std.debug.assert(target.pixels.len == @as(usize, target.width) * @as(usize, target.height));
     std.debug.assert(std.math.isFinite(scale) and scale > 0);
 
@@ -28,6 +29,7 @@ pub fn render(target: RenderTarget, draw_list: *const DrawList, font: Font, scal
                 .line => |c| if (!c.clip.isEmpty()) drawLine(target, c.p0, c.p1, c.color, c.thickness, c.clip),
                 .text => |c| if (!c.clip.isEmpty()) (c.font orelse font).drawTo(target, c.pos, c.text, c.color, c.clip, 1.0),
                 .image => |c| if (!c.clip.isEmpty()) drawImage(target, c.rect, c.pixels, c.src_w, c.src_h, c.clip),
+                .path => |c| if (!c.clip.isEmpty()) drawPath(target, draw_list, c, 1.0, true),
             }
         }
         return;
@@ -83,6 +85,14 @@ pub fn render(target: RenderTarget, draw_list: *const DrawList, font: Font, scal
                 const phys_clip = scaleRect(c.clip, scale);
                 if (!phys_clip.isEmpty()) {
                     drawImage(target, scaleRect(c.rect, scale), c.pixels, c.src_w, c.src_h, phys_clip);
+                }
+            },
+            .path => |c| {
+                const phys_clip = scaleRect(c.clip, scale);
+                if (!phys_clip.isEmpty()) {
+                    var scaled = c;
+                    scaled.clip = phys_clip;
+                    drawPath(target, draw_list, scaled, scale, true);
                 }
             },
         }
@@ -277,6 +287,304 @@ fn drawLine(target: RenderTarget, p0: Vec2, p1: Vec2, col: Color, thickness: u32
         if (e2 < dx) {
             err += dx;
             y0 += sy;
+        }
+    }
+}
+
+const PathCmd = @FieldType(draw_mod.DrawCmd, "path");
+
+/// Hot path: flatten once into DrawList-owned buffers, then edge accumulation
+/// (per edge), coverage resolve (per bbox row), compositing (every pixel of
+/// the clipped bbox, every frame). Capacity grows only when a shape needs more
+/// than the last peak; a second `render` of the same cmds does not allocate.
+fn drawPath(
+    target: RenderTarget,
+    draw_list: *DrawList,
+    cmd: PathCmd,
+    scale: f32,
+    comptime use_simd: bool,
+) void {
+    const target_rect = Rect{ .x = 0, .y = 0, .w = target.width, .h = target.height };
+    const clip_t = Rect.intersect(cmd.clip, target_rect);
+    if (clip_t.isEmpty() or cmd.verbs.len == 0) return;
+
+    flattenPath(draw_list, cmd.verbs, cmd.points, scale);
+    const bbox = bboxFromFlat(draw_list.path_flat_pts.items, clip_t) orelse return;
+
+    // bbox.w is the intersection of the flattened AABB with clip ∩ target, so
+    // it cannot exceed target.width. One row is then at most
+    // target.width × 9 bytes. A row reaching the 4 MiB cap would need a
+    // target about 466_000 px wide, which no presentable framebuffer has.
+    const row_bytes = @as(usize, bbox.w) * draw_mod.path_scratch_bytes_per_pixel;
+    std.debug.assert(row_bytes <= draw_mod.path_scratch_limit_bytes);
+    // Clamp: never above the production ceiling, never below one row. A
+    // requested 0 still draws (one row at a time). Holds without the asserts.
+    const limit = @max(row_bytes, @min(draw_list.path_scratch_limit, draw_mod.path_scratch_limit_bytes));
+    std.debug.assert(limit >= row_bytes);
+    std.debug.assert(limit <= draw_mod.path_scratch_limit_bytes);
+    const max_px = limit / draw_mod.path_scratch_bytes_per_pixel;
+    var band_h: u32 = bbox.h;
+    if (@as(usize, bbox.w) * @as(usize, bbox.h) > max_px) {
+        band_h = @max(1, @as(u32, @intCast(max_px / @max(@as(usize, bbox.w), 1))));
+    }
+    std.debug.assert(band_h >= 1);
+
+    var y = bbox.y;
+    const y_end = bbox.y + @as(i32, @intCast(bbox.h));
+    while (y < y_end) {
+        const remain: u32 = @intCast(y_end - y);
+        const this_h = @min(band_h, remain);
+        const px = @as(usize, bbox.w) * this_h;
+        draw_list.ensurePathScratch(px);
+
+        const xform = vector.ScaleTranslate{
+            .sx = 1,
+            .sy = 1,
+            .dx = -@as(f32, @floatFromInt(bbox.x)),
+            .dy = -@as(f32, @floatFromInt(y)),
+        };
+        vector.rasterizePolylinesInto(
+            asVectorPts(draw_list.path_flat_pts.items),
+            draw_list.path_contour_ends.items,
+            xform,
+            bbox.w,
+            this_h,
+            draw_list.path_area,
+            draw_list.path_cover,
+            draw_list.path_coverage,
+        );
+        if (!cmd.aa) quantizeCoverage(draw_list.path_coverage[0..px]);
+        blitPathCoverage(
+            target,
+            bbox.x,
+            y,
+            draw_list.path_coverage[0..px],
+            bbox.w,
+            this_h,
+            cmd.color,
+            use_simd,
+        );
+        y += @as(i32, @intCast(this_h));
+    }
+}
+
+fn scalePt(p: draw_mod.Vec2f, scale: f32) draw_mod.Vec2f {
+    const x = std.math.clamp(@as(f64, p.x) * @as(f64, scale), -@as(f64, std.math.floatMax(f32)), @as(f64, std.math.floatMax(f32)));
+    const y = std.math.clamp(@as(f64, p.y) * @as(f64, scale), -@as(f64, std.math.floatMax(f32)), @as(f64, std.math.floatMax(f32)));
+    return .{ .x = @floatCast(x), .y = @floatCast(y) };
+}
+
+fn asVectorPts(pts: []const draw_mod.Vec2f) []const vector.Vec2f {
+    if (pts.len == 0) return &.{};
+    return @as([*]const vector.Vec2f, @ptrCast(pts.ptr))[0..pts.len];
+}
+
+fn appendFlat(dl: *DrawList, p: draw_mod.Vec2f) void {
+    dl.path_flat_pts.append(dl.alloc, p) catch @panic("drawPath: OOM");
+}
+
+fn flushContour(dl: *DrawList, start: usize) void {
+    const end = dl.path_flat_pts.items.len;
+    if (end - start >= 2) {
+        dl.path_contour_ends.append(dl.alloc, end) catch @panic("drawPath: OOM");
+    } else {
+        dl.path_flat_pts.shrinkRetainingCapacity(start);
+    }
+}
+
+/// Flatten once into DrawList-owned buffers. Capacity is retained across
+/// commands and frames; growth happens only when this shape needs more.
+fn flattenPath(
+    dl: *DrawList,
+    verbs: []const draw_mod.PathVerb,
+    points: []const draw_mod.Vec2f,
+    scale: f32,
+) void {
+    dl.path_flat_pts.clearRetainingCapacity();
+    dl.path_contour_ends.clearRetainingCapacity();
+    var pi: usize = 0;
+    var cur: draw_mod.Vec2f = .{ .x = 0, .y = 0 };
+    var contour_start: usize = 0;
+    var have = false;
+    for (verbs) |v| {
+        switch (v) {
+            .move => {
+                if (have) flushContour(dl, contour_start);
+                cur = scalePt(points[pi], scale);
+                contour_start = dl.path_flat_pts.items.len;
+                appendFlat(dl, cur);
+                have = true;
+                pi += 1;
+            },
+            .line => {
+                cur = scalePt(points[pi], scale);
+                appendFlat(dl, cur);
+                pi += 1;
+            },
+            .quad => {
+                const c = scalePt(points[pi], scale);
+                const e = scalePt(points[pi + 1], scale);
+                flattenQuadDraw(dl, cur, c, e, 0);
+                cur = e;
+                pi += 2;
+            },
+            .cubic => {
+                const c1 = scalePt(points[pi], scale);
+                const c2 = scalePt(points[pi + 1], scale);
+                const e = scalePt(points[pi + 2], scale);
+                flattenCubicDraw(dl, cur, c1, c2, e, 0);
+                cur = e;
+                pi += 3;
+            },
+            .close => {
+                if (have) {
+                    flushContour(dl, contour_start);
+                    have = false;
+                }
+            },
+        }
+    }
+    if (have) flushContour(dl, contour_start);
+}
+
+fn midPt(a: draw_mod.Vec2f, b: draw_mod.Vec2f) draw_mod.Vec2f {
+    return .{ .x = (a.x + b.x) * 0.5, .y = (a.y + b.y) * 0.5 };
+}
+
+fn flattenQuadDraw(dl: *DrawList, p0: draw_mod.Vec2f, c: draw_mod.Vec2f, p1: draw_mod.Vec2f, depth: u32) void {
+    const vp0 = vector.Vec2f{ .x = p0.x, .y = p0.y };
+    const vc = vector.Vec2f{ .x = c.x, .y = c.y };
+    const vp1 = vector.Vec2f{ .x = p1.x, .y = p1.y };
+    const flat = depth >= vector.flatten_max_depth or
+        vector.pointToLineDistance(vc, vp0, vp1) <= vector.flatten_tol;
+    if (flat) {
+        appendFlat(dl, p1);
+        return;
+    }
+    const p01 = midPt(p0, c);
+    const p12 = midPt(c, p1);
+    const m = midPt(p01, p12);
+    flattenQuadDraw(dl, p0, p01, m, depth + 1);
+    flattenQuadDraw(dl, m, p12, p1, depth + 1);
+}
+
+fn flattenCubicDraw(dl: *DrawList, p0: draw_mod.Vec2f, c1: draw_mod.Vec2f, c2: draw_mod.Vec2f, p1: draw_mod.Vec2f, depth: u32) void {
+    const vp0 = vector.Vec2f{ .x = p0.x, .y = p0.y };
+    const vc1 = vector.Vec2f{ .x = c1.x, .y = c1.y };
+    const vc2 = vector.Vec2f{ .x = c2.x, .y = c2.y };
+    const vp1 = vector.Vec2f{ .x = p1.x, .y = p1.y };
+    const flat = depth >= vector.flatten_max_depth or
+        (vector.pointToLineDistance(vc1, vp0, vp1) <= vector.flatten_tol and
+            vector.pointToLineDistance(vc2, vp0, vp1) <= vector.flatten_tol);
+    if (flat) {
+        appendFlat(dl, p1);
+        return;
+    }
+    const p01 = midPt(p0, c1);
+    const p12 = midPt(c1, c2);
+    const p23 = midPt(c2, p1);
+    const p012 = midPt(p01, p12);
+    const p123 = midPt(p12, p23);
+    const m = midPt(p012, p123);
+    flattenCubicDraw(dl, p0, p01, p012, m, depth + 1);
+    flattenCubicDraw(dl, m, p123, p23, p1, depth + 1);
+}
+
+fn bboxFromFlat(pts: []const draw_mod.Vec2f, clip_t: Rect) ?Rect {
+    if (pts.len == 0) return null;
+    var min_x: f32 = pts[0].x;
+    var min_y: f32 = pts[0].y;
+    var max_x: f32 = pts[0].x;
+    var max_y: f32 = pts[0].y;
+    for (pts[1..]) |p| {
+        min_x = @min(min_x, p.x);
+        min_y = @min(min_y, p.y);
+        max_x = @max(max_x, p.x);
+        max_y = @max(max_y, p.y);
+    }
+
+    const clip_x0: f64 = @floatFromInt(clip_t.x);
+    const clip_y0: f64 = @floatFromInt(clip_t.y);
+    const clip_x1: f64 = @as(f64, @floatFromInt(clip_t.x)) + @as(f64, @floatFromInt(clip_t.w));
+    const clip_y1: f64 = @as(f64, @floatFromInt(clip_t.y)) + @as(f64, @floatFromInt(clip_t.h));
+    const bx0 = std.math.clamp(@as(f64, min_x), clip_x0, clip_x1);
+    const by0 = std.math.clamp(@as(f64, min_y), clip_y0, clip_y1);
+    const bx1 = std.math.clamp(@as(f64, max_x), clip_x0, clip_x1);
+    const by1 = std.math.clamp(@as(f64, max_y), clip_y0, clip_y1);
+
+    const ix0: i32 = @intFromFloat(@floor(bx0));
+    const iy0: i32 = @intFromFloat(@floor(by0));
+    const ix1: i32 = @intFromFloat(@ceil(bx1));
+    const iy1: i32 = @intFromFloat(@ceil(by1));
+    if (ix1 <= ix0 or iy1 <= iy0) return null;
+    return .{
+        .x = ix0,
+        .y = iy0,
+        .w = @intCast(ix1 - ix0),
+        .h = @intCast(iy1 - iy0),
+    };
+}
+
+fn quantizeCoverage(cov: []u8) void {
+    for (cov) |*c| c.* = if (c.* >= 128) 255 else 0;
+}
+
+/// Composite 8bpp coverage over an already-clipped dest rect.
+/// Clip/bounds are hoisted: the dest rectangle is inside the target.
+/// SIMD 4-pixel `srcOverCoverage4` plus a scalar tail; opaque + coverage 255
+/// runs go through `fill32`.
+fn blitPathCoverage(
+    target: RenderTarget,
+    dst_x: i32,
+    dst_y: i32,
+    cov: []const u8,
+    w: u32,
+    h: u32,
+    col: Color,
+    comptime use_simd: bool,
+) void {
+    if (w == 0 or h == 0) return;
+    const src_u32: u32 = @bitCast(col);
+    const src4 = [4]u32{ src_u32, src_u32, src_u32, src_u32 };
+    const ux: u32 = @intCast(dst_x);
+    const uy: u32 = @intCast(dst_y);
+
+    var row: u32 = 0;
+    while (row < h) : (row += 1) {
+        const dst_base = (uy + row) * target.width + ux;
+        const cov_base = row * w;
+        var x: u32 = 0;
+        if (col.a == 255) {
+            while (x < w) {
+                const c = cov[cov_base + x];
+                if (c == 0) {
+                    x += 1;
+                    continue;
+                }
+                if (c == 255) {
+                    var run = x + 1;
+                    while (run < w and cov[cov_base + run] == 255) run += 1;
+                    pixelops.fill32(target.pixels[dst_base + x ..][0 .. run - x], src_u32);
+                    x = run;
+                    continue;
+                }
+                target.pixels[dst_base + x] = pixelops.srcOverCoverage(target.pixels[dst_base + x], src_u32, c);
+                x += 1;
+            }
+            continue;
+        }
+        if (comptime use_simd) {
+            while (x + 4 <= w) : (x += 4) {
+                const cov4: @Vector(4, u8) = @as(*align(1) const @Vector(4, u8), @ptrCast(cov.ptr + cov_base + x)).*;
+                if (@reduce(.Or, cov4) == 0) continue;
+                const dst_chunk: *[4]u32 = target.pixels[dst_base + x ..][0..4];
+                dst_chunk.* = @bitCast(pixelops.srcOverCoverage4(@bitCast(dst_chunk.*), @bitCast(src4), cov4));
+            }
+        }
+        while (x < w) : (x += 1) {
+            const c = cov[cov_base + x];
+            if (c == 0) continue;
+            target.pixels[dst_base + x] = pixelops.srcOverCoverage(target.pixels[dst_base + x], src_u32, c);
         }
     }
 }
@@ -1075,4 +1383,429 @@ test "text clip scale rules match rect" {
         try std.testing.expectEqual(via_rect.w, Spy.last_clip.w);
         try std.testing.expectEqual(via_rect.h, Spy.last_clip.h);
     }
+}
+
+fn pathPx(pixels: []const u32, stride: u32, x: u32, y: u32) u32 {
+    return pixels[y * stride + x];
+}
+
+test "path fill: pixel-aligned convex rect is opaque inside and empty outside" {
+    var pixels = [_]u32{0xFF000000} ** (8 * 8);
+    const target = RenderTarget{ .pixels = &pixels, .width = 8, .height = 8 };
+    var dl = DrawList.init(std.testing.allocator);
+    defer dl.deinit();
+    dl.reset(8, 8);
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var b = dl.beginPath(arena.allocator());
+    try b.moveTo(.{ .x = 2, .y = 2 });
+    try b.lineTo(.{ .x = 6, .y = 2 });
+    try b.lineTo(.{ .x = 6, .y = 6 });
+    try b.lineTo(.{ .x = 2, .y = 6 });
+    try b.close();
+    try b.finish(.{ .color = Color.rgba(0xFF, 0, 0, 0xFF) });
+    render(target, &dl, font_mod.default_font, 1.0);
+    try std.testing.expectEqual(@as(u32, 0xFFFF0000), pathPx(&pixels, 8, 3, 3));
+    try std.testing.expectEqual(@as(u32, 0xFFFF0000), pathPx(&pixels, 8, 5, 5));
+    try std.testing.expectEqual(@as(u32, 0xFF000000), pathPx(&pixels, 8, 0, 0));
+    try std.testing.expectEqual(@as(u32, 0xFF000000), pathPx(&pixels, 8, 7, 7));
+}
+
+test "path fill: concave chevron has a hollow notch" {
+    var pixels = [_]u32{0xFF000000} ** (16 * 16);
+    const target = RenderTarget{ .pixels = &pixels, .width = 16, .height = 16 };
+    var dl = DrawList.init(std.testing.allocator);
+    defer dl.deinit();
+    dl.reset(16, 16);
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var b = dl.beginPath(arena.allocator());
+    try b.moveTo(.{ .x = 1, .y = 1 });
+    try b.lineTo(.{ .x = 15, .y = 1 });
+    try b.lineTo(.{ .x = 15, .y = 15 });
+    try b.lineTo(.{ .x = 8, .y = 8 });
+    try b.lineTo(.{ .x = 1, .y = 15 });
+    try b.close();
+    try b.finish(.{ .color = Color.rgba(0, 0xFF, 0, 0xFF) });
+    render(target, &dl, font_mod.default_font, 1.0);
+    try std.testing.expectEqual(@as(u32, 0xFF00FF00), pathPx(&pixels, 16, 2, 2));
+    try std.testing.expectEqual(@as(u32, 0xFF000000), pathPx(&pixels, 16, 8, 12));
+}
+
+test "path fill: opposite-winding inner contour is a hole" {
+    var pixels = [_]u32{0xFF000000} ** (12 * 12);
+    const target = RenderTarget{ .pixels = &pixels, .width = 12, .height = 12 };
+    var dl = DrawList.init(std.testing.allocator);
+    defer dl.deinit();
+    dl.reset(12, 12);
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var b = dl.beginPath(arena.allocator());
+    try b.moveTo(.{ .x = 1, .y = 1 });
+    try b.lineTo(.{ .x = 11, .y = 1 });
+    try b.lineTo(.{ .x = 11, .y = 11 });
+    try b.lineTo(.{ .x = 1, .y = 11 });
+    try b.close();
+    try b.moveTo(.{ .x = 4, .y = 4 });
+    try b.lineTo(.{ .x = 4, .y = 8 });
+    try b.lineTo(.{ .x = 8, .y = 8 });
+    try b.lineTo(.{ .x = 8, .y = 4 });
+    try b.close();
+    try b.finish(.{ .color = Color.rgba(0, 0, 0xFF, 0xFF) });
+    render(target, &dl, font_mod.default_font, 1.0);
+    try std.testing.expectEqual(@as(u32, 0xFF0000FF), pathPx(&pixels, 12, 2, 2));
+    try std.testing.expectEqual(@as(u32, 0xFF000000), pathPx(&pixels, 12, 5, 5));
+    try std.testing.expectEqual(@as(u32, 0xFF000000), pathPx(&pixels, 12, 6, 6));
+}
+
+test "path fill: same-winding inner contour fills the interior" {
+    var pixels = [_]u32{0xFF000000} ** (12 * 12);
+    const target = RenderTarget{ .pixels = &pixels, .width = 12, .height = 12 };
+    var dl = DrawList.init(std.testing.allocator);
+    defer dl.deinit();
+    dl.reset(12, 12);
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var b = dl.beginPath(arena.allocator());
+    try b.moveTo(.{ .x = 1, .y = 1 });
+    try b.lineTo(.{ .x = 11, .y = 1 });
+    try b.lineTo(.{ .x = 11, .y = 11 });
+    try b.lineTo(.{ .x = 1, .y = 11 });
+    try b.close();
+    try b.moveTo(.{ .x = 4, .y = 4 });
+    try b.lineTo(.{ .x = 8, .y = 4 });
+    try b.lineTo(.{ .x = 8, .y = 8 });
+    try b.lineTo(.{ .x = 4, .y = 8 });
+    try b.close();
+    try b.finish(.{ .color = Color.rgba(0xFF, 0xFF, 0, 0xFF) });
+    render(target, &dl, font_mod.default_font, 1.0);
+    try std.testing.expectEqual(@as(u32, 0xFFFFFF00), pathPx(&pixels, 12, 2, 2));
+    try std.testing.expectEqual(@as(u32, 0xFFFFFF00), pathPx(&pixels, 12, 5, 5));
+}
+
+test "path fill: several moves are several contours" {
+    var pixels = [_]u32{0xFF000000} ** (16 * 8);
+    const target = RenderTarget{ .pixels = &pixels, .width = 16, .height = 8 };
+    var dl = DrawList.init(std.testing.allocator);
+    defer dl.deinit();
+    dl.reset(16, 8);
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var b = dl.beginPath(arena.allocator());
+    try b.moveTo(.{ .x = 1, .y = 1 });
+    try b.lineTo(.{ .x = 4, .y = 1 });
+    try b.lineTo(.{ .x = 4, .y = 4 });
+    try b.lineTo(.{ .x = 1, .y = 4 });
+    try b.moveTo(.{ .x = 8, .y = 1 });
+    try b.lineTo(.{ .x = 12, .y = 1 });
+    try b.lineTo(.{ .x = 12, .y = 4 });
+    try b.lineTo(.{ .x = 8, .y = 4 });
+    try b.finish(.{ .color = Color.rgba(0xFF, 0, 0xFF, 0xFF) });
+    render(target, &dl, font_mod.default_font, 1.0);
+    try std.testing.expectEqual(@as(u32, 0xFFFF00FF), pathPx(&pixels, 16, 2, 2));
+    try std.testing.expectEqual(@as(u32, 0xFFFF00FF), pathPx(&pixels, 16, 10, 2));
+    try std.testing.expectEqual(@as(u32, 0xFF000000), pathPx(&pixels, 16, 6, 2));
+}
+
+test "path fill: implicit close matches an explicit close" {
+    var a = [_]u32{0xFF000000} ** (8 * 8);
+    var bpx = [_]u32{0xFF000000} ** (8 * 8);
+    const ta = RenderTarget{ .pixels = &a, .width = 8, .height = 8 };
+    const tb = RenderTarget{ .pixels = &bpx, .width = 8, .height = 8 };
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var dl_open = DrawList.init(std.testing.allocator);
+    defer dl_open.deinit();
+    dl_open.reset(8, 8);
+    var p0 = dl_open.beginPath(arena.allocator());
+    try p0.moveTo(.{ .x = 1, .y = 1 });
+    try p0.lineTo(.{ .x = 6, .y = 1 });
+    try p0.lineTo(.{ .x = 6, .y = 6 });
+    try p0.lineTo(.{ .x = 1, .y = 6 });
+    try p0.finish(.{ .color = Color.rgba(0xFF, 0, 0, 0xFF) });
+
+    var dl_closed = DrawList.init(std.testing.allocator);
+    defer dl_closed.deinit();
+    dl_closed.reset(8, 8);
+    var p1 = dl_closed.beginPath(arena.allocator());
+    try p1.moveTo(.{ .x = 1, .y = 1 });
+    try p1.lineTo(.{ .x = 6, .y = 1 });
+    try p1.lineTo(.{ .x = 6, .y = 6 });
+    try p1.lineTo(.{ .x = 1, .y = 6 });
+    try p1.close();
+    try p1.finish(.{ .color = Color.rgba(0xFF, 0, 0, 0xFF) });
+
+    render(ta, &dl_open, font_mod.default_font, 1.0);
+    render(tb, &dl_closed, font_mod.default_font, 1.0);
+    try std.testing.expectEqualSlices(u32, &a, &bpx);
+}
+
+test "path fill: AA off quantizes coverage at 128" {
+    var on = [_]u32{0xFF000000} ** (8 * 8);
+    var off = [_]u32{0xFF000000} ** (8 * 8);
+    const t_on = RenderTarget{ .pixels = &on, .width = 8, .height = 8 };
+    const t_off = RenderTarget{ .pixels = &off, .width = 8, .height = 8 };
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var dl_on = DrawList.init(std.testing.allocator);
+    defer dl_on.deinit();
+    dl_on.reset(8, 8);
+    var b_on = dl_on.beginPath(arena.allocator());
+    try b_on.moveTo(.{ .x = 1.5, .y = 1 });
+    try b_on.lineTo(.{ .x = 6.5, .y = 1 });
+    try b_on.lineTo(.{ .x = 6.5, .y = 6 });
+    try b_on.lineTo(.{ .x = 1.5, .y = 6 });
+    try b_on.close();
+    try b_on.finish(.{ .color = Color.rgba(0xFF, 0xFF, 0xFF, 0xFF), .aa = true });
+
+    var dl_off = DrawList.init(std.testing.allocator);
+    defer dl_off.deinit();
+    dl_off.reset(8, 8);
+    var b_off = dl_off.beginPath(arena.allocator());
+    try b_off.moveTo(.{ .x = 1.5, .y = 1 });
+    try b_off.lineTo(.{ .x = 6.5, .y = 1 });
+    try b_off.lineTo(.{ .x = 6.5, .y = 6 });
+    try b_off.lineTo(.{ .x = 1.5, .y = 6 });
+    try b_off.close();
+    try b_off.finish(.{ .color = Color.rgba(0xFF, 0xFF, 0xFF, 0xFF), .aa = false });
+
+    render(t_on, &dl_on, font_mod.default_font, 1.0);
+    render(t_off, &dl_off, font_mod.default_font, 1.0);
+
+    // AA-on edge is a midtone; AA-off is either white or black.
+    const edge_on = pathPx(&on, 8, 1, 3);
+    const edge_off = pathPx(&off, 8, 1, 3);
+    try std.testing.expect(edge_on != 0xFF000000 and edge_on != 0xFFFFFFFF);
+    try std.testing.expect(edge_off == 0xFF000000 or edge_off == 0xFFFFFFFF);
+}
+
+test "path fill: coverage scratch peak stays at or under the 4 MiB cap" {
+    var pixels = [_]u32{0xFF000000} ** (64 * 64);
+    const target = RenderTarget{ .pixels = &pixels, .width = 64, .height = 64 };
+    var dl = DrawList.init(std.testing.allocator);
+    defer dl.deinit();
+    dl.reset(64, 64);
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var b = dl.beginPath(arena.allocator());
+    try b.moveTo(.{ .x = 0, .y = 0 });
+    try b.lineTo(.{ .x = 64, .y = 0 });
+    try b.lineTo(.{ .x = 64, .y = 64 });
+    try b.lineTo(.{ .x = 0, .y = 64 });
+    try b.close();
+    try b.finish(.{ .color = Color.rgba(0xFF, 0, 0, 0xFF) });
+    render(target, &dl, font_mod.default_font, 1.0);
+    try std.testing.expect(dl.path_scratch_peak_bytes <= draw_mod.path_scratch_limit_bytes);
+}
+
+test "path fill: a bbox over the scratch cap is banded and the peak stays at the cap" {
+    const W: u32 = 512;
+    const H: u32 = 1024;
+    const buf = try std.testing.allocator.alloc(u32, W * H);
+    defer std.testing.allocator.free(buf);
+    @memset(buf, 0xFF000000);
+    const target = RenderTarget{ .pixels = buf, .width = W, .height = H };
+    var dl = DrawList.init(std.testing.allocator);
+    defer dl.deinit();
+    dl.reset(W, H);
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var b = dl.beginPath(arena.allocator());
+    try b.moveTo(.{ .x = 0, .y = 0 });
+    try b.lineTo(.{ .x = @floatFromInt(W), .y = 0 });
+    try b.lineTo(.{ .x = @floatFromInt(W), .y = @floatFromInt(H) });
+    try b.lineTo(.{ .x = 0, .y = @floatFromInt(H) });
+    try b.close();
+    try b.finish(.{ .color = Color.rgba(0x20, 0x20, 0x20, 0xFF) });
+    render(target, &dl, font_mod.default_font, 1.0);
+    try std.testing.expect(dl.path_scratch_peak_bytes <= draw_mod.path_scratch_limit_bytes);
+    try std.testing.expect(dl.path_scratch_pixels <= draw_mod.path_scratch_limit_bytes / draw_mod.path_scratch_bytes_per_pixel);
+    try std.testing.expectEqual(@as(u32, 0xFF202020), buf[10 * W + 10]);
+    try std.testing.expectEqual(@as(u32, 0xFF202020), buf[(H - 10) * W + (W - 10)]);
+}
+
+test "path flatten: max distance to a quadratic stays within 0.2 device px at scale 1/2/4" {
+    const p0 = vector.Vec2f{ .x = 0, .y = 0 };
+    const c = vector.Vec2f{ .x = 10, .y = 20 };
+    const p1 = vector.Vec2f{ .x = 20, .y = 0 };
+    for ([_]f32{ 1, 2, 4 }) |s| {
+        const q0 = vector.Vec2f{ .x = p0.x * s, .y = p0.y * s };
+        const qc = vector.Vec2f{ .x = c.x * s, .y = c.y * s };
+        const q1 = vector.Vec2f{ .x = p1.x * s, .y = p1.y * s };
+        var pts: std.ArrayList(vector.Vec2f) = .empty;
+        defer pts.deinit(std.testing.allocator);
+        try pts.append(std.testing.allocator, q0);
+        try vector.flattenQuadInto(&pts, std.testing.allocator, q0, qc, q1, 0);
+        var t: f32 = 0;
+        var max_d: f32 = 0;
+        while (t <= 1.0) : (t += 0.002) {
+            const sample = vector.evalQuad(q0, qc, q1, t);
+            var best: f32 = std.math.floatMax(f32);
+            var i: usize = 0;
+            while (i + 1 < pts.items.len) : (i += 1) {
+                const d = vector.pointToLineDistance(sample, pts.items[i], pts.items[i + 1]);
+                best = @min(best, d);
+            }
+            max_d = @max(max_d, best);
+        }
+        try std.testing.expect(max_d <= vector.flatten_tol + 1e-4);
+    }
+}
+
+test "path flatten: max distance to a cubic stays within 0.2 device px at scale 1/2/4" {
+    const p0 = vector.Vec2f{ .x = 0, .y = 0 };
+    const c1 = vector.Vec2f{ .x = 0, .y = 16 };
+    const c2 = vector.Vec2f{ .x = 16, .y = 16 };
+    const p1 = vector.Vec2f{ .x = 16, .y = 0 };
+    for ([_]f32{ 1, 2, 4 }) |s| {
+        const q0 = vector.Vec2f{ .x = p0.x * s, .y = p0.y * s };
+        const qc1 = vector.Vec2f{ .x = c1.x * s, .y = c1.y * s };
+        const qc2 = vector.Vec2f{ .x = c2.x * s, .y = c2.y * s };
+        const q1 = vector.Vec2f{ .x = p1.x * s, .y = p1.y * s };
+        var pts: std.ArrayList(vector.Vec2f) = .empty;
+        defer pts.deinit(std.testing.allocator);
+        try pts.append(std.testing.allocator, q0);
+        try vector.flattenCubicInto(&pts, std.testing.allocator, q0, qc1, qc2, q1, 0);
+        var t: f32 = 0;
+        var max_d: f32 = 0;
+        while (t <= 1.0) : (t += 0.002) {
+            const sample = vector.evalCubic(q0, qc1, qc2, q1, t);
+            var best: f32 = std.math.floatMax(f32);
+            var i: usize = 0;
+            while (i + 1 < pts.items.len) : (i += 1) {
+                const d = vector.pointToLineDistance(sample, pts.items[i], pts.items[i + 1]);
+                best = @min(best, d);
+            }
+            max_d = @max(max_d, best);
+        }
+        try std.testing.expect(max_d <= vector.flatten_tol + 1e-4);
+    }
+}
+
+test "path flatten: depth-cap error is recorded for a spike quadratic" {
+    // Starting at flatten_max_depth forces the remaining chord (the accepted
+    // approximation when the cap is hit). Control is 1000 px off the chord.
+    const p0 = vector.Vec2f{ .x = 0, .y = 0 };
+    const c = vector.Vec2f{ .x = 1000, .y = 1000 };
+    const p1 = vector.Vec2f{ .x = 0.001, .y = 0 };
+    var pts: std.ArrayList(vector.Vec2f) = .empty;
+    defer pts.deinit(std.testing.allocator);
+    try pts.append(std.testing.allocator, p0);
+    try vector.flattenQuadInto(&pts, std.testing.allocator, p0, c, p1, vector.flatten_max_depth);
+    var t: f32 = 0;
+    var max_d: f32 = 0;
+    while (t <= 1.0) : (t += 0.002) {
+        const sample = vector.evalQuad(p0, c, p1, t);
+        var best: f32 = std.math.floatMax(f32);
+        var i: usize = 0;
+        while (i + 1 < pts.items.len) : (i += 1) {
+            const d = vector.pointToLineDistance(sample, pts.items[i], pts.items[i + 1]);
+            best = @min(best, d);
+        }
+        max_d = @max(max_d, best);
+    }
+    // The cap is the contract: the remaining error is accepted. Mid-curve
+    // to the leftover chord is about 500 device px for this spike.
+    try std.testing.expect(max_d > 400);
+    try std.testing.expect(max_d < 600);
+}
+
+fn fillComplexPath(dl: *DrawList, arena: std.mem.Allocator, aa: bool) !void {
+    var b = dl.beginPath(arena);
+    try b.moveTo(.{ .x = 2, .y = 2 });
+    try b.lineTo(.{ .x = 30, .y = 4 });
+    try b.quadTo(.{ .x = 34, .y = 16 }, .{ .x = 28, .y = 30 });
+    try b.lineTo(.{ .x = 4, .y = 28 });
+    try b.close();
+    try b.moveTo(.{ .x = 12, .y = 12 });
+    try b.lineTo(.{ .x = 12, .y = 20 });
+    try b.lineTo(.{ .x = 20, .y = 20 });
+    try b.lineTo(.{ .x = 20, .y = 12 });
+    try b.close();
+    try b.finish(.{ .color = Color.rgba(0x40, 0x80, 0xC0, 0xA0), .aa = aa });
+}
+
+test "path render: second frame allocates nothing (FailingAllocator)" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var dl = DrawList.init(std.testing.allocator);
+    defer dl.deinit();
+    dl.reset(64, 64);
+    try fillComplexPath(&dl, arena.allocator(), true);
+
+    var pixels = [_]u32{0xFF101010} ** (64 * 64);
+    const target = RenderTarget{ .pixels = &pixels, .width = 64, .height = 64 };
+    render(target, &dl, font_mod.default_font, 1.0);
+
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
+    dl.alloc = failing.allocator();
+    render(target, &dl, font_mod.default_font, 1.0);
+    try std.testing.expectEqual(@as(usize, 0), failing.allocated_bytes);
+    dl.alloc = std.testing.allocator;
+}
+
+test "path blit: SIMD matches scalar on a translucent path at least 4 px wide" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var dl = DrawList.init(std.testing.allocator);
+    defer dl.deinit();
+    dl.reset(32, 16);
+    try fillComplexPath(&dl, arena.allocator(), true);
+    const cmd = dl.cmds.items[0].path;
+
+    var pix_simd = [_]u32{0xFF334455} ** (32 * 16);
+    var pix_sca = pix_simd;
+    drawPath(.{ .pixels = &pix_simd, .width = 32, .height = 16 }, &dl, cmd, 1.0, true);
+    drawPath(.{ .pixels = &pix_sca, .width = 32, .height = 16 }, &dl, cmd, 1.0, false);
+    try std.testing.expectEqualSlices(u32, &pix_sca, &pix_simd);
+}
+
+test "path fill: a requested scratch limit of 0 still matches the default and stays under the cap" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var dl_def = DrawList.init(std.testing.allocator);
+    defer dl_def.deinit();
+    dl_def.reset(32, 32);
+    try fillComplexPath(&dl_def, arena.allocator(), true);
+
+    var dl_zero = DrawList.init(std.testing.allocator);
+    defer dl_zero.deinit();
+    dl_zero.reset(32, 32);
+    try fillComplexPath(&dl_zero, arena.allocator(), true);
+    dl_zero.path_scratch_limit = 0;
+
+    var pix_def = [_]u32{0xFF000000} ** (32 * 32);
+    var pix_zero = pix_def;
+    render(.{ .pixels = &pix_def, .width = 32, .height = 32 }, &dl_def, font_mod.default_font, 1.0);
+    render(.{ .pixels = &pix_zero, .width = 32, .height = 32 }, &dl_zero, font_mod.default_font, 1.0);
+    try std.testing.expectEqualSlices(u32, &pix_def, &pix_zero);
+    try std.testing.expect(dl_zero.path_scratch_peak_bytes <= draw_mod.path_scratch_limit_bytes);
+}
+
+test "path fill: banding matches an unbanded rasterize for a diagonal, a curve, and a hole" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var dl_full = DrawList.init(std.testing.allocator);
+    defer dl_full.deinit();
+    dl_full.reset(32, 32);
+    try fillComplexPath(&dl_full, arena.allocator(), true);
+
+    var dl_band = DrawList.init(std.testing.allocator);
+    defer dl_band.deinit();
+    dl_band.reset(32, 32);
+    try fillComplexPath(&dl_band, arena.allocator(), true);
+    // 4 rows × 32 px × 9 bytes = 1152; a 32×32 shape must split.
+    dl_band.path_scratch_limit = 32 * 4 * draw_mod.path_scratch_bytes_per_pixel;
+
+    var pix_full = [_]u32{0xFF000000} ** (32 * 32);
+    var pix_band = pix_full;
+    render(.{ .pixels = &pix_full, .width = 32, .height = 32 }, &dl_full, font_mod.default_font, 1.0);
+    render(.{ .pixels = &pix_band, .width = 32, .height = 32 }, &dl_band, font_mod.default_font, 1.0);
+    try std.testing.expectEqualSlices(u32, &pix_full, &pix_band);
+    try std.testing.expect(dl_band.path_scratch_peak_bytes <= dl_band.path_scratch_limit);
 }

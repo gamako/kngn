@@ -176,7 +176,7 @@ kngn/
 │   └── text.zig       # BDF text (→ future, next to libs/gfx)
 ├── kit/               # the public umbrella module (ADR-007 R4). Applications and external consumers import only this
 │   └── kit.zig        # re-exports platform, control, types, audio, gui, png, font, dsp, synth, gamepad, recipe, gmath, gfx, appshell, sound, midi and more
-├── examples/          # samples 01..44, run from the root with run-example_NN, plus image/ (the shared usako.png asset)
+├── examples/          # samples 01..45, run from the root with run-example_NN, plus image/ (the shared usako.png asset)
 ├── libs/              # L2–L3, portable reusable libraries (platform-independent as a rule, unit testable headless)
 │   ├── png/           # a PNG codec (decode and encode)
 │   ├── pixelops/      # shared pixel primitives (premultiplied and straight blends, div255, clip hoisting, u32 fill)
@@ -576,6 +576,7 @@ zig build bench-swizzle         # BGRA->RGBA swizzle: the load forms (vector poi
 zig build bench-upscale         # nearest-neighbour upscale at present time (naive / column table / row reuse) against one write pass over the same rectangle
 zig build bench-synth           # Synth(16 voices).render and MasterEffects.process: ns/block and × realtime
 zig build bench-gui-frame       # a full gui Context frame (beginFrame → build → endFrame → render; 500/1000 rows, avg/min/p95)
+zig build bench-path            # path fill: small/medium/fullscreen × AA × scale × one/many, plus scratch peak
 zig build bench-frameprof       # what the frame section profiler costs per frame (disabled / bookkeeping only / with real clock reads)
 
 # The pixel editor (-Dplatform switches objc/swift/metal)
@@ -610,7 +611,7 @@ zig build run-example_31        # 31_sprite_ex (a drawSpriteEx demo, using kit.g
 #   27_selectable_label / 28_text_input / 29_midi_monitor / 30_sound_demo / 31_sprite_ex /
 #   32_sprite_anim / 33_camera / 34_action_map / 35_gui_gallery / 36_tilemap / 37_gui_torture /
 #   38_minigame / 39_settings_shell / 40_list_menu / 41_panel_host / 42_tracker_grid /
-#   43_game_inventory / 44_fixed_framebuffer
+#   43_game_inventory / 44_fixed_framebuffer / 45_path_drawing
 # examples/image/ is a shared asset with no run step.
 ```
 

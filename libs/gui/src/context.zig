@@ -339,6 +339,12 @@ pub const Context = struct {
         return self.arena.allocator();
     }
 
+    /// Start a filled path. Verbs and points go on the frame arena; `finish`
+    /// appends one DrawCmd on success and nothing on InvalidPath or OOM.
+    pub fn beginPath(self: *Context) draw.PathBuilder {
+        return self.draw_list.beginPath(self.allocator());
+    }
+
     /// screen_w/screen_h are logical size (DrawList root clip / layout root).
     /// Not physical framebuffer dimensions. scale is applied in gui.render(..., scale).
     pub fn beginFrame(self: *Context, screen_w: u32, screen_h: u32) void {
@@ -1728,6 +1734,7 @@ test "label: default color follows style.text" {
 
 fn tooltipHasText(ctx: *const Context, expected: []const u8) bool {
     for (ctx.draw_list.cmds.items) |cmd| {
+        // Path commands are not tooltip labels; only `.text` is inspected.
         if (cmd == .text and std.mem.eql(u8, cmd.text.text, expected)) return true;
     }
     return false;

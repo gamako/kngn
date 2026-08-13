@@ -634,3 +634,71 @@ which is why the load form, not the algorithm, was the thing to fix.
 enough to matter contained no SIMD instruction for the feature to affect (`gui_render`, which
 does gain about 5%, is a tenth of the frame). Do not read a flag as a speedup: read the
 disassembly of the loop you care about.
+
+## Path fill (`zig build bench-path` and `bench-gui-frame`)
+
+Filled paths rasterize with analytic coverage into a DrawList-owned scratch (area +
+cover + 8bpp), then blit with `pixelops.srcOverCoverage` / `srcOverCoverage4`. One
+shape whose scratch would exceed 4 MiB is split into horizontal bands.
+
+**Conditions** (every row below): Apple M1 Max, aarch64-macos, ReleaseFast, no
+display. `bench-gui-frame` uses its built-in logical 1024×768 window and 500/1000
+rows; three runs, median of the printed `avg`. `bench-path` uses a logical
+1920×1080 target (one run of the printed matrix).
+
+**Regression gate**: `bench-gui-frame` avg must not grow more than 5% against
+the path-free baseline (same machine, same flags). Measured median after path
+landed is *below* that baseline on every cell (largest drop −23%, smallest −4%);
+the extra `DrawCmd` arm and unused scratch fields do not show up as a +5% frame
+regression. Run-to-run spread on this bench is itself several percent, so treat
+the sign of the drop as “no regression”, not as a speedup claim.
+
+### `bench-gui-frame` (median of 3, ns)
+
+| rows | scale | phys | before (no path) | after | Δ |
+|---|---:|---|---:|---:|---:|
+| 500 | 1.0 | 1024×768 | 334975 | 258641 | −22.8% |
+| 1000 | 1.0 | 1024×768 | 445064 | 400270 | −10.1% |
+| 500 | 1.5 | 1536×1152 | 519311 | 416678 | −19.8% |
+| 1000 | 1.5 | 1536×1152 | 772468 | 639038 | −17.3% |
+| 500 | 2.0 | 2048×1536 | 630633 | 563070 | −10.7% |
+| 1000 | 2.0 | 2048×1536 | 850457 | 813212 | −4.4% |
+
+### `bench-path` (one run, ns and scratch peak)
+
+Scratch is area(f32)+cover(f32)+8bpp = 9 bytes/px, capped at 4 MiB
+(4 194 304). A 1920×1080 shape is 18.7 MiB unbanded; banding holds the peak
+at ~4.18 MiB. Scale 2 on a full-frame path (logical 1920×1080 → phys
+3840×2160) stays at ~4.16 MiB.
+
+The **before** column is the first landing (per-command heap flatten + Outline
+build every `render`). The **after** column reuses DrawList-owned geometry
+buffers and flattens once. Many small paths drop by more than 10×; a single
+full-frame path is dominated by rasterize/blit and moves little.
+
+| size | count | AA | scale | before ns | after ns | scratch peak |
+|---|---|---:|---:|---:|---:|---:|
+| small | one | 1 | 1.0 | 22323 | 6744 | 27648 |
+| small | many | 1 | 1.0 | 762508 | 20377 | 864 |
+| small | one | 1 | 2.0 | 37859 | 24390 | 110592 |
+| small | many | 1 | 2.0 | 775247 | 47411 | 3105 |
+| small | one | 0 | 1.0 | 33564 | 8044 | 27648 |
+| small | many | 0 | 1.0 | 785149 | 21167 | 864 |
+| small | one | 0 | 2.0 | 47761 | 29078 | 110592 |
+| small | many | 0 | 2.0 | 1012477 | 50326 | 3105 |
+| medium | one | 1 | 1.0 | 204862 | 93807 | 442368 |
+| medium | many | 1 | 1.0 | 1311873 | 102032 | 11484 |
+| medium | one | 1 | 2.0 | 422523 | 358853 | 1769472 |
+| medium | many | 1 | 2.0 | 1190048 | 348400 | 45414 |
+| medium | one | 0 | 1.0 | 147618 | 107971 | 442368 |
+| medium | many | 0 | 1.0 | 811786 | 114213 | 11484 |
+| medium | one | 0 | 2.0 | 525736 | 433853 | 1769472 |
+| medium | many | 0 | 2.0 | 1296823 | 403596 | 45414 |
+| full | one | 1 | 1.0 | 3002630 | 2972294 | 4181544 |
+| full | many | 1 | 1.0 | 3439773 | 2474217 | 355752 |
+| full | one | 1 | 2.0 | 11435170 | 11130799 | 4164336 |
+| full | many | 1 | 2.0 | 12188035 | 9925377 | 1423008 |
+| full | one | 0 | 1.0 | 3916814 | 3364609 | 4181544 |
+| full | many | 0 | 1.0 | 4255544 | 2778775 | 355752 |
+| full | one | 0 | 2.0 | 15633964 | 14181009 | 4164336 |
+| full | many | 0 | 2.0 | 23551418 | 11940884 | 1423008 |

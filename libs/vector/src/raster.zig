@@ -36,8 +36,13 @@ pub const ScaleTranslate = struct {
     }
 };
 
-const flatten_tol: f32 = 0.2; // device px
-const flatten_max_depth = 16;
+/// Device-pixel flatness. A control farther than this from the chord is split.
+/// At `flatten_max_depth` the remaining chord is used; that approximation is
+/// accepted. A spike quadratic forced to the cap (control 1000 px off a 0.001 px
+/// chord) has a sampled max error of about 500 device px (the mid-curve
+/// distance to the remaining chord). Ordinary curves stay inside `flatten_tol`.
+pub const flatten_tol: f32 = 0.2; // device px
+pub const flatten_max_depth = 16;
 
 const Raster = struct {
     area: []f32,
@@ -148,18 +153,25 @@ const Raster = struct {
     }
 
     /// Per-row running sum into 8bpp coverage.
+    /// The row base is computed outside the pixel loop; the inner walk is a
+    /// contiguous index.
     fn resolve(self: *Raster, out: []u8) void {
         var row: u32 = 0;
+        var row_base: usize = 0;
         while (row < self.h) : (row += 1) {
             var acc: f32 = 0;
             var x: u32 = 0;
-            while (x < self.w) : (x += 1) {
-                const i = @as(usize, row) * self.w + x;
+            var i = row_base;
+            while (x < self.w) : ({
+                x += 1;
+                i += 1;
+            }) {
                 const c = acc + self.area[i];
                 const cov = @min(@abs(c), 1.0);
                 out[i] = @intFromFloat(@round(cov * 255.0));
                 acc += self.cover[i];
             }
+            row_base += self.w;
         }
     }
 
@@ -223,27 +235,29 @@ fn distToLine(p: Vec2f, a: Vec2f, b: Vec2f) f32 {
     return @abs(cross) / @sqrt(len2);
 }
 
-/// Rasterize outline into (w,h) coverage. Empty outline / w==0/h==0 → all zeros.
-pub fn rasterize(alloc: std.mem.Allocator, ol: Outline, xform: ScaleTranslate, w: u32, h: u32) Error!Bitmap {
-    if (w == 0 or h == 0) return .{ .data = try alloc.alloc(u8, 0), .w = w, .h = h };
-
-    const n = std.math.mul(usize, w, h) catch return error.InvalidSize;
-    // Whether two f32 buffers + u8 output fit a practical size (oversized → explicit error)
-    _ = std.math.mul(usize, n, @sizeOf(f32)) catch return error.InvalidSize;
-
-    const area = try alloc.alloc(f32, n);
-    defer alloc.free(area);
-    @memset(area, 0);
-    const cover = try alloc.alloc(f32, n);
-    defer alloc.free(cover);
-    @memset(cover, 0);
+/// Rasterize `ol` into caller-provided buffers. `area`, `cover`, and `out` must
+/// each be at least `w*h` long. `area` and `cover` are zeroed. Does not allocate.
+pub fn rasterizeInto(
+    ol: Outline,
+    xform: ScaleTranslate,
+    w: u32,
+    h: u32,
+    area: []f32,
+    cover: []f32,
+    out: []u8,
+) void {
+    if (w == 0 or h == 0) return;
+    const n = @as(usize, w) * @as(usize, h);
+    std.debug.assert(area.len >= n and cover.len >= n and out.len >= n);
+    @memset(area[0..n], 0);
+    @memset(cover[0..n], 0);
 
     var raster = Raster{ .area = area, .cover = cover, .w = w, .h = h };
 
     for (ol.contours) |contour| {
         const start = xform.apply(contour.start);
         var cur = start;
-        var ok = Raster.finite(start); // On a non-finite point, treat the contour as broken and suppress further points + close
+        var ok = Raster.finite(start);
         for (contour.segments) |seg| {
             if (!ok) break;
             switch (seg) {
@@ -273,13 +287,133 @@ pub fn rasterize(alloc: std.mem.Allocator, ol: Outline, xform: ScaleTranslate, w
                 },
             }
         }
-        if (ok) raster.edge(cur, start); // Close only when the contour is not broken
+        if (ok) raster.edge(cur, start);
     }
 
+    raster.resolve(out[0..n]);
+}
+
+/// Rasterize closed polylines into caller-provided buffers. Does not allocate.
+/// `points[prev_end..end]` is one contour (`contour_ends` are exclusive). Each
+/// contour is closed with an edge back to its first point. `xform` maps the
+/// already-flattened device points into the local scratch origin.
+pub fn rasterizePolylinesInto(
+    points: []const Vec2f,
+    contour_ends: []const usize,
+    xform: ScaleTranslate,
+    w: u32,
+    h: u32,
+    area: []f32,
+    cover: []f32,
+    out: []u8,
+) void {
+    if (w == 0 or h == 0) return;
+    const n = @as(usize, w) * @as(usize, h);
+    std.debug.assert(area.len >= n and cover.len >= n and out.len >= n);
+    @memset(area[0..n], 0);
+    @memset(cover[0..n], 0);
+
+    var raster = Raster{ .area = area, .cover = cover, .w = w, .h = h };
+    var start: usize = 0;
+    for (contour_ends) |end| {
+        std.debug.assert(end <= points.len);
+        std.debug.assert(end >= start);
+        const pts = points[start..end];
+        start = end;
+        if (pts.len < 2) continue;
+        const first = xform.apply(pts[0]);
+        if (!Raster.finite(first)) continue;
+        var cur = first;
+        var ok = true;
+        for (pts[1..]) |p| {
+            const e = xform.apply(p);
+            if (!Raster.finite(e)) {
+                ok = false;
+                break;
+            }
+            raster.edge(cur, e);
+            cur = e;
+        }
+        if (ok) raster.edge(cur, first);
+    }
+    raster.resolve(out[0..n]);
+}
+
+/// Rasterize outline into (w,h) coverage. Empty outline / w==0/h==0 → all zeros.
+pub fn rasterize(alloc: std.mem.Allocator, ol: Outline, xform: ScaleTranslate, w: u32, h: u32) Error!Bitmap {
+    if (w == 0 or h == 0) return .{ .data = try alloc.alloc(u8, 0), .w = w, .h = h };
+
+    const n = std.math.mul(usize, w, h) catch return error.InvalidSize;
+    // Whether two f32 buffers + u8 output fit a practical size (oversized → explicit error)
+    _ = std.math.mul(usize, n, @sizeOf(f32)) catch return error.InvalidSize;
+
+    const area = try alloc.alloc(f32, n);
+    defer alloc.free(area);
+    const cover = try alloc.alloc(f32, n);
+    defer alloc.free(cover);
     const out = try alloc.alloc(u8, n);
     errdefer alloc.free(out);
-    raster.resolve(out);
+    rasterizeInto(ol, xform, w, h, area, cover, out);
     return .{ .data = out, .w = w, .h = h };
+}
+
+/// Walk a quadratic and append each flattened endpoint (not `p0`) to `out`.
+/// Recursion is capped at `flatten_max_depth`; past that the remaining chord is used.
+pub fn flattenQuadInto(out: *std.ArrayList(Vec2f), alloc: std.mem.Allocator, p0: Vec2f, c: Vec2f, p1: Vec2f, depth: u32) std.mem.Allocator.Error!void {
+    if (!Raster.finite(p0) or !Raster.finite(c) or !Raster.finite(p1)) return;
+    if (depth >= flatten_max_depth or quadFlat(p0, c, p1)) {
+        try out.append(alloc, p1);
+        return;
+    }
+    const p01 = mid(p0, c);
+    const p12 = mid(c, p1);
+    const m = mid(p01, p12);
+    try flattenQuadInto(out, alloc, p0, p01, m, depth + 1);
+    try flattenQuadInto(out, alloc, m, p12, p1, depth + 1);
+}
+
+/// Walk a cubic and append each flattened endpoint (not `p0`) to `out`.
+/// Recursion is capped at `flatten_max_depth`; past that the remaining chord is used.
+pub fn flattenCubicInto(out: *std.ArrayList(Vec2f), alloc: std.mem.Allocator, p0: Vec2f, c1: Vec2f, c2: Vec2f, p1: Vec2f, depth: u32) std.mem.Allocator.Error!void {
+    if (!Raster.finite(p0) or !Raster.finite(c1) or !Raster.finite(c2) or !Raster.finite(p1)) return;
+    if (depth >= flatten_max_depth or cubicFlat(p0, c1, c2, p1)) {
+        try out.append(alloc, p1);
+        return;
+    }
+    const p01 = mid(p0, c1);
+    const p12 = mid(c1, c2);
+    const p23 = mid(c2, p1);
+    const p012 = mid(p01, p12);
+    const p123 = mid(p12, p23);
+    const m = mid(p012, p123);
+    try flattenCubicInto(out, alloc, p0, p01, p012, m, depth + 1);
+    try flattenCubicInto(out, alloc, m, p123, p23, p1, depth + 1);
+}
+
+/// Distance from `p` to the infinite line through `a`–`b`. Exposed so flatten
+/// error tests can use the same metric as the flattener.
+pub fn pointToLineDistance(p: Vec2f, a: Vec2f, b: Vec2f) f32 {
+    return distToLine(p, a, b);
+}
+
+/// Sample a quadratic Bézier at `t` in [0, 1].
+pub fn evalQuad(p0: Vec2f, c: Vec2f, p1: Vec2f, t: f32) Vec2f {
+    const u = 1 - t;
+    return .{
+        .x = u * u * p0.x + 2 * u * t * c.x + t * t * p1.x,
+        .y = u * u * p0.y + 2 * u * t * c.y + t * t * p1.y,
+    };
+}
+
+/// Sample a cubic Bézier at `t` in [0, 1].
+pub fn evalCubic(p0: Vec2f, c1: Vec2f, c2: Vec2f, p1: Vec2f, t: f32) Vec2f {
+    const u = 1 - t;
+    const uu = u * u;
+    const tt = t * t;
+    return .{
+        .x = uu * u * p0.x + 3 * uu * t * c1.x + 3 * u * tt * c2.x + tt * t * p1.x,
+        .y = uu * u * p0.y + 3 * uu * t * c1.y + 3 * u * tt * c2.y + tt * t * p1.y,
+    };
 }
 
 // ============================================================

@@ -9,6 +9,7 @@
 //! - hitTest and layout-build codepoint walks are O(codepoint) at widget-call time.
 //! - SelectionState updates and word selection run on events only.
 //! - This file does not paint pixels; widgets.zig emits the rect/text DrawCmds.
+//!   Path commands are not produced here and this file does not inspect DrawCmd.
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;

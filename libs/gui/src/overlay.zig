@@ -41,6 +41,14 @@ fn cloneCmd(arena: Allocator, cmd: DrawCmd) Allocator.Error!DrawCmd {
             .src_h = c.src_h,
             .clip = c.clip,
         } },
+        .path => |c| .{ .path = .{
+            .verbs = try arena.dupe(draw_mod.PathVerb, c.verbs),
+            .points = try arena.dupe(draw_mod.Vec2f, c.points),
+            .color = c.color,
+            .winding = c.winding,
+            .aa = c.aa,
+            .clip = c.clip,
+        } },
         else => cmd,
     };
 }
@@ -124,9 +132,10 @@ pub const Overlay = struct {
     }
 
     /// Draw the overlay, or return immediately when it is empty.
-    pub fn render(self: *const Overlay, target: RenderTarget, font: Font, scale: f32) void {
-        const dl = self.drawList() orelse return;
-        render_mod.render(target, dl, font, scale);
+    /// Takes `*Overlay` because `gui.render` writes into the DrawList's path scratch.
+    pub fn render(self: *Overlay, target: RenderTarget, font: Font, scale: f32) void {
+        if (!self.active) return;
+        render_mod.render(target, &self.dl, font, scale);
     }
 };
 

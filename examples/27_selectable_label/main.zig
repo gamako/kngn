@@ -1,7 +1,8 @@
 //! 27_selectable_label: read-only SelectableLabel drag / double-click / Cmd+C demo.
 //!
 //! Hot path declaration: selection updates and copy requests are event-only. Drawing uses the existing gui.render / Font path and
-//! selection rect/text DrawCmd; no new all-pixel loop.
+//! selection rect/text DrawCmd; no new all-pixel loop. This demo does not
+//! emit path commands and does not inspect the DrawCmd union.
 
 const std = @import("std");
 const platform = @import("platform");

@@ -761,6 +761,7 @@ pub fn build(b: *std.Build) void {
             .{ .name = "example_42", .path = "examples/42_tracker_grid/main.zig", .needs_sprite = false, .needs_fps_counter = false, .needs_fixed_timestep = false, .needs_text = false, .needs_gui = true, .needs_png = false, .needs_font = false, .needs_audio = false, .needs_gamepad = false, .needs_gmath = false, .needs_sound = false },
             .{ .name = "example_43", .path = "examples/43_game_inventory/main.zig", .needs_sprite = false, .needs_fps_counter = false, .needs_fixed_timestep = false, .needs_text = false, .needs_gui = true, .needs_png = false, .needs_font = false, .needs_audio = false, .needs_gamepad = true, .needs_gmath = false, .needs_sound = false },
             .{ .name = "example_44", .path = "examples/44_fixed_framebuffer/main.zig", .needs_sprite = false, .needs_fps_counter = false, .needs_fixed_timestep = false, .needs_text = false, .needs_gui = false, .needs_png = false, .needs_font = false, .needs_audio = false, .needs_gamepad = false, .needs_gmath = false, .needs_sound = false, .platform_features = exe_features.mascot },
+            .{ .name = "example_45", .path = "examples/45_path_drawing/main.zig", .needs_sprite = false, .needs_fps_counter = false, .needs_fixed_timestep = false, .needs_text = false, .needs_gui = true, .needs_png = false, .needs_font = false, .needs_audio = false, .needs_gamepad = false, .needs_gmath = false, .needs_sound = false },
         }) |example| {
             const needs: ExampleNeeds = .{
                 .needs_sprite = example.needs_sprite,
@@ -2321,6 +2322,7 @@ pub fn build(b: *std.Build) void {
     });
     gui_test_root.addImport("font", shared_modules.font.mod);
     gui_test_root.addImport("pixelops", shared_modules.pixelops.mod);
+    gui_test_root.addImport("vector", shared_modules.vector.mod);
     gui_test_root.addImport("command_types", shared_modules.command_types.mod);
     const gui_test = b.addTest(.{ .root_module = gui_test_root });
     const run_gui_test = b.addRunArtifact(gui_test);
@@ -2361,6 +2363,7 @@ pub fn build(b: *std.Build) void {
         });
         guard_gui.addImport("font", shared_modules.font.mod);
         guard_gui.addImport("pixelops", shared_modules.pixelops.mod);
+        guard_gui.addImport("vector", shared_modules.vector.mod);
         guard_gui.addImport("command_types", shared_modules.command_types.mod);
         const guard_mod = b.createModule(.{
             .root_source_file = b.path("tests/gui-contract-guard/main.zig"),
@@ -2988,6 +2991,8 @@ pub fn build(b: *std.Build) void {
     });
     bench_gui_mod.addImport("font", bench_font_mod);
     bench_gui_mod.addImport("pixelops", bench_pixelops_mod);
+    bench_gui_mod.addImport("vector", shared_modules.vector.mod);
+    bench_gui_mod.addImport("command_types", shared_modules.command_types.mod);
     const bench_gui_root = b.createModule(.{
         .root_source_file = b.path("bench/gui.zig"),
         .target = target,
@@ -3011,6 +3016,17 @@ pub fn build(b: *std.Build) void {
     const bench_gui_frame_step = b.step("bench-gui-frame", "Run GUI full Context frame benchmark 500/1000 rows (ReleaseFast)");
     bench_gui_frame_step.dependOn(&b.addRunArtifact(bench_gui_frame_exe).step);
 
+    // bench-path: filled-path rasterize + blit (small/medium/full × AA × scale × count)
+    const bench_path_root = b.createModule(.{
+        .root_source_file = b.path("bench/path.zig"),
+        .target = target,
+        .optimize = .ReleaseFast,
+    });
+    bench_path_root.addImport("gui", bench_gui_mod);
+    const bench_path_exe = b.addExecutable(.{ .name = "bench_path", .root_module = bench_path_root });
+    const bench_path_step = b.step("bench-path", "Run GUI path-fill benchmark small/medium/full (ReleaseFast)");
+    bench_path_step.dependOn(&b.addRunArtifact(bench_path_exe).step);
+
     // bench-gui-list-menu: list/menu shell 500-row full Context frame (ReleaseFast fixed)
     // menuBar needs command_types, so build a separate gui module from bench_gui_mod.
     const bench_list_menu_cmd = b.createModule(.{
@@ -3030,6 +3046,7 @@ pub fn build(b: *std.Build) void {
     });
     bench_list_menu_gui.addImport("font", bench_font_mod);
     bench_list_menu_gui.addImport("pixelops", bench_pixelops_mod);
+    bench_list_menu_gui.addImport("vector", shared_modules.vector.mod);
     bench_list_menu_gui.addImport("command_types", bench_list_menu_cmd);
     const bench_list_menu_ui = b.createModule(.{
         .root_source_file = b.path("examples/40_list_menu/ui.zig"),
@@ -3571,6 +3588,7 @@ const SharedModules = struct {
             b.addModule("gui", .{ .root_source_file = b.path("libs/gui/src/gui.zig") }) };
         link(gui, font);
         link(gui, pixelops); // drawImage SIMD in render.zig
+        link(gui, vector); // path fill coverage rasterizer
         link(gui, command_types);
 
         // objc_runtime (L1): minimal Objective-C runtime FFI helper. Used by both camera_macos.zig

@@ -248,14 +248,16 @@ command's line, not just as a pixel difference a human has to spot.
   pixels — only `src_w`/`src_h` and a content hash (`pixfnv=#XXXXXXXX`, FNV-1a 32-bit
   over the raw pixel bytes). Every line ends with `offclip=0|1`: whether that command's
   own extent (its rect for `rect_filled`/`rect_outline`/`image`, both endpoints for
-  `line`, the draw position for `text`) is fully contained by its own baked-in clip
-  rect. `offclip=1` is the same signal a truncated shape or a mis-placed label would
-  leave in a screenshot, just readable without one.
-- `digest drawlist` folds the same fields into one line:
-  `hash=#XXXXXXXX rect_filled=N rect_outline=N line=N text=N image=N offclip=N`. `hash`
-  is an FNV-1a 32-bit fold over every command's fields in draw order (including `text`
-  content and, for `image`, the pixel bytes), so it changes whenever anything the dump
-  would show changes; the five counts and `offclip` are the coarser, more stable half.
+  `line`, the draw position for `text`, the point AABB for `path`) is fully contained
+  by its own baked-in clip rect. `offclip=1` is the same signal a truncated shape or
+  a mis-placed label would leave in a screenshot, just readable without one.
+  `path` carries `color`, `aa`, `winding`, a compact `verbs="MLQCZ"` string and
+  `pts` as comma-separated IEEE-754 hex bits.
+- `digest drawlist` hashes the same per-command dump text (plus the path-wire schema
+  version) into one line:
+  `hash=#XXXXXXXX rect_filled=N rect_outline=N line=N text=N image=N path=N offclip=N`.
+  `hash` changes whenever anything the dump would show changes; the six counts and
+  `offclip` are the coarser, more stable half.
 - **Handling jitter**: an app with animated or continuously-varying draw positions
   (a running clock label, a live cursor trail) makes `hash` change every frame by
   design — do not `expect drawlist hash=...` there. The per-kind counts and `offclip`

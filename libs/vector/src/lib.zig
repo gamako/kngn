@@ -21,6 +21,15 @@ pub const Error = raster.Error;
 pub const Bitmap = raster.Bitmap;
 pub const ScaleTranslate = raster.ScaleTranslate;
 pub const rasterize = raster.rasterize;
+pub const rasterizeInto = raster.rasterizeInto;
+pub const rasterizePolylinesInto = raster.rasterizePolylinesInto;
+pub const flatten_tol = raster.flatten_tol;
+pub const flatten_max_depth = raster.flatten_max_depth;
+pub const flattenQuadInto = raster.flattenQuadInto;
+pub const flattenCubicInto = raster.flattenCubicInto;
+pub const pointToLineDistance = raster.pointToLineDistance;
+pub const evalQuad = raster.evalQuad;
+pub const evalCubic = raster.evalCubic;
 
 test {
     _ = outline;

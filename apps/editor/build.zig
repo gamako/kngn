@@ -38,11 +38,16 @@ pub fn build(b: *std.Build) void {
     });
     font.addImport("png", png);
     font.addImport("pixelops", pixelops);
+    const vector = b.createModule(.{
+        .root_source_file = .{ .cwd_relative = PROJECT_ROOT ++ "/libs/vector/src/lib.zig" },
+    });
+    font.addImport("vector", vector);
     const gui = b.createModule(.{
         .root_source_file = .{ .cwd_relative = PROJECT_ROOT ++ "/libs/gui/src/gui.zig" },
     });
     gui.addImport("font", font);
     gui.addImport("pixelops", pixelops);
+    gui.addImport("vector", vector);
     gui.addImport("command_types", command_types);
 
     // Versioned container for the .pix project format (std only; no deps)

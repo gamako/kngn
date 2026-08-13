@@ -3,6 +3,7 @@
 //! Hot path declaration: edit / caret / selection / scroll are event-only. While composition is active,
 //! reread the composition snapshot every frame (latest-wins; avoids a stale preedit if an event is dropped).
 //! Preedit draw reuses the existing DrawCmd and Font paths; caret blink is decided from Context virtual time alone.
+//! This demo does not emit path commands and does not inspect the DrawCmd union.
 //! Composition text borrows a fixed buffer (no heap alloc).
 
 const std = @import("std");

@@ -14,28 +14,28 @@
 //!   `cmd=line x0=.. y0=.. x1=.. y1=.. thickness=.. color=.. clip_.. offclip=..`
 //!   `cmd=text x=.. y=.. color=.. font=default|custom clip_.. offclip=.. text="<escaped content>"`
 //!   `cmd=image x=.. y=.. w=.. h=.. src_w=.. src_h=.. pixfnv=#XXXXXXXX clip_.. offclip=..`
+//!   `cmd=path color=.. aa=0|1 winding=nonzero verbs="MLQCZ" pts="<f32-hex pairs>" clip_.. offclip=..`
 //! `offclip=1` means the command's own extent is not fully contained by the clip rect baked
 //! into it (for `line`/`text`, "extent" is the endpoints/the draw position — the same signal
 //! a truncated shape or a mis-placed label would produce). A scene with nothing accidentally
 //! cut off has `offclip=0` on every line.
 //!
-//! `digest` folds the same per-command fields into one line: a stable hash plus a
-//! per-kind count and a total `offclip` count. Two frames whose commands are byte-for-byte
-//! the same (including the `text` slice and, for `image`, the pixel content) produce the
-//! same `hash`; the counts alone stay stable across a frame with animated coordinates,
-//! because they do not fold in position (see docs/harness.md for the trade-off between the
-//! two).
+//! `digest` hashes the same per-command text `dumpAlloc` emits (plus the path-wire
+//! schema version) and reports a per-kind count and a total `offclip` count. Two
+//! frames whose dump lines are byte-for-byte the same produce the same `hash`; the
+//! counts alone stay stable across a frame with animated coordinates, because they
+//! do not fold in position (see docs/harness.md for the trade-off between the two).
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const draw_mod = @import("draw.zig");
 const geom = @import("geom.zig");
 const cmd_text = @import("draw_cmd_text.zig");
+const wire = @import("drawlist_wire.zig");
 
 pub const DrawCmd = draw_mod.DrawCmd;
 pub const DrawList = draw_mod.DrawList;
 pub const Rect = geom.Rect;
-pub const Vec2 = geom.Vec2;
 
 /// Whether `r` is entirely inside `clip` (a `rect`/`image` command's requested area is not
 /// truncated by its baked-in clip).
@@ -44,88 +44,57 @@ fn rectFullyInside(r: Rect, clip: Rect) bool {
     return inter.x == r.x and inter.y == r.y and inter.w == r.w and inter.h == r.h;
 }
 
-fn colorBits(c: draw_mod.Color) u32 {
-    return cmd_text.colorBits(c);
-}
-
-fn hashRect(h: *std.hash.Fnv1a_32, r: Rect) void {
-    h.update(std.mem.asBytes(&r.x));
-    h.update(std.mem.asBytes(&r.y));
-    h.update(std.mem.asBytes(&r.w));
-    h.update(std.mem.asBytes(&r.h));
-}
-
-fn hashVec2(h: *std.hash.Fnv1a_32, v: Vec2) void {
-    h.update(std.mem.asBytes(&v.x));
-    h.update(std.mem.asBytes(&v.y));
-}
-
-/// One line: a stable hash over every command's fields (text content and image pixels
-/// included) plus a per-kind count and how many commands are `offclip`. Fits comfortably
-/// inside the harness's 1024-byte digest contract regardless of `dl.cmds.len`, because the
-/// hash is folded incrementally rather than building a per-command string first.
+/// One line: a stable hash of the dump text of every command (plus the path-wire
+/// schema version) and a per-kind count plus how many commands are `offclip`.
+/// Fits inside the harness's 1024-byte digest contract regardless of `dl.cmds.len`.
 pub fn digest(dl: *const DrawList, buf: []u8) []const u8 {
     var h = std.hash.Fnv1a_32.init();
+    h.update(std.mem.asBytes(&wire.schema_version));
     var n_rect_filled: u32 = 0;
     var n_rect_outline: u32 = 0;
     var n_line: u32 = 0;
     var n_text: u32 = 0;
     var n_image: u32 = 0;
+    var n_path: u32 = 0;
     var n_offclip: u32 = 0;
 
+    var line: std.ArrayList(u8) = .empty;
+    defer line.deinit(std.heap.page_allocator);
+
     for (dl.cmds.items) |cmd| {
+        line.clearRetainingCapacity();
+        cmd_text.appendCmd(&line, std.heap.page_allocator, cmd) catch return buf[0..0];
+        h.update(line.items);
         switch (cmd) {
             .rect_filled => |c| {
                 n_rect_filled += 1;
                 if (!rectFullyInside(c.rect, c.clip)) n_offclip += 1;
-                h.update("RF");
-                hashRect(&h, c.rect);
-                h.update(std.mem.asBytes(&colorBits(c.color)));
-                hashRect(&h, c.clip);
             },
             .rect_outline => |c| {
                 n_rect_outline += 1;
                 if (!rectFullyInside(c.rect, c.clip)) n_offclip += 1;
-                h.update("RO");
-                hashRect(&h, c.rect);
-                h.update(std.mem.asBytes(&colorBits(c.color)));
-                h.update(std.mem.asBytes(&c.thickness));
-                hashRect(&h, c.clip);
             },
             .line => |c| {
                 n_line += 1;
                 if (!(c.clip.contains(c.p0) and c.clip.contains(c.p1))) n_offclip += 1;
-                h.update("LN");
-                hashVec2(&h, c.p0);
-                hashVec2(&h, c.p1);
-                h.update(std.mem.asBytes(&colorBits(c.color)));
-                h.update(std.mem.asBytes(&c.thickness));
-                hashRect(&h, c.clip);
             },
             .text => |c| {
                 n_text += 1;
                 if (!c.clip.contains(c.pos)) n_offclip += 1;
-                h.update("TX");
-                hashVec2(&h, c.pos);
-                h.update(std.mem.asBytes(&colorBits(c.color)));
-                hashRect(&h, c.clip);
-                h.update(c.text);
             },
             .image => |c| {
                 n_image += 1;
                 if (!rectFullyInside(c.rect, c.clip)) n_offclip += 1;
-                h.update("IM");
-                hashRect(&h, c.rect);
-                h.update(std.mem.asBytes(&c.src_w));
-                h.update(std.mem.asBytes(&c.src_h));
-                hashRect(&h, c.clip);
-                h.update(std.mem.sliceAsBytes(c.pixels));
+            },
+            .path => {
+                n_path += 1;
+                if (cmd_text.offclipOf(cmd) == 1) n_offclip += 1;
             },
         }
     }
 
-    return std.fmt.bufPrint(buf, "hash={X:0>8} rect_filled={d} rect_outline={d} line={d} text={d} image={d} offclip={d}", .{
-        h.final(), n_rect_filled, n_rect_outline, n_line, n_text, n_image, n_offclip,
+    return std.fmt.bufPrint(buf, "hash={X:0>8} rect_filled={d} rect_outline={d} line={d} text={d} image={d} path={d} offclip={d}", .{
+        h.final(), n_rect_filled, n_rect_outline, n_line, n_text, n_image, n_path, n_offclip,
     }) catch buf[0..0];
 }
 
@@ -287,4 +256,23 @@ test "dumpAlloc: empty DrawList still has the header line" {
     const dump = try dumpAlloc(testing.allocator, &dl);
     defer testing.allocator.free(dump);
     try testing.expectEqualStrings("cmds=0\n", dump);
+}
+
+test "digest: a path command is counted and changes the hash" {
+    var dl = DrawList.init(testing.allocator);
+    defer dl.deinit();
+    dl.reset(64, 64);
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    var b = dl.beginPath(arena.allocator());
+    try b.moveTo(.{ .x = 0, .y = 0 });
+    try b.lineTo(.{ .x = 8, .y = 0 });
+    try b.lineTo(.{ .x = 0, .y = 8 });
+    try b.close();
+    try b.finish(.{ .color = draw_mod.Color.rgba(0xFF, 0, 0, 0xFF) });
+
+    var buf: [1024]u8 = undefined;
+    const line = digest(&dl, &buf);
+    try testing.expect(std.mem.indexOf(u8, line, "path=1") != null);
+    try testing.expect(std.mem.indexOf(u8, line, "offclip=0") != null);
 }

@@ -965,6 +965,7 @@ test "popup text_y is ink-centered (item_h=20, ink=18 → +1)" {
             try std.testing.expectEqual(expected_y, t.pos.y);
             text_count += 1;
         },
+        // Path commands are not produced by popup layout; ignore them.
         else => {},
     };
     try std.testing.expect(saw_bg);
@@ -1006,6 +1007,7 @@ test "tooltip text_y uses the same item_h/ink centering as popup" {
             try std.testing.expectEqualStrings("tip", t.text);
             saw_text = true;
         },
+        // Path commands are not produced by tooltip layout; ignore them.
         else => {},
     };
     try std.testing.expect(saw_text);

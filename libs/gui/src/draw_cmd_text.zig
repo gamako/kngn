@@ -13,12 +13,16 @@ const std = @import("std");
 const Allocator = std.mem.Allocator;
 const draw_mod = @import("draw.zig");
 const geom = @import("geom.zig");
+const wire = @import("drawlist_wire.zig");
 
 pub const DrawCmd = draw_mod.DrawCmd;
 pub const DrawList = draw_mod.DrawList;
 pub const Rect = geom.Rect;
 pub const Vec2 = geom.Vec2;
 pub const Color = draw_mod.Color;
+pub const PathVerb = draw_mod.PathVerb;
+pub const PathWinding = draw_mod.PathWinding;
+pub const Vec2f = draw_mod.Vec2f;
 
 /// How many overlay commands a single inject may install. Sized so a full list still
 /// fits inside the copilot/harness 64 KiB wire limit at the current per-line width.
@@ -62,6 +66,9 @@ pub const ParseError = error{
     ImagePayloadUnavailable,
     FontNotRestorable,
     ValueOutOfRange,
+    InvalidPath,
+    TooManyVerbs,
+    TooManyPoints,
 };
 
 pub const FieldRole = enum {
@@ -73,6 +80,12 @@ pub const FieldRole = enum {
     /// Written by the serializer; accepted and ignored by the parser (a derived
     /// value such as `offclip` or `pixfnv`, not a `DrawCmd` field).
     derived,
+    /// Path winding name (`nonzero`).
+    winding,
+    /// Compact path-verb string (`MLQCZ`).
+    path_verbs,
+    /// Path points as comma-separated IEEE-754 hex bits (`xxxxxxxx,yyyyyyyy,...`).
+    path_points,
 };
 
 pub const FieldSpec = struct {
@@ -174,6 +187,22 @@ pub const verbs = [_]VerbSpec{
             .{ .name = "offclip", .role = .derived, .required = false },
         },
     },
+    .{
+        .name = "path",
+        .tag = .path,
+        .fields = &.{
+            .{ .name = "color", .role = .color },
+            .{ .name = "aa", .role = .u32 },
+            .{ .name = "winding", .role = .winding },
+            .{ .name = "verbs", .role = .path_verbs },
+            .{ .name = "pts", .role = .path_points },
+            .{ .name = "clip_x", .role = .i32, .required = false },
+            .{ .name = "clip_y", .role = .i32, .required = false },
+            .{ .name = "clip_w", .role = .u32, .required = false },
+            .{ .name = "clip_h", .role = .u32, .required = false },
+            .{ .name = "offclip", .role = .derived, .required = false },
+        },
+    },
 };
 
 comptime {
@@ -219,14 +248,36 @@ pub fn colorFromBits(bits: u32) Color {
     return @bitCast(bits);
 }
 
-fn offclipOf(cmd: DrawCmd) u32 {
+pub fn offclipOf(cmd: DrawCmd) u32 {
     return switch (cmd) {
         .rect_filled => |c| @intFromBool(!rectFullyInside(c.rect, c.clip)),
         .rect_outline => |c| @intFromBool(!rectFullyInside(c.rect, c.clip)),
         .line => |c| @intFromBool(!(c.clip.contains(c.p0) and c.clip.contains(c.p1))),
         .text => |c| @intFromBool(!c.clip.contains(c.pos)),
         .image => |c| @intFromBool(!rectFullyInside(c.rect, c.clip)),
+        .path => |c| @intFromBool(!pathPointsInsideClip(c.points, c.clip)),
     };
+}
+
+fn pathPointsInsideClip(points: []const Vec2f, clip: Rect) bool {
+    if (points.len == 0) return true;
+    var min_x: f32 = std.math.floatMax(f32);
+    var min_y: f32 = std.math.floatMax(f32);
+    var max_x: f32 = -std.math.floatMax(f32);
+    var max_y: f32 = -std.math.floatMax(f32);
+    for (points) |p| {
+        min_x = @min(min_x, p.x);
+        min_y = @min(min_y, p.y);
+        max_x = @max(max_x, p.x);
+        max_y = @max(max_y, p.y);
+    }
+    const x0: i32 = @intFromFloat(@floor(min_x));
+    const y0: i32 = @intFromFloat(@floor(min_y));
+    const x1: i32 = @intFromFloat(@ceil(max_x));
+    const y1: i32 = @intFromFloat(@ceil(max_y));
+    const w: u32 = if (x1 > x0) @intCast(x1 - x0) else 0;
+    const h: u32 = if (y1 > y0) @intCast(y1 - y0) else 0;
+    return rectFullyInside(.{ .x = x0, .y = y0, .w = w, .h = h }, clip);
 }
 
 fn pixfnvOf(cmd: DrawCmd) u32 {
@@ -292,6 +343,12 @@ fn readI32(cmd: DrawCmd, name: []const u8) i32 {
             c.clip.y
         else
             unreachable,
+        .path => |c| if (std.mem.eql(u8, name, "clip_x"))
+            c.clip.x
+        else if (std.mem.eql(u8, name, "clip_y"))
+            c.clip.y
+        else
+            unreachable,
     };
 }
 
@@ -347,6 +404,14 @@ fn readU32(cmd: DrawCmd, name: []const u8) u32 {
             c.clip.h
         else
             unreachable,
+        .path => |c| if (std.mem.eql(u8, name, "aa"))
+            @intFromBool(c.aa)
+        else if (std.mem.eql(u8, name, "clip_w"))
+            c.clip.w
+        else if (std.mem.eql(u8, name, "clip_h"))
+            c.clip.h
+        else
+            unreachable,
     };
 }
 
@@ -357,6 +422,7 @@ fn readColor(cmd: DrawCmd) u32 {
         .line => |c| colorBits(c.color),
         .text => |c| colorBits(c.color),
         .image => 0,
+        .path => |c| colorBits(c.color),
     };
 }
 
@@ -372,6 +438,36 @@ fn readText(cmd: DrawCmd) []const u8 {
         .text => |c| c.text,
         else => "",
     };
+}
+
+fn windingName(cmd: DrawCmd) []const u8 {
+    return switch (cmd) {
+        .path => |c| switch (c.winding) {
+            .nonzero => "nonzero",
+        },
+        else => "nonzero",
+    };
+}
+
+fn appendPathVerbs(list: *std.ArrayList(u8), allocator: Allocator, cmd: DrawCmd) !void {
+    const path_verbs = switch (cmd) {
+        .path => |c| c.verbs,
+        else => return,
+    };
+    for (path_verbs) |v| try list.append(allocator, v.letter());
+}
+
+fn appendPathPoints(list: *std.ArrayList(u8), allocator: Allocator, cmd: DrawCmd) !void {
+    const points = switch (cmd) {
+        .path => |c| c.points,
+        else => return,
+    };
+    for (points, 0..) |p, i| {
+        if (i != 0) try list.append(allocator, ',');
+        const xb: u32 = @bitCast(p.x);
+        const yb: u32 = @bitCast(p.y);
+        try appendFmt(list, allocator, "{x:0>8},{x:0>8}", .{ xb, yb });
+    }
 }
 
 /// Appends a value formatted with `fmt` to `list`.
@@ -432,6 +528,17 @@ pub fn appendCmd(list: *std.ArrayList(u8), allocator: Allocator, cmd: DrawCmd) !
                 } else {
                     try appendFmt(list, allocator, "{s}=0", .{field.name});
                 }
+            },
+            .winding => try appendFmt(list, allocator, "{s}={s}", .{ field.name, windingName(cmd) }),
+            .path_verbs => {
+                try appendFmt(list, allocator, "{s}=\"", .{field.name});
+                try appendPathVerbs(list, allocator, cmd);
+                try list.append(allocator, '"');
+            },
+            .path_points => {
+                try appendFmt(list, allocator, "{s}=\"", .{field.name});
+                try appendPathPoints(list, allocator, cmd);
+                try list.append(allocator, '"');
             },
         }
     }
@@ -554,6 +661,10 @@ const Staging = struct {
     text: ?[]const u8 = null,
     src_w: ?u32 = null,
     src_h: ?u32 = null,
+    aa: ?u32 = null,
+    winding: ?PathWinding = null,
+    path_verbs: ?[]const PathVerb = null,
+    path_points: ?[]const Vec2f = null,
 
     fn putI32(self: *Staging, name: []const u8, v: i32) ParseError!void {
         if (std.mem.eql(u8, name, "x")) {
@@ -605,6 +716,9 @@ const Staging = struct {
         } else if (std.mem.eql(u8, name, "clip_h")) {
             if (self.clip_h != null) return error.DuplicateField;
             self.clip_h = v;
+        } else if (std.mem.eql(u8, name, "aa")) {
+            if (self.aa != null) return error.DuplicateField;
+            self.aa = v;
         } else return error.UnknownField;
     }
 
@@ -694,7 +808,70 @@ fn buildCmd(verb: *const VerbSpec, st: Staging, arena: Allocator) (ParseError ||
         // The dump form never carries pixels (only src_w/src_h and a content hash).
         // Reconstructing a zeroed buffer would draw something other than what was sent.
         .image => return error.ImagePayloadUnavailable,
+        .path => blk: {
+            const path_verbs = st.path_verbs orelse return error.MissingField;
+            const points = st.path_points orelse return error.MissingField;
+            const aa = st.aa orelse return error.MissingField;
+            if (aa > 1) return error.InvalidValue;
+            if (path_verbs.len > wire.MAX_VERBS) return error.TooManyVerbs;
+            if (points.len > wire.MAX_POINTS) return error.TooManyPoints;
+            draw_mod.validatePathSequence(path_verbs) catch return error.InvalidPath;
+            var need: usize = 0;
+            for (path_verbs) |v| need += v.pointCount();
+            if (need != points.len) return error.InvalidValue;
+            for (points) |p| {
+                if (!std.math.isFinite(p.x) or !std.math.isFinite(p.y)) return error.InvalidValue;
+            }
+            break :blk .{ .path = .{
+                .verbs = path_verbs,
+                .points = points,
+                .color = colorFromBits(st.color orelse return error.MissingField),
+                .winding = st.winding orelse .nonzero,
+                .aa = aa != 0,
+                .clip = clip,
+            } };
+        },
     };
+}
+
+fn parseWinding(s: []const u8) ParseError!PathWinding {
+    if (std.mem.eql(u8, s, "nonzero")) return .nonzero;
+    return error.InvalidValue;
+}
+
+fn parsePathVerbs(arena: Allocator, s: []const u8) (ParseError || Allocator.Error)![]PathVerb {
+    if (s.len > wire.MAX_VERBS) return error.TooManyVerbs;
+    var out: std.ArrayList(PathVerb) = .empty;
+    errdefer out.deinit(arena);
+    for (s) |c| {
+        const v = draw_mod.pathVerbFromLetter(c) orelse return error.InvalidValue;
+        try out.append(arena, v);
+    }
+    return out.toOwnedSlice(arena);
+}
+
+fn parsePathPoints(arena: Allocator, s: []const u8) (ParseError || Allocator.Error)![]Vec2f {
+    if (s.len == 0) return try arena.alloc(Vec2f, 0);
+    var count: usize = 1;
+    for (s) |c| {
+        if (c == ',') count += 1;
+    }
+    if (count % 2 != 0) return error.InvalidValue;
+    const n = count / 2;
+    if (n > wire.MAX_POINTS) return error.TooManyPoints;
+    const out = try arena.alloc(Vec2f, n);
+    var it = std.mem.splitScalar(u8, s, ',');
+    var i: usize = 0;
+    while (i < n) : (i += 1) {
+        const xs = it.next() orelse return error.InvalidValue;
+        const ys = it.next() orelse return error.InvalidValue;
+        if (xs.len != 8 or ys.len != 8) return error.InvalidValue;
+        const xb = std.fmt.parseUnsigned(u32, xs, 16) catch return error.InvalidValue;
+        const yb = std.fmt.parseUnsigned(u32, ys, 16) catch return error.InvalidValue;
+        out[i] = .{ .x = @bitCast(xb), .y = @bitCast(yb) };
+    }
+    if (it.next() != null) return error.InvalidValue;
+    return out;
 }
 
 /// Parses one `cmd=<verb> k=v ...` line into a `DrawCmd`. `text` payloads are
@@ -733,6 +910,18 @@ pub fn parseCmdLine(line: []const u8, arena: Allocator) (ParseError || Allocator
                 st.text = owned;
             },
             .derived => {},
+            .winding => {
+                if (st.winding != null) return error.DuplicateField;
+                st.winding = try parseWinding(pair.value);
+            },
+            .path_verbs => {
+                if (st.path_verbs != null) return error.DuplicateField;
+                st.path_verbs = try parsePathVerbs(arena, pair.value);
+            },
+            .path_points => {
+                if (st.path_points != null) return error.DuplicateField;
+                st.path_points = try parsePathPoints(arena, pair.value);
+            },
         }
     }
 
@@ -845,13 +1034,13 @@ pub fn parseDump(
 const testing = std.testing;
 
 test "draw_cmd_text: verb table covers every DrawCmd tag by name" {
-    try testing.expectEqual(@as(usize, 5), verbs.len);
+    try testing.expectEqual(@as(usize, 6), verbs.len);
     try testing.expect(verbByName("rect_filled") != null);
     try testing.expect(verbByName("rect_outline") != null);
     try testing.expect(verbByName("line") != null);
     try testing.expect(verbByName("text") != null);
     try testing.expect(verbByName("image") != null);
-    try testing.expect(verbByName("path") == null);
+    try testing.expect(verbByName("path") != null);
 }
 
 test "draw_cmd_text: serialize walks the table field order" {
@@ -911,7 +1100,38 @@ test "draw_cmd_text: rect/line/text dump parses back" {
 test "draw_cmd_text: unknown verb is an explicit error" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
-    try testing.expectError(error.UnknownVerb, parseCmdLine("cmd=path x=0 y=0", arena.allocator()));
+    try testing.expectError(error.UnknownVerb, parseCmdLine("cmd=bogus x=0 y=0", arena.allocator()));
+}
+
+test "draw_cmd_text: path dump parses back" {
+    var src = DrawList.init(testing.allocator);
+    defer src.deinit();
+    src.reset(64, 64);
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    var b = src.beginPath(arena.allocator());
+    try b.moveTo(.{ .x = 1.5, .y = 2.25 });
+    try b.lineTo(.{ .x = 10, .y = 0 });
+    try b.quadTo(.{ .x = 12, .y = 4 }, .{ .x = 8, .y = 8 });
+    try b.cubicTo(.{ .x = 6, .y = 9 }, .{ .x = 4, .y = 9 }, .{ .x = 2, .y = 8 });
+    try b.close();
+    try b.finish(.{ .color = Color.rgba(0xFF, 0, 0, 0x80), .aa = false });
+
+    var dump_list: std.ArrayList(u8) = .empty;
+    defer dump_list.deinit(testing.allocator);
+    try appendCmd(&dump_list, testing.allocator, src.cmds.items[0]);
+
+    var dst = DrawList.init(testing.allocator);
+    defer dst.deinit();
+    try parseDump(&dst, arena.allocator(), dump_list.items, MAX_CMDS);
+    try testing.expectEqual(@as(usize, 1), dst.cmds.items.len);
+    const p = dst.cmds.items[0].path;
+    try testing.expectEqual(src.cmds.items[0].path.verbs.len, p.verbs.len);
+    try testing.expectEqual(src.cmds.items[0].path.points.len, p.points.len);
+    try testing.expectEqual(colorBits(src.cmds.items[0].path.color), colorBits(p.color));
+    try testing.expect(!p.aa);
+    try testing.expectEqual(src.cmds.items[0].path.points[0].x, p.points[0].x);
+    try testing.expectEqual(src.cmds.items[0].path.points[0].y, p.points[0].y);
 }
 
 test "draw_cmd_text: unknown field is an explicit error" {
@@ -1067,4 +1287,30 @@ test "draw_cmd_text: text payload must be valid UTF-8" {
         error.InvalidUtf8,
         parseCmdLine("cmd=text x=0 y=0 color=#FFFFFFFF text=\"\xE9\"", arena.allocator()),
     );
+}
+
+test "draw_cmd_text: path verb order and caps are explicit errors" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    try testing.expectError(
+        error.InvalidPath,
+        parseCmdLine("cmd=path color=#FF0000FF aa=1 winding=nonzero verbs=\"LML\" pts=\"00000000,00000000,00000000,00000000,00000000,00000000\"", arena.allocator()),
+    );
+    try testing.expectError(
+        error.InvalidPath,
+        parseCmdLine("cmd=path color=#FF0000FF aa=1 winding=nonzero verbs=\"ZL\" pts=\"00000000,00000000\"", arena.allocator()),
+    );
+
+    const too_many = try testing.allocator.alloc(u8, "cmd=path color=#FF0000FF aa=1 winding=nonzero verbs=\"".len + wire.MAX_VERBS + 2 + "\" pts=\"\" ".len + 8);
+    defer testing.allocator.free(too_many);
+    var n: usize = 0;
+    const head = "cmd=path color=#FF0000FF aa=1 winding=nonzero verbs=\"";
+    @memcpy(too_many[n..][0..head.len], head);
+    n += head.len;
+    @memset(too_many[n..][0 .. wire.MAX_VERBS + 1], 'M');
+    n += wire.MAX_VERBS + 1;
+    const tail = "\" pts=\"\"";
+    @memcpy(too_many[n..][0..tail.len], tail);
+    n += tail.len;
+    try testing.expectError(error.TooManyVerbs, parseCmdLine(too_many[0..n], arena.allocator()));
 }

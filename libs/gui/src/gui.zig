@@ -20,6 +20,24 @@ pub const Color = @import("color.zig").Color;
 
 pub const DrawCmd = @import("draw.zig").DrawCmd;
 pub const DrawList = @import("draw.zig").DrawList;
+pub const PathVec2f = @import("draw.zig").Vec2f;
+pub const PathVerb = @import("draw.zig").PathVerb;
+pub const PathVerbSpec = @import("draw.zig").PathVerbSpec;
+pub const path_verb_table = @import("draw.zig").path_verb_table;
+pub const pathVerbFromLetter = @import("draw.zig").pathVerbFromLetter;
+pub const pathVerbFromWireTag = @import("draw.zig").pathVerbFromWireTag;
+pub const PathContourState = @import("draw.zig").PathContourState;
+pub const validatePathSequence = @import("draw.zig").validatePathSequence;
+pub const PathWinding = @import("draw.zig").PathWinding;
+pub const PathFill = @import("draw.zig").PathFill;
+pub const PathBuilder = @import("draw.zig").PathBuilder;
+pub const PathError = @import("draw.zig").PathError;
+pub const path_scratch_limit_bytes = @import("draw.zig").path_scratch_limit_bytes;
+pub const path_scratch_bytes_per_pixel = @import("draw.zig").path_scratch_bytes_per_pixel;
+
+/// Binary path-verb wire (encode / validate). The overlay inject parser uses the
+/// same tags; schema version is folded into `drawlistDigest`.
+pub const drawlist_wire = @import("drawlist_wire.zig");
 
 /// A `DrawList`'s observability pair for the harness `drawlist` custom probe (see
 /// docs/harness.md): `drawlistDigest` folds it to one stable-hash-plus-counts line,
@@ -251,5 +269,6 @@ test {
     _ = @import("dnd.zig");
     _ = @import("drawlist_probe.zig");
     _ = @import("draw_cmd_text.zig");
+    _ = @import("drawlist_wire.zig");
     _ = @import("overlay.zig");
 }

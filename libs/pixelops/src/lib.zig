@@ -224,6 +224,48 @@ pub inline fn scaleAlpha4(c: Vec16u8, cov: u8) Vec16u8 {
 }
 
 // ============================================================
+// per-pixel coverage (path fill / glyph blit)
+//
+// Hot-path declaration: **runs over every pixel of a path bbox, every frame**.
+// Coverage is 8bpp and varies per pixel, so the 4-pixel form takes four
+// coverage bytes rather than one shared value. Rounding is `div255Round`
+// so `srcOverCoverage` is bit-identical to the text path
+// (`scaleAlpha` then `srcOverOpaque` / `Color.blend`).
+// ============================================================
+
+/// Shuffle that replicates each of 4 coverage bytes across that pixel's 4 lanes.
+/// Input is packed as [c0, c1, c2, c3, ?, ?, …]; only the first four lanes are used.
+const cov_idx: @Vector(16, i32) = .{ 0, 0, 0, 0, 1, 1, 1, 1, 2, 2, 2, 2, 3, 3, 3, 3 };
+
+/// Scale each of 4 pixels' alpha by its own coverage byte.
+/// Bit-identical to `scaleAlpha` per pixel. RGB lanes are unchanged.
+pub inline fn scaleAlphaCov4(c: Vec16u8, cov: @Vector(4, u8)) Vec16u8 {
+    const cov_pad = @shuffle(u8, @as(Vec16u8, @bitCast([16]u8{
+        cov[0], cov[1], cov[2], cov[3],
+        0,      0,      0,      0,
+        0,      0,      0,      0,
+        0,      0,      0,      0,
+    })), undefined, cov_idx);
+    const c16: Vec16u16 = @intCast(c);
+    const cov16: Vec16u16 = @intCast(cov_pad);
+    const scaled: Vec16u8 = @intCast(div255RoundVec16(c16 * cov16));
+    return @select(u8, alpha_mask, scaled, c);
+}
+
+/// Composite `src` over opaque `dst` after multiplying `src` alpha by `cov`.
+/// `a' = div255Round(src.a * cov)`, then `srcOverOpaque`.
+/// Bit-identical to `srcOverOpaque(dst, scaleAlpha(src, cov))`.
+pub fn srcOverCoverage(dst: u32, src: u32, cov: u8) u32 {
+    return srcOverOpaque(dst, scaleAlpha(src, cov));
+}
+
+/// 4-pixel form of `srcOverCoverage`. `cov` is one coverage byte per pixel.
+/// Bit-identical to four `srcOverCoverage` calls. I/O layout matches `srcOverOpaque4`.
+pub inline fn srcOverCoverage4(dst: Vec16u8, src: Vec16u8, cov: @Vector(4, u8)) Vec16u8 {
+    return srcOverOpaque4(dst, scaleAlphaCov4(src, cov));
+}
+
+// ============================================================
 // straight family, general SIMD (variable dst alpha)
 //
 // Variable out_a division cannot be expressed with div255 (divisor fixed at 255), so use f32 division.
@@ -670,6 +712,97 @@ test "srcOverOpaque == srcOver (opaque dst): (sa, src, dst) per-channel equivale
                 try testing.expectEqual(srcOver(dst, src), srcOverOpaque(dst, src));
             }
         }
+    }
+}
+
+test "srcOverCoverage4 matches scalar srcOverCoverage (boundary + random)" {
+    var prng = std.Random.DefaultPrng.init(0xC0EE);
+    const rng = prng.random();
+    const forced_a = [_]u8{ 0, 1, 128, 254, 255 };
+    const forced_cov = [_]u8{ 0, 1, 128, 254, 255 };
+    var trial: usize = 0;
+    while (trial < 2000) : (trial += 1) {
+        var src: [4]u32 = undefined;
+        var dst: [4]u32 = undefined;
+        var cov: [4]u8 = undefined;
+        for (&src, &dst, &cov, 0..) |*s, *d, *c, i| {
+            const a: u8 = if (trial < forced_a.len) forced_a[trial] else rng.int(u8);
+            const bytes: [4]u8 = .{ rng.int(u8), rng.int(u8), rng.int(u8), a };
+            s.* = @bitCast(bytes);
+            d.* = rng.int(u32) | 0xFF000000;
+            c.* = if (trial < forced_cov.len) forced_cov[(trial + i) % forced_cov.len] else rng.int(u8);
+        }
+        var expected: [4]u32 = undefined;
+        for (0..4) |i| expected[i] = srcOverCoverage(dst[i], src[i], cov[i]);
+        const actual: [4]u32 = @bitCast(srcOverCoverage4(@bitCast(dst), @bitCast(src), cov));
+        try testing.expectEqualSlices(u32, &expected, &actual);
+    }
+}
+
+test "srcOverCoverage matches the text coverage blit (scaleAlpha then srcOverOpaque)" {
+    const alphas = [_]u8{ 0, 1, 128, 254, 255 };
+    const covs = [_]u8{ 0, 1, 128, 254, 255 };
+    const dsts = [_]u32{ 0xFF000000, 0xFFFFFFFF, 0xFF123456, 0xFFABCDEF };
+    for (alphas) |a| {
+        for (covs) |cov| {
+            for (dsts) |dst| {
+                const src: u32 = (@as(u32, a) << 24) | 0x00AABBCC;
+                const got = srcOverCoverage(dst, src, cov);
+                const want = srcOverOpaque(dst, scaleAlpha(src, cov));
+                try testing.expectEqual(want, got);
+            }
+        }
+    }
+    var prng = std.Random.DefaultPrng.init(0x7E87);
+    const rng = prng.random();
+    var i: usize = 0;
+    while (i < 2000) : (i += 1) {
+        const src = rng.int(u32);
+        const dst = rng.int(u32) | 0xFF000000;
+        const cov = rng.int(u8);
+        try testing.expectEqual(srcOverOpaque(dst, scaleAlpha(src, cov)), srcOverCoverage(dst, src, cov));
+    }
+}
+
+test "srcOverCoverage identities: cov=0 keeps dst, cov=255 and a=255 writes src" {
+    const alphas = [_]u8{ 0, 1, 128, 254, 255 };
+    const covs = [_]u8{ 0, 1, 128, 254, 255 };
+    var prng = std.Random.DefaultPrng.init(0x1DE0);
+    const rng = prng.random();
+    for (alphas) |a| {
+        for (covs) |cov| {
+            var trial: usize = 0;
+            while (trial < 32) : (trial += 1) {
+                const rgb: u32 = rng.int(u32) & 0x00FFFFFF;
+                const src: u32 = (@as(u32, a) << 24) | rgb;
+                const dst: u32 = rng.int(u32) | 0xFF000000;
+                const out = srcOverCoverage(dst, src, cov);
+                if (cov == 0) {
+                    try testing.expectEqual(dst, out);
+                }
+                if (cov == 255 and a == 255) {
+                    try testing.expectEqual(src | 0xFF000000, out);
+                }
+            }
+        }
+    }
+}
+
+test "scaleAlphaCov4 matches scalar scaleAlpha (per-pixel coverage)" {
+    var prng = std.Random.DefaultPrng.init(0x5CA1);
+    const rng = prng.random();
+    var trial: usize = 0;
+    while (trial < 1000) : (trial += 1) {
+        var px: [4]u32 = undefined;
+        var cov: [4]u8 = undefined;
+        for (&px, &cov) |*p, *c| {
+            p.* = rng.int(u32);
+            c.* = rng.int(u8);
+        }
+        var expected: [4]u32 = undefined;
+        for (0..4) |i| expected[i] = scaleAlpha(px[i], cov[i]);
+        const actual: [4]u32 = @bitCast(scaleAlphaCov4(@bitCast(px), cov));
+        try testing.expectEqualSlices(u32, &expected, &actual);
     }
 }
 

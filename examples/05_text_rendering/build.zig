@@ -24,6 +24,10 @@ pub fn build(b: *std.Build) void {
     });
     font.addImport("png", png);
     font.addImport("pixelops", pixelops);
+    const vector = b.createModule(.{
+        .root_source_file = .{ .cwd_relative = PROJECT_ROOT ++ "/libs/vector/src/lib.zig" },
+    });
+    font.addImport("vector", vector);
     const text = b.createModule(.{
         .root_source_file = .{ .cwd_relative = PROJECT_ROOT ++ "/src/text.zig" },
     });

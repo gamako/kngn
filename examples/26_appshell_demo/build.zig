@@ -14,9 +14,14 @@ pub fn build(b: *std.Build) void {
     const font = b.createModule(.{ .root_source_file = .{ .cwd_relative = PROJECT_ROOT ++ "/libs/font/src/lib.zig" } });
     font.addImport("png", png);
     font.addImport("pixelops", pixelops);
+    const vector = b.createModule(.{
+        .root_source_file = .{ .cwd_relative = PROJECT_ROOT ++ "/libs/vector/src/lib.zig" },
+    });
+    font.addImport("vector", vector);
     const gui = b.createModule(.{ .root_source_file = .{ .cwd_relative = PROJECT_ROOT ++ "/libs/gui/src/gui.zig" } });
     gui.addImport("font", font);
     gui.addImport("pixelops", pixelops);
+    gui.addImport("vector", vector);
     gui.addImport("command_types", command_types);
     const dsp = b.createModule(.{ .root_source_file = .{ .cwd_relative = PROJECT_ROOT ++ "/src/dsp/dsp.zig" } });
     const synth = b.createModule(.{ .root_source_file = .{ .cwd_relative = PROJECT_ROOT ++ "/libs/synth/src/synth.zig" } });
