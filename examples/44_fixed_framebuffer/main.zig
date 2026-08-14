@@ -1,26 +1,35 @@
-//! A fixed-size framebuffer, magnified into a letterbox by present (docs/adr/030).
+//! This example compares a bounded `.fixed` framebuffer with `.physical` rendering.
 //!
-//! The window can be any size and any aspect ratio; the framebuffer stays 640x400 and the application
-//! only ever sees that one coordinate space, at a content scale of 1.0. What the window's size changes
-//! is where the framebuffer lands: how far it is magnified, and how wide the bars around it are.
+//! `KNGN_FIXED_FB_MODE` selects `fixed` or `physical`; it defaults to `fixed`.
+//! In `.fixed`, the application always draws into a 640x400 framebuffer and present
+//! magnifies it into an aspect-preserving letterbox. In `.physical`, the window keeps
+//! its logical size while the framebuffer follows the physical display size.
 //!
-//! It is drawn as a **static** picture on purpose, so that the framebuffer is a fixed value and the
-//! same replay script run at different window sizes produces the same `fb` digest — which is the point
-//! of the mode: the window's size stops being a variable of a verification run.
+//! Both modes run the same scene generator. The framebuffer dimensions are the only
+//! workload-dependent input: `.fixed` bounds the application rasterization area,
+//! while `.physical` follows the window's physical area.
 //!
-//! What to look for on screen:
+//! X11 supports `.fixed` through the shared software nearest-neighbour upscale path.
+//! No backend is excluded from this example's mode contract.
+//!
+//! The picture is **static** on purpose, so that a framebuffer of a given size is a
+//! fixed value: the same replay script at the same framebuffer size produces the same
+//! `fb` digest. The window's size is not a variable of that digest under `.fixed`.
+//!
+//! What to look for on screen in `.fixed`:
 //!
 //! - the aspect ratio is preserved, with black bars on the two sides that run out first
 //! - the magnification is nearest-neighbour, so the grid stays crisp and the pixels go blocky
 //! - the outermost row and column of the framebuffer (the white outline) are both fully visible
 //!
 //! The initial window size comes from `KNGN_FIXED_FB_WINDOW` as `WIDTHxHEIGHT` in logical points, so
-//! that one build can be run at several sizes; without it the window is 800x600, which is a different
-//! aspect ratio from the framebuffer and therefore shows bars straight away.
+//! that one build can be run at several sizes; without it the window is 800x600. In `.fixed` that is
+//! a different aspect ratio from the framebuffer and therefore shows bars straight away.
 //!
-//! A click prints the framebuffer coordinate it arrived as. Over the bars that is negative, or past the
-//! last row or column: a position outside the framebuffer is delivered as it is rather than clamped
-//! into the content (docs/adr/030 R4).
+//! A click prints the coordinate it arrived as. In `.fixed` that is a framebuffer coordinate; over
+//! the bars it is negative, or past the last row or column, rather than clamped into the content
+//! (docs/adr/030 R4). In `.physical` the event is a logical window coordinate, and the bounds are
+//! the window's logical size.
 //!
 //! `KNGN_FIXED_FB_TRANSPARENT=1` asks for a **transparent, borderless** window instead, with
 //! click-through on. That is the only way to see what the letterbox really is: in an opaque window it is
@@ -28,19 +37,21 @@
 //! whatever is behind rather than reaching this window (docs/adr/030 R4, R9). Clicks over the content
 //! still arrive and still print, so the two halves can be compared in one run. It is borderless because
 //! a frame would cover the bars, and because a resizable frame's edge swallows a click aimed at the
-//! outermost row of the framebuffer.
+//! outermost row of the framebuffer. The option is refused together with
+//! `KNGN_FIXED_FB_MODE=physical`, because `.physical` has no letterbox.
 //!
-//! **A backend whose present cannot magnify refuses the window** rather than handing back a framebuffer
-//! of a size that was not asked for (docs/adr/030 R5), so this sample needs one that can: every macOS
-//! backend, both Windows backends, wayland on Linux, and any browser on the web. X11 is the exception
-//! until its software upscale exists, and a wayland compositor without `wp_viewporter` refuses too. It
-//! says so and exits when the window is refused.
+//! `KNGN_FIXED_FB_UNPACED=1` skips the 60 Hz caller-side pace so a free-run measurement can see the
+//! real frame cost. `0` or an unset variable keeps the 60 Hz pace. Any other value is refused.
+//!
+//! **A backend whose present cannot magnify refuses a `.fixed` window** rather than handing back a
+//! framebuffer of a size that was not asked for (docs/adr/030 R5). A Wayland compositor without
+//! `wp_viewporter` refuses too. It says so and exits when the window is refused.
 
 const std = @import("std");
 const platform = @import("platform");
 const pixelops = @import("pixelops");
 
-/// The framebuffer, whatever the window does.
+/// The framebuffer under `.fixed`, whatever the window does.
 const FB_WIDTH: u32 = 640;
 const FB_HEIGHT: u32 = 400;
 
@@ -59,6 +70,24 @@ const COLOR_CORNER_BL: u32 = 0xFF0A84FF;
 const COLOR_CORNER_BR: u32 = 0xFFFFD60A;
 
 const CORNER_SIZE: u32 = 24;
+
+const RenderMode = enum { fixed, physical };
+
+/// Parse `KNGN_FIXED_FB_MODE`. Unset or empty is `.fixed`; any other value must be an allowed name.
+fn parseRenderMode(text: ?[]const u8) error{InvalidMode}!RenderMode {
+    const value = text orelse return .fixed;
+    if (value.len == 0 or std.mem.eql(u8, value, "fixed")) return .fixed;
+    if (std.mem.eql(u8, value, "physical")) return .physical;
+    return error.InvalidMode;
+}
+
+/// Parse `KNGN_FIXED_FB_UNPACED`. Unset or `0` is paced; `1` is unpaced; any other value is refused.
+fn parseUnpaced(text: ?[]const u8) error{InvalidMode}!bool {
+    const value = text orelse return false;
+    if (std.mem.eql(u8, value, "0")) return false;
+    if (std.mem.eql(u8, value, "1")) return true;
+    return error.InvalidMode;
+}
 
 /// Parse `WIDTHxHEIGHT`. Anything else, including a zero side, gives null and the default is used: an
 /// unreadable value should not decide the window's size silently.
@@ -108,11 +137,14 @@ fn draw(pixels: []u32, width: u32, height: u32) void {
     row = 0;
     while (row < height) : (row += 1) pixels[row * width + cx] = COLOR_CROSS;
 
-    // A block in each corner, in its own colour, so an orientation flip is obvious.
-    fillRect(pixels, width, 0, 0, CORNER_SIZE, CORNER_SIZE, COLOR_CORNER_TL);
-    fillRect(pixels, width, width - CORNER_SIZE, 0, CORNER_SIZE, CORNER_SIZE, COLOR_CORNER_TR);
-    fillRect(pixels, width, 0, height - CORNER_SIZE, CORNER_SIZE, CORNER_SIZE, COLOR_CORNER_BL);
-    fillRect(pixels, width, width - CORNER_SIZE, height - CORNER_SIZE, CORNER_SIZE, CORNER_SIZE, COLOR_CORNER_BR);
+    // A block in each corner, in its own colour, so an orientation flip is obvious. The size is
+    // clamped so a framebuffer smaller than the nominal block does not underflow the origin.
+    const corner_w = @min(CORNER_SIZE, width);
+    const corner_h = @min(CORNER_SIZE, height);
+    fillRect(pixels, width, 0, 0, corner_w, corner_h, COLOR_CORNER_TL);
+    fillRect(pixels, width, width - corner_w, 0, corner_w, corner_h, COLOR_CORNER_TR);
+    fillRect(pixels, width, 0, height - corner_h, corner_w, corner_h, COLOR_CORNER_BL);
+    fillRect(pixels, width, width - corner_w, height - corner_h, corner_w, corner_h, COLOR_CORNER_BR);
 }
 
 fn fillRect(pixels: []u32, stride: u32, x: u32, y: u32, w: u32, h: u32, color: u32) void {
@@ -135,33 +167,67 @@ pub fn main() !void {
         }
     }
 
+    const mode_text: ?[]const u8 = if (std.c.getenv("KNGN_FIXED_FB_MODE")) |raw| std.mem.span(raw) else null;
+    const mode = parseRenderMode(mode_text) catch {
+        std.debug.print(
+            "KNGN_FIXED_FB_MODE must be 'fixed' or 'physical', got '{s}'\n",
+            .{mode_text.?},
+        );
+        return error.InvalidMode;
+    };
+
     // A transparent window is where the letterbox stops being black and becomes nothing at all, which is
     // the half of the contract an opaque window cannot show. Borderless goes with it (see the header).
     const transparent = std.c.getenv("KNGN_FIXED_FB_TRANSPARENT") != null;
+    const unpaced_text: ?[]const u8 = if (std.c.getenv("KNGN_FIXED_FB_UNPACED")) |raw| std.mem.span(raw) else null;
+    const unpaced = parseUnpaced(unpaced_text) catch {
+        std.debug.print(
+            "KNGN_FIXED_FB_UNPACED must be '0' or '1', got '{s}'\n",
+            .{unpaced_text.?},
+        );
+        return error.InvalidMode;
+    };
+
+    if (mode == .physical and transparent) {
+        std.debug.print(
+            "KNGN_FIXED_FB_TRANSPARENT cannot be combined with KNGN_FIXED_FB_MODE=physical\n",
+            .{},
+        );
+        return error.InvalidMode;
+    }
 
     try platform.init();
     defer platform.shutdown();
+
+    const fb_mode: platform.FramebufferMode = switch (mode) {
+        .fixed => .{ .fixed = .{ .width = FB_WIDTH, .height = FB_HEIGHT } },
+        .physical => .physical,
+    };
 
     var window = platform.Window.createWithOptions(
         window_size.width,
         window_size.height,
         "44: Fixed Framebuffer",
         .{
-            .fb_mode = .{ .fixed = .{ .width = FB_WIDTH, .height = FB_HEIGHT } },
-            .transparent = transparent,
-            .borderless = transparent,
+            .fb_mode = fb_mode,
+            .transparent = mode == .fixed and transparent,
+            .borderless = mode == .fixed and transparent,
         },
     ) catch |err| {
         if (err == error.Unsupported) {
-            // The one refusal this sample provokes, and the message says which builds can run it —
-            // "Unsupported" on its own reads like a broken sample rather than a backend without a
-            // letterboxed present yet.
-            std.debug.print(
-                "Refused: this backend has no present that magnifies a framebuffer into a letterbox{s}.\n" ++
-                    "Run it on one that has: macOS, Windows (-Dplatform=gdi or -Dplatform=d3d11)," ++
-                    " Linux -Dplatform=wayland, or the web.\n",
-                .{if (transparent) ", or no transparent window" else ""},
-            );
+            switch (mode) {
+                .fixed => std.debug.print(
+                    "Refused: this backend has no present that magnifies a framebuffer into a letterbox{s}.\n" ++
+                        "Run it on one that has: macOS, Windows (-Dplatform=gdi or -Dplatform=d3d11)," ++
+                        " Linux (-Dplatform=wayland or -Dplatform=x11), or the web. A Wayland compositor" ++
+                        " without wp_viewporter also refuses.\n",
+                    .{if (transparent) ", or no transparent window" else ""},
+                ),
+                .physical => std.debug.print(
+                    "Refused: this backend cannot create the requested window.\n",
+                    .{},
+                ),
+            }
             return;
         }
         std.debug.print("Failed to create window: {s}\n", .{@errorName(err)});
@@ -170,23 +236,47 @@ pub fn main() !void {
     defer window.destroy();
 
     std.debug.print(
-        "window {d}x{d} points, framebuffer {d}x{d} fixed. Resize the window: the framebuffer does not change.\n",
-        .{ window_size.width, window_size.height, FB_WIDTH, FB_HEIGHT },
+        "mode={s} window {d}x{d} points, framebuffer {s}, pacing {s}.\n",
+        .{
+            @tagName(mode),
+            window_size.width,
+            window_size.height,
+            switch (mode) {
+                .fixed => "640x400 fixed",
+                .physical => "physical",
+            },
+            if (unpaced) "off" else "60 Hz",
+        },
     );
+    switch (mode) {
+        .fixed => std.debug.print("Resize the window: the framebuffer does not change.\n", .{}),
+        .physical => std.debug.print("Resize the window: the framebuffer follows the physical size.\n", .{}),
+    }
     if (transparent) {
         // Per-pixel click-through: over a pixel the window has not drawn — every pixel of the letterbox —
         // the click goes to the application behind instead of here (docs/adr/030 R4).
         window.setClickThrough(true);
         std.debug.print("transparent: the bars show the desktop through them, and swallow no clicks.\n", .{});
     }
-    std.debug.print("Click to print the framebuffer coordinate. ESC or Q quits.\n", .{});
+    std.debug.print(
+        "Click to print the {s} coordinate. ESC or Q quits.\n",
+        .{switch (mode) {
+            .fixed => "framebuffer",
+            .physical => "window",
+        }},
+    );
+
+    var app_size: platform.WindowSize = window.logicalSize();
 
     main_loop: while (window.pollEvents()) {
         const frame_t0 = platform.getTime();
-        defer platform.framePaceUntil(frame_t0 + FRAME_PERIOD_S);
+        defer {
+            if (!unpaced) platform.framePaceUntil(frame_t0 + FRAME_PERIOD_S);
+        }
 
         if (window.lockFramebuffer()) |fb| {
             defer fb.unlock();
+            app_size = fb.logical_size;
             draw(fb.pixels, fb.width, fb.height);
             window.present();
         }
@@ -197,10 +287,17 @@ pub fn main() !void {
                 .ESCAPE, .Q => break :main_loop,
                 else => {},
             },
-            .mouse_down => |m| {
-                const inside = m.x >= 0 and m.y >= 0 and
-                    m.x < @as(i32, @intCast(FB_WIDTH)) and m.y < @as(i32, @intCast(FB_HEIGHT));
-                std.debug.print("click at fb ({d},{d}) {s}\n", .{ m.x, m.y, if (inside) "content" else "letterbox" });
+            .mouse_down => |m| switch (mode) {
+                .fixed => {
+                    const inside = m.x >= 0 and m.y >= 0 and
+                        m.x < @as(i32, @intCast(FB_WIDTH)) and m.y < @as(i32, @intCast(FB_HEIGHT));
+                    std.debug.print("click at fb ({d},{d}) {s}\n", .{ m.x, m.y, if (inside) "content" else "letterbox" });
+                },
+                .physical => {
+                    const inside = m.x >= 0 and m.y >= 0 and
+                        m.x < @as(i32, @intCast(app_size.width)) and m.y < @as(i32, @intCast(app_size.height));
+                    std.debug.print("click at window ({d},{d}) {s}\n", .{ m.x, m.y, if (inside) "content" else "outside" });
+                },
             },
             else => {},
         };
