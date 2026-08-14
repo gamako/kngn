@@ -19,9 +19,9 @@
 //! HiDPI and `.physical`:
 //! - `SetThreadDpiAwarenessContext(PMv2)` is applied temporarily around **any** geometry work on a
 //!   `.physical` window (`.logical` keeps the start-up awareness): creation holds it until the
-//!   post-creation measurements are done, and a fullscreen transition takes it again. Win32
-//!   geometry APIs speak the calling thread's DPI space, so a window measured or moved from the
-//!   wrong context is off by the scale.
+//!   post-creation measurements are done, `getGeometry` takes it again to report the outer frame,
+//!   and a fullscreen transition takes it again. Win32 geometry APIs speak the calling thread's
+//!   DPI space, so a window measured or moved from the wrong context is off by the scale.
 //! - Making input raw, and content_scale, branch on the real awareness (`GetWindowDpiAwarenessContext`), not on fb_mode.
 //! - When `.logical` degrades onto PMv2, content_scale is forced to 1.0 (the size contract).
 //! - WM_SIZE and WM_DPICHANGED only mark things pending → they are committed together at the `lockFramebuffer` boundary.
@@ -456,7 +456,7 @@ fn isPmv2Context(ctx: DPI_AWARENESS_CONTEXT) bool {
 /// clamped to the monitor. Creation already avoids this by holding the aware context until its own
 /// geometry work is finished; anything that moves or measures the window later has to do the same.
 ///
-/// Hot path declaration: event time only (a fullscreen transition).
+/// Hot path declaration: initialisation, event time, lock-boundary metrics, and shutdown geometry.
 fn enterWindowDpiScope(is_pmv2: bool) DPI_AWARENESS_CONTEXT {
     if (!is_pmv2) return null;
     return SetThreadDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
@@ -642,9 +642,9 @@ pub const Core = struct {
     // there by this code, and Win32 offers the user no way to toggle it — so this flag *is* the
     // state, and nothing has to be read back from the window system.
     fullscreen: bool = false,
-    /// The style and outer frame to put back when leaving fullscreen. The frame is in physical
-    /// screen pixels, because that is what SetWindowPos takes; the geometry an application persists
-    /// is the logical one the latch holds.
+    /// The style and outer frame to put back when leaving fullscreen. On a PMv2 window `left`/`top`
+    /// are physical screen coordinates — the same unit `CreateWindowExW` and `SetWindowPos` take.
+    /// The restore latch holds a mixed geometry: that physical position plus a logical content size.
     windowed_style: DWORD = 0,
     windowed_frame: RECT = .{ .left = 0, .top = 0, .right = 0, .bottom = 0 },
     restore: types.RestoreGeometryLatch = .{ .geometry = .{ .position = null, .size = .{ .width = 0, .height = 0 } } },
@@ -671,6 +671,9 @@ pub const Core = struct {
         return createInternal(width, height, title, opts.fullscreen, opts);
     }
 
+    /// Build the HWND and the heap `Core`. `opts.position` is the outer-frame Win32 screen
+    /// coordinate, passed to `CreateWindowExW` with no conversion; on a `.physical` window that is
+    /// a physical pixel, because creation runs inside the PMv2 scope.
     fn createInternal(width: u32, height: u32, title: [:0]const u8, fullscreen: bool, opts: types.WindowOptions) Error!*Core {
         if (!g_class_registered) return error.WindowCreationFailed;
         if (width == 0 or height == 0) return error.WindowCreationFailed;
@@ -745,7 +748,8 @@ pub const Core = struct {
             pos_x = 0;
             pos_y = 0;
         } else {
-            // An explicit position is passed to CreateWindowExW (without one it is CW_USEDEFAULT).
+            // An explicit position is the outer-frame screen coordinate, passed through to
+            // CreateWindowExW with no conversion. Without one it is CW_USEDEFAULT.
             if (opts.position) |pos| {
                 pos_x = pos.x;
                 pos_y = pos.y;
@@ -1111,18 +1115,11 @@ pub const Core = struct {
         };
     }
 
-    /// The current window geometry. The position comes from GetWindowRect.
-    /// The size is the logical size (`self.logical_width/height`), except under `.fixed`, where that
-    /// is the framebuffer rather than anything about the window (ADR-030 R2) and the window's own size
-    /// is its client area. Persisting the framebuffer's size instead would make a window that reopens at
-    /// the framebuffer's size whatever the user had resized it to.
-    /// **It must never return physical pixels** (`GetClientRect` or `self.width/height`). A caller such as the
-    /// pixel editor's `window_state` persistence passes `getGeometry().size` straight into the next run's
-    /// `WindowOptions.size`, a value that is read as logical. Returning physical pixels here would therefore
-    /// make a `.physical` window grow without bound (scale^N): save → misread as logical on the next run →
-    /// scaled up again → saved, and so on. X11's `getGeometry` already returns the logical size for exactly
-    /// this reason.
-    pub fn getGeometry(self: *Core) types.WindowGeometry {
+    /// Window geometry in the calling thread's current DPI space. The caller must already be inside
+    /// the window's DPI scope (`enterWindowDpiScope`). On a PMv2 window the position is the
+    /// outer-frame physical screen coordinate; the size is the logical content size (or the client
+    /// area under `.fixed`). A failed `GetWindowRect` yields `position == null`.
+    fn geometryInCurrentDpiScope(self: *Core) types.WindowGeometry {
         var wr = RECT{ .left = 0, .top = 0, .right = 0, .bottom = 0 };
         const have_pos = GetWindowRect(self.hwnd, &wr) != 0;
         const size: types.WindowSize = switch (self.fb_mode) {
@@ -1135,6 +1132,39 @@ pub const Core = struct {
             .position = if (have_pos) .{ .x = wr.left, .y = wr.top } else null,
             .size = size,
         };
+    }
+
+    /// The current window geometry.
+    ///
+    /// Position is the outer-frame Win32 screen coordinate (`GetWindowRect` left/top), read inside
+    /// the same PMv2 scope `CreateWindowExW` uses. On a PMv2 window that is a physical pixel;
+    /// otherwise it is the calling thread's native DPI space. Position and size may therefore use
+    /// different units. A PMv2 scope that cannot be entered yields `position == null` rather than a
+    /// virtualised coordinate.
+    ///
+    /// The size is the logical size (`self.logical_width/height`), except under `.fixed`, where that
+    /// is the framebuffer rather than anything about the window (ADR-030 R2) and the window's own size
+    /// is its client area. Persisting the framebuffer's size instead would make a window that reopens at
+    /// the framebuffer's size whatever the user had resized it to.
+    /// **The size must never be physical pixels** (`GetClientRect` or `self.width/height`). A caller such as the
+    /// pixel editor's `window_state` persistence passes `getGeometry().size` straight into the next run's
+    /// `WindowOptions.size`, a value that is read as logical. Returning physical pixels here would therefore
+    /// make a `.physical` window grow without bound (scale^N): save → misread as logical on the next run →
+    /// scaled up again → saved, and so on. X11's `getGeometry` already returns the logical size for exactly
+    /// this reason.
+    pub fn getGeometry(self: *Core) types.WindowGeometry {
+        const dpi_scope = enterWindowDpiScope(self.is_pmv2);
+        defer leaveWindowDpiScope(dpi_scope);
+        if (self.is_pmv2 and dpi_scope == null) {
+            return .{
+                .position = null,
+                .size = switch (self.fb_mode) {
+                    .fixed => .{ .width = self.client_w, .height = self.client_h },
+                    .logical, .physical => .{ .width = self.logical_width, .height = self.logical_height },
+                },
+            };
+        }
+        return self.geometryInCurrentDpiScope();
     }
 
     /// Whether the window is fullscreen right now (ADR-019 R10). Fullscreen here is a window this
@@ -1158,12 +1188,15 @@ pub const Core = struct {
         if (self.fullscreen == enable) return;
         if (self.transparent) return;
         if (enable) {
-            // Read outside the scope below: the geometry an application persists is logical, and
-            // `getGeometry` reports the position in the calling thread's space.
-            const windowed_geo = self.getGeometry();
-
+            // Enter the window's DPI space before any geometry read or move. The persisted
+            // geometry is mixed: a physical outer-frame position and a logical content size.
+            // `geometryInCurrentDpiScope` reads inside this scope so the public `getGeometry`
+            // does not open a nested one.
             const dpi_scope = enterWindowDpiScope(self.is_pmv2);
             defer leaveWindowDpiScope(dpi_scope);
+            if (self.is_pmv2 and dpi_scope == null) return;
+
+            const windowed_geo = self.geometryInCurrentDpiScope();
 
             const sw = GetSystemMetrics(SM_CXSCREEN);
             const sh = GetSystemMetrics(SM_CYSCREEN);
@@ -1183,6 +1216,7 @@ pub const Core = struct {
         } else {
             const dpi_scope = enterWindowDpiScope(self.is_pmv2);
             defer leaveWindowDpiScope(dpi_scope);
+            if (self.is_pmv2 and dpi_scope == null) return;
 
             self.fullscreen = false;
             _ = SetWindowLongPtrW(self.hwnd, GWL_STYLE, @bitCast(@as(usize, self.windowed_style | WS_VISIBLE)));
@@ -1576,7 +1610,13 @@ fn wndProc(hwnd: HWND, msg: UINT, wparam: WPARAM, lparam: LPARAM) callconv(.wina
                 const sy = suggested.top;
                 const sw = suggested.right - suggested.left;
                 const sh = suggested.bottom - suggested.top;
-                _ = SetWindowPos(core.hwnd, null, sx, sy, sw, sh, SWP_NOZORDER | SWP_NOACTIVATE);
+                // The suggested RECT is physical on a PMv2 window. SetWindowPos reads the calling
+                // thread's DPI space, so the move has to run inside that same PMv2 scope.
+                const dpi_scope = enterWindowDpiScope(core.is_pmv2);
+                defer leaveWindowDpiScope(dpi_scope);
+                if (!(core.is_pmv2 and dpi_scope == null)) {
+                    _ = SetWindowPos(core.hwnd, null, sx, sy, sw, sh, SWP_NOZORDER | SWP_NOACTIVATE);
+                }
             }
             return 0;
         },
@@ -2068,4 +2108,100 @@ test "dpiOr96 substitutes the reference DPI for a reading the platform could not
     try std.testing.expectEqual(@as(UINT, 96), dpiOr96(0));
     try std.testing.expectEqual(@as(UINT, 96), dpiOr96(96));
     try std.testing.expectEqual(@as(UINT, 192), dpiOr96(192));
+}
+
+/// `GetWindowRect` in the window's PMv2 space and in the calling thread's restored space.
+/// A failed PMv2 switch is a test failure. When the two readings match, DPI virtualisation is
+/// not observable (typically 100% scale) and the caller should skip rather than pass quietly.
+fn pmv2InsideAndOutsideRect(hwnd: HWND) !struct { inside: RECT, outside: RECT } {
+    const inside: RECT = blk: {
+        const scope = enterWindowDpiScope(true);
+        defer leaveWindowDpiScope(scope);
+        if (scope == null) return error.TestUnexpectedResult;
+        var wr = RECT{ .left = 0, .top = 0, .right = 0, .bottom = 0 };
+        if (GetWindowRect(hwnd, &wr) == 0) return error.TestUnexpectedResult;
+        break :blk wr;
+    };
+    var outside = RECT{ .left = 0, .top = 0, .right = 0, .bottom = 0 };
+    if (GetWindowRect(hwnd, &outside) == 0) return error.TestUnexpectedResult;
+    return .{ .inside = inside, .outside = outside };
+}
+
+fn skipIfDpiNotVirtualized(inside: RECT, outside: RECT) !void {
+    if (inside.left == outside.left and inside.top == outside.top) return error.SkipZigTest;
+}
+
+test "getGeometry: PMv2 position matches the in-scope GetWindowRect, not the virtualised one" {
+    try init();
+    defer shutdown();
+
+    const want = types.WindowPosition{ .x = 347, .y = 211 };
+    const logical: WindowSize = .{ .width = 640, .height = 480 };
+    const core = try Core.createWithOptions(logical.width, logical.height, "t", .{
+        .fb_mode = .physical,
+        .position = want,
+    });
+    defer core.destroy();
+
+    try std.testing.expect(core.is_pmv2);
+    const pair = try pmv2InsideAndOutsideRect(core.hwnd);
+    try skipIfDpiNotVirtualized(pair.inside, pair.outside);
+
+    const geo = core.getGeometry();
+    try std.testing.expect(geo.position != null);
+    try std.testing.expectEqual(pair.inside.left, geo.position.?.x);
+    try std.testing.expectEqual(pair.inside.top, geo.position.?.y);
+    try std.testing.expect(geo.position.?.x != pair.outside.left or geo.position.?.y != pair.outside.top);
+    // Size stays the logical contract; matching the physical position must not pull size into
+    // the same unit or divide the position into the size's space.
+    try std.testing.expectEqual(logical.width, geo.size.width);
+    try std.testing.expectEqual(logical.height, geo.size.height);
+}
+
+test "setFullscreen: the restore latch keeps the in-scope PMv2 position, not the virtualised one" {
+    try init();
+    defer shutdown();
+
+    const want = types.WindowPosition{ .x = 347, .y = 211 };
+    const logical: WindowSize = .{ .width = 640, .height = 480 };
+    const core = try Core.createWithOptions(logical.width, logical.height, "t", .{
+        .fb_mode = .physical,
+        .position = want,
+    });
+    defer core.destroy();
+
+    try std.testing.expect(core.is_pmv2);
+    const pair = try pmv2InsideAndOutsideRect(core.hwnd);
+    try skipIfDpiNotVirtualized(pair.inside, pair.outside);
+
+    const saved = core.getGeometry();
+    try std.testing.expect(saved.position != null);
+    try std.testing.expectEqual(pair.inside.left, saved.position.?.x);
+    try std.testing.expectEqual(pair.inside.top, saved.position.?.y);
+
+    core.setFullscreen(true);
+    try std.testing.expect(core.fullscreen);
+    try std.testing.expect(core.restore.geometry.position != null);
+    try std.testing.expectEqual(pair.inside.left, core.restore.geometry.position.?.x);
+    try std.testing.expectEqual(pair.inside.top, core.restore.geometry.position.?.y);
+    try std.testing.expect(core.restore.geometry.position.?.x != pair.outside.left or
+        core.restore.geometry.position.?.y != pair.outside.top);
+    try std.testing.expectEqual(pair.inside.left, core.windowed_frame.left);
+    try std.testing.expectEqual(pair.inside.top, core.windowed_frame.top);
+    try std.testing.expectEqual(logical.width, core.restore.geometry.size.width);
+    try std.testing.expectEqual(logical.height, core.restore.geometry.size.height);
+
+    const latched = core.windowedGeometry();
+    try std.testing.expect(latched.position != null);
+    try std.testing.expectEqual(pair.inside.left, latched.position.?.x);
+    try std.testing.expectEqual(pair.inside.top, latched.position.?.y);
+    try std.testing.expectEqual(logical.width, latched.size.width);
+    try std.testing.expectEqual(logical.height, latched.size.height);
+
+    core.setFullscreen(false);
+    try std.testing.expect(!core.fullscreen);
+    const restored = core.getGeometry();
+    try std.testing.expect(restored.position != null);
+    try std.testing.expectEqual(pair.inside.left, restored.position.?.x);
+    try std.testing.expectEqual(pair.inside.top, restored.position.?.y);
 }
