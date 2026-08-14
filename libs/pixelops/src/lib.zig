@@ -553,6 +553,205 @@ pub fn clipBlit(dst_w: u32, dst_h: u32, src_w: u32, src_h: u32, x: i32, y: i32) 
 }
 
 // ============================================================
+// nearest-neighbour resample (letterboxed present of a fixed framebuffer)
+// ============================================================
+
+pub const ResampleRect = struct {
+    x: u32,
+    y: u32,
+    width: u32,
+    height: u32,
+};
+
+pub const ResampleSurface = struct {
+    pixels: []u32,
+    stride: u32,
+};
+
+pub const ResampleSource = struct {
+    pixels: []const u32,
+    stride: u32,
+    width: u32,
+    height: u32,
+};
+
+/// A column LUT is a mapping for one `(src_width, dst_width)` pair:
+/// `entries[x] = floor(x * src_width / dst_width)` for `x` in `0..dst_width`.
+/// Length alone does not identify the table: a longer table built for a different
+/// destination width is a different mapping, and using a prefix of it is wrong.
+pub const NearestColumnLut = struct {
+    entries: []const u32,
+    src_width: u32,
+    dst_width: u32,
+
+    /// True when this table is the mapping for `src_width` → `dst_width`.
+    pub fn matches(self: NearestColumnLut, src_width: u32, dst_width: u32) bool {
+        if (self.src_width != src_width or self.dst_width != dst_width) return false;
+        return dst_width == 0 or self.entries.len >= dst_width;
+    }
+};
+
+/// Fill `lut[0..dst_width]` with `floor(x * src_width / dst_width)` and return a
+/// table that records those widths. Built when the mapping changes, never per
+/// pixel. A zero destination width is a no-op (no division).
+pub fn buildNearestColumnLut(lut: []u32, src_width: u32, dst_width: u32) NearestColumnLut {
+    if (dst_width == 0) {
+        return .{ .entries = lut[0..0], .src_width = src_width, .dst_width = 0 };
+    }
+    std.debug.assert(lut.len >= dst_width);
+    var x: u32 = 0;
+    while (x < dst_width) : (x += 1) {
+        lut[x] = @intCast(@as(u64, x) * src_width / dst_width);
+    }
+    return .{ .entries = lut[0..dst_width], .src_width = src_width, .dst_width = dst_width };
+}
+
+/// Independent scalar nearest-neighbour: one division per destination pixel, no LUT
+/// and no row reuse. Bit-identity of `nearestResample` is pinned against this.
+///
+/// Runs over every destination pixel, every frame, as the reference implementation.
+/// The shipped present path is `nearestResample`.
+pub fn nearestResampleScalar(
+    dst: ResampleSurface,
+    dst_rect: ResampleRect,
+    src: ResampleSource,
+) void {
+    if (resampleIsNoop(dst_rect, src)) return;
+    assertResampleFits(dst, dst_rect, src);
+
+    var y: u32 = 0;
+    while (y < dst_rect.height) : (y += 1) {
+        const sy: u32 = @intCast(@as(u64, y) * src.height / dst_rect.height);
+        const srow = src.pixels[@as(usize, sy) * src.stride ..][0..src.width];
+        const drow = dst.pixels[(@as(usize, dst_rect.y) + y) * dst.stride + dst_rect.x ..][0..dst_rect.width];
+        var x: u32 = 0;
+        while (x < dst_rect.width) : (x += 1) {
+            drow[x] = srow[@intCast(@as(u64, x) * src.width / dst_rect.width)];
+        }
+    }
+}
+
+/// Nearest-neighbour resample of `src` into `dst_rect`. Uses `column_lut` for the
+/// generic path; an integer magnification that matches a specialised factor takes
+/// a vector store per source pixel instead. Destination pixels outside `dst_rect`
+/// are not written.
+///
+/// Runs over every destination pixel, every frame on a backend that cannot scale
+/// while presenting. Column division lives in a caller-owned LUT built when the
+/// mapping changes; rows that share a source row are generated once and
+/// replicated with `@memcpy`. An integer magnification in {2,3,4,5,6,7,8} writes
+/// each source pixel as one `@Vector(k, u32)` store. There is no clip, bounds
+/// test, or division inside the pixel loop.
+///
+/// PRECONDITION: `column_lut` is the table for `src.width` → `dst_rect.width`
+/// (`NearestColumnLut.matches`); every stored index is `< src.width`; `dst_rect`
+/// fits `dst`; each source row fits `src.pixels`. Zero-sized source or
+/// destination is a no-op.
+pub fn nearestResample(
+    dst: ResampleSurface,
+    dst_rect: ResampleRect,
+    src: ResampleSource,
+    column_lut: NearestColumnLut,
+) void {
+    if (resampleIsNoop(dst_rect, src)) return;
+    assertColumnLutUsable(column_lut, src.width, dst_rect.width);
+    assertResampleFits(dst, dst_rect, src);
+
+    const lut = column_lut.entries[0..dst_rect.width];
+    if (integerFactor(src.width, src.height, dst_rect.width, dst_rect.height)) |k| {
+        switch (k) {
+            1 => resampleCopyRows(dst, dst_rect, src),
+            inline 2, 3, 4, 5, 6, 7, 8 => |kc| resampleIntFactor(dst, dst_rect, src, kc),
+            else => resampleLut(dst, dst_rect, src, lut),
+        }
+        return;
+    }
+    resampleLut(dst, dst_rect, src, lut);
+}
+
+/// Entry-only check: the table is the mapping for these widths, and every stored
+/// column index is inside the source. Not called from the pixel loop.
+fn assertColumnLutUsable(lut: NearestColumnLut, src_width: u32, dst_width: u32) void {
+    std.debug.assert(lut.matches(src_width, dst_width));
+    if (src_width == 0 or dst_width == 0) return;
+    for (lut.entries[0..dst_width]) |sx| {
+        std.debug.assert(sx < src_width);
+    }
+}
+
+inline fn resampleIsNoop(dst_rect: ResampleRect, src: ResampleSource) bool {
+    return dst_rect.width == 0 or dst_rect.height == 0 or src.width == 0 or src.height == 0;
+}
+
+fn assertResampleFits(dst: ResampleSurface, dst_rect: ResampleRect, src: ResampleSource) void {
+    std.debug.assert(dst.stride > 0);
+    std.debug.assert(src.stride > 0);
+    std.debug.assert(src.stride >= src.width);
+    std.debug.assert(dst_rect.x <= dst.stride and dst_rect.width <= dst.stride - dst_rect.x);
+    const dst_span: usize = @as(usize, dst_rect.x) + dst_rect.width;
+    const dst_last_row: usize = @as(usize, dst_rect.y) + dst_rect.height - 1;
+    std.debug.assert(dst.pixels.len >= dst_span and dst_last_row <= (dst.pixels.len - dst_span) / dst.stride);
+    const src_span: usize = src.width;
+    const src_last_row: usize = src.height - 1;
+    std.debug.assert(src.pixels.len >= src_span and src_last_row <= (src.pixels.len - src_span) / src.stride);
+}
+
+fn integerFactor(src_w: u32, src_h: u32, dst_w: u32, dst_h: u32) ?u32 {
+    if (src_w == 0 or src_h == 0) return null;
+    if (dst_w % src_w != 0 or dst_h % src_h != 0) return null;
+    const kx = dst_w / src_w;
+    const ky = dst_h / src_h;
+    if (kx != ky) return null;
+    return kx;
+}
+
+fn resampleCopyRows(dst: ResampleSurface, dst_rect: ResampleRect, src: ResampleSource) void {
+    var y: u32 = 0;
+    while (y < dst_rect.height) : (y += 1) {
+        const srow = src.pixels[@as(usize, y) * src.stride ..][0..src.width];
+        const drow = dst.pixels[(@as(usize, dst_rect.y) + y) * dst.stride + dst_rect.x ..][0..dst_rect.width];
+        @memcpy(drow, srow);
+    }
+}
+
+fn resampleIntFactor(dst: ResampleSurface, dst_rect: ResampleRect, src: ResampleSource, comptime k: u32) void {
+    var y: u32 = 0;
+    while (y < dst_rect.height) {
+        const sy = y / k;
+        const srow = src.pixels[@as(usize, sy) * src.stride ..][0..src.width];
+        const built = dst.pixels[(@as(usize, dst_rect.y) + y) * dst.stride + dst_rect.x ..][0..dst_rect.width];
+        var i: usize = 0;
+        for (srow) |p| {
+            const v: @Vector(k, u32) = @splat(p);
+            built[i..][0..k].* = v;
+            i += k;
+        }
+        var y2: u32 = y + 1;
+        while (y2 < dst_rect.height and y2 / k == sy) : (y2 += 1) {
+            @memcpy(dst.pixels[(@as(usize, dst_rect.y) + y2) * dst.stride + dst_rect.x ..][0..dst_rect.width], built);
+        }
+        y = y2;
+    }
+}
+
+fn resampleLut(dst: ResampleSurface, dst_rect: ResampleRect, src: ResampleSource, lut: []const u32) void {
+    var y: u32 = 0;
+    while (y < dst_rect.height) {
+        const sy: u32 = @intCast(@as(u64, y) * src.height / dst_rect.height);
+        const srow = src.pixels[@as(usize, sy) * src.stride ..][0..src.width];
+        const built = dst.pixels[(@as(usize, dst_rect.y) + y) * dst.stride + dst_rect.x ..][0..dst_rect.width];
+        for (built, lut) |*d, sx| d.* = srow[sx];
+        var y2: u32 = y + 1;
+        while (y2 < dst_rect.height and
+            @as(u32, @intCast(@as(u64, y2) * src.height / dst_rect.height)) == sy) : (y2 += 1)
+        {
+            @memcpy(dst.pixels[(@as(usize, dst_rect.y) + y2) * dst.stride + dst_rect.x ..][0..dst_rect.width], built);
+        }
+        y = y2;
+    }
+}
+
+// ============================================================
 // Tests
 // ============================================================
 const testing = std.testing;
@@ -1079,4 +1278,263 @@ test "swizzleBgraToRgba matches scalar (boundary lengths + random)" {
         swizzleBgraToRgbaScalar(dst_scalar, src);
         try testing.expectEqualSlices(u8, dst_scalar, dst_simd);
     }
+}
+
+// ---- nearest resample ----
+
+const resample_poison: u32 = 0xDEADBEEF;
+
+fn scalarNearestCol(x: u32, src_width: u32, dst_width: u32) u32 {
+    return @intCast(@as(u64, x) * src_width / dst_width);
+}
+
+fn fillPattern(buf: []u32, seed: u32) void {
+    for (buf, 0..) |*p, i| p.* = seed +% @as(u32, @truncate(i *% 2654435761));
+}
+
+fn expectLutMatchesScalar(lut: []const u32, src_width: u32, dst_width: u32) !void {
+    try testing.expectEqual(dst_width, @as(u32, @intCast(lut.len)));
+    var x: u32 = 0;
+    while (x < dst_width) : (x += 1) {
+        try testing.expectEqual(scalarNearestCol(x, src_width, dst_width), lut[x]);
+    }
+}
+
+fn resampleCase(
+    src_w: u32,
+    src_h: u32,
+    src_stride: u32,
+    dst_w: u32,
+    dst_h: u32,
+    dst_stride: u32,
+    origin_x: u32,
+    origin_y: u32,
+    src_pixels: []const u32,
+) !void {
+    const dst_rows = origin_y + dst_h + 1;
+    const dst_len = @as(usize, dst_stride) * dst_rows;
+    const got = try testing.allocator.alloc(u32, dst_len);
+    defer testing.allocator.free(got);
+    const want = try testing.allocator.alloc(u32, dst_len);
+    defer testing.allocator.free(want);
+    @memset(got, resample_poison);
+    @memset(want, resample_poison);
+
+    const lut_buf = try testing.allocator.alloc(u32, dst_w);
+    defer testing.allocator.free(lut_buf);
+    const lut = buildNearestColumnLut(lut_buf, src_w, dst_w);
+
+    const dst_fast: ResampleSurface = .{ .pixels = got, .stride = dst_stride };
+    const dst_ref: ResampleSurface = .{ .pixels = want, .stride = dst_stride };
+    const rect: ResampleRect = .{ .x = origin_x, .y = origin_y, .width = dst_w, .height = dst_h };
+    const source: ResampleSource = .{
+        .pixels = src_pixels,
+        .stride = src_stride,
+        .width = src_w,
+        .height = src_h,
+    };
+    nearestResample(dst_fast, rect, source, lut);
+    nearestResampleScalar(dst_ref, rect, source);
+    try testing.expectEqualSlices(u32, want, got);
+}
+
+test "buildNearestColumnLut matches independent scalar arithmetic" {
+    const Case = struct { src_w: u32, dst_w: u32 };
+    const cases = [_]Case{
+        .{ .src_w = 8, .dst_w = 8 }, // 1:1
+        .{ .src_w = 8, .dst_w = 16 }, // integer upscale
+        .{ .src_w = 640, .dst_w = 1280 },
+        .{ .src_w = 640, .dst_w = 1728 }, // non-integer
+        .{ .src_w = 640, .dst_w = 400 }, // minification
+        .{ .src_w = 640, .dst_w = 1 }, // destination width 1
+        .{ .src_w = 1, .dst_w = 17 }, // source width 1
+    };
+    for (cases) |c| {
+        const lut = try testing.allocator.alloc(u32, c.dst_w);
+        defer testing.allocator.free(lut);
+        const table = buildNearestColumnLut(lut, c.src_w, c.dst_w);
+        try testing.expect(table.matches(c.src_w, c.dst_w));
+        try expectLutMatchesScalar(table.entries, c.src_w, c.dst_w);
+        for (table.entries) |sx| try testing.expect(sx < c.src_w or c.src_w == 0);
+    }
+}
+
+test "NearestColumnLut.matches is the (src_width, dst_width) pair, not the buffer length" {
+    var buf: [16]u32 = undefined;
+    const wide = buildNearestColumnLut(&buf, 8, 16);
+    try testing.expect(wide.matches(8, 16));
+    // A prefix of a 16-wide table is not the mapping for dest width 8.
+    try testing.expect(!wide.matches(8, 8));
+    try testing.expect(!wide.matches(4, 16));
+    const empty = buildNearestColumnLut(buf[0..0], 8, 0);
+    try testing.expect(empty.matches(8, 0));
+    try testing.expect(!empty.matches(8, 16));
+}
+
+test "nearestResample matches nearestResampleScalar (integer factors, non-integer, minification, 1x)" {
+    const Case = struct { sw: u32, sh: u32, dw: u32, dh: u32 };
+    const cases = [_]Case{
+        .{ .sw = 8, .sh = 5, .dw = 16, .dh = 10 }, // 2x
+        .{ .sw = 8, .sh = 5, .dw = 24, .dh = 15 }, // 3x
+        .{ .sw = 8, .sh = 5, .dw = 32, .dh = 20 }, // 4x
+        .{ .sw = 8, .sh = 5, .dw = 64, .dh = 40 }, // 8x
+        .{ .sw = 8, .sh = 5, .dw = 20, .dh = 13 }, // non-integer
+        .{ .sw = 16, .sh = 10, .dw = 8, .dh = 5 }, // minification
+        .{ .sw = 8, .sh = 5, .dw = 8, .dh = 5 }, // 1x
+        .{ .sw = 8, .sh = 5, .dw = 40, .dh = 25 }, // 5x specialised
+        .{ .sw = 8, .sh = 5, .dw = 72, .dh = 45 }, // 9x falls back to the LUT path
+    };
+    for (cases) |c| {
+        const src = try testing.allocator.alloc(u32, c.sw * c.sh);
+        defer testing.allocator.free(src);
+        fillPattern(src, 0xA1000000);
+        try resampleCase(c.sw, c.sh, c.sw, c.dw, c.dh, c.dw, 0, 0, src);
+    }
+}
+
+test "nearestResample matches nearestResampleScalar with stride padding and a destination origin" {
+    const sw: u32 = 6;
+    const sh: u32 = 4;
+    const src_stride: u32 = 10;
+    const src = try testing.allocator.alloc(u32, src_stride * sh);
+    defer testing.allocator.free(src);
+    @memset(src, 0x11223344);
+    var y: u32 = 0;
+    while (y < sh) : (y += 1) {
+        var x: u32 = 0;
+        while (x < sw) : (x += 1) {
+            src[y * src_stride + x] = 0xFF000000 | (y << 8) | x;
+        }
+    }
+    try resampleCase(sw, sh, src_stride, 12, 8, 20, 3, 2, src); // 2x, origin (3,2), dst stride pad
+    try resampleCase(sw, sh, src_stride, 10, 7, 16, 1, 1, src); // non-integer, origin (1,1)
+}
+
+test "nearestResample matches nearestResampleScalar on a random pixel pattern" {
+    var prng = std.Random.DefaultPrng.init(0x9E5A);
+    const rng = prng.random();
+    const sw: u32 = 17;
+    const sh: u32 = 11;
+    const src = try testing.allocator.alloc(u32, sw * sh);
+    defer testing.allocator.free(src);
+    for (src) |*p| p.* = rng.int(u32);
+    try resampleCase(sw, sh, sw, 34, 22, 34, 0, 0, src); // 2x
+    try resampleCase(sw, sh, sw, 25, 19, 25, 0, 0, src); // non-integer
+    try resampleCase(sw, sh, sw, 9, 6, 9, 0, 0, src); // minification
+}
+
+test "nearestResample writes nothing outside the destination rectangle" {
+    const sw: u32 = 4;
+    const sh: u32 = 3;
+    const src = try testing.allocator.alloc(u32, sw * sh);
+    defer testing.allocator.free(src);
+    fillPattern(src, 0xB2000000);
+    const dst_stride: u32 = 12;
+    const origin_x: u32 = 2;
+    const origin_y: u32 = 1;
+    const dw: u32 = 8;
+    const dh: u32 = 6;
+    const rows: u32 = 10;
+    const got = try testing.allocator.alloc(u32, dst_stride * rows);
+    defer testing.allocator.free(got);
+    @memset(got, resample_poison);
+
+    const lut_buf = try testing.allocator.alloc(u32, dw);
+    defer testing.allocator.free(lut_buf);
+    const lut = buildNearestColumnLut(lut_buf, sw, dw);
+    nearestResample(
+        .{ .pixels = got, .stride = dst_stride },
+        .{ .x = origin_x, .y = origin_y, .width = dw, .height = dh },
+        .{ .pixels = src, .stride = sw, .width = sw, .height = sh },
+        lut,
+    );
+
+    var y: u32 = 0;
+    while (y < rows) : (y += 1) {
+        var x: u32 = 0;
+        while (x < dst_stride) : (x += 1) {
+            const inside = y >= origin_y and y < origin_y + dh and x >= origin_x and x < origin_x + dw;
+            if (!inside) {
+                try testing.expectEqual(resample_poison, got[y * dst_stride + x]);
+            } else {
+                try testing.expect(got[y * dst_stride + x] != resample_poison);
+            }
+        }
+    }
+}
+
+test "nearestResample row reuse covers every source row without a gap or duplicate skip" {
+    // 2x: dest rows 0-1 share source 0, 2-3 share source 1.
+    const src = [_]u32{ 0xA, 0xB, 0xC, 0xD };
+    var dst: [8]u32 = undefined;
+    var lut: [2]u32 = undefined;
+    const table = buildNearestColumnLut(&lut, 2, 2);
+    nearestResample(
+        .{ .pixels = &dst, .stride = 2 },
+        .{ .x = 0, .y = 0, .width = 2, .height = 4 },
+        .{ .pixels = &src, .stride = 2, .width = 2, .height = 2 },
+        table,
+    );
+    try testing.expectEqualSlices(u32, &.{ 0xA, 0xB, 0xA, 0xB, 0xC, 0xD, 0xC, 0xD }, &dst);
+
+    // Source-row boundaries: dest height 5, source height 3 → rows map 0,0,1,1,2.
+    const src3 = [_]u32{ 1, 3, 5 };
+    var dst5: [5]u32 = undefined;
+    var lut1: [1]u32 = undefined;
+    const table1 = buildNearestColumnLut(&lut1, 1, 1);
+    nearestResample(
+        .{ .pixels = &dst5, .stride = 1 },
+        .{ .x = 0, .y = 0, .width = 1, .height = 5 },
+        .{ .pixels = &src3, .stride = 1, .width = 1, .height = 3 },
+        table1,
+    );
+    try testing.expectEqual(@as(u32, 1), dst5[0]);
+    try testing.expectEqual(@as(u32, 1), dst5[1]);
+    try testing.expectEqual(@as(u32, 3), dst5[2]);
+    try testing.expectEqual(@as(u32, 3), dst5[3]);
+    try testing.expectEqual(@as(u32, 5), dst5[4]);
+
+    // Minification: dest height 2, source height 4 → dest rows 0,1 read source 0,2.
+    const src4 = [_]u32{ 10, 20, 30, 40 };
+    var dst2: [2]u32 = undefined;
+    nearestResample(
+        .{ .pixels = &dst2, .stride = 1 },
+        .{ .x = 0, .y = 0, .width = 1, .height = 2 },
+        .{ .pixels = &src4, .stride = 1, .width = 1, .height = 4 },
+        table1,
+    );
+    try testing.expectEqual(@as(u32, 10), dst2[0]);
+    try testing.expectEqual(@as(u32, 30), dst2[1]);
+}
+
+test "nearestResample and nearestResampleScalar are no-ops on a zero-sized source or destination" {
+    var dst = [_]u32{resample_poison} ** 4;
+    var src = [_]u32{ 1, 2, 3, 4 };
+    var lut_empty: [0]u32 = .{};
+    var lut1: [1]u32 = .{0};
+
+    nearestResample(
+        .{ .pixels = &dst, .stride = 2 },
+        .{ .x = 0, .y = 0, .width = 0, .height = 2 },
+        .{ .pixels = &src, .stride = 2, .width = 2, .height = 2 },
+        .{ .entries = &lut_empty, .src_width = 2, .dst_width = 0 },
+    );
+    nearestResampleScalar(
+        .{ .pixels = &dst, .stride = 2 },
+        .{ .x = 0, .y = 0, .width = 2, .height = 0 },
+        .{ .pixels = &src, .stride = 2, .width = 2, .height = 2 },
+    );
+    nearestResample(
+        .{ .pixels = &dst, .stride = 2 },
+        .{ .x = 0, .y = 0, .width = 2, .height = 2 },
+        .{ .pixels = src[0..0], .stride = 2, .width = 0, .height = 2 },
+        .{ .entries = &lut1, .src_width = 0, .dst_width = 2 },
+    );
+    nearestResampleScalar(
+        .{ .pixels = &dst, .stride = 2 },
+        .{ .x = 0, .y = 0, .width = 2, .height = 2 },
+        .{ .pixels = src[0..0], .stride = 2, .width = 2, .height = 0 },
+    );
+    _ = buildNearestColumnLut(lut_empty[0..], 4, 0);
+    try testing.expectEqualSlices(u32, &.{ resample_poison, resample_poison, resample_poison, resample_poison }, &dst);
 }

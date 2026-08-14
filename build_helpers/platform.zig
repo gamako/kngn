@@ -496,6 +496,50 @@ fn resolvePixelops(
     });
 }
 
+/// The pixelops module the x11 platform backend imports, reused from `extra` / `kit_libs`
+/// when the caller already built one so `libs/pixelops/src/lib.zig` is not put in two modules.
+fn resolveStandalonePlatformPixelops(
+    b: *std.Build,
+    spec: StandaloneSpec,
+    kit_root: []const u8,
+) *std.Build.Module {
+    var roots: std.ArrayList(?*std.Build.Module) = .empty;
+    defer roots.deinit(b.allocator);
+    if (spec.kit_libs) |kl| {
+        roots.appendSlice(b.allocator, &.{
+            kl.platform_types, kl.command_types, kl.gui,   kl.png,     kl.font,
+            kl.dsp,            kl.synth,         kl.gmath, kl.gfx,     kl.sound,
+            kl.serde,          kl.appshell,      kl.paint, kl.gamepad, kl.pixelops,
+        }) catch @panic("OOM");
+    }
+    for (spec.extra) |imp| roots.append(b.allocator, imp.module) catch @panic("OOM");
+
+    var found = collectWiredImports(b, roots.items, "pixelops");
+    defer found.deinit(b.allocator);
+    for (spec.extra) |imp| {
+        if (std.mem.eql(u8, imp.name, "pixelops")) appendUnique(b, &found, imp.module);
+    }
+    if (spec.kit_libs) |kl| {
+        if (kl.pixelops) |explicit| {
+            for (found.items) |candidate| {
+                if (candidate == explicit) continue;
+                std.log.err(
+                    "kit_libs.pixelops is a different module than the one wired as \"pixelops\" " ++
+                        "into the modules passed to buildStandalone. libs/pixelops/src/lib.zig can " ++
+                        "belong to only one module, so pass the same instance everywhere.",
+                    .{},
+                );
+                std.process.exit(1);
+            }
+            return explicit;
+        }
+    }
+    if (found.items.len != 0) return found.items[0];
+    return b.createModule(.{
+        .root_source_file = .{ .cwd_relative = b.fmt("{s}/libs/pixelops/src/lib.zig", .{kit_root}) },
+    });
+}
+
 /// Create one exe per implemented backend for the target OS, plus install / `run-<backend>` /
 /// `run` (default). Resolve the SDK only on macOS (Linux needs no xcrun).
 pub fn buildStandalone(
@@ -618,6 +662,13 @@ pub fn buildStandalone(
     } else null;
 
     const features = platformFeatures(spec);
+    const kit_root: []const u8 = std.fs.path.dirname(core_dir) orelse ".";
+    const x11_pixelops: ?*std.Build.Module = blk: {
+        for (implementedBackends(target_os)) |be| {
+            if (be == .x11) break :blk resolveStandalonePlatformPixelops(b, spec, kit_root);
+        }
+        break :blk null;
+    };
 
     for (implementedBackends(target_os)) |be| {
         const platform_mod = createPlatformModule(
@@ -631,6 +682,7 @@ pub fn buildStandalone(
             harness_mod,
             features,
         );
+        if (be == .x11) platform_mod.addImport("pixelops", x11_pixelops.?);
 
         const root = b.createModule(.{
             .root_source_file = spec.main_source,
@@ -643,7 +695,6 @@ pub fn buildStandalone(
         // kit umbrella (ADR-007 R4/R5). apps standalones have the root `@import("kit")`.
         // Keep 1:1 with kit/kit.zig's pub imports (platform is per-backend, so kit is too).
         if (spec.kit_libs) |kl| {
-            const kit_root: []const u8 = std.fs.path.dirname(core_dir) orelse ".";
             const kit_mod = b.createModule(.{
                 .root_source_file = .{ .cwd_relative = b.fmt("{s}/kit/kit.zig", .{kit_root}) },
             });

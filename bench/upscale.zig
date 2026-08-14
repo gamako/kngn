@@ -205,6 +205,31 @@ fn expandRowInt(drow: []u32, srow: []const u32, k: usize) void {
     }
 }
 
+/// The shipped primitive: `pixelops.nearestResample` over the letterboxed destination.
+fn upscaleShipped(c: Ctx) void {
+    const m = c.map;
+    pixelops.nearestResample(
+        .{ .pixels = c.dst, .stride = @intCast(c.stride) },
+        .{
+            .x = @intCast(m.ox),
+            .y = @intCast(m.oy),
+            .width = @intCast(m.dw),
+            .height = @intCast(m.dh),
+        },
+        .{
+            .pixels = c.src,
+            .stride = @intCast(c.src_w),
+            .width = @intCast(c.src_w),
+            .height = @intCast(c.src_h),
+        },
+        .{
+            .entries = c.col[0..c.map.dw],
+            .src_width = @intCast(c.src_w),
+            .dst_width = @intCast(c.map.dw),
+        },
+    );
+}
+
 // ── driver ────────────────────────────────────────────────────────────────────
 
 const Candidate = struct {
@@ -276,6 +301,7 @@ const candidates = [_]Candidate{
     .{ .name = "column LUT         ", .body = upscaleColLut },
     .{ .name = "row reuse + LUT    ", .body = upscaleRowReuse },
     .{ .name = "row reuse + splat  ", .body = upscaleRowReuseSplat, .integer_only = true },
+    .{ .name = "pixelops.nearest   ", .body = upscaleShipped },
 };
 
 const Scenario = struct {

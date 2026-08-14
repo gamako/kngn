@@ -64,7 +64,8 @@ fn link(consumer: TaggedModule, dep: TaggedModule) void {
 /// Explicit core → libs exceptions. Current set:
 ///   - harness(core/control) → png(libs/png) (PNG encode / crc32 for snapshot fb)
 ///   - harness(core/control) → dsp (digest audio spectrum analysis: band/centroid/onset)
-///   - platform(core) → pixelops(libs/pixelops) (BGRA→RGBA SIMD swizzle for wasm present)
+///   - platform(core) → pixelops(libs/pixelops) (BGRA→RGBA SIMD swizzle for wasm present;
+///     software nearest resample for x11 fixed-framebuffer present)
 /// Adding a new exception requires revising ADR-007.
 fn linkCoreException(consumer: TaggedModule, dep: TaggedModule, comptime reason: []const u8) void {
     comptime std.debug.assert(reason.len > 0);
@@ -1162,6 +1163,11 @@ pub fn build(b: *std.Build) void {
             shared_modules.command_types.mod,
             shared_modules.harness.mod,
             .{},
+        );
+        linkCoreException(
+            .{ .layer = .core, .name = "platform", .mod = platform_linux_x11_test_mod },
+            shared_modules.pixelops,
+            "software nearest resample for x11 fixed-framebuffer present",
         );
         const platform_linux_x11_test = b.addTest(.{ .root_module = platform_linux_x11_test_mod });
         test_platform_facade_step.dependOn(&b.addRunArtifact(platform_linux_x11_test).step);
@@ -3309,10 +3315,12 @@ fn makePlatformVariant(
     }) };
     wireKitImports(kit, platform_mod, common, app_runtime);
 
-    // BGRA→RGBA SIMD swizzle for wasm present (platform_wasm → pixelops).
-    // ADR-007 core→lib exception via linkCoreException (bare addImport is not allowed).
+    // platform → pixelops: wasm present swizzle, or x11 software nearest resample.
+    // Other backends keep the compositor / GPU scale path and do not take this exception.
     if (backend == .wasm) {
         linkCoreException(platform_mod, common.pixelops, "BGRA→RGBA SIMD swizzle for wasm present");
+    } else if (backend == .x11) {
+        linkCoreException(platform_mod, common.pixelops, "software nearest resample for x11 fixed-framebuffer present");
     }
 
     return .{
@@ -3469,6 +3477,13 @@ const SharedModules = struct {
         const pixelops: TaggedModule = .{ .layer = .lib, .name = "pixelops", .mod = b.createModule(.{
             .root_source_file = b.path("libs/pixelops/src/lib.zig"),
         }) };
+        if (platform_backend == .x11) {
+            linkCoreException(
+                platform_mod,
+                pixelops,
+                "software nearest resample for x11 fixed-framebuffer present",
+            );
+        }
 
         // libs/gmath: platform-independent f32 game math and collision primitives.
         // It is a stable L2-L3 library and is publicly exposed through kit.gmath.

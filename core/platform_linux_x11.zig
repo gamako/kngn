@@ -30,6 +30,7 @@ const input = @import("platform_linux_input.zig");
 const conv = @import("platform_linux_convert.zig");
 const common = @import("platform_linux_common.zig");
 const build_options = @import("build_options");
+const pixelops = @import("pixelops");
 
 const c = @cImport({
     @cInclude("X11/Xlib.h");
@@ -93,7 +94,7 @@ fn logicalSizeForPhysical(fb_mode: FramebufferMode, physical: WindowSize, scale:
     // mode this backend has not implemented would silently take the wrong branch here.
     switch (fb_mode) {
         .logical => return physical,
-        .fixed => return physical, // refused at creation; the framebuffer never reaches this size path
+        .fixed => |size| return size,
         .physical => {},
     }
     return .{
@@ -106,13 +107,35 @@ fn logicalSizeForPhysical(fb_mode: FramebufferMode, physical: WindowSize, scale:
 fn effectiveFramebufferSize(fb_mode: FramebufferMode, logical: WindowSize, scale: f32) WindowSize {
     switch (fb_mode) {
         .logical => return logical,
-        .fixed => |size| return size, // refused at creation, but stated rather than left to fall through
+        .fixed => |size| return size,
         .physical => {},
     }
     return .{
         .width = roundToPhysicalPx(logical.width, scale),
         .height = roundToPhysicalPx(logical.height, scale),
     };
+}
+
+fn isFixedMode(fb_mode: FramebufferMode) bool {
+    return switch (fb_mode) {
+        .fixed => true,
+        .logical, .physical => false,
+    };
+}
+
+/// Content scale reported to the application: 1.0 under `.fixed` (the real scale stays in
+/// state for window geometry).
+fn reportedContentScale(fb_mode: FramebufferMode, raw: f32) f32 {
+    return switch (fb_mode) {
+        .fixed => 1.0,
+        .logical, .physical => effectiveContentScale(raw),
+    };
+}
+
+fn presentMappingPlacementChanged(a: types.PresentMapping, b: types.PresentMapping) bool {
+    return a.origin.x != b.origin.x or a.origin.y != b.origin.y or
+        a.dst_size.width != b.dst_size.width or a.dst_size.height != b.dst_size.height or
+        a.viewport.width != b.viewport.width or a.viewport.height != b.viewport.height;
 }
 
 /// Read content_scale from Xft.dpi (an X resource). A failure is fail-soft and gives 1.0.
@@ -238,13 +261,17 @@ const State = struct {
     /// The logical size (the coordinates of the application and the GUI; the create argument, held independently rather than derived back through lround).
     logical_width: u32,
     logical_height: u32,
-    /// The physical, framebuffer and real window pixel size (the unit of the blit, of present and of ConfigureNotify).
+    /// The physical, real window pixel size (ConfigureNotify, XImage, present).
     /// Under `.logical` it equals the logical size; under `.physical` it is `roundToPhysicalPx(logical, scale)`.
+    /// Under `.fixed` it is the window size, independent of the framebuffer.
     physical_width: u32,
     physical_height: u32,
-    /// A backwards-compatible alias: the framebuffer size the existing blit path refers to == physical_*.
+    /// A backwards-compatible alias of the real window pixel size (XImage / blit).
     width: u32,
     height: u32,
+    /// The size the application draws. Equals the window under covering modes; the mode's size under `.fixed`.
+    framebuffer_width: u32,
+    framebuffer_height: u32,
     fb_mode: FramebufferMode,
     /// For a query (making input raw, and `contentScale()`). X11 does not support a runtime change, so it stays equal to the latched value.
     pending_content_scale: f32,
@@ -257,8 +284,20 @@ const State = struct {
     depth: c_uint,
 
     // The canonical BGRA framebuffer (what the caller writes, and what lockFramebuffer returns).
-    // direct: an alias of the image data (nothing extra is allocated). fallback: a separate allocation.
+    // Covering + direct: an alias of the image data. Covering + fallback, and every `.fixed` path:
+    // a separately owned allocation (never an alias of the XImage).
     backing: []u32,
+    /// True when `backing` aliases the XImage / shm buffer and must not be freed on its own.
+    backing_is_alias: bool,
+    /// Fallback visual + `.fixed`: window-sized canonical buffer that present resamples into
+    /// before `convert`. Empty on the direct path and on covering modes.
+    scaled: []u32,
+    /// Caller-owned column LUT for `.fixed` present. Empty on covering modes.
+    column_lut: []u32,
+    lut_src_width: u32,
+    lut_dst_width: u32,
+    last_present_mapping: types.PresentMapping,
+    have_present_mapping: bool,
 
     // blit
     image: *c.XImage,
@@ -330,9 +369,6 @@ pub const Window = struct {
     /// own size, so the width and height are ignored in that case (ADR-019 R3).
     /// Hot path declaration: initialisation only.
     pub fn createWithOptions(width: u32, height: u32, title: [:0]const u8, opts: types.WindowOptions) Error!Window {
-        // No present here magnifies a framebuffer into a letterbox yet, so a fixed one is refused
-        // rather than quietly behaving like another mode (ADR-030 R5).
-        try types.refuseFixedFramebuffer(opts.fb_mode);
         return createInternal(width, height, title, opts.fullscreen, opts);
     }
 
@@ -363,14 +399,32 @@ pub const Window = struct {
             .width = @intCast(c.XDisplayWidth(dpy, screen)),
             .height = @intCast(c.XDisplayHeight(dpy, screen)),
         } else undefined;
-        const logical: WindowSize = if (fullscreen)
-            logicalSizeForPhysical(opts.fb_mode, screen_size, scale)
-        else
-            .{ .width = width, .height = height };
-        const fb_size = if (fullscreen) screen_size else effectiveFramebufferSize(opts.fb_mode, logical, scale);
+        const requested: WindowSize = .{ .width = width, .height = height };
+        const win_size: WindowSize = if (fullscreen)
+            screen_size
+        else switch (opts.fb_mode) {
+            // Create arguments are the real window size; the framebuffer stays the size the mode carries.
+            .fixed => requested,
+            .logical, .physical => effectiveFramebufferSize(opts.fb_mode, requested, scale),
+        };
+        const fb_size: WindowSize = switch (opts.fb_mode) {
+            .fixed => |size| size,
+            .logical, .physical => if (fullscreen)
+                screen_size
+            else
+                effectiveFramebufferSize(opts.fb_mode, requested, scale),
+        };
+        const logical: WindowSize = switch (opts.fb_mode) {
+            .fixed => |size| size,
+            .logical, .physical => if (fullscreen)
+                logicalSizeForPhysical(opts.fb_mode, screen_size, scale)
+            else
+                requested,
+        };
         if (fb_size.width == 0 or fb_size.height == 0) return error.WindowCreationFailed;
-        const win_w = fb_size.width;
-        const win_h = fb_size.height;
+        if (win_size.width == 0 or win_size.height == 0) return error.WindowCreationFailed;
+        const win_w = win_size.width;
+        const win_h = win_size.height;
 
         var visual: ?*c.Visual = undefined;
         var depth: c_uint = undefined;
@@ -501,6 +555,8 @@ pub const Window = struct {
             .physical_height = win_h,
             .width = win_w,
             .height = win_h,
+            .framebuffer_width = fb_size.width,
+            .framebuffer_height = fb_size.height,
             .fb_mode = opts.fb_mode,
             .pending_content_scale = scale,
             .content_scale = scale,
@@ -513,6 +569,13 @@ pub const Window = struct {
             .colormap = colormap,
             .own_gc = own_gc,
             .backing = &.{},
+            .backing_is_alias = false,
+            .scaled = &.{},
+            .column_lut = &.{},
+            .lut_src_width = 0,
+            .lut_dst_width = 0,
+            .last_present_mapping = .{},
+            .have_present_mapping = false,
             .image = undefined,
             .bytes_per_line = 0,
             .use_shm = false,
@@ -549,8 +612,13 @@ pub const Window = struct {
 
         // Set up the blit (shm when XShm is available, XPutImage when it is not or it fails).
         // The visual classification decides direct or fallback, and settles st.backing (the canonical BGRA the caller writes).
-        // Under `.physical` it is allocated at the physical pixel size.
-        try setupBlit(st, visual, depth, win_w, win_h);
+        // Under `.physical` the window is the physical pixel size; under `.fixed` the XImage is
+        // window-sized and the framebuffer is the size the mode carries.
+        try setupBlit(st, visual, depth, win_w, win_h, fb_size.width, fb_size.height);
+        if (isFixedMode(opts.fb_mode)) {
+            errdefer teardownFixedResources(st);
+            try ensureColumnLut(st, fb_size.width, letterboxDestWidth(win_w, win_h, fb_size.width, fb_size.height));
+        }
 
         // The map happens only once the blit is ready (so it is never mapped for an instant and then fails)
         _ = c.XMapWindow(dpy, win);
@@ -570,8 +638,8 @@ pub const Window = struct {
         if (st.own_gc) _ = c.XFreeGC(dpy, st.gc); // Free the GC made by hand for a transparent window
         _ = c.XDestroyWindow(dpy, st.window);
         if (st.colormap != 0) _ = c.XFreeColormap(dpy, st.colormap); // Free the transparent ARGB colormap
-        // The fallback backing is a separate allocation. The direct backing is an alias of the image data and has already been freed by teardownBlit.
-        if (!st.direct) alloc.free(st.backing);
+        // Owned buffers only: an alias of the image data has already been released by teardownBlit.
+        freeOwnedBuffers(st);
         alloc.destroy(st);
     }
 
@@ -655,16 +723,15 @@ pub const Window = struct {
         const st = self.state;
         // X11 does not support a runtime scale change, so the latch keeps its start-up value (applying it is the identity).
         // The two-mode structure of query and latched is kept, to match the other backends.
-        const scale = effectiveContentScale(st.content_scale);
         const logical: WindowSize = .{ .width = st.logical_width, .height = st.logical_height };
-        const fb_size: WindowSize = .{ .width = st.physical_width, .height = st.physical_height };
+        const fb_size: WindowSize = .{ .width = st.framebuffer_width, .height = st.framebuffer_height };
         return .{
             .pixels = st.backing,
-            .width = st.physical_width,
-            .height = st.physical_height,
+            .width = st.framebuffer_width,
+            .height = st.framebuffer_height,
             .logical_size = logical,
             .framebuffer_size = fb_size,
-            .content_scale = scale,
+            .content_scale = reportedContentScale(st.fb_mode, st.content_scale),
             .scale_epoch = st.scale_epoch,
             .state = st,
         };
@@ -677,24 +744,37 @@ pub const Window = struct {
     }
 
     /// The currently negotiated framebuffer size (in physical pixels; equal to the logical one under `.logical`).
+    /// Under `.fixed` this is the size the mode carries, not the window.
     pub fn framebufferSize(self: Window) WindowSize {
+        const st = self.state;
+        return .{ .width = st.framebuffer_width, .height = st.framebuffer_height };
+    }
+
+    /// The currently negotiated content scale (from the real Xft.dpi whether `.logical` or `.physical`;
+    /// 1.0 under `.fixed` and on a failed query).
+    pub fn contentScale(self: Window) f32 {
+        return reportedContentScale(self.state.fb_mode, self.state.pending_content_scale);
+    }
+
+    /// The real window in physical pixels, which is what the facade works the letterbox of a
+    /// fixed framebuffer out from.
+    pub fn presentViewport(self: Window) WindowSize {
         const st = self.state;
         return .{ .width = st.physical_width, .height = st.physical_height };
     }
 
-    /// The currently negotiated content scale (from the real Xft.dpi whether `.logical` or `.physical`; 1.0 on failure).
-    pub fn contentScale(self: Window) f32 {
-        return effectiveContentScale(self.state.pending_content_scale);
-    }
-
-    /// The mapping is unused while this backend refuses a fixed framebuffer: its framebuffer
-    /// always covers the window, so the destination rectangle is the window.
-    pub fn present(self: Window, _: types.PresentMapping) void {
+    /// Blit the framebuffer. Covering modes write the window 1:1. `.fixed` resamples into the
+    /// mapping's destination rectangle and keeps the letterbox bars.
+    pub fn present(self: Window, mapping: types.PresentMapping) void {
         const st = self.state;
         const dpy = st.display;
-        if (st.click_through and !st.ct_region_valid) refreshInputShape(st); // once only, after it is turned on
-        // direct has the caller writing the image data itself, so nothing is converted. Only fallback converts the backing into the image data.
-        if (!st.direct) convert(st);
+        if (st.click_through and !st.ct_region_valid) refreshInputShape(st, mapping);
+        if (isFixedMode(st.fb_mode)) {
+            presentFixed(st, mapping);
+        } else if (!st.direct) {
+            convert(st, st.backing);
+        }
+        if (st.width == 0 or st.height == 0) return;
         const w: c_uint = @intCast(st.width);
         const h: c_uint = @intCast(st.height);
         if (st.use_shm) {
@@ -815,15 +895,26 @@ pub const Window = struct {
 
 /// The current window geometry.
 /// The position is the client origin in root coordinates (XTranslateCoordinates). On failure it is position=null.
-/// The size is the **logical** content (`logical_width/height`). Restoring uses the same basis, through WM_NORMAL_HINTS's StaticGravity.
+/// The size is what a caller should persist: the logical content (`logical_width/height`)
+/// under `.logical` and `.physical`, and the physical window size under `.fixed`.
+/// Under `.fixed` the reported logical size *is* the framebuffer, so persisting that
+/// would reopen the window at the framebuffer size after the user had resized it.
+/// Restoring uses the same basis, through WM_NORMAL_HINTS's StaticGravity.
 fn currentGeometry(st: *State) types.WindowGeometry {
     var root_x: c_int = 0;
     var root_y: c_int = 0;
     var child: c.Window = undefined;
     const ok = c.XTranslateCoordinates(st.display, st.window, c.XDefaultRootWindow(st.display), 0, 0, &root_x, &root_y, &child);
+    // Under `.fixed` the logical size is the framebuffer, which must not be persisted as the
+    // window size: restoring would reopen at the framebuffer's size regardless of how the user
+    // had resized the window.
+    const size: WindowSize = switch (st.fb_mode) {
+        .fixed => .{ .width = st.physical_width, .height = st.physical_height },
+        .logical, .physical => .{ .width = st.logical_width, .height = st.logical_height },
+    };
     return .{
         .position = if (ok != 0) .{ .x = root_x, .y = root_y } else null,
-        .size = .{ .width = st.logical_width, .height = st.logical_height },
+        .size = size,
     };
 }
 
@@ -1036,11 +1127,10 @@ fn mouseEvent(st: *State, x: c_int, y: c_int, button: MouseButton, state: u32) M
 /// X11 native (real window pixel coordinates) → raw physical event coordinates.
 fn nativeToRawPhysical(st: *const State, native_x: c_int, native_y: c_int) struct { x: i32, y: i32 } {
     switch (st.fb_mode) {
-        .physical => return .{ .x = native_x, .y = native_y },
+        // Native coordinates are already the real window pixels. The facade applies the latched
+        // `PresentMapping.physicalToApp`, so this path must not convert again.
+        .physical, .fixed => return .{ .x = native_x, .y = native_y },
         .logical => {},
-        // Refused by `refuseFixedFramebuffer` at window creation, because this backend has no
-        // present that magnifies. Its input would need the letterbox mapping, not this one.
-        .fixed => unreachable,
     }
     // `.logical`: the window is at the logical size, so native is a logical value. It is multiplied into raw physical, which pairs with the facade's normalisation.
     const s = effectiveContentScale(st.pending_content_scale);
@@ -1092,13 +1182,59 @@ fn handleMotion(st: *State, e: *c.XMotionEvent) void {
 /// A bounding box would let the window catch the transparent corners of a round picture too (click-through would not work), hence a per-pixel mask.
 /// It is gated by ct_region_valid and runs once after it is turned on (never an all-pixel loop per frame, which keeps the performance rules).
 /// The alpha of canonical BGRA is the top 8 bits. XCreateBitmapFromData is LSB-first and pads each row to a byte boundary.
-fn refreshInputShape(st: *State) void {
+/// Map a framebuffer span through `mapping` into a window-physical rectangle. A zero-area
+/// destination is dropped so minification cannot add an empty bit of the input mask.
+fn physicalRectFromFramebufferSpan(
+    mapping: types.PresentMapping,
+    x: i32,
+    y: i32,
+    w: i32,
+    h: i32,
+) ?types.WindowRect {
+    const r = types.framebufferRectToPhysical(mapping, x, y, w, h);
+    if (r.w <= 0 or r.h <= 0) return null;
+    return .{
+        .x = r.x,
+        .y = r.y,
+        .width = @intCast(r.w),
+        .height = @intCast(r.h),
+    };
+}
+
+fn setBitmapRect(data: []u8, byte_stride: u32, win_w: u32, win_h: u32, rect: types.WindowRect) void {
+    const x0_i = @max(rect.x, 0);
+    const y0_i = @max(rect.y, 0);
+    const x1_i = @min(types.PresentMapping.saturate(@as(i128, rect.x) + rect.width), @as(i32, @intCast(win_w)));
+    const y1_i = @min(types.PresentMapping.saturate(@as(i128, rect.y) + rect.height), @as(i32, @intCast(win_h)));
+    if (x1_i <= x0_i or y1_i <= y0_i) return;
+    const x0: u32 = @intCast(x0_i);
+    const y0: u32 = @intCast(y0_i);
+    const x1: u32 = @intCast(x1_i);
+    const y1: u32 = @intCast(y1_i);
+    var y: u32 = y0;
+    while (y < y1) : (y += 1) {
+        var x: u32 = x0;
+        while (x < x1) : (x += 1) {
+            data[@as(usize, y) * byte_stride + (x >> 3)] |= (@as(u8, 1) << @intCast(x & 7));
+        }
+    }
+}
+
+fn refreshInputShape(st: *State, mapping: types.PresentMapping) void {
+    if (st.ct_region_valid) return;
+    if (isFixedMode(st.fb_mode)) {
+        refreshFixedInputShape(st, mapping);
+        return;
+    }
     const w = st.width;
     const h = st.height;
     const px = st.backing;
     if (px.len < @as(usize, w) * @as(usize, h)) return;
+    const win_w_c = std.math.cast(c_uint, w) orelse return;
+    const win_h_c = std.math.cast(c_uint, h) orelse return;
     const stride = (w + 7) / 8; // the bytes per row (8px per byte, padded to a byte boundary)
-    const data = alloc.alloc(u8, @as(usize, stride) * @as(usize, h)) catch return;
+    const nbytes = std.math.mul(usize, stride, h) catch return;
+    const data = alloc.alloc(u8, nbytes) catch return;
     defer alloc.free(data);
     @memset(data, 0);
     var y: u32 = 0;
@@ -1111,7 +1247,7 @@ fn refreshInputShape(st: *State) void {
             }
         }
     }
-    const bmp = c.XCreateBitmapFromData(st.display, st.window, @ptrCast(data.ptr), @intCast(w), @intCast(h));
+    const bmp = c.XCreateBitmapFromData(st.display, st.window, @ptrCast(data.ptr), win_w_c, win_h_c);
     if (bmp == 0) return; // on failure valid is left unset and the next present retries
     c.XShapeCombineMask(st.display, st.window, c.ShapeInput, 0, 0, bmp, c.ShapeSet);
     _ = c.XFreePixmap(st.display, bmp);
@@ -1119,7 +1255,53 @@ fn refreshInputShape(st: *State) void {
     st.ct_region_valid = true;
 }
 
-fn setupBlit(st: *State, visual: ?*c.Visual, depth: c_uint, width: u32, height: u32) Error!void {
+fn refreshFixedInputShape(st: *State, mapping: types.PresentMapping) void {
+    const win_w = st.physical_width;
+    const win_h = st.physical_height;
+    const fb_w = st.framebuffer_width;
+    const fb_h = st.framebuffer_height;
+    const px = st.backing;
+    if (px.len < @as(usize, fb_w) * @as(usize, fb_h)) return;
+    const win_w_c = std.math.cast(c_uint, win_w) orelse return;
+    const win_h_c = std.math.cast(c_uint, win_h) orelse return;
+    const stride = (win_w + 7) / 8;
+    const nbytes = std.math.mul(usize, stride, win_h) catch return;
+    const data = alloc.alloc(u8, nbytes) catch return;
+    defer alloc.free(data);
+    @memset(data, 0);
+
+    var y: u32 = 0;
+    while (y < fb_h) : (y += 1) {
+        const row = @as(usize, y) * @as(usize, fb_w);
+        var x: u32 = 0;
+        while (x < fb_w) {
+            if ((px[row + x] >> 24) == 0) {
+                x += 1;
+                continue;
+            }
+            const run_start = x;
+            while (x < fb_w and (px[row + x] >> 24) != 0) : (x += 1) {}
+            if (physicalRectFromFramebufferSpan(
+                mapping,
+                @intCast(run_start),
+                @intCast(y),
+                @intCast(x - run_start),
+                1,
+            )) |rect| {
+                setBitmapRect(data, stride, win_w, win_h, rect);
+            }
+        }
+    }
+
+    const bmp = c.XCreateBitmapFromData(st.display, st.window, @ptrCast(data.ptr), win_w_c, win_h_c);
+    if (bmp == 0) return;
+    c.XShapeCombineMask(st.display, st.window, c.ShapeInput, 0, 0, bmp, c.ShapeSet);
+    _ = c.XFreePixmap(st.display, bmp);
+    _ = c.XFlush(st.display);
+    st.ct_region_valid = true;
+}
+
+fn setupBlit(st: *State, visual: ?*c.Visual, depth: c_uint, window_w: u32, window_h: u32, fb_w: u32, fb_h: u32) Error!void {
     const dpy = st.display;
 
     // Try the shm path when XShm is available.
@@ -1127,14 +1309,14 @@ fn setupBlit(st: *State, visual: ?*c.Visual, depth: c_uint, width: u32, height: 
     // (which is how the fallback is checked in an environment where XShm does work).
     const disable_shm = std.c.getenv("KNGN_DISABLE_XSHM") != null;
     if (!disable_shm and c.XShmQueryExtension(dpy) != 0) {
-        if (trySetupShm(st, visual, depth, width, height)) {
-            try classifyAndSetupBacking(st, width, height);
+        if (trySetupShm(st, visual, depth, window_w, window_h)) {
+            try classifyAndSetupBacking(st, window_w, window_h, fb_w, fb_h);
             return;
         }
         // failed → fall back
     }
-    try setupPutImage(st, visual, depth, width, height);
-    try classifyAndSetupBacking(st, width, height);
+    try setupPutImage(st, visual, depth, window_w, window_h);
+    try classifyAndSetupBacking(st, window_w, window_h, fb_w, fb_h);
 }
 
 /// The XShm path. true on success, false when it should fall back.
@@ -1235,7 +1417,7 @@ fn setupPutImage(st: *State, visual: ?*c.Visual, depth: c_uint, width: u32, heig
 
 /// After the XImage is created, classifyVisual classifies the visual and settles the direct or fallback backing.
 /// fail (not 32bpp, MSBFirst, a non-contiguous or overlapping mask, 16/24bpp, 565 and so on) gives WindowCreationFailed.
-fn classifyAndSetupBacking(st: *State, width: u32, height: u32) Error!void {
+fn classifyAndSetupBacking(st: *State, window_w: u32, window_h: u32, fb_w: u32, fb_h: u32) Error!void {
     const img = st.image;
     const bpp: u32 = @intCast(img.*.bits_per_pixel);
     const byte_order: conv.ByteOrder = if (img.*.byte_order == c.MSBFirst) .msb_first else .lsb_first;
@@ -1243,29 +1425,78 @@ fn classifyAndSetupBacking(st: *State, width: u32, height: u32) Error!void {
     const gm: u64 = img.*.green_mask;
     const bm: u64 = img.*.blue_mask;
 
-    const px_count = std.math.mul(usize, width, height) catch return failBlit(st);
-
-    switch (conv.classifyVisual(bpp, byte_order, st.bytes_per_line, width, rm, gm, bm)) {
+    switch (conv.classifyVisual(bpp, byte_order, st.bytes_per_line, window_w, rm, gm, bm)) {
         .fail => return failBlit(st),
         .direct => {
-            // A standard visual: the low 24 bits match 0x00RRGGBB, so the caller writes the image data itself (with no converting copy).
-            // The backing is an alias of the image data (nothing extra is allocated).
             st.direct = true;
-            const base: [*]u32 = @ptrCast(@alignCast(img.*.data));
-            st.backing = base[0..px_count];
-            @memset(st.backing, 0);
+            st.r_shift = 0;
+            st.g_shift = 0;
+            st.b_shift = 0;
         },
         .fallback => {
-            // A non-standard shift or stride padding: a separate backing (BGRA) is kept and converted by packPixel at present time.
             st.direct = false;
             st.r_shift = conv.maskShift(rm) orelse return failBlit(st);
             st.g_shift = conv.maskShift(gm) orelse return failBlit(st);
             st.b_shift = conv.maskShift(bm) orelse return failBlit(st);
-            const buf = alloc.alloc(u32, px_count) catch return failBlit(st);
-            @memset(buf, 0);
-            st.backing = buf;
         },
     }
+
+    if (isFixedMode(st.fb_mode)) {
+        try setupFixedBacking(st, window_w, window_h, fb_w, fb_h);
+        return;
+    }
+
+    const px_count = std.math.mul(usize, window_w, window_h) catch return failBlit(st);
+    if (st.direct) {
+        // A standard visual: the low 24 bits match 0x00RRGGBB, so the caller writes the image data itself (with no converting copy).
+        // The backing is an alias of the image data (nothing extra is allocated).
+        st.backing_is_alias = true;
+        const base: [*]u32 = @ptrCast(@alignCast(img.*.data));
+        st.backing = base[0..px_count];
+        @memset(st.backing, 0);
+        st.scaled = &.{};
+    } else {
+        // A non-standard shift or stride padding: a separate backing (BGRA) is kept and converted by packPixel at present time.
+        st.backing_is_alias = false;
+        const buf = alloc.alloc(u32, px_count) catch return failBlit(st);
+        @memset(buf, 0);
+        st.backing = buf;
+        st.scaled = &.{};
+    }
+}
+
+fn setupFixedBacking(st: *State, window_w: u32, window_h: u32, fb_w: u32, fb_h: u32) Error!void {
+    // `.fixed` always owns the framebuffer. Direct visual still resamples into the XImage;
+    // fallback resamples into `scaled` and then converts.
+    st.backing_is_alias = false;
+    var allocated_backing = false;
+    if (st.backing.len == 0) {
+        const fb_count = std.math.mul(usize, fb_w, fb_h) catch return failBlit(st);
+        const buf = alloc.alloc(u32, fb_count) catch return failBlit(st);
+        @memset(buf, 0);
+        st.backing = buf;
+        allocated_backing = true;
+    }
+    if (st.direct) {
+        st.scaled = &.{};
+        return;
+    }
+    const win_count = std.math.mul(usize, window_w, window_h) catch {
+        if (allocated_backing) {
+            alloc.free(st.backing);
+            st.backing = &.{};
+        }
+        return failBlit(st);
+    };
+    const scaled = alloc.alloc(u32, win_count) catch {
+        if (allocated_backing) {
+            alloc.free(st.backing);
+            st.backing = &.{};
+        }
+        return failBlit(st);
+    };
+    @memset(scaled, 0);
+    st.scaled = scaled;
 }
 
 /// Free the blit resources (the XImage, and either the XShm segment or the Zig-owned transfer buffer). Shared by `destroy` and `failBlit`.
@@ -1295,6 +1526,13 @@ fn failBlit(st: *State) Error {
 /// A snapshot of the blit fields. It is what makes the resize two-phase (allocate the new, free the old; restore the old on failure).
 const BlitState = struct {
     backing: []u32,
+    backing_is_alias: bool,
+    scaled: []u32,
+    column_lut: []u32,
+    lut_src_width: u32,
+    lut_dst_width: u32,
+    last_present_mapping: types.PresentMapping,
+    have_present_mapping: bool,
     image: *c.XImage,
     bytes_per_line: usize,
     use_shm: bool,
@@ -1311,6 +1549,13 @@ const BlitState = struct {
 fn captureBlit(st: *const State) BlitState {
     return .{
         .backing = st.backing,
+        .backing_is_alias = st.backing_is_alias,
+        .scaled = st.scaled,
+        .column_lut = st.column_lut,
+        .lut_src_width = st.lut_src_width,
+        .lut_dst_width = st.lut_dst_width,
+        .last_present_mapping = st.last_present_mapping,
+        .have_present_mapping = st.have_present_mapping,
         .image = st.image,
         .bytes_per_line = st.bytes_per_line,
         .use_shm = st.use_shm,
@@ -1327,6 +1572,13 @@ fn captureBlit(st: *const State) BlitState {
 
 fn restoreBlit(st: *State, b: BlitState) void {
     st.backing = b.backing;
+    st.backing_is_alias = b.backing_is_alias;
+    st.scaled = b.scaled;
+    st.column_lut = b.column_lut;
+    st.lut_src_width = b.lut_src_width;
+    st.lut_dst_width = b.lut_dst_width;
+    st.last_present_mapping = b.last_present_mapping;
+    st.have_present_mapping = b.have_present_mapping;
     st.image = b.image;
     st.bytes_per_line = b.bytes_per_line;
     st.use_shm = b.use_shm;
@@ -1340,7 +1592,7 @@ fn restoreBlit(st: *State, b: BlitState) void {
     st.b_shift = b.b_shift;
 }
 
-/// Free the resources of a BlitState (a snapshot value). The value form of teardownBlit, plus freeing the fallback backing.
+/// Free the resources of a BlitState (a snapshot value). The value form of teardownBlit, plus owned buffers.
 fn freeBlitState(dpy: *c.Display, b: *BlitState) void {
     if (b.use_shm) {
         if (b.attached) _ = c.XShmDetach(dpy, &b.shminfo);
@@ -1351,8 +1603,11 @@ fn freeBlitState(dpy: *c.Display, b: *BlitState) void {
         destroyImage(b.image);
         if (b.xfer.len != 0) alloc.free(b.xfer);
     }
-    // The fallback backing is a separate allocation. The direct backing is an alias of the image data and was freed above.
-    if (!b.direct and b.backing.len != 0) alloc.free(b.backing);
+    // An alias of the image data was released above. `.fixed` resize keeps the framebuffer
+    // and so snapshots it as empty here.
+    if (!b.backing_is_alias and b.backing.len != 0) alloc.free(b.backing);
+    if (b.scaled.len != 0) alloc.free(b.scaled);
+    if (b.column_lut.len != 0) alloc.free(b.column_lut);
 }
 
 /// Apply the real window pixel size of a ConfigureNotify to logical and physical, and reallocate the blit.
@@ -1360,6 +1615,11 @@ fn freeBlitState(dpy: *c.Display, b: *BlitState) void {
 fn applyConfigureSize(st: *State, new_phys_w: u32, new_phys_h: u32) void {
     if (new_phys_w == 0 or new_phys_h == 0) return;
     if (new_phys_w == st.physical_width and new_phys_h == st.physical_height) return;
+
+    if (isFixedMode(st.fb_mode)) {
+        resizeBlit(st, new_phys_w, new_phys_h, st.framebuffer_width, st.framebuffer_height);
+        return;
+    }
 
     // A Configure size is always the real window pixel size = physical = the framebuffer. The
     // derivation is the same helper window creation uses, so a fullscreen window's logical size
@@ -1372,38 +1632,59 @@ fn applyConfigureSize(st: *State, new_phys_w: u32, new_phys_h: u32) void {
     const new_logical_w: u32 = new_logical.width;
     const new_logical_h: u32 = new_logical.height;
 
-    resizeBlit(st, new_phys_w, new_phys_h);
+    resizeBlit(st, new_phys_w, new_phys_h, new_phys_w, new_phys_h);
     // physical is updated only when resizeBlit succeeds. On failure the old size is kept, so logical is left alone too.
     if (st.physical_width == new_phys_w and st.physical_height == new_phys_h) {
         st.logical_width = new_logical_w;
         st.logical_height = new_logical_h;
+        st.framebuffer_width = new_phys_w;
+        st.framebuffer_height = new_phys_h;
     }
 }
 
 /// Called on a ConfigureNotify. It tries setupBlit at the new size, and on success frees the old blit and
 /// updates physical/width/height. On a failure (an OOM, say) it restores the old blit and keeps the old size (never breaking the window).
-fn resizeBlit(st: *State, new_w: u32, new_h: u32) void {
+fn resizeBlit(st: *State, new_w: u32, new_h: u32, fb_w: u32, fb_h: u32) void {
     if (new_w == 0 or new_h == 0) return; // minimised, or zero, is ignored
     if (new_w == st.physical_width and new_h == st.physical_height) return;
 
+    const fixed = isFixedMode(st.fb_mode);
     var old = captureBlit(st);
+    if (fixed) {
+        // Detach the window-sized scratch so a successful setupBlit can allocate a new one
+        // without aliasing the snapshot we still have to free (or restore).
+        st.scaled = &.{};
+    }
     // setupBlit overwrites st's blit fields with the new resources (on failure its internal failBlit frees the
     // new resources, but st's fields are left dangling → the catch below restores the old values).
-    setupBlit(st, st.visual, st.depth, new_w, new_h) catch {
+    setupBlit(st, st.visual, st.depth, new_w, new_h, fb_w, fb_h) catch {
         restoreBlit(st, old);
         return;
     };
+    if (fixed) {
+        ensureColumnLut(st, fb_w, letterboxDestWidth(new_w, new_h, fb_w, fb_h)) catch {
+            teardownBlit(st);
+            if (st.scaled.len != 0) alloc.free(st.scaled);
+            restoreBlit(st, old);
+            return;
+        };
+        // The framebuffer and the (possibly reused) LUT stay with `st`.
+        old.backing = &.{};
+        old.backing_is_alias = true;
+        old.column_lut = &.{};
+    }
     st.physical_width = new_w;
     st.physical_height = new_h;
     st.width = new_w;
     st.height = new_h;
+    st.have_present_mapping = false;
     st.ct_region_valid = false; // A size change makes the click-through input shape be recomputed (the old mask is stale)
     freeBlitState(st.display, &old);
 }
 
-/// The fallback path: convert the canonical BGRA (0xAARRGGBB) backing into the image data (in the visual's mask layout).
+/// The fallback path: convert canonical BGRA (0xAARRGGBB) `src` into the image data (in the visual's mask layout).
 /// Stride padding is absorbed by reading bytes_per_line. It is never called on the direct path.
-fn convert(st: *State) void {
+fn convert(st: *State, src_pixels: []const u32) void {
     const w = st.width;
     const h = st.height;
     const data: [*]u8 = @ptrCast(st.image.*.data);
@@ -1412,12 +1693,129 @@ fn convert(st: *State) void {
     var y: usize = 0;
     while (y < h) : (y += 1) {
         const row: [*]u32 = @ptrCast(@alignCast(data + y * bpl));
-        const src = st.backing[y * w ..][0..w];
+        const src = src_pixels[y * w ..][0..w];
         var x: usize = 0;
         while (x < w) : (x += 1) {
             row[x] = conv.packPixel(src[x], st.r_shift, st.g_shift, st.b_shift);
         }
     }
+}
+
+fn letterboxDestWidth(win_w: u32, win_h: u32, fb_w: u32, fb_h: u32) u32 {
+    return types.PresentMapping.letterbox(
+        .{ .width = win_w, .height = win_h },
+        .{ .width = fb_w, .height = fb_h },
+    ).dst_size.width;
+}
+
+fn ensureColumnLut(st: *State, src_w: u32, dst_w: u32) Error!void {
+    if (dst_w == 0) {
+        if (st.column_lut.len != 0) {
+            alloc.free(st.column_lut);
+            st.column_lut = &.{};
+        }
+        st.lut_src_width = src_w;
+        st.lut_dst_width = 0;
+        return;
+    }
+    if (columnLutView(st).matches(src_w, dst_w)) return;
+    const new_lut = alloc.alloc(u32, dst_w) catch return error.WindowCreationFailed;
+    const table = pixelops.buildNearestColumnLut(new_lut, src_w, dst_w);
+    st.column_lut = new_lut;
+    st.lut_src_width = table.src_width;
+    st.lut_dst_width = table.dst_width;
+}
+
+fn freeOwnedBuffers(st: *State) void {
+    if (!st.backing_is_alias and st.backing.len != 0) alloc.free(st.backing);
+    st.backing = &.{};
+    st.backing_is_alias = false;
+    if (st.scaled.len != 0) alloc.free(st.scaled);
+    st.scaled = &.{};
+    if (st.column_lut.len != 0) alloc.free(st.column_lut);
+    st.column_lut = &.{};
+    st.lut_src_width = 0;
+    st.lut_dst_width = 0;
+}
+
+fn teardownFixedResources(st: *State) void {
+    teardownBlit(st);
+    freeOwnedBuffers(st);
+}
+
+fn columnLutView(st: *const State) pixelops.NearestColumnLut {
+    const n = @min(st.column_lut.len, st.lut_dst_width);
+    return .{
+        .entries = st.column_lut[0..n],
+        .src_width = st.lut_src_width,
+        .dst_width = st.lut_dst_width,
+    };
+}
+
+fn imagePixels(st: *State) []u32 {
+    const count = std.math.mul(usize, st.bytes_per_line / 4, st.height) catch return &.{};
+    const base: [*]u32 = @ptrCast(@alignCast(st.image.*.data));
+    return base[0..count];
+}
+
+fn presentFixed(st: *State, mapping: types.PresentMapping) void {
+    if (mapping.viewport.width == 0 or mapping.viewport.height == 0 or
+        mapping.dst_size.width == 0 or mapping.dst_size.height == 0)
+        return;
+
+    const dest_pixels: []u32 = if (st.direct) imagePixels(st) else st.scaled;
+    if (dest_pixels.len == 0) return;
+    const dest_stride: u32 = if (st.direct)
+        @intCast(st.bytes_per_line / 4)
+    else
+        st.width;
+
+    const paint_bars = !st.have_present_mapping or presentMappingPlacementChanged(st.last_present_mapping, mapping);
+    if (paint_bars) {
+        const bar_color: u32 = if (st.transparent) 0x00000000 else 0xFF000000;
+        const bars = types.letterboxBars(mapping);
+        for (bars.rects[0..bars.count]) |bar| {
+            pixelops.fillRect32(
+                dest_pixels,
+                dest_stride,
+                @intCast(bar.x),
+                @intCast(bar.y),
+                bar.width,
+                bar.height,
+                bar_color,
+            );
+        }
+        st.last_present_mapping = mapping;
+        st.have_present_mapping = true;
+    }
+
+    const lut = columnLutView(st);
+    if (!lut.matches(st.framebuffer_width, mapping.dst_size.width)) {
+        // A table built for another width is a different mapping. Rebuild; do not
+        // resample through a prefix of the old table.
+        ensureColumnLut(st, st.framebuffer_width, mapping.dst_size.width) catch {
+            if (!st.direct) convert(st, dest_pixels);
+            return;
+        };
+    }
+    pixelops.nearestResample(
+        .{ .pixels = dest_pixels, .stride = dest_stride },
+        .{
+            .x = @intCast(mapping.origin.x),
+            .y = @intCast(mapping.origin.y),
+            .width = mapping.dst_size.width,
+            .height = mapping.dst_size.height,
+        },
+        .{
+            .pixels = st.backing,
+            .stride = st.framebuffer_width,
+            .width = st.framebuffer_width,
+            .height = st.framebuffer_height,
+        },
+        columnLutView(st),
+    );
+
+    if (!st.direct) convert(st, dest_pixels);
 }
 
 // ============================================================================
@@ -1511,4 +1909,103 @@ test "a fullscreen logical size does not move when the first resize reports the 
     const b = logicalSizeForPhysical(.physical, odd, 1.5);
     try std.testing.expectEqual(a.width, b.width);
     try std.testing.expectEqual(@as(u32, 1707), a.width); // 2560/1.5 = 1706.67 -> 1707
+}
+
+test "effectiveFramebufferSize .fixed returns the size the mode carries" {
+    const fixed: FramebufferMode = .{ .fixed = .{ .width = 640, .height = 400 } };
+    const ignored: WindowSize = .{ .width = 1920, .height = 1080 };
+    const fb = effectiveFramebufferSize(fixed, ignored, 2.0);
+    try std.testing.expectEqual(@as(u32, 640), fb.width);
+    try std.testing.expectEqual(@as(u32, 400), fb.height);
+}
+
+test "logicalSizeForPhysical .fixed returns the size the mode carries" {
+    const fixed: FramebufferMode = .{ .fixed = .{ .width = 640, .height = 400 } };
+    const physical: WindowSize = .{ .width = 1920, .height = 1080 };
+    const logical = logicalSizeForPhysical(fixed, physical, 2.0);
+    try std.testing.expectEqual(@as(u32, 640), logical.width);
+    try std.testing.expectEqual(@as(u32, 400), logical.height);
+}
+
+test "nativeToRawPhysical .fixed keeps native physical coordinates" {
+    var st: State = undefined;
+    st.fb_mode = .{ .fixed = .{ .width = 640, .height = 400 } };
+    st.pending_content_scale = 2.0;
+    const raw = nativeToRawPhysical(&st, 100, 50);
+    try std.testing.expectEqual(@as(i32, 100), raw.x);
+    try std.testing.expectEqual(@as(i32, 50), raw.y);
+}
+
+test "fixed input shape: the whole framebuffer maps onto the destination rectangle" {
+    const m = types.PresentMapping.letterbox(
+        .{ .width = 1280, .height = 800 },
+        .{ .width = 640, .height = 400 },
+    );
+    const r = physicalRectFromFramebufferSpan(m, 0, 0, 640, 400).?;
+    try std.testing.expectEqual(m.origin.x, r.x);
+    try std.testing.expectEqual(m.origin.y, r.y);
+    try std.testing.expectEqual(m.dst_size.width, r.width);
+    try std.testing.expectEqual(m.dst_size.height, r.height);
+}
+
+test "fixed input shape: side and top/bottom bars stay outside the destination" {
+    const wide = types.PresentMapping.letterbox(
+        .{ .width = 1920, .height = 1080 },
+        .{ .width = 640, .height = 400 },
+    );
+    const content = physicalRectFromFramebufferSpan(wide, 0, 0, 640, 400).?;
+    try std.testing.expectEqual(wide.origin.x, content.x);
+    try std.testing.expectEqual(wide.origin.y, content.y);
+    try std.testing.expectEqual(wide.dst_size.width, content.width);
+    try std.testing.expectEqual(wide.dst_size.height, content.height);
+    const side_bars = types.letterboxBars(wide);
+    try std.testing.expect(side_bars.count > 0);
+    for (side_bars.rects[0..side_bars.count]) |bar| {
+        const bar_right = bar.x + @as(i32, @intCast(bar.width));
+        const bar_bottom = bar.y + @as(i32, @intCast(bar.height));
+        const content_right = content.x + @as(i32, @intCast(content.width));
+        const content_bottom = content.y + @as(i32, @intCast(content.height));
+        const overlap = bar.x < content_right and bar_right > content.x and
+            bar.y < content_bottom and bar_bottom > content.y;
+        try std.testing.expect(!overlap);
+    }
+
+    const tall = types.PresentMapping.letterbox(
+        .{ .width = 900, .height = 1600 },
+        .{ .width = 640, .height = 400 },
+    );
+    const tall_content = physicalRectFromFramebufferSpan(tall, 0, 0, 640, 400).?;
+    try std.testing.expectEqual(tall.origin.y, tall_content.y);
+    try std.testing.expect(tall.origin.y > 0 or types.letterboxBars(tall).count > 0);
+}
+
+test "fixed input shape: odd-split bars match the mapping" {
+    const m = types.PresentMapping.letterbox(
+        .{ .width = 1001, .height = 400 },
+        .{ .width = 640, .height = 400 },
+    );
+    const bars = types.letterboxBars(m);
+    try std.testing.expect(bars.count >= 2);
+    const content = physicalRectFromFramebufferSpan(m, 0, 0, 640, 400).?;
+    try std.testing.expectEqual(m.origin.x, content.x);
+    try std.testing.expectEqual(m.dst_size.width, content.width);
+    try std.testing.expectEqual(@as(i32, 180), m.origin.x);
+    try std.testing.expectEqual(@as(u32, 640), m.dst_size.width);
+    var side: u32 = 0;
+    for (bars.rects[0..bars.count]) |bar| {
+        if (bar.y == 0 and bar.height == m.viewport.height) side += bar.width;
+    }
+    try std.testing.expectEqual(@as(u32, 361), side); // 180 + 181
+    try std.testing.expectEqual(m.viewport.width, content.width + side);
+}
+
+test "fixed input shape: minification drops a zero-area rectangle" {
+    const m = types.PresentMapping.letterbox(
+        .{ .width = 2, .height = 2 },
+        .{ .width = 4, .height = 4 },
+    );
+    try std.testing.expectEqual(@as(u32, 2), m.dst_size.width);
+    // Source column 1 of 4 into dest width 2 is a zero-width physical span.
+    try std.testing.expect(physicalRectFromFramebufferSpan(m, 1, 0, 1, 1) == null);
+    try std.testing.expect(physicalRectFromFramebufferSpan(m, 0, 0, 1, 1) != null);
 }
