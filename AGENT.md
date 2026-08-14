@@ -217,7 +217,8 @@ kngn/
 > `linkAppException`, and those call sites in `build.zig` are the authoritative list:
 > `harness(core/control) → png(libs/png)` (encoding a framebuffer snapshot as PNG, and
 > crc32), `harness → dsp` (the spectrum analysis behind the audio digest),
-> `platform → pixelops` (the BGRA→RGBA SIMD swizzle for a wasm present),
+> `platform → pixelops` (SIMD pixel work at present time: the BGRA→RGBA swizzle on
+> wasm, and the nearest resampler that magnifies a fixed framebuffer on X11),
 > `example_26 → paint` (a direct paint import in the demo), and
 > `apps/noodle/lofi.zig → synth` / `→ dsp` (using the generative layer directly).
 > Apps reach pixelops through `kit.pixelops` (re-export), not via `linkAppException`.
@@ -236,7 +237,7 @@ kngn/
 | direnv | entering the directory activates the nix devShell automatically (recommended) |
 
 The macOS backend's Swift runtime autolinking (`build_helpers/swift.zig`) has been
-checked against SDK major versions 15–16 (`macos.checked_sdk_major_range`). An SDK
+checked against SDK major versions 15–26 (`macos.checked_sdk_major_range`). An SDK
 outside that range prints a build-time warning naming the exact range; if the build
 then fails with an undefined `__swift_FORCE_LOAD_$_<name>` symbol, add `<name>` to
 `optional_libs` in that file.
