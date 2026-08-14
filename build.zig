@@ -140,7 +140,7 @@ fn makeInternalWasmLinker(b: *std.Build, wasm_harness: bool) platform.WasmLinker
                 link(root, shared.scope);
                 link(root, shared.serde);
             } else if (std.mem.eql(u8, link_ctx.spec.name, "mic_demo")) {
-                // Scaffold for wasm microphone capture (kit only; capture logic lands later).
+                // The wasm microphone capture demo reaches capture through kit alone.
                 const root = TaggedModule{ .mod = link_ctx.app_module, .layer = .app, .name = "mic_demo" };
                 link(root, pm.base().kit);
             } else {
@@ -282,7 +282,7 @@ fn buildWasm(
     addBuildStep(b, "build-pixie", "Build Pixie wasm (wasm32-wasi)", apps[0].exe);
     addBuildStep(b, "build-synth-wasm", "Build Synth wasm (shared memory + AudioWorklet)", apps[1].exe);
     addBuildStep(b, "build-synth-postmessage-wasm", "Build Synth wasm (postMessage audio, no shared memory)", apps[2].exe);
-    addBuildStep(b, "build-mic-demo-wasm", "Build mic_demo wasm (shared memory + mic capture scaffold)", apps[3].exe);
+    addBuildStep(b, "build-mic-demo-wasm", "Build mic_demo wasm (shared memory + microphone capture)", apps[3].exe);
     addWasmHarnessGate(b, target, optimize, wasm_harness, install_all, apps);
 }
 
@@ -309,7 +309,7 @@ fn packageWebFromNative(b: *std.Build, optimize: std.builtin.OptimizeMode, insta
     addBuildStep(b, "build-pixie-wasm", "Build Pixie wasm for web (wasm32-wasi)", apps[0].exe);
     addBuildStep(b, "build-synth-wasm", "Build Synth wasm for web (shared memory + AudioWorklet)", apps[1].exe);
     addBuildStep(b, "build-synth-postmessage-wasm", "Build Synth wasm for web (postMessage audio, no shared memory)", apps[2].exe);
-    addBuildStep(b, "build-mic-demo-wasm", "Build mic_demo wasm for web (shared memory + mic capture scaffold)", apps[3].exe);
+    addBuildStep(b, "build-mic-demo-wasm", "Build mic_demo wasm for web (shared memory + microphone capture)", apps[3].exe);
     addWasmHarnessGate(b, wasi_target, optimize, wasm_harness, install_all, apps);
 }
 
