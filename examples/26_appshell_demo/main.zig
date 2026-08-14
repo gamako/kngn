@@ -59,7 +59,7 @@ pub fn main() !void {
     const background = backgroundFromPrefs(&prefs);
 
     const fallback = appshell.window_state.default();
-    const loaded_window = try appshell.window_state.load(io, data_dir, "window_state.ash", fallback);
+    const loaded_window = try appshell.window_state.load(io, data_dir, "window_state.ash", fallback, appshell.window_state.currentSpace());
     var recent = appshell.recent_files.RecentFiles.init(allocator, 10);
     defer recent.deinit();
     _ = try recent.load(io, data_dir, "recent_files.ash");
@@ -189,7 +189,7 @@ fn saveAll(app: *App) !void {
     try app.autosave.clear();
     try app.prefs.setI64(PREF_BACKGROUND, app.background);
     try app.prefs.save(app.io, app.data_dir, "preferences.ash");
-    try appshell.window_state.save(app.io, app.data_dir, "window_state.ash", app.window_state);
+    try appshell.window_state.save(app.io, app.data_dir, "window_state.ash", app.window_state, appshell.window_state.currentSpace());
     try app.recent.save(app.io, app.data_dir, "recent_files.ash");
 }
 

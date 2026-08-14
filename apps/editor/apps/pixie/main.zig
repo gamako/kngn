@@ -510,10 +510,21 @@ const App = struct {
             .position = null,
             .size = .{ .width = WINDOW_W, .height = WINDOW_H },
         };
-        const loaded = appshell.window_state.load(io, data_dir, "window_state.ash", fallback_state) catch |err| {
+        const loaded = appshell.window_state.load(
+            io,
+            data_dir,
+            "window_state.ash",
+            fallback_state,
+            appshell.window_state.currentSpace(),
+        ) catch |err| {
             std.log.err("pixie: window_state load failed: {s}", .{@errorName(err)});
             return fallback_opts;
         };
+        switch (loaded.status) {
+            .position_space_undeclared => std.log.warn("pixie: window_state position space undeclared", .{}),
+            .position_space_mismatch => std.log.warn("pixie: window_state position space mismatch", .{}),
+            .loaded, .defaulted => {},
+        }
         const resolved = appshell.window_state.resolve(loaded.state, fallback_state, null);
         return .{
             .position = if (resolved.position) |p| .{ .x = p.x, .y = p.y } else null,
@@ -573,7 +584,7 @@ const App = struct {
             .position = if (geo.position) |p| .{ .x = p.x, .y = p.y } else null,
             .size = .{ .width = geo.size.width, .height = geo.size.height },
         };
-        appshell.window_state.save(self.io, self.data_dir, "window_state.ash", state) catch |err| {
+        appshell.window_state.save(self.io, self.data_dir, "window_state.ash", state, appshell.window_state.currentSpace()) catch |err| {
             std.log.err("pixie: window_state save failed: {s}", .{@errorName(err)});
         };
     }
