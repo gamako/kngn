@@ -605,6 +605,205 @@ fn startHostBridgeTransport() void {
     std.debug.print("[harness] host bridge enabled (free-run)\n", .{});
 }
 
+const ListenReusePolicy = enum {
+    /// Existing `reuse_address = true` path (ephemeral ports).
+    standard,
+    /// POSIX: `SO_REUSEADDR` only, no `SO_REUSEPORT` (fixed ports).
+    address_only,
+};
+
+fn listenWithReusePolicy(
+    io: std.Io,
+    address: net.IpAddress,
+    policy: ListenReusePolicy,
+) net.IpAddress.ListenError!net.Server {
+    switch (policy) {
+        .standard => return address.listen(io, .{ .reuse_address = true }),
+        .address_only => {
+            if (builtin.os.tag == .windows or is_wasm) {
+                return address.listen(io, .{ .reuse_address = true });
+            }
+            return listenFixedAddressOnly(io, address);
+        },
+    }
+}
+
+fn listenHarnessServer(io: std.Io, port: u16) net.IpAddress.ListenError!net.Server {
+    const addr = net.IpAddress{
+        .ip4 = net.Ip4Address.loopback(port),
+    };
+    if (port == 0) return listenWithReusePolicy(io, addr, .standard);
+    return listenWithReusePolicy(io, addr, .address_only);
+}
+
+/// Fixed-port LISTEN builds the socket directly so the standard `listen` path
+/// cannot set `SO_REUSEPORT`. The returned handle is a `std.posix.fd_t` and
+/// follows the current `std.Io` socket-handle contract. Ownership stays with
+/// the same `std.Io.Threaded` as `io`. After a successful return, close is
+/// left to `net.Socket.close` / `net.Server.deinit` and is not done here.
+///
+/// Errno mapping matches `netListenIpPosix` / `openSocketPosix` /
+/// `setSocketOptionPosix` / `posixBind` / `posixGetSockName` in `std.Io.Threaded`:
+/// programmer-bug cases (`BADF` / `INVAL` / `NOTSOCK` / `FAULT`) go through
+/// `errnoBug` where those helpers do. `listen` only treats `BADF` that way.
+/// `Threaded.Syscall` is not public, so this path does not wrap each call in
+/// `Syscall.start` / `finish`. It retries `EINTR` after `io.checkCancel()`,
+/// the public cancel point. This listen runs at process init on the app
+/// thread, where `Thread.current` is null and std's `Syscall.start` would
+/// also be a no-op.
+fn listenFixedAddressOnly(
+    io: std.Io,
+    address: net.IpAddress,
+) net.IpAddress.ListenError!net.Server {
+    if (address != .ip4) return error.AddressFamilyUnsupported;
+
+    const posix = std.posix;
+    const sock_type: u32 = posix.SOCK.STREAM |
+        if (std.Io.Threaded.socket_flags_unsupported) 0 else posix.SOCK.CLOEXEC;
+    const protocol: u32 = @intFromEnum(net.Protocol.tcp);
+
+    const fd: posix.fd_t = open: {
+        try io.checkCancel();
+        while (true) {
+            const rc = posix.system.socket(posix.AF.INET, sock_type, protocol);
+            switch (posix.errno(rc)) {
+                .SUCCESS => break :open @intCast(rc),
+                .INTR => {
+                    try io.checkCancel();
+                    continue;
+                },
+                .AFNOSUPPORT => return error.AddressFamilyUnsupported,
+                .INVAL => return error.ProtocolUnsupportedBySystem,
+                .MFILE => return error.ProcessFdQuotaExceeded,
+                .NFILE => return error.SystemFdQuotaExceeded,
+                .NOBUFS, .NOMEM => return error.SystemResources,
+                .PROTONOSUPPORT => return error.ProtocolUnsupportedByAddressFamily,
+                .PROTOTYPE => return error.SocketModeUnsupported,
+                else => |e| return posix.unexpectedErrno(e),
+            }
+        }
+    };
+    errdefer {
+        const sock = net.Socket{ .handle = fd, .address = address };
+        sock.close(io);
+    }
+
+    if (std.Io.Threaded.socket_flags_unsupported) {
+        try io.checkCancel();
+        while (true) {
+            switch (posix.errno(posix.system.fcntl(fd, posix.F.SETFD, @as(usize, posix.FD_CLOEXEC)))) {
+                .SUCCESS => break,
+                .INTR => {
+                    try io.checkCancel();
+                    continue;
+                },
+                else => |e| return posix.unexpectedErrno(e),
+            }
+        }
+    }
+
+    {
+        const yes: u32 = 1;
+        const o: []const u8 = @ptrCast(&yes);
+        try io.checkCancel();
+        while (true) {
+            switch (posix.errno(posix.system.setsockopt(fd, posix.SOL.SOCKET, posix.SO.REUSEADDR, o.ptr, @intCast(o.len)))) {
+                .SUCCESS => break,
+                .INTR => {
+                    try io.checkCancel();
+                    continue;
+                },
+                .BADF, .NOTSOCK, .INVAL, .FAULT => |e| return std.Io.Threaded.errnoBug(e),
+                else => |e| return posix.unexpectedErrno(e),
+            }
+        }
+    }
+
+    var storage: std.Io.Threaded.PosixAddress = undefined;
+    var addr_len = std.Io.Threaded.addressToPosix(&address, &storage);
+    try io.checkCancel();
+    while (true) {
+        switch (posix.errno(posix.system.bind(fd, &storage.any, addr_len))) {
+            .SUCCESS => break,
+            .INTR => {
+                try io.checkCancel();
+                continue;
+            },
+            .ADDRINUSE => return error.AddressInUse,
+            .BADF, .INVAL, .NOTSOCK, .FAULT => |e| return std.Io.Threaded.errnoBug(e),
+            .AFNOSUPPORT => return error.AddressFamilyUnsupported,
+            .ADDRNOTAVAIL => return error.AddressUnavailable,
+            .NOMEM => return error.SystemResources,
+            else => |e| return posix.unexpectedErrno(e),
+        }
+    }
+
+    try io.checkCancel();
+    while (true) {
+        switch (posix.errno(posix.system.listen(fd, net.default_kernel_backlog))) {
+            .SUCCESS => break,
+            .INTR => {
+                try io.checkCancel();
+                continue;
+            },
+            .ADDRINUSE => return error.AddressInUse,
+            .BADF => |e| return std.Io.Threaded.errnoBug(e),
+            else => |e| return posix.unexpectedErrno(e),
+        }
+    }
+
+    addr_len = @sizeOf(std.Io.Threaded.PosixAddress);
+    try io.checkCancel();
+    while (true) {
+        switch (posix.errno(posix.system.getsockname(fd, &storage.any, &addr_len))) {
+            .SUCCESS => break,
+            .INTR => {
+                try io.checkCancel();
+                continue;
+            },
+            .BADF, .FAULT, .INVAL, .NOTSOCK => |e| return std.Io.Threaded.errnoBug(e),
+            .NOBUFS => return error.SystemResources,
+            else => |e| return posix.unexpectedErrno(e),
+        }
+    }
+
+    return .{
+        .socket = .{
+            .handle = fd,
+            .address = std.Io.Threaded.addressFromPosix(&storage),
+        },
+        .options = if (net.Server.AcceptOptions != void) .{
+            .mode = .stream,
+            .protocol = .tcp,
+        },
+    };
+}
+
+fn listenFailureStopsProcess(port: u16) bool {
+    return port != 0;
+}
+
+fn formatListenFailure(buf: []u8, port: u16, err: anyerror) []const u8 {
+    const ending: []const u8 = if (listenFailureStopsProcess(port)) "exiting" else "disabling harness";
+    if (err == error.AddressInUse) {
+        return std.fmt.bufPrint(
+            buf,
+            "[harness] listen failed on 127.0.0.1:{d}: address already in use (another process is already listening); {s}",
+            .{ port, ending },
+        ) catch unreachable;
+    }
+    return std.fmt.bufPrint(
+        buf,
+        "[harness] listen failed on 127.0.0.1:{d}: {s}; {s}",
+        .{ port, @errorName(err), ending },
+    ) catch unreachable;
+}
+
+fn reportListenFailure(port: u16, err: anyerror) void {
+    var buf: [256]u8 = undefined;
+    std.debug.print("{s}\n", .{formatListenFailure(&buf, port, err)});
+}
+
 fn startNativeTransport() void {
     const script_path = pending_script_path;
     const listen = parseListenPortValue(pending_listen_raw);
@@ -634,10 +833,10 @@ fn startNativeTransport() void {
     }
 
     // listen (TCP)
-    const addr = net.IpAddress{ .ip4 = net.Ip4Address.loopback(decision.listen_port) };
-    server = addr.listen(io_val, .{ .reuse_address = true }) catch |err| {
-        std.debug.print("[harness] listen failed: {s}\n", .{@errorName(err)});
-        return; // left disabled
+    server = listenHarnessServer(io_val, decision.listen_port) catch |err| {
+        reportListenFailure(decision.listen_port, err);
+        if (listenFailureStopsProcess(decision.listen_port)) std.process.exit(1);
+        return;
     };
     record_path = readEnv("KNGN_HARNESS_RECORD");
     mode = .live;
@@ -6064,8 +6263,10 @@ fn testSleepMs(io: std.Io, ms: u64) void {
 fn initLiveServerForTest() !u16 {
     threaded = std.Io.Threaded.init(gpa, .{});
     io_val = threaded.io();
-    const addr = net.IpAddress{ .ip4 = net.Ip4Address.loopback(0) };
-    server = try addr.listen(io_val, .{ .reuse_address = true });
+    const addr = net.IpAddress{
+        .ip4 = net.Ip4Address.loopback(0),
+    };
+    server = try listenWithReusePolicy(io_val, addr, .standard);
     mode = .live;
     clock_mode = .manual; // the existing live pump test relies on the blocking contract
     cmd_buf = "";
@@ -6383,6 +6584,121 @@ test "parseListenPortValue: absent/empty/0/fixed/invalid" {
         try testing.expect(p.requested);
         try testing.expect(!p.valid);
     }
+}
+
+fn listenThenPublish(io: std.Io, port: u16, dest_dir: std.Io.Dir, dest_name: []const u8) net.IpAddress.ListenError!u16 {
+    var s = try listenHarnessServer(io, port);
+    defer s.deinit(io);
+    const chosen = s.socket.address.getPort();
+    var pbuf: [16]u8 = undefined;
+    const txt = std.fmt.bufPrint(&pbuf, "{d}\n", .{chosen}) catch unreachable;
+    dest_dir.writeFile(io, .{ .sub_path = dest_name, .data = txt }) catch {};
+    return chosen;
+}
+
+test "fixed listener rejects a second listener without a fixed port constant" {
+    var t = std.Io.Threaded.init(gpa, .{});
+    defer t.deinit();
+    const io = t.io();
+
+    const first_addr = net.IpAddress{ .ip4 = net.Ip4Address.loopback(0) };
+    var first = listenWithReusePolicy(io, first_addr, .address_only) catch return error.SkipZigTest;
+    defer first.deinit(io);
+    const occupied = first.socket.address.getPort();
+    try testing.expect(occupied != 0);
+
+    const second_addr = net.IpAddress{ .ip4 = net.Ip4Address.loopback(occupied) };
+    try testing.expectError(error.AddressInUse, listenWithReusePolicy(io, second_addr, .address_only));
+}
+
+test "address-only listener can reopen immediately after close" {
+    var t = std.Io.Threaded.init(gpa, .{});
+    defer t.deinit();
+    const io = t.io();
+
+    const first_addr = net.IpAddress{ .ip4 = net.Ip4Address.loopback(0) };
+    var first = listenWithReusePolicy(io, first_addr, .address_only) catch return error.SkipZigTest;
+    const occupied = first.socket.address.getPort();
+    try testing.expect(occupied != 0);
+    first.deinit(io);
+
+    const reopen_addr = net.IpAddress{ .ip4 = net.Ip4Address.loopback(occupied) };
+    var second = listenWithReusePolicy(io, reopen_addr, .address_only) catch |err| switch (err) {
+        error.AddressInUse => return error.SkipZigTest,
+        else => return err,
+    };
+    defer second.deinit(io);
+    try testing.expectEqual(occupied, second.socket.address.getPort());
+}
+
+test "standard listener still selects an ephemeral port" {
+    var t = std.Io.Threaded.init(gpa, .{});
+    defer t.deinit();
+    const io = t.io();
+
+    const addr = net.IpAddress{ .ip4 = net.Ip4Address.loopback(0) };
+    var server_local = listenWithReusePolicy(io, addr, .standard) catch return error.SkipZigTest;
+    defer server_local.deinit(io);
+    try testing.expect(server_local.socket.address.getPort() != 0);
+}
+
+test "listen failure reports port and existing listener" {
+    var t = std.Io.Threaded.init(gpa, .{});
+    defer t.deinit();
+    const io = t.io();
+
+    const addr = net.IpAddress{ .ip4 = net.Ip4Address.loopback(0) };
+    var first = listenWithReusePolicy(io, addr, .standard) catch return error.SkipZigTest;
+    defer first.deinit(io);
+    const port = first.socket.address.getPort();
+
+    var buf: [256]u8 = undefined;
+    const msg = formatListenFailure(&buf, port, error.AddressInUse);
+    var port_buf: [8]u8 = undefined;
+    const port_txt = std.fmt.bufPrint(&port_buf, "{d}", .{port}) catch unreachable;
+    try testing.expect(std.mem.indexOf(u8, msg, port_txt) != null);
+    try testing.expect(std.mem.indexOf(u8, msg, "address already in use") != null);
+    try testing.expect(std.mem.indexOf(u8, msg, "another process is already listening") != null);
+    try testing.expect(std.mem.indexOf(u8, msg, "exiting") != null);
+    try testing.expect(std.mem.indexOf(u8, msg, "TASK-") == null);
+}
+
+test "ephemeral listen failure does not stop the process" {
+    try testing.expect(!listenFailureStopsProcess(0));
+    try testing.expect(listenFailureStopsProcess(1));
+
+    var keep_buf: [256]u8 = undefined;
+    const keep = formatListenFailure(&keep_buf, 0, error.AddressInUse);
+    try testing.expect(std.mem.indexOf(u8, keep, "disabling harness") != null);
+    try testing.expect(std.mem.indexOf(u8, keep, "exiting") == null);
+
+    var stop_buf: [256]u8 = undefined;
+    const stop = formatListenFailure(&stop_buf, 1, error.SystemResources);
+    try testing.expect(std.mem.indexOf(u8, stop, "exiting") != null);
+    try testing.expect(std.mem.indexOf(u8, stop, "disabling harness") == null);
+}
+
+test "failed fixed listen does not publish a port" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var t = std.Io.Threaded.init(gpa, .{});
+    defer t.deinit();
+    const io = t.io();
+
+    const first_addr = net.IpAddress{ .ip4 = net.Ip4Address.loopback(0) };
+    var first = listenWithReusePolicy(io, first_addr, .address_only) catch return error.SkipZigTest;
+    defer first.deinit(io);
+    const occupied = first.socket.address.getPort();
+
+    const sentinel = "4242\n";
+    try tmp.dir.writeFile(io, .{ .sub_path = "harness.port", .data = sentinel });
+
+    try testing.expectError(error.AddressInUse, listenThenPublish(io, occupied, tmp.dir, "harness.port"));
+
+    const after = try tmp.dir.readFileAlloc(io, "harness.port", gpa, .unlimited);
+    defer gpa.free(after);
+    try testing.expectEqualStrings(sentinel, after);
 }
 
 test "decideTransport: SCRIPT/LISTEN/MANUAL_CLOCK exclusivity and clock defaults" {

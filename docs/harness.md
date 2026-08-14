@@ -511,6 +511,23 @@ scripts/kngn ctl --port-file /tmp/kngn.port 'quit'                              
 KNGN_HARNESS_SCRIPT=/tmp/live.txt KNGN_HARNESS_OUT=/tmp zig build run-synth
 ```
 
+A fixed port (`KNGN_HARNESS_LISTEN=<n>` with `n > 0`) does not join another
+process's LISTEN group on the same `127.0.0.1:<n>`. The second process prints
+an error that names the loopback address, the requested port, the existing
+listener, and that it is exiting, then stops with exit code 1. It does not
+create, delete, or overwrite the port file; the existing listener's port file
+is left as it is. An ephemeral port (no value, empty, or `0`) still lets the
+kernel pick a free port. If that listen fails, the process prints the same
+kind of error ending in `disabling harness` and continues with the harness
+off; it does not exit. `SO_REUSEADDR` is kept so a restart can bind again
+through TIME_WAIT.
+
+| OS | `reuse_address = true` public contract | Fixed-port implementation |
+|---|---|---|
+| Linux | `SO_REUSEADDR` and `SO_REUSEPORT` | bind with `SO_REUSEADDR` only; a second LISTEN is refused |
+| macOS | POSIX: `SO_REUSEADDR` and `SO_REUSEPORT` | bind with `SO_REUSEADDR` only; a second LISTEN is refused |
+| Windows | `SO_REUSEADDR` only; `SO_REUSEPORT` is not set | the standard listen path; `AddressInUse` on a second start is verified on a Windows machine |
+
 | Environment variable | Role |
 |---|---|
 | `KNGN_HARNESS_SCRIPT=<file>` | enables **replay** (the file transport; always a manual clock) |
