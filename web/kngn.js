@@ -10,7 +10,10 @@
 //   wasm: filename (default pixie.wasm)
 //   audioTransport: "none" | "worklet_shared" | "worklet_postmessage"
 //   sharedMemory: true only with worklet_shared (COOP/COEP required)
-//   capture: true enables mic input (requires worklet_shared; data-capture="true")
+//   capture: true enables mic input (requires worklet_shared; data-capture="true").
+//     An explicit ?capture=0 / ?capture=1 query wins over data-capture.
+//   harness: true installs the host bridge when the module exports it
+//     (data-harness="true" / ?harness=1). A build without the exports is a no-op.
 //   embedded + wasmBase64: single-HTML package (no fetch of .wasm)
 //   workletSource: embedded worklet text for postMessage single-HTML
 //
@@ -2235,6 +2238,8 @@ function base64ToArrayBuffer(b64) {
  *   audio?: boolean,
  *   audioTransport?: string,
  *   capture?: boolean,
+ *   harness?: boolean,
+ *   harnessCaptureFrames?: boolean,
  *   embedded?: boolean,
  *   wasmBase64?: string,
  *   workletSource?: string,
@@ -2410,17 +2415,23 @@ function defaultOptsFromPage() {
     params.get("shared") === "1" ||
     body?.dataset?.shared === "1" ||
     transport === "worklet_shared";
-  // data-capture="true" (dataset.capture === "true") or ?capture=1
+  // An explicit capture query wins, including ?capture=0. Absent the query, data-capture applies.
+  const captureParam = params.get("capture");
   const capture =
-    params.get("capture") === "1" ||
-    body?.dataset?.capture === "true" ||
-    body?.dataset?.capture === "1";
+    captureParam != null
+      ? captureParam === "1"
+      : body?.dataset?.capture === "true" || body?.dataset?.capture === "1";
+  const harness =
+    params.get("harness") === "1" ||
+    body?.dataset?.harness === "true" ||
+    body?.dataset?.harness === "1";
   return {
     wasm,
     audioTransport: transport,
     audio: transport === "worklet_shared" || transport === "worklet_postmessage",
     sharedMemory,
     capture,
+    harness,
   };
 }
 

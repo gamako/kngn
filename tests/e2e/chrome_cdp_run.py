@@ -9,6 +9,9 @@ Usage:
     --user-data-dir /tmp/chrome-profile \\
     --seconds 15 \\
     --console-log /tmp/mic-console.log
+
+  Optional host-bridge batch (after the page installs globalThis.__kngnHarness):
+    --harness-commands /tmp/cmds.txt --harness-response /tmp/resp.txt
 """
 
 from __future__ import annotations
@@ -158,7 +161,13 @@ class CdpWs:
             return None, rest
         return payload.decode("utf-8"), rest
 
-    def call(self, method: str, params: dict[str, Any] | None = None, timeout: float = 20.0) -> Any:
+    def call(
+        self,
+        method: str,
+        params: dict[str, Any] | None = None,
+        timeout: float = 20.0,
+        on_event: Any = None,
+    ) -> Any:
         self._id += 1
         mid = self._id
         msg: dict[str, Any] = {"id": mid, "method": method}
@@ -166,16 +175,14 @@ class CdpWs:
             msg["params"] = params
         self.send(msg)
         deadline = time.time() + timeout
-        extras: list[dict[str, Any]] = []
         while time.time() < deadline:
             for ev in self.recv_messages(min(1.0, max(0.05, deadline - time.time()))):
                 if ev.get("id") == mid:
-                    # push extras back... discard for simplicity; events after still drain
                     if "error" in ev:
                         raise RuntimeError(f"{method}: {ev['error']}")
                     return ev.get("result")
-                if "method" in ev:
-                    extras.append(ev)
+                if "method" in ev and on_event is not None:
+                    on_event(ev)
             # keep looping until reply
         raise TimeoutError(method)
 
@@ -215,7 +222,20 @@ def main() -> int:
     ap.add_argument("--seconds", type=float, default=15.0)
     ap.add_argument("--console-log", required=True)
     ap.add_argument("--devtools-port", type=int, default=0)
+    ap.add_argument(
+        "--harness-commands",
+        default=None,
+        help="Command batch to send through globalThis.__kngnHarness.exec",
+    )
+    ap.add_argument(
+        "--harness-response",
+        default=None,
+        help="Write the host-bridge response text here",
+    )
     args = ap.parse_args()
+    if (args.harness_commands is None) != (args.harness_response is None):
+        print("error: --harness-commands and --harness-response must be used together", file=sys.stderr)
+        return 2
 
     port = args.devtools_port or (9400 + (os.getpid() % 400))
     os.makedirs(args.user_data_dir, exist_ok=True)
@@ -258,7 +278,6 @@ def main() -> int:
                     url = t.get("url") or ""
                     if "mic-demo" in url or args.url.split("?")[0] in url:
                         return t
-                # Fall back to any page with a debugger URL.
                 for t in http_json(f"http://127.0.0.1:{port}/json/list"):
                     if t.get("type") == "page" and t.get("webSocketDebuggerUrl"):
                         return t
@@ -274,7 +293,6 @@ def main() -> int:
                 break
             time.sleep(0.25)
         if not target or not target.get("webSocketDebuggerUrl"):
-            # Dump list for diagnosis.
             try:
                 print("json/list:", json.dumps(http_json(f"http://127.0.0.1:{port}/json/list"), indent=2)[:2000], file=sys.stderr)
             except Exception as e:  # noqa: BLE001
@@ -288,6 +306,9 @@ def main() -> int:
             except Exception as e:  # noqa: BLE001
                 print(f"warn: {domain}: {e}", file=sys.stderr)
 
+        def on_console(ev: dict[str, Any]) -> None:
+            handle_event(ev, args.console_log)
+
         try:
             href = (
                 (
@@ -295,6 +316,7 @@ def main() -> int:
                         "Runtime.evaluate",
                         {"expression": "location.href", "returnByValue": True},
                         timeout=5,
+                        on_event=on_console,
                     )
                     or {}
                 ).get("result")
@@ -306,8 +328,77 @@ def main() -> int:
 
         deadline = time.time() + args.seconds
         while time.time() < deadline:
+            if proc.poll() is not None:
+                raise RuntimeError("Chrome exited while collecting console")
             for ev in page.recv_messages(0.5):
-                handle_event(ev, args.console_log)
+                on_console(ev)
+
+        if args.harness_commands:
+            ready = False
+            for i in range(40):
+                if proc.poll() is not None:
+                    raise RuntimeError("Chrome exited while waiting for the host bridge")
+                for ev in page.recv_messages(0.05):
+                    on_console(ev)
+                try:
+                    ev = page.call(
+                        "Runtime.evaluate",
+                        {
+                            "expression": (
+                                "typeof globalThis.__kngnHarness !== 'undefined' && "
+                                "typeof globalThis.__kngnHarness.exec === 'function'"
+                            ),
+                            "returnByValue": True,
+                        },
+                        timeout=3,
+                        on_event=on_console,
+                    )
+                    if ev and ev.get("exceptionDetails"):
+                        print(f"warn: harness ready exception: {ev['exceptionDetails']}", flush=True)
+                    elif ((ev or {}).get("result") or {}).get("value"):
+                        ready = True
+                        print(f"host bridge ready (poll {i})", flush=True)
+                        break
+                    if i % 8 == 0:
+                        href_ev = page.call(
+                            "Runtime.evaluate",
+                            {"expression": "location.href", "returnByValue": True},
+                            timeout=3,
+                            on_event=on_console,
+                        )
+                        href = ((href_ev or {}).get("result") or {}).get("value")
+                        print(f"host bridge not ready href={href!r} (poll {i})", flush=True)
+                except Exception as e:  # noqa: BLE001
+                    print(f"warn: harness ready eval: {e}", file=sys.stderr)
+                time.sleep(0.25)
+            if not ready:
+                raise RuntimeError("host bridge did not become ready")
+
+            with open(args.harness_commands, encoding="utf-8") as f:
+                commands = f.read()
+            if proc.poll() is not None:
+                raise RuntimeError("Chrome exited before the host bridge exec")
+            result = page.call(
+                "Runtime.evaluate",
+                {
+                    "expression": "globalThis.__kngnHarness.exec(" + json.dumps(commands) + ")",
+                    "awaitPromise": True,
+                    "returnByValue": True,
+                },
+                timeout=90,
+                on_event=on_console,
+            )
+            if not result:
+                raise RuntimeError("host bridge exec returned no result")
+            if result.get("exceptionDetails"):
+                raise RuntimeError(f"host bridge exec failed: {result['exceptionDetails']}")
+            value = (result.get("result") or {}).get("value")
+            if not isinstance(value, str) or value == "":
+                raise RuntimeError("host bridge exec returned no response text")
+            with open(args.harness_response, "w", encoding="utf-8") as f:
+                f.write(value)
+            print(f"host bridge response -> {args.harness_response}", flush=True)
+
         print(f"cdp ok; console -> {args.console_log}", flush=True)
         return 0
     except Exception as e:  # noqa: BLE001
@@ -320,7 +411,7 @@ def main() -> int:
 
                     r, _, _ = _sel.select([proc.stderr], [], [], 0.2)
                     if r:
-                        err = proc.stderr.read()
+                        err = proc.stderr.read(4096)
                         if err:
                             sys.stderr.write(err.decode("utf-8", "replace")[:4000])
                 except Exception:

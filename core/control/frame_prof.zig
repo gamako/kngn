@@ -368,6 +368,12 @@ test "only 1 and 0 decide; anything else follows the harness" {
     }
 }
 
+test "an absent environment follows the harness" {
+    // A wasm module has no environment: every read is null, so measurement follows harness.isEnabled().
+    try testing.expect(decideFrom(null, true));
+    try testing.expect(!decideFrom(null, false));
+}
+
 test "disabled: nothing is recorded and the digest reports an empty window" {
     TestProf.setEnabledForTest(false);
     defer TestProf.setEnabledForTest(null);

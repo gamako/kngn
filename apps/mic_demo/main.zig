@@ -13,6 +13,25 @@ const app_runtime = kit.app_runtime;
 const WIN_W: u32 = 640;
 const WIN_H: u32 = 360;
 
+/// The sections `App.frame` is split into for `digest frameprof`. Order matches the order
+/// the marks run in; the digest prints `@tagName`, so inserting one renumbers nothing.
+const FrameSection = enum {
+    /// Drain the capture ring and run the capture callback on the main thread.
+    capture_drain,
+    /// Poll permission and open/start the capture device when granted.
+    capture_lifecycle,
+    /// Drain the window event queue.
+    events,
+    /// Fill the framebuffer (status strip and level meter).
+    draw,
+    /// Hand the frame to the backend.
+    present,
+};
+
+/// Reads the real clock, not `platform.getTime`: under a replay that one is virtual and would
+/// report every section as zero.
+const Prof = kit.frame_prof.Profiler(FrameSection, platform.getRealTime);
+
 /// Opaque dark slate (0xAARRGGBB).
 const BG: u32 = 0xFF18_1820;
 const BAR_BG: u32 = 0xFF28_2830;
@@ -85,6 +104,20 @@ const App = struct {
 
         const app = try gpa.create(App);
         app.* = .{ .gpa = gpa };
+        platform.registerProbe(.{
+            .name = Prof.probe_name,
+            .ctx = app,
+            .ext = "txt",
+            .digest = Prof.probeDigest,
+            .desc = "frame section timing: frames/aborted/frame_ms/body_ms/gap_ms/body_p95_ms/body_max_ms + per-section ms",
+        });
+        platform.registerAction(.{
+            .name = Prof.reset_action_name,
+            .ctx = app,
+            .run = Prof.resetAction,
+            .network_policy = .local_only,
+            .desc = "drop the frame section profiler window",
+        });
         return app;
     }
 
@@ -98,11 +131,18 @@ const App = struct {
 
     pub fn frame(self: *App, win: *platform.Window, now: f64) !bool {
         _ = now;
+        // Frame section timing. There is deliberately no `defer Prof.end(...)`: the one call sits
+        // right after present, so "completed frame" means "presented". A path that leaves early —
+        // no framebuffer — never reaches it, and the next begin() records the attempt as aborted
+        // rather than letting a partial frame into the statistics.
+        Prof.begin();
 
         // Drain first (main-thread frame tick): delivers blocks and runs the callback.
         audio.drainCaptureIfActive();
+        Prof.mark(.capture_drain);
 
         self.pollCaptureLifecycle();
+        Prof.mark(.capture_lifecycle);
 
         var running = true;
         while (win.nextEvent()) |ev| {
@@ -114,11 +154,14 @@ const App = struct {
                 else => {},
             }
         }
+        Prof.mark(.events);
 
         if (win.lockFramebuffer()) |fb| {
             defer fb.unlock();
             self.draw(fb);
+            Prof.mark(.draw);
             win.present();
+            Prof.end(.present);
         }
 
         return running;

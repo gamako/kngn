@@ -219,12 +219,12 @@ Two more things to know before reading a number off this line:
 the statistics (it has no predecessor to measure a period against), as is the frame after an
 abort.
 
-**Turning it on.** `KNGN_FRAME_PROF=1` forces it on and `=0` forces it off; unset, it
-follows the harness, so `digest frameprof` works in an ordinary harness run with no extra
-configuration. The explicit `0` is what makes it possible to measure the profiler's own cost:
-reading frame rate needs the harness, which would otherwise switch the profiler on too. On
-wasm there is no environment, so it comes on only in a `-Dwasm-harness=true` build driven by
-the host bridge, and a shipping wasm page never measures.
+**Turning it on.** Native: `KNGN_FRAME_PROF=1` forces it on and `=0` forces it off; unset, or
+any other value, it follows the harness, so `digest frameprof` works in an ordinary harness
+run with no extra configuration. The explicit `0` is what makes it possible to measure the
+profiler's own cost: reading frame rate needs the harness, which would otherwise switch the
+profiler on too. Wasm has no environment, so that override is not available — measurement
+follows the host bridge, as described under "wasm: the host bridge" below.
 
 ### DrawList observability (`drawlist`)
 
@@ -837,7 +837,9 @@ Without the flag a wasm build keeps the no-op stub and is byte-for-byte what it 
 ### What the page sees
 
 With the flag, the module exports a small bridge and `web/kngn.js` wraps it as
-`globalThis.__kngnHarness`, installed when `boot()` is given `harness: true`:
+`globalThis.__kngnHarness`. The page turns the bridge on with `boot({ harness: true })`,
+`data-harness="true"`, or `?harness=1`. A shipping build has no export to call, so those
+options are inert:
 
 | Call | Meaning |
 |---|---|
@@ -913,3 +915,42 @@ digest window'
 
 Its `README.md` covers the page commands (`@resize`, `@env`), the audio transports, the
 launch-time device scale factor and where snapshots are written.
+
+### Measuring frames (`digest frameprof`)
+
+A wasm module has no environment, so `KNGN_FRAME_PROF` cannot force the profiler on or off.
+Measurement follows the harness: a `-Dwasm-harness=true` build whose page enables the host
+bridge turns it on; a shipping build, or a page that never enables the bridge, leaves it
+off. There is no wasm-only action and no env-compatible override — to keep the profiler
+off, do not enable the bridge.
+
+The digest keys and their meaning are the same as native: `frame_ms == body_ms + gap_ms`,
+and the section values sum to `body_ms`. The clock is `platform.getRealTime()`, not the
+virtual harness clock. `gap_ms` is still not idle time: on wasm it includes the rAF
+interval, the page's own work between frames, and OS scheduling. Compare two packages in
+the foreground under the same load.
+
+`harnessCaptureFrames` stays off for a frameprof comparison. Turning it on copies the
+framebuffer every frame and folds that memcpy into the body.
+
+From the page, after the module has installed `globalThis.__kngnHarness`:
+
+```js
+const text = await globalThis.__kngnHarness.exec(
+  "action frameprof_reset\nstep 180\ndigest frameprof\n",
+);
+```
+
+The response is the same live framing the TCP transport uses, including a `frameprof …`
+line. With `frames=0` the averages are absent.
+
+The same steps measure any wasm application that registers a `frameprof` probe and marks a
+`present` section — including one whose present path scales a fixed framebuffer into the
+canvas. Package with `-Dwasm-harness=true`, enable the host bridge on the page, reset the
+window, step enough frames, and read `digest frameprof`. This document does not record a
+measurement of that present path.
+
+A before/after comparison uses one packaged bundle and switches the feature under test
+from the page. `?capture=0` and `?capture=1` override `data-capture` so the same
+`mic_demo` package can be timed with the microphone path off and on; another application
+does the same with whatever query or data attribute selects its feature.

@@ -1050,8 +1050,18 @@ fn runFreeRunCommands() bool {
 }
 
 /// The free-run non-blocking drain. When empty it checks the listener's readiness exactly once, without waiting.
+/// A test that requested the host bridge uses that drain even on native, so the submit / frame-boundary /
+/// publish / clear contract can be asserted without compiling this module for wasm.
 fn drainFreeRunTransport() void {
-    if (comptime is_wasm) drainHostBridge() else drainFreeRunTransportNative();
+    if (comptime is_wasm) {
+        drainHostBridge();
+        return;
+    }
+    if (builtin.is_test and host_bridge_requested) {
+        drainHostBridge();
+        return;
+    }
+    drainFreeRunTransportNative();
 }
 
 fn drainFreeRunTransportNative() void {
@@ -1491,6 +1501,8 @@ fn finishLiveRequest() void {
     if (!live_req_open) return;
     pending_wait = .none;
     if (comptime is_wasm) {
+        publishHostResponse();
+    } else if (builtin.is_test and host_bridge_requested) {
         publishHostResponse();
     } else if (live_stream_owned) {
         var wbuf: [4096]u8 = undefined;
@@ -3786,6 +3798,12 @@ fn resetForTest() void {
     test_poll_zero_count = 0;
     pending_pred_actual_len = 0;
     live_stream_owned = false;
+    live_req_open = false;
+    host_bridge_requested = false;
+    host_req_pending = false;
+    host_req_len = 0;
+    host_resp_ready = false;
+    host_resp_len = 0;
 }
 
 test "parseKey: a name to a KeyCode (case-insensitive, and digits)" {
@@ -6915,6 +6933,39 @@ test "the free-run execution model: true every frame even with no agent present"
         try testing.expect(pollGateFreeRun(true));
     }
     try testing.expect(!quit_requested);
+}
+
+test "host bridge: a submitted digest request publishes the live response" {
+    resetForTest();
+    defer resetForTest();
+
+    var c = TestProbeCtx{ .value = 7 };
+    registerProbe(.{ .name = "bridge", .ctx = &c, .digest = testProbeDigest });
+
+    hostBridgeEnable(1);
+    mode = .live;
+    clock_mode = .free_run;
+    try testing.expect(isEnabled());
+
+    const req = "digest bridge\n";
+    @memcpy(host_req_buf[0..req.len], req);
+    try testing.expectEqual(@as(u32, 1), hostBridgeSubmit(@intCast(req.len)));
+    try testing.expectEqual(@as(u32, 0), hostBridgeSubmit(@intCast(req.len)));
+
+    try testing.expect(pollGateFreeRun(true));
+    try testing.expectEqual(@as(u32, 1), hostBridgeResponseReady());
+    try testing.expectEqualStrings("bridge value=7\n", host_resp_buf[0..host_resp_len]);
+    try testing.expectEqual(@as(?usize, null), std.mem.indexOf(u8, host_resp_buf[0..host_resp_len], "[harness]"));
+
+    try testing.expectEqual(@as(u32, 0), hostBridgeSubmit(@intCast(req.len)));
+    hostBridgeResponseClear();
+    try testing.expectEqual(@as(u32, 0), hostBridgeResponseReady());
+
+    @memcpy(host_req_buf[0..req.len], req);
+    try testing.expectEqual(@as(u32, 1), hostBridgeSubmit(@intCast(req.len)));
+    try testing.expect(pollGateFreeRun(true));
+    try testing.expectEqualStrings("bridge value=7\n", host_resp_buf[0..host_resp_len]);
+    hostBridgeResponseClear();
 }
 
 // ============================================================================
