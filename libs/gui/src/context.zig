@@ -95,7 +95,32 @@ pub const DragState = dnd_mod.DragState;
 /// `clip` is the effective clip after intersecting ancestor `clip_children` (matches draw pushClip bounds).
 /// This node's own `clip_children` is not stored here; it only affects the child_clip passed downward.
 /// `buttonBehavior` / TextInput / SelectableLabel share the `pointHitsVisible(rect, clip, p)` predicate.
-pub const CachedRect = struct { rect: Rect, clip: Rect, measured_w: i32 = 0, measured_h: i32 = 0 };
+pub const CachedRect = struct {
+    rect: Rect,
+    clip: Rect,
+    measured_w: i32 = 0,
+    measured_h: i32 = 0,
+    /// Recorded content extent after place. -1 = not recorded (leaf / place not run).
+    content_w: i32 = -1,
+    content_h: i32 = -1,
+    /// Clamped `.fixed` declaration, or -1 when the axis is not `.fixed`.
+    declared_w: i32 = -1,
+    declared_h: i32 = -1,
+
+    /// Scroll-range size: declared fixed (clamped) → recorded extent → measured.
+    pub fn scrollContentSize(self: CachedRect) Vec2 {
+        return .{
+            .x = pickContentLen(self.declared_w, self.content_w, self.measured_w),
+            .y = pickContentLen(self.declared_h, self.content_h, self.measured_h),
+        };
+    }
+};
+
+fn pickContentLen(declared: i32, extent: i32, measured: i32) i32 {
+    if (declared >= 0) return declared;
+    if (extent >= 0) return extent;
+    return measured;
+}
 
 /// Options for `Context.text`. `color = null` uses `style.text`. `max_lines = 0`
 /// means unlimited for `.visible` / `.clip`, and 1 for `.ellipsis`.
@@ -785,8 +810,7 @@ pub const Context = struct {
     /// rect_cache (for hit-test) after endFrame.
     pub fn beginBox(self: *Context, cfg: BoxConfig) void {
         self.requireFrame("beginBox");
-        layout.assertSizingValid(cfg.width);
-        layout.assertSizingValid(cfg.height);
+        layout.assertBoxConfigValid(cfg);
         const parent = self.layout_current.?;
         const node = self.allocator().create(layout.Node) catch @panic("Context.beginBox: OOM");
         node.* = .{
@@ -872,7 +896,8 @@ pub const Context = struct {
     }
 
     /// Previous-frame measured size of an explicit-ID node (natural size from layout.measure).
-    /// Used for scroll clamping etc. Same previous-frame sync contract as getNodeRect.
+    /// ScrollArea prefers declared fixed, then recorded content extent, then this value
+    /// (`CachedRect.scrollContentSize`). Same previous-frame sync contract as getNodeRect.
     /// null on first frame / auto ID / unknown ID / 0.
     pub fn getNodeMeasured(self: *const Context, id: Id) ?Vec2 {
         if (id == 0) return null;
@@ -908,7 +933,10 @@ pub const Context = struct {
     ///   - `clip_children=false` → `clip` unchanged (overflow draw/hit allowed; even with a zero-size parent,
     ///     children can hit if inside the ancestor clip)
     /// Same definition as `emitNode`'s pushClip bounds (cached clip ↔ draw clip correspondence).
-    /// measured_w/h are layout.measure results (natural size for scroll clamp etc.).
+    /// measured_w/h are layout.measure results. content_w/h are the recorded
+    /// content extent (-1 if unrecorded). declared_w/h are the clamped `.fixed`
+    /// size (-1 if the axis is not `.fixed`). ScrollArea reads them in that
+    /// declared → extent → measured order.
     /// Duplicate explicit IDs in the same frame are a contract violation (Debug assert; Release last-wins overwrite,
     /// but callers must not use duplicate IDs).
     fn updateRectCache(self: *Context, node: *const layout.Node, clip: Rect) void {
@@ -917,7 +945,16 @@ pub const Context = struct {
                 @panic("Context.endFrame: OOM");
             // Duplicate explicit IDs in the same frame are a contract violation (last-wins overwrite breaks hit-test)
             std.debug.assert(!gop.found_existing);
-            gop.value_ptr.* = .{ .rect = node.rect, .clip = clip, .measured_w = node.measured_w, .measured_h = node.measured_h };
+            gop.value_ptr.* = .{
+                .rect = node.rect,
+                .clip = clip,
+                .measured_w = node.measured_w,
+                .measured_h = node.measured_h,
+                .content_w = node.content_w,
+                .content_h = node.content_h,
+                .declared_w = layout.declaredSizeOf(node, true),
+                .declared_h = layout.declaredSizeOf(node, false),
+            };
         }
         const child_clip = if (node.cfg.clip_children) Rect.intersect(clip, node.rect) else clip;
         var it = node.first_child;
@@ -2663,5 +2700,142 @@ test "ellipsizeText: Context wrapper matches text_wrap.truncate" {
     const via_mod = text_wrap_mod.truncate(ctx.allocator(), ctx.font, "a-very-long-file-name-that-does-not-fit-the-column.txt", 80) catch unreachable;
     try std.testing.expectEqualStrings(via_mod.text, via_ctx.text);
     try std.testing.expectEqual(via_mod.truncated, via_ctx.truncated);
+    ctx.endFrame();
+}
+
+test "extent: unrecorded CachedRect falls back to measured" {
+    const cached = CachedRect{
+        .rect = .{ .x = 0, .y = 0, .w = 10, .h = 10 },
+        .clip = .{ .x = 0, .y = 0, .w = 10, .h = 10 },
+        .measured_w = 80,
+        .measured_h = 40,
+    };
+    try std.testing.expectEqual(@as(i32, -1), cached.content_w);
+    try std.testing.expectEqual(@as(i32, -1), cached.declared_w);
+    try std.testing.expectEqual(@as(i32, 80), cached.scrollContentSize().x);
+    try std.testing.expectEqual(@as(i32, 40), cached.scrollContentSize().y);
+}
+
+test "extent: declared fixed wins over a smaller recorded extent" {
+    const cached = CachedRect{
+        .rect = .{ .x = 0, .y = 0, .w = 40, .h = 40 },
+        .clip = .{ .x = 0, .y = 0, .w = 40, .h = 40 },
+        .measured_w = 40,
+        .measured_h = 10,
+        .content_w = 40,
+        .content_h = 10,
+        .declared_w = -1,
+        .declared_h = 500,
+    };
+    try std.testing.expectEqual(@as(i32, 40), cached.scrollContentSize().x);
+    try std.testing.expectEqual(@as(i32, 500), cached.scrollContentSize().y);
+}
+
+test "extent: ScrollArea uses previous-frame extent for max_y on a grow wrap content box" {
+    var ctx = testCtx();
+    defer ctx.deinit();
+    const sid: Id = 0x3040;
+    const content_id = id_mod.hashInt(sid, 1);
+    var scroll = Vec2f{ .x = 0, .y = 0 };
+    const opts = widgets.ScrollAreaOpts{
+        .width = .{ .fixed = 80 },
+        .height = .{ .fixed = 40 },
+        .content_width = .{ .grow = 1 },
+        .content_height = .{ .grow = 1 },
+    };
+
+    ctx.beginFrame(80, 40);
+    ctx.beginScrollArea(sid, &scroll, opts);
+    ctx.beginBox(.{
+        .direction = .row,
+        .wrap = true,
+        .width = .{ .grow = 1 },
+        .height = .{ .grow = 1 },
+        .gap = 0,
+    });
+    var i: u32 = 0;
+    while (i < 6) : (i += 1) {
+        ctx.beginBox(.{ .width = .{ .fixed = 50 }, .height = .{ .fixed = 16 } });
+        ctx.endBox();
+    }
+    ctx.endBox();
+    ctx.endScrollArea();
+    ctx.endFrame();
+
+    const cached = ctx.getNodeCachedRect(content_id).?;
+    try std.testing.expectEqual(@as(i32, 0), cached.measured_h);
+    try std.testing.expect(cached.content_h > cached.measured_h);
+    try std.testing.expect(cached.content_h > 40);
+
+    scroll.y = 9999;
+    ctx.beginFrame(80, 40);
+    ctx.beginScrollArea(sid, &scroll, opts);
+    ctx.beginBox(.{
+        .direction = .row,
+        .wrap = true,
+        .width = .{ .grow = 1 },
+        .height = .{ .grow = 1 },
+        .gap = 0,
+    });
+    i = 0;
+    while (i < 6) : (i += 1) {
+        ctx.beginBox(.{ .width = .{ .fixed = 50 }, .height = .{ .fixed = 16 } });
+        ctx.endBox();
+    }
+    ctx.endBox();
+    ctx.endScrollArea();
+    ctx.endFrame();
+
+    const max_y = cached.content_h - 40;
+    try std.testing.expect(max_y > 0);
+    try std.testing.expectEqual(@as(f32, @floatFromInt(max_y)), scroll.y);
+}
+
+test "extent: ScrollArea prefers a declared fixed content size over extent (virtual-list shape)" {
+    var ctx = testCtx();
+    defer ctx.deinit();
+    const sid: Id = 0x3041;
+    const content_id = id_mod.hashInt(sid, 1);
+    var scroll = Vec2f{ .x = 0, .y = 0 };
+    const opts = widgets.ScrollAreaOpts{
+        .width = .{ .fixed = 80 },
+        .height = .{ .fixed = 40 },
+        .content_width = .{ .grow = 1 },
+        .content_height = .{ .fixed = 500 },
+    };
+
+    ctx.beginFrame(80, 40);
+    ctx.beginScrollArea(sid, &scroll, opts);
+    ctx.beginBox(.{ .width = .{ .fixed = 40 }, .height = .{ .fixed = 16 } });
+    ctx.endBox();
+    ctx.endScrollArea();
+    ctx.endFrame();
+
+    const cached = ctx.getNodeCachedRect(content_id).?;
+    try std.testing.expectEqual(@as(i32, 500), cached.declared_h);
+    try std.testing.expect(cached.content_h < 500);
+    try std.testing.expectEqual(@as(i32, 500), cached.scrollContentSize().y);
+
+    scroll.y = 9999;
+    ctx.beginFrame(80, 40);
+    ctx.beginScrollArea(sid, &scroll, opts);
+    ctx.beginBox(.{ .width = .{ .fixed = 40 }, .height = .{ .fixed = 16 } });
+    ctx.endBox();
+    ctx.endScrollArea();
+    ctx.endFrame();
+
+    try std.testing.expectEqual(@as(f32, 460), scroll.y);
+}
+
+test "wrap: beginBox accepts a legal wrap config" {
+    var ctx = testCtx();
+    defer ctx.deinit();
+    ctx.beginFrame(100, 80);
+    ctx.beginBox(.{ .direction = .row, .wrap = true, .width = .{ .fixed = 80 }, .height = .fit });
+    ctx.beginBox(.{ .width = .{ .fixed = 30 }, .height = .{ .fixed = 10 } });
+    ctx.endBox();
+    ctx.beginBox(.{ .width = .{ .fixed = 30 }, .height = .{ .fixed = 10 } });
+    ctx.endBox();
+    ctx.endBox();
     ctx.endFrame();
 }

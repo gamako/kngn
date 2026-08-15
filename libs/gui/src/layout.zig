@@ -8,10 +8,24 @@
 // They are not a per-pixel loop and do not touch the real-time audio path.
 //
 // Limitations:
-// - no flex-item wrap (text wrap is supported; a flex line that wraps to the next row is not)
+// - wrap (main-axis flex wrap) is supported. wrap=true is illegal when the main-axis
+//   Sizing is fit (a fit main axis grows to one line). wrap=true with a grow / percent
+//   main axis is illegal when the cross axis is fit (line count is unknown at measure).
+//   Line splitting uses each child's clamped resolved main size, except grow which
+//   enters at its min (default 0) so membership does not depend on the share that
+//   membership would determine. Inside a wrap box, cross-axis grow fills the line
+//   (not the container) and cross-axis percent resolves against the line cross size.
+// - no shrink. If children exceed the parent they overflow (clip_children can hide
+//   the overflow). min/max clamp is uniform across fixed/fit/grow/percent: applied
+//   to computeMeasured and to every placed main/cross size. weight-0 grow children
+//   take none of the remainder but still clamp (grow=0, min=20 is 20 and is frozen
+//   into used from the start). If the sum of mins exceeds the remainder, each child
+//   still gets its min and the parent overflows. Leftover remainder stays as a
+//   trailing gap when no unfrozen weight>0 grow child remains (every such child
+//   max-frozen, or none existed). Freeze iteration is bit-identical to the
+//   unconstrained peel when no clamp fires.
 // - no absolute positioning
 // - main-axis alignment (justify_content) is start only; right-align etc. by inserting a grow box
-// - no shrink. If children exceed the parent they overflow (clip_children can hide the overflow)
 // - grow / percent children inside a fit parent measure as 0 (the fit parent shrinks accordingly).
 //   This holds on both axes, including measureHeights.
 // - percent is relative to the parent content box (after padding, before gap). Floor truncation;
@@ -57,9 +71,21 @@ pub const BoxConfig = struct {
     direction: Direction = .column,
     width: Sizing = .fit,
     height: Sizing = .fit,
+    /// Orthogonal clamp applied to every Sizing on this axis (fixed/fit/grow/percent).
+    /// Defaults are a no-op: min 0, max maxInt(i32).
+    min_width: i32 = 0,
+    min_height: i32 = 0,
+    max_width: i32 = std.math.maxInt(i32),
+    max_height: i32 = std.math.maxInt(i32),
     /// top, right, bottom, left
     padding: [4]i32 = .{ 0, 0, 0, 0 },
     gap: i32 = 0,
+    /// Cross-axis gap between wrap lines. null means the same value as `gap`.
+    /// Optional so a negative gap stays distinct from "use gap".
+    cross_gap: ?i32 = null,
+    /// When true, children wrap onto the next cross-axis line once the main axis
+    /// is full. See the Limitations block for the wrap contracts.
+    wrap: bool = false,
     align_cross: Align = .start,
     bg: ?Color = null,
     /// Border (null = none). Emitted bg → children → border
@@ -109,6 +135,16 @@ pub const Node = struct {
     child_count: u32 = 0,
     measured_w: i32 = 0,
     measured_h: i32 = 0,
+    /// Content extent after place, in border-box units (max child edge + both paddings).
+    /// Origin is this node's content origin (inside padding). Child rects have
+    /// scroll_x/y added back so the extent does not depend on scroll. Negative
+    /// child positions do not extend past the origin (clamped at 0 before max).
+    /// An unclipped child's own content extent is included, offset by the child.
+    /// -1 = not recorded: a leaf never records extent, and a box stays -1 until
+    /// placeHeights runs. A leaf has no children; its own rect is already folded
+    /// into the parent's extent, so a leaf-side content_w/h would duplicate that.
+    content_w: i32 = -1,
+    content_h: i32 = -1,
     /// Final rect after placement (set by placeWidths / placeHeights)
     rect: Rect = .{ .x = 0, .y = 0, .w = 0, .h = 0 },
     leaf: ?LeafKind = null,
@@ -139,6 +175,46 @@ pub fn assertSizingValid(s: Sizing) void {
     }
 }
 
+/// Whether `cfg.wrap` is legal with the main/cross Sizing pair.
+pub fn wrapConfigValid(cfg: BoxConfig) bool {
+    if (!cfg.wrap) return true;
+    const main = switch (cfg.direction) {
+        .row => cfg.width,
+        .column => cfg.height,
+    };
+    const cross = switch (cfg.direction) {
+        .row => cfg.height,
+        .column => cfg.width,
+    };
+    if (main == .fit) return false;
+    const main_indefinite = switch (main) {
+        .grow, .percent => true,
+        else => false,
+    };
+    if (main_indefinite and cross == .fit) return false;
+    return true;
+}
+
+/// Detect invalid BoxConfig values in debug builds (called from beginBox).
+pub fn assertBoxConfigValid(cfg: BoxConfig) void {
+    assertSizingValid(cfg.width);
+    assertSizingValid(cfg.height);
+    std.debug.assert(cfg.min_width >= 0);
+    std.debug.assert(cfg.min_height >= 0);
+    std.debug.assert(cfg.max_width >= cfg.min_width);
+    std.debug.assert(cfg.max_height >= cfg.min_height);
+    std.debug.assert(wrapConfigValid(cfg));
+}
+
+/// Declared fixed size after min/max clamp, or -1 when the axis is not `.fixed`.
+pub fn declaredSizeOf(node: *const Node, axis_is_w: bool) i32 {
+    const s = if (axis_is_w) node.cfg.width else node.cfg.height;
+    return switch (s) {
+        .fixed => |n| clampAxis(node, if (axis_is_w) .w else .h, n),
+        else => -1,
+    };
+}
+
 const Axis = enum { w, h };
 
 fn axisPadding(cfg: BoxConfig, axis: Axis) i32 {
@@ -166,6 +242,46 @@ fn measuredOf(node: *const Node, axis: Axis) i32 {
     return switch (axis) {
         .w => node.measured_w,
         .h => node.measured_h,
+    };
+}
+
+fn minOf(node: *const Node, axis: Axis) i32 {
+    return switch (axis) {
+        .w => node.cfg.min_width,
+        .h => node.cfg.min_height,
+    };
+}
+
+fn maxOf(node: *const Node, axis: Axis) i32 {
+    return switch (axis) {
+        .w => node.cfg.max_width,
+        .h => node.cfg.max_height,
+    };
+}
+
+fn clampAxis(node: *const Node, axis: Axis, value: i32) i32 {
+    return std.math.clamp(value, minOf(node, axis), maxOf(node, axis));
+}
+
+fn hasAxisClamp(node: *const Node, axis: Axis) bool {
+    return minOf(node, axis) > 0 or maxOf(node, axis) < std.math.maxInt(i32);
+}
+
+fn growWeightOf(node: *const Node, axis: Axis) u16 {
+    return switch (sizingOf(node, axis)) {
+        .grow => |w| w,
+        else => 0,
+    };
+}
+
+fn effectiveCrossGap(cfg: BoxConfig) i32 {
+    return cfg.cross_gap orelse cfg.gap;
+}
+
+fn crossAxis(cfg: BoxConfig) Axis {
+    return switch (cfg.direction) {
+        .row => .h,
+        .column => .w,
     };
 }
 
@@ -249,23 +365,28 @@ pub fn measure(node: *Node, default_font: Font) void {
 }
 
 fn computeMeasured(node: *const Node, axis: Axis) i32 {
-    switch (sizingOf(node, axis)) {
-        .fixed => |n| return n,
-        .grow, .percent => return 0, // Unresolved at measure time
-        .fit => {},
-    }
-    const pad = axisPadding(node.cfg, axis);
-    if (mainAxis(node.cfg) == axis) {
-        var sum: i32 = 0;
-        var it = node.first_child;
-        while (it) |c| : (it = c.next_sibling) sum += measuredOf(c, axis);
-        return sum + gapTotal(node.cfg.gap, node.child_count) + pad;
-    } else {
-        var max_child: i32 = 0;
-        var it = node.first_child;
-        while (it) |c| : (it = c.next_sibling) max_child = @max(max_child, measuredOf(c, axis));
-        return max_child + pad;
-    }
+    const raw: i32 = switch (sizingOf(node, axis)) {
+        .fixed => |n| n,
+        .grow, .percent => 0, // Unresolved at measure time
+        .fit => blk: {
+            if (node.cfg.wrap and mainAxis(node.cfg) != axis) {
+                break :blk measureWrapCross(node, axis);
+            }
+            const pad = axisPadding(node.cfg, axis);
+            if (mainAxis(node.cfg) == axis) {
+                var sum: i32 = 0;
+                var it = node.first_child;
+                while (it) |c| : (it = c.next_sibling) sum += measuredOf(c, axis);
+                break :blk sum + gapTotal(node.cfg.gap, node.child_count) + pad;
+            } else {
+                var max_child: i32 = 0;
+                var it = node.first_child;
+                while (it) |c| : (it = c.next_sibling) max_child = @max(max_child, measuredOf(c, axis));
+                break :blk max_child + pad;
+            }
+        },
+    };
+    return clampAxis(node, axis, raw);
 }
 
 /// Place widths (pre-order). Sets `rect.x` / `rect.w` from `rect` and resolves
@@ -280,13 +401,21 @@ pub fn placeWidths(node: *Node, rect: Rect) void {
 }
 
 /// Place heights (pre-order). Sets `rect.y` / `rect.h` from `rect` and resolves
-/// children on the height axis only.
+/// children on the height axis only. A box records content extent here, folded
+/// into the same child walk that places (children already have both axes from
+/// placeWidths + this pass). A leaf returns without recording: it has no
+/// children, and the parent already includes the leaf rect in its own extent.
 ///
 /// Hot path: every frame on the GUI layout path; not a per-pixel loop; not RT.
 pub fn placeHeights(node: *Node, rect: Rect) void {
     node.rect.y = rect.y;
     node.rect.h = rect.h;
-    if (node.leaf != null or node.first_child == null) return;
+    if (node.leaf != null) return;
+    if (node.first_child == null) {
+        node.content_w = node.cfg.padding[3] + node.cfg.padding[1];
+        node.content_h = node.cfg.padding[0] + node.cfg.padding[2];
+        return;
+    }
     placeChildrenOnAxis(node, .h);
 }
 
@@ -297,20 +426,208 @@ pub fn place(node: *Node, rect: Rect) void {
 }
 
 fn resolveSize(child: *const Node, axis: Axis, content: i32, grow_take: ?i32) i32 {
-    return switch (sizingOf(child, axis)) {
+    const raw: i32 = switch (sizingOf(child, axis)) {
         .fixed => |n| n,
         .fit => measuredOf(child, axis),
         .percent => |f| percentOf(content, f),
         .grow => |w| blk: {
             if (grow_take) |take| break :blk take;
             _ = w;
-            // Cross-axis grow ignores weight and fills parent content.
+            // Cross-axis grow ignores weight and fills the given content
+            // (parent content, or the wrap line's cross size).
             break :blk content;
         },
     };
+    return clampAxis(child, axis, raw);
+}
+
+/// Size a child contributes when deciding which flex line it belongs on.
+///
+/// Hot path: every frame on the GUI layout path (O(children) per wrap box);
+/// not a per-pixel loop; not RT.
+///
+/// fixed / fit / percent enter at their clamped resolved size. grow enters at
+/// its min (default 0). grow's final share depends on who shares the line, and
+/// line membership would otherwise depend on that share — using min breaks
+/// the cycle.
+fn wrapEntrySize(child: *const Node, main: Axis, content_main: i32) i32 {
+    return switch (sizingOf(child, main)) {
+        .grow => minOf(child, main),
+        .fixed => |n| clampAxis(child, main, n),
+        .fit => clampAxis(child, main, measuredOf(child, main)),
+        .percent => |f| clampAxis(child, main, percentOf(content_main, f)),
+    };
+}
+
+fn nextLineStart(first: *Node, content_main: i32, gap: i32, main: Axis) ?*Node {
+    var used = wrapEntrySize(first, main, content_main);
+    var it = first.next_sibling;
+    while (it) |c| {
+        const entry = wrapEntrySize(c, main, content_main);
+        if (used + gap + entry > content_main) return c;
+        used += gap + entry;
+        it = c.next_sibling;
+    }
+    return null;
+}
+
+fn countUntil(first: *Node, end: ?*Node) u32 {
+    var n: u32 = 0;
+    var it: ?*Node = first;
+    while (it) |c| {
+        if (c == end) break;
+        n += 1;
+        it = c.next_sibling;
+    }
+    return n;
+}
+
+fn lineHasClamp(first: *Node, end: ?*Node, axis: Axis) bool {
+    var it: ?*Node = first;
+    while (it) |c| {
+        if (c == end) break;
+        if (hasAxisClamp(c, axis)) return true;
+        it = c.next_sibling;
+    }
+    return false;
+}
+
+/// Line cross size: max of (non-grow/percent children's clamped resolved size,
+/// grow/percent children's min). A line of only grow/percent children with
+/// min 0 has cross 0 (same idea as grow/percent measuring 0 inside a fit parent).
+fn lineCrossSize(first: *Node, end: ?*Node, cross: Axis) i32 {
+    var line_cross: i32 = 0;
+    var it: ?*Node = first;
+    while (it) |c| {
+        if (c == end) break;
+        const contrib: i32 = switch (sizingOf(c, cross)) {
+            .grow, .percent => minOf(c, cross),
+            .fixed => |n| clampAxis(c, cross, n),
+            .fit => clampAxis(c, cross, measuredOf(c, cross)),
+        };
+        line_cross = @max(line_cross, contrib);
+        it = c.next_sibling;
+    }
+    return line_cross;
+}
+
+fn wrapContentMainForMeasure(node: *const Node) i32 {
+    const main = mainAxis(node.cfg);
+    const pad = axisPadding(node.cfg, main);
+    return switch (sizingOf(node, main)) {
+        .fixed => |n| @max(0, clampAxis(node, main, n) - pad),
+        .fit, .grow, .percent => @max(0, clampAxis(node, main, measuredOf(node, main)) - pad),
+    };
+}
+
+fn measureWrapCross(node: *const Node, cross: Axis) i32 {
+    const main = mainAxis(node.cfg);
+    const content_main = wrapContentMainForMeasure(node);
+    const gap = node.cfg.gap;
+    const cgap = effectiveCrossGap(node.cfg);
+    const pad = axisPadding(node.cfg, cross);
+    var first = node.first_child;
+    if (first == null) return pad;
+    var total: i32 = 0;
+    var nlines: u32 = 0;
+    while (first) |f| {
+        const end = nextLineStart(f, content_main, gap, main);
+        total += lineCrossSize(f, end, cross);
+        nlines += 1;
+        first = end;
+    }
+    if (nlines > 1) total += cgap * (@as(i32, @intCast(nlines)) - 1);
+    return total + pad;
+}
+
+fn resolveContentMain(node: *const Node) i32 {
+    const main = mainAxis(node.cfg);
+    const pad = axisPadding(node.cfg, main);
+    const placed: i32 = if (main == .w)
+        @intCast(node.rect.w)
+    else
+        @intCast(node.rect.h);
+    return @max(0, clampAxis(node, main, placed) - pad);
+}
+
+fn mainSizeKnown(node: *const Node, placing_axis: Axis) bool {
+    const main = mainAxis(node.cfg);
+    if (placing_axis == main) return true;
+    if (sizingOf(node, main) == .fixed) return true;
+    // Widths are placed before heights, so a row-wrap box already has rect.w.
+    return main == .w;
+}
+
+fn contentMainForPlace(node: *const Node, placing_axis: Axis) i32 {
+    if (mainSizeKnown(node, placing_axis)) return resolveContentMain(node);
+    return switch (sizingOf(node, mainAxis(node.cfg))) {
+        .fixed => |n| @max(0, clampAxis(node, mainAxis(node.cfg), n) - axisPadding(node.cfg, mainAxis(node.cfg))),
+        else => std.math.maxInt(i32) / 4,
+    };
+}
+
+const unfrozen_mark: u32 = std.math.maxInt(u32);
+
+fn rectSizeU(node: *const Node, axis: Axis) u32 {
+    return if (axis == .w) node.rect.w else node.rect.h;
+}
+
+fn setRectSizeU(node: *Node, axis: Axis, v: u32) void {
+    if (axis == .w) node.rect.w = v else node.rect.h = v;
+}
+
+fn setRectSizeI(node: *Node, axis: Axis, v: i32) void {
+    setRectSizeU(node, axis, @intCast(@max(0, v)));
+}
+
+fn isUnfrozenGrow(node: *const Node, axis: Axis) bool {
+    return switch (sizingOf(node, axis)) {
+        .grow => |w| w > 0 and rectSizeU(node, axis) == unfrozen_mark,
+        else => false,
+    };
+}
+
+const ExtentAcc = struct {
+    parent: *const Node,
+    max_right: *i32,
+    max_bottom: *i32,
+};
+
+fn accumulateExtent(parent: *const Node, child: *const Node, max_right: *i32, max_bottom: *i32) void {
+    const origin_x = parent.rect.x + parent.cfg.padding[3];
+    const origin_y = parent.rect.y + parent.cfg.padding[0];
+    const child_right = child.rect.x + @as(i32, @intCast(child.rect.w));
+    const child_bottom = child.rect.y + @as(i32, @intCast(child.rect.h));
+    const rel_right = child_right - origin_x + parent.cfg.scroll_x;
+    const rel_bottom = child_bottom - origin_y + parent.cfg.scroll_y;
+    max_right.* = @max(max_right.*, @max(rel_right, 0));
+    max_bottom.* = @max(max_bottom.*, @max(rel_bottom, 0));
+    if (!child.cfg.clip_children) {
+        if (child.content_w >= 0) {
+            const ext_right = child.rect.x + child.content_w - origin_x + parent.cfg.scroll_x;
+            max_right.* = @max(max_right.*, @max(ext_right, 0));
+        }
+        if (child.content_h >= 0) {
+            const ext_bottom = child.rect.y + child.content_h - origin_y + parent.cfg.scroll_y;
+            max_bottom.* = @max(max_bottom.*, @max(ext_bottom, 0));
+        }
+    }
+}
+
+fn commitExtent(node: *Node, max_right: i32, max_bottom: i32) void {
+    node.content_w = max_right + node.cfg.padding[3] + node.cfg.padding[1];
+    node.content_h = max_bottom + node.cfg.padding[0] + node.cfg.padding[2];
 }
 
 fn placeChildrenOnAxis(node: *Node, axis: Axis) void {
+    if (node.cfg.wrap) {
+        placeWrapOnAxis(node, axis);
+        return;
+    }
+    placeLinearOnAxis(node, axis);
+}
+
+fn placeLinearOnAxis(node: *Node, axis: Axis) void {
     const cfg = node.cfg;
     const main = mainAxis(cfg);
     const content_origin: i32 = if (axis == .w)
@@ -319,38 +636,17 @@ fn placeChildrenOnAxis(node: *Node, axis: Axis) void {
         node.rect.y + cfg.padding[0];
     const content_size: i32 = @max(0, @as(i32, @intCast(if (axis == .w) node.rect.w else node.rect.h)) - axisPadding(cfg, axis));
     const scroll: i32 = if (axis == .w) cfg.scroll_x else cfg.scroll_y;
+    var max_right: i32 = 0;
+    var max_bottom: i32 = 0;
 
     if (main == axis) {
-        var used: i32 = gapTotal(cfg.gap, node.child_count);
-        var grow_total: i64 = 0;
-        var it = node.first_child;
-        while (it) |c| : (it = c.next_sibling) {
-            switch (sizingOf(c, main)) {
-                .fixed => |n| used += n,
-                .fit => used += measuredOf(c, main),
-                .percent => |f| used += percentOf(content_size, f),
-                .grow => |w| grow_total += w,
-            }
-        }
-        var remaining: i64 = @max(0, content_size - used);
-        var w_rest: i64 = grow_total;
-        var cursor: i32 = content_origin - scroll;
-        it = node.first_child;
-        while (it) |c| : (it = c.next_sibling) {
-            const size: i32 = switch (sizingOf(c, main)) {
-                .fixed => |n| n,
-                .fit => measuredOf(c, main),
-                .percent => |f| percentOf(content_size, f),
-                .grow => |w| blk: {
-                    const take: i64 = if (w_rest > 0) @divTrunc(remaining * w, w_rest) else 0;
-                    remaining -= take;
-                    w_rest -= w;
-                    break :blk @intCast(take);
-                },
-            };
-            descendPlace(c, axis, cursor, size);
-            cursor += size + cfg.gap;
-        }
+        const acc: ?ExtentAcc = if (axis == .h) .{
+            .parent = node,
+            .max_right = &max_right,
+            .max_bottom = &max_bottom,
+        } else null;
+        placeLineMain(node.first_child, null, node.child_count, content_origin - scroll, content_size, cfg.gap, axis, acc);
+        if (axis == .h) commitExtent(node, max_right, max_bottom);
     } else {
         var it = node.first_child;
         while (it) |c| : (it = c.next_sibling) {
@@ -361,8 +657,230 @@ fn placeChildrenOnAxis(node: *Node, axis: Axis) void {
                 .end => content_size - size,
             };
             descendPlace(c, axis, content_origin + cross_off - scroll, size);
+            if (axis == .h) accumulateExtent(node, c, &max_right, &max_bottom);
+        }
+        if (axis == .h) commitExtent(node, max_right, max_bottom);
+    }
+}
+
+/// Distribute leftover main-axis space among grow children on one line, then place.
+///
+/// Hot path: every frame on the GUI layout path. Line membership and placement
+/// are O(children). Freeze reallocation is worst-case O(grow_on_line^2);
+/// practical grow counts are small. Not a per-pixel loop; not RT.
+///
+/// Invariants:
+/// - weight 0 grow children take 0 of the remainder but still receive min/max
+///   clamp (a grow=0, min=20 child is 20 and is frozen into used from the start).
+/// - if the sum of mins exceeds the remainder, each child still gets its min
+///   and the parent overflows (same as the no-shrink contract).
+/// - leftover remainder stays as a trailing gap when no unfrozen weight>0 grow
+///   child remains (every such child max-frozen, or none existed).
+/// - with no clamp violations the peel is bit-identical to the unconstrained
+///   accumulate-peel (the no-clamp branch is that peel).
+fn placeLineMain(
+    first: ?*Node,
+    end: ?*Node,
+    count: u32,
+    cursor0: i32,
+    content_main: i32,
+    gap: i32,
+    axis: Axis,
+    extent: ?ExtentAcc,
+) void {
+    const start = first orelse return;
+    if (!lineHasClamp(start, end, axis)) {
+        var used: i32 = gapTotal(gap, count);
+        var grow_total: i64 = 0;
+        var it: ?*Node = start;
+        while (it) |c| {
+            if (c == end) break;
+            switch (sizingOf(c, axis)) {
+                .fixed => |n| used += n,
+                .fit => used += measuredOf(c, axis),
+                .percent => |f| used += percentOf(content_main, f),
+                .grow => |w| grow_total += w,
+            }
+            it = c.next_sibling;
+        }
+        var remaining: i64 = @max(0, content_main - used);
+        var w_rest: i64 = grow_total;
+        var cursor: i32 = cursor0;
+        it = start;
+        while (it) |c| {
+            if (c == end) break;
+            const size: i32 = switch (sizingOf(c, axis)) {
+                .fixed => |n| n,
+                .fit => measuredOf(c, axis),
+                .percent => |f| percentOf(content_main, f),
+                .grow => |w| blk: {
+                    const take: i64 = if (w_rest > 0) @divTrunc(remaining * w, w_rest) else 0;
+                    remaining -= take;
+                    w_rest -= w;
+                    break :blk @intCast(take);
+                },
+            };
+            descendPlace(c, axis, cursor, size);
+            if (extent) |acc| accumulateExtent(acc.parent, c, acc.max_right, acc.max_bottom);
+            cursor += size + gap;
+            it = c.next_sibling;
+        }
+        return;
+    }
+
+    var used: i32 = gapTotal(gap, count);
+    var it: ?*Node = start;
+    while (it) |c| {
+        if (c == end) break;
+        switch (sizingOf(c, axis)) {
+            .grow => |w| {
+                if (w == 0) {
+                    const sz = clampAxis(c, axis, 0);
+                    setRectSizeI(c, axis, sz);
+                    used += sz;
+                } else {
+                    setRectSizeU(c, axis, unfrozen_mark);
+                }
+            },
+            else => {
+                const sz = resolveSize(c, axis, content_main, 0);
+                setRectSizeI(c, axis, sz);
+                used += sz;
+            },
+        }
+        it = c.next_sibling;
+    }
+
+    while (true) {
+        var w_rest: i64 = 0;
+        it = start;
+        while (it) |c| {
+            if (c == end) break;
+            if (isUnfrozenGrow(c, axis)) w_rest += growWeightOf(c, axis);
+            it = c.next_sibling;
+        }
+        if (w_rest == 0) break;
+
+        const remaining: i64 = @max(0, content_main - used);
+        var peel_rem = remaining;
+        var wr = w_rest;
+        var any_freeze = false;
+        it = start;
+        while (it) |c| {
+            if (c == end) break;
+            if (isUnfrozenGrow(c, axis)) {
+                const w: i64 = growWeightOf(c, axis);
+                const take: i64 = if (wr > 0) @divTrunc(peel_rem * w, wr) else 0;
+                peel_rem -= take;
+                wr -= w;
+                const take_i: i32 = @intCast(take);
+                const clamped = clampAxis(c, axis, take_i);
+                if (clamped != take_i) {
+                    setRectSizeI(c, axis, clamped);
+                    used += clamped;
+                    any_freeze = true;
+                }
+            }
+            it = c.next_sibling;
+        }
+        if (!any_freeze) {
+            peel_rem = remaining;
+            wr = w_rest;
+            it = start;
+            while (it) |c| {
+                if (c == end) break;
+                if (isUnfrozenGrow(c, axis)) {
+                    const w: i64 = growWeightOf(c, axis);
+                    const take: i64 = if (wr > 0) @divTrunc(peel_rem * w, wr) else 0;
+                    peel_rem -= take;
+                    wr -= w;
+                    setRectSizeI(c, axis, @intCast(take));
+                }
+                it = c.next_sibling;
+            }
+            break;
         }
     }
+
+    var cursor: i32 = cursor0;
+    it = start;
+    while (it) |c| {
+        if (c == end) break;
+        const size: i32 = @intCast(rectSizeU(c, axis));
+        descendPlace(c, axis, cursor, size);
+        if (extent) |acc| accumulateExtent(acc.parent, c, acc.max_right, acc.max_bottom);
+        cursor += size + gap;
+        it = c.next_sibling;
+    }
+}
+
+fn placeWrapOnAxis(node: *Node, axis: Axis) void {
+    const main = mainAxis(node.cfg);
+    if (axis == main) {
+        placeWrapMain(node);
+        if (main == .h) {
+            // Column wrap: main (height) is now known, so re-place cross (width)
+            // with the final line membership.
+            placeWrapCross(node, true, true);
+        }
+    } else {
+        placeWrapCross(node, axis == .h, mainSizeKnown(node, axis));
+    }
+}
+
+fn placeWrapMain(node: *Node) void {
+    const cfg = node.cfg;
+    const main = mainAxis(cfg);
+    const content_main = resolveContentMain(node);
+    const origin: i32 = if (main == .w)
+        node.rect.x + cfg.padding[3]
+    else
+        node.rect.y + cfg.padding[0];
+    const scroll: i32 = if (main == .w) cfg.scroll_x else cfg.scroll_y;
+    var first = node.first_child;
+    while (first) |f| {
+        const end = nextLineStart(f, content_main, cfg.gap, main);
+        const count = countUntil(f, end);
+        placeLineMain(f, end, count, origin - scroll, content_main, cfg.gap, main, null);
+        first = end;
+    }
+}
+
+fn placeWrapCross(node: *Node, record_extent: bool, main_known: bool) void {
+    const cfg = node.cfg;
+    const main = mainAxis(cfg);
+    const cross = crossAxis(cfg);
+    const content_main = if (main_known) resolveContentMain(node) else contentMainForPlace(node, cross);
+    const cgap = effectiveCrossGap(cfg);
+    const origin_cross: i32 = if (cross == .w)
+        node.rect.x + cfg.padding[3]
+    else
+        node.rect.y + cfg.padding[0];
+    const scroll_cross: i32 = if (cross == .w) cfg.scroll_x else cfg.scroll_y;
+    var max_right: i32 = 0;
+    var max_bottom: i32 = 0;
+    var cross_cursor = origin_cross - scroll_cross;
+    var first = node.first_child;
+    while (first) |f| {
+        const end = nextLineStart(f, content_main, cfg.gap, main);
+        const line_cross = lineCrossSize(f, end, cross);
+        var it: ?*Node = f;
+        while (it) |c| {
+            if (c == end) break;
+            const size = resolveSize(c, cross, line_cross, null);
+            const cross_off: i32 = switch (cfg.align_cross) {
+                .start => 0,
+                .center => @divFloor(line_cross - size, 2),
+                .end => line_cross - size,
+            };
+            descendPlace(c, cross, cross_cursor + cross_off, size);
+            if (record_extent) accumulateExtent(node, c, &max_right, &max_bottom);
+            it = c.next_sibling;
+        }
+        cross_cursor += line_cross + cgap;
+        first = end;
+    }
+    if (record_extent) commitExtent(node, max_right, max_bottom);
 }
 
 fn descendPlace(child: *Node, axis: Axis, pos: i32, size: i32) void {
@@ -943,4 +1461,686 @@ test "axis split: measure+place matches layoutTree for non-wrap text" {
     try std.testing.expectEqual(ta.rect, tb.rect);
     try std.testing.expectEqual(ta.measured_w, tb.measured_w);
     try std.testing.expectEqual(ta.measured_h, tb.measured_h);
+}
+
+fn boxWH(w: i32, h: i32) Node {
+    return .{ .cfg = .{ .width = .{ .fixed = w }, .height = .{ .fixed = h } } };
+}
+
+fn layoutOnce(root: *Node, w: u32, h: u32) void {
+    measure(root, test_font);
+    place(root, .{ .x = 0, .y = 0, .w = w, .h = h });
+}
+
+test "minmax: fixed is clamped" {
+    var root: Node = .{ .cfg = .{ .direction = .row, .width = .{ .fixed = 200 }, .height = .{ .fixed = 20 } } };
+    var lo: Node = .{ .cfg = .{ .width = .{ .fixed = 80 }, .height = .{ .fixed = 10 }, .min_width = 90 } };
+    var hi: Node = .{ .cfg = .{ .width = .{ .fixed = 80 }, .height = .{ .fixed = 10 }, .max_width = 50 } };
+    appendChild(&root, &lo);
+    appendChild(&root, &hi);
+    layoutOnce(&root, 200, 20);
+    try std.testing.expectEqual(@as(u32, 90), lo.rect.w);
+    try std.testing.expectEqual(@as(u32, 50), hi.rect.w);
+}
+
+test "minmax: grow weight 0 with min_width receives min" {
+    var root: Node = .{ .cfg = .{ .direction = .row, .width = .{ .fixed = 100 }, .height = .{ .fixed = 10 } } };
+    var g: Node = .{ .cfg = .{ .width = .{ .grow = 0 }, .height = .{ .fixed = 10 }, .min_width = 20 } };
+    appendChild(&root, &g);
+    layoutOnce(&root, 100, 10);
+    try std.testing.expectEqual(@as(u32, 20), g.rect.w);
+}
+
+test "minmax: fit min floors and max clips (child overflows)" {
+    {
+        var root: Node = .{ .cfg = .{ .direction = .row, .min_width = 50 } };
+        var a: Node = boxWH(10, 10);
+        appendChild(&root, &a);
+        measure(&root, test_font);
+        try std.testing.expectEqual(@as(i32, 50), root.measured_w);
+    }
+    {
+        var root: Node = .{ .cfg = .{ .direction = .row, .max_width = 20 } };
+        var a: Node = boxWH(80, 10);
+        appendChild(&root, &a);
+        measure(&root, test_font);
+        place(&root, .{ .x = 0, .y = 0, .w = @intCast(root.measured_w), .h = 10 });
+        try std.testing.expectEqual(@as(i32, 20), root.measured_w);
+        try std.testing.expectEqual(@as(u32, 80), a.rect.w);
+    }
+}
+
+test "minmax: percent is clamped" {
+    var root: Node = .{ .cfg = .{ .direction = .row, .width = .{ .fixed = 100 }, .height = .{ .fixed = 10 } } };
+    var hi: Node = .{ .cfg = .{ .width = .{ .percent = 0.8 }, .height = .{ .fixed = 10 }, .max_width = 50 } };
+    var lo: Node = .{ .cfg = .{ .width = .{ .percent = 0.1 }, .height = .{ .fixed = 10 }, .min_width = 30 } };
+    appendChild(&root, &hi);
+    appendChild(&root, &lo);
+    layoutOnce(&root, 100, 10);
+    try std.testing.expectEqual(@as(u32, 50), hi.rect.w);
+    try std.testing.expectEqual(@as(u32, 30), lo.rect.w);
+}
+
+test "minmax: used sums the clamped non-grow size (fixed 80 max 40 leaves 60 for grow)" {
+    var root: Node = .{ .cfg = .{ .direction = .row, .width = .{ .fixed = 100 }, .height = .{ .fixed = 10 } } };
+    var f: Node = .{ .cfg = .{ .width = .{ .fixed = 80 }, .height = .{ .fixed = 10 }, .max_width = 40 } };
+    var g: Node = .{ .cfg = .{ .width = .{ .grow = 1 }, .height = .{ .fixed = 10 } } };
+    appendChild(&root, &f);
+    appendChild(&root, &g);
+    layoutOnce(&root, 100, 10);
+    try std.testing.expectEqual(@as(u32, 40), f.rect.w);
+    try std.testing.expectEqual(@as(u32, 60), g.rect.w);
+}
+
+test "minmax: grow min wins over the peel" {
+    var root: Node = .{ .cfg = .{ .direction = .row, .width = .{ .fixed = 100 }, .height = .{ .fixed = 10 } } };
+    var a: Node = .{ .cfg = .{ .width = .{ .grow = 1 }, .height = .{ .fixed = 10 }, .min_width = 60 } };
+    var b: Node = .{ .cfg = .{ .width = .{ .grow = 1 }, .height = .{ .fixed = 10 }, .min_width = 60 } };
+    appendChild(&root, &a);
+    appendChild(&root, &b);
+    layoutOnce(&root, 100, 10);
+    try std.testing.expectEqual(@as(u32, 60), a.rect.w);
+    try std.testing.expectEqual(@as(u32, 60), b.rect.w);
+}
+
+test "minmax: grow max freezes and the leftover is redistributed (two freeze passes)" {
+    var root: Node = .{ .cfg = .{ .direction = .row, .width = .{ .fixed = 100 }, .height = .{ .fixed = 10 } } };
+    var a: Node = .{ .cfg = .{ .width = .{ .grow = 1 }, .height = .{ .fixed = 10 }, .max_width = 20 } };
+    var b: Node = .{ .cfg = .{ .width = .{ .grow = 1 }, .height = .{ .fixed = 10 } } };
+    var c: Node = .{ .cfg = .{ .width = .{ .grow = 1 }, .height = .{ .fixed = 10 } } };
+    appendChild(&root, &a);
+    appendChild(&root, &b);
+    appendChild(&root, &c);
+    layoutOnce(&root, 100, 10);
+    try std.testing.expectEqual(@as(u32, 20), a.rect.w);
+    try std.testing.expectEqual(@as(u32, 40), b.rect.w);
+    try std.testing.expectEqual(@as(u32, 40), c.rect.w);
+}
+
+test "minmax: grow weight 0 stays 0 when min is 0" {
+    var root: Node = .{ .cfg = .{ .direction = .row, .width = .{ .fixed = 100 }, .height = .{ .fixed = 10 } } };
+    var z: Node = .{ .cfg = .{ .width = .{ .grow = 0 }, .height = .{ .fixed = 10 } } };
+    var g: Node = .{ .cfg = .{ .width = .{ .grow = 1 }, .height = .{ .fixed = 10 } } };
+    appendChild(&root, &z);
+    appendChild(&root, &g);
+    layoutOnce(&root, 100, 10);
+    try std.testing.expectEqual(@as(u32, 0), z.rect.w);
+    try std.testing.expectEqual(@as(u32, 100), g.rect.w);
+}
+
+test "minmax: min sum greater than remainder prefers min (parent overflows)" {
+    var root: Node = .{ .cfg = .{ .direction = .row, .width = .{ .fixed = 50 }, .height = .{ .fixed = 10 } } };
+    var a: Node = .{ .cfg = .{ .width = .{ .grow = 1 }, .height = .{ .fixed = 10 }, .min_width = 40 } };
+    var b: Node = .{ .cfg = .{ .width = .{ .grow = 1 }, .height = .{ .fixed = 10 }, .min_width = 40 } };
+    appendChild(&root, &a);
+    appendChild(&root, &b);
+    layoutOnce(&root, 50, 10);
+    try std.testing.expectEqual(@as(u32, 40), a.rect.w);
+    try std.testing.expectEqual(@as(u32, 40), b.rect.w);
+    try std.testing.expectEqual(@as(i32, 80), b.rect.x + @as(i32, @intCast(b.rect.w)));
+}
+
+test "minmax: leftover remains when every grow child max-freezes" {
+    var root: Node = .{ .cfg = .{ .direction = .row, .width = .{ .fixed = 100 }, .height = .{ .fixed = 10 } } };
+    var a: Node = .{ .cfg = .{ .width = .{ .grow = 1 }, .height = .{ .fixed = 10 }, .max_width = 20 } };
+    var b: Node = .{ .cfg = .{ .width = .{ .grow = 1 }, .height = .{ .fixed = 10 }, .max_width = 20 } };
+    appendChild(&root, &a);
+    appendChild(&root, &b);
+    layoutOnce(&root, 100, 10);
+    try std.testing.expectEqual(@as(u32, 20), a.rect.w);
+    try std.testing.expectEqual(@as(u32, 20), b.rect.w);
+    try std.testing.expectEqual(@as(i32, 40), b.rect.x + @as(i32, @intCast(b.rect.w)));
+}
+
+test "minmax: leftover remains when no positive-weight grow child exists" {
+    var root: Node = .{ .cfg = .{ .direction = .row, .width = .{ .fixed = 100 }, .height = .{ .fixed = 10 } } };
+    var f: Node = boxWH(30, 10);
+    var z: Node = .{ .cfg = .{ .width = .{ .grow = 0 }, .height = .{ .fixed = 10 } } };
+    appendChild(&root, &f);
+    appendChild(&root, &z);
+    layoutOnce(&root, 100, 10);
+    try std.testing.expectEqual(@as(u32, 30), f.rect.w);
+    try std.testing.expectEqual(@as(u32, 0), z.rect.w);
+    try std.testing.expectEqual(@as(i32, 30), z.rect.x + @as(i32, @intCast(z.rect.w)));
+}
+
+test "minmax: mix of grow=0+min, grow=0, and positive-weight grow keeps the invariants" {
+    var root: Node = .{ .cfg = .{ .direction = .row, .width = .{ .fixed = 100 }, .height = .{ .fixed = 10 } } };
+    var a: Node = .{ .cfg = .{ .width = .{ .grow = 0 }, .height = .{ .fixed = 10 }, .min_width = 20 } };
+    var b: Node = .{ .cfg = .{ .width = .{ .grow = 0 }, .height = .{ .fixed = 10 } } };
+    var c: Node = .{ .cfg = .{ .width = .{ .grow = 1 }, .height = .{ .fixed = 10 } } };
+    appendChild(&root, &a);
+    appendChild(&root, &b);
+    appendChild(&root, &c);
+    layoutOnce(&root, 100, 10);
+    try std.testing.expectEqual(@as(u32, 20), a.rect.w);
+    try std.testing.expectEqual(@as(u32, 0), b.rect.w);
+    try std.testing.expectEqual(@as(u32, 80), c.rect.w);
+}
+
+test "minmax: min sum greater than the parent overflows" {
+    var root: Node = .{ .cfg = .{ .direction = .row, .width = .{ .fixed = 30 }, .height = .{ .fixed = 10 } } };
+    var a: Node = .{ .cfg = .{ .width = .{ .fixed = 20 }, .height = .{ .fixed = 10 }, .min_width = 25 } };
+    var b: Node = .{ .cfg = .{ .width = .{ .fixed = 20 }, .height = .{ .fixed = 10 }, .min_width = 25 } };
+    appendChild(&root, &a);
+    appendChild(&root, &b);
+    layoutOnce(&root, 30, 10);
+    try std.testing.expectEqual(@as(u32, 25), a.rect.w);
+    try std.testing.expectEqual(@as(u32, 25), b.rect.w);
+}
+
+test "minmax: max equals min is a fixed size" {
+    var root: Node = .{ .cfg = .{ .direction = .row, .width = .{ .fixed = 100 }, .height = .{ .fixed = 10 } } };
+    var g: Node = .{ .cfg = .{ .width = .{ .grow = 1 }, .height = .{ .fixed = 10 }, .min_width = 40, .max_width = 40 } };
+    appendChild(&root, &g);
+    layoutOnce(&root, 100, 10);
+    try std.testing.expectEqual(@as(u32, 40), g.rect.w);
+}
+
+test "minmax: unconstrained grow peel stays bit-identical (1:2 of 100)" {
+    var root: Node = .{ .cfg = .{ .direction = .row, .width = .{ .fixed = 200 }, .height = .{ .fixed = 50 } } };
+    var f: Node = boxWH(50, 10);
+    var p: Node = .{ .cfg = .{ .width = .{ .percent = 0.25 }, .height = .{ .fixed = 10 } } };
+    var g1: Node = .{ .cfg = .{ .width = .{ .grow = 1 }, .height = .{ .fixed = 10 } } };
+    var g2: Node = .{ .cfg = .{ .width = .{ .grow = 2 }, .height = .{ .fixed = 10 } } };
+    appendChild(&root, &f);
+    appendChild(&root, &p);
+    appendChild(&root, &g1);
+    appendChild(&root, &g2);
+    layoutOnce(&root, 200, 50);
+    try std.testing.expectEqual(@as(u32, 50), f.rect.w);
+    try std.testing.expectEqual(@as(u32, 50), p.rect.w);
+    try std.testing.expectEqual(@as(u32, 33), g1.rect.w);
+    try std.testing.expectEqual(@as(u32, 67), g2.rect.w);
+}
+
+test "wrap: grow main uses the placed width for line breaks" {
+    var screen: Node = .{ .cfg = .{ .direction = .column, .width = .{ .fixed = 80 }, .height = .{ .fixed = 200 } } };
+    var root: Node = .{ .cfg = .{
+        .direction = .row,
+        .wrap = true,
+        .width = .{ .grow = 1 },
+        .height = .{ .grow = 1 },
+    } };
+    var a: Node = boxWH(50, 10);
+    var b: Node = boxWH(50, 10);
+    appendChild(&root, &a);
+    appendChild(&root, &b);
+    appendChild(&screen, &root);
+    layoutOnce(&screen, 80, 200);
+    try std.testing.expectEqual(@as(u32, 80), root.rect.w);
+    try std.testing.expectEqual(@as(i32, 0), a.rect.y);
+    try std.testing.expectEqual(@as(i32, 10), b.rect.y);
+}
+
+test "wrap: exact fit stays on one line" {
+    var root: Node = .{ .cfg = .{
+        .direction = .row,
+        .wrap = true,
+        .width = .{ .fixed = 100 },
+        .height = .fit,
+        .gap = 20,
+    } };
+    var a: Node = boxWH(40, 10);
+    var b: Node = boxWH(40, 10);
+    appendChild(&root, &a);
+    appendChild(&root, &b);
+    layoutOnce(&root, 100, 50);
+    try std.testing.expectEqual(@as(i32, 0), a.rect.x);
+    try std.testing.expectEqual(@as(i32, 60), b.rect.x);
+    try std.testing.expectEqual(@as(i32, 0), a.rect.y);
+    try std.testing.expectEqual(@as(i32, 0), b.rect.y);
+    try std.testing.expectEqual(@as(i32, 10), root.measured_h);
+}
+
+test "wrap: the container max_width changes the line break (fixed 100, max 50)" {
+    var root: Node = .{ .cfg = .{
+        .direction = .row,
+        .wrap = true,
+        .width = .{ .fixed = 100 },
+        .max_width = 50,
+        .height = .fit,
+    } };
+    var a: Node = boxWH(40, 10);
+    var b: Node = boxWH(40, 10);
+    appendChild(&root, &a);
+    appendChild(&root, &b);
+    layoutOnce(&root, 100, 50);
+    try std.testing.expectEqual(@as(i32, 0), a.rect.x);
+    try std.testing.expectEqual(@as(i32, 0), b.rect.x);
+    try std.testing.expectEqual(@as(i32, 0), a.rect.y);
+    try std.testing.expectEqual(@as(i32, 10), b.rect.y);
+    try std.testing.expectEqual(@as(i32, 20), root.measured_h);
+}
+
+test "wrap: 1px overflow starts a new line" {
+    var root: Node = .{ .cfg = .{
+        .direction = .row,
+        .wrap = true,
+        .width = .{ .fixed = 100 },
+        .height = .fit,
+        .gap = 1,
+    } };
+    var a: Node = boxWH(50, 10);
+    var b: Node = boxWH(50, 10);
+    appendChild(&root, &a);
+    appendChild(&root, &b);
+    layoutOnce(&root, 100, 50);
+    try std.testing.expectEqual(@as(i32, 0), b.rect.x);
+    // cross_gap defaults to gap (1), so the second line starts at 10 + 1.
+    try std.testing.expectEqual(@as(i32, 11), b.rect.y);
+}
+
+test "wrap: a single child that overflows the line stays on that line" {
+    var root: Node = .{ .cfg = .{
+        .direction = .row,
+        .wrap = true,
+        .width = .{ .fixed = 50 },
+        .height = .fit,
+    } };
+    var a: Node = boxWH(80, 10);
+    appendChild(&root, &a);
+    layoutOnce(&root, 50, 50);
+    try std.testing.expectEqual(@as(i32, 0), a.rect.x);
+    try std.testing.expectEqual(@as(i32, 0), a.rect.y);
+    try std.testing.expectEqual(@as(u32, 80), a.rect.w);
+    try std.testing.expectEqual(@as(i32, 10), root.measured_h);
+}
+
+test "wrap: line cross is the max of the line" {
+    var root: Node = .{ .cfg = .{
+        .direction = .row,
+        .wrap = true,
+        .width = .{ .fixed = 100 },
+        .height = .fit,
+    } };
+    var a: Node = boxWH(40, 10);
+    var b: Node = boxWH(40, 30);
+    var c: Node = boxWH(40, 20);
+    appendChild(&root, &a);
+    appendChild(&root, &b);
+    appendChild(&root, &c);
+    layoutOnce(&root, 100, 80);
+    try std.testing.expectEqual(@as(i32, 0), a.rect.y);
+    try std.testing.expectEqual(@as(i32, 0), b.rect.y);
+    try std.testing.expectEqual(@as(i32, 30), c.rect.y);
+    try std.testing.expectEqual(@as(i32, 50), root.measured_h);
+}
+
+test "wrap: align_cross center applies inside the line" {
+    var root: Node = .{ .cfg = .{
+        .direction = .row,
+        .wrap = true,
+        .width = .{ .fixed = 100 },
+        .height = .fit,
+        .align_cross = .center,
+    } };
+    var a: Node = boxWH(40, 10);
+    var b: Node = boxWH(40, 30);
+    appendChild(&root, &a);
+    appendChild(&root, &b);
+    layoutOnce(&root, 100, 80);
+    try std.testing.expectEqual(@as(i32, 10), a.rect.y);
+    try std.testing.expectEqual(@as(i32, 0), b.rect.y);
+}
+
+test "wrap: cross_gap defaults to gap and can be set separately" {
+    {
+        var root: Node = .{ .cfg = .{
+            .direction = .row,
+            .wrap = true,
+            .width = .{ .fixed = 50 },
+            .height = .fit,
+            .gap = 4,
+        } };
+        var a: Node = boxWH(40, 10);
+        var b: Node = boxWH(40, 10);
+        appendChild(&root, &a);
+        appendChild(&root, &b);
+        measure(&root, test_font);
+        try std.testing.expectEqual(@as(i32, 24), root.measured_h);
+        place(&root, .{ .x = 0, .y = 0, .w = 50, .h = @intCast(root.measured_h) });
+        try std.testing.expectEqual(@as(i32, 14), b.rect.y);
+    }
+    {
+        var root: Node = .{ .cfg = .{
+            .direction = .row,
+            .wrap = true,
+            .width = .{ .fixed = 50 },
+            .height = .fit,
+            .gap = 4,
+            .cross_gap = 8,
+        } };
+        var a: Node = boxWH(40, 10);
+        var b: Node = boxWH(40, 10);
+        appendChild(&root, &a);
+        appendChild(&root, &b);
+        measure(&root, test_font);
+        try std.testing.expectEqual(@as(i32, 28), root.measured_h);
+        place(&root, .{ .x = 0, .y = 0, .w = 50, .h = @intCast(root.measured_h) });
+        try std.testing.expectEqual(@as(i32, 18), b.rect.y);
+    }
+}
+
+test "wrap: main fixed plus cross fit measures as the line sum" {
+    var root: Node = .{ .cfg = .{
+        .direction = .row,
+        .wrap = true,
+        .width = .{ .fixed = 50 },
+        .height = .fit,
+        .padding = .{ 2, 3, 4, 5 },
+        .cross_gap = 6,
+    } };
+    var a: Node = boxWH(40, 10);
+    var b: Node = boxWH(40, 20);
+    appendChild(&root, &a);
+    appendChild(&root, &b);
+    measure(&root, test_font);
+    // 10 + 20 + cross_gap 6 + pad 2+4 = 42
+    try std.testing.expectEqual(@as(i32, 42), root.measured_h);
+}
+
+test "wrap: percent children enter at the resolved size (two 0.6 do not share a line)" {
+    var root: Node = .{ .cfg = .{
+        .direction = .row,
+        .wrap = true,
+        .width = .{ .fixed = 100 },
+        .height = .fit,
+    } };
+    var a: Node = .{ .cfg = .{ .width = .{ .percent = 0.6 }, .height = .{ .fixed = 10 } } };
+    var b: Node = .{ .cfg = .{ .width = .{ .percent = 0.6 }, .height = .{ .fixed = 10 } } };
+    appendChild(&root, &a);
+    appendChild(&root, &b);
+    layoutOnce(&root, 100, 50);
+    try std.testing.expectEqual(@as(u32, 60), a.rect.w);
+    try std.testing.expectEqual(@as(u32, 60), b.rect.w);
+    try std.testing.expectEqual(@as(i32, 0), a.rect.y);
+    try std.testing.expectEqual(@as(i32, 10), b.rect.y);
+}
+
+test "wrap: grow enters at min and is then distributed on the line" {
+    var root: Node = .{ .cfg = .{
+        .direction = .row,
+        .wrap = true,
+        .width = .{ .fixed = 100 },
+        .height = .fit,
+    } };
+    var g1: Node = .{ .cfg = .{ .width = .{ .grow = 1 }, .height = .{ .fixed = 10 } } };
+    var g2: Node = .{ .cfg = .{ .width = .{ .grow = 1 }, .height = .{ .fixed = 10 } } };
+    var f: Node = boxWH(40, 10);
+    appendChild(&root, &g1);
+    appendChild(&root, &g2);
+    appendChild(&root, &f);
+    layoutOnce(&root, 100, 50);
+    try std.testing.expectEqual(@as(i32, 0), g1.rect.y);
+    try std.testing.expectEqual(@as(i32, 0), g2.rect.y);
+    try std.testing.expectEqual(@as(i32, 0), f.rect.y);
+    try std.testing.expectEqual(@as(u32, 30), g1.rect.w);
+    try std.testing.expectEqual(@as(u32, 30), g2.rect.w);
+    try std.testing.expectEqual(@as(u32, 40), f.rect.w);
+}
+
+test "wrap: a line of only cross-grow + min_height children has line cross equal to min" {
+    var root: Node = .{ .cfg = .{
+        .direction = .row,
+        .wrap = true,
+        .width = .{ .fixed = 50 },
+        .height = .fit,
+    } };
+    var a: Node = .{ .cfg = .{ .width = .{ .fixed = 40 }, .height = .{ .grow = 1 }, .min_height = 20 } };
+    var b: Node = .{ .cfg = .{ .width = .{ .fixed = 40 }, .height = .{ .grow = 1 }, .min_height = 20 } };
+    appendChild(&root, &a);
+    appendChild(&root, &b);
+    layoutOnce(&root, 50, 80);
+    try std.testing.expectEqual(@as(u32, 20), a.rect.h);
+    try std.testing.expectEqual(@as(u32, 20), b.rect.h);
+    try std.testing.expectEqual(@as(i32, 20), b.rect.y);
+    try std.testing.expectEqual(@as(i32, 40), root.measured_h);
+}
+
+test "wrap: cross grow fills the line, not the container; cross percent resolves against the line; a grow-only line is 0" {
+    {
+        var root: Node = .{ .cfg = .{
+            .direction = .row,
+            .wrap = true,
+            .width = .{ .fixed = 100 },
+            .height = .{ .fixed = 100 },
+        } };
+        var a: Node = boxWH(40, 20);
+        var g: Node = .{ .cfg = .{ .width = .{ .fixed = 40 }, .height = .{ .grow = 1 } } };
+        var c: Node = boxWH(80, 30);
+        appendChild(&root, &a);
+        appendChild(&root, &g);
+        appendChild(&root, &c);
+        layoutOnce(&root, 100, 100);
+        // line 1: a + g (40+40 <= 100). line cross = 20. g fills 20, not the 100-tall container.
+        try std.testing.expectEqual(@as(i32, 0), a.rect.y);
+        try std.testing.expectEqual(@as(u32, 20), g.rect.h);
+        try std.testing.expectEqual(@as(i32, 0), g.rect.y);
+        try std.testing.expectEqual(@as(i32, 20), c.rect.y);
+        try std.testing.expectEqual(@as(u32, 30), c.rect.h);
+    }
+    {
+        var root: Node = .{ .cfg = .{
+            .direction = .row,
+            .wrap = true,
+            .width = .{ .fixed = 100 },
+            .height = .{ .fixed = 100 },
+        } };
+        var a: Node = boxWH(40, 40);
+        var p: Node = .{ .cfg = .{ .width = .{ .fixed = 40 }, .height = .{ .percent = 0.5 } } };
+        appendChild(&root, &a);
+        appendChild(&root, &p);
+        layoutOnce(&root, 100, 100);
+        try std.testing.expectEqual(@as(u32, 20), p.rect.h);
+        try std.testing.expectEqual(@as(i32, 0), p.rect.y);
+    }
+    {
+        var root: Node = .{ .cfg = .{
+            .direction = .row,
+            .wrap = true,
+            .width = .{ .fixed = 50 },
+            .height = .fit,
+        } };
+        var g: Node = .{ .cfg = .{ .width = .{ .fixed = 40 }, .height = .{ .grow = 1 } } };
+        appendChild(&root, &g);
+        measure(&root, test_font);
+        try std.testing.expectEqual(@as(i32, 0), root.measured_h);
+    }
+}
+
+test "wrap: a zero-width child still occupies a line slot (no empty line)" {
+    var root: Node = .{ .cfg = .{
+        .direction = .row,
+        .wrap = true,
+        .width = .{ .fixed = 0 },
+        .height = .fit,
+    } };
+    var a: Node = boxWH(0, 10);
+    var b: Node = boxWH(40, 10);
+    appendChild(&root, &a);
+    appendChild(&root, &b);
+    layoutOnce(&root, 0, 50);
+    try std.testing.expectEqual(@as(i32, 0), a.rect.y);
+    try std.testing.expectEqual(@as(i32, 10), b.rect.y);
+}
+
+test "wrap: column wrap with grow height uses the placed height for line breaks" {
+    var screen: Node = .{ .cfg = .{ .direction = .row, .width = .{ .fixed = 80 }, .height = .{ .fixed = 50 } } };
+    var root: Node = .{ .cfg = .{
+        .direction = .column,
+        .wrap = true,
+        .width = .{ .grow = 1 },
+        .height = .{ .grow = 1 },
+    } };
+    var a: Node = boxWH(10, 40);
+    var b: Node = boxWH(20, 40);
+    appendChild(&root, &a);
+    appendChild(&root, &b);
+    appendChild(&screen, &root);
+    layoutOnce(&screen, 80, 50);
+    try std.testing.expectEqual(@as(u32, 50), root.rect.h);
+    try std.testing.expectEqual(@as(i32, 0), a.rect.x);
+    try std.testing.expectEqual(@as(i32, 10), b.rect.x);
+    try std.testing.expectEqual(@as(i32, 0), a.rect.y);
+    try std.testing.expectEqual(@as(i32, 0), b.rect.y);
+}
+
+test "wrap: column direction wraps on height" {
+    var root: Node = .{ .cfg = .{
+        .direction = .column,
+        .wrap = true,
+        .width = .fit,
+        .height = .{ .fixed = 50 },
+    } };
+    var a: Node = boxWH(10, 40);
+    var b: Node = boxWH(20, 40);
+    appendChild(&root, &a);
+    appendChild(&root, &b);
+    layoutOnce(&root, 80, 50);
+    try std.testing.expectEqual(@as(i32, 0), a.rect.x);
+    try std.testing.expectEqual(@as(i32, 10), b.rect.x);
+    try std.testing.expectEqual(@as(i32, 0), a.rect.y);
+    try std.testing.expectEqual(@as(i32, 0), b.rect.y);
+    try std.testing.expectEqual(@as(i32, 30), root.measured_w);
+}
+
+test "wrap: scroll offset shifts children without changing sizes or line breaks" {
+    var root: Node = .{ .cfg = .{
+        .direction = .row,
+        .wrap = true,
+        .width = .{ .fixed = 50 },
+        .height = .fit,
+        .scroll_x = 5,
+        .scroll_y = 7,
+    } };
+    var a: Node = boxWH(40, 10);
+    var b: Node = boxWH(40, 10);
+    appendChild(&root, &a);
+    appendChild(&root, &b);
+    layoutOnce(&root, 50, 50);
+    try std.testing.expectEqual(@as(i32, -5), a.rect.x);
+    try std.testing.expectEqual(@as(i32, -7), a.rect.y);
+    try std.testing.expectEqual(@as(i32, -5), b.rect.x);
+    try std.testing.expectEqual(@as(i32, 3), b.rect.y);
+    try std.testing.expectEqual(@as(u32, 40), a.rect.w);
+    try std.testing.expectEqual(@as(u32, 10), a.rect.h);
+}
+
+test "wrap: forbidden contracts are rejected by wrapConfigValid" {
+    try std.testing.expect(wrapConfigValid(.{ .wrap = false, .width = .fit, .height = .fit }));
+    try std.testing.expect(!wrapConfigValid(.{ .wrap = true, .direction = .row, .width = .fit, .height = .{ .fixed = 10 } }));
+    try std.testing.expect(!wrapConfigValid(.{ .wrap = true, .direction = .row, .width = .{ .grow = 1 }, .height = .fit }));
+    try std.testing.expect(!wrapConfigValid(.{ .wrap = true, .direction = .row, .width = .{ .percent = 0.5 }, .height = .fit }));
+    try std.testing.expect(!wrapConfigValid(.{ .wrap = true, .direction = .column, .width = .fit, .height = .{ .grow = 1 } }));
+    try std.testing.expect(wrapConfigValid(.{ .wrap = true, .direction = .row, .width = .{ .fixed = 100 }, .height = .fit }));
+    try std.testing.expect(wrapConfigValid(.{ .wrap = true, .direction = .row, .width = .{ .grow = 1 }, .height = .{ .grow = 1 } }));
+    try std.testing.expect(wrapConfigValid(.{ .wrap = true, .direction = .column, .width = .fit, .height = .{ .fixed = 50 } }));
+}
+
+test "extent: a wrap box reports padding plus the child envelope" {
+    var root: Node = .{ .cfg = .{
+        .direction = .row,
+        .wrap = true,
+        .width = .{ .fixed = 50 },
+        .height = .fit,
+        .padding = .{ 1, 2, 3, 4 },
+    } };
+    var a: Node = boxWH(40, 10);
+    var b: Node = boxWH(40, 10);
+    appendChild(&root, &a);
+    appendChild(&root, &b);
+    layoutOnce(&root, 50, 50);
+    try std.testing.expectEqual(@as(i32, 40 + 4 + 2), root.content_w);
+    try std.testing.expectEqual(@as(i32, 20 + 1 + 3), root.content_h);
+}
+
+test "extent: no children is padding only" {
+    var root: Node = .{ .cfg = .{ .padding = .{ 1, 2, 3, 4 } } };
+    layoutOnce(&root, 50, 50);
+    try std.testing.expectEqual(@as(i32, 6), root.content_w);
+    try std.testing.expectEqual(@as(i32, 4), root.content_h);
+}
+
+test "extent: a non-zero node origin still uses the content origin" {
+    var root: Node = .{ .cfg = .{ .padding = .{ 5, 5, 5, 5 } } };
+    var a: Node = boxWH(20, 10);
+    appendChild(&root, &a);
+    measure(&root, test_font);
+    place(&root, .{ .x = 50, .y = 80, .w = 40, .h = 30 });
+    try std.testing.expectEqual(@as(i32, 20 + 10), root.content_w);
+    try std.testing.expectEqual(@as(i32, 10 + 10), root.content_h);
+}
+
+test "extent: scroll does not change the recorded extent" {
+    var scrolled: Node = .{ .cfg = .{ .direction = .column, .scroll_y = 20 } };
+    var a: Node = boxWH(10, 30);
+    var b: Node = boxWH(10, 40);
+    appendChild(&scrolled, &a);
+    appendChild(&scrolled, &b);
+    layoutOnce(&scrolled, 100, 50);
+
+    var still: Node = .{ .cfg = .{ .direction = .column } };
+    var c: Node = boxWH(10, 30);
+    var d: Node = boxWH(10, 40);
+    appendChild(&still, &c);
+    appendChild(&still, &d);
+    layoutOnce(&still, 100, 50);
+
+    try std.testing.expectEqual(still.content_w, scrolled.content_w);
+    try std.testing.expectEqual(still.content_h, scrolled.content_h);
+    try std.testing.expectEqual(@as(i32, 70), scrolled.content_h);
+}
+
+test "extent: a negative-position child does not shrink the origin" {
+    var root: Node = .{ .cfg = .{ .direction = .column, .width = .{ .fixed = 20 }, .height = .{ .fixed = 50 }, .gap = -25 } };
+    var a: Node = boxWH(10, 10);
+    var b: Node = boxWH(10, 10);
+    appendChild(&root, &a);
+    appendChild(&root, &b);
+    layoutOnce(&root, 20, 50);
+    try std.testing.expect(b.rect.y < 0);
+    try std.testing.expect(b.rect.y + @as(i32, @intCast(b.rect.h)) < 0);
+    try std.testing.expectEqual(@as(i32, 10), root.content_h);
+    try std.testing.expectEqual(@as(i32, 10), root.content_w);
+}
+
+test "extent: an unclipped child's overflowing descendant is included; a clipped child is not" {
+    {
+        var root: Node = .{ .cfg = .{ .direction = .column, .width = .{ .fixed = 40 }, .height = .{ .fixed = 40 } } };
+        var mid: Node = .{ .cfg = .{
+            .direction = .column,
+            .width = .{ .fixed = 20 },
+            .height = .{ .fixed = 20 },
+            .clip_children = false,
+        } };
+        var leaf: Node = boxWH(50, 10);
+        appendChild(&mid, &leaf);
+        appendChild(&root, &mid);
+        layoutOnce(&root, 40, 40);
+        try std.testing.expectEqual(@as(i32, 50), mid.content_w);
+        try std.testing.expectEqual(@as(i32, 50), root.content_w);
+    }
+    {
+        var root: Node = .{ .cfg = .{ .direction = .column, .width = .{ .fixed = 40 }, .height = .{ .fixed = 40 } } };
+        var mid: Node = .{ .cfg = .{
+            .direction = .column,
+            .width = .{ .fixed = 20 },
+            .height = .{ .fixed = 20 },
+            .clip_children = true,
+        } };
+        var leaf: Node = boxWH(50, 10);
+        appendChild(&mid, &leaf);
+        appendChild(&root, &mid);
+        layoutOnce(&root, 40, 40);
+        try std.testing.expectEqual(@as(i32, 50), mid.content_w);
+        try std.testing.expectEqual(@as(i32, 20), root.content_w);
+    }
+}
+
+test "extent: a leaf does not record content extent (stays -1)" {
+    var t: Node = textLeaf("Hi", false);
+    layoutOnce(&t, 200, 50);
+    try std.testing.expectEqual(@as(i32, -1), t.content_w);
+    try std.testing.expectEqual(@as(i32, -1), t.content_h);
 }

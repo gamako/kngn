@@ -1870,7 +1870,8 @@ pub fn splitter(ctx: *Context, id: Id, orient: Orient, size: *i32, opts: Splitte
 // ScrollArea (2-axis scroll region + scrollbars)
 // ============================================================
 // Structure: outer(row) → [ leftCol(column) → [ viewport(clip,scroll) → content(fit) , hbar ] , vbar ]
-// viewport uses previous-frame rect; content uses previous-frame measured (natural size) from rect_cache.
+// viewport uses previous-frame rect; content size is declared fixed → recorded
+// extent → measured, from the previous-frame rect_cache.
 // Clamp of scroll, whether bars show, and thumb geometry use **previous-frame** values (same sync contract as splitter.
 // Frames where content or viewport size changes are transitional for one frame, then self-correct).
 // Caller holds scroll in `*Vec2f` (keeps trackpad fractions). layout gets rounded i32.
@@ -1925,13 +1926,14 @@ pub fn beginScrollArea(ctx: *Context, id: Id, scroll: *Vec2f, opts: ScrollAreaOp
     const vthumb_id = id_mod.hashInt(id, 2);
     const hthumb_id = id_mod.hashInt(id, 3);
 
-    // Previous-frame viewport rect / content natural size
+    // Previous-frame viewport rect / content size (declared fixed → extent → measured)
     const vp = ctx.getNodeRect(id);
-    const cm = ctx.getNodeMeasured(content_id);
+    const cached = ctx.getNodeCachedRect(content_id);
+    const cs = if (cached) |c| c.scrollContentSize() else geom.Vec2{ .x = 0, .y = 0 };
     const vp_w: i32 = if (vp) |r| @intCast(r.w) else 0;
     const vp_h: i32 = if (vp) |r| @intCast(r.h) else 0;
-    const content_w: i32 = if (cm) |m| m.x else 0;
-    const content_h: i32 = if (cm) |m| m.y else 0;
+    const content_w: i32 = cs.x;
+    const content_h: i32 = cs.y;
     const max_x: i32 = @max(0, content_w - vp_w);
     const max_y: i32 = @max(0, content_h - vp_h);
     const need_v = max_y > 0;

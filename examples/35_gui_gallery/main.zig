@@ -492,6 +492,37 @@ fn renderLayout(ctx: *gui.Context, app: *App) void {
     }
     ctx.endScrollArea();
     ctx.endBox();
+
+    ctx.labelEx("wrap + min/max", ctx.style.text_subtle);
+    ctx.beginBox(.{
+        .direction = .row,
+        .wrap = true,
+        .width = .{ .fixed = 220 },
+        .height = .{ .fixed = 72 },
+        .gap = 6,
+        .cross_gap = 6,
+    });
+    const cards = [_]struct { label: []const u8, w: i32, min_w: i32, max_w: i32 }{
+        .{ .label = "min 56", .w = 40, .min_w = 56, .max_w = 96 },
+        .{ .label = "max 48", .w = 80, .min_w = 0, .max_w = 48 },
+        .{ .label = "card A", .w = 64, .min_w = 0, .max_w = std.math.maxInt(i32) },
+        .{ .label = "card B", .w = 64, .min_w = 0, .max_w = std.math.maxInt(i32) },
+        .{ .label = "card C", .w = 64, .min_w = 0, .max_w = std.math.maxInt(i32) },
+        .{ .label = "card D", .w = 64, .min_w = 0, .max_w = std.math.maxInt(i32) },
+    };
+    for (cards) |card| {
+        ctx.beginBox(.{
+            .width = .{ .fixed = card.w },
+            .height = .{ .fixed = 28 },
+            .min_width = card.min_w,
+            .max_width = card.max_w,
+            .padding = .{ 4, 6, 4, 6 },
+            .bg = gui.Color.rgba(0x30, 0x38, 0x48, 0xFF),
+        });
+        ctx.label(card.label);
+        ctx.endBox();
+    }
+    ctx.endBox();
     ctx.endBox();
 }
 
