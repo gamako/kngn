@@ -214,6 +214,18 @@ pub fn pickWheelChainHead(records: []const ScrollAreaRecord, mouse: Vec2) Id {
     return best_id;
 }
 
+/// Builder for a custom tooltip subtree. Same function-pointer + opaque-context
+/// shape as `CustomDrawFn`. Called only while a tooltip is showing (hover delay
+/// already met). The builder may use layout and draw-command APIs; interactive
+/// and state-mutating APIs are a lifecycle violation (see `requireInteractiveAllowed`).
+pub const TooltipBuildFn = *const fn (build_ctx: *anyopaque, ctx: *Context) void;
+
+/// Overlay candidate published at endFrame. At most one per frame; last writer wins.
+pub const TooltipCandidate = union(enum) {
+    text: []const u8,
+    custom: *layout.Node,
+};
+
 /// One row's two fixed-width cells, held so `endSliderGroup` can widen them once the group's
 /// widest label and widest value are known. Allocated on the frame arena and linked in build order.
 pub const SliderGroupCell = struct {
@@ -301,15 +313,29 @@ pub const Context = struct {
     tooltip_hover_start_s: f64 = 0,
     /// Rect at continuous-hover start (movement breaks continuity).
     tooltip_hover_rect: Rect = .{ .x = 0, .y = 0, .w = 0, .h = 0 },
-    /// Whether tooltip() refreshed the hover target this frame (suppresses unbuilt stale overlays).
+    /// Whether tooltip() or tooltipBox() refreshed the hover target this frame
+    /// (suppresses unbuilt stale overlays).
     tooltip_hover_refreshed: bool = false,
     /// Last interactive widget (updated by behaviorFromCache; frame-local).
     tooltip_last_id: Id = 0,
     tooltip_last_rect: Rect = .{ .x = 0, .y = 0, .w = 0, .h = 0 },
     tooltip_last_hovered: bool = false,
-    /// Candidate emitted at this frame's endFrame (text on the frame arena; null if not yet due).
-    tooltip_candidate_text: ?[]const u8 = null,
+    /// Candidate emitted at this frame's endFrame (null if not yet due). Last writer wins.
+    tooltip_candidate: ?TooltipCandidate = null,
     tooltip_candidate_anchor: Rect = .{ .x = 0, .y = 0, .w = 0, .h = 0 },
+    /// Non-zero while a custom-tooltip builder is running. Interactive / state-mutating
+    /// APIs are forbidden in this mode (lifecycle violation in every optimisation mode).
+    display_only_depth: u32 = 0,
+    /// This-frame custom-tooltip work. Reset in beginFrame.
+    /// Hover checks run every frame; build and measure/place run only while a custom tooltip shows.
+    tooltip_builder_calls: u32 = 0,
+    tooltip_layout_calls: u32 = 0,
+    /// When true, `allocator()` wraps the frame arena and records alloc count / peak bytes.
+    /// Off by default (production path). The tooltip bench turns this on.
+    track_frame_arena: bool = false,
+    frame_arena_allocs: u32 = 0,
+    frame_arena_live: usize = 0,
+    frame_arena_peak: usize = 0,
     /// Frame-local IME composition (preedit) state. Cleared in beginFrame;
     /// the app sets it every frame via setComposition before widget calls.
     composition: input_mod.CompositionState = .{},
@@ -451,8 +477,19 @@ pub const Context = struct {
     }
 
     /// Arena allocator (for cmd text/image payloads). Reset on the next beginFrame.
+    /// When `track_frame_arena` is set, the returned allocator records alloc count and
+    /// peak outstanding bytes for the tooltip bench. Production leaves the flag off.
     pub fn allocator(self: *Context) Allocator {
+        if (self.track_frame_arena) {
+            return .{ .ptr = self, .vtable = &frame_arena_vtable };
+        }
         return self.arena.allocator();
+    }
+
+    /// Copy `pixels` onto the frame arena. Valid until the next beginFrame.
+    /// Use this when a tooltip builder generates a thumbnail that must outlive the call.
+    pub fn dupePixels(self: *Context, pixels: []const u32) []u32 {
+        return self.allocator().dupe(u32, pixels) catch @panic("dupePixels: OOM");
     }
 
     /// Start a filled path. Verbs and points go on the frame arena; `finish`
@@ -505,8 +542,14 @@ pub const Context = struct {
         self.tooltip_last_rect = .{ .x = 0, .y = 0, .w = 0, .h = 0 };
         self.tooltip_last_hovered = false;
         self.tooltip_hover_refreshed = false;
-        self.tooltip_candidate_text = null;
+        self.tooltip_candidate = null;
         self.tooltip_candidate_anchor = .{ .x = 0, .y = 0, .w = 0, .h = 0 };
+        self.display_only_depth = 0;
+        self.tooltip_builder_calls = 0;
+        self.tooltip_layout_calls = 0;
+        self.frame_arena_allocs = 0;
+        self.frame_arena_live = 0;
+        self.frame_arena_peak = 0;
         self.drag_submitted_this_frame = false;
         // The cells a group collects live on the frame arena, so the group cannot outlive the frame.
         self.slider_group = null;
@@ -555,6 +598,17 @@ pub const Context = struct {
         requireContract(!self.frame_active, what ++ " must be called with no frame open");
     }
 
+    /// Require that a display-only tooltip builder is not running.
+    ///
+    /// Interactive widgets, focus / scroll / popup / drag mutation, per-id store
+    /// touches, nested tooltips, and input injection are lifecycle violations
+    /// inside a custom-tooltip builder. Checked at each public API entry, before
+    /// any caller-owned write, so a first-frame (empty rect cache) call still
+    /// fails. Panics in every optimisation mode (same class as `requireContract`).
+    pub inline fn requireInteractiveAllowed(self: *const Context, comptime what: []const u8) void {
+        requireContract(self.display_only_depth == 0, what ++ " is not allowed in a display-only tooltip builder");
+    }
+
     pub fn endFrame(self: *Context) void {
         self.requireFrame("endFrame");
         // Every beginDisabled needs a matching endDisabled within the same frame (immediate-mode
@@ -564,6 +618,7 @@ pub const Context = struct {
         // written back there, so an unclosed group would leave its rows at zero-width columns.
         requireContract(self.slider_group == null, "endFrame with a slider group still open");
         requireContract(self.table == null, "endFrame with a table still open");
+        requireContract(self.display_only_depth == 0, "endFrame with a display-only tooltip builder still open");
         const root = self.layout_root.?;
         // Detect beginBox / endBox mismatches
         requireContract(self.layout_current == root, "endFrame with a box still open");
@@ -582,8 +637,25 @@ pub const Context = struct {
             if (self.rect_cache.get(rec.id)) |c| rec.rect = c.rect;
         }
         // tooltip overlay: after layout UI, before frame_active=false (below popupMenu; popup runs after endFrame).
-        if (self.tooltip_candidate_text) |tip| {
-            popup_mod.drawTooltipOverlay(self, tip, self.tooltip_candidate_anchor);
+        if (self.tooltip_candidate) |cand| {
+            switch (cand) {
+                .text => |tip| popup_mod.drawTooltipOverlay(self, tip, self.tooltip_candidate_anchor),
+                .custom => |tip_root| {
+                    self.tooltip_layout_calls += 1;
+                    popup_mod.placeTooltipSubtree(
+                        tip_root,
+                        self.tooltip_candidate_anchor,
+                        self.screen_w,
+                        self.screen_h,
+                        self.font,
+                        self.allocator(),
+                    );
+                    const style = self.style;
+                    self.draw_list.rectFilled(tip_root.rect, style.bg) catch @panic("tooltip: OOM");
+                    self.draw_list.rectOutline(tip_root.rect, style.border, 1) catch @panic("tooltip: OOM");
+                    self.emitNode(tip_root);
+                },
+            }
         }
         // If the target was not refreshed this frame, clear the timer (suppress stale overlays for hidden widgets)
         if (self.tooltip_hover_id != 0 and !self.tooltip_hover_refreshed) {
@@ -638,6 +710,7 @@ pub const Context = struct {
     /// order (see `StagedInput` in input.zig). Note that staged input reaches `ctx.input` only
     /// when that frame opens, so reading `ctx.input` before beginFrame does not see it yet.
     pub fn pushEvent(self: *Context, ev: InputEvent) void {
+        self.requireInteractiveAllowed("pushEvent");
         if (self.frame_active) {
             self.input.pushEvent(ev);
         } else {
@@ -650,6 +723,7 @@ pub const Context = struct {
     /// and applied by the next beginFrame, so the caller keeps no obligation past the call.
     /// Does not accept platform types (ADR-007).
     pub fn setComposition(self: *Context, state: input_mod.CompositionState) void {
+        self.requireInteractiveAllowed("setComposition");
         if (self.frame_active) {
             self.composition = state;
         } else {
@@ -677,12 +751,14 @@ pub const Context = struct {
     /// for ordinary widgets outside a popup (see popup.zig).
     pub fn beginDisabled(self: *Context) void {
         self.requireFrame("beginDisabled");
+        self.requireInteractiveAllowed("beginDisabled");
         self.disabled_depth += 1;
     }
 
     /// Leave a disabled scope opened by `beginDisabled`.
     pub fn endDisabled(self: *Context) void {
         self.requireFrame("endDisabled");
+        self.requireInteractiveAllowed("endDisabled");
         requireContract(self.disabled_depth > 0, "endDisabled without a matching beginDisabled");
         self.disabled_depth -= 1;
     }
@@ -703,6 +779,7 @@ pub const Context = struct {
     /// through the standard cache-based helper (stepgrid, Listbox row) can release stale state
     /// the same way the standard helper does, not by reimplementing this.
     pub fn clearDisabledInteraction(self: *Context, id: Id) void {
+        self.requireInteractiveAllowed("clearDisabledInteraction");
         if (self.state.focused_id == id) {
             self.state.focused_id = 0;
             self.state.focus_visible = false;
@@ -719,6 +796,7 @@ pub const Context = struct {
     /// knows where it put the focus. Only Tab traversal raises the ring.
     pub fn claimFocus(self: *Context, id: Id) bool {
         self.requireFrame("claimFocus");
+        self.requireInteractiveAllowed("claimFocus");
         if (id == 0) return false;
         self.state.focused_id = id;
         self.state.focus_visible = false;
@@ -730,6 +808,7 @@ pub const Context = struct {
     /// widget claimed focus this frame.
     pub fn releaseFocus(self: *Context) void {
         self.requireFrame("releaseFocus");
+        self.requireInteractiveAllowed("releaseFocus");
         self.state.focused_id = 0;
         self.state.focus_visible = false;
     }
@@ -755,6 +834,7 @@ pub const Context = struct {
     /// frame because `focus_order` keeps its capacity.
     pub fn registerFocusable(self: *Context, id: Id) void {
         self.requireFrame("registerFocusable");
+        self.requireInteractiveAllowed("registerFocusable");
         if (id == 0 or self.popup_state != null or self.popup_stack.len != 0) return;
         self.focus_order.append(self.gpa, id) catch @panic("Context.registerFocusable: OOM");
     }
@@ -855,20 +935,63 @@ pub const Context = struct {
     pub const tooltip_delay_s: f64 = 0.5;
 
     /// Record the last interactive widget (called additively from behaviorFromCache).
-    /// Even without a rect cache yet, record hovered=false so tooltip() can no-op.
+    /// Even without a rect cache yet, record hovered=false so tooltip() / tooltipBox() can no-op.
     pub fn noteLastInteractive(self: *Context, id: Id, rect: Rect, hovered: bool) void {
         self.requireFrame("noteLastInteractive");
+        self.requireInteractiveAllowed("noteLastInteractive");
         self.tooltip_last_id = id;
         self.tooltip_last_rect = rect;
         self.tooltip_last_hovered = hovered;
     }
 
-    /// Attach a tooltip to the interactive widget just evaluated.
+    /// Attach a text tooltip to the interactive widget just evaluated.
     /// No-op if not hovered this frame. When the same id+rect has been continuous for >= `tooltip_delay_s`,
     /// raise an overlay candidate at the end of endFrame. text is duped onto the frame arena.
+    /// Same-frame last writer wins against `tooltipBox`.
     pub fn tooltip(self: *Context, tip: []const u8) void {
         self.requireFrame("tooltip");
-        if (!self.tooltip_last_hovered or self.tooltip_last_id == 0) return;
+        self.requireInteractiveAllowed("tooltip");
+        if (!self.refreshTooltipHover()) return;
+        const dup = self.allocator().dupe(u8, tip) catch @panic("tooltip: OOM");
+        self.tooltip_candidate = .{ .text = dup };
+    }
+
+    /// Attach a custom-content tooltip to the interactive widget just evaluated.
+    /// Hover delay and continuity share `tooltip_hover_*` with `tooltip`.
+    ///
+    /// Hot path: hover bookkeeping every frame. The builder and measure/place run
+    /// once per showing frame (the frame arena is reset every beginFrame, so the
+    /// subtree is not cached). They do not run while hidden or before the delay.
+    /// Command append only; no per-pixel loop; not RT.
+    ///
+    /// The builder is display-only: layout and draw-command APIs are allowed;
+    /// interactive / state-mutating APIs panic in every optimisation mode.
+    /// Tables are forbidden here: they keep a Context-owned state stack and
+    /// interactive rows write hover / tooltip state, so allowing one would need
+    /// a full save/restore plus a second interactive-row ban — not worth a
+    /// table inside a tooltip. Collapsible begin/end are forbidden as a pair
+    /// (one side alone would unbalance `collapsibleBodyDepth`).
+    /// The subtree is not entered into `rect_cache` or `focus_order`.
+    /// Tooltip content does not scroll. If the subtree is larger than the screen,
+    /// the root is clipped to the screen (no flip; overflow is cut).
+    ///
+    /// Image pixels passed to `imageBox` must stay valid through `gui.render`
+    /// after `endFrame`. Use application-owned memory or a frame-arena copy
+    /// (`dupePixels` / `allocator().dupe`). A caller-stack temporary is not valid.
+    /// Same-frame last writer wins against `tooltip`.
+    pub fn tooltipBox(self: *Context, build_fn: TooltipBuildFn, build_ctx: *anyopaque) void {
+        self.requireFrame("tooltipBox");
+        self.requireInteractiveAllowed("tooltipBox");
+        if (!self.refreshTooltipHover()) return;
+        const root = self.buildTooltipSubtree(build_fn, build_ctx);
+        self.tooltip_builder_calls += 1;
+        self.tooltip_candidate = .{ .custom = root };
+    }
+
+    /// Shared hover-delay bookkeeping for `tooltip` and `tooltipBox`.
+    /// Returns true when a candidate should be published this frame.
+    fn refreshTooltipHover(self: *Context) bool {
+        if (!self.tooltip_last_hovered or self.tooltip_last_id == 0) return false;
 
         const id = self.tooltip_last_id;
         const rect = self.tooltip_last_rect;
@@ -879,14 +1002,82 @@ pub const Context = struct {
         }
         self.tooltip_hover_refreshed = true;
 
-        if (self.now() - self.tooltip_hover_start_s < tooltip_delay_s) return;
-
-        const dup = self.allocator().dupe(u8, tip) catch @panic("tooltip: OOM");
-        self.tooltip_candidate_text = dup;
+        if (self.now() - self.tooltip_hover_start_s < tooltip_delay_s) return false;
         self.tooltip_candidate_anchor = rect;
+        return true;
+    }
+
+    fn sliderGroupUnchanged(a: ?SliderGroupState, b: ?SliderGroupState) bool {
+        const left = a orelse return b == null;
+        const right = b orelse return false;
+        return left.column_gap == right.column_gap and
+            left.cells == right.cells and
+            left.last == right.last and
+            left.label_w == right.label_w and
+            left.value_w == right.value_w;
+    }
+
+    fn tableUnchanged(a: ?table_mod.TableState, b: ?table_mod.TableState) bool {
+        const left = a orelse return b == null;
+        const right = b orelse return false;
+        return left.id == right.id and
+            left.cols.ptr == right.cols.ptr and
+            left.cols.len == right.cols.len and
+            left.header_built == right.header_built and
+            left.body_opened == right.body_opened and
+            left.row_open == right.row_open and
+            left.cell_open == right.cell_open and
+            left.row_index == right.row_index;
+    }
+
+    /// Build a detached tooltip subtree. `layout_current` is swapped to a frame-arena
+    /// root for the builder and restored on the way out. Builder imbalance is a
+    /// lifecycle violation (a silent restore would hide an unclosed box).
+    fn buildTooltipSubtree(self: *Context, build_fn: TooltipBuildFn, build_ctx: *anyopaque) *layout.Node {
+        const pad = self.style.popup_padding;
+        const root = self.allocator().create(layout.Node) catch @panic("tooltipBox: OOM");
+        root.* = .{
+            .cfg = .{
+                .direction = .column,
+                .width = .fit,
+                .height = .fit,
+                .padding = .{ pad, pad, pad, pad },
+            },
+        };
+
+        const saved_layout = self.layout_current;
+        const saved_disabled = self.disabled_depth;
+        const saved_scroll_len = self.scroll_stack.items.len;
+        const saved_slider = self.slider_group;
+        const saved_table = self.table;
+        const saved_collapsible = widgets.collapsibleBodyDepth();
+        const saved_id_len = self.id_stack.stack.items.len;
+        const saved_ids = self.allocator().dupe(Id, self.id_stack.stack.items) catch @panic("tooltipBox: OOM");
+        const saved_display = self.display_only_depth;
+
+        self.layout_current = root;
+        self.display_only_depth += 1;
+        defer {
+            self.layout_current = saved_layout;
+            self.display_only_depth = saved_display;
+        }
+
+        build_fn(build_ctx, self);
+
+        requireContract(self.layout_current == root, "tooltipBox builder left a box open");
+        requireContract(self.disabled_depth == saved_disabled, "tooltipBox builder changed disabled depth");
+        requireContract(self.scroll_stack.items.len == saved_scroll_len, "tooltipBox builder changed scroll stack");
+        requireContract(sliderGroupUnchanged(self.slider_group, saved_slider), "tooltipBox builder changed slider group");
+        requireContract(tableUnchanged(self.table, saved_table), "tooltipBox builder changed table");
+        requireContract(widgets.collapsibleBodyDepth() == saved_collapsible, "tooltipBox builder changed collapsible depth");
+        requireContract(self.display_only_depth == saved_display + 1, "tooltipBox builder changed display-only depth");
+        requireContract(self.id_stack.stack.items.len == saved_id_len, "tooltipBox builder left the id stack unbalanced");
+        requireContract(std.mem.eql(Id, self.id_stack.stack.items, saved_ids), "tooltipBox builder changed id stack contents");
+        return root;
     }
 
     pub fn perIdState(self: *Context, id: Id) *state_mod.PerIdState {
+        self.requireInteractiveAllowed("perIdState");
         std.debug.assert(id != 0);
         return self.per_id_state.getOrPut(self.gpa, id);
     }
@@ -1154,6 +1345,52 @@ pub const Context = struct {
     }
 };
 
+const frame_arena_vtable: Allocator.VTable = .{
+    .alloc = frameArenaAlloc,
+    .resize = frameArenaResize,
+    .remap = frameArenaRemap,
+    .free = frameArenaFree,
+};
+
+fn frameArenaAlloc(ctx_ptr: *anyopaque, len: usize, alignment: std.mem.Alignment, ret_addr: usize) ?[*]u8 {
+    const self: *Context = @ptrCast(@alignCast(ctx_ptr));
+    const ptr = self.arena.allocator().rawAlloc(len, alignment, ret_addr) orelse return null;
+    self.frame_arena_allocs += 1;
+    self.frame_arena_live += len;
+    if (self.frame_arena_live > self.frame_arena_peak) self.frame_arena_peak = self.frame_arena_live;
+    return ptr;
+}
+
+fn frameArenaResize(ctx_ptr: *anyopaque, memory: []u8, alignment: std.mem.Alignment, new_len: usize, ret_addr: usize) bool {
+    const self: *Context = @ptrCast(@alignCast(ctx_ptr));
+    if (!self.arena.allocator().rawResize(memory, alignment, new_len, ret_addr)) return false;
+    if (new_len > memory.len) {
+        self.frame_arena_live += new_len - memory.len;
+        if (self.frame_arena_live > self.frame_arena_peak) self.frame_arena_peak = self.frame_arena_live;
+    } else {
+        self.frame_arena_live -= memory.len - new_len;
+    }
+    return true;
+}
+
+fn frameArenaRemap(ctx_ptr: *anyopaque, memory: []u8, alignment: std.mem.Alignment, new_len: usize, ret_addr: usize) ?[*]u8 {
+    const self: *Context = @ptrCast(@alignCast(ctx_ptr));
+    const ptr = self.arena.allocator().rawRemap(memory, alignment, new_len, ret_addr) orelse return null;
+    if (new_len > memory.len) {
+        self.frame_arena_live += new_len - memory.len;
+        if (self.frame_arena_live > self.frame_arena_peak) self.frame_arena_peak = self.frame_arena_live;
+    } else {
+        self.frame_arena_live -= memory.len - new_len;
+    }
+    return ptr;
+}
+
+fn frameArenaFree(ctx_ptr: *anyopaque, memory: []u8, alignment: std.mem.Alignment, ret_addr: usize) void {
+    const self: *Context = @ptrCast(@alignCast(ctx_ptr));
+    self.arena.allocator().rawFree(memory, alignment, ret_addr);
+    self.frame_arena_live -= memory.len;
+}
+
 pub const ButtonResult = struct {
     clicked: bool = false,
     hovered: bool = false,
@@ -1182,6 +1419,7 @@ pub fn pointHitsVisible(rect: Rect, clip: Rect, p: Vec2) bool {
 /// Contract that keeps TextInput range select, slider, and ScrollArea thumb drags working.
 pub fn buttonBehavior(ctx: *Context, id: Id, rect: Rect, clip: Rect) ButtonResult {
     ctx.requireFrame("buttonBehavior");
+    ctx.requireInteractiveAllowed("buttonBehavior");
     // Modal absorption: while a popup is open (the classic slot or a stacked one — see
     // popup.zig's PopupStack), background widgets get no hover/hot/active at all.
     // popup.openPopup()/openPopupStacked() always reset active_id/hot_id/next_hot_id to 0 on
@@ -2321,6 +2559,212 @@ test "tooltip: if not built this frame, no stale overlay appears" {
     ctx.endFrame();
     try std.testing.expect(!tooltipHasText(&ctx, "stale"));
     try std.testing.expectEqual(@as(Id, 0), ctx.tooltip_hover_id);
+}
+
+fn simpleBoxTip(_: *anyopaque, c: *Context) void {
+    c.label("box tip");
+}
+
+const CountingTip = struct {
+    calls: u32 = 0,
+    fn build(ptr: *anyopaque, c: *Context) void {
+        const self: *CountingTip = @ptrCast(@alignCast(ptr));
+        self.calls += 1;
+        c.label("counted tip");
+    }
+};
+
+const ExplicitIdTip = struct {
+    const box_id: Id = 0xC0FFEE;
+    fn build(_: *anyopaque, c: *Context) void {
+        c.beginBox(.{ .id = box_id, .width = .{ .fixed = 40 }, .height = .{ .fixed = 16 } });
+        c.label("id tip");
+        c.endBox();
+    }
+};
+
+fn hoverButtonWithBox(ctx: *Context, id: Id, label: []const u8, build_fn: TooltipBuildFn, build_ctx: *anyopaque, now_s: f64) void {
+    ctx.beginFrameAt(800, 600, now_s);
+    const r = ctx.getNodeRect(id) orelse Rect{ .x = 0, .y = 0, .w = 48, .h = 24 };
+    const cx = r.x + @as(i32, @intCast(r.w / 2));
+    const cy = r.y + @as(i32, @intCast(r.h / 2));
+    ctx.pushEvent(.{ .mouse_move = .{ .x = cx, .y = cy, .modifiers = 0 } });
+    _ = ctx.buttonId(id, label, .{});
+    ctx.tooltipBox(build_fn, build_ctx);
+    ctx.endFrame();
+}
+
+test "tooltipBox: hidden on the first hover frame and before the delay" {
+    var ctx = testCtx();
+    defer ctx.deinit();
+    var dummy: u8 = 0;
+
+    ctx.beginFrameAt(800, 600, 0.0);
+    _ = ctx.buttonId(1, "Btn", .{});
+    ctx.endFrame();
+
+    hoverButtonWithBox(&ctx, 1, "Btn", simpleBoxTip, &dummy, 0.0);
+    try std.testing.expect(!tooltipHasText(&ctx, "box tip"));
+    try std.testing.expectEqual(@as(u32, 0), ctx.tooltip_builder_calls);
+
+    hoverButtonWithBox(&ctx, 1, "Btn", simpleBoxTip, &dummy, 0.4);
+    try std.testing.expect(!tooltipHasText(&ctx, "box tip"));
+    try std.testing.expectEqual(@as(u32, 0), ctx.tooltip_builder_calls);
+}
+
+test "tooltipBox: shows after 500ms hover and hides on leave" {
+    var ctx = testCtx();
+    defer ctx.deinit();
+    var dummy: u8 = 0;
+
+    ctx.beginFrameAt(800, 600, 0.0);
+    _ = ctx.buttonId(1, "Btn", .{});
+    ctx.endFrame();
+
+    hoverButtonWithBox(&ctx, 1, "Btn", simpleBoxTip, &dummy, 0.0);
+    hoverButtonWithBox(&ctx, 1, "Btn", simpleBoxTip, &dummy, 0.5);
+    try std.testing.expect(tooltipHasText(&ctx, "box tip"));
+    try std.testing.expectEqual(@as(u32, 1), ctx.tooltip_builder_calls);
+    try std.testing.expectEqual(@as(u32, 1), ctx.tooltip_layout_calls);
+
+    ctx.beginFrameAt(800, 600, 0.6);
+    ctx.pushEvent(.{ .mouse_move = .{ .x = 700, .y = 500, .modifiers = 0 } });
+    _ = ctx.buttonId(1, "Btn", .{});
+    ctx.tooltipBox(simpleBoxTip, &dummy);
+    ctx.endFrame();
+    try std.testing.expect(!tooltipHasText(&ctx, "box tip"));
+    try std.testing.expectEqual(@as(u32, 0), ctx.tooltip_builder_calls);
+}
+
+test "tooltipBox: builder is not called until the delay fires" {
+    var ctx = testCtx();
+    defer ctx.deinit();
+    var counter = CountingTip{};
+
+    ctx.beginFrameAt(800, 600, 0.0);
+    _ = ctx.buttonId(1, "Btn", .{});
+    ctx.endFrame();
+
+    hoverButtonWithBox(&ctx, 1, "Btn", CountingTip.build, &counter, 0.0);
+    try std.testing.expectEqual(@as(u32, 0), counter.calls);
+    hoverButtonWithBox(&ctx, 1, "Btn", CountingTip.build, &counter, 0.4);
+    try std.testing.expectEqual(@as(u32, 0), counter.calls);
+    hoverButtonWithBox(&ctx, 1, "Btn", CountingTip.build, &counter, 0.5);
+    try std.testing.expectEqual(@as(u32, 1), counter.calls);
+}
+
+test "tooltipBox: subtree does not join the main layout, rect cache, or focus order" {
+    var ctx = testCtx();
+    defer ctx.deinit();
+    var dummy: u8 = 0;
+
+    ctx.beginFrameAt(800, 600, 0.0);
+    _ = ctx.buttonId(1, "Btn", .{});
+    ctx.endFrame();
+
+    hoverButtonWithBox(&ctx, 1, "Btn", ExplicitIdTip.build, &dummy, 0.0);
+    const child_count_hidden = ctx.layout_root.?.child_count;
+    const first_rect_hidden = ctx.layout_root.?.first_child.?.rect;
+    const cache_len_hidden = ctx.rect_cache.count();
+    const focus_len_hidden = ctx.focus_order.items.len;
+
+    hoverButtonWithBox(&ctx, 1, "Btn", ExplicitIdTip.build, &dummy, 0.5);
+    try std.testing.expect(tooltipHasText(&ctx, "id tip"));
+    try std.testing.expectEqual(child_count_hidden, ctx.layout_root.?.child_count);
+    try std.testing.expectEqual(first_rect_hidden, ctx.layout_root.?.first_child.?.rect);
+    try std.testing.expectEqual(cache_len_hidden, ctx.rect_cache.count());
+    try std.testing.expectEqual(focus_len_hidden, ctx.focus_order.items.len);
+    try std.testing.expect(ctx.getNodeRect(ExplicitIdTip.box_id) == null);
+    try std.testing.expect(ctx.rect_cache.get(ExplicitIdTip.box_id) == null);
+    for (ctx.focus_order.items) |fid| {
+        try std.testing.expect(fid != ExplicitIdTip.box_id);
+    }
+}
+
+test "tooltipBox then tooltip in the same frame: text wins" {
+    var ctx = testCtx();
+    defer ctx.deinit();
+    var dummy: u8 = 0;
+
+    ctx.beginFrameAt(800, 600, 0.0);
+    _ = ctx.buttonId(1, "Btn", .{});
+    ctx.endFrame();
+
+    hoverButtonWithTip(&ctx, 1, "Btn", "text wins", 0.0);
+
+    ctx.beginFrameAt(800, 600, 0.5);
+    const r = ctx.getNodeRect(1).?;
+    ctx.pushEvent(.{ .mouse_move = .{
+        .x = r.x + @as(i32, @intCast(r.w / 2)),
+        .y = r.y + @as(i32, @intCast(r.h / 2)),
+        .modifiers = 0,
+    } });
+    _ = ctx.buttonId(1, "Btn", .{});
+    ctx.tooltipBox(simpleBoxTip, &dummy);
+    ctx.tooltip("text wins");
+    ctx.endFrame();
+
+    try std.testing.expect(tooltipHasText(&ctx, "text wins"));
+    try std.testing.expect(!tooltipHasText(&ctx, "box tip"));
+}
+
+test "tooltip then tooltipBox in the same frame: custom wins" {
+    var ctx = testCtx();
+    defer ctx.deinit();
+    var dummy: u8 = 0;
+
+    ctx.beginFrameAt(800, 600, 0.0);
+    _ = ctx.buttonId(1, "Btn", .{});
+    ctx.endFrame();
+
+    hoverButtonWithTip(&ctx, 1, "Btn", "text lost", 0.0);
+
+    ctx.beginFrameAt(800, 600, 0.5);
+    const r = ctx.getNodeRect(1).?;
+    ctx.pushEvent(.{ .mouse_move = .{
+        .x = r.x + @as(i32, @intCast(r.w / 2)),
+        .y = r.y + @as(i32, @intCast(r.h / 2)),
+        .modifiers = 0,
+    } });
+    _ = ctx.buttonId(1, "Btn", .{});
+    ctx.tooltip("text lost");
+    ctx.tooltipBox(simpleBoxTip, &dummy);
+    ctx.endFrame();
+
+    try std.testing.expect(tooltipHasText(&ctx, "box tip"));
+    try std.testing.expect(!tooltipHasText(&ctx, "text lost"));
+}
+
+test "tooltipBox: image pixels from the frame arena survive emit" {
+    var ctx = testCtx();
+    defer ctx.deinit();
+
+    const ImageTip = struct {
+        fn build(_: *anyopaque, c: *Context) void {
+            const src = [_]u32{ 0xFF112233, 0xFF445566, 0xFF778899, 0xFFAABBCC };
+            const copy = c.dupePixels(&src);
+            c.imageBox(0xBEEF, copy, 2, 2, .{});
+        }
+    };
+
+    ctx.beginFrameAt(800, 600, 0.0);
+    _ = ctx.buttonId(1, "Btn", .{});
+    ctx.endFrame();
+
+    var dummy: u8 = 0;
+    hoverButtonWithBox(&ctx, 1, "Btn", ImageTip.build, &dummy, 0.0);
+    hoverButtonWithBox(&ctx, 1, "Btn", ImageTip.build, &dummy, 0.5);
+
+    var saw_image = false;
+    for (ctx.draw_list.cmds.items) |cmd| {
+        if (cmd == .image) {
+            saw_image = true;
+            try std.testing.expectEqual(@as(u32, 2), cmd.image.src_w);
+            try std.testing.expectEqual(@as(u32, 2), cmd.image.src_h);
+            try std.testing.expectEqual(@as(u32, 0xFF112233), cmd.image.pixels[0]);
+        }
+    }
+    try std.testing.expect(saw_image);
 }
 
 // ── Keyboard focus traversal ──

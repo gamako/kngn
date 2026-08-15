@@ -24,10 +24,12 @@
 // can express "do not pass input while a popup is open" through wantsMouse() alone.
 
 const std = @import("std");
+const Allocator = std.mem.Allocator;
 const context_mod = @import("context.zig");
 const geom = @import("geom.zig");
 const id_mod = @import("id.zig");
 const font_mod = @import("font.zig");
+const layout = @import("layout.zig");
 
 pub const Context = context_mod.Context;
 pub const Rect = geom.Rect;
@@ -271,6 +273,7 @@ pub fn hitTestItem(geo: PopupGeometry, item_count: usize, p: Vec2) ?usize {
 /// calling `cancelDrag` first on the caller; this only keeps an app that forgets from leaving a
 /// drag stuck forever behind a modal popup, at the cost of losing that payload silently).
 pub fn openPopup(ctx: *Context, id: Id, pos: Vec2) void {
+    ctx.requireInteractiveAllowed("openPopup");
     ctx.popup_state = .{ .id = id, .pos = pos };
     ctx.state.active_id = 0;
     ctx.state.hot_id = 0;
@@ -282,6 +285,7 @@ pub fn openPopup(ctx: *Context, id: Id, pos: Vec2) void {
 /// so ESC detection itself is the caller's job. Follows the "platform-independent"
 /// policy from the top of input.zig).
 pub fn closePopup(ctx: *Context) void {
+    ctx.requireInteractiveAllowed("closePopup");
     ctx.popup_state = null;
 }
 
@@ -319,6 +323,7 @@ pub fn openPopupCount(ctx: *const Context) usize {
 /// since either kind being open already means background widgets are modally blocked (including
 /// the same drag-and-drop fail-safe; see `openPopup`'s doc comment).
 pub fn openPopupStacked(ctx: *Context, id: Id, pos: Vec2) void {
+    ctx.requireInteractiveAllowed("openPopupStacked");
     ctx.popup_stack.open(id, pos);
     ctx.state.active_id = 0;
     ctx.state.hot_id = 0;
@@ -328,6 +333,7 @@ pub fn openPopupStacked(ctx: *Context, id: Id, pos: Vec2) void {
 
 /// Close a popup opened with `openPopupStacked`. Does not touch the classic slot.
 pub fn closePopupStacked(ctx: *Context, id: Id) void {
+    ctx.requireInteractiveAllowed("closePopupStacked");
     ctx.popup_stack.close(id);
 }
 
@@ -517,6 +523,79 @@ pub fn drawTooltipOverlay(ctx: *Context, text: []const u8, anchor: Rect) void {
     if (r.isEmpty()) return;
     const text_y = font_mod.centeredTextY(r.y, geo.item_h, text_h);
     dl.textEx(.{ .x = r.x + 4, .y = text_y }, text, style.text, null) catch @panic("tooltip: OOM");
+}
+
+/// Add the same (dx, dy) to `node` and every descendant. Layout rects are absolute;
+/// moving only the root would leave children behind. Does not re-run measure/place.
+///
+/// Hot path: once per showing custom-tooltip frame, over the tooltip subtree
+/// (not the main tree). Not a per-pixel loop; not RT.
+pub fn translateNodeTree(node: *layout.Node, dx: i32, dy: i32) void {
+    node.rect.x += dx;
+    node.rect.y += dy;
+    var it = node.first_child;
+    while (it) |c| : (it = c.next_sibling) translateNodeTree(c, dx, dy);
+}
+
+/// Place a custom-tooltip subtree: natural size 4px below `anchor`, then push back
+/// from the right and bottom edges (no flip). If the subtree is larger than the
+/// screen, the root rect is shrunk to the screen, the whole tree is translated
+/// by the same delta, and `clip_children` cuts overflow. Tooltips do not scroll.
+///
+/// Hot path: once per showing custom-tooltip frame. Five-stage layout plus a
+/// tree walk. Not a per-pixel loop; not RT.
+pub fn placeTooltipSubtree(
+    root: *layout.Node,
+    anchor: Rect,
+    screen_w: u32,
+    screen_h: u32,
+    font: font_mod.Font,
+    allocator: Allocator,
+) void {
+    if (screen_w == 0 or screen_h == 0) return;
+
+    layout.measureWidths(root, font);
+    const nat_w: i32 = @max(root.measured_w, 1);
+    const desired_x = anchor.x;
+    const desired_y = anchor.y + @as(i32, @intCast(anchor.h)) + 4;
+    layout.placeWidths(root, .{
+        .x = desired_x,
+        .y = desired_y,
+        .w = @intCast(nat_w),
+        .h = 0,
+    });
+    layout.wrapText(root, font, allocator);
+    layout.measureHeights(root, font);
+    const nat_h: i32 = @max(root.measured_h, 1);
+    layout.placeHeights(root, .{
+        .x = desired_x,
+        .y = desired_y,
+        .w = @intCast(nat_w),
+        .h = @intCast(nat_h),
+    });
+
+    const sw: i32 = @intCast(screen_w);
+    const sh: i32 = @intCast(screen_h);
+    var oversized = false;
+    if (@as(i32, @intCast(root.rect.w)) > sw) {
+        root.rect.w = @intCast(sw);
+        oversized = true;
+    }
+    if (@as(i32, @intCast(root.rect.h)) > sh) {
+        root.rect.h = @intCast(sh);
+        oversized = true;
+    }
+    if (oversized) root.cfg.clip_children = true;
+
+    const rw: i32 = @intCast(root.rect.w);
+    const rh: i32 = @intCast(root.rect.h);
+    var dx: i32 = 0;
+    var dy: i32 = 0;
+    if (root.rect.x + rw > sw) dx = sw - (root.rect.x + rw);
+    if (root.rect.y + rh > sh) dy = sh - (root.rect.y + rh);
+    if (root.rect.x + dx < 0) dx = -root.rect.x;
+    if (root.rect.y + dy < 0) dy = -root.rect.y;
+    if (dx != 0 or dy != 0) translateNodeTree(root, dx, dy);
 }
 
 // ============================================================
@@ -1164,4 +1243,85 @@ test "popupPos: reads position from either backend, null when not open" {
     try std.testing.expectEqual(Vec2{ .x = 5, .y = 6 }, ctx.popupPos(1).?);
     ctx.openPopupStacked(2, .{ .x = 7, .y = 8 });
     try std.testing.expectEqual(Vec2{ .x = 7, .y = 8 }, ctx.popupPos(2).?);
+}
+
+test "placeTooltipSubtree: sits 4px below the anchor at natural size" {
+    const color = color_mod.Color.rgba(0xFF, 0xFF, 0xFF, 0xFF);
+    var root = layout.Node{ .cfg = .{
+        .direction = .column,
+        .width = .fit,
+        .height = .fit,
+        .padding = .{ 4, 4, 4, 4 },
+    } };
+    var leaf = layout.Node{ .leaf = .{ .text = .{
+        .str = "hi",
+        .color = color,
+        .font = null,
+    } } };
+    layout.appendChild(&root, &leaf);
+
+    const anchor = Rect{ .x = 20, .y = 10, .w = 30, .h = 12 };
+    placeTooltipSubtree(&root, anchor, 800, 600, font_mod.default_font, std.testing.allocator);
+
+    try std.testing.expectEqual(@as(i32, 20), root.rect.x);
+    try std.testing.expectEqual(@as(i32, 10 + 12 + 4), root.rect.y);
+    try std.testing.expectEqual(@as(i32, 24), leaf.rect.x); // + padding
+    try std.testing.expectEqual(@as(i32, 10 + 12 + 4 + 4), leaf.rect.y);
+    try std.testing.expect(!root.cfg.clip_children);
+}
+
+test "placeTooltipSubtree: right and bottom overflow is pushed back, not flipped" {
+    const color = color_mod.Color.rgba(0xFF, 0xFF, 0xFF, 0xFF);
+    var root = layout.Node{ .cfg = .{
+        .direction = .column,
+        .width = .fit,
+        .height = .fit,
+        .padding = .{ 4, 4, 4, 4 },
+    } };
+    var leaf = layout.Node{ .leaf = .{ .text = .{
+        .str = "XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX",
+        .color = color,
+        .font = null,
+    } } };
+    layout.appendChild(&root, &leaf);
+
+    const anchor = Rect{ .x = 180, .y = 60, .w = 16, .h = 12 };
+    placeTooltipSubtree(&root, anchor, 200, 80, font_mod.default_font, std.testing.allocator);
+
+    try std.testing.expect(root.rect.x >= 0);
+    try std.testing.expect(root.rect.y >= 0);
+    try std.testing.expect(@as(i64, root.rect.x) + root.rect.w <= 200);
+    try std.testing.expect(@as(i64, root.rect.y) + root.rect.h <= 80);
+    // Child moved by the same delta as the root (not left at the pre-clamp position).
+    try std.testing.expectEqual(root.rect.x + 4, leaf.rect.x);
+    try std.testing.expectEqual(root.rect.y + 4, leaf.rect.y);
+}
+
+test "placeTooltipSubtree: larger than the screen shrinks the root and clips" {
+    var root = layout.Node{ .cfg = .{
+        .direction = .column,
+        .width = .fit,
+        .height = .fit,
+        .padding = .{ 2, 2, 2, 2 },
+    } };
+    var leaf = layout.Node{ .leaf = .{ .custom = .{
+        .measured = .{ .x = 400, .y = 300 },
+        .draw_fn = struct {
+            fn f(_: *anyopaque, _: *layout.DrawList, _: Rect) void {}
+        }.f,
+        .ctx = undefined,
+    } } };
+    layout.appendChild(&root, &leaf);
+
+    const anchor = Rect{ .x = 10, .y = 10, .w = 8, .h = 8 };
+    placeTooltipSubtree(&root, anchor, 80, 50, font_mod.default_font, std.testing.allocator);
+
+    try std.testing.expectEqual(@as(u32, 80), root.rect.w);
+    try std.testing.expectEqual(@as(u32, 50), root.rect.h);
+    try std.testing.expect(root.cfg.clip_children);
+    try std.testing.expectEqual(@as(i32, 0), root.rect.x);
+    try std.testing.expectEqual(@as(i32, 0), root.rect.y);
+    // Children keep natural size; clip on the root cuts the overflow.
+    try std.testing.expectEqual(@as(u32, 400), leaf.rect.w);
+    try std.testing.expectEqual(@as(u32, 300), leaf.rect.h);
 }

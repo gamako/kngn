@@ -98,6 +98,13 @@ step 32
 digest gallery
 expect gallery hot=iconButton
 snapshot fb
+# custom tooltipBox on the 16px swatch after the brush
+# brush center 184, icon 16, gap 8, half swatch 8 → 184+8+8+8 = 208
+inject mouse_move 208 124
+step 32
+digest gallery
+expect gallery hot=tooltipBox
+snapshot fb
 # leave → tooltip off
 inject mouse_move 1000 620
 step 2

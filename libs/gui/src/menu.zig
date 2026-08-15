@@ -214,6 +214,7 @@ pub fn formatItemLabel(allocator: std.mem.Allocator, cmd: Command) ![]const u8 {
 /// Inside `beginFrame`…`endFrame`: top-menu button row. Click toggles `state.open_title`.
 /// Replacement entry point for the existing menu-bar beginBox row.
 pub fn menuBar(ctx: *Context, commands: []const Command, state: *MenuBarState) void {
+    ctx.requireInteractiveAllowed("menuBar");
     state.switch_click = false;
     var titles: [16][]const u8 = undefined;
     const n = collectMenuTitles(commands, &titles);

@@ -122,6 +122,7 @@ fn pointHitsVisible(rect: Rect, clip: Rect, p: Vec2) bool {
 /// widget under the same id.
 pub fn dragSource(ctx: *Context, id: Id, payload: DragPayload) DragSourceResult {
     ctx.requireFrame("dragSource");
+    ctx.requireInteractiveAllowed("dragSource");
     std.debug.assert(id != 0);
     if (ctx.isDisabled()) {
         ctx.clearDisabledInteraction(id);
@@ -182,6 +183,7 @@ pub const DropResult = struct {
 /// dragging press does not make targets light up).
 pub fn dropTarget(ctx: *Context, id: Id, can_accept: bool) DropResult {
     ctx.requireFrame("dropTarget");
+    ctx.requireInteractiveAllowed("dropTarget");
     std.debug.assert(id != 0);
     if (ctx.isDisabled()) {
         ctx.clearDisabledInteraction(id);
@@ -229,6 +231,7 @@ pub fn dragPosition(ctx: *const Context) ?Vec2 {
 /// every drag-and-drop caller needs); returns null when a `dropTarget` already claimed it (that
 /// target's own return value is the caller's copy) or the drag is still in flight.
 pub fn finishDrag(ctx: *Context) ?DragPayload {
+    ctx.requireInteractiveAllowed("finishDrag");
     const d = ctx.drag orelse return null;
     if (d.phase != .dragging or !ctx.input.mouse_released.left) return null;
     ctx.drag = null;
@@ -241,6 +244,7 @@ pub fn finishDrag(ctx: *Context) ?DragPayload {
 /// drag (`.dragging`) was cancelled, so the caller can restore its source state; returns null for
 /// `armed` (nothing was ever committed) or when there was no drag at all.
 pub fn cancelDrag(ctx: *Context) ?DragPayload {
+    ctx.requireInteractiveAllowed("cancelDrag");
     const d = ctx.drag orelse return null;
     ctx.drag = null;
     if (ctx.state.active_id == d.source_id) ctx.state.active_id = 0;

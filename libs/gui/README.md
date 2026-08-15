@@ -41,7 +41,7 @@ the framebuffer mode.
 | | Before the first frame | Frame open | After `endFrame` |
 |---|---|---|---|
 | `pushEvent`, `setComposition` | yes — staged | yes — applies now | yes — staged |
-| Widgets, `ctx.custom`, `beginBox`/`endBox`, `beginDisabled`, `tooltip`, `claimFocus`, `endFrame` | no | yes | no |
+| Widgets, `ctx.custom`, `beginBox`/`endBox`, `beginDisabled`, `tooltip`, `tooltipBox`, `claimFocus`, `endFrame` | no | yes | no |
 | `popupMenu`, `popupMenuStacked`, `menuBarPopup` | no — nothing to draw over yet | no | yes |
 | `beginFrame` | yes | no | yes |
 

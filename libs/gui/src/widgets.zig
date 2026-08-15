@@ -140,6 +140,7 @@ pub fn buttonEx(ctx: *Context, label: []const u8, opts: ButtonOpts) ButtonResult
 /// Explicit-ID form. Use when callers need `getNodeRect(id)` (e.g. pixie Save) or
 /// the same label appears more than once in one scope.
 pub fn buttonId(ctx: *Context, id: Id, label: []const u8, opts: ButtonOpts) ButtonResult {
+    ctx.requireInteractiveAllowed("button");
     const result = behaviorFromCache(ctx, id);
     const style = ctx.style;
     const disabled = ctx.isDisabled();
@@ -191,6 +192,7 @@ pub fn colorSwatchEx(ctx: *Context, opts: SwatchOpts) ButtonResult {
 
 /// Explicit-ID form. Prefer this when identical colors can sit side by side (palette).
 pub fn colorSwatchId(ctx: *Context, id: Id, opts: SwatchOpts) ButtonResult {
+    ctx.requireInteractiveAllowed("colorSwatch");
     const result = behaviorFromCache(ctx, id);
     const style = ctx.style;
     const size = opts.size orelse style.swatch_size;
@@ -243,6 +245,7 @@ pub fn iconButton(ctx: *Context, icon: IconBitmap, selected: bool) bool {
 
 /// Explicit-ID form. Use for toolbars with duplicate icons or external rect lookup.
 pub fn iconButtonId(ctx: *Context, id: Id, icon: IconBitmap, selected: bool) ButtonResult {
+    ctx.requireInteractiveAllowed("iconButton");
     std.debug.assert(icon.len == 16);
     const result = behaviorFromCache(ctx, id);
     const style = ctx.style;
@@ -388,6 +391,7 @@ pub fn selectableLabelId(
     opts: SelectableLabelOpts,
 ) SelectableLabelResult {
     ctx.requireFrame("selectableLabel");
+    ctx.requireInteractiveAllowed("selectableLabel");
     std.debug.assert(id != 0);
 
     if (opts.focusable) ctx.registerFocusable(id);
@@ -518,6 +522,7 @@ pub fn textInputId(
     opts: TextInputOpts,
 ) TextInputResult {
     ctx.requireFrame("textInput");
+    ctx.requireInteractiveAllowed("textInputId");
     std.debug.assert(id != 0);
 
     const disabled = ctx.isDisabled();
@@ -990,6 +995,7 @@ pub const SliderGroupOpts = struct {
 /// A slider built outside any group keeps its own `[label][track_w][value]` row exactly as before.
 /// Groups do not nest.
 pub fn beginSliderGroup(ctx: *Context, opts: SliderGroupOpts) void {
+    ctx.requireInteractiveAllowed("beginSliderGroup");
     Context.requireContract(ctx.slider_group == null, "beginSliderGroup inside another slider group");
     ctx.slider_group = .{ .column_gap = opts.column_gap };
     ctx.beginBox(.{ .direction = .column, .width = opts.width, .gap = opts.row_gap });
@@ -997,6 +1003,7 @@ pub fn beginSliderGroup(ctx: *Context, opts: SliderGroupOpts) void {
 
 /// Close a group opened by `beginSliderGroup`, settling its column widths.
 pub fn endSliderGroup(ctx: *Context) void {
+    ctx.requireInteractiveAllowed("endSliderGroup");
     Context.requireContract(ctx.slider_group != null, "endSliderGroup without a matching beginSliderGroup");
     const group = ctx.slider_group.?;
     ctx.slider_group = null;
@@ -1018,6 +1025,7 @@ pub fn sliderI32(ctx: *Context, label: []const u8, value: *i32, opts: SliderI32O
 
 /// Explicit-ID form.
 pub fn sliderI32Id(ctx: *Context, id: Id, label: []const u8, value: *i32, opts: SliderI32Opts) bool {
+    ctx.requireInteractiveAllowed("sliderI32");
     const spec: SliderSpec = .{
         .min = @floatFromInt(opts.min),
         .max = @floatFromInt(opts.max),
@@ -1037,6 +1045,7 @@ pub fn sliderF32(ctx: *Context, label: []const u8, value: *f32, opts: SliderF32O
 
 /// Explicit-ID form.
 pub fn sliderF32Id(ctx: *Context, id: Id, label: []const u8, value: *f32, opts: SliderF32Opts) bool {
+    ctx.requireInteractiveAllowed("sliderF32");
     const spec: SliderSpec = .{
         .min = opts.min,
         .max = opts.max,
@@ -1309,6 +1318,7 @@ pub fn svSquare(ctx: *Context, label: []const u8, hue: f32, s: *f32, v: *f32, op
 
 /// Explicit-ID form.
 pub fn svSquareId(ctx: *Context, id: Id, hue: f32, s: *f32, v: *f32, opts: SvSquareOpts) bool {
+    ctx.requireInteractiveAllowed("svSquare");
     const size = opts.size orelse ctx.style.picker_sv_size;
     std.debug.assert(size >= 2);
     const old_s = s.*;
@@ -1392,6 +1402,7 @@ pub fn hueBar(ctx: *Context, label: []const u8, h: *f32, opts: HueBarOpts) bool 
 
 /// Explicit-ID form.
 pub fn hueBarId(ctx: *Context, id: Id, h: *f32, opts: HueBarOpts) bool {
+    ctx.requireInteractiveAllowed("hueBar");
     const bw = opts.w orelse ctx.style.picker_hue_w;
     const bh = opts.h orelse ctx.style.picker_sv_size;
     std.debug.assert(bw >= 1 and bh >= 2);
@@ -1459,7 +1470,9 @@ const HueBarDraw = struct {
 
 // ── Image box (generic 1:1 leaf) ──────────────────
 // Like svSquare / hueBar: fixed-px leaf via `DrawCmd.image`. `pixels` are caller-owned and must
-// live through render (frame arena recommended). `dl.image` asserts `rect.w==src_w`, so
+// live through `gui.render` after `endFrame`. Pass application-owned memory or a frame-arena
+// copy (`ctx.dupePixels` / `ctx.allocator().dupe`). A caller-stack temporary is not valid:
+// render runs after the widget call returns. `dl.image` asserts `rect.w==src_w`, so
 // callers downscale themselves; here only 1:1 blit. Non-interactive (no hit-test).
 
 pub const ImageBoxOpts = struct {
@@ -1470,6 +1483,8 @@ pub const ImageBoxOpts = struct {
 
 /// 1:1 image box (explicit ID). Blits w×h `pixels` into a same-size rect.
 /// `pixels.len == w*h`, w>=1, h>=1.
+/// `pixels` must remain valid through `gui.render` after `endFrame`.
+/// A caller-stack temporary is not valid.
 pub fn imageBox(ctx: *Context, id: Id, pixels: []const u32, w: i32, h: i32, opts: ImageBoxOpts) void {
     std.debug.assert(w >= 1 and h >= 1);
     std.debug.assert(pixels.len == @as(usize, @intCast(w)) * @as(usize, @intCast(h)));
@@ -1520,6 +1535,7 @@ pub fn checkbox(ctx: *Context, label: []const u8, value: *bool) bool {
 
 /// Explicit-ID form. Use for duplicate labels in one scope or external rect lookup.
 pub fn checkboxId(ctx: *Context, id: Id, label: []const u8, value: *bool) bool {
+    ctx.requireInteractiveAllowed("checkbox");
     const result = behaviorFromCache(ctx, id);
     if (result.clicked) value.* = !value.*;
     const style = ctx.style;
@@ -1578,6 +1594,7 @@ pub fn toggle(ctx: *Context, label: []const u8, value: *bool) bool {
 
 /// Explicit-ID form.
 pub fn toggleId(ctx: *Context, id: Id, label: []const u8, value: *bool) bool {
+    ctx.requireInteractiveAllowed("toggle");
     const result = behaviorFromCache(ctx, id);
     if (result.clicked) value.* = !value.*;
     const style = ctx.style;
@@ -1637,6 +1654,7 @@ pub fn radio(ctx: *Context, label: []const u8, selected: bool) bool {
 
 /// Explicit-ID form. Use when identical radio labels share a scope (or `id_stack.push`).
 pub fn radioId(ctx: *Context, id: Id, label: []const u8, selected: bool) bool {
+    ctx.requireInteractiveAllowed("radio");
     const result = behaviorFromCache(ctx, id);
     const style = ctx.style;
     const disabled = ctx.isDisabled();
@@ -1687,12 +1705,18 @@ const RadioGlyph = struct {
 /// Depth of the body opened by `beginCollapsible` (debug contract check; single-thread assumed).
 threadlocal var collapsible_body_depth: u32 = 0;
 
+/// Current open-body depth. Used by the custom-tooltip symmetry check.
+pub fn collapsibleBodyDepth() u32 {
+    return collapsible_body_depth;
+}
+
 const collapsible_glyph_px: i32 = 12;
 
 /// header/glyph/title run every frame (small area). When closed, no body layout nodes, child widgets, or hit-tests.
 /// Open state is caller-owned `*bool` (same rule as ScrollArea’s scroll; not in PerIdStateStore).
 /// Build the body only when the return is true, and always close with `endCollapsible`.
 pub fn beginCollapsible(ctx: *Context, id: Id, title: []const u8, open: *bool) bool {
+    ctx.requireInteractiveAllowed("beginCollapsible");
     std.debug.assert(id != 0);
     const result = behaviorFromCache(ctx, id);
     if (result.clicked) open.* = !open.*;
@@ -1733,6 +1757,7 @@ pub fn beginCollapsible(ctx: *Context, id: Id, title: []const u8, open: *bool) b
 /// Body `endBox` (every frame but O(1). Call only when `beginCollapsible` returned true).
 /// Calling while closed mis-pops the parent — contract violation.
 pub fn endCollapsible(ctx: *Context) void {
+    ctx.requireInteractiveAllowed("endCollapsible");
     Context.requireContract(collapsible_body_depth > 0, "endCollapsible without an open collapsible body");
     collapsible_body_depth -= 1;
     ctx.endBox();
@@ -1836,6 +1861,7 @@ fn splitterDelta(orient: Orient, mouse_dx: i32, mouse_dy: i32, invert: bool) i32
 /// Sync hit-test: `buttonBehavior` on previous-frame rect; while held, apply `Input.dragDelta` to size with min/max clamp.
 /// Placed as an explicit-id box: vertical=thickness wide × grow tall / horizontal=thickness tall × grow wide.
 pub fn splitter(ctx: *Context, id: Id, orient: Orient, size: *i32, opts: SplitterOpts) bool {
+    ctx.requireInteractiveAllowed("splitter");
     std.debug.assert(opts.thickness > 0);
     const old = size.*;
 
@@ -1926,6 +1952,7 @@ fn scrollThumbColor(ctx: *Context, st: context_mod.ScrollState, thumb_id: Id) Co
 /// (3) wheel, only if this area is the chain head → (4) clamp. Areas that are not the
 /// chain head leave leftover wheel for `endScrollArea`.
 pub fn beginScrollArea(ctx: *Context, id: Id, scroll: *Vec2f, opts: ScrollAreaOpts) void {
+    ctx.requireInteractiveAllowed("beginScrollArea");
     const content_id = id_mod.hashInt(id, 1);
     const vthumb_id = id_mod.hashInt(id, 2);
     const hthumb_id = id_mod.hashInt(id, 3);
@@ -2089,6 +2116,7 @@ fn applyScrollAreaWheel(ctx: *Context, st: *context_mod.ScrollState) void {
 /// Non-head areas (and leftover after the head) consume wheel here, innermost first.
 /// Records this area's id / depth / end-order so the next frame can build the chain.
 pub fn endScrollArea(ctx: *Context) void {
+    ctx.requireInteractiveAllowed("endScrollArea");
     var st = ctx.scroll_stack.pop() orelse @panic("endScrollArea: mismatched begin");
     ctx.endBox(); // inner content
     applyScrollAreaWheel(ctx, &st);
@@ -2338,6 +2366,7 @@ pub fn endVirtualList(ctx: *Context) void {
 /// Call before `beginVirtualList` so this write is step (1) of the scroll
 /// order (caller → thumb → wheel → clamp).
 pub fn virtualScrollToRow(ctx: *Context, id: Id, scroll: *Vec2f, opts: VirtualListOpts, index: usize) void {
+    ctx.requireInteractiveAllowed("virtualScrollToRow");
     assertVirtualListOpts(opts);
     if (opts.row_count == 0) return;
     const idx = @min(index, opts.row_count - 1);
@@ -2398,6 +2427,7 @@ pub const TabResult = struct {
 /// One tab of a strip. `selected` is the caller's current choice (display only, same
 /// convention as `radioId`); a caller moves its selection by reacting to `result.focused`.
 pub fn tabId(ctx: *Context, id: Id, label: []const u8, selected: bool, opts: TabOpts) TabResult {
+    ctx.requireInteractiveAllowed("tab");
     const result = behaviorFromCache(ctx, id);
     const style = ctx.style;
     const hot = ctx.state.hot_id == id;
@@ -2500,6 +2530,7 @@ pub const ListboxRowResult = struct {
 /// Roving tab stop: registers as focusable only while `selected` is true, so a 500-row list
 /// costs Tab exactly one stop — whichever row is currently selected — never one per row.
 pub fn beginListboxRow(ctx: *Context, id: Id, selected: bool, opts: ListboxRowOpts) ListboxRowResult {
+    ctx.requireInteractiveAllowed("listboxRow");
     std.debug.assert(id != 0);
     const disabled = ctx.isDisabled();
 

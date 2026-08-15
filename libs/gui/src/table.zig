@@ -331,8 +331,14 @@ fn dupeCols(ctx: *Context, cols: []const TableCol) []TableCol {
 /// Open a table. `id` is required and becomes the outer box id plus the IdStack
 /// table scope (row scopes nest inside it so two tables in one parent do not
 /// collide on a cell widget that shares a label).
+///
+/// A table is forbidden inside a display-only tooltip builder. It keeps its own
+/// Context-owned state stack and interactive rows write hover / tooltip state,
+/// so allowing one would need a full save/restore plus a second interactive-row
+/// ban. That cost is not worth putting a table in a tooltip.
 pub fn beginTable(ctx: *Context, id: Id, cols: []const TableCol, opts: TableOpts) void {
     ctx.requireFrame("beginTable");
+    ctx.requireInteractiveAllowed("beginTable");
     Context.requireContract(ctx.table == null, "beginTable inside another table");
     Context.requireContract(id != 0, "beginTable requires a non-zero id");
     if (opts.scroll != null) {
@@ -396,6 +402,7 @@ fn buildHeaderCells(ctx: *Context) void {
 /// it is an ordinary first row.
 pub fn tableHeaderRow(ctx: *Context) void {
     ctx.requireFrame("tableHeaderRow");
+    ctx.requireInteractiveAllowed("tableHeaderRow");
     const t = tableState(ctx);
     Context.requireContract(!t.header_built, "tableHeaderRow called twice");
     Context.requireContract(!t.body_opened, "tableHeaderRow after body rows have started");
@@ -468,6 +475,7 @@ fn ensureBody(ctx: *Context) void {
 /// writer). Roving tab stop and `pollListNav` follow `beginListboxRow`.
 pub fn beginTableRow(ctx: *Context, opts: TableRowOpts) void {
     ctx.requireFrame("beginTableRow");
+    ctx.requireInteractiveAllowed("beginTableRow");
     const t = tableState(ctx);
     Context.requireContract(!t.row_open, "beginTableRow while a row is still open");
     if (t.stretch_cells) {
@@ -526,6 +534,7 @@ pub fn beginTableRow(ctx: *Context, opts: TableRowOpts) void {
 /// onto every cell of this row.
 pub fn endTableRow(ctx: *Context) TableRowResult {
     ctx.requireFrame("endTableRow");
+    ctx.requireInteractiveAllowed("endTableRow");
     const t = tableState(ctx);
     Context.requireContract(t.row_open, "endTableRow without an open row");
     Context.requireContract(!t.cell_open, "endTableRow while a cell is still open");
@@ -578,6 +587,7 @@ pub fn endTableRow(ctx: *Context) TableRowResult {
 /// inside (labelEllipsis, imageBox, checkbox, …).
 pub fn beginTableCell(ctx: *Context) void {
     ctx.requireFrame("beginTableCell");
+    ctx.requireInteractiveAllowed("beginTableCell");
     const t = tableState(ctx);
     Context.requireContract(t.row_open, "beginTableCell without an open row");
     Context.requireContract(!t.cell_open, "beginTableCell while a cell is still open");
@@ -590,6 +600,7 @@ pub fn beginTableCell(ctx: *Context) void {
 
 pub fn endTableCell(ctx: *Context) void {
     ctx.requireFrame("endTableCell");
+    ctx.requireInteractiveAllowed("endTableCell");
     const t = tableState(ctx);
     Context.requireContract(t.cell_open, "endTableCell without an open cell");
     ctx.endBox();
@@ -664,6 +675,7 @@ fn resolveFitColumns(ctx: *Context, t: *const TableState) void {
 /// `scroll.x` and the vertical-bar padding onto the header strip.
 pub fn endTable(ctx: *Context) void {
     ctx.requireFrame("endTable");
+    ctx.requireInteractiveAllowed("endTable");
     Context.requireContract(ctx.table != null, "endTable without a matching beginTable");
     const t = tableState(ctx);
     Context.requireContract(!t.row_open, "endTable with a row still open");

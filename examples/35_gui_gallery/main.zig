@@ -159,6 +159,7 @@ const Ids = struct {
     const table_row0: gui.Id = 0x3590;
     const badge_host: gui.Id = 0x3546;
     const badge: gui.Id = 0x3547;
+    const tooltip_host: gui.Id = 0x3548;
     const tree_row0: gui.Id = 0x35A0;
 };
 
@@ -287,6 +288,7 @@ const App = struct {
             Ids.splitter => "splitter",
             Ids.scroll => "scrollArea",
             Ids.icon_pen, Ids.icon_brush => "iconButton",
+            Ids.tooltip_host => "tooltipBox",
             Ids.collapsible => "collapsible",
             Ids.collapsible_child => "button",
             Ids.popup_trigger, Ids.popup => "popup",
@@ -482,6 +484,17 @@ fn renderColor(ctx: *gui.Context, app: *App) void {
     ctx.label("HSV controls use libs/gui gradient buffers; gallery adds no rasterizer.");
 }
 
+fn itemTooltip(ptr: *anyopaque, ctx: *gui.Context) void {
+    _ = ptr;
+    ctx.beginBox(.{ .direction = .row, .gap = 8, .align_cross = .center });
+    ctx.imageBox(0x35B0, &image_pixels, 8, 8, .{ .border = ctx.style.border });
+    ctx.beginBox(.{ .direction = .column, .gap = 2 });
+    ctx.labelStyled("Item", .heading);
+    ctx.label("A custom tooltip");
+    ctx.endBox();
+    ctx.endBox();
+}
+
 fn renderLayout(ctx: *gui.Context, app: *App) void {
     ctx.beginBox(.{ .direction = .column, .width = .{ .grow = 1 }, .height = .{ .grow = 1 }, .gap = 8 });
     // iconButton: selected (pen) / normal (brush) — app-side 16x16 1-bit assets
@@ -492,7 +505,13 @@ fn renderLayout(ctx: *gui.Context, app: *App) void {
     ctx.tooltip("Pen (P)");
     _ = ctx.iconButtonId(Ids.icon_brush, &ICON_BRUSH, false);
     ctx.tooltip("Brush (B) — long tooltip text for display check");
-    ctx.labelEx("selected / normal + tooltip", ctx.style.text_subtle);
+    _ = ctx.colorSwatchId(Ids.tooltip_host, .{
+        .color = gui.Color.rgba(0x4A, 0x90, 0xE2, 0xFF),
+        .size = 16,
+    });
+    var unused: u8 = 0;
+    ctx.tooltipBox(itemTooltip, &unused);
+    ctx.labelEx("selected / normal + tooltip / custom box", ctx.style.text_subtle);
     ctx.endBox();
 
     // Collapsible: dynamic title (tied to tool name) + body child (open/closed changes the screen)

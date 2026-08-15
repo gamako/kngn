@@ -121,6 +121,8 @@ pub const wordRange = @import("text_edit.zig").wordRange;
 
 pub const Context = @import("context.zig").Context;
 pub const TextOptions = @import("context.zig").TextOptions;
+pub const TooltipBuildFn = @import("context.zig").TooltipBuildFn;
+pub const TooltipCandidate = @import("context.zig").TooltipCandidate;
 pub const ButtonResult = @import("context.zig").ButtonResult;
 pub const buttonBehavior = @import("context.zig").buttonBehavior;
 pub const pointHitsVisible = @import("context.zig").pointHitsVisible;

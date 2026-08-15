@@ -56,7 +56,69 @@ const Case = enum {
     table_scroll_fit_width,
     /// A scrolling table with `.fit` height.
     table_scroll_fit_height,
+    /// Display-only tooltip builder called a prohibited API.
+    display_only_button,
+    display_only_checkbox,
+    display_only_toggle,
+    display_only_radio,
+    display_only_slider_i32,
+    display_only_slider_f32,
+    display_only_sv,
+    display_only_hue,
+    display_only_swatch,
+    display_only_icon,
+    display_only_selectable,
+    display_only_tab,
+    display_only_listbox,
+    display_only_splitter,
+    display_only_collapsible,
+    display_only_end_collapsible,
+    display_only_menu_bar,
+    display_only_virtual_scroll_to_row,
+    display_only_begin_table,
+    display_only_register_focusable,
+    display_only_claim_focus,
+    display_only_release_focus,
+    display_only_clear_disabled,
+    display_only_note_last,
+    display_only_begin_disabled,
+    display_only_end_disabled,
+    display_only_begin_scroll,
+    display_only_end_scroll,
+    display_only_begin_slider_group,
+    display_only_end_slider_group,
+    display_only_open_popup,
+    display_only_close_popup,
+    display_only_open_popup_stacked,
+    display_only_close_popup_stacked,
+    display_only_drag_source,
+    display_only_drop_target,
+    display_only_finish_drag,
+    display_only_cancel_drag,
+    display_only_text_input,
+    display_only_per_id_state,
+    display_only_tooltip,
+    display_only_tooltip_box,
+    display_only_push_event,
+    display_only_set_composition,
+    display_only_button_behavior,
+    tooltip_builder_unclosed_box,
+    tooltip_builder_id_stack,
 };
+
+fn runDisplayOnly(ctx: *gui.Context, build_fn: gui.TooltipBuildFn) void {
+    ctx.beginFrame(320, 240);
+    // First frame: empty rect cache. Arm hover so the builder actually runs.
+    ctx.tooltip_last_id = 1;
+    ctx.tooltip_last_rect = .{ .x = 8, .y = 8, .w = 40, .h = 16 };
+    ctx.tooltip_last_hovered = true;
+    ctx.tooltip_hover_id = 1;
+    ctx.tooltip_hover_rect = ctx.tooltip_last_rect;
+    ctx.tooltip_hover_start_s = ctx.now() - gui.Context.tooltip_delay_s;
+    var dummy: u8 = 0;
+    ctx.tooltipBox(build_fn, &dummy);
+    ctx.endFrame();
+}
 
 pub fn main(init: std.process.Init) !void {
     const gpa = init.gpa;
@@ -177,6 +239,260 @@ pub fn main(init: std.process.Init) !void {
             ctx.endTable();
             ctx.endFrame();
         },
+        .display_only_button => runDisplayOnly(&ctx, struct {
+            fn build(_: *anyopaque, c: *gui.Context) void {
+                _ = c.button("x");
+            }
+        }.build),
+        .display_only_checkbox => runDisplayOnly(&ctx, struct {
+            fn build(_: *anyopaque, c: *gui.Context) void {
+                var v = false;
+                _ = c.checkbox("x", &v);
+            }
+        }.build),
+        .display_only_toggle => runDisplayOnly(&ctx, struct {
+            fn build(_: *anyopaque, c: *gui.Context) void {
+                var v = false;
+                _ = c.toggle("x", &v);
+            }
+        }.build),
+        .display_only_radio => runDisplayOnly(&ctx, struct {
+            fn build(_: *anyopaque, c: *gui.Context) void {
+                _ = c.radio("x", false);
+            }
+        }.build),
+        .display_only_slider_i32 => runDisplayOnly(&ctx, struct {
+            fn build(_: *anyopaque, c: *gui.Context) void {
+                var v: i32 = 0;
+                _ = c.sliderI32("x", &v, .{ .min = 0, .max = 10 });
+            }
+        }.build),
+        .display_only_slider_f32 => runDisplayOnly(&ctx, struct {
+            fn build(_: *anyopaque, c: *gui.Context) void {
+                var v: f32 = 0;
+                _ = c.sliderF32("x", &v, .{ .min = 0, .max = 1 });
+            }
+        }.build),
+        .display_only_sv => runDisplayOnly(&ctx, struct {
+            fn build(_: *anyopaque, c: *gui.Context) void {
+                var s: f32 = 0.5;
+                var v: f32 = 0.5;
+                _ = c.svSquare("x", 0, &s, &v, .{});
+            }
+        }.build),
+        .display_only_hue => runDisplayOnly(&ctx, struct {
+            fn build(_: *anyopaque, c: *gui.Context) void {
+                var h: f32 = 0;
+                _ = c.hueBar("x", &h, .{});
+            }
+        }.build),
+        .display_only_swatch => runDisplayOnly(&ctx, struct {
+            fn build(_: *anyopaque, c: *gui.Context) void {
+                _ = c.colorSwatch(gui.Color.rgba(0, 0, 0, 0xFF), false);
+            }
+        }.build),
+        .display_only_icon => runDisplayOnly(&ctx, struct {
+            fn build(_: *anyopaque, c: *gui.Context) void {
+                const icon = [_]u16{0} ** 16;
+                _ = c.iconButton(&icon, false);
+            }
+        }.build),
+        .display_only_selectable => runDisplayOnly(&ctx, struct {
+            fn build(_: *anyopaque, c: *gui.Context) void {
+                _ = c.selectableLabel("x", .{});
+            }
+        }.build),
+        .display_only_tab => runDisplayOnly(&ctx, struct {
+            fn build(_: *anyopaque, c: *gui.Context) void {
+                _ = c.tabId(2, "x", false, .{});
+            }
+        }.build),
+        .display_only_listbox => runDisplayOnly(&ctx, struct {
+            fn build(_: *anyopaque, c: *gui.Context) void {
+                _ = c.beginListboxRow(2, false, .{});
+            }
+        }.build),
+        .display_only_splitter => runDisplayOnly(&ctx, struct {
+            fn build(_: *anyopaque, c: *gui.Context) void {
+                var size: i32 = 40;
+                _ = c.splitter(2, .vertical, &size, .{});
+            }
+        }.build),
+        .display_only_collapsible => runDisplayOnly(&ctx, struct {
+            fn build(_: *anyopaque, c: *gui.Context) void {
+                var open = false;
+                _ = c.beginCollapsible(2, "x", &open);
+            }
+        }.build),
+        .display_only_end_collapsible => runDisplayOnly(&ctx, struct {
+            fn build(_: *anyopaque, c: *gui.Context) void {
+                c.endCollapsible();
+            }
+        }.build),
+        .display_only_menu_bar => runDisplayOnly(&ctx, struct {
+            fn build(_: *anyopaque, c: *gui.Context) void {
+                var state: gui.MenuBarState = .{};
+                gui.menuBar(c, &.{}, &state);
+            }
+        }.build),
+        .display_only_virtual_scroll_to_row => runDisplayOnly(&ctx, struct {
+            fn build(_: *anyopaque, c: *gui.Context) void {
+                var scroll: gui.Vec2f = .{};
+                c.virtualScrollToRow(2, &scroll, .{ .row_height = 16, .row_count = 0 }, 0);
+            }
+        }.build),
+        .display_only_begin_table => runDisplayOnly(&ctx, struct {
+            fn build(_: *anyopaque, c: *gui.Context) void {
+                c.beginTable(2, &[_]gui.TableCol{}, .{});
+            }
+        }.build),
+        .display_only_register_focusable => runDisplayOnly(&ctx, struct {
+            fn build(_: *anyopaque, c: *gui.Context) void {
+                c.registerFocusable(2);
+            }
+        }.build),
+        .display_only_claim_focus => runDisplayOnly(&ctx, struct {
+            fn build(_: *anyopaque, c: *gui.Context) void {
+                _ = c.claimFocus(2);
+            }
+        }.build),
+        .display_only_release_focus => runDisplayOnly(&ctx, struct {
+            fn build(_: *anyopaque, c: *gui.Context) void {
+                c.releaseFocus();
+            }
+        }.build),
+        .display_only_clear_disabled => runDisplayOnly(&ctx, struct {
+            fn build(_: *anyopaque, c: *gui.Context) void {
+                c.clearDisabledInteraction(2);
+            }
+        }.build),
+        .display_only_note_last => runDisplayOnly(&ctx, struct {
+            fn build(_: *anyopaque, c: *gui.Context) void {
+                c.noteLastInteractive(2, .{ .x = 0, .y = 0, .w = 1, .h = 1 }, false);
+            }
+        }.build),
+        .display_only_begin_disabled => runDisplayOnly(&ctx, struct {
+            fn build(_: *anyopaque, c: *gui.Context) void {
+                c.beginDisabled();
+            }
+        }.build),
+        .display_only_end_disabled => runDisplayOnly(&ctx, struct {
+            fn build(_: *anyopaque, c: *gui.Context) void {
+                c.endDisabled();
+            }
+        }.build),
+        .display_only_begin_scroll => runDisplayOnly(&ctx, struct {
+            fn build(_: *anyopaque, c: *gui.Context) void {
+                var scroll: gui.Vec2f = .{};
+                c.beginScrollArea(2, &scroll, .{});
+            }
+        }.build),
+        .display_only_end_scroll => runDisplayOnly(&ctx, struct {
+            fn build(_: *anyopaque, c: *gui.Context) void {
+                c.endScrollArea();
+            }
+        }.build),
+        .display_only_begin_slider_group => runDisplayOnly(&ctx, struct {
+            fn build(_: *anyopaque, c: *gui.Context) void {
+                c.beginSliderGroup(.{});
+            }
+        }.build),
+        .display_only_end_slider_group => runDisplayOnly(&ctx, struct {
+            fn build(_: *anyopaque, c: *gui.Context) void {
+                c.endSliderGroup();
+            }
+        }.build),
+        .display_only_open_popup => runDisplayOnly(&ctx, struct {
+            fn build(_: *anyopaque, c: *gui.Context) void {
+                c.openPopup(2, .{ .x = 0, .y = 0 });
+            }
+        }.build),
+        .display_only_close_popup => runDisplayOnly(&ctx, struct {
+            fn build(_: *anyopaque, c: *gui.Context) void {
+                c.closePopup();
+            }
+        }.build),
+        .display_only_open_popup_stacked => runDisplayOnly(&ctx, struct {
+            fn build(_: *anyopaque, c: *gui.Context) void {
+                c.openPopupStacked(2, .{ .x = 0, .y = 0 });
+            }
+        }.build),
+        .display_only_close_popup_stacked => runDisplayOnly(&ctx, struct {
+            fn build(_: *anyopaque, c: *gui.Context) void {
+                c.closePopupStacked(2);
+            }
+        }.build),
+        .display_only_drag_source => runDisplayOnly(&ctx, struct {
+            fn build(_: *anyopaque, c: *gui.Context) void {
+                _ = c.dragSource(2, gui.DragPayload.fromValue(u8, 1, 0));
+            }
+        }.build),
+        .display_only_drop_target => runDisplayOnly(&ctx, struct {
+            fn build(_: *anyopaque, c: *gui.Context) void {
+                _ = c.dropTarget(2, true);
+            }
+        }.build),
+        .display_only_finish_drag => runDisplayOnly(&ctx, struct {
+            fn build(_: *anyopaque, c: *gui.Context) void {
+                _ = c.finishDrag();
+            }
+        }.build),
+        .display_only_cancel_drag => runDisplayOnly(&ctx, struct {
+            fn build(_: *anyopaque, c: *gui.Context) void {
+                _ = c.cancelDrag();
+            }
+        }.build),
+        .display_only_text_input => runDisplayOnly(&ctx, struct {
+            fn build(_: *anyopaque, c: *gui.Context) void {
+                var buf = gui.TextBuffer.init(c.gpa, "") catch @panic("oom");
+                defer buf.deinit();
+                _ = c.textInputId(2, &buf, .{});
+            }
+        }.build),
+        .display_only_per_id_state => runDisplayOnly(&ctx, struct {
+            fn build(_: *anyopaque, c: *gui.Context) void {
+                _ = c.perIdState(2);
+            }
+        }.build),
+        .display_only_tooltip => runDisplayOnly(&ctx, struct {
+            fn build(_: *anyopaque, c: *gui.Context) void {
+                c.tooltip("nested");
+            }
+        }.build),
+        .display_only_tooltip_box => runDisplayOnly(&ctx, struct {
+            fn build(_: *anyopaque, c: *gui.Context) void {
+                c.tooltipBox(struct {
+                    fn inner(_: *anyopaque, inner_ctx: *gui.Context) void {
+                        inner_ctx.label("inner");
+                    }
+                }.inner, undefined);
+            }
+        }.build),
+        .display_only_push_event => runDisplayOnly(&ctx, struct {
+            fn build(_: *anyopaque, c: *gui.Context) void {
+                c.pushEvent(.{ .mouse_move = .{ .x = 0, .y = 0, .modifiers = 0 } });
+            }
+        }.build),
+        .display_only_set_composition => runDisplayOnly(&ctx, struct {
+            fn build(_: *anyopaque, c: *gui.Context) void {
+                c.setComposition(.{});
+            }
+        }.build),
+        .display_only_button_behavior => runDisplayOnly(&ctx, struct {
+            fn build(_: *anyopaque, c: *gui.Context) void {
+                _ = gui.buttonBehavior(c, 2, .{ .x = 0, .y = 0, .w = 8, .h = 8 }, .{ .x = 0, .y = 0, .w = 320, .h = 240 });
+            }
+        }.build),
+        .tooltip_builder_unclosed_box => runDisplayOnly(&ctx, struct {
+            fn build(_: *anyopaque, c: *gui.Context) void {
+                c.beginBox(.{});
+            }
+        }.build),
+        .tooltip_builder_id_stack => runDisplayOnly(&ctx, struct {
+            fn build(_: *anyopaque, c: *gui.Context) void {
+                c.id_stack.push("x");
+            }
+        }.build),
     }
 
     // Reaching here means the contract check did not fire.

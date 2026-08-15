@@ -2506,6 +2506,53 @@ pub fn build(b: *std.Build) void {
             .{ .case = "table_stretch_grow", .message = "stretch_cells requires row height .fit or .fixed" },
             .{ .case = "table_scroll_fit_width", .message = "a scrolling table cannot use .fit width" },
             .{ .case = "table_scroll_fit_height", .message = "a scrolling table cannot use .fit height" },
+            .{ .case = "display_only_button", .message = "button is not allowed in a display-only tooltip builder" },
+            .{ .case = "display_only_checkbox", .message = "checkbox is not allowed in a display-only tooltip builder" },
+            .{ .case = "display_only_toggle", .message = "toggle is not allowed in a display-only tooltip builder" },
+            .{ .case = "display_only_radio", .message = "radio is not allowed in a display-only tooltip builder" },
+            .{ .case = "display_only_slider_i32", .message = "sliderI32 is not allowed in a display-only tooltip builder" },
+            .{ .case = "display_only_slider_f32", .message = "sliderF32 is not allowed in a display-only tooltip builder" },
+            .{ .case = "display_only_sv", .message = "svSquare is not allowed in a display-only tooltip builder" },
+            .{ .case = "display_only_hue", .message = "hueBar is not allowed in a display-only tooltip builder" },
+            .{ .case = "display_only_swatch", .message = "colorSwatch is not allowed in a display-only tooltip builder" },
+            .{ .case = "display_only_icon", .message = "iconButton is not allowed in a display-only tooltip builder" },
+            .{ .case = "display_only_selectable", .message = "selectableLabel is not allowed in a display-only tooltip builder" },
+            .{ .case = "display_only_tab", .message = "tab is not allowed in a display-only tooltip builder" },
+            .{ .case = "display_only_listbox", .message = "listboxRow is not allowed in a display-only tooltip builder" },
+            .{ .case = "display_only_splitter", .message = "splitter is not allowed in a display-only tooltip builder" },
+            .{ .case = "display_only_collapsible", .message = "beginCollapsible is not allowed in a display-only tooltip builder" },
+            .{ .case = "display_only_end_collapsible", .message = "endCollapsible is not allowed in a display-only tooltip builder" },
+            .{ .case = "display_only_menu_bar", .message = "menuBar is not allowed in a display-only tooltip builder" },
+            .{ .case = "display_only_virtual_scroll_to_row", .message = "virtualScrollToRow is not allowed in a display-only tooltip builder" },
+            .{ .case = "display_only_begin_table", .message = "beginTable is not allowed in a display-only tooltip builder" },
+            .{ .case = "display_only_register_focusable", .message = "registerFocusable is not allowed in a display-only tooltip builder" },
+            .{ .case = "display_only_claim_focus", .message = "claimFocus is not allowed in a display-only tooltip builder" },
+            .{ .case = "display_only_release_focus", .message = "releaseFocus is not allowed in a display-only tooltip builder" },
+            .{ .case = "display_only_clear_disabled", .message = "clearDisabledInteraction is not allowed in a display-only tooltip builder" },
+            .{ .case = "display_only_note_last", .message = "noteLastInteractive is not allowed in a display-only tooltip builder" },
+            .{ .case = "display_only_begin_disabled", .message = "beginDisabled is not allowed in a display-only tooltip builder" },
+            .{ .case = "display_only_end_disabled", .message = "endDisabled is not allowed in a display-only tooltip builder" },
+            .{ .case = "display_only_begin_scroll", .message = "beginScrollArea is not allowed in a display-only tooltip builder" },
+            .{ .case = "display_only_end_scroll", .message = "endScrollArea is not allowed in a display-only tooltip builder" },
+            .{ .case = "display_only_begin_slider_group", .message = "beginSliderGroup is not allowed in a display-only tooltip builder" },
+            .{ .case = "display_only_end_slider_group", .message = "endSliderGroup is not allowed in a display-only tooltip builder" },
+            .{ .case = "display_only_open_popup", .message = "openPopup is not allowed in a display-only tooltip builder" },
+            .{ .case = "display_only_close_popup", .message = "closePopup is not allowed in a display-only tooltip builder" },
+            .{ .case = "display_only_open_popup_stacked", .message = "openPopupStacked is not allowed in a display-only tooltip builder" },
+            .{ .case = "display_only_close_popup_stacked", .message = "closePopupStacked is not allowed in a display-only tooltip builder" },
+            .{ .case = "display_only_drag_source", .message = "dragSource is not allowed in a display-only tooltip builder" },
+            .{ .case = "display_only_drop_target", .message = "dropTarget is not allowed in a display-only tooltip builder" },
+            .{ .case = "display_only_finish_drag", .message = "finishDrag is not allowed in a display-only tooltip builder" },
+            .{ .case = "display_only_cancel_drag", .message = "cancelDrag is not allowed in a display-only tooltip builder" },
+            .{ .case = "display_only_text_input", .message = "textInputId is not allowed in a display-only tooltip builder" },
+            .{ .case = "display_only_per_id_state", .message = "perIdState is not allowed in a display-only tooltip builder" },
+            .{ .case = "display_only_tooltip", .message = "tooltip is not allowed in a display-only tooltip builder" },
+            .{ .case = "display_only_tooltip_box", .message = "tooltipBox is not allowed in a display-only tooltip builder" },
+            .{ .case = "display_only_push_event", .message = "pushEvent is not allowed in a display-only tooltip builder" },
+            .{ .case = "display_only_set_composition", .message = "setComposition is not allowed in a display-only tooltip builder" },
+            .{ .case = "display_only_button_behavior", .message = "buttonBehavior is not allowed in a display-only tooltip builder" },
+            .{ .case = "tooltip_builder_unclosed_box", .message = "tooltipBox builder left a box open" },
+            .{ .case = "tooltip_builder_id_stack", .message = "tooltipBox builder left the id stack unbalanced" },
         };
         for (cases) |c| {
             const run_guard = b.addRunArtifact(guard_exe);
@@ -3152,6 +3199,17 @@ pub fn build(b: *std.Build) void {
     const bench_gui_table_exe = b.addExecutable(.{ .name = "bench_gui_table", .root_module = bench_gui_table_root });
     const bench_gui_table_step = b.step("bench-gui-table", "Run GUI table widget full Context frame benchmark 500x4 (ReleaseFast)");
     bench_gui_table_step.dependOn(&b.addRunArtifact(bench_gui_table_exe).step);
+
+    const bench_gui_tooltip_root = b.createModule(.{
+        .root_source_file = b.path("bench/gui_tooltip.zig"),
+        .target = target,
+        .optimize = .ReleaseFast,
+    });
+    bench_gui_tooltip_root.addImport("gui", bench_gui_mod);
+    bench_gui_tooltip_root.addImport("peak_allocator", bench_peak_allocator_mod);
+    const bench_gui_tooltip_exe = b.addExecutable(.{ .name = "bench_gui_tooltip", .root_module = bench_gui_tooltip_root });
+    const bench_gui_tooltip_step = b.step("bench-gui-tooltip", "Run GUI custom-tooltip full Context frame benchmark (ReleaseFast)");
+    bench_gui_tooltip_step.dependOn(&b.addRunArtifact(bench_gui_tooltip_exe).step);
 
     // bench-path: filled-path rasterize + blit (small/medium/full × AA × scale × count)
     const bench_path_root = b.createModule(.{
