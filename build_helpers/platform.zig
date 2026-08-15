@@ -777,6 +777,14 @@ pub fn buildStandalone(
             kit_midi_mod.addImport("platform_types", types_mod);
             kit_midi_mod.addImport("harness", harness_mod);
             kit_mod.addImport("midi", kit_midi_mod);
+            // frame_prof: kit.zig imports unconditionally. core/control/frame_prof.zig depends
+            // only on harness (enable rule and readEnv); harness is per-backend, so the
+            // profiler is created per backend here (same reason as midi: not in KitLibs).
+            const kit_frame_prof_mod = b.createModule(.{
+                .root_source_file = .{ .cwd_relative = b.fmt("{s}/control/frame_prof.zig", .{core_dir}) },
+            });
+            kit_frame_prof_mod.addImport("harness", harness_mod);
+            kit_mod.addImport("frame_prof", kit_frame_prof_mod);
             root.addImport("kit", kit_mod);
         }
         if (spec.kit_libs) |kl| if (kl.paint) |paint| root.addImport("paint", paint);

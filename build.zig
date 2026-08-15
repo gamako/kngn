@@ -939,7 +939,7 @@ pub fn build(b: *std.Build) void {
     // there is not supported today, so the host decides whether these steps exist at all.
     // `install` is the step to run: buildStandalone installs its artifact and declares no
     // step of its own.
-    const standalone_gates: ?[2]*std.Build.Step = if (b.graph.host.result.os.tag == .windows) null else blk: {
+    const standalone_gates: ?[3]*std.Build.Step = if (b.graph.host.result.os.tag == .windows) null else blk: {
         // A standalone build is the only path that exercises buildStandalone's kit wiring;
         // the parent build reaches kit a different way, so without this the whole path is
         // unbuilt by `zig build test`. 32_sprite_anim is the strictest shape available:
@@ -974,7 +974,21 @@ pub fn build(b: *std.Build) void {
         );
         guard_step.dependOn(&guard_run.step);
 
-        break :blk .{ example_step, guard_step };
+        // Pixie kit-surface smoke: `cd apps/editor && zig build`. Catches a kit re-export
+        // that pixie actually uses and that buildStandalone failed to wire. It is not a
+        // sweep of every kit re-export; names pixie never touches stay uncaught here.
+        const editor_step = addChildBuild(
+            b,
+            "apps/editor",
+            "check-editor-standalone",
+            "Build the editor standalone (child zig build install; pixie kit-surface smoke, not a full kit-wiring sweep)",
+            "install",
+            "editor-standalone-check",
+            child_explicit_platform,
+            child_explicit_optimize,
+        );
+
+        break :blk .{ example_step, guard_step, editor_step };
     };
 
     if (install_all) {

@@ -21,7 +21,7 @@
 //! "internal / may break", and promote them into kit once the API settles (maturity gate).
 //!
 //! Note: because platform is a per-backend module, kit is also generated per backend
-//! (makeKitModule in build.zig). Adding an import here requires matching wiring in build.zig.
+//! (makeKitModule in build.zig). Adding an import here requires matching wiring in both the root build.zig and buildStandalone.
 
 pub const platform = @import("platform");
 pub const control = @import("harness");
