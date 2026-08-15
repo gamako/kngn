@@ -2498,6 +2498,14 @@ pub fn build(b: *std.Build) void {
             .{ .case = "unclosed_box", .message = "endFrame with a box still open" },
             .{ .case = "unclosed_slider_group", .message = "endFrame with a slider group still open" },
             .{ .case = "double_begin_frame", .message = "beginFrame must be called with no frame open" },
+            .{ .case = "unclosed_table", .message = "endFrame with a table still open" },
+            .{ .case = "nested_table", .message = "beginTable inside another table" },
+            .{ .case = "table_cell_count", .message = "table row cell count does not match column count" },
+            .{ .case = "table_h_scroll_grow", .message = "h_scroll cannot use grow or percent columns" },
+            .{ .case = "table_h_scroll_no_scroll", .message = "h_scroll requires opts.scroll" },
+            .{ .case = "table_stretch_grow", .message = "stretch_cells requires row height .fit or .fixed" },
+            .{ .case = "table_scroll_fit_width", .message = "a scrolling table cannot use .fit width" },
+            .{ .case = "table_scroll_fit_height", .message = "a scrolling table cannot use .fit height" },
         };
         for (cases) |c| {
             const run_guard = b.addRunArtifact(guard_exe);
@@ -3132,6 +3140,18 @@ pub fn build(b: *std.Build) void {
     const bench_gui_frame_exe = b.addExecutable(.{ .name = "bench_gui_frame", .root_module = bench_gui_frame_root });
     const bench_gui_frame_step = b.step("bench-gui-frame", "Run GUI full Context frame benchmark 500/1000 rows (ReleaseFast)");
     bench_gui_frame_step.dependOn(&b.addRunArtifact(bench_gui_frame_exe).step);
+
+    // bench-gui-table: 500x4 table scenarios (fixed / fit / mixed / scroll / interactive)
+    const bench_gui_table_root = b.createModule(.{
+        .root_source_file = b.path("bench/gui_table.zig"),
+        .target = target,
+        .optimize = .ReleaseFast,
+    });
+    bench_gui_table_root.addImport("gui", bench_gui_mod);
+    bench_gui_table_root.addImport("peak_allocator", bench_peak_allocator_mod);
+    const bench_gui_table_exe = b.addExecutable(.{ .name = "bench_gui_table", .root_module = bench_gui_table_root });
+    const bench_gui_table_step = b.step("bench-gui-table", "Run GUI table widget full Context frame benchmark 500x4 (ReleaseFast)");
+    bench_gui_table_step.dependOn(&b.addRunArtifact(bench_gui_table_exe).step);
 
     // bench-path: filled-path rasterize + blit (small/medium/full × AA × scale × count)
     const bench_path_root = b.createModule(.{

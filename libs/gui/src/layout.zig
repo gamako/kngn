@@ -90,7 +90,8 @@ pub const BoxConfig = struct {
     bg: ?Color = null,
     /// Border (null = none). Emitted bg → children → border
     border: ?Border = null,
-    /// If true, bake a clip from this rect into children's draw cmds (does not affect layout math)
+    /// If true, bake a clip from the content box (rect minus padding) into
+    /// children's draw cmds (does not affect layout math).
     clip_children: bool = false,
     /// Child placement offset for scrolling (px). Shifts final rects of children (and descendants)
     /// left by scroll_x and up by scroll_y. Does not affect child size, measured, or cursor math (placement only).
@@ -193,6 +194,24 @@ pub fn wrapConfigValid(cfg: BoxConfig) bool {
     };
     if (main_indefinite and cross == .fit) return false;
     return true;
+}
+
+/// Border-box `rect` minus `padding` (top, right, bottom, left).
+/// `clip_children` clips to this box so padding (a scrollbar gutter, etc.)
+/// is outside the visible child region. Zero padding leaves `rect` unchanged.
+pub fn contentBox(rect: Rect, padding: [4]i32) Rect {
+    const top = padding[0];
+    const right = padding[1];
+    const bottom = padding[2];
+    const left = padding[3];
+    const w: i32 = @as(i32, @intCast(rect.w)) - left - right;
+    const h: i32 = @as(i32, @intCast(rect.h)) - top - bottom;
+    return .{
+        .x = rect.x + left,
+        .y = rect.y + top,
+        .w = if (w > 0) @intCast(w) else 0,
+        .h = if (h > 0) @intCast(h) else 0,
+    };
 }
 
 /// Detect invalid BoxConfig values in debug builds (called from beginBox).
@@ -979,6 +998,16 @@ const gap_vt: Font.VTable = .{
     }.f,
 };
 const gap_font: Font = .{ .ptr = &gap_dummy, .vtable = &gap_vt };
+
+test "contentBox: subtracts padding; zero padding is identity" {
+    const r = Rect{ .x = 10, .y = 20, .w = 100, .h = 40 };
+    try std.testing.expectEqual(r, contentBox(r, .{ 0, 0, 0, 0 }));
+    const inner = contentBox(r, .{ 2, 8, 4, 1 });
+    try std.testing.expectEqual(@as(i32, 11), inner.x);
+    try std.testing.expectEqual(@as(i32, 22), inner.y);
+    try std.testing.expectEqual(@as(u32, 91), inner.w);
+    try std.testing.expectEqual(@as(u32, 34), inner.h);
+}
 
 test "measure: row fit (including gap + padding)" {
     var root: Node = .{ .cfg = .{ .direction = .row, .padding = .{ 2, 3, 4, 5 }, .gap = 7 } };

@@ -193,6 +193,19 @@ pub const endFormRow = @import("widgets.zig").endFormRow;
 pub const SliderGroupOpts = @import("widgets.zig").SliderGroupOpts;
 pub const beginSliderGroup = @import("widgets.zig").beginSliderGroup;
 pub const endSliderGroup = @import("widgets.zig").endSliderGroup;
+// Column table (sticky header, shared column widths)
+pub const TableCol = @import("table.zig").TableCol;
+pub const TableOpts = @import("table.zig").TableOpts;
+pub const TableRowInteractive = @import("table.zig").TableRowInteractive;
+pub const TableRowOpts = @import("table.zig").TableRowOpts;
+pub const TableRowResult = @import("table.zig").TableRowResult;
+pub const beginTable = @import("table.zig").beginTable;
+pub const endTable = @import("table.zig").endTable;
+pub const tableHeaderRow = @import("table.zig").tableHeaderRow;
+pub const beginTableRow = @import("table.zig").beginTableRow;
+pub const endTableRow = @import("table.zig").endTableRow;
+pub const beginTableCell = @import("table.zig").beginTableCell;
+pub const endTableCell = @import("table.zig").endTableCell;
 
 // PanelHost — dock-slot panel system.
 pub const PanelHost = @import("panel_host.zig").PanelHost;
@@ -298,4 +311,5 @@ test {
     _ = @import("drawlist_wire.zig");
     _ = @import("overlay.zig");
     _ = @import("text_wrap.zig");
+    _ = @import("table.zig");
 }

@@ -6,7 +6,7 @@ digest gallery
 expect gallery section=overview
 expect gallery index=0
 expect gallery widgets=0
-expect gallery missing=12
+expect gallery missing=11
 expect gallery schema=v0
 snapshot fb
 
@@ -149,15 +149,24 @@ digest gallery
 expect gallery section=stepgrid
 expect gallery widgets=1
 snapshot fb
-# stepgrid -> missing
+# stepgrid -> table
+inject key_down PAGE_DOWN
+step 1
+inject key_up PAGE_DOWN
+step 1
+digest gallery
+expect gallery section=table
+expect gallery widgets=1
+snapshot fb
+# table -> missing
 inject key_down PAGE_DOWN
 step 1
 inject key_up PAGE_DOWN
 step 1
 digest gallery
 expect gallery section=missing
-expect gallery index=8
-expect gallery widgets=12
-expect gallery missing=12
+expect gallery index=9
+expect gallery widgets=11
+expect gallery missing=11
 snapshot fb
 quit

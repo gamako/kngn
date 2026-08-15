@@ -25,6 +25,7 @@ const Section = enum(u8) {
     layout,
     menus,
     stepgrid,
+    table,
     missing,
 };
 
@@ -44,6 +45,7 @@ const SECTIONS = [_]SectionMeta{
     .{ .name = "layout", .detail = "splitter / scrollArea / iconButton / tooltip / collapsible", .widgets = 5, .missing = 0 },
     .{ .name = "menus", .detail = "popup/contextMenu / menuBar", .widgets = 2, .missing = 0 },
     .{ .name = "stepgrid", .detail = "stepgrid.widgetRow", .widgets = 1, .missing = 0 },
+    .{ .name = "table", .detail = "column header / sticky scroll / selected row / ellipsis", .widgets = 1, .missing = 0 },
     .{ .name = "missing", .detail = "APG / ImGui gaps (placeholder only)", .widgets = MISSING.len, .missing = MISSING.len },
 };
 
@@ -96,6 +98,9 @@ const MENUS_MATRIX = [_]MatrixRow{
 const STEPGRID_MATRIX = [_]MatrixRow{
     .{ .name = "stepgrid", .cells = .{ "ok", "demo", "demo", "N/A", "part", "ok", "N/A", "N/A", "ok" } },
 };
+const TABLE_MATRIX = [_]MatrixRow{
+    .{ .name = "table", .cells = .{ "ok", "demo", "demo", "ok", "N/A", "ok", "N/A", "N/A", "N/A" } },
+};
 
 // Widgets with no libs/gui API at all (contrast with the demo sections above, each of which
 // exercises a real, implemented widget). `category` names the follow-up bucket from the
@@ -118,7 +123,6 @@ const MISSING = [_]MissingEntry{
     .{ .name = "Disclosure", .category = "settings shell" },
     .{ .name = "Meter", .category = "settings shell" },
     .{ .name = "Spinbutton", .category = "settings shell" },
-    .{ .name = "Table", .category = "list+menu shell" },
     .{ .name = "Tree View", .category = "list+menu shell" },
     .{ .name = "Treegrid", .category = "deferred" },
 };
@@ -148,6 +152,8 @@ const Ids = struct {
     const popup: gui.Id = 0x3551;
     const grid: gui.Id = 0x3560;
     const disabled_toggle: gui.Id = 0x3570;
+    const table: gui.Id = 0x3580;
+    const table_row0: gui.Id = 0x3590;
 };
 
 const image_pixels = [_]u32{
@@ -229,6 +235,9 @@ const App = struct {
     splitter_size: i32 = 250,
     scroll: gui.Vec2f = .{},
     collapsible_open: bool = false,
+    table_scroll: gui.Vec2f = .{},
+    table_selected: usize = 0,
+    table_on: [8]bool = .{ true, false, true, false, true, false, true, false },
     menu: gui.MenuBarState = .{},
     text: *gui.TextBuffer,
     // Frame-local paste for Cmd+V (consumer wiring. set in the event loop; clear at frame start)
@@ -275,7 +284,10 @@ const App = struct {
             Ids.collapsible => "collapsible",
             Ids.collapsible_child => "button",
             Ids.popup_trigger, Ids.popup => "popup",
-            else => if (self.current() == .menus) "menuBar" else "none",
+            Ids.table => "table",
+            else => if (id >= Ids.table_row0 and id < Ids.table_row0 + 16)
+                "tableRow"
+            else if (self.current() == .menus) "menuBar" else "none",
         };
     }
 };
@@ -338,6 +350,7 @@ fn matrixFor(section: Section) []const MatrixRow {
         .layout => &LAYOUT_MATRIX,
         .menus => &MENUS_MATRIX,
         .stepgrid => &STEPGRID_MATRIX,
+        .table => &TABLE_MATRIX,
         else => &.{},
     };
 }
@@ -545,6 +558,69 @@ fn renderStepgrid(ctx: *gui.Context) void {
     _ = gui.stepgrid.widgetRow(ctx, .{ .id_base = Ids.grid, .mask = 0b1010_1010_1010_1010, .cell_size = 20, .editable = true });
 }
 
+const TABLE_ROWS = [_]struct { name: []const u8, status: []const u8, path: []const u8 }{
+    .{ .name = "layer 0", .status = "vis", .path = "documents/project/sprites/hero_idle.png" },
+    .{ .name = "layer 1", .status = "hid", .path = "documents/project/sprites/hero_walk.png" },
+    .{ .name = "layer 2", .status = "vis", .path = "documents/project/sprites/hero_jump.png" },
+    .{ .name = "bg far", .status = "vis", .path = "documents/project/maps/overworld_far.png" },
+    .{ .name = "bg near", .status = "hid", .path = "documents/project/maps/overworld_near.png" },
+    .{ .name = "ui hud", .status = "vis", .path = "documents/project/ui/hud_atlas.png" },
+    .{ .name = "fx glow", .status = "hid", .path = "documents/project/fx/glow_soft.png" },
+    .{ .name = "mask", .status = "vis", .path = "documents/project/masks/selection.png" },
+};
+
+fn renderTable(ctx: *gui.Context, app: *App) void {
+    ctx.label("sticky header / selected row / ellipsis path");
+    switch (ctx.pollListNav(Ids.table_row0 + app.table_selected)) {
+        .next => if (app.table_selected + 1 < TABLE_ROWS.len) {
+            app.table_selected += 1;
+            _ = ctx.claimFocus(Ids.table_row0 + app.table_selected);
+        },
+        .prev => if (app.table_selected > 0) {
+            app.table_selected -= 1;
+            _ = ctx.claimFocus(Ids.table_row0 + app.table_selected);
+        },
+        .none => {},
+    }
+    const cols = [_]gui.TableCol{
+        .{ .width = .{ .fixed = 72 }, .header = "Name" },
+        .{ .width = .{ .fixed = 40 }, .header = "St" },
+        .{ .width = .{ .grow = 1 }, .header = "Path" },
+        .{ .width = .{ .fixed = 36 }, .header = "On" },
+    };
+    ctx.beginTable(Ids.table, &cols, .{
+        .width = .{ .grow = 1 },
+        .height = .{ .grow = 1 },
+        .column_gap = 6,
+        .scroll = &app.table_scroll,
+        .header_bg = gui.Color.rgba(0x28, 0x30, 0x3C, 0xFF),
+        .bg = gui.Color.rgba(0x18, 0x1C, 0x24, 0xFF),
+        .border = .{ .color = ctx.style.border, .thickness = 1 },
+    });
+    ctx.tableHeaderRow();
+    for (TABLE_ROWS, 0..) |row, i| {
+        const rid: gui.Id = Ids.table_row0 + i;
+        ctx.beginTableRow(.{
+            .interactive = .{ .id = rid, .selected = i == app.table_selected },
+            .idle_bg = if (i % 2 == 0) gui.Color.rgba(0x20, 0x24, 0x2C, 0xFF) else null,
+        });
+        ctx.beginTableCell();
+        ctx.label(row.name);
+        ctx.endTableCell();
+        ctx.beginTableCell();
+        ctx.label(row.status);
+        ctx.endTableCell();
+        ctx.beginTableCell();
+        _ = ctx.labelEllipsis(row.path, 160, ctx.style.text);
+        ctx.endTableCell();
+        ctx.beginTableCell();
+        _ = ctx.checkbox(" ", &app.table_on[i]);
+        ctx.endTableCell();
+        if (ctx.endTableRow().activated) app.table_selected = i;
+    }
+    ctx.endTable();
+}
+
 fn renderMissing(ctx: *gui.Context) void {
     ctx.beginBox(.{ .direction = .row, .width = .{ .grow = 1 }, .height = .{ .grow = 1 }, .gap = 6 });
     var i: usize = 0;
@@ -574,6 +650,7 @@ fn renderSection(ctx: *gui.Context, app: *App) void {
         .layout => renderLayout(ctx, app),
         .menus => renderMenus(ctx, app),
         .stepgrid => renderStepgrid(ctx),
+        .table => renderTable(ctx, app),
         .missing => renderMissing(ctx),
     }
 }
@@ -584,7 +661,7 @@ fn renderFrame(ctx: *gui.Context, app: *App) void {
     ctx.beginBox(.{ .height = .{ .fixed = 64 }, .width = .{ .grow = 1 }, .padding = .{ 8, 8, 8, 8 }, .bg = gui.Color.rgba(0x28, 0x30, 0x3C, 0xFF) });
     ctx.label("GUI Capability Gallery v0");
     var section_buf: [128]u8 = undefined;
-    ctx.labelEx(std.fmt.bufPrint(&section_buf, "section {d}/8: {s} — {s}", .{ app.section, meta.name, meta.detail }) catch "section=?", ctx.style.text_subtle);
+    ctx.labelEx(std.fmt.bufPrint(&section_buf, "section {d}/{d}: {s} — {s}", .{ app.section, SECTIONS.len - 1, meta.name, meta.detail }) catch "section=?", ctx.style.text_subtle);
     ctx.labelEx("PAGE_DOWN/UP or N/P: navigate | ESC / Q: quit", ctx.style.text_subtle);
     ctx.endBox();
 

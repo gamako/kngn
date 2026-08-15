@@ -40,6 +40,22 @@ const Case = enum {
     unclosed_slider_group,
     /// A frame opened while one is already open.
     double_begin_frame,
+    /// A table closed with a table still open.
+    unclosed_table,
+    /// beginTable while another table is open.
+    nested_table,
+    /// endTableRow with fewer cells than columns.
+    table_cell_count,
+    /// h_scroll with a grow column.
+    table_h_scroll_grow,
+    /// h_scroll without a scroll pointer.
+    table_h_scroll_no_scroll,
+    /// stretch_cells on a grow-height row.
+    table_stretch_grow,
+    /// A scrolling table with `.fit` width.
+    table_scroll_fit_width,
+    /// A scrolling table with `.fit` height.
+    table_scroll_fit_height,
 };
 
 pub fn main(init: std.process.Init) !void {
@@ -88,6 +104,78 @@ pub fn main(init: std.process.Init) !void {
         .double_begin_frame => {
             ctx.beginFrame(320, 240);
             ctx.beginFrame(320, 240);
+        },
+        .unclosed_table => {
+            ctx.beginFrame(320, 240);
+            ctx.beginTable(1, &[_]gui.TableCol{}, .{});
+            ctx.endFrame();
+        },
+        .nested_table => {
+            ctx.beginFrame(320, 240);
+            ctx.beginTable(1, &[_]gui.TableCol{}, .{});
+            ctx.beginTable(2, &[_]gui.TableCol{}, .{});
+            ctx.endTable();
+            ctx.endTable();
+            ctx.endFrame();
+        },
+        .table_cell_count => {
+            const cols = [_]gui.TableCol{.{ .width = .{ .fixed = 40 } }};
+            ctx.beginFrame(320, 240);
+            ctx.beginTable(1, &cols, .{});
+            ctx.beginTableRow(.{});
+            _ = ctx.endTableRow();
+            ctx.endTable();
+            ctx.endFrame();
+        },
+        .table_h_scroll_grow => {
+            var scroll: gui.Vec2f = .{};
+            const cols = [_]gui.TableCol{.{ .width = .{ .grow = 1 } }};
+            ctx.beginFrame(320, 240);
+            ctx.beginTable(1, &cols, .{ .scroll = &scroll, .h_scroll = true });
+            ctx.endTable();
+            ctx.endFrame();
+        },
+        .table_h_scroll_no_scroll => {
+            const cols = [_]gui.TableCol{.{ .width = .{ .fixed = 40 } }};
+            ctx.beginFrame(320, 240);
+            ctx.beginTable(1, &cols, .{ .h_scroll = true });
+            ctx.endTable();
+            ctx.endFrame();
+        },
+        .table_stretch_grow => {
+            const cols = [_]gui.TableCol{.{ .width = .{ .fixed = 40 } }};
+            ctx.beginFrame(320, 240);
+            ctx.beginTable(1, &cols, .{ .stretch_cells = true });
+            ctx.beginTableRow(.{ .height = .{ .grow = 1 } });
+            ctx.beginTableCell();
+            ctx.endTableCell();
+            _ = ctx.endTableRow();
+            ctx.endTable();
+            ctx.endFrame();
+        },
+        .table_scroll_fit_width => {
+            var scroll: gui.Vec2f = .{};
+            const cols = [_]gui.TableCol{.{ .width = .{ .fixed = 40 } }};
+            ctx.beginFrame(320, 240);
+            ctx.beginTable(1, &cols, .{
+                .width = .fit,
+                .height = .{ .grow = 1 },
+                .scroll = &scroll,
+            });
+            ctx.endTable();
+            ctx.endFrame();
+        },
+        .table_scroll_fit_height => {
+            var scroll: gui.Vec2f = .{};
+            const cols = [_]gui.TableCol{.{ .width = .{ .fixed = 40 } }};
+            ctx.beginFrame(320, 240);
+            ctx.beginTable(1, &cols, .{
+                .width = .{ .grow = 1 },
+                .height = .fit,
+                .scroll = &scroll,
+            });
+            ctx.endTable();
+            ctx.endFrame();
         },
     }
 

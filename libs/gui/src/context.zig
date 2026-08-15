@@ -33,7 +33,8 @@
 //
 // Clip / hit-test visibility contract:
 //   - cached `clip` is the effective clip reflecting ancestor clip_children (same bounds as draw pushClip).
-//   - A node's own clip_children applies to its children, not itself.
+//   - A node's own clip_children applies to its children, not itself, and clips to the
+//     content box (border-box minus padding) so padding is outside the visible child region.
 //   - clip_children=false overflow is allowed for both draw and hit-test (outside the parent rect but inside ancestor clip).
 //   - Outside clip_children=true is forbidden for both draw and hit-test.
 //   - A zero-size effective clip is invisible and not hit-testable.
@@ -64,6 +65,7 @@ const popup_mod = @import("popup.zig");
 const stepgrid_mod = @import("stepgrid.zig");
 // dnd.zig uses the same mutual-import pattern (Context.drag is declared here; the state machine lives there).
 const dnd_mod = @import("dnd.zig");
+const table_mod = @import("table.zig");
 
 pub const Rect = geom.Rect;
 pub const Vec2 = geom.Vec2;
@@ -327,6 +329,8 @@ pub const Context = struct {
     drag_submitted_this_frame: bool = false,
     /// The slider group `beginSliderGroup` opened, if one is open. Groups do not nest.
     slider_group: ?SliderGroupState = null,
+    /// The table `beginTable` opened, if one is open. Tables do not nest.
+    table: ?table_mod.TableState = null,
 
     // ── Widget layer. Implementations live in widgets.zig (aliases for method syntax) ──
     pub const button = widgets.button;
@@ -375,6 +379,14 @@ pub const Context = struct {
     // Slider group (label / track / value columns shared by the rows inside)
     pub const beginSliderGroup = widgets.beginSliderGroup;
     pub const endSliderGroup = widgets.endSliderGroup;
+    // Column table (sticky header, shared column widths)
+    pub const beginTable = table_mod.beginTable;
+    pub const endTable = table_mod.endTable;
+    pub const tableHeaderRow = table_mod.tableHeaderRow;
+    pub const beginTableRow = table_mod.beginTableRow;
+    pub const endTableRow = table_mod.endTableRow;
+    pub const beginTableCell = table_mod.beginTableCell;
+    pub const endTableCell = table_mod.endTableCell;
     // read-only text selection
     pub const selectableLabel = widgets.selectableLabel;
     pub const selectableLabelId = widgets.selectableLabelId;
@@ -498,6 +510,7 @@ pub const Context = struct {
         self.drag_submitted_this_frame = false;
         // The cells a group collects live on the frame arena, so the group cannot outlive the frame.
         self.slider_group = null;
+        self.table = null;
         self.draw_list.reset(screen_w, screen_h);
         // Implicit layout-tree root (callers just start with beginBox)
         const root = self.allocator().create(layout.Node) catch @panic("Context.beginFrame: OOM");
@@ -550,6 +563,7 @@ pub const Context = struct {
         // Likewise every beginSliderGroup needs its endSliderGroup: the group's column widths are
         // written back there, so an unclosed group would leave its rows at zero-width columns.
         requireContract(self.slider_group == null, "endFrame with a slider group still open");
+        requireContract(self.table == null, "endFrame with a table still open");
         const root = self.layout_root.?;
         // Detect beginBox / endBox mismatches
         requireContract(self.layout_current == root, "endFrame with a box still open");
@@ -906,8 +920,9 @@ pub const Context = struct {
     /// run), or the frame's root when no box is open.
     ///
     /// For a widget that must revise a box's configuration after building something the
-    /// configuration depends on. The slider group is the only such caller: it equalises its column
-    /// widths at `endSliderGroup`, once every row has declared what it needs. Valid only until the
+    /// configuration depends on. The slider group equalises its column widths at
+    /// `endSliderGroup`; the table writes fit-column widths, stretch-cell heights,
+    /// and sticky-header scroll / bar padding the same way. Valid only until the
     /// frame ends, because the node lives on the frame arena.
     pub fn openBox(self: *Context) *layout.Node {
         self.requireFrame("openBox");
@@ -1028,7 +1043,8 @@ pub const Context = struct {
     ///
     /// `clip` arg = ancestor-derived effective clip (used for this node's draw and hit-test).
     /// Clip passed to children:
-    ///   - `clip_children=true`  → `intersect(clip, node.rect)` (outside parent rect: invisible / not hittable)
+    ///   - `clip_children=true`  → `intersect(clip, contentBox(node.rect, padding))`
+    ///     (padding sits outside the visible child region; a zero content box empties the clip)
     ///   - `clip_children=false` → `clip` unchanged (overflow draw/hit allowed; even with a zero-size parent,
     ///     children can hit if inside the ancestor clip)
     /// Same definition as `emitNode`'s pushClip bounds (cached clip ↔ draw clip correspondence).
@@ -1055,15 +1071,17 @@ pub const Context = struct {
                 .declared_h = layout.declaredSizeOf(node, false),
             };
         }
-        const child_clip = if (node.cfg.clip_children) Rect.intersect(clip, node.rect) else clip;
+        const child_clip = if (node.cfg.clip_children)
+            Rect.intersect(clip, layout.contentBox(node.rect, node.cfg.padding))
+        else
+            clip;
         var it = node.first_child;
         while (it) |c| : (it = c.next_sibling) self.updateRectCache(c, child_clip);
     }
 
-    /// Emit draw cmds (pre-order DFS): bg → (pushClip(node.rect) if clip_children) → children / leaf →
+    /// Emit draw cmds (pre-order DFS): bg → (pushClip(content box) if clip_children) → children / leaf →
     /// popClip → border.
-    /// `pushClip(node.rect)` intersects with the ancestor clip in draw_list, so the baked clip matches
-    /// the `child_clip = intersect(ancestor, node.rect)` that `updateRectCache` passes to children.
+    /// `pushClip` uses the content box (rect minus padding), matching `updateRectCache`.
     /// border is emitted after popClip (= ancestor clip) so the frame sits on top of children.
     fn emitNode(self: *Context, node: *const layout.Node) void {
         if (node.leaf) |leaf| {
@@ -1100,7 +1118,8 @@ pub const Context = struct {
             self.draw_list.rectFilled(node.rect, bg) catch @panic("Context.endFrame: OOM");
         }
         if (node.cfg.clip_children) {
-            self.draw_list.pushClip(node.rect) catch @panic("Context.endFrame: OOM");
+            self.draw_list.pushClip(layout.contentBox(node.rect, node.cfg.padding)) catch
+                @panic("Context.endFrame: OOM");
         }
         var it = node.first_child;
         while (it) |c| : (it = c.next_sibling) self.emitNode(c);
@@ -1493,6 +1512,31 @@ test "rect_cache: with clip_children=true, a partially clipped child gets the vi
     try std.testing.expectEqual(@as(u32, 20), item.clip.h);
     try std.testing.expect(pointHitsVisible(item.rect, item.clip, .{ .x = item.rect.x + 1, .y = item.rect.y + 1 }));
     try std.testing.expect(!pointHitsVisible(item.rect, item.clip, .{ .x = item.rect.x + 1, .y = item.rect.y + 30 }));
+}
+
+test "rect_cache: clip_children clips to the content box inside padding" {
+    var ctx = testCtx();
+    defer ctx.deinit();
+    const vp_id: Id = 40;
+    const item_id: Id = 41;
+
+    ctx.beginFrame(800, 600);
+    ctx.beginBox(.{
+        .id = vp_id,
+        .width = .{ .fixed = 100 },
+        .height = .{ .fixed = 20 },
+        .padding = .{ 0, 8, 0, 0 },
+        .clip_children = true,
+    });
+    ctx.beginBox(.{ .id = item_id, .width = .{ .fixed = 100 }, .height = .{ .fixed = 20 } });
+    ctx.endBox();
+    ctx.endBox();
+    ctx.endFrame();
+
+    const item = ctx.rect_cache.get(item_id).?;
+    try std.testing.expectEqual(@as(u32, 92), item.clip.w);
+    try std.testing.expect(pointHitsVisible(item.rect, item.clip, .{ .x = item.rect.x + 1, .y = item.rect.y + 1 }));
+    try std.testing.expect(!pointHitsVisible(item.rect, item.clip, .{ .x = item.clip.x + @as(i32, @intCast(item.clip.w)), .y = item.rect.y + 1 }));
 }
 
 test "Context.wantsMouse: true from the hover-start frame" {

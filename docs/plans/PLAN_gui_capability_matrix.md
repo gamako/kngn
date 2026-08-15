@@ -54,7 +54,7 @@ Basic, Trees, Collapsing Headers, Text, Images, Combo, List boxes, Selectables, 
 | Slider / Spinbutton | Drag/Slider widgets | sliderI32 / sliderF32; Spinbutton unsupported | settings shell |
 | Slider (Multi-Thumb) | Range widgets | Unsupported | deferred |
 | Switch | Basic | toggle | settings shell |
-| Table | Tables | Column table unsupported | list+menu shell |
+| Table | Tables | `beginTable` / `endTable` / `tableHeaderRow` / `beginTableRow` / `beginTableCell` (sticky header, shared column widths) | list+menu shell |
 | Tabs | Tabs | `ctx.tabId` (selection follows focus, radioId's caller-owns-selection convention) | settings shell / tracker shell |
 | Toolbar | Basic / Layout | row + button; no dedicated API | settings shell / list+menu shell |
 | Tooltip | — | `ctx.tooltip(text)` (500ms hover delay, virtual-clock deterministic, screen-edge clamp via `popupContentWidth`'s clamp rules) | game inventory shell |
@@ -82,6 +82,7 @@ lands or a gap closes; nothing technical ties the two together.
 | Color / Image | Context.colorSwatchId, Context.svSquareId, Context.hueBarId, Context.imageBox |
 | Layout | gui.splitter, Context.beginScrollArea/endScrollArea, Context.beginFormRow/endFormRow |
 | Selection | Context.tabId, Context.beginListboxRow/endListboxRow + gui.pollListNav |
+| Table | Context.beginTable/endTable, Context.tableHeaderRow, Context.beginTableRow/endTableRow, Context.beginTableCell/endTableCell |
 | State | Context.beginDisabled/endDisabled/isDisabled |
 | Popup / Menu | Context.popupMenu / popupMenuEx (PopupItem.checked, keep_open_on_select), gui.openPopupStacked/popupMenuStacked, gui.menuBar, gui.menuBarPopup, Context.tooltip |
 | Step grid | gui.stepgrid.widgetRow |
@@ -114,13 +115,14 @@ Use only Id-bearing variants that actually exist in libs/gui, and avoid collisio
 | popup / contextMenu | ✓ | ✓ | ✓ | N/A | ✓ item | N/A | N/A | N/A | ✓ |
 | menuBar | ✓ | demo | demo | N/A | ✓ command | N/A | N/A | N/A | ✓ |
 | stepgrid | ✓ | demo | demo | N/A | ✓ | ✓ | N/A | N/A | ✓ |
+| table | ✓ | demo | demo | ✓ | N/A | ✓ | N/A | N/A | N/A |
 
 ## 9. Unsupported-widget empty sections
 
 The missing section originally showed 15 items. Tabs, Listbox and Tooltip have since gained real APIs
 (`ctx.tabId`, `beginListboxRow`/`endListboxRow`/`gui.pollListNav`, `ctx.tooltip`; see §5's correction
-note), leaving these 12: Accordion, Alert / Message Dialog, Breadcrumb, Carousel, Combobox, Dialog
-(Modal), Disclosure, Meter, Spinbutton, Table, Tree View, Treegrid. Each item is only a rectangle, NOT
+note), leaving these 11: Accordion, Alert / Message Dialog, Breadcrumb, Carousel, Combobox, Dialog
+(Modal), Disclosure, Meter, Spinbutton, Tree View, Treegrid. Each item is only a rectangle, NOT
 IMPLEMENTED, and a follow-up category (torture suite / settings shell / list+menu shell / deferred). No
 widget implementation is included. `examples/35_gui_gallery`'s own placeholder count and `MISSING` array
 have not been re-synced to this correction (see §5's note) — this section's count is the corrected one.
