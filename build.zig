@@ -1,5 +1,12 @@
 const std = @import("std");
 
+/// Build helpers re-exported for packages that depend on kngn (`@import("kngn").build_helpers`).
+pub const build_helpers = struct {
+    pub const consumer = @import("build_helpers/consumer.zig");
+    pub const macos = @import("build_helpers/macos.zig");
+    pub const swift = @import("build_helpers/swift.zig");
+};
+
 const platform = @import("build_helpers/platform.zig");
 const macos = @import("build_helpers/macos.zig");
 
@@ -122,7 +129,7 @@ fn makeInternalWasmLinker(b: *std.Build, wasm_harness: bool) platform.WasmLinker
             wasm_max_opts.addOption(usize, "max_modules", @as(usize, 48));
             wasm_max_opts.addOption(bool, "has_frame_cap", false);
             wasm_max_opts.addOption(u32, "frame_cap_hz", @as(u32, 0));
-            const shared = SharedModules.init(bb, true, self.wasm_harness, false, 48, wasm_max_opts.createModule(), target, .wasm);
+            const shared = SharedModules.init(bb, true, self.wasm_harness, false, false, 48, wasm_max_opts.createModule(), target, .wasm);
             const pm = makePlatformModules(bb, target, .wasm, &shared);
 
             if (std.mem.eql(u8, link_ctx.spec.name, "pixie")) {
@@ -434,6 +441,18 @@ fn assertVendoredHelpersIdentical(b: *std.Build) void {
 /// When the parent was invoked with an explicit `-Dplatform` / `-Doptimize` (or `--release`),
 /// those flags are forwarded; otherwise the child uses its own host defaults.
 /// Cross-compilation of a child is not a gate guarantee (no automatic target rewrite).
+/// Every sample that builds on its own as a package. The sweep gate walks this list, so a
+/// new sample joins the gate by being added here.
+const standalone_examples = [_][]const u8{
+    "01_timed_window",   "02_keyboard_input",   "03_sprite_rendering",  "04_fixed_timestep",
+    "05_text_rendering", "06_sprite_benchmark", "07_mouse_input",       "15_audio_tone",
+    "21_char_input",     "22_gamepad",          "23_fullscreen",        "25_collision_demo",
+    "26_appshell_demo",  "30_sound_demo",       "32_sprite_anim",       "33_camera",
+    "34_action_map",     "35_gui_gallery",      "36_tilemap",           "37_gui_torture",
+    "38_minigame",       "39_settings_shell",   "40_list_menu",         "41_panel_host",
+    "42_tracker_grid",   "43_game_inventory",   "44_fixed_framebuffer",
+};
+
 fn addCheckedChildBuild(
     b: *std.Build,
     child_dir: []const u8,
@@ -546,6 +565,7 @@ pub fn build(b: *std.Build) void {
             true,
             wasm_harness,
             false,
+            false,
             48,
             wasm_pub_opts.createModule(),
             target,
@@ -553,11 +573,24 @@ pub fn build(b: *std.Build) void {
         );
         // SharedModules with is_wasm=true uses createModule for platform/png/… so register
         // the public names explicitly for external consumers.
-        _ = b.modules.put(b.graph.arena, b.dupe("platform"), wasm_pub_shared.platform.mod) catch @panic("OOM");
-        _ = b.modules.put(b.graph.arena, b.dupe("png"), wasm_pub_shared.png.mod) catch @panic("OOM");
-        _ = b.modules.put(b.graph.arena, b.dupe("gmath"), wasm_pub_shared.gmath.mod) catch @panic("OOM");
-        _ = b.modules.put(b.graph.arena, b.dupe("font"), wasm_pub_shared.font.mod) catch @panic("OOM");
-        _ = b.modules.put(b.graph.arena, b.dupe("gui"), wasm_pub_shared.gui.mod) catch @panic("OOM");
+        publishModuleAlias(b, "platform", wasm_pub_shared.platform.mod);
+        publishModuleAlias(b, "png", wasm_pub_shared.png.mod);
+        publishModuleAlias(b, "gmath", wasm_pub_shared.gmath.mod);
+        publishModuleAlias(b, "font", wasm_pub_shared.font.mod);
+        publishModuleAlias(b, "gui", wasm_pub_shared.gui.mod);
+        // The same names the native branch publishes, from this branch's own instances. A
+        // name that resolves for one target and not the other would be the very split this
+        // package removed between the two ways of reaching kit.
+        publishModuleAlias(b, "keyboard", wasm_pub_shared.keyboard);
+        publishModuleAlias(b, "sprite", wasm_pub_shared.sprite);
+        publishModuleAlias(b, "fixed_timestep", wasm_pub_shared.fixed_timestep);
+        publishModuleAlias(b, "fps_counter", wasm_pub_shared.fps_counter);
+        publishModuleAlias(b, "text", wasm_pub_shared.text);
+        publishModuleAlias(b, "audio", wasm_pub_shared.audio.mod);
+        publishModuleAlias(b, "gamepad", wasm_pub_shared.gamepad.mod);
+        publishModuleAlias(b, "pixelops", wasm_pub_shared.pixelops.mod);
+        publishModuleAlias(b, "sound", wasm_pub_shared.sound.mod);
+        publishModuleAlias(b, "paint", wasm_pub_shared.paint.mod);
         const app_runtime_wasm: TaggedModule = .{ .layer = .core, .name = "app_runtime", .mod = b.createModule(.{
             .root_source_file = b.path("core/app_runtime.zig"),
             .target = target,
@@ -615,6 +648,16 @@ pub fn build(b: *std.Build) void {
         "Enable gamepad for external platform module and native archive (default false)",
     ) orelse false;
 
+    // Native-menu opt-in for external consumers. Default false, and the same shape as
+    // `enable_gamepad`: one boolean drives both `dep.module("platform")`'s build_options and
+    // the published archive, because the menu needs its own translation unit archived next to
+    // the backend. A module that claims the feature while the archive lacks it fails to link.
+    const enable_menu_ext = b.option(
+        bool,
+        "enable_menu",
+        "Enable the native menu for the external platform module and native archive (default false)",
+    ) orelse false;
+
     // modular/noodle concurrent module limit. Default 48 = bit-identical with the current default.
     // Lower bound: enough for the default lofi patch + macros. Upper bound: u16 handle / a sensible memory range.
     // Create the Options Module once via createModule; all consumers share it through addImport
@@ -647,7 +690,31 @@ pub fn build(b: *std.Build) void {
     // Shared modules (OS/backend-independent; shared by main + examples + pixie + synth)
     // Also includes the external public modules (platform/png/font/gui).
     // ========================================
-    const shared_modules = SharedModules.init(b, false, wasm_harness, enable_gamepad_ext, max_modules_option, max_modules_mod, target, platform_option);
+    const shared_modules = SharedModules.init(b, false, wasm_harness, enable_gamepad_ext, enable_menu_ext, max_modules_option, max_modules_mod, target, platform_option);
+
+    // Names a package consumer can ask for beyond the six `SharedModules.init` registers
+    // itself. Every sample in `examples/` builds on its own as a package (its own
+    // `build.zig.zon` naming this one), and a sample's source imports the individual library
+    // it demonstrates rather than the umbrella, so those import names have to resolve.
+    //
+    // These are **aliases of the instances kit already holds**, never second modules built
+    // from the same source: a second instance would put one file in two modules, and the two
+    // could drift the way two ways of reaching kit did. `publishModuleAlias` asserts that,
+    // so a caller registering a different pointer under a taken name stops the build.
+    //
+    // Being reachable is not a stability promise. `kit` is the surface that carries one
+    // (ADR-020); everything here may change with no notice, and `text` and `paint` are
+    // explicitly still in flux.
+    publishModuleAlias(b, "keyboard", shared_modules.keyboard);
+    publishModuleAlias(b, "sprite", shared_modules.sprite);
+    publishModuleAlias(b, "fixed_timestep", shared_modules.fixed_timestep);
+    publishModuleAlias(b, "fps_counter", shared_modules.fps_counter);
+    publishModuleAlias(b, "text", shared_modules.text);
+    publishModuleAlias(b, "audio", shared_modules.audio.mod);
+    publishModuleAlias(b, "gamepad", shared_modules.gamepad.mod);
+    publishModuleAlias(b, "pixelops", shared_modules.pixelops.mod);
+    publishModuleAlias(b, "sound", shared_modules.sound.mod);
+    publishModuleAlias(b, "paint", shared_modules.paint.mod);
 
     // External public kit umbrella. Reuses SharedModules instances so type identity holds.
     // Obtained via dep.module("kit"). platform / gui / gamepad etc. are the same module instances through kit.
@@ -933,62 +1000,73 @@ pub fn build(b: *std.Build) void {
     );
     check_consumer_step.dependOn(check_vendor_step);
 
-    // Standalone gates. `examples/*/build.zig` and `tests/standalone-guard/build.zig` reach
-    // the build helpers through a `build_helpers` symlink, which a Windows checkout expands
-    // into plain files (see docs/platform-verification.md); building a sample standalone
-    // there is not supported today, so the host decides whether these steps exist at all.
-    // `install` is the step to run: buildStandalone installs its artifact and declares no
-    // step of its own.
-    const standalone_gates: ?[3]*std.Build.Step = if (b.graph.host.result.os.tag == .windows) null else blk: {
-        // A standalone build is the only path that exercises buildStandalone's kit wiring;
-        // the parent build reaches kit a different way, so without this the whole path is
-        // unbuilt by `zig build test`. 32_sprite_anim is the strictest shape available:
-        // its pixelops sits two hops down, behind gfx's sprite module.
-        const example_step = addChildBuild(
-            b,
-            "examples/32_sprite_anim",
+    // Standalone gates. Every sample in `examples/` and the editor build on their own as
+    // packages depending on this one, which is the same path an application outside this
+    // repository takes. Two levels: a few representative samples plus the editor run with
+    // `zig build test`, and the full sweep of every sample joins `-Dinstall-all=true`,
+    // because a link step per sample is more than the aggregate test should carry.
+    //
+    // These run on every host. A sample reaches the build helpers through the package, so
+    // nothing here depends on a symbolic link surviving a checkout — which is what used to
+    // keep a Windows host out (see docs/platform-verification.md).
+    //
+    // `install` is the step to run: a sample's build script installs its artifact and
+    // declares no step of its own beyond `run`.
+    const standalone_gates: [3]*std.Build.Step = blk: {
+        // The three between them cover what a sample can ask the package for: individual
+        // legacy modules with a deep dependency (font pulls vector), the capability links an
+        // executable has to make itself (audio), and a module outside kit (paint).
+        const representative = [_]struct { path: []const u8, id: []const u8 }{
+            .{ .path = "examples/05_text_rendering", .id = "example-05-standalone-check" },
+            .{ .path = "examples/30_sound_demo", .id = "example-30-standalone-check" },
+            .{ .path = "examples/26_appshell_demo", .id = "example-26-standalone-check" },
+        };
+        const example_step = b.step(
             "check-example-standalone",
-            "Build one example standalone (child zig build install; exercises the kit wiring)",
-            "install",
-            "example-standalone-check",
-            child_explicit_platform,
-            child_explicit_optimize,
+            "Build representative samples on their own (child zig build install; the package path an outside application takes)",
         );
+        for (representative) |sample| {
+            example_step.dependOn(&addCheckedChildBuild(
+                b,
+                sample.path,
+                "install",
+                sample.id,
+                child_explicit_platform,
+                child_explicit_optimize,
+            ).step);
+        }
 
-        // The positive gate above cannot show that the shared-module checks fire: it passes
-        // whether or not they detect anything. This one breaks the pixelops contract on
-        // purpose and asserts on the diagnostic.
-        const guard_run = addCheckedChildBuild(
-            b,
-            "tests/standalone-guard",
-            "install",
-            "standalone-guard-check",
-            child_explicit_platform,
-            child_explicit_optimize,
+        // The sweep. A name a sample imports but the package never publishes only shows up
+        // in that sample's own build, so the set has to be complete to mean anything.
+        const all_step = b.step(
+            "check-examples-standalone",
+            "Build every sample on its own (child zig build install; joins -Dinstall-all=true)",
         );
-        guard_run.expectExitCode(1);
-        guard_run.addCheck(.{ .expect_stderr_match = "kit_libs.pixelops is unset" });
-        const guard_step = b.step(
-            "check-standalone-guard",
-            "Assert a standalone build that shares no pixelops module fails during configuration",
-        );
-        guard_step.dependOn(&guard_run.step);
+        for (standalone_examples) |sample| {
+            all_step.dependOn(&addCheckedChildBuild(
+                b,
+                b.fmt("examples/{s}", .{sample}),
+                "install",
+                b.fmt("{s}-standalone-check", .{sample}),
+                child_explicit_platform,
+                child_explicit_optimize,
+            ).step);
+        }
 
-        // Pixie kit-surface smoke: `cd apps/editor && zig build`. Catches a kit re-export
-        // that pixie actually uses and that buildStandalone failed to wire. It is not a
-        // sweep of every kit re-export; names pixie never touches stay uncaught here.
+        // The editor is the only consumer of the native menu, which reaches it as a package
+        // option rather than through the module graph.
         const editor_step = addChildBuild(
             b,
             "apps/editor",
             "check-editor-standalone",
-            "Build the editor standalone (child zig build install; pixie kit-surface smoke, not a full kit-wiring sweep)",
+            "Build the editor standalone (child zig build install; the only build that opts into the native menu)",
             "install",
             "editor-standalone-check",
             child_explicit_platform,
             child_explicit_optimize,
         );
 
-        break :blk .{ example_step, guard_step, editor_step };
+        break :blk .{ example_step, all_step, editor_step };
     };
 
     if (install_all) {
@@ -1004,6 +1082,9 @@ pub fn build(b: *std.Build) void {
         b.getInstallStep().dependOn(check_template_step);
         b.getInstallStep().dependOn(check_template_web_step);
         b.getInstallStep().dependOn(check_consumer_step);
+        // The sweep of every sample built on its own. It has to be attached explicitly:
+        // declaring the step is not enough for this build to run it.
+        b.getInstallStep().dependOn(standalone_gates[1]);
     }
 
     // ========================================
@@ -1023,7 +1104,7 @@ pub fn build(b: *std.Build) void {
     if (target_os == .macos) {
         // enable_gamepad_ext aligns KNGN_ENABLE_GAMEPAD on the native archive with the platform module.
         // GameController framework linking stays on the consumer side (explicit on the exe when enabled).
-        _ = addPlatformNativeLib(b, target, optimize, platform_root, .metal, "platform_native_metal", enable_gamepad_ext);
+        _ = addPlatformNativeLib(b, target, optimize, platform_root, .metal, "platform_native_metal", enable_gamepad_ext, enable_menu_ext);
     }
 
     // ========================================
@@ -2818,8 +2899,10 @@ pub fn build(b: *std.Build) void {
     // gates/consumer/. Their wasm counterpart stays on -Dinstall-all=true.
     test_step.dependOn(check_template_step);
     test_step.dependOn(check_consumer_step);
-    // The standalone gates exist only where a standalone build does (see their definition).
-    if (standalone_gates) |gates| for (gates) |gate| test_step.dependOn(gate);
+    // The aggregate takes the representative samples and the editor; the full sweep (index 1)
+    // is on -Dinstall-all=true instead.
+    test_step.dependOn(standalone_gates[0]);
+    test_step.dependOn(standalone_gates[2]);
 
     // ========================================
     // Micro-benchmarks. Pure-logic measurement (no display / audio device; OS-independent).
@@ -3461,7 +3544,7 @@ const SharedModules = struct {
     /// `platform_backend`: value of `-Dplatform` (or the OS default). Stamped into
     /// `build_options.platform_backend` and used to attach `@cImport`-required system libs
     /// (X11/Wayland). Must match the backend the consumer executable links against.
-    fn init(b: *std.Build, is_wasm: bool, wasm_harness: bool, enable_gamepad: bool, max_modules: usize, max_modules_mod: *std.Build.Module, target: std.Build.ResolvedTarget, platform_backend: platform.PlatformType) SharedModules {
+    fn init(b: *std.Build, is_wasm: bool, wasm_harness: bool, enable_gamepad: bool, enable_menu: bool, max_modules: usize, max_modules_mod: *std.Build.Module, target: std.Build.ResolvedTarget, platform_backend: platform.PlatformType) SharedModules {
         // External public module. Available via dep.module("platform") and via kit.
         //
         // Its shape — libc, the platform.h include path, the backend's @cImport system libs
@@ -3494,7 +3577,7 @@ const SharedModules = struct {
         // module's build_options: a flag turned off here would delete the feature for them
         // with no way to get it back. Per-executable gating is for executables built in this
         // repository, which compile their own object file.
-        platform.addPlatformBuildOptions(b, platform_mod.mod, platform_backend, platform.PlatformFeatures.published(enable_gamepad));
+        platform.addPlatformBuildOptions(b, platform_mod.mod, platform_backend, platform.PlatformFeatures.published(enable_gamepad, enable_menu));
 
         // External public module. dep.module("png").
         const png: TaggedModule = .{ .layer = .lib, .name = "png", .mod = if (is_wasm)
@@ -4171,6 +4254,21 @@ fn addBuildStep(
 // cannot be resolved at static-lib build time (search paths also do not propagate to the consumer), so the
 // consumer exe applies them (C-style: vendor macos/swift build helpers onto the exe).
 // ============================================================
+/// Register an existing module under a package-visible name.
+///
+/// `b.addModule` builds a *new* module, so using it to publish something the graph already
+/// holds would create a second instance of the same source file. This registers the pointer
+/// itself, the way the wasm branch republishes its shared modules.
+fn publishModuleAlias(b: *std.Build, name: []const u8, module: *std.Build.Module) void {
+    if (b.modules.get(name)) |existing| {
+        if (existing != module) {
+            std.debug.panic("module '{s}' is already published as a different instance", .{name});
+        }
+        return;
+    }
+    _ = b.modules.put(b.graph.arena, b.dupe(name), module) catch @panic("OOM");
+}
+
 fn addPlatformNativeLib(
     b: *std.Build,
     target: std.Build.ResolvedTarget,
@@ -4179,6 +4277,7 @@ fn addPlatformNativeLib(
     platform_type: platform.PlatformType,
     name: []const u8,
     enable_gamepad: bool,
+    enable_menu: bool,
 ) *std.Build.Step.Compile {
     // Gamepad opt-in for the external-consumer native archive.
     // Same boolean as build_options.enable_gamepad on the SharedModules public "platform".
@@ -4187,7 +4286,7 @@ fn addPlatformNativeLib(
     // The same feature set as the published platform module (`PlatformFeatures.published`):
     // the archive is what an external consumer links, and a feature missing from it while the
     // module says it is on becomes an undefined symbol in the consumer's executable.
-    const compiled = platform.compilePlatformLayer(b, platform_type, optimize, platform_root, platform.PlatformFeatures.published(enable_gamepad));
+    const compiled = platform.compilePlatformLayer(b, platform_type, optimize, platform_root, platform.PlatformFeatures.published(enable_gamepad, enable_menu));
 
     const lib_mod = b.createModule(.{
         .root_source_file = b.path("core/platform_native_stub.zig"),

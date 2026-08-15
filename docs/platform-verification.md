@@ -177,15 +177,13 @@ a GTK application, so whether it appears depends on the session:
 
 Install zig 0.16 on the machine and build natively (`flake.nix` does not cover Windows).
 
-**A known limitation, unaddressed**: git on Windows does not materialise symbolic links
-by default (`core.symlinks=false`, developer mode off) and instead expands them as a
-**text file containing the link target**. So `examples/*/build_helpers` and
-`apps/editor/build_helpers` are broken on Windows, and **building a sample on its own
-(`cd examples/<NAME> && zig build`) fails there**. A `zig build` from the top of the
-repository works on Windows, because `build.zig` references real paths and never goes
-through a symlink. To build a sample standalone on Windows, either check out again with
-developer mode on and `core.symlinks=true` to restore real symlinks, or change
-`build.zig` to remove the symlink dependency of `build_helpers` (neither is done today).
+**Standalone builds work here.** A sample built on its own reaches the build helpers
+through the package (`@import("kngn").build_helpers`) rather than through a symbolic link,
+so the obstacle that used to make this impossible — git on Windows expanding a symlink into
+a text file containing its target — is gone, and the standalone gates run on a Windows host
+like any other. Measured on a Windows checkout: `examples/05_text_rendering`,
+`examples/26_appshell_demo` and `apps/editor` each build with `zig build` from their own
+directory. The editor asks the package for the native menu, which a non-macOS build ignores.
 
 ### Running the test suite
 

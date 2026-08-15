@@ -1,116 +1,52 @@
 const std = @import("std");
 
-// build_helpers/ is a symlink to ../../build_helpers.
-const platform = @import("build_helpers/platform.zig");
-
-const PROJECT_ROOT = "../..";
+// The build helpers come from the kngn package this sample depends on, the same way any
+// application outside this repository reaches them.
+const kngn_build = @import("kngn");
+const helpers = kngn_build.build_helpers.consumer;
+const macos = kngn_build.build_helpers.macos;
 
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
+    const backend = helpers.resolveBackend(b, target);
+    helpers.assertStandaloneNativeBackend(backend);
 
-    // kit wiring: same shape as examples/33_camera. Share the gamepad module between gfx and kit.gamepad.
-    const png = b.createModule(.{
-        .root_source_file = .{ .cwd_relative = PROJECT_ROOT ++ "/libs/png/src/lib.zig" },
+    // target / optimize / platform are propagated so the executable and the modules it links
+    // share one backend.
+    const dep = b.dependency("kngn", .{
+        .target = target,
+        .optimize = optimize,
+        .platform = backend,
+        .enable_gamepad = true,
     });
-    const pixelops = b.createModule(.{
-        .root_source_file = .{ .cwd_relative = PROJECT_ROOT ++ "/libs/pixelops/src/lib.zig" },
-    });
-    const platform_types = b.createModule(.{
-        .root_source_file = .{ .cwd_relative = PROJECT_ROOT ++ "/core/platform_types.zig" },
-    });
-    const command_types = b.createModule(.{
-        .root_source_file = .{ .cwd_relative = PROJECT_ROOT ++ "/core/command_types.zig" },
-    });
-    command_types.addImport("platform_types", platform_types);
 
-    const font = b.createModule(.{
-        .root_source_file = .{ .cwd_relative = PROJECT_ROOT ++ "/libs/font/src/lib.zig" },
+    const exe = b.addExecutable(.{
+        .name = "example_34_action_map",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("main.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
     });
-    font.addImport("png", png);
-    font.addImport("pixelops", pixelops);
-    const vector = b.createModule(.{
-        .root_source_file = .{ .cwd_relative = PROJECT_ROOT ++ "/libs/vector/src/lib.zig" },
-    });
-    font.addImport("vector", vector);
+    exe.root_module.addImport("kit", dep.module("kit"));
 
-    const gui = b.createModule(.{
-        .root_source_file = .{ .cwd_relative = PROJECT_ROOT ++ "/libs/gui/src/gui.zig" },
-    });
-    gui.addImport("font", font);
-    gui.addImport("pixelops", pixelops);
-    gui.addImport("vector", vector);
-    gui.addImport("command_types", command_types);
+    // Every sample may print the backend it was built for.
+    const opts = b.addOptions();
+    opts.addOption([]const u8, "platform_name", @tagName(backend));
+    exe.root_module.addOptions("build_options", opts);
 
-    const dsp = b.createModule(.{
-        .root_source_file = .{ .cwd_relative = PROJECT_ROOT ++ "/src/dsp/dsp.zig" },
-    });
-    const synth = b.createModule(.{
-        .root_source_file = .{ .cwd_relative = PROJECT_ROOT ++ "/libs/synth/src/synth.zig" },
-    });
-    synth.addImport("dsp", dsp);
-    const gmath = b.createModule(.{
-        .root_source_file = .{ .cwd_relative = PROJECT_ROOT ++ "/libs/gmath/src/lib.zig" },
-    });
-    const sound = b.createModule(.{
-        .root_source_file = .{ .cwd_relative = PROJECT_ROOT ++ "/libs/sound/src/sound.zig" },
-    });
-    sound.addImport("dsp", dsp);
-    sound.addImport("synth", synth);
+    const sdk_paths: ?macos.MacOSSDKPaths = if (target.result.os.tag == .macos)
+        macos.resolveMacOSSDKPaths(b, null, null)
+    else
+        null;
+    helpers.setupConsumerExe(b, exe, dep, backend, sdk_paths, .{ .enable_gamepad = true });
 
-    // Share one gamepad instance between gfx(action_map) and kit.
-    const gamepad_mod = b.createModule(.{
-        .root_source_file = .{ .cwd_relative = PROJECT_ROOT ++ "/src/gamepad.zig" },
-    });
-    gamepad_mod.addImport("platform_types", platform_types);
+    b.installArtifact(exe);
 
-    const gfx_keyboard = b.createModule(.{
-        .root_source_file = .{ .cwd_relative = PROJECT_ROOT ++ "/libs/gfx/src/keyboard.zig" },
-    });
-    gfx_keyboard.addImport("platform_types", platform_types);
-    const gfx_sprite = b.createModule(.{
-        .root_source_file = .{ .cwd_relative = PROJECT_ROOT ++ "/libs/gfx/src/sprite.zig" },
-    });
-    gfx_sprite.addImport("png", png);
-    gfx_sprite.addImport("pixelops", pixelops);
-    const gfx_ft = b.createModule(.{
-        .root_source_file = .{ .cwd_relative = PROJECT_ROOT ++ "/libs/gfx/src/fixed_timestep.zig" },
-    });
-    const gfx_fps = b.createModule(.{
-        .root_source_file = .{ .cwd_relative = PROJECT_ROOT ++ "/libs/gfx/src/fps_counter.zig" },
-    });
-    const gfx = b.createModule(.{
-        .root_source_file = .{ .cwd_relative = PROJECT_ROOT ++ "/libs/gfx/src/gfx.zig" },
-    });
-    gfx.addImport("sprite", gfx_sprite);
-    gfx.addImport("fixed_timestep", gfx_ft);
-    gfx.addImport("fps_counter", gfx_fps);
-    gfx.addImport("keyboard", gfx_keyboard);
-    gfx.addImport("gamepad", gamepad_mod);
-    gfx.addImport("platform_types", platform_types);
-    gfx.addImport("gmath", gmath); // TileMap collision (additive)
-
-    platform.buildStandalone(b, target, optimize, .{
-        .base_name = "example_34_action_map",
-        .main_source = b.path("main.zig"),
-        .platform_source = .{ .cwd_relative = PROJECT_ROOT ++ "/core/platform.zig" },
-        .platform_include = .{ .cwd_relative = PROJECT_ROOT ++ "/platform" },
-        .platform_root = b.path(PROJECT_ROOT ++ "/platform"),
-        .png_module = png,
-        .link_gamepad = true,
-        .kit_libs = .{
-            .platform_types = platform_types,
-            .command_types = command_types,
-            .gui = gui,
-            .png = png,
-            .font = font,
-            .dsp = dsp,
-            .synth = synth,
-            .gmath = gmath,
-            .gfx = gfx,
-            .sound = sound,
-            .pixelops = pixelops,
-            .gamepad = gamepad_mod,
-        },
-    });
+    const run_cmd = b.addRunArtifact(exe);
+    run_cmd.step.dependOn(b.getInstallStep());
+    if (b.args) |args| run_cmd.addArgs(args);
+    const run_step = b.step("run", "Run the action map sample");
+    run_step.dependOn(&run_cmd.step);
 }

@@ -210,12 +210,34 @@ replacing the widget path would change every existing UI frame.
   `kit.sound`, `kit.synth` and `kit.dsp` are pure DSP over buffers you already own, so they
   need neither flag.
 
-  The other fields of `PlatformFeatures` — file panels, cursor shapes, mascot windows,
+  Most other fields of `PlatformFeatures` — file panels, cursor shapes, mascot windows,
   fullscreen, text input — are **not** yours to choose. They decide what goes into the macOS
   backend object file, and you link a prebuilt archive with all of them already enabled, so
-  passing `false` turns nothing off. Only `enable_audio` and `enable_midi` mean anything from
-  outside this repository (see
+  passing `false` turns nothing off (see
   [ADR-013](adr/013_per-executable-capability-linking.md)).
+
+  Two exceptions have to be asked for **on the dependency as well**, because the archive is
+  built differently for them — the gamepad backend and the native menu's extra translation
+  unit. Ask on both sides or the executable fails to link with an undefined symbol:
+
+  ```zig
+  const dep = b.dependency("kngn", .{
+      .target = target,
+      .optimize = optimize,
+      .platform = backend,
+      .enable_gamepad = true,
+      .enable_menu = true,
+  });
+  helpers.setupConsumerExe(b, exe, dep, backend, sdk_paths, .{
+      .enable_gamepad = true,
+      .enable_menu = true,
+  });
+  ```
+
+  `kit` is the surface with a stability promise (ADR-020). The package also publishes the
+  individual modules by name — `dep.module("font")`, `dep.module("gmath")` and others,
+  aliases of the very instances `kit` holds rather than second copies. Reaching one is
+  supported; it carrying the same promise is not.
 
   [`gates/consumer/`](../gates/consumer/) builds exactly this wiring on every change, so the
   flags stay working; it is a gate, not a starting point.

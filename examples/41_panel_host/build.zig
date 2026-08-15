@@ -1,90 +1,52 @@
 const std = @import("std");
 
-// build_helpers/ is a symlink to ../../build_helpers.
-const platform = @import("build_helpers/platform.zig");
-
-const PROJECT_ROOT = "../..";
+// The build helpers come from the kngn package this sample depends on, the same way any
+// application outside this repository reaches them.
+const kngn_build = @import("kngn");
+const helpers = kngn_build.build_helpers.consumer;
+const macos = kngn_build.build_helpers.macos;
 
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
+    const backend = helpers.resolveBackend(b, target);
+    helpers.assertStandaloneNativeBackend(backend);
 
-    // gui and platform/harness share command_types.zig, so pass the same module instance via kit_libs
-    // (avoids dual modules triggering "file exists in modules").
-    const platform_types = b.createModule(.{
-        .root_source_file = .{ .cwd_relative = PROJECT_ROOT ++ "/core/platform_types.zig" },
+    // target / optimize / platform are propagated so the executable and the modules it links
+    // share one backend.
+    const dep = b.dependency("kngn", .{
+        .target = target,
+        .optimize = optimize,
+        .platform = backend,
     });
-    const command_types = b.createModule(.{
-        .root_source_file = .{ .cwd_relative = PROJECT_ROOT ++ "/core/command_types.zig" },
-    });
-    command_types.addImport("platform_types", platform_types);
 
-    const png = b.createModule(.{
-        .root_source_file = .{ .cwd_relative = PROJECT_ROOT ++ "/libs/png/src/lib.zig" },
+    const exe = b.addExecutable(.{
+        .name = "example_41_panel_host",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("main.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
     });
-    const pixelops = b.createModule(.{
-        .root_source_file = .{ .cwd_relative = PROJECT_ROOT ++ "/libs/pixelops/src/lib.zig" },
-    });
-    const font = b.createModule(.{
-        .root_source_file = .{ .cwd_relative = PROJECT_ROOT ++ "/libs/font/src/lib.zig" },
-    });
-    font.addImport("png", png);
-    font.addImport("pixelops", pixelops);
-    const vector = b.createModule(.{
-        .root_source_file = .{ .cwd_relative = PROJECT_ROOT ++ "/libs/vector/src/lib.zig" },
-    });
-    font.addImport("vector", vector);
+    exe.root_module.addImport("platform", dep.module("platform"));
+    exe.root_module.addImport("gui", dep.module("gui"));
 
-    const gui = b.createModule(.{
-        .root_source_file = .{ .cwd_relative = PROJECT_ROOT ++ "/libs/gui/src/gui.zig" },
-    });
-    gui.addImport("font", font);
-    gui.addImport("pixelops", pixelops);
-    gui.addImport("vector", vector);
-    gui.addImport("command_types", command_types);
+    // Every sample may print the backend it was built for.
+    const opts = b.addOptions();
+    opts.addOption([]const u8, "platform_name", @tagName(backend));
+    exe.root_module.addOptions("build_options", opts);
 
-    // kit_libs required fields (main does not use kit, but supply them for shared command_types)
-    const dsp = b.createModule(.{
-        .root_source_file = .{ .cwd_relative = PROJECT_ROOT ++ "/src/dsp/dsp.zig" },
-    });
-    const synth = b.createModule(.{
-        .root_source_file = .{ .cwd_relative = PROJECT_ROOT ++ "/libs/synth/src/synth.zig" },
-    });
-    synth.addImport("dsp", dsp);
-    const gmath = b.createModule(.{
-        .root_source_file = .{ .cwd_relative = PROJECT_ROOT ++ "/libs/gmath/src/lib.zig" },
-    });
-    const sound = b.createModule(.{
-        .root_source_file = .{ .cwd_relative = PROJECT_ROOT ++ "/libs/sound/src/sound.zig" },
-    });
-    sound.addImport("dsp", dsp);
-    sound.addImport("synth", synth);
-    const gfx = b.createModule(.{
-        .root_source_file = .{ .cwd_relative = PROJECT_ROOT ++ "/libs/gfx/src/gfx.zig" },
-    });
-    gfx.addImport("png", png);
-    gfx.addImport("pixelops", pixelops);
+    const sdk_paths: ?macos.MacOSSDKPaths = if (target.result.os.tag == .macos)
+        macos.resolveMacOSSDKPaths(b, null, null)
+    else
+        null;
+    helpers.setupConsumerExe(b, exe, dep, backend, sdk_paths, .{});
 
-    platform.buildStandalone(b, target, optimize, .{
-        .base_name = "example_41_panel_host",
-        .main_source = b.path("main.zig"),
-        .platform_source = .{ .cwd_relative = PROJECT_ROOT ++ "/core/platform.zig" },
-        .platform_include = .{ .cwd_relative = PROJECT_ROOT ++ "/platform" },
-        .platform_root = b.path(PROJECT_ROOT ++ "/platform"),
-        .png_module = png,
-        .extra = &.{.{ .name = "gui", .module = gui }},
-        .kit_libs = .{
-            .platform_types = platform_types,
-            .command_types = command_types,
-            .gui = gui,
-            .png = png,
-            .font = font,
-            .dsp = dsp,
-            .synth = synth,
-            .gmath = gmath,
-            .gfx = gfx,
-            .sound = sound,
-            .pixelops = pixelops,
-        },
-    });
+    b.installArtifact(exe);
+
+    const run_cmd = b.addRunArtifact(exe);
+    run_cmd.step.dependOn(b.getInstallStep());
+    if (b.args) |args| run_cmd.addArgs(args);
+    const run_step = b.step("run", "Run the panel host sample");
+    run_step.dependOn(&run_cmd.step);
 }

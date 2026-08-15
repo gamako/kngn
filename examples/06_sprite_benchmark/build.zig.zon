@@ -1,0 +1,18 @@
+.{
+    .name = .example_06_sprite_benchmark,
+    .version = "0.0.0",
+    .fingerprint = 0xbc6a5a10138196e6,
+    .minimum_zig_version = "0.16.0",
+    .dependencies = .{
+        // The kngn package root is two directories up. A copy of this sample placed next to a
+        // kngn checkout changes this path and nothing else.
+        .kngn = .{
+            .path = "../..",
+        },
+    },
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "main.zig",
+    },
+}

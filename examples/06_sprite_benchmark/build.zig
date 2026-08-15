@@ -1,42 +1,53 @@
 const std = @import("std");
 
-const platform = @import("build_helpers/platform.zig");
-
-const PROJECT_ROOT = "../..";
+// The build helpers come from the kngn package this sample depends on, the same way any
+// application outside this repository reaches them.
+const kngn_build = @import("kngn");
+const helpers = kngn_build.build_helpers.consumer;
+const macos = kngn_build.build_helpers.macos;
 
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
+    const backend = helpers.resolveBackend(b, target);
+    helpers.assertStandaloneNativeBackend(backend);
 
-    const png = b.createModule(.{
-        .root_source_file = .{ .cwd_relative = PROJECT_ROOT ++ "/libs/png/src/lib.zig" },
-    });
-
-    // Shared blend implementation for sprite/blend
-    const pixelops = b.createModule(.{
-        .root_source_file = .{ .cwd_relative = PROJECT_ROOT ++ "/libs/pixelops/src/lib.zig" },
-    });
-    const sprite = b.createModule(.{
-        .root_source_file = .{ .cwd_relative = PROJECT_ROOT ++ "/libs/gfx/src/sprite.zig" },
-    });
-    sprite.addImport("png", png);
-    sprite.addImport("pixelops", pixelops);
-    const fps_counter = b.createModule(.{
-        .root_source_file = .{ .cwd_relative = PROJECT_ROOT ++ "/libs/gfx/src/fps_counter.zig" },
+    // target / optimize / platform are propagated so the executable and the modules it links
+    // share one backend.
+    const dep = b.dependency("kngn", .{
+        .target = target,
+        .optimize = optimize,
+        .platform = backend,
     });
 
-    platform.buildStandalone(b, target, optimize, .{
-        .base_name = "example_06_sprite_benchmark",
-        .main_source = b.path("main.zig"),
-        .platform_source = .{ .cwd_relative = PROJECT_ROOT ++ "/core/platform.zig" },
-        .platform_include = .{ .cwd_relative = PROJECT_ROOT ++ "/platform" },
-        .platform_root = b.path(PROJECT_ROOT ++ "/platform"),
-        .keyboard_source = .{ .cwd_relative = PROJECT_ROOT ++ "/libs/gfx/src/keyboard.zig" },
-        // Share one png module between harness(platform→harness→png) and sprite (avoid duplicating it).
-        .png_module = png,
-        .extra = &.{
-            .{ .name = "sprite", .module = sprite },
-            .{ .name = "fps_counter", .module = fps_counter },
-        },
+    const exe = b.addExecutable(.{
+        .name = "example_06_sprite_benchmark",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("main.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
     });
+    exe.root_module.addImport("platform", dep.module("platform"));
+    exe.root_module.addImport("sprite", dep.module("sprite"));
+    exe.root_module.addImport("fps_counter", dep.module("fps_counter"));
+
+    // Every sample may print the backend it was built for.
+    const opts = b.addOptions();
+    opts.addOption([]const u8, "platform_name", @tagName(backend));
+    exe.root_module.addOptions("build_options", opts);
+
+    const sdk_paths: ?macos.MacOSSDKPaths = if (target.result.os.tag == .macos)
+        macos.resolveMacOSSDKPaths(b, null, null)
+    else
+        null;
+    helpers.setupConsumerExe(b, exe, dep, backend, sdk_paths, .{});
+
+    b.installArtifact(exe);
+
+    const run_cmd = b.addRunArtifact(exe);
+    run_cmd.step.dependOn(b.getInstallStep());
+    if (b.args) |args| run_cmd.addArgs(args);
+    const run_step = b.step("run", "Run the sprite benchmark");
+    run_step.dependOn(&run_cmd.step);
 }

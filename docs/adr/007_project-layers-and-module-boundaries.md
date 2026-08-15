@@ -233,8 +233,10 @@ shells alone**, which makes the judgement simple (R6, R8).
   semver's initial-development clause applies, and ADR-020 also states the
   maturity-gate conditions a flux lib must meet before promotion into `kit`.
 - The `build_helpers` symlink workaround for standalone example builds — including
-  the Windows limitation described in `AGENT.md` — is out of scope here. Moving to
-  `kit` opens a path to removing it later, but it is untouched now.
+  the Windows limitation described in `AGENT.md` — was out of scope here. **Since
+  resolved**: every sample and the editor build as packages depending on this one, so
+  they obtain `kit` the single way an outside application does and reach the build
+  helpers through `@import("kngn").build_helpers`. The symlinks are gone.
 - Splitting an app into its own repository (graduating under R8) can be done as a
   **non-event**, because the app depends on `kit` alone.
 

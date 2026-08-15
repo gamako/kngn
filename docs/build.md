@@ -104,12 +104,12 @@ An example also builds on its own:
 cd examples/01_timed_window && zig build run
 ```
 
-Each example directory holds a `build_helpers` symlink pointing at
-`../../build_helpers`, which works around Zig 0.16's restriction on `@import`
-outside the build root. Recreate it with
-`ln -sf ../../build_helpers build_helpers` if a clone breaks it. On Windows the
-symlink does not survive a checkout — see
-[platform-verification.md](platform-verification.md).
+Each example directory is its own package: a `build.zig.zon` naming this repository
+as a `.path` dependency, and a build script that asks it for the modules the sample
+imports and for the build helpers (`@import("kngn").build_helpers`). That is the same
+path an application outside this repository takes, so a sample is worth copying as a
+starting point. A standalone build targets a native backend; asking one for wasm stops
+with a message naming `zig build package-web`.
 
 ## Tests
 

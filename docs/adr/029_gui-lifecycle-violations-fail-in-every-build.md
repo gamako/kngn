@@ -59,8 +59,8 @@ builds `tests/gui-contract-guard/` — a program that breaks one contract on pur
 argument — and runs each case as its own process, in `ReleaseFast` and `ReleaseSmall`, asserting
 on the exit code and the message. The guard reports through an exit code from its own panic
 handler rather than through the default abort, because the signal an abort raises differs by
-platform while an exit code does not. This follows `tests/standalone-guard`, which asserts on a
-build that must fail.
+platform while an exit code does not. A gate that asserts on a failure needs the failure to be
+the same shape everywhere it runs.
 
 The gate is on `zig build test`, and the gui module is rebuilt at each guard optimisation mode
 rather than reused from the test build — the claim is about what `libs/gui` compiles to with

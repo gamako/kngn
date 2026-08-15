@@ -1,27 +1,52 @@
 const std = @import("std");
 
-// build_helpers/ is a symlink to ../../build_helpers.
-// Zig 0.16 `@import` cannot reach files outside the build root, so
-// the symlink exposes the shared helper inside the build root.
-const platform = @import("build_helpers/platform.zig");
-
-// Path to the parent project root (relative to this directory).
-const PROJECT_ROOT = "../..";
+// The build helpers come from the kngn package this sample depends on, the same way any
+// application outside this repository reaches them.
+const kngn_build = @import("kngn");
+const helpers = kngn_build.build_helpers.consumer;
+const macos = kngn_build.build_helpers.macos;
 
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
+    const backend = helpers.resolveBackend(b, target);
+    helpers.assertStandaloneNativeBackend(backend);
 
-    // Same OS-aware standalone build as the other examples (macOS: metal, Linux: x11/wayland, Windows: windows).
-    // audio backend covers macOS(AudioToolbox)/Linux(ALSA)/Windows(WASAPI) when link_audio=true.
-    // With link_audio=true, buildStandalone creates the audio facade module and wires the harness.
-    // platform_types / harness / png are also derived from platform_source and shared by buildStandalone.
-    platform.buildStandalone(b, target, optimize, .{
-        .base_name = "example_15_audio_tone",
-        .main_source = b.path("main.zig"),
-        .platform_source = .{ .cwd_relative = PROJECT_ROOT ++ "/core/platform.zig" },
-        .platform_include = .{ .cwd_relative = PROJECT_ROOT ++ "/platform" },
-        .platform_root = b.path(PROJECT_ROOT ++ "/platform"),
-        .link_audio = true,
+    // target / optimize / platform are propagated so the executable and the modules it links
+    // share one backend.
+    const dep = b.dependency("kngn", .{
+        .target = target,
+        .optimize = optimize,
+        .platform = backend,
     });
+
+    const exe = b.addExecutable(.{
+        .name = "example_15_audio_tone",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("main.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    exe.root_module.addImport("platform", dep.module("platform"));
+    exe.root_module.addImport("audio", dep.module("audio"));
+
+    // Every sample may print the backend it was built for.
+    const opts = b.addOptions();
+    opts.addOption([]const u8, "platform_name", @tagName(backend));
+    exe.root_module.addOptions("build_options", opts);
+
+    const sdk_paths: ?macos.MacOSSDKPaths = if (target.result.os.tag == .macos)
+        macos.resolveMacOSSDKPaths(b, null, null)
+    else
+        null;
+    helpers.setupConsumerExe(b, exe, dep, backend, sdk_paths, .{ .enable_audio = true });
+
+    b.installArtifact(exe);
+
+    const run_cmd = b.addRunArtifact(exe);
+    run_cmd.step.dependOn(b.getInstallStep());
+    if (b.args) |args| run_cmd.addArgs(args);
+    const run_step = b.step("run", "Run the audio tone sample");
+    run_step.dependOn(&run_cmd.step);
 }

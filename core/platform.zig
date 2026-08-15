@@ -47,7 +47,7 @@ const harness = @import("harness");
 const copilot = harness.copilot;
 const netsync = harness.netsync;
 // The opt-in flag for the real gamepad backend (the GameController framework), symmetrical with
-// audio's `link_audio`. build.zig's `createPlatformModule`/`buildStandalone` always supply this named
+// audio's `link_audio`. build.zig's `createPlatformModule` always supplies this named
 // import (the externally published module included), so every caller can reference it safely.
 const build_options = @import("build_options");
 

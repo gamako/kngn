@@ -6,9 +6,9 @@
 //! external project. It is the supported surface for `dep.module("kit")` apps:
 //! backend resolution and executable-side linking only.
 //!
-//! Internal-only helpers (`buildStandalone`, `createPlatformModule`,
-//! `compilePlatformLayer`, …) live in `platform.zig`, which re-exports this module
-//! so there is a single implementation of shared types and Wayland glue.
+//! Internal-only helpers (`createPlatformModule`, `compilePlatformLayer`, …) live in
+//! `platform.zig`, which re-exports this module so there is a single implementation of
+//! shared types and Wayland glue.
 //!
 //! All functions run at build-graph configuration time only (not per-frame / RT).
 
@@ -95,14 +95,17 @@ pub const PlatformFeatures = struct {
 
     /// Every feature enabled — what the published platform module and the published native
     /// archive are built with, so that an external consumer keeps the whole surface.
-    /// `enable_gamepad` stays a parameter because it also decides a framework link the
-    /// consumer's executable has to make, and it reaches the consumer as `-Denable_gamepad`.
-    pub fn published(enable_gamepad: bool) PlatformFeatures {
+    ///
+    /// Two flags stay parameters because each also decides something on the consumer's side
+    /// that a module cannot carry: `enable_gamepad` a framework link, `enable_menu` an extra
+    /// translation unit that has to be archived alongside the backend. Both reach the
+    /// consumer as package options (`-Denable_gamepad`, `-Denable_menu`) and **must be given
+    /// the same value here and at `addPlatformNativeLib`**: a module claiming a feature the
+    /// archive was built without fails to link with an undefined symbol.
+    pub fn published(enable_gamepad: bool, enable_menu: bool) PlatformFeatures {
         return .{
             .enable_gamepad = enable_gamepad,
-            // The menu needs its own translation unit archived alongside, which the published
-            // archive does not carry, so it stays off outside this repository.
-            .enable_menu = false,
+            .enable_menu = enable_menu,
             .enable_dialog = true,
             .enable_cursor = true,
             .enable_mascot = true,
@@ -111,6 +114,16 @@ pub const PlatformFeatures = struct {
         };
     }
 };
+
+/// Stop a build that asks a package consumer's build script to target wasm.
+///
+/// A consumer build script assembles a native executable: it links a prebuilt archive and
+/// system libraries, neither of which exists for wasm. The wasm artefacts are built by the
+/// kngn package itself, which owns the reactor root, the memory layout and the web package.
+pub fn assertStandaloneNativeBackend(backend: PlatformType) void {
+    if (backend != .wasm) return;
+    @panic("this build script targets a native backend; wasm artefacts come from the kngn package's own `zig build package-web`");
+}
 
 /// Link the system libraries `core/audio.zig` resolves against, for one module.
 ///

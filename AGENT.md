@@ -203,9 +203,7 @@ kngn/
 │   └── consumer/      # links kit.audio / kit.midi through setupConsumerExe (zig build check-consumer)
 ├── tests/             # tests that are not a `zig test` of one module
 │   ├── e2e/           # end-to-end scripts
-│   ├── gui_leak.zig   # PerIdStateStore state-leak measurement (zig build test-gui-leak)
-│   └── standalone-guard/ # a standalone build that breaks the shared-module contract on
-│                      #   purpose; the gate asserts it fails (zig build check-standalone-guard)
+│   └── gui_leak.zig   # PerIdStateStore state-leak measurement (zig build test-gui-leak)
 └── docs/              # documentation (see the index above)
 ```
 
@@ -272,14 +270,21 @@ cd examples/01_timed_window && zig build run
 cd examples/02_keyboard_input && zig build run   # and so on for each example directory
 ```
 
-Each example directory contains a `build_helpers` symlink (pointing at
-`../../build_helpers`). It works around Zig 0.16's restriction on `@import` outside the
-build root, so a standalone build can still reach the build helpers
-(`build_helpers/platform.zig` and friends). If the link breaks
-after a clone, recreate it with
-`cd examples/<NAME> && ln -sf ../../build_helpers build_helpers`. (On Windows the
-symlink does not survive a checkout — see
-[docs/platform-verification.md](docs/platform-verification.md).)
+Each example directory is its own package: a `build.zig.zon` names this repository as a
+`.path` dependency, and the build script asks it for what the sample imports
+(`dep.module("platform")`, `dep.module("kit")`, …) plus the build helpers
+(`@import("kngn").build_helpers`). **There is one way to obtain `kit`, and a sample takes
+the same one an application outside this repository takes** — which is what makes a sample
+worth copying as a starting point.
+
+`kit` is the surface with a stability promise (ADR-020). The package also publishes the
+individual modules the samples import by name; those are aliases of the very instances
+`kit` holds, never second copies, but being reachable is not a promise that they will not
+change. `text` and `paint` in particular are still in flux.
+
+A standalone build targets a native backend. Asking one for wasm stops with a message
+naming `zig build package-web`, which is the step that owns the reactor root, the memory
+layout and the web package.
 
 ## Implementation status
 
@@ -537,10 +542,10 @@ zig build check-template      # build template/ as an external package
 zig build check-vendor        # vendored build_helpers copies are byte-identical (check-template-vendor is an alias)
 zig build check-wasm-harness  # compile + export-check the wasm apps with -Dwasm-harness=true (nothing ships that configuration; joins -Dinstall-all=true)
 
-# The standalone gates (not registered on a Windows host: a checkout there expands the
-# build_helpers symlink, so no sample builds standalone — see docs/platform-verification.md)
-zig build check-example-standalone  # build one example on its own (the only path through buildStandalone's kit wiring)
-zig build check-standalone-guard    # a build that shares no pixelops module must fail during configuration
+# The standalone gates (every sample and the editor built as packages, on every host)
+zig build check-example-standalone   # representative samples built on their own (05 / 30 / 26)
+zig build check-examples-standalone  # every sample built on its own (joins -Dinstall-all=true)
+zig build check-editor-standalone    # apps/editor built on its own (the only build that opts into the native menu)
 
 # Individual tests (all included in the aggregate)
 zig build test-core             # libs/paint (undo, tools, Document and the .pix round trip) plus the editor's input state machine
