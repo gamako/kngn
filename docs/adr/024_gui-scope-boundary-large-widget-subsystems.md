@@ -1,8 +1,10 @@
 # ADR-024: GUI scope boundary — multiline text editing, list virtualization, and window docking
 
-- Status: Proposed. This record is a proposal awaiting sign-off, not yet an accepted
-  decision; nothing in `libs/gui` changes as a result of writing it.
+- Status: Proposed for §1 and §3. §2 (list virtualization) is accepted and
+  implemented. The record as a whole stays Proposed because docking and
+  multiline editing are still open.
 - Date: 2026-08-02
+- Updated: 2026-08-16
 - Category: GUI, immediate-mode widget API, scope
 
 ## Context and problem
@@ -114,84 +116,76 @@ observation sections in `docs/plans/PLAN_gui_capability_matrix.md` (for example 
 §16.2, §17), recording that an app had to build panel rearrangement by hand because
 `panel_host.zig` could not express it.
 
-### 2. List virtualization — not implemented, not ruled out
+### 2. List virtualization — implemented (narrow experiment)
 
-**Current state.** `examples/40_list_menu` — the reproduction shell built to exercise a
-scrolling list — builds and lays out all 500 rows every frame with
-`gui.beginListboxRow`/`endListboxRow` (each row also using `Context.labelEllipsis` and
-`Context.labelEx` for its cells). `Context.beginScrollArea`/`endScrollArea` clips and offsets
-the viewport; it does not skip building or measuring rows that fall outside it. There is no
-visible-range computation, no row-height cache, and no API for a caller to supply rows lazily
-from a data source larger than what is materialized per frame. (`examples/40_list_menu/ui.zig`'s
-`ROW_H` constant already fixes every row to the same height in this shell — a smaller,
-narrower experiment than general virtualization would be to compute the visible range from
-that fixed height and skip building rows outside it, without yet solving variable row
-height or a lazily-fetched data source. That narrower experiment is a candidate first step,
-not something this record has built or measured.)
+**Trigger.** An external `kit` consumer needed a gallery of several hundred composite
+thumbnails. The every-row-every-frame model forced that app into manual paging — a
+product-shape problem at the data size it already had, not a crossing of this ADR's
+≈4ms GUI-Context-frame bar. That is what opened the work. Variable row height and a
+lazily-fetched data source stay out of scope.
 
-**The measurement this decision rests on.** `zig build bench-gui-list-menu` (500-row
-list+menu shell, full `Context` frame — `beginFrame` through `endFrame` and render —
-ReleaseFast, 1024×768, warmup 100, 1000 iterations; measured on Apple M1 Max, zig 0.16.0,
-2026-08-02, across 3 runs): **avg 448–471µs, min 427–448µs, p95 459–524µs**. For comparison,
-the plainer `bench-gui-frame` benchmark measures avg ≈263µs at 500 bare `buttonId` rows and
-avg ≈416µs at 1000 bare `buttonId` rows, at the same scale and viewport. That second
-benchmark has no toolbar, menu bar, or filter row and a different per-row shape, so this ADR
-does not read the two totals as a validated per-row cost multiplier — only as two whole-shell
-figures that both land in the same order of magnitude. Both figures are recorded in
-`docs/plans/PLAN_gui_capability_matrix.md` §15.1 item 1. Against a 60fps frame's software-path
-budget (a 16.67ms period, documented in `docs/performance-measurement.md`), the list+menu
-shell's ≈0.45–0.47ms **GUI-Context-frame time** (not a whole application frame — see below)
-is under 3% of one such period. This record sets its own, narrower bar for "comfortably under
-budget" when re-checking this decision: staying under roughly a quarter of that period (≈4ms)
-for this GUI-Context-frame measurement alone, leaving headroom for the rest of an actual
-frame (clearing, blitting, presenting) that this benchmark does not include — a bar today's
-figures clear by a wide margin. This ≈4ms figure is this ADR's own re-check threshold, not a
-repository-wide performance rule. The benchmark itself is a headless, display-less
-microbenchmark of `beginFrame`→`endFrame`→`gui.render` only, not the shell's real per-frame
-cost: it excludes a backend's blit/present cost, so it is one of the two measurements
-`docs/performance-measurement.md` says a performance claim needs — a microbenchmark plus the
-application's real, on-screen frame rate — and only the first exists for this shell today.
+**What shipped.** `Context.beginVirtualList` / `endVirtualList` /
+`virtualScrollToRow` in `libs/gui/src/widgets.zig`: a thin helper on
+`beginScrollArea`, not a replacement. Fixed row height, in-memory source. The
+caller builds only the half-open `VirtualRange` (plus overscan). Content height is
+declared `.fixed = total_h`, so ScrollArea's declared-fixed → recorded extent →
+measured order uses the full list height even though only the visible rows are
+children. Horizontal scroll is off (`content_width = .grow`). Vertical padding is
+illegal (it would shift the first row and under-size the range); extra vertical
+space belongs on an outer box. The leading spacer is emitted only when
+`first > 0`. Rows themselves are the only supported focus target (the
+`beginListboxRow` roving tab stop); a focusable widget inside a virtual row is
+unsupported. `pollListNav` is unchanged: the caller applies nav, then
+`virtualScrollToRow`, then `beginVirtualList`, so the selected row is in the same
+frame's window. An unbuilt row is not touched in `PerIdStateStore` and may return
+at defaults after a capacity trim; focused / active / hot entries stay protected.
 
-**Why not now.** The measurement above says the every-row-every-frame approach is not a
-performance problem at the row counts measured (500, and 1000 in the plainer benchmark), and
-no shipped application in this family — settings form, list+menu, tracker grid, game
-inventory, all of them reproduction shells built to exercise `libs/gui` rather than end-user
-products — has an actual requirement for a list larger than 500 rows. (`bench-gui-frame`'s
-1000-row case and `examples/37_gui_torture`'s "volume" case, which can switch between 500 and
-1000 rows, are synthetic stress tests exercised for their own sake, not an application asking
-for more than 500 rows.) Building a virtualization contract ahead of a concrete consumer means
-guessing at the shape that consumer will actually need (fixed vs. variable row height,
-whether rows come from an in-memory array or a lazily-fetched source, how selection and
-keyboard nav track an index that is no longer 1:1 with "the row currently built") — guesses
-this document has no evidence to make well. This entry is deliberately not phrased as "we
-will never build this": of the three features in this ADR, this is the one closest to being
-needed.
+**Wheel timing.** Previous-frame geometry decides *who* is first: each
+`endScrollArea` records `{id, viewport rect, depth, end-order serial}` and
+`beginFrame` keeps that registry. The chain head is the deepest recorded area
+under the cursor; same-depth overlaps use reverse end-order so the order matches
+end-time LIFO. Only that head consumes wheel in `beginScrollArea`, from its
+*current* `scroll` and content size (the registry never stores a previous-frame
+max). Other areas that have a previous-frame viewport consume leftover wheel
+in `endScrollArea`. An area on its first frame has no previous-frame rect, so
+it is not a wheel target; it becomes one on the next frame. The cursor used
+for every wheel hit-test this frame is the one sealed with the chain (a later
+`mouse_move` does not retarget consumption). Scroll writes settle in this
+order: caller (`virtualScrollToRow` and similar) → thumb drag → chain-head
+wheel → clamp. This is the same class of previous-frame hit-test trade-off as
+ADR-016 / ADR-028.
 
-**What would be required when it is.** At minimum: a visible-range computation derived from
-scroll offset and a row height (fixed, or cached per row for variable-height content); an
-index mapping from scroll position to data index, so an app can supply rows from a source
-larger than what is ever materialized in one frame; and a `libs/gui`-facing contract change
-where `beginListboxRow` call sites for out-of-view rows are skipped entirely rather than
-built and clipped. That last part interacts with ADR-016's one-frame lag: a row's rect only
-enters `rect_cache` once it has been built at least once, so a row that scrolls into view for
-the first time is not yet hit-testable on the frame it appears — a real, and currently
-unresolved, consequence of combining virtualization with the existing hit-test timing
-contract.
+**ADR-016 interaction.** A row that is first built this frame is not in
+`rect_cache` and is not hit-testable until the next frame. Overscan hides that
+lag for ordinary wheel steps (those rows were already built). Overscan is not a
+resolution of the lag: a jump that lands past the overscan window still has a
+one-frame hit-test delay. Wheel-at-begin plus overscan is the contract; it does
+not claim the delay is gone.
 
-**Concrete signal to reconsider.** Any of:
+**Measurement.** `zig build bench-gui-list-menu` (full `Context` frame —
+`beginFrame` through `endFrame` and render — ReleaseFast, 1024×768, warmup 100,
+1000 iterations, headless, zig 0.16.0, Apple M1 Max, 2026-08-16). Four points, 500 /
+5000 rows × full / virtual. After warm-up every case had 0 GPA alloc calls.
+The ≈4ms bar below is this ADR's own re-check threshold, not a repository-wide
+performance rule.
 
-- An application in this repository has an actual requirement for a list past 500 rows. The
-  right trigger is re-running `bench-gui-list-menu` (or an equivalent bench for the new
-  shell) at the new row count and finding the measured GUI-Context-frame time is no longer
-  comfortably under the ≈4ms bar this ADR defined above — not a row count guessed in
-  advance; this document deliberately does not project today's 500-row figure out to an
-  untested N.
-- The application's real, on-screen frame rate (the second measurement
-  `docs/performance-measurement.md` calls for, which this record has not taken) shows the
-  existing 500-row shells are not comfortably inside budget once blit/present cost and a
-  slower backend are included — a best-effort software-blit backend (X11, GDI) or a Debug
-  build (measured elsewhere in this repository at roughly 3.6× a ReleaseFast build) are the
-  concrete cases to check before assuming the headless microbenchmark above still applies.
+| rows | mode | avg | min | p95 | arena peak | vs ≈4ms bar |
+|---|---|---|---|---|---|---|
+| 500 | full | 483µs | 475µs | 494µs | 1.12 MiB | under |
+| 500 | virtual | 229µs | 225µs | 234µs | 109 KiB | under |
+| 5000 | full | 3.32ms | 3.20ms | 3.56ms | 9.52 MiB | under (p95 ≈89% of the bar) |
+| 5000 | virtual | 227µs | 224µs | 234µs | 109 KiB | under |
+
+The 2026-08-02 500-row full-build figures (avg 448–471µs, Apple M1 Max, zig
+0.16.0) remain the pre-virtualization baseline. 5000-row full build stays
+under the ≈4ms bar on this host; virtualization's value at that size is the
+flat ~230µs and the 100× smaller arena, not a bar crossing. The bench is
+still a headless microbenchmark, not the shell's real on-screen frame; pair
+it with `docs/performance-measurement.md`'s present-path measurement when
+making a performance claim.
+
+**What is still out of scope.** Variable row height, lazily-fetched rows, and
+any contract where a virtual row contains its own focusable widgets.
 
 ### 3. Multiline text editing — likely wanted, not built yet
 
@@ -235,15 +229,15 @@ needed for real content).
 
 ## Consequences
 
-Nothing in `libs/gui` changes because of this record. It documents, for a reader of this
-repository who has no access to any private task tracker, why three toolkit-standard
-features are visibly absent from the widget-repertoire measurement's capability matrix, and
-gives each a re-opening condition stated in terms of an application need or a measurement,
-not a calendar date. The list-virtualization figures this ADR cites (§2) were re-measured
-on 2026-08-02 against the shell's current `beginListboxRow`-based implementation and are
-recorded, with method and conditions, in `docs/plans/PLAN_gui_capability_matrix.md` §15.1
-item 1; they are expected to be re-measured again, not re-derived by extrapolation, the next
-time list size becomes a live question.
+§2 is implemented as the narrow experiment described there. §1 (docking) and §3
+(multiline editing) are unchanged: they stay documented absences with explicit
+re-opening conditions. Callers that want a large fixed-row in-memory list use
+`beginVirtualList` and skip out-of-range `beginListboxRow` calls; the every-row
+`beginScrollArea` path remains for lists that are already cheap to build in
+full. Wheel consumption for the deepest ScrollArea under the cursor moves from
+`endScrollArea` to `beginScrollArea`; nested remainder propagation, the
+sealed-cursor hit-test, and a new area not being a wheel target on its first
+frame are part of that contract.
 
 ## Related
 

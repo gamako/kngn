@@ -1,0 +1,16 @@
+# Replay: virtual list smoke. Open the list, wheel, snapshot.
+# Drive with:
+#   KNGN_LIST_VIRTUAL=1 KNGN_HARNESS_SCRIPT=examples/40_list_menu/e2e_virtual.txt \
+#   KNGN_HARNESS_OUT=/tmp/kngn-virtual zig build run-example_40
+step 4
+digest state
+digest layout
+snapshot fb /tmp/kngn-virtual/virtual_idle.png
+inject mouse_move 200 300
+step 1
+inject scroll 0 -12
+step 2
+digest state
+digest layout
+snapshot fb /tmp/kngn-virtual/virtual_scrolled.png
+quit

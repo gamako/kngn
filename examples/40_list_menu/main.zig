@@ -1,12 +1,16 @@
 //! List + menu shell benchmark.
 //!
-//! Finder / GitHub Issues mini: toolbar / menuBar / 500-row scroll list /
+//! Finder / GitHub Issues mini: toolbar / menuBar / scroll list /
 //! single selection / context menu / multi-filter popup / keyboard nav.
 //! Row selection and Up/Down navigation are `gui.beginListboxRow`/`gui.pollListNav`; the
 //! multi-select filter popup, right-click context menu and ellipsis remain example-side.
 //!
+//! `KNGN_LIST_VIRTUAL=1` builds the list through `beginVirtualList`.
+//! `KNGN_LIST_ROWS` sets the in-memory row count (default 500).
+//!
 //! Hot path declaration:
-//! - Building / laying out / appending DrawList for 500 rows is per-frame O(N) (N=500).
+//! - Non-virtual: building / laying out / appending DrawList is per-frame O(N).
+//! - Virtual: range math is O(1); row build is O(visible rows + overscan).
 //! - No new all-pixel loop, full framebuffer copy, custom rasterizer, or RT path.
 //! - popup / keyboard / probe / env are event-only or init-only.
 
@@ -82,7 +86,13 @@ pub fn main(init: std.process.Init) !void {
     var ctx = gui.Context.init(gpa, gui.default_font);
     defer ctx.deinit();
 
-    const row_data = try ui.initRows(gpa);
+    const row_count = parseDim(envSlice("KNGN_LIST_ROWS"), ui.ROW_COUNT, "KNGN_LIST_ROWS");
+    const virtual = blk: {
+        const raw = envSlice("KNGN_LIST_VIRTUAL") orelse break :blk false;
+        break :blk std.mem.eql(u8, raw, "1") or std.mem.eql(u8, raw, "true");
+    };
+
+    const row_data = try ui.initRows(gpa, row_count);
     defer ui.deinitRows(gpa, row_data.rows, row_data.storage);
 
     var app: ui.App = .{
@@ -92,6 +102,7 @@ pub fn main(init: std.process.Init) !void {
         .screen_h = screen_h,
         .rows = row_data.rows,
         .row_storage = row_data.storage,
+        .virtual = virtual,
     };
     ui.recomputeVisible(&app);
 

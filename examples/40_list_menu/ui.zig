@@ -2,7 +2,8 @@
 //! Used by examples/40_list_menu/main.zig and bench/gui_list_menu.zig.
 //!
 //! Hot path declaration:
-//! - Building / laying out / appending DrawList for 500 rows is per-frame O(N) (N=500).
+//! - Non-virtual: building / laying out / appending DrawList is per-frame O(N).
+//! - Virtual: range math is O(1); row build is O(visible rows + overscan).
 //! - Includes per-row label text layout (ellipsized name plus kind/detail) on the frame arena.
 //! - No new all-pixel loop, full framebuffer copy, custom rasterizer, or RT path.
 //! - popup ops / keyboard nav / ellipsis calc are event-only / target-row only.
@@ -129,6 +130,8 @@ pub const App = struct {
 
     empty_state: bool = false,
     ellipsis_used: bool = false,
+    /// When true, the list is a fixed-row virtual list (`beginVirtualList`).
+    virtual: bool = false,
 
     context_open_request: bool = false,
     filter_open_request: bool = false,
@@ -161,17 +164,20 @@ pub const App = struct {
     // ellipsis scratch (per-row display name in frame arena; flag only here)
 };
 
-pub fn initRows(gpa: std.mem.Allocator) !struct { rows: []Row, storage: []u8 } {
+pub fn initRows(gpa: std.mem.Allocator, count: usize) !struct { rows: []Row, storage: []u8 } {
     var storage_list: std.ArrayList(u8) = .empty;
     errdefer storage_list.deinit(gpa);
-    const rows = try gpa.alloc(Row, ROW_COUNT);
+    const rows = try gpa.alloc(Row, count);
     errdefer gpa.free(rows);
 
-    var name_off: [ROW_COUNT]struct { start: usize, len: usize } = undefined;
-    var detail_off: [ROW_COUNT]struct { start: usize, len: usize } = undefined;
+    const Off = struct { start: usize, len: usize };
+    const name_off = try gpa.alloc(Off, count);
+    defer gpa.free(name_off);
+    const detail_off = try gpa.alloc(Off, count);
+    defer gpa.free(detail_off);
 
     var i: usize = 0;
-    while (i < ROW_COUNT) : (i += 1) {
+    while (i < count) : (i += 1) {
         const kind: RowKind = switch (i % 10) {
             0, 1, 2, 3, 4, 5 => .file,
             6, 7, 8 => .issue,
@@ -210,7 +216,7 @@ pub fn initRows(gpa: std.mem.Allocator) !struct { rows: []Row, storage: []u8 } {
 
     const storage = try storage_list.toOwnedSlice(gpa);
     i = 0;
-    while (i < ROW_COUNT) : (i += 1) {
+    while (i < count) : (i += 1) {
         rows[i].name = storage[name_off[i].start .. name_off[i].start + name_off[i].len];
         rows[i].detail = storage[detail_off[i].start .. detail_off[i].start + detail_off[i].len];
     }
@@ -497,14 +503,36 @@ pub fn buildUi(app: *App) void {
     // List
     // content_width=.grow is required: default .fit makes child width=.grow measure as 0, so
     // row-background rect width collapses and the highlight is invisible (text leaves draw overflow at fixed width).
-    ctx.beginScrollArea(Ids.list_scroll, &app.list_scroll, .{
+    // Virtual lists keep vertical padding at 0 (the helper's contract); horizontal pad stays.
+    const list_bg = gui.Color.rgba(0x20, 0x24, 0x2C, 0xFF);
+    const vopts: gui.VirtualListOpts = .{
+        .row_height = ROW_H,
+        .row_count = app.visible_count,
         .width = .{ .grow = 1 },
         .height = .{ .grow = 1 },
-        .padding = .{ 4, 4, 4, 4 },
+        .padding = .{ 0, 4, 0, 4 },
         .gap = 1,
-        .content_width = .{ .grow = 1 },
-        .bg = gui.Color.rgba(0x20, 0x24, 0x2C, 0xFF),
-    });
+        .bg = list_bg,
+    };
+    if (app.virtual and app.active_row >= 0) {
+        if (visibleIndexOf(app, @intCast(app.active_row))) |vi| {
+            gui.virtualScrollToRow(ctx, Ids.list_scroll, &app.list_scroll, vopts, vi);
+        }
+    }
+
+    const range: gui.VirtualRange = if (app.virtual) blk: {
+        break :blk ctx.beginVirtualList(Ids.list_scroll, &app.list_scroll, vopts);
+    } else blk: {
+        ctx.beginScrollArea(Ids.list_scroll, &app.list_scroll, .{
+            .width = .{ .grow = 1 },
+            .height = .{ .grow = 1 },
+            .padding = .{ 4, 4, 4, 4 },
+            .gap = 1,
+            .content_width = .{ .grow = 1 },
+            .bg = list_bg,
+        });
+        break :blk .{ .first = 0, .end = app.visible_count };
+    };
 
     if (app.visible_count == 0) {
         ctx.beginBox(.{
@@ -522,9 +550,16 @@ pub fn buildUi(app: *App) void {
         const idle_even = gui.Color.rgba(0x22, 0x26, 0x2E, 0xFF);
         const idle_odd = gui.Color.rgba(0x1C, 0x20, 0x28, 0xFF);
 
+        var vis_i: usize = 0;
         var i: usize = 0;
         while (i < app.rows.len) : (i += 1) {
             if (!isRowVisible(app, i)) continue;
+            if (vis_i < range.first) {
+                vis_i += 1;
+                continue;
+            }
+            if (vis_i >= range.end) break;
+            vis_i += 1;
             const row = app.rows[i];
             const idx: i32 = @intCast(i);
             // selectRow always moves selected_row and active_row together, so active_row alone
@@ -559,8 +594,22 @@ pub fn buildUi(app: *App) void {
             if (res.activated) selectRow(app, idx, .mouse);
         }
     }
-    ctx.endScrollArea();
+    if (app.virtual) {
+        ctx.endVirtualList();
+    } else {
+        ctx.endScrollArea();
+    }
     ctx.endBox();
+}
+
+fn visibleIndexOf(app: *const App, data_index: usize) ?usize {
+    if (!isRowVisible(app, data_index)) return null;
+    var vis: usize = 0;
+    var i: usize = 0;
+    while (i < data_index) : (i += 1) {
+        if (isRowVisible(app, i)) vis += 1;
+    }
+    return vis;
 }
 
 /// Recomputes the geometry a popup's `id` is actually drawn at, for probe/e2e coordinate
@@ -721,10 +770,11 @@ pub fn stateDigest(ctx_ptr: *anyopaque, buf: []u8) []const u8 {
         menu_s,
         app.context_row,
     });
-    appendFmt(buf, &off, " last_context_action={s} last_menu_command={s} ellipsis_used={d}", .{
+    appendFmt(buf, &off, " last_context_action={s} last_menu_command={s} ellipsis_used={d} virtual={d}", .{
         @tagName(app.last_context_action),
         @tagName(app.last_menu_command),
         @as(u32, if (app.ellipsis_used) 1 else 0),
+        @as(u32, if (app.virtual) 1 else 0),
     });
     appendFmt(buf, &off, " multi_select=0 drag_select=0 custom_keyboard=1", .{});
     return buf[0..off];

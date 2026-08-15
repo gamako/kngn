@@ -134,7 +134,16 @@ pub const TextOptions = struct {
 
 /// Internal state carried across a scroll area's begin→end. begin computes from the previous-frame cache,
 /// pushes onto scroll_stack; end pops and builds the scrollbar.
-/// Wheel is not applied in begin; it is consumed/propagated in end (LIFO = innermost first).
+///
+/// Wheel consumption: previous-frame geometry decides *who* is first (the chain head =
+/// deepest area under the cursor, ties at the same depth broken by reverse end-order).
+/// Only that head consumes wheel in `beginScrollArea`. Other areas that have a
+/// previous-frame viewport consume leftover wheel in `endScrollArea` (innermost
+/// first, so inner-edge remainder still propagates outward). An area with no
+/// previous-frame rect (its first frame) is not a wheel target; it becomes one
+/// on the next frame. Amounts are always computed from the area's current
+/// `scroll` and content size; the registry never stores a previous-frame max.
+/// Hit-testing uses the cursor sealed with the chain, not a later `mouse_pos`.
 pub const ScrollState = struct {
     bar_thickness: i32,
     track_col: Color,
@@ -149,6 +158,9 @@ pub const ScrollState = struct {
     h_len: i32,
     vthumb_id: Id,
     hthumb_id: Id,
+    /// Viewport widget id (`beginScrollArea`'s `id`). Used to record the area and
+    /// to match the wheel-chain head.
+    viewport_id: Id = 0,
     /// Caller-owned scroll amount (wheel target)
     scroll: *Vec2f = undefined,
     /// Previous-frame viewport rect (for hit-testing; null if unsettled)
@@ -161,6 +173,44 @@ pub const ScrollState = struct {
     /// This frame's viewport layout node (scroll_x/y applied after wheel)
     viewport_node: ?*layout.Node = null,
 };
+
+/// Previous-frame ScrollArea entry used only to decide wheel order (never amount).
+/// `rect` is the viewport settled at the previous `endFrame`. `serial` is the
+/// previous frame's `endScrollArea` arrival index (0 = first to end).
+pub const ScrollAreaRecord = struct {
+    id: Id,
+    rect: Rect = .{ .x = 0, .y = 0, .w = 0, .h = 0 },
+    depth: u16 = 0,
+    serial: u16 = 0,
+};
+
+/// Pick the wheel-chain head from previous-frame geometry: deepest record whose
+/// viewport contains `mouse`, ties at the same depth broken by reverse end-order
+/// (later `endScrollArea` wins). An empty / zero-size rect never matches.
+///
+/// This is the same scan order as end-time LIFO for nested areas, made unique
+/// for same-depth overlapping siblings. Amounts are not decided here.
+pub fn pickWheelChainHead(records: []const ScrollAreaRecord, mouse: Vec2) Id {
+    var best_id: Id = 0;
+    var best_depth: i32 = -1;
+    var best_serial: i32 = -1;
+    for (records) |rec| {
+        if (rec.rect.w == 0 or rec.rect.h == 0) continue;
+        const rw: i32 = @intCast(rec.rect.w);
+        const rh: i32 = @intCast(rec.rect.h);
+        const inside = mouse.x >= rec.rect.x and mouse.x < rec.rect.x + rw and
+            mouse.y >= rec.rect.y and mouse.y < rec.rect.y + rh;
+        if (!inside) continue;
+        const deeper = @as(i32, rec.depth) > best_depth;
+        const later = rec.depth == best_depth and @as(i32, rec.serial) > best_serial;
+        if (deeper or later) {
+            best_id = rec.id;
+            best_depth = rec.depth;
+            best_serial = rec.serial;
+        }
+    }
+    return best_id;
+}
 
 /// One row's two fixed-width cells, held so `endSliderGroup` can widen them once the group's
 /// widest label and widest value are known. Allocated on the frame arena and linked in build order.
@@ -214,10 +264,21 @@ pub const Context = struct {
     focus_move: enum { none, next, prev } = .none,
     /// Scroll-area begin→end state stack (supports nesting). Not on the arena (push/pop within the frame).
     scroll_stack: std.ArrayList(ScrollState) = .empty,
-    /// Unconsumed wheel delta for the frame (seeded from input.scroll_delta at the first endScrollArea).
+    /// Unconsumed wheel delta for the frame (seeded from input.scroll_delta at the first wheel apply).
     /// Each ScrollArea consumes only what it could move; remainder at an edge propagates outward.
     wheel_remaining: Vec2f = .{},
     wheel_remaining_seeded: bool = false,
+    /// Previous-frame ScrollArea geometry (order only). Swapped with `scroll_areas_cur` in beginFrame.
+    scroll_areas_prev: std.ArrayList(ScrollAreaRecord) = .empty,
+    /// This frame's ScrollArea records, written in `endScrollArea` and given settled rects in endFrame.
+    scroll_areas_cur: std.ArrayList(ScrollAreaRecord) = .empty,
+    /// Whether `ensureWheelChain` has sealed this frame's chain head.
+    wheel_chain_ready: bool = false,
+    /// Viewport id of the chain head (0 = none). Only this area consumes wheel in begin.
+    wheel_chain_head: Id = 0,
+    /// Cursor used for every wheel hit-test this frame. Sealed with the chain
+    /// so a later `pushEvent(mouse_move)` cannot retarget consumption.
+    wheel_chain_mouse: Vec2 = .{ .x = 0, .y = 0 },
     /// Shared widget style. Caller may rewrite directly (no push/pop).
     style: Style,
     /// Popup / context-menu open state. The classic mechanism (openPopup/closePopup/popupMenu)
@@ -324,6 +385,10 @@ pub const Context = struct {
     // Vertical/horizontal scroll region
     pub const beginScrollArea = widgets.beginScrollArea;
     pub const endScrollArea = widgets.endScrollArea;
+    // Fixed-row virtual list (thin helper on ScrollArea)
+    pub const beginVirtualList = widgets.beginVirtualList;
+    pub const endVirtualList = widgets.endVirtualList;
+    pub const virtualScrollToRow = widgets.virtualScrollToRow;
     // Popup / context menu. Implementation and contract: see popup.zig.
     pub const openPopup = popup_mod.openPopup;
     pub const closePopup = popup_mod.closePopup;
@@ -365,6 +430,8 @@ pub const Context = struct {
         self.per_id_state.deinit(self.gpa);
         self.focus_order.deinit(self.gpa);
         self.scroll_stack.deinit(self.gpa);
+        self.scroll_areas_prev.deinit(self.gpa);
+        self.scroll_areas_cur.deinit(self.gpa);
         self.draw_list.deinit();
         self.id_stack.deinit();
         self.input.deinit();
@@ -412,6 +479,15 @@ pub const Context = struct {
         self.focus_move = .none;
         self.wheel_remaining = .{};
         self.wheel_remaining_seeded = false;
+        {
+            const tmp = self.scroll_areas_prev;
+            self.scroll_areas_prev = self.scroll_areas_cur;
+            self.scroll_areas_cur = tmp;
+            self.scroll_areas_cur.clearRetainingCapacity();
+        }
+        self.wheel_chain_ready = false;
+        self.wheel_chain_head = 0;
+        self.wheel_chain_mouse = .{ .x = 0, .y = 0 };
         // tooltip frame-local (continuous-hover id/start/rect persist across frames)
         self.tooltip_last_id = 0;
         self.tooltip_last_rect = .{ .x = 0, .y = 0, .w = 0, .h = 0 };
@@ -485,6 +561,11 @@ pub const Context = struct {
             self.rect_cache.clearRetainingCapacity();
             self.updateRectCache(root, screen_rect);
             self.emitNode(root);
+        }
+        // Seal this frame's viewport rects so the next frame's wheel chain reads
+        // previous-frame geometry (same 1-frame lag as hit-test).
+        for (self.scroll_areas_cur.items) |*rec| {
+            if (self.rect_cache.get(rec.id)) |c| rec.rect = c.rect;
         }
         // tooltip overlay: after layout UI, before frame_active=false (below popupMenu; popup runs after endFrame).
         if (self.tooltip_candidate_text) |tip| {
@@ -893,6 +974,24 @@ pub const Context = struct {
     pub fn getNodeCachedRect(self: *const Context, id: Id) ?CachedRect {
         if (id == 0) return null;
         return self.rect_cache.get(id);
+    }
+
+    /// Seal this frame's wheel chain from previous-frame geometry and the cursor
+    /// known at the first `beginScrollArea`. The sealed cursor is stored in
+    /// `wheel_chain_mouse` and is the only point `applyScrollAreaWheel` uses, so
+    /// a later `pushEvent(mouse_move)` does not reshuffle the chain or retarget
+    /// leftover consumption. Callers that push the wheel after `beginFrame`
+    /// (the usual loop) are seen here because events apply immediately once the
+    /// frame is open.
+    ///
+    /// An area that was not in the previous-frame registry has no viewport rect
+    /// yet, so it is not a wheel target this frame. It becomes one on the next
+    /// frame, once `endFrame` has recorded its rect.
+    pub fn ensureWheelChain(self: *Context) void {
+        if (self.wheel_chain_ready) return;
+        self.wheel_chain_ready = true;
+        self.wheel_chain_mouse = self.input.mouse_pos;
+        self.wheel_chain_head = pickWheelChainHead(self.scroll_areas_prev.items, self.wheel_chain_mouse);
     }
 
     /// Previous-frame measured size of an explicit-ID node (natural size from layout.measure).

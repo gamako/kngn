@@ -1920,7 +1920,11 @@ fn scrollThumbColor(ctx: *Context, st: context_mod.ScrollState, thumb_id: Id) Co
 
 /// Begin a 2-axis scroll region. `id` is the viewport’s explicit ID (`getNodeRect(id)` = viewport rect).
 /// `scroll` is caller-owned f32 scroll (x/y). Push content widgets after begin; close with `endScrollArea`.
-/// Wheel is not applied in begin; `endScrollArea` consumes it LIFO (innermost first) with end-reach propagation.
+///
+/// Scroll is settled in this order, then used for this frame's content / virtual range:
+/// (1) caller writes (`virtualScrollToRow` and similar, before begin) → (2) thumb drag →
+/// (3) wheel, only if this area is the chain head → (4) clamp. Areas that are not the
+/// chain head leave leftover wheel for `endScrollArea`.
 pub fn beginScrollArea(ctx: *Context, id: Id, scroll: *Vec2f, opts: ScrollAreaOpts) void {
     const content_id = id_mod.hashInt(id, 1);
     const vthumb_id = id_mod.hashInt(id, 2);
@@ -1938,6 +1942,8 @@ pub fn beginScrollArea(ctx: *Context, id: Id, scroll: *Vec2f, opts: ScrollAreaOp
     const max_y: i32 = @max(0, content_h - vp_h);
     const need_v = max_y > 0;
     const need_h = max_x > 0;
+
+    ctx.ensureWheelChain();
 
     // Thumb drag (`buttonBehavior` on previous-frame thumb rect; map held `Input.dragDelta` into scroll)
     if (need_v) {
@@ -1961,7 +1967,8 @@ pub fn beginScrollArea(ctx: *Context, id: Id, scroll: *Vec2f, opts: ScrollAreaOp
         }
     }
 
-    // Clamp as f32 (wheel is applied later in end; here only thumb results)
+    // Clamp thumb (and any caller write) before wheel so the chain head applies
+    // wheel on top of the already-settled thumb position.
     scroll.x = std.math.clamp(scroll.x, 0, @as(f32, @floatFromInt(max_x)));
     scroll.y = std.math.clamp(scroll.y, 0, @as(f32, @floatFromInt(max_y)));
 
@@ -1980,6 +1987,7 @@ pub fn beginScrollArea(ctx: *Context, id: Id, scroll: *Vec2f, opts: ScrollAreaOp
         .h_len = 0,
         .vthumb_id = vthumb_id,
         .hthumb_id = hthumb_id,
+        .viewport_id = id,
         .scroll = scroll,
         .viewport_rect = vp,
         .max_x = max_x,
@@ -2005,6 +2013,14 @@ pub fn beginScrollArea(ctx: *Context, id: Id, scroll: *Vec2f, opts: ScrollAreaOp
             0;
     }
 
+    // Chain head only: consume wheel now so a virtual list can read the settled
+    // scroll.y before it builds rows. Non-head areas leave the remainder for end.
+    if (ctx.wheel_chain_head == id) {
+        applyScrollAreaWheel(ctx, &st);
+        scroll.x = std.math.clamp(scroll.x, 0, @as(f32, @floatFromInt(max_x)));
+        scroll.y = std.math.clamp(scroll.y, 0, @as(f32, @floatFromInt(max_y)));
+    }
+
     const sx: i32 = @intFromFloat(@round(scroll.x));
     const sy: i32 = @intFromFloat(@round(scroll.y));
 
@@ -2019,7 +2035,10 @@ pub fn beginScrollArea(ctx: *Context, id: Id, scroll: *Vec2f, opts: ScrollAreaOp
 
 /// Apply unconsumed wheel to scroll; consume only the delta that actually moved.
 /// Remainder that could not move at an edge stays in `ctx.wheel_remaining` for outer ScrollAreas.
+/// Hit-test uses the cursor sealed with the wheel chain, not a later `mouse_pos`.
+/// A missing previous-frame viewport (first frame of this id) is not a wheel target.
 fn applyScrollAreaWheel(ctx: *Context, st: *context_mod.ScrollState) void {
+    ctx.ensureWheelChain();
     if (!ctx.wheel_remaining_seeded) {
         ctx.wheel_remaining = ctx.input.scroll_delta;
         ctx.wheel_remaining_seeded = true;
@@ -2028,7 +2047,7 @@ fn applyScrollAreaWheel(ctx: *Context, st: *context_mod.ScrollState) void {
     if (rem.x == 0 and rem.y == 0) return;
 
     const r = st.viewport_rect orelse return;
-    const mp = ctx.input.mouse_pos;
+    const mp = ctx.wheel_chain_mouse;
     const inside = mp.x >= r.x and mp.x < r.x + @as(i32, @intCast(r.w)) and
         mp.y >= r.y and mp.y < r.y + @as(i32, @intCast(r.h));
     if (!inside) return;
@@ -2067,11 +2086,20 @@ fn applyScrollAreaWheel(ctx: *Context, st: *context_mod.ScrollState) void {
 }
 
 /// Close the scroll area and build scrollbars (pairs with begin).
-/// Right after closing content, process wheel innermost-first and reflect into viewport scroll same-frame.
+/// Non-head areas (and leftover after the head) consume wheel here, innermost first.
+/// Records this area's id / depth / end-order so the next frame can build the chain.
 pub fn endScrollArea(ctx: *Context) void {
     var st = ctx.scroll_stack.pop() orelse @panic("endScrollArea: mismatched begin");
     ctx.endBox(); // inner content
     applyScrollAreaWheel(ctx, &st);
+    const serial: u16 = std.math.cast(u16, ctx.scroll_areas_cur.items.len) orelse std.math.maxInt(u16);
+    const depth: u16 = std.math.cast(u16, ctx.scroll_stack.items.len) orelse std.math.maxInt(u16);
+    ctx.scroll_areas_cur.append(ctx.gpa, .{
+        .id = st.viewport_id,
+        .rect = st.viewport_rect orelse .{ .x = 0, .y = 0, .w = 0, .h = 0 },
+        .depth = depth,
+        .serial = serial,
+    }) catch @panic("endScrollArea: OOM");
     ctx.endBox(); // viewport
 
     // Horizontal scrollbar (inside leftCol, below viewport)
@@ -2099,6 +2127,242 @@ pub fn endScrollArea(ctx: *Context) void {
         ctx.endBox(); // vbar
     }
     ctx.endBox(); // outer
+}
+
+// ============================================================
+// Virtual list (fixed row height on a ScrollArea)
+// ============================================================
+// Hot path declaration: range math is O(1) per frame on the GUI build path.
+// Row widgets are built only for the visible window (plus overscan). Not a
+// per-pixel loop and not on the real-time audio path. After warm-up there is
+// no GPA allocation on this helper (frame-arena Nodes scale with the window).
+//
+// Narrow contract: fixed row height, in-memory source, no lazy fetch. The
+// helper wraps `beginScrollArea` / `endScrollArea`; it does not replace them.
+//
+// Content height is declared `.fixed = total_h`, so ScrollArea's
+// declared-fixed → extent → measured order uses the full list height even
+// though only the visible rows are children (their recorded extent is smaller).
+// Horizontal scroll is off (`content_width = .grow`); row boxes should also
+// use `.grow = 1` on width.
+//
+// Vertical padding must be 0. Layout's `.fixed` content height does not add
+// padding, so a vertical pad would shift the first row and under-size the
+// scroll range. Horizontal padding is allowed. Extra vertical space belongs
+// on an outer box.
+//
+// Rows themselves are the only supported focus target (`beginListboxRow`'s
+// roving tab stop). A focusable widget inside a virtual row is unsupported:
+// skipping unbuilt rows would change Tab order.
+//
+// A row that is not built this frame is not touched in `PerIdStateStore`.
+// After a capacity trim it may come back at defaults. `focused` / `active` /
+// `hot` entries stay protected even while the row is off-screen.
+//
+// Call order for keyboard nav: `pollListNav` → apply the selection →
+// `virtualScrollToRow` → `beginVirtualList`. The selected row is then inside
+// the same-frame window, so highlight and `focus_order` match.
+//
+// `beginVirtualList` reads scroll only after `beginScrollArea` has applied
+// thumb drag, the chain-head wheel share, and clamp.
+
+pub const VirtualListOpts = struct {
+    row_height: i32,
+    row_count: usize,
+    width: layout.Sizing = .{ .grow = 1 },
+    height: layout.Sizing = .{ .grow = 1 },
+    /// top, right, bottom, left. Top and bottom must be 0 (debug-asserted).
+    padding: [4]i32 = .{ 0, 0, 0, 0 },
+    /// Gap between rows (also the content box gap). Must be >= 0.
+    gap: i32 = 0,
+    align_cross: layout.Align = .start,
+    bg: ?Color = null,
+    border: ?layout.Border = null,
+    wheel_px: f32 = 32.0,
+    bar_thickness: i32 = 8,
+    /// Extra rows built on each side of the visible window.
+    overscan: u16 = 2,
+};
+
+/// Half-open visible (plus overscan) index window. The caller builds only
+/// `first .. end`.
+pub const VirtualRange = struct {
+    first: usize = 0,
+    end: usize = 0,
+
+    pub fn len(self: VirtualRange) usize {
+        return self.end - self.first;
+    }
+};
+
+/// First-frame viewport-height fallback when the previous-frame rect is
+/// missing and `opts.height` is not `.fixed`. The frame's logical screen
+/// height is the parent window's upper bound, so the first frame builds
+/// enough rows to fill the window. Over-build on this frame is accepted.
+pub fn virtualListFallbackViewportHeight(screen_h: u32) i32 {
+    return @intCast(screen_h);
+}
+
+pub fn virtualListPitch(opts: VirtualListOpts) i32 {
+    std.debug.assert(opts.row_height > 0);
+    std.debug.assert(opts.gap >= 0);
+    const pitch_i64 = @as(i64, opts.row_height) + @as(i64, opts.gap);
+    std.debug.assert(pitch_i64 > 0 and pitch_i64 <= std.math.maxInt(i32));
+    return @intCast(pitch_i64);
+}
+
+/// Full content height. `row_count == 0` is 0 (avoids `(n-1)` underflow).
+/// `row_count` is bounded first so the i64 cast and the multiply cannot wrap
+/// before the i32-range check.
+pub fn virtualListTotalHeight(opts: VirtualListOpts) i32 {
+    const pitch = virtualListPitch(opts);
+    if (opts.row_count == 0) return 0;
+    const g: i64 = opts.gap;
+    const pitch_i: i64 = pitch;
+    // total = n * pitch - gap for n >= 1. Cap n so that product fits i32.
+    const max_n: usize = @intCast(@divFloor(@as(i64, std.math.maxInt(i32)) + g, pitch_i));
+    std.debug.assert(opts.row_count <= max_n);
+    const n: i64 = @intCast(opts.row_count);
+    const total = n * pitch_i - g;
+    std.debug.assert(total >= 0 and total <= std.math.maxInt(i32));
+    return @intCast(total);
+}
+
+/// Leading spacer height when `first > 0`: `first * pitch - gap` so the
+/// content-box gap after the spacer lands the first built row at `first * pitch`.
+/// `first == 0` is 0 (no spacer; a standing spacer would insert an extra gap
+/// before row 0). `first` is bounded before the multiply.
+pub fn virtualListSpacerHeight(first: usize, pitch: i32, gap: i32) i32 {
+    if (first == 0) return 0;
+    std.debug.assert(pitch > 0);
+    std.debug.assert(gap >= 0);
+    const g: i64 = gap;
+    const pitch_i: i64 = pitch;
+    const max_first: usize = @intCast(@divFloor(@as(i64, std.math.maxInt(i32)) + g, pitch_i));
+    std.debug.assert(first <= max_first);
+    const h: i64 = @as(i64, @intCast(first)) * pitch_i - g;
+    std.debug.assert(h >= 0 and h <= std.math.maxInt(i32));
+    return @intCast(h);
+}
+
+/// Saturating conversion of a row-index float. `+inf` (and values at or above
+/// `maxInt(u32)`) saturate to `maxInt(usize)` so a huge / infinite window
+/// reaches the end of the list. NaN, `-inf`, and non-positive values become 0.
+fn f32IndexSat(v: f32) usize {
+    if (std.math.isNan(v) or v <= 0) return 0;
+    if (!std.math.isFinite(v)) return std.math.maxInt(usize);
+    const limit: f32 = @floatFromInt(std.math.maxInt(u32));
+    if (v >= limit) return std.math.maxInt(usize);
+    return @intFromFloat(v);
+}
+
+/// Visible window plus overscan. `scroll_y` is the caller-owned f32 (layout
+/// uses `round(scroll_y)` as i32; the two can differ by < 0.5 px). Underflow
+/// of `first - overscan` saturates at 0; `end + overscan` saturates at usize max
+/// then clamps to `row_count`.
+pub fn virtualListVisibleRange(scroll_y: f32, vp_h: i32, row_count: usize, pitch: i32, overscan: u16) VirtualRange {
+    if (row_count == 0) return .{ .first = 0, .end = 0 };
+    std.debug.assert(pitch > 0);
+    const pitch_f: f32 = @floatFromInt(pitch);
+    const vp_f: f32 = @floatFromInt(@max(vp_h, 0));
+    const first_raw = f32IndexSat(@floor(scroll_y / pitch_f));
+    const first = first_raw -| @as(usize, overscan);
+    const last_raw = f32IndexSat(@ceil((scroll_y + vp_f) / pitch_f));
+    const end_raw = last_raw +| @as(usize, overscan);
+    const end = @min(row_count, end_raw);
+    return .{ .first = @min(first, end), .end = end };
+}
+
+fn virtualListViewportHeight(ctx: *const Context, id: Id, opts: VirtualListOpts) i32 {
+    if (ctx.getNodeRect(id)) |r| return @intCast(r.h);
+    return switch (opts.height) {
+        .fixed => |h| h,
+        else => virtualListFallbackViewportHeight(ctx.screen_h),
+    };
+}
+
+fn assertVirtualListOpts(opts: VirtualListOpts) void {
+    _ = virtualListPitch(opts);
+    _ = virtualListTotalHeight(opts);
+    std.debug.assert(opts.padding[0] == 0 and opts.padding[2] == 0);
+}
+
+/// Open a fixed-row virtual list. Builds the ScrollArea (content height =
+/// full `total_h`, width grow) and an optional leading spacer, then returns
+/// the half-open index window the caller should materialize.
+///
+/// Close with `endVirtualList`. `row_count == 0` still opens the area and
+/// returns `{0, 0}`.
+pub fn beginVirtualList(ctx: *Context, id: Id, scroll: *Vec2f, opts: VirtualListOpts) VirtualRange {
+    assertVirtualListOpts(opts);
+    const total_h = virtualListTotalHeight(opts);
+    const pitch = if (opts.row_count == 0) opts.row_height else virtualListPitch(opts);
+    beginScrollArea(ctx, id, scroll, .{
+        .width = opts.width,
+        .height = opts.height,
+        .direction = .column,
+        .padding = opts.padding,
+        .gap = opts.gap,
+        .align_cross = opts.align_cross,
+        .content_width = .{ .grow = 1 },
+        .content_height = .{ .fixed = total_h },
+        .bg = opts.bg,
+        .border = opts.border,
+        .wheel_px = opts.wheel_px,
+        .bar_thickness = opts.bar_thickness,
+    });
+    if (opts.row_count == 0) return .{ .first = 0, .end = 0 };
+
+    const vp_h = virtualListViewportHeight(ctx, id, opts);
+    const range = virtualListVisibleRange(scroll.y, vp_h, opts.row_count, pitch, opts.overscan);
+    if (range.first > 0) {
+        const spacer_h = virtualListSpacerHeight(range.first, pitch, opts.gap);
+        ctx.beginBox(.{ .width = .{ .grow = 1 }, .height = .{ .fixed = spacer_h } });
+        ctx.endBox();
+    }
+    return range;
+}
+
+/// Close a virtual list opened by `beginVirtualList`.
+pub fn endVirtualList(ctx: *Context) void {
+    endScrollArea(ctx);
+}
+
+/// Move `scroll.y` so `index` is fully visible in the previous-frame viewport.
+/// Not a pure function: reads `getNodeRect(id)` and writes `scroll`.
+///
+/// Degenerate cases: `row_count == 0` is a no-op; `index >= row_count` clamps
+/// to the last row. When the row is taller than the viewport, the row's top
+/// is aligned to the viewport top (bottom-align would hide the start).
+///
+/// Call before `beginVirtualList` so this write is step (1) of the scroll
+/// order (caller → thumb → wheel → clamp).
+pub fn virtualScrollToRow(ctx: *Context, id: Id, scroll: *Vec2f, opts: VirtualListOpts, index: usize) void {
+    assertVirtualListOpts(opts);
+    if (opts.row_count == 0) return;
+    const idx = @min(index, opts.row_count - 1);
+    const pitch = virtualListPitch(opts);
+    const total_h = virtualListTotalHeight(opts);
+    const vp_h = virtualListViewportHeight(ctx, id, opts);
+    const max_y = @max(0, total_h - vp_h);
+    const max_y_f: f32 = @floatFromInt(max_y);
+    const row_top: i64 = @as(i64, @intCast(idx)) * @as(i64, pitch);
+    const row_h: i64 = opts.row_height;
+    const vp: i64 = vp_h;
+
+    if (row_h >= vp) {
+        scroll.y = std.math.clamp(@as(f32, @floatFromInt(row_top)), 0, max_y_f);
+        return;
+    }
+    const row_bottom = row_top + row_h;
+    const view_top = scroll.y;
+    const view_bottom = scroll.y + @as(f32, @floatFromInt(vp_h));
+    if (view_top > @as(f32, @floatFromInt(row_top))) {
+        scroll.y = @floatFromInt(row_top);
+    } else if (view_bottom < @as(f32, @floatFromInt(row_bottom))) {
+        scroll.y = @as(f32, @floatFromInt(row_bottom - vp));
+    }
+    scroll.y = std.math.clamp(scroll.y, 0, max_y_f);
 }
 
 // ============================================================
@@ -2336,6 +2600,10 @@ pub fn endFormRow(ctx: *Context) void {
 // ============================================================
 
 const render_mod = @import("render.zig");
+
+test {
+    _ = @import("virtual_list.zig");
+}
 
 fn testCtx() Context {
     return Context.init(std.testing.allocator, font_mod.default_font);

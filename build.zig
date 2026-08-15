@@ -3179,7 +3179,7 @@ pub fn build(b: *std.Build) void {
     bench_gui_list_menu_root.addImport("gui", bench_list_menu_gui);
     bench_gui_list_menu_root.addImport("list_menu_ui", bench_list_menu_ui);
     const bench_gui_list_menu_exe = b.addExecutable(.{ .name = "bench_gui_list_menu", .root_module = bench_gui_list_menu_root });
-    const bench_gui_list_menu_step = b.step("bench-gui-list-menu", "Run GUI list/menu shell full Context frame benchmark 500 rows (ReleaseFast)");
+    const bench_gui_list_menu_step = b.step("bench-gui-list-menu", "Run GUI list/menu shell full Context frame benchmark 500/5000 x full/virtual (ReleaseFast)");
     bench_gui_list_menu_step.dependOn(&b.addRunArtifact(bench_gui_list_menu_exe).step);
 
     // bench-blit: pixie canvas zoom transfer + checker background (measure old/new together)
