@@ -30,22 +30,16 @@ pub const Vec2f = draw_mod.Vec2f;
 /// fits inside the copilot/harness 64 KiB wire limit at the current per-line width.
 pub const MAX_CMDS = 256;
 
-/// Inclusive coordinate range the parser accepts. At a supported `content_scale`
-/// (the usual window scale, around 1–2) these bounds keep `render.zig`'s integer
-/// arithmetic (`@intCast` of thickness, `@abs(x1 - x0)`, `x + w`) inside i32.
-/// 2^20 is larger than any window we present (8K is 7680). They do not cover an
-/// arbitrary caller-supplied scale; that is the renderer's contract.
-pub const MAX_COORD: i32 = 1 << 20;
-pub const MIN_COORD: i32 = -(1 << 20);
+/// Inclusive coordinate range the parser accepts. Same values as `geom`: the
+/// renderer-wide DrawCmd domain.
+pub const MAX_COORD: i32 = geom.MAX_COORD;
+pub const MIN_COORD: i32 = geom.MIN_COORD;
 
-/// Maximum `w` / `h` / `clip_w` / `clip_h`. Same 2^20 bound as `MAX_COORD` so
-/// `x + w` stays inside i32 when `x` is also in range, at a supported scale.
-pub const MAX_EXTENT: u32 = 1 << 20;
+/// Maximum `w` / `h` / `clip_w` / `clip_h`. Same value as `geom.MAX_EXTENT`.
+pub const MAX_EXTENT: u32 = geom.MAX_EXTENT;
 
-/// Maximum stroke / outline thickness. 4096 px is already a filled slab, not a
-/// stroke. Together with `MAX_COORD`, `coord + thickness + thickness / 2` stays
-/// inside i32 at a supported scale.
-pub const MAX_THICKNESS: u32 = 4096;
+/// Maximum stroke / outline thickness. Same value as `geom.MAX_THICKNESS`.
+pub const MAX_THICKNESS: u32 = geom.MAX_THICKNESS;
 
 /// Clip used when a command omits `clip_*`. Large enough that a typical window is
 /// fully inside it, so an annotation that does not name a clip is still drawn.

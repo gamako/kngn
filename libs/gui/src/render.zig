@@ -15,12 +15,98 @@ pub const DrawList = draw_mod.DrawList;
 pub const BitmapFont = font_mod.BitmapFont;
 pub const Font = font_mod.Font;
 
+/// Largest `scale` `render` accepts. A coordinate of 2^20 plus an extent of
+/// 2^20 is 2^21; times 256 is 2^29, which still fits in i32 after `drawLine`
+/// expands the AABB by thickness (`max - min` plus thickness).
+pub const MAX_SCALE: f32 = 256.0;
+
+/// True when `scale` is finite and in `(0, MAX_SCALE]`. NaN fails this
+/// comparison, so it does not need a separate check.
+pub fn scaleWithinDomain(scale: f32) bool {
+    return scale > 0.0 and scale <= MAX_SCALE;
+}
+
+/// True when every coordinate, extent, and thickness the command will
+/// physicalize lies in `geom`'s DrawCmd domain. Path points must also be
+/// finite. A path stroke's `width` must be finite and in
+/// `(0, path_stroke_width_max]`; `miter_limit` must be finite and `>= 1`.
+pub fn cmdWithinDomain(cmd: draw_mod.DrawCmd) bool {
+    return switch (cmd) {
+        .rect_filled => |c| rectInDomain(c.rect) and rectInDomain(c.clip),
+        .rect_outline => |c| rectInDomain(c.rect) and rectInDomain(c.clip) and thicknessInDomain(c.thickness),
+        .line => |c| pointInDomain(c.p0) and pointInDomain(c.p1) and rectInDomain(c.clip) and thicknessInDomain(c.thickness),
+        .text => |c| pointInDomain(c.pos) and rectInDomain(c.clip),
+        .image => |c| rectInDomain(c.rect) and rectInDomain(c.clip),
+        .path => |c| pathInDomain(c),
+    };
+}
+
+fn coordInDomain(v: i32) bool {
+    return v >= geom.MIN_COORD and v <= geom.MAX_COORD;
+}
+
+fn extentInDomain(v: u32) bool {
+    return v <= geom.MAX_EXTENT;
+}
+
+fn thicknessInDomain(v: u32) bool {
+    return v <= geom.MAX_THICKNESS;
+}
+
+fn pointInDomain(p: Vec2) bool {
+    return coordInDomain(p.x) and coordInDomain(p.y);
+}
+
+fn rectInDomain(r: Rect) bool {
+    return coordInDomain(r.x) and coordInDomain(r.y) and extentInDomain(r.w) and extentInDomain(r.h);
+}
+
+fn pathPointInDomain(p: draw_mod.Vec2f) bool {
+    const lo: f32 = @floatFromInt(geom.MIN_COORD);
+    const hi: f32 = @floatFromInt(geom.MAX_COORD);
+    return std.math.isFinite(p.x) and std.math.isFinite(p.y) and
+        p.x >= lo and p.x <= hi and p.y >= lo and p.y <= hi;
+}
+
+/// Runs once per DrawCmd per frame on the scaled path; proportional to
+/// control-point count, not to target pixel count.
+fn pathInDomain(c: @FieldType(draw_mod.DrawCmd, "path")) bool {
+    if (!rectInDomain(c.clip)) return false;
+    for (c.points) |p| {
+        if (!pathPointInDomain(p)) return false;
+    }
+    if (c.stroke) |st| {
+        if (!std.math.isFinite(st.width) or
+            !(st.width > 0 and st.width <= draw_mod.path_stroke_width_max) or
+            !std.math.isFinite(st.miter_limit) or
+            st.miter_limit < 1) return false;
+    }
+    return true;
+}
+
 /// font = default font. Each text cmd may carry a font override that takes priority.
-/// scale: conversion factor from logical DrawList → physical target (1.0 = logical=physical, fast path).
-/// `.text` keeps logical coordinates when scale==1.0; when scale!=1.0 it physicalizes pos/clip and passes scale to Font.drawTo.
+///
+/// `scale` converts logical DrawList units to physical target pixels
+/// (`1.0` = logical equals physical, fast path). Accepted range is
+/// `0 < scale <= MAX_SCALE`. NaN fails the same comparison. A value outside
+/// that range panics in every optimisation mode; endpoints are not clamped,
+/// because clamping a line or path would change its shape.
+///
+/// When `scale != 1.0`, each command's coordinates, extents, and thicknesses
+/// must lie in `geom.MIN_COORD..=geom.MAX_COORD` / `geom.MAX_EXTENT` /
+/// `geom.MAX_THICKNESS`. Path points must also be finite. A path stroke's
+/// `width` must be finite and in `(0, path_stroke_width_max]`; `miter_limit`
+/// must be finite and `>= 1`. A command outside that domain
+/// panics in every optimisation mode. When `scale == 1.0` no physicalization
+/// runs, so that domain is not checked.
+///
+/// `.text` keeps logical coordinates when scale==1.0; when scale!=1.0 it
+/// physicalizes pos/clip and passes scale to Font.drawTo.
 pub fn render(target: RenderTarget, draw_list: *DrawList, font: Font, scale: f32) void {
     std.debug.assert(target.pixels.len == @as(usize, target.width) * @as(usize, target.height));
-    std.debug.assert(std.math.isFinite(scale) and scale > 0);
+    if (!scaleWithinDomain(scale)) {
+        std.debug.panic("gui.render: scale {e} is outside the accepted range (0, {d}]", .{ scale, MAX_SCALE });
+    }
 
     if (scale == 1.0) {
         for (draw_list.cmds.items) |cmd| {
@@ -37,6 +123,9 @@ pub fn render(target: RenderTarget, draw_list: *DrawList, font: Font, scale: f32
     }
 
     for (draw_list.cmds.items) |cmd| {
+        if (!cmdWithinDomain(cmd)) {
+            std.debug.panic("gui.render: DrawCmd {s} is outside the accepted domain", .{@tagName(cmd)});
+        }
         switch (cmd) {
             .rect_filled => |c| {
                 const phys_clip = scaleRect(c.clip, scale);
@@ -102,7 +191,9 @@ pub fn render(target: RenderTarget, draw_list: *DrawList, font: Font, scale: f32
 
 // ── scale helpers ─────────────────────────────────────────────────────────────
 
-/// Both edges floor: physical.x = floor(x*s), physical.w = max(0, floor((x+w)*s) - physical.x)
+/// Both edges floor: physical.x = floor(x*s), physical.w = max(0, floor((x+w)*s) - physical.x).
+/// Under the `render` contract, |logical coord| <= 2^20, extent <= 2^20, and
+/// scale <= 256, so |physical| <= 2^29 and `@intFromFloat` stays inside i32.
 fn scaleRect(rect: Rect, scale: f32) Rect {
     const x0 = floorI32(@as(f32, @floatFromInt(rect.x)) * scale);
     const y0 = floorI32(@as(f32, @floatFromInt(rect.y)) * scale);
@@ -116,6 +207,8 @@ fn scaleRect(rect: Rect, scale: f32) Rect {
     };
 }
 
+/// Under the `render` contract, |logical coord| <= 2^20 and scale <= 256, so
+/// |physical| <= 2^28 and `@intFromFloat` stays inside i32.
 fn scalePoint(point: Vec2, scale: f32) Vec2 {
     return .{
         .x = floorI32(@as(f32, @floatFromInt(point.x)) * scale),
@@ -123,12 +216,16 @@ fn scalePoint(point: Vec2, scale: f32) Vec2 {
     };
 }
 
+/// Under the `render` contract, thickness <= 4096 and scale <= 256, so the
+/// rounded product is at most 2^20 and fits in u32.
 fn scaleThickness(thickness: u32, scale: f32) u32 {
     const t = @round(@as(f32, @floatFromInt(thickness)) * scale);
     if (t < 1.0) return 1;
     return @intFromFloat(t);
 }
 
+/// Caller guarantees `v` is finite and inside i32. The `render` contract
+/// implies `|v| <= 2^29`.
 fn floorI32(v: f32) i32 {
     return @intFromFloat(@floor(v));
 }
@@ -507,6 +604,12 @@ fn flattenCubicDraw(dl: *DrawList, p0: draw_mod.Vec2f, c1: draw_mod.Vec2f, c2: d
     flattenCubicDraw(dl, m, p123, p23, p1, depth + 1);
 }
 
+/// Intersect the flattened AABB with `clip ∩ target`, then convert. Stroke
+/// miter joins can sit outside the input points, but the clamp onto
+/// `clip ∩ target` keeps the converted size inside the target. Non-finite
+/// values are the only hole: a NaN bypasses clamp and `@intFromFloat` traps.
+/// The `render` contract requires input points, stroke width, and
+/// `miter_limit` to be finite, which keeps this conversion defined.
 fn bboxFromFlat(pts: []const draw_mod.Vec2f, clip_t: Rect) ?Rect {
     if (pts.len == 0) return null;
     var min_x: f32 = pts[0].x;
@@ -2132,4 +2235,264 @@ test "path stroke: a closed one-point or two-point contour paints nothing" {
     for (pixels) |px| {
         try std.testing.expectEqual(@as(u32, 0xFF000000), px);
     }
+}
+
+// ── render input domain ────────────────────────────────────────────
+
+test "scaleWithinDomain: rejects values outside (0, MAX_SCALE]" {
+    try std.testing.expect(scaleWithinDomain(MAX_SCALE));
+    try std.testing.expect(scaleWithinDomain(1.0));
+    try std.testing.expect(scaleWithinDomain(2.0));
+    try std.testing.expect(!scaleWithinDomain(0.0));
+    try std.testing.expect(!scaleWithinDomain(-1.0));
+    try std.testing.expect(!scaleWithinDomain(std.math.nan(f32)));
+    try std.testing.expect(!scaleWithinDomain(std.math.inf(f32)));
+    try std.testing.expect(!scaleWithinDomain(-std.math.inf(f32)));
+    try std.testing.expect(!scaleWithinDomain(MAX_SCALE * 2.0));
+}
+
+test "cmdWithinDomain: rejects coordinates, extents, thicknesses, and non-finite path values outside the domain" {
+    const col = Color.rgba(0xFF, 0xFF, 0xFF, 0xFF);
+    const ok_rect = Rect{ .x = 0, .y = 0, .w = 8, .h = 8 };
+    const ok_pt = Vec2{ .x = 0, .y = 0 };
+    const img = [_]u32{0xFFFFFFFF};
+    const ok_path_pts = [_]draw_mod.Vec2f{ .{ .x = 0, .y = 0 }, .{ .x = 4, .y = 0 } };
+    const ok_path_verbs = [_]draw_mod.PathVerb{ .move, .line };
+
+    try std.testing.expect(cmdWithinDomain(.{ .rect_filled = .{ .rect = ok_rect, .color = col, .clip = ok_rect } }));
+    try std.testing.expect(cmdWithinDomain(.{ .rect_outline = .{ .rect = ok_rect, .color = col, .thickness = geom.MAX_THICKNESS, .clip = ok_rect } }));
+    try std.testing.expect(cmdWithinDomain(.{ .line = .{ .p0 = ok_pt, .p1 = ok_pt, .color = col, .thickness = 1, .clip = ok_rect } }));
+    try std.testing.expect(cmdWithinDomain(.{ .text = .{ .pos = ok_pt, .text = "A", .color = col, .clip = ok_rect } }));
+    try std.testing.expect(cmdWithinDomain(.{ .image = .{ .rect = ok_rect, .pixels = &img, .src_w = 1, .src_h = 1, .clip = ok_rect } }));
+    try std.testing.expect(cmdWithinDomain(.{ .path = .{
+        .verbs = &ok_path_verbs,
+        .points = &ok_path_pts,
+        .color = col,
+        .winding = .nonzero,
+        .aa = true,
+        .clip = ok_rect,
+        .stroke = .{ .width = 1, .join = .miter, .cap = .butt, .miter_limit = 4 },
+    } }));
+
+    try std.testing.expect(!cmdWithinDomain(.{ .rect_filled = .{
+        .rect = .{ .x = geom.MAX_COORD + 1, .y = 0, .w = 1, .h = 1 },
+        .color = col,
+        .clip = ok_rect,
+    } }));
+    try std.testing.expect(!cmdWithinDomain(.{ .rect_filled = .{
+        .rect = .{ .x = geom.MIN_COORD - 1, .y = 0, .w = 1, .h = 1 },
+        .color = col,
+        .clip = ok_rect,
+    } }));
+    try std.testing.expect(!cmdWithinDomain(.{ .rect_filled = .{
+        .rect = .{ .x = 0, .y = 0, .w = geom.MAX_EXTENT + 1, .h = 1 },
+        .color = col,
+        .clip = ok_rect,
+    } }));
+    try std.testing.expect(!cmdWithinDomain(.{ .rect_outline = .{
+        .rect = ok_rect,
+        .color = col,
+        .thickness = geom.MAX_THICKNESS + 1,
+        .clip = ok_rect,
+    } }));
+    try std.testing.expect(!cmdWithinDomain(.{ .line = .{
+        .p0 = .{ .x = geom.MAX_COORD + 1, .y = 0 },
+        .p1 = ok_pt,
+        .color = col,
+        .thickness = 1,
+        .clip = ok_rect,
+    } }));
+    try std.testing.expect(!cmdWithinDomain(.{ .text = .{
+        .pos = ok_pt,
+        .text = "A",
+        .color = col,
+        .clip = .{ .x = 0, .y = 0, .w = geom.MAX_EXTENT + 1, .h = 1 },
+    } }));
+    try std.testing.expect(!cmdWithinDomain(.{ .image = .{
+        .rect = ok_rect,
+        .pixels = &img,
+        .src_w = 1,
+        .src_h = 1,
+        .clip = .{ .x = geom.MIN_COORD - 1, .y = 0, .w = 1, .h = 1 },
+    } }));
+
+    const nan_pts = [_]draw_mod.Vec2f{.{ .x = std.math.nan(f32), .y = 0 }};
+    try std.testing.expect(!cmdWithinDomain(.{ .path = .{
+        .verbs = &.{.move},
+        .points = &nan_pts,
+        .color = col,
+        .winding = .nonzero,
+        .aa = true,
+        .clip = ok_rect,
+    } }));
+    const inf_pts = [_]draw_mod.Vec2f{.{ .x = std.math.inf(f32), .y = 0 }};
+    try std.testing.expect(!cmdWithinDomain(.{ .path = .{
+        .verbs = &.{.move},
+        .points = &inf_pts,
+        .color = col,
+        .winding = .nonzero,
+        .aa = true,
+        .clip = ok_rect,
+    } }));
+    const oob_pts = [_]draw_mod.Vec2f{.{ .x = @floatFromInt(geom.MAX_COORD + 1), .y = 0 }};
+    try std.testing.expect(!cmdWithinDomain(.{ .path = .{
+        .verbs = &.{.move},
+        .points = &oob_pts,
+        .color = col,
+        .winding = .nonzero,
+        .aa = true,
+        .clip = ok_rect,
+    } }));
+    try std.testing.expect(!cmdWithinDomain(.{ .path = .{
+        .verbs = &ok_path_verbs,
+        .points = &ok_path_pts,
+        .color = col,
+        .winding = .nonzero,
+        .aa = true,
+        .clip = ok_rect,
+        .stroke = .{ .width = std.math.nan(f32), .join = .miter, .cap = .butt, .miter_limit = 4 },
+    } }));
+    try std.testing.expect(!cmdWithinDomain(.{ .path = .{
+        .verbs = &ok_path_verbs,
+        .points = &ok_path_pts,
+        .color = col,
+        .winding = .nonzero,
+        .aa = true,
+        .clip = ok_rect,
+        .stroke = .{ .width = std.math.inf(f32), .join = .miter, .cap = .butt, .miter_limit = 4 },
+    } }));
+    try std.testing.expect(!cmdWithinDomain(.{ .path = .{
+        .verbs = &ok_path_verbs,
+        .points = &ok_path_pts,
+        .color = col,
+        .winding = .nonzero,
+        .aa = true,
+        .clip = ok_rect,
+        .stroke = .{ .width = 1, .join = .miter, .cap = .butt, .miter_limit = std.math.nan(f32) },
+    } }));
+    try std.testing.expect(!cmdWithinDomain(.{ .path = .{
+        .verbs = &ok_path_verbs,
+        .points = &ok_path_pts,
+        .color = col,
+        .winding = .nonzero,
+        .aa = true,
+        .clip = ok_rect,
+        .stroke = .{ .width = 1, .join = .miter, .cap = .butt, .miter_limit = std.math.inf(f32) },
+    } }));
+    try std.testing.expect(!cmdWithinDomain(.{ .path = .{
+        .verbs = &ok_path_verbs,
+        .points = &ok_path_pts,
+        .color = col,
+        .winding = .nonzero,
+        .aa = true,
+        .clip = ok_rect,
+        .stroke = .{ .width = 0, .join = .miter, .cap = .butt, .miter_limit = 4 },
+    } }));
+    try std.testing.expect(!cmdWithinDomain(.{ .path = .{
+        .verbs = &ok_path_verbs,
+        .points = &ok_path_pts,
+        .color = col,
+        .winding = .nonzero,
+        .aa = true,
+        .clip = ok_rect,
+        .stroke = .{ .width = -1, .join = .miter, .cap = .butt, .miter_limit = 4 },
+    } }));
+    try std.testing.expect(!cmdWithinDomain(.{ .path = .{
+        .verbs = &ok_path_verbs,
+        .points = &ok_path_pts,
+        .color = col,
+        .winding = .nonzero,
+        .aa = true,
+        .clip = ok_rect,
+        .stroke = .{ .width = draw_mod.path_stroke_width_max + 1, .join = .miter, .cap = .butt, .miter_limit = 4 },
+    } }));
+    try std.testing.expect(!cmdWithinDomain(.{ .path = .{
+        .verbs = &ok_path_verbs,
+        .points = &ok_path_pts,
+        .color = col,
+        .winding = .nonzero,
+        .aa = true,
+        .clip = ok_rect,
+        .stroke = .{ .width = 1, .join = .miter, .cap = .butt, .miter_limit = 0 },
+    } }));
+}
+
+test "render: domain maxima at MAX_SCALE do not panic" {
+    var pixels = [_]u32{0xFF000000} ** (32 * 32);
+    const target = RenderTarget{ .pixels = &pixels, .width = 32, .height = 32 };
+    var dl = DrawList.init(std.testing.allocator);
+    defer dl.deinit();
+    dl.reset(32, 32);
+
+    const max_c = geom.MAX_COORD;
+    const min_c = geom.MIN_COORD;
+    const max_e = geom.MAX_EXTENT;
+    const max_t = geom.MAX_THICKNESS;
+    const col = Color.rgba(0xFF, 0xFF, 0xFF, 0xFF);
+    const far_pos = Rect{ .x = max_c, .y = max_c, .w = max_e, .h = max_e };
+    const far_neg = Rect{ .x = min_c, .y = min_c, .w = max_e, .h = max_e };
+    const cover = Rect{ .x = 0, .y = 0, .w = max_e, .h = max_e };
+    const img = [_]u32{0xFFFFFFFF};
+
+    try dl.cmds.append(dl.alloc, .{ .rect_filled = .{ .rect = far_pos, .color = col, .clip = far_pos } });
+    try dl.cmds.append(dl.alloc, .{ .rect_outline = .{ .rect = far_neg, .color = col, .thickness = max_t, .clip = far_neg } });
+    try dl.cmds.append(dl.alloc, .{ .line = .{
+        .p0 = .{ .x = max_c, .y = min_c },
+        .p1 = .{ .x = max_c, .y = max_c },
+        .color = col,
+        .thickness = max_t,
+        .clip = far_pos,
+    } });
+    try dl.cmds.append(dl.alloc, .{ .text = .{
+        .pos = .{ .x = max_c, .y = max_c },
+        .text = "A",
+        .color = col,
+        .clip = far_pos,
+    } });
+    try dl.cmds.append(dl.alloc, .{ .image = .{
+        .rect = far_pos,
+        .pixels = &img,
+        .src_w = 1,
+        .src_h = 1,
+        .clip = far_pos,
+    } });
+
+    const fill_pts = [_]draw_mod.Vec2f{
+        .{ .x = @floatFromInt(max_c), .y = @floatFromInt(max_c) },
+        .{ .x = @floatFromInt(max_c - 8), .y = @floatFromInt(max_c) },
+        .{ .x = @floatFromInt(max_c), .y = @floatFromInt(max_c - 8) },
+    };
+    const fill_verbs = [_]draw_mod.PathVerb{ .move, .line, .line, .close };
+    try dl.cmds.append(dl.alloc, .{ .path = .{
+        .verbs = &fill_verbs,
+        .points = &fill_pts,
+        .color = col,
+        .winding = .nonzero,
+        .aa = true,
+        .clip = cover,
+        .stroke = null,
+    } });
+
+    const stroke_pts = [_]draw_mod.Vec2f{
+        .{ .x = @floatFromInt(min_c), .y = @floatFromInt(min_c + 16) },
+        .{ .x = @floatFromInt(min_c + 16), .y = @floatFromInt(min_c + 16) },
+        .{ .x = @floatFromInt(min_c + 16), .y = @floatFromInt(min_c) },
+    };
+    const stroke_verbs = [_]draw_mod.PathVerb{ .move, .line, .line };
+    try dl.cmds.append(dl.alloc, .{ .path = .{
+        .verbs = &stroke_verbs,
+        .points = &stroke_pts,
+        .color = col,
+        .winding = .nonzero,
+        .aa = true,
+        .clip = cover,
+        .stroke = .{
+            .width = @floatFromInt(max_t),
+            .join = .miter,
+            .cap = .butt,
+            .miter_limit = 4.0,
+        },
+    } });
+
+    render(target, &dl, font_mod.default_font, MAX_SCALE);
 }
