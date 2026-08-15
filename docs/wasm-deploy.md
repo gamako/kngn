@@ -42,7 +42,7 @@ Both steps share the same wasm compile graph per app when requested together.
 
 | `WasmAudio` | Used by (in-tree) | Notes |
 |---|---|---|
-| `.none` | pixie; **template** | No AudioContext / worklet startup |
+| `.none` | pixie; fixed_fb; **template** | No AudioContext / worklet startup |
 | `.worklet_shared` | synth | SharedArrayBuffer; needs COOP/COEP |
 | `.worklet_postmessage` | synth postMessage variant / single HTML | Main-thread render; no isolation headers |
 
@@ -97,7 +97,17 @@ canvas {
 ```
 
 Without `object-fit` the bitmap is stretched to the element and a fixed-size framebuffer comes
-out distorted. `web/index.html` carries all three; a host page of your own has to as well.
+out distorted. `web/index.html` and `web/fixed-fb.html` carry all three; a host page of your own
+has to as well.
+
+**Host pages come in two layouts.** `index.html` and `fixed-fb.html` give the canvas a viewport-
+filling CSS box (`width: 100vw; height: 100vh`) plus the three declarations above, so a `.fixed`
+framebuffer is letterboxed into the browser window. `synth.html`, `synth-postmessage.html`,
+`mic-demo.html`, and `template/web/template.html` leave the canvas without a CSS box size, so the
+bitmap stays at its intrinsic pixel size and is not magnified — that is intentional, not a bug.
+Add the viewport-fill and letterbox declarations only on pages that should expand to fill the
+window; do not rewrite every host page the same way.
+
 Two consequences worth stating:
 
 - **Pointer positions are unaffected**, because they are taken relative to the *element* box
@@ -142,10 +152,14 @@ Output of `zig build package-web` (`zig-out/web/`), measured directly (`*.single
 |----------|------|-----------|
 | `index.html` | Pixie entry | not required |
 | `pixie.wasm` | Pixie wasm | not required |
+| `fixed-fb.html` | Fixed framebuffer letterbox example | not required |
+| `fixed_fb.wasm` | Fixed framebuffer example wasm | not required |
 | `synth.html` | Synth (shared audio) | **required** |
 | `synth.wasm` | Synth wasm (shared memory) | **required** |
 | `synth-postmessage.html` | Synth (postMessage audio) | not required |
 | `synth_postmessage.wasm` | Synth wasm (non-shared) | not required |
+| `mic-demo.html` | Microphone capture demo | **required** |
+| `mic_demo.wasm` | Mic demo wasm (shared memory) | **required** |
 | `kngn.js` | Shared JS glue | — |
 | `kngn-worklet.js` | AudioWorklet (shared + postMessage) | — |
 | `_headers` | Cloudflare Pages | shared synth header rules |
@@ -162,8 +176,10 @@ Output of `zig build package-web-single` (`zig-out/web/`), also measured directl
 ### HTML / JS fetch paths
 
 - `index.html` → `data-wasm="pixie.wasm"` + `data-audio-transport="none"`
+- `fixed-fb.html` → `data-wasm="fixed_fb.wasm"` + `data-audio-transport="none"`
 - `synth.html` → `data-wasm="synth.wasm"` + `data-audio-transport="worklet_shared"` (needs isolation)
 - `synth-postmessage.html` → `data-wasm="synth_postmessage.wasm"` + `data-audio-transport="worklet_postmessage"`
+- `mic-demo.html` → `data-wasm="mic_demo.wasm"` + `data-audio-transport="worklet_shared"` + capture (needs isolation)
 
 Audio transport comes from `data-audio-transport` or embedded options; the glue does not guess from the app name.
 
@@ -267,7 +283,7 @@ digest audio rms=0.0770 peak=0.2147 silent=0 frames=4096
 | `zig build package-web` / `package-web-single` | **Yes** (root multi-file / single HTML) |
 | `zig build -Dinstall-all=true` | **Yes** — root wasm packages join the default install, plus the template native and web gates, the consumer gate and the harness gate below |
 | `zig build check-template-web` | **Yes** (template child package only) |
-| `zig build check-wasm-harness` | **Yes** — the three wasm apps built with `-Dwasm-harness=true` compiled in |
+| `zig build check-wasm-harness` | **Yes** — the packaged wasm apps built with `-Dwasm-harness=true` compiled in |
 
 `zig build test` deliberately stays free of wasm compile time. Use `-Dinstall-all=true` or the
 explicit package steps when you touch `core/control/`, the platform facade, `libs/appshell`,
@@ -277,7 +293,7 @@ or anything a wasm root imports.
 compiles the no-op harness stub, so `core/control/harness.zig` is never compiled against the
 wasm module set unless something asks for it — and a call it makes into a module with a
 wasm-only variant (`core/control/netsync_wasm.zig` above all) can go missing and break only
-that build. The gate compiles and export-checks the three apps with the harness in; it does
+that build. The gate compiles and export-checks the packaged apps with the harness in; it does
 not package them, because packaging is what the rows above already exercise. It resolves under
 every flag combination, and under `-Dwasm-harness=true` it rides the shipped graph instead of
 compiling a second one.

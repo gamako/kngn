@@ -1,23 +1,92 @@
 const std = @import("std");
 
 // build_helpers/ is a symlink to ../../build_helpers.
-// Zig 0.16 `@import` cannot reach files outside the build root, so
-// the symlink exposes the shared helper inside the build root.
 const platform = @import("build_helpers/platform.zig");
 
-// Path to the parent project root (relative to this directory).
 const PROJECT_ROOT = "../..";
 
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
 
-    // The whole framebuffer is redrawn every frame in a colour that is not byte-repeating, which is
-    // the case `pixelops.fill32` exists for. No kit here, so this is the only module for
-    // libs/pixelops in the build.
+    // kit wiring: follow examples/32_sprite_anim/build.zig; share one png / pixelops instance.
+    const png = b.createModule(.{
+        .root_source_file = .{ .cwd_relative = PROJECT_ROOT ++ "/libs/png/src/lib.zig" },
+    });
     const pixelops = b.createModule(.{
         .root_source_file = .{ .cwd_relative = PROJECT_ROOT ++ "/libs/pixelops/src/lib.zig" },
     });
+    const platform_types = b.createModule(.{
+        .root_source_file = .{ .cwd_relative = PROJECT_ROOT ++ "/core/platform_types.zig" },
+    });
+    const command_types = b.createModule(.{
+        .root_source_file = .{ .cwd_relative = PROJECT_ROOT ++ "/core/command_types.zig" },
+    });
+    command_types.addImport("platform_types", platform_types);
+
+    const font = b.createModule(.{
+        .root_source_file = .{ .cwd_relative = PROJECT_ROOT ++ "/libs/font/src/lib.zig" },
+    });
+    font.addImport("png", png);
+    font.addImport("pixelops", pixelops);
+    const vector = b.createModule(.{
+        .root_source_file = .{ .cwd_relative = PROJECT_ROOT ++ "/libs/vector/src/lib.zig" },
+    });
+    font.addImport("vector", vector);
+
+    const gui = b.createModule(.{
+        .root_source_file = .{ .cwd_relative = PROJECT_ROOT ++ "/libs/gui/src/gui.zig" },
+    });
+    gui.addImport("font", font);
+    gui.addImport("pixelops", pixelops);
+    gui.addImport("vector", vector);
+    gui.addImport("command_types", command_types);
+
+    const dsp = b.createModule(.{
+        .root_source_file = .{ .cwd_relative = PROJECT_ROOT ++ "/src/dsp/dsp.zig" },
+    });
+    const synth = b.createModule(.{
+        .root_source_file = .{ .cwd_relative = PROJECT_ROOT ++ "/libs/synth/src/synth.zig" },
+    });
+    synth.addImport("dsp", dsp);
+    const gmath = b.createModule(.{
+        .root_source_file = .{ .cwd_relative = PROJECT_ROOT ++ "/libs/gmath/src/lib.zig" },
+    });
+    const sound = b.createModule(.{
+        .root_source_file = .{ .cwd_relative = PROJECT_ROOT ++ "/libs/sound/src/sound.zig" },
+    });
+    sound.addImport("dsp", dsp);
+    sound.addImport("synth", synth);
+
+    const gfx_keyboard = b.createModule(.{
+        .root_source_file = .{ .cwd_relative = PROJECT_ROOT ++ "/libs/gfx/src/keyboard.zig" },
+    });
+    gfx_keyboard.addImport("platform_types", platform_types);
+    const gfx_sprite = b.createModule(.{
+        .root_source_file = .{ .cwd_relative = PROJECT_ROOT ++ "/libs/gfx/src/sprite.zig" },
+    });
+    gfx_sprite.addImport("png", png);
+    gfx_sprite.addImport("pixelops", pixelops);
+    const gfx_ft = b.createModule(.{
+        .root_source_file = .{ .cwd_relative = PROJECT_ROOT ++ "/libs/gfx/src/fixed_timestep.zig" },
+    });
+    const gfx_fps = b.createModule(.{
+        .root_source_file = .{ .cwd_relative = PROJECT_ROOT ++ "/libs/gfx/src/fps_counter.zig" },
+    });
+    const gfx = b.createModule(.{
+        .root_source_file = .{ .cwd_relative = PROJECT_ROOT ++ "/libs/gfx/src/gfx.zig" },
+    });
+    gfx.addImport("sprite", gfx_sprite);
+    gfx.addImport("fixed_timestep", gfx_ft);
+    gfx.addImport("fps_counter", gfx_fps);
+    gfx.addImport("keyboard", gfx_keyboard);
+    const gamepad_mod = b.createModule(.{
+        .root_source_file = .{ .cwd_relative = PROJECT_ROOT ++ "/src/gamepad.zig" },
+    });
+    gamepad_mod.addImport("platform_types", platform_types);
+    gfx.addImport("gamepad", gamepad_mod);
+    gfx.addImport("platform_types", platform_types);
+    gfx.addImport("gmath", gmath);
 
     platform.buildStandalone(b, target, optimize, .{
         .base_name = "example_44_fixed_framebuffer",
@@ -28,8 +97,20 @@ pub fn build(b: *std.Build) void {
         // The transparent, borderless variant of the letterbox check needs the mascot opt-in; nothing
         // else here does, and text input is off because this sample reads keys rather than characters.
         .platform_features = .{ .enable_mascot = true, .enable_text_input = false },
-        .extra = &.{
-            .{ .name = "pixelops", .module = pixelops },
+        .png_module = png,
+        .kit_libs = .{
+            .platform_types = platform_types,
+            .command_types = command_types,
+            .gui = gui,
+            .png = png,
+            .font = font,
+            .dsp = dsp,
+            .synth = synth,
+            .gmath = gmath,
+            .gfx = gfx,
+            .sound = sound,
+            .pixelops = pixelops,
+            .gamepad = gamepad_mod,
         },
     });
 }

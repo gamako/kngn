@@ -144,6 +144,10 @@ fn makeInternalWasmLinker(b: *std.Build, wasm_harness: bool) platform.WasmLinker
                 // The wasm microphone capture demo reaches capture through kit alone.
                 const root = TaggedModule{ .mod = link_ctx.app_module, .layer = .app, .name = "mic_demo" };
                 link(root, pm.base().kit);
+            } else if (std.mem.eql(u8, link_ctx.spec.name, "fixed_fb")) {
+                // Fixed-framebuffer example: kit alone (platform / pixelops / app_runtime via kit).
+                const root = TaggedModule{ .mod = link_ctx.app_module, .layer = .app, .name = "fixed_fb" };
+                link(root, pm.base().kit);
             } else {
                 std.debug.panic("internal wasm linker: unknown app '{s}'", .{link_ctx.spec.name});
             }
@@ -155,9 +159,9 @@ fn makeInternalWasmLinker(b: *std.Build, wasm_harness: bool) platform.WasmLinker
     return .{ .context = ctx, .apply = Ctx.apply };
 }
 
-/// pixie + synth (shared) + synth_postmessage + mic_demo WasmAppSpec values for the in-tree web package.
+/// pixie + synth (shared) + synth_postmessage + mic_demo + fixed_fb WasmAppSpec values for the in-tree web package.
 /// When `with_single_html` is true, pixie and the postMessage synth produce `*.single.html`.
-fn makeWasmAppSpecs(b: *std.Build, base_target: std.Build.ResolvedTarget, with_single_html: bool) [4]platform.WasmAppSpec {
+fn makeWasmAppSpecs(b: *std.Build, base_target: std.Build.ResolvedTarget, with_single_html: bool) [5]platform.WasmAppSpec {
     // Keep the caller's CPU / OS / ABI / existing feature set; add simd128 for pixelops @Vector paths.
     var pixie_query = base_target.query;
     pixie_query.cpu_features_add.addFeatureSet(std.Target.wasm.featureSet(&.{.simd128}));
@@ -256,6 +260,18 @@ fn makeWasmAppSpecs(b: *std.Build, base_target: std.Build.ResolvedTarget, with_s
             // worklet_shared × single HTML is a build error (COOP/COEP required).
             .single_html = false,
         },
+        .{
+            .name = "fixed_fb",
+            .target_query = pixie_query,
+            .app_source = b.path("examples/44_fixed_framebuffer/main.zig"),
+            .wasm_root_source = b.path("examples/44_fixed_framebuffer/wasm_root.zig"),
+            .wasm_root_import_name = "fixed_fb_app",
+            .single_threaded = platform.wasm_single_threaded,
+            .audio = .none,
+            .html_source = b.path("web/fixed-fb.html"),
+            .html_install_path = "web/fixed-fb.html",
+            .single_html = false,
+        },
     };
 }
 
@@ -276,7 +292,7 @@ fn buildWasm(
         .linker = makeInternalWasmLinker(b, wasm_harness),
         .default_install = true,
         .create_package_step = true,
-        .package_step_description = "Package wasm web deploy bundle to zig-out/web/ (pixie + synth + mic_demo + static assets)",
+        .package_step_description = "Package wasm web deploy bundle to zig-out/web/ (pixie + synth + mic_demo + fixed_fb + static assets)",
         .create_single_package_step = true,
         .single_package_step_description = "Package single-file HTML (pixie + postMessage synth) to zig-out/web/",
     });
@@ -303,7 +319,7 @@ fn packageWebFromNative(b: *std.Build, optimize: std.builtin.OptimizeMode, insta
         .linker = makeInternalWasmLinker(b, wasm_harness),
         .default_install = install_all,
         .create_package_step = true,
-        .package_step_description = "Package wasm web deploy bundle to zig-out/web/ (pixie + synth + mic_demo + static assets)",
+        .package_step_description = "Package wasm web deploy bundle to zig-out/web/ (pixie + synth + mic_demo + fixed_fb + static assets)",
         .create_single_package_step = true,
         .single_package_step_description = "Package single-file HTML (pixie + postMessage synth) to zig-out/web/",
     });
@@ -778,9 +794,9 @@ pub fn build(b: *std.Build) void {
                 .needs_midi = std.mem.eql(u8, example.name, "example_29"),
                 .needs_gmath = example.needs_gmath,
                 .needs_sound = example.needs_sound,
-                .needs_pixelops = std.mem.eql(u8, example.name, "example_23") or std.mem.eql(u8, example.name, "example_44"),
+                .needs_pixelops = std.mem.eql(u8, example.name, "example_23"),
                 .platform_features = if (@hasField(@TypeOf(example), "platform_features")) example.platform_features else exe_features.base,
-                .needs_kit = std.mem.eql(u8, example.name, "example_31") or std.mem.eql(u8, example.name, "example_32") or std.mem.eql(u8, example.name, "example_33") or std.mem.eql(u8, example.name, "example_34") or std.mem.eql(u8, example.name, "example_36") or std.mem.eql(u8, example.name, "example_38") or std.mem.startsWith(u8, example.name, "example_26"),
+                .needs_kit = std.mem.eql(u8, example.name, "example_31") or std.mem.eql(u8, example.name, "example_32") or std.mem.eql(u8, example.name, "example_33") or std.mem.eql(u8, example.name, "example_34") or std.mem.eql(u8, example.name, "example_36") or std.mem.eql(u8, example.name, "example_38") or std.mem.eql(u8, example.name, "example_44") or std.mem.startsWith(u8, example.name, "example_26"),
             };
             // audio examples: audio-capable OSes only (macOS/Linux/Windows). All other examples: every OS.
             if (!needs.needs_audio or audio_supported) {
