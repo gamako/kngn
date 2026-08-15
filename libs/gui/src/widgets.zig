@@ -18,9 +18,10 @@
 //   Disambiguate with the matching `*Id` API or `id_stack.push(i)` scopes.
 //
 // Text display contract (default font):
-//   `label` / `selectableLabel` / etc. pass newlines through to Font. Default font is single-line:
-//   newline codepoints advance 8px with no glyph. CJK/emoji also measure 8px per codepoint,
-//   no glyph, no fallback. TextInput is single-line (rejects newline / control inserts).
+//   `label` / `labelEx` / `text` split on paragraphs (LF / CR / CRLF) and never pass
+//   control characters to Font. `wrap` only folds inside a paragraph. CJK/emoji also
+//   measure 8px per codepoint, no glyph, no fallback. TextInput is single-line
+//   (rejects newline / control inserts).
 
 const std = @import("std");
 
@@ -32,6 +33,7 @@ const geom = @import("geom.zig");
 const id_mod = @import("id.zig");
 const input_mod = @import("input.zig");
 const text_edit = @import("text_edit.zig");
+const text_wrap = @import("text_wrap.zig");
 const state_mod = @import("state.zig");
 const font_mod = @import("font.zig");
 pub const Vec2f = input_mod.Vec2f;
@@ -2278,46 +2280,15 @@ pub fn endListboxRow(ctx: *Context) void {
 // truncation point never lands inside a multi-byte UTF-8 sequence), same algorithm an
 // example previously hand-rolled with `font.measure` and a manual "..." append.
 
-pub const EllipsisResult = struct {
-    /// The text to draw: `text` unchanged, or a truncated arena copy ending in "...".
-    text: []const u8,
-    /// Whether `text` was shortened to fit `max_w`.
-    truncated: bool = false,
-};
+pub const EllipsisResult = text_wrap.TruncateResult;
 
 /// Truncate `text` to fit within `max_w` px under `ctx.font`, appending a trailing "...".
-/// Returns the original slice (and `truncated = false`) when it already fits, or when
-/// `max_w <= 0` (nothing to measure against). The truncated copy lives on the frame arena, so
-/// it is valid through this frame's `endFrame` like any other per-frame text.
+/// Thin wrapper around `text_wrap.truncate` that passes the frame arena. Same semantics
+/// as the low-level API (when `"..."` itself does not fit, the result is `"..."` and
+/// may exceed `max_w`). The result lives as long as the shorter of `text` and the frame.
 pub fn ellipsizeText(ctx: *Context, text: []const u8, max_w: i32) EllipsisResult {
-    if (max_w <= 0) return .{ .text = text };
-    const full_w: i32 = @intCast(ctx.font.measure(text));
-    if (full_w <= max_w) return .{ .text = text };
-
-    const ellipsis = "...";
-    const ell_w: i32 = @intCast(ctx.font.measure(ellipsis));
-    if (ell_w >= max_w) {
-        const owned = ctx.allocator().dupe(u8, ellipsis) catch return .{ .text = text };
-        return .{ .text = owned, .truncated = true };
-    }
-    const budget = max_w - ell_w;
-    var keep: usize = 0;
-    var w: i32 = 0;
-    var i: usize = 0;
-    while (i < text.len) {
-        const cp_len = std.unicode.utf8ByteSequenceLength(text[i]) catch 1;
-        if (i + cp_len > text.len) break;
-        const piece = text[i .. i + cp_len];
-        const pw: i32 = @intCast(ctx.font.measure(piece));
-        if (w + pw > budget) break;
-        w += pw;
-        keep = i + cp_len;
-        i += cp_len;
-    }
-    const owned = ctx.allocator().alloc(u8, keep + ellipsis.len) catch return .{ .text = text };
-    @memcpy(owned[0..keep], text[0..keep]);
-    @memcpy(owned[keep..], ellipsis);
-    return .{ .text = owned, .truncated = true };
+    return text_wrap.truncate(ctx.allocator(), ctx.font, text, max_w) catch
+        @panic("ellipsizeText: OOM");
 }
 
 /// Draw `text` as a label, truncated with `ellipsizeText` first if it would exceed `max_w`.
@@ -5853,6 +5824,16 @@ test "ellipsizeText: max_w<=0 returns the original text rather than an empty ell
     const r = ellipsizeText(&ctx, "anything", 0);
     ctx.endFrame();
     try std.testing.expectEqualStrings("anything", r.text);
+    try std.testing.expect(!r.truncated);
+}
+
+test "ellipsizeText: CR LF folds to one space (same as text_wrap.truncate)" {
+    var ctx = testCtx();
+    defer ctx.deinit();
+    ctx.beginFrame(200, 40);
+    const r = ellipsizeText(&ctx, "a\r\nb", 1000);
+    ctx.endFrame();
+    try std.testing.expectEqualStrings("a b", r.text);
     try std.testing.expect(!r.truncated);
 }
 

@@ -1,8 +1,8 @@
 # Layout: sizing rules and pitfalls
 
 `src/layout.zig` implements a small flex-style layout engine. This document is the
-current contract for `Sizing` (fixed / fit / grow / percent) and the two-pass
-measure/place model behind it, worked through an example, plus the pitfalls that
+current contract for `Sizing` (fixed / fit / grow / percent) and the five-stage
+axis-split model behind it, worked through an example, plus the pitfalls that
 model creates — most notably a `.fit` container silently reducing a `.grow` child
 on its main axis to zero size, and (under a narrower condition) doing the same to
 a `.percent` child or a cross-axis `.grow` child. `README.md`'s "Layout engine
@@ -24,37 +24,36 @@ A box's `direction` (`.row` or `.column`) decides which of its two axes is "main
 (the axis children are laid out along) and which is "cross" (the axis children
 are aligned within, per `align_cross`).
 
-## The two passes
+## The five stages
 
-Layout runs in exactly two tree walks per frame, in this order:
+Wrapping text cannot know its height until its width is settled, so layout
+splits the two axes. Each frame runs five tree walks, in this order:
 
-1. **`measure`** — post-order (children before parents). Each node resolves its
-   own `measured_w` / `measured_h`:
-   - A **leaf** (text, or a custom-drawn widget) resolves to its own intrinsic
-     content size (text ink width/height, or the caller-supplied `measured`
-     size) regardless of its declared `Sizing` — `measure` resolves a leaf's
-     size before ever looking at its `Sizing`. This governs only the leaf's
-     *measured* contribution (what an ancestor computing `.fit` sees). At
-     `place` time the leaf is treated exactly like a box: its own declared
-     `Sizing` (`.fixed`, `.fit`, `.grow`, `.percent`) still decides how much
-     room its direct parent actually gives it — a leaf whose declared size
-     differs from its intrinsic content size can end up overflowing (if
-     given less) or with unused space around it (if given more).
-   - A **box** (a node with children) resolves through `Sizing`:
-     `.fixed(n)` resolves to `n` immediately; `.fit` resolves to the sum
-     (main axis) or max (cross axis) of the node's children's
-     *already-computed* `measured_w`/`measured_h` on that axis, plus padding
-     and inter-child gap; **`.grow` and `.percent` resolve to `0` at this
-     stage, unconditionally** — regardless of what that node's own children
-     need. Both are placement-time concepts (they need to know the actual
-     space available, which does not exist yet during a bottom-up measure).
-2. **`place`** — pre-order (parents before children), starting from the root
-   with an actual `Rect`. Each node's content box (its rect minus padding) is
-   now a concrete size, so this pass resolves what `measure` could not:
-   `.percent` as a fraction of that concrete content size, and `.grow` as the
-   leftover after fixed/fit/percent siblings are subtracted, divided by weight.
-   `place` then recurses into each child with *that child's own* resolved rect
-   as the new concrete size for its own content box.
+1. **`measureWidths`** — post-order. Text leaves take the max intrinsic
+   paragraph width (`text_wrap.measureIntrinsicWidth`; layout never calls
+   `font.measure` on a leaf string). Custom leaves take their caller-supplied
+   width. Boxes resolve `.fixed` / `.fit` on the width axis; **`.grow` and
+   `.percent` are 0**.
+2. **`placeWidths`** — pre-order. Resolves `rect.x` / `rect.w` the way the
+   historical `place` pass resolved both axes: `.percent` of the parent's
+   content width, `.grow` leftover by weight (or fill, on the cross axis).
+3. **`wrapText`** — every text leaf is split into logical lines at its placed
+   width. `wrap = false` still splits on paragraphs; `wrap = true` also folds
+   inside a paragraph. The leaf's `measured_h` is then the line count
+   (one line uses ink height so a single-line leaf matches the historical size).
+4. **`measureHeights`** — post-order. Re-aggregates `.fit` heights from the
+   (now wrap-aware) children. **`.grow` and `.percent` are 0** here too —
+   the same rule as width measure, including inside a `.fit` parent.
+5. **`placeHeights`** — pre-order. Resolves `rect.y` / `rect.h`.
+
+A leaf still ignores its own `Sizing` at measure time (intrinsic contribution
+only). At place time it is treated like a box. A wrap / clip / ellipsis leaf
+is created with `width = .grow` so a definite-width ancestor gives it a box
+to fold into; a `.fit`-width ancestor still sees the intrinsic measure and
+grows to max-content, so the leaf does not fold.
+
+`measure` + `place` remain as a convenience for callers that do not wrap
+(they seed text height from the paragraph count instead of running `wrapText`).
 
 ## The pitfall: `.grow` on a `.fit` container's main axis is always exactly zero
 

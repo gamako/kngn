@@ -1,22 +1,30 @@
 // Flex layout engine.
-// Two passes: tree build (in context.zig) → measure (post-order DFS) → place (pre-order DFS).
-// This file holds only types and the pure measure / place logic; it does not depend on Context.
+// Five-stage pipeline after tree build (in context.zig):
+//   measureWidths (post-order) → placeWidths (pre-order) → wrapText →
+//   measureHeights (post-order) → placeHeights (pre-order).
+// This file holds only types and the pure measure / place / wrap logic; it does not depend on Context.
+//
+// Hot path declaration: the five stages run every frame on the GUI layout path.
+// They are not a per-pixel loop and do not touch the real-time audio path.
 //
 // Limitations:
-// - no wrap
+// - no flex-item wrap (text wrap is supported; a flex line that wraps to the next row is not)
 // - no absolute positioning
 // - main-axis alignment (justify_content) is start only; right-align etc. by inserting a grow box
 // - no shrink. If children exceed the parent they overflow (clip_children can hide the overflow)
-// - grow / percent children inside a fit parent measure as 0 (the fit parent shrinks accordingly)
+// - grow / percent children inside a fit parent measure as 0 (the fit parent shrinks accordingly).
+//   This holds on both axes, including measureHeights.
 // - percent is relative to the parent content box (after padding, before gap). Floor truncation;
 //   no sum correction among percent children. Leftover px from truncation is absorbed by grow children
 
 const std = @import("std");
+const Allocator = std.mem.Allocator;
 const geom = @import("geom.zig");
 const color_mod = @import("color.zig");
 const draw_mod = @import("draw.zig");
 const font_mod = @import("font.zig");
 const id_mod = @import("id.zig");
+const text_wrap = @import("text_wrap.zig");
 
 pub const Rect = geom.Rect;
 pub const Vec2 = geom.Vec2;
@@ -70,10 +78,21 @@ pub const BoxConfig = struct {
 /// Allocator.Error from DrawList methods is handled inside the callback (catch @panic on OOM is recommended).
 pub const CustomDrawFn = *const fn (ctx: *anyopaque, dl: *DrawList, rect: Rect) void;
 
+pub const Overflow = text_wrap.Overflow;
+
 pub const LeafKind = union(enum) {
     /// font is an override (null = Context font). Affects both measure and draw (the draw cmd's font);
     /// emitNode carries font onto the draw cmd.
-    text: struct { str: []const u8, color: Color, font: ?Font },
+    /// `wrap` folds each paragraph at the placed width. `overflow` applies only to this
+    /// leaf's draw commands (not to CachedRect.clip or hit-test).
+    text: struct {
+        str: []const u8,
+        color: Color,
+        font: ?Font,
+        wrap: bool = false,
+        max_lines: u16 = 0,
+        overflow: Overflow = .visible,
+    },
     custom: struct { measured: Vec2, draw_fn: CustomDrawFn, ctx: *anyopaque },
 };
 
@@ -90,9 +109,12 @@ pub const Node = struct {
     child_count: u32 = 0,
     measured_w: i32 = 0,
     measured_h: i32 = 0,
-    /// Final rect after placement (set by place)
+    /// Final rect after placement (set by placeWidths / placeHeights)
     rect: Rect = .{ .x = 0, .y = 0, .w = 0, .h = 0 },
     leaf: ?LeafKind = null,
+    /// Logical lines from wrapText. Empty until wrapText runs. Slices borrow the
+    /// leaf string or an allocator-owned normalised / ellipsis buffer.
+    lines: []const text_wrap.Line = &.{},
 };
 
 /// Append at the end (O(1) via last_child).
@@ -158,28 +180,72 @@ fn percentOf(content: i32, f: f32) i32 {
     return @intFromFloat(@floor(@as(f64, @floatFromInt(content)) * @as(f64, f)));
 }
 
-/// Measure pass (post-order DFS). Leaves get content size; boxes resolve fixed / fit.
-/// grow / percent are 0 at this stage (folded as 0 when the parent is fit).
-pub fn measure(node: *Node, default_font: Font) void {
+/// Width measure (post-order). Text leaves use `measureIntrinsicWidth` only —
+/// layout never calls `font.measure` on a leaf string directly, so wrap and
+/// non-wrap share one paragraph rule.
+///
+/// Hot path: every frame on the GUI layout path; not a per-pixel loop; not RT.
+pub fn measureWidths(node: *Node, default_font: Font) void {
     if (node.leaf) |leaf| {
         switch (leaf) {
             .text => |t| {
                 const f = t.font orelse default_font;
-                node.measured_w = @intCast(f.measure(t.str));
-                // Logical ink height, not line_height (which includes line gap).
-                node.measured_h = font_mod.fontInkHeight(f);
+                node.measured_w = text_wrap.measureIntrinsicWidth(f, t.str);
             },
             .custom => |c| {
                 node.measured_w = @max(0, c.measured.x);
+            },
+        }
+        return;
+    }
+    var it = node.first_child;
+    while (it) |c| : (it = c.next_sibling) measureWidths(c, default_font);
+    node.measured_w = computeMeasured(node, .w);
+}
+
+/// Height measure (post-order). Text-leaf `measured_h` is already set by wrapText
+/// (or by `seedTextHeightsUnwrapped` when tests call `measure` without wrap).
+/// grow / percent children inside a fit parent measure as 0 on this axis too.
+///
+/// Hot path: every frame on the GUI layout path; not a per-pixel loop; not RT.
+pub fn measureHeights(node: *Node, default_font: Font) void {
+    if (node.leaf) |leaf| {
+        switch (leaf) {
+            .text => {},
+            .custom => |c| {
                 node.measured_h = @max(0, c.measured.y);
             },
         }
         return;
     }
     var it = node.first_child;
-    while (it) |c| : (it = c.next_sibling) measure(c, default_font);
-    node.measured_w = computeMeasured(node, .w);
+    while (it) |c| : (it = c.next_sibling) measureHeights(c, default_font);
     node.measured_h = computeMeasured(node, .h);
+}
+
+fn seedTextHeightsUnwrapped(node: *Node, default_font: Font) void {
+    if (node.leaf) |leaf| {
+        switch (leaf) {
+            .text => |t| {
+                const f = t.font orelse default_font;
+                node.measured_h = text_wrap.heightForLineCount(f, text_wrap.paragraphCount(t.str));
+            },
+            .custom => |c| {
+                node.measured_h = @max(0, c.measured.y);
+            },
+        }
+        return;
+    }
+    var it = node.first_child;
+    while (it) |c| : (it = c.next_sibling) seedTextHeightsUnwrapped(c, default_font);
+}
+
+/// Convenience for callers that do not wrap: measure both axes, using paragraph
+/// count (not wrap-folded line count) for text height.
+pub fn measure(node: *Node, default_font: Font) void {
+    measureWidths(node, default_font);
+    seedTextHeightsUnwrapped(node, default_font);
+    measureHeights(node, default_font);
 }
 
 fn computeMeasured(node: *const Node, axis: Axis) i32 {
@@ -202,85 +268,154 @@ fn computeMeasured(node: *const Node, axis: Axis) i32 {
     }
 }
 
-/// Place pass (pre-order DFS). Walks down while fixing rects from the root.
-/// Requires a prior measure.
-pub fn place(node: *Node, rect: Rect) void {
-    node.rect = rect;
+/// Place widths (pre-order). Sets `rect.x` / `rect.w` from `rect` and resolves
+/// children on the width axis only.
+///
+/// Hot path: every frame on the GUI layout path; not a per-pixel loop; not RT.
+pub fn placeWidths(node: *Node, rect: Rect) void {
+    node.rect.x = rect.x;
+    node.rect.w = rect.w;
     if (node.leaf != null or node.first_child == null) return;
+    placeChildrenOnAxis(node, .w);
+}
 
+/// Place heights (pre-order). Sets `rect.y` / `rect.h` from `rect` and resolves
+/// children on the height axis only.
+///
+/// Hot path: every frame on the GUI layout path; not a per-pixel loop; not RT.
+pub fn placeHeights(node: *Node, rect: Rect) void {
+    node.rect.y = rect.y;
+    node.rect.h = rect.h;
+    if (node.leaf != null or node.first_child == null) return;
+    placeChildrenOnAxis(node, .h);
+}
+
+/// Convenience: place both axes. Requires a prior measure. Does not wrap text.
+pub fn place(node: *Node, rect: Rect) void {
+    placeWidths(node, rect);
+    placeHeights(node, rect);
+}
+
+fn resolveSize(child: *const Node, axis: Axis, content: i32, grow_take: ?i32) i32 {
+    return switch (sizingOf(child, axis)) {
+        .fixed => |n| n,
+        .fit => measuredOf(child, axis),
+        .percent => |f| percentOf(content, f),
+        .grow => |w| blk: {
+            if (grow_take) |take| break :blk take;
+            _ = w;
+            // Cross-axis grow ignores weight and fills parent content.
+            break :blk content;
+        },
+    };
+}
+
+fn placeChildrenOnAxis(node: *Node, axis: Axis) void {
     const cfg = node.cfg;
-    // Content box (after padding). Clamp to 0 if padding exceeds the rect
-    const content_x = rect.x + cfg.padding[3];
-    const content_y = rect.y + cfg.padding[0];
-    const content_w = @max(0, @as(i32, @intCast(rect.w)) - axisPadding(cfg, .w));
-    const content_h = @max(0, @as(i32, @intCast(rect.h)) - axisPadding(cfg, .h));
-
     const main = mainAxis(cfg);
-    const content_main: i32 = if (main == .w) content_w else content_h;
-    const content_cross: i32 = if (main == .w) content_h else content_w;
+    const content_origin: i32 = if (axis == .w)
+        node.rect.x + cfg.padding[3]
+    else
+        node.rect.y + cfg.padding[0];
+    const content_size: i32 = @max(0, @as(i32, @intCast(if (axis == .w) node.rect.w else node.rect.h)) - axisPadding(cfg, axis));
+    const scroll: i32 = if (axis == .w) cfg.scroll_x else cfg.scroll_y;
 
-    // 1. Sum non-grow main-axis sizes and total grow weight
-    var used: i32 = gapTotal(cfg.gap, node.child_count);
-    var grow_total: i64 = 0;
-    var it = node.first_child;
-    while (it) |c| : (it = c.next_sibling) {
-        switch (sizingOf(c, main)) {
-            .fixed => |n| used += n,
-            .fit => used += measuredOf(c, main),
-            .percent => |f| used += percentOf(content_main, f),
-            .grow => |w| grow_total += w,
+    if (main == axis) {
+        var used: i32 = gapTotal(cfg.gap, node.child_count);
+        var grow_total: i64 = 0;
+        var it = node.first_child;
+        while (it) |c| : (it = c.next_sibling) {
+            switch (sizingOf(c, main)) {
+                .fixed => |n| used += n,
+                .fit => used += measuredOf(c, main),
+                .percent => |f| used += percentOf(content_size, f),
+                .grow => |w| grow_total += w,
+            }
+        }
+        var remaining: i64 = @max(0, content_size - used);
+        var w_rest: i64 = grow_total;
+        var cursor: i32 = content_origin - scroll;
+        it = node.first_child;
+        while (it) |c| : (it = c.next_sibling) {
+            const size: i32 = switch (sizingOf(c, main)) {
+                .fixed => |n| n,
+                .fit => measuredOf(c, main),
+                .percent => |f| percentOf(content_size, f),
+                .grow => |w| blk: {
+                    const take: i64 = if (w_rest > 0) @divTrunc(remaining * w, w_rest) else 0;
+                    remaining -= take;
+                    w_rest -= w;
+                    break :blk @intCast(take);
+                },
+            };
+            descendPlace(c, axis, cursor, size);
+            cursor += size + cfg.gap;
+        }
+    } else {
+        var it = node.first_child;
+        while (it) |c| : (it = c.next_sibling) {
+            const size: i32 = resolveSize(c, axis, content_size, null);
+            const cross_off: i32 = switch (cfg.align_cross) {
+                .start => 0,
+                .center => @divFloor(content_size - size, 2),
+                .end => content_size - size,
+            };
+            descendPlace(c, axis, content_origin + cross_off - scroll, size);
         }
     }
+}
 
-    // 2-3. Accumulate-distribute the remainder to grow children by weight while advancing the main-axis cursor and fixing child rects.
-    //      Peel `take = remaining * w / w_rest` in order so no fraction is left and sum(take) == remainder.
-    //      If the remainder is negative (overflow), every grow child gets 0.
-    var remaining: i64 = @max(0, content_main - used);
-    var w_rest: i64 = grow_total;
-    var cursor: i32 = if (main == .w) content_x else content_y;
-    const cross_origin: i32 = if (main == .w) content_y else content_x;
-
-    it = node.first_child;
-    while (it) |c| : (it = c.next_sibling) {
-        const main_size: i32 = switch (sizingOf(c, main)) {
-            .fixed => |n| n,
-            .fit => measuredOf(c, main),
-            .percent => |f| percentOf(content_main, f),
-            .grow => |w| blk: {
-                const take: i64 = if (w_rest > 0) @divTrunc(remaining * w, w_rest) else 0;
-                remaining -= take;
-                w_rest -= w;
-                break :blk @intCast(take);
-            },
-        };
-        const cross: Axis = if (main == .w) .h else .w;
-        const cross_size: i32 = switch (sizingOf(c, cross)) {
-            .fixed => |n| n,
-            .fit => measuredOf(c, cross),
-            .percent => |f| percentOf(content_cross, f),
-            .grow => content_cross, // Cross-axis grow ignores weight and fills parent content
-        };
-        // Cross-axis align uses resolved size (not measured: percent/grow children would be 0)
-        const cross_off: i32 = switch (cfg.align_cross) {
-            .start => 0,
-            .center => @divFloor(content_cross - cross_size, 2),
-            .end => content_cross - cross_size,
-        };
-        // Scroll offset: shift only the child's final position left/up (cursor math unchanged).
-        const child_rect: Rect = if (main == .w) .{
-            .x = cursor - cfg.scroll_x,
-            .y = cross_origin + cross_off - cfg.scroll_y,
-            .w = @intCast(@max(0, main_size)),
-            .h = @intCast(@max(0, cross_size)),
-        } else .{
-            .x = cross_origin + cross_off - cfg.scroll_x,
-            .y = cursor - cfg.scroll_y,
-            .w = @intCast(@max(0, cross_size)),
-            .h = @intCast(@max(0, main_size)),
-        };
-        place(c, child_rect);
-        cursor += main_size + cfg.gap;
+fn descendPlace(child: *Node, axis: Axis, pos: i32, size: i32) void {
+    const s: u32 = @intCast(@max(0, size));
+    if (axis == .w) {
+        placeWidths(child, .{ .x = pos, .y = 0, .w = s, .h = 0 });
+    } else {
+        placeHeights(child, .{ .x = 0, .y = pos, .w = 0, .h = s });
     }
+}
+
+/// Fold every text leaf at its placed width, store logical lines on the node,
+/// and set `measured_h` from the line count. Non-wrap leaves still split on
+/// paragraphs. A single-paragraph, non-wrap, `.visible` leaf that needs no
+/// normalisation leaves `lines` empty (emit uses the original string).
+///
+/// Hot path: every frame on the GUI layout path; not a per-pixel loop; not RT.
+pub fn wrapText(node: *Node, default_font: Font, allocator: Allocator) void {
+    if (node.leaf) |leaf| {
+        switch (leaf) {
+            .text => |t| {
+                const f = t.font orelse default_font;
+                const opts = text_wrap.WrapOpts{
+                    .wrap = t.wrap,
+                    .max_lines = t.max_lines,
+                    .overflow = t.overflow,
+                };
+                const avail: i32 = @intCast(node.rect.w);
+                const wrapped = text_wrap.wrapParagraphs(allocator, f, t.str, avail, opts) catch
+                    @panic("layout.wrapText: OOM");
+                node.lines = wrapped.lines;
+                const n_lines: u32 = if (wrapped.lines.len == 0) 1 else @intCast(wrapped.lines.len);
+                node.measured_h = text_wrap.heightForLineCount(f, n_lines);
+            },
+            .custom => |c| {
+                node.measured_h = @max(0, c.measured.y);
+            },
+        }
+        return;
+    }
+    var it = node.first_child;
+    while (it) |c| : (it = c.next_sibling) wrapText(c, default_font, allocator);
+}
+
+/// Full five-stage layout. Prefer this over `measure` + `place` when text may wrap.
+///
+/// Hot path: every frame on the GUI layout path; not a per-pixel loop; not RT.
+pub fn layoutTree(node: *Node, rect: Rect, font: Font, allocator: Allocator) void {
+    measureWidths(node, font);
+    placeWidths(node, rect);
+    wrapText(node, font, allocator);
+    measureHeights(node, font);
+    placeHeights(node, rect);
 }
 
 // ============================================================
@@ -638,4 +773,174 @@ test "place: scroll_x shifts only child placement left (row)" {
     try std.testing.expectEqual(@as(i32, 15), b.rect.x);
     try std.testing.expectEqual(@as(i32, 0), a.rect.y);
     try std.testing.expectEqual(@as(i32, 0), root.rect.x); // Own rect unchanged
+}
+
+const white = Color.rgba(0xFF, 0xFF, 0xFF, 0xFF);
+
+fn textLeaf(str: []const u8, wrap: bool) Node {
+    return .{
+        .cfg = .{ .width = if (wrap) .{ .grow = 1 } else .fit },
+        .leaf = .{ .text = .{ .str = str, .color = white, .font = null, .wrap = wrap } },
+    };
+}
+
+test "measureWidths: text leaf uses measureIntrinsicWidth (not font.measure)" {
+    var t: Node = textLeaf("ab\nabc", false);
+    measureWidths(&t, test_font);
+    try std.testing.expectEqual(@as(i32, 24), t.measured_w);
+}
+
+test "layoutTree: wrap leaf height under a fixed-width parent" {
+    var arena_inst = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_inst.deinit();
+    var root: Node = .{ .cfg = .{ .direction = .column, .width = .{ .fixed = 40 }, .height = .fit } };
+    var t: Node = textLeaf("hello world", true);
+    appendChild(&root, &t);
+    layoutTree(&root, .{ .x = 0, .y = 0, .w = 40, .h = 200 }, test_font, arena_inst.allocator());
+    try std.testing.expectEqual(@as(u32, 40), t.rect.w);
+    try std.testing.expectEqual(@as(i32, 32), t.measured_h);
+    try std.testing.expectEqual(@as(usize, 2), t.lines.len);
+}
+
+test "layoutTree: wrap leaf height under a grow-width parent" {
+    var arena_inst = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_inst.deinit();
+    var screen: Node = .{ .cfg = .{ .direction = .column, .width = .{ .fixed = 40 }, .height = .{ .fixed = 200 } } };
+    var parent: Node = .{ .cfg = .{ .direction = .column, .width = .{ .grow = 1 }, .height = .fit } };
+    var t: Node = textLeaf("hello world", true);
+    appendChild(&parent, &t);
+    appendChild(&screen, &parent);
+    layoutTree(&screen, .{ .x = 0, .y = 0, .w = 40, .h = 200 }, test_font, arena_inst.allocator());
+    try std.testing.expectEqual(@as(u32, 40), t.rect.w);
+    try std.testing.expectEqual(@as(i32, 32), t.measured_h);
+}
+
+test "layoutTree: wrap leaf height under a percent-width parent" {
+    var arena_inst = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_inst.deinit();
+    var screen: Node = .{ .cfg = .{ .direction = .column, .width = .{ .fixed = 80 }, .height = .{ .fixed = 200 } } };
+    var parent: Node = .{ .cfg = .{ .direction = .column, .width = .{ .percent = 0.5 }, .height = .fit } };
+    var t: Node = textLeaf("hello world", true);
+    appendChild(&parent, &t);
+    appendChild(&screen, &parent);
+    layoutTree(&screen, .{ .x = 0, .y = 0, .w = 80, .h = 200 }, test_font, arena_inst.allocator());
+    try std.testing.expectEqual(@as(u32, 40), t.rect.w);
+    try std.testing.expectEqual(@as(i32, 32), t.measured_h);
+}
+
+test "layoutTree: n=1 wrap matches the non-wrap measured size" {
+    var arena_inst = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_inst.deinit();
+    var wrapped: Node = textLeaf("Hello", true);
+    var plain: Node = textLeaf("Hello", false);
+    layoutTree(&wrapped, .{ .x = 0, .y = 0, .w = 200, .h = 50 }, test_font, arena_inst.allocator());
+    measure(&plain, test_font);
+    place(&plain, .{ .x = 0, .y = 0, .w = 200, .h = 50 });
+    try std.testing.expectEqual(plain.measured_w, wrapped.measured_w);
+    try std.testing.expectEqual(plain.measured_h, wrapped.measured_h);
+    try std.testing.expectEqual(@as(i32, 16), wrapped.measured_h);
+}
+
+test "layoutTree: fit-width parent does not wrap (max-content)" {
+    var arena_inst = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_inst.deinit();
+    var root: Node = .{ .cfg = .{ .direction = .column, .width = .fit, .height = .fit } };
+    var t: Node = textLeaf("hello world", true);
+    appendChild(&root, &t);
+    layoutTree(&root, .{ .x = 0, .y = 0, .w = 200, .h = 50 }, test_font, arena_inst.allocator());
+    try std.testing.expectEqual(@as(i32, 88), root.measured_w);
+    try std.testing.expectEqual(@as(i32, 16), t.measured_h);
+    try std.testing.expectEqual(@as(usize, 1), t.lines.len);
+}
+
+test "layoutTree: wrap works in a row parent" {
+    var arena_inst = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_inst.deinit();
+    var root: Node = .{ .cfg = .{ .direction = .row, .width = .{ .fixed = 40 }, .height = .fit } };
+    var t: Node = textLeaf("hello world", true);
+    appendChild(&root, &t);
+    layoutTree(&root, .{ .x = 0, .y = 0, .w = 40, .h = 200 }, test_font, arena_inst.allocator());
+    try std.testing.expectEqual(@as(u32, 40), t.rect.w);
+    try std.testing.expectEqual(@as(i32, 32), t.measured_h);
+}
+
+test "layoutTree: wrap respects padding, gap, and align_cross" {
+    var arena_inst = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_inst.deinit();
+    var root: Node = .{ .cfg = .{
+        .direction = .row,
+        .width = .{ .fixed = 80 },
+        .height = .{ .fixed = 80 },
+        .padding = .{ 4, 4, 4, 4 },
+        .align_cross = .center,
+    } };
+    var t: Node = textLeaf("hello world", true);
+    appendChild(&root, &t);
+    layoutTree(&root, .{ .x = 0, .y = 0, .w = 80, .h = 80 }, test_font, arena_inst.allocator());
+    try std.testing.expectEqual(@as(u32, 72), t.rect.w);
+    try std.testing.expectEqual(@as(i32, 32), t.measured_h);
+    try std.testing.expectEqual(@as(i32, 4 + @divFloor(72 - 32, 2)), t.rect.y);
+}
+
+test "layoutTree: wrap height under fixed / fit / percent / grow parents" {
+    var arena_inst = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_inst.deinit();
+    const a = arena_inst.allocator();
+    {
+        var root: Node = .{ .cfg = .{ .direction = .column, .width = .{ .fixed = 40 }, .height = .{ .fixed = 10 } } };
+        var t: Node = textLeaf("hello world", true);
+        appendChild(&root, &t);
+        layoutTree(&root, .{ .x = 0, .y = 0, .w = 40, .h = 10 }, test_font, a);
+        try std.testing.expectEqual(@as(i32, 32), t.measured_h);
+        try std.testing.expectEqual(@as(u32, 32), t.rect.h);
+    }
+    {
+        var screen: Node = .{ .cfg = .{ .direction = .column, .width = .{ .fixed = 40 }, .height = .{ .fixed = 100 } } };
+        var parent: Node = .{ .cfg = .{ .direction = .column, .width = .{ .grow = 1 }, .height = .{ .percent = 0.5 } } };
+        var t: Node = textLeaf("hello world", true);
+        appendChild(&parent, &t);
+        appendChild(&screen, &parent);
+        layoutTree(&screen, .{ .x = 0, .y = 0, .w = 40, .h = 100 }, test_font, a);
+        try std.testing.expectEqual(@as(u32, 50), parent.rect.h);
+        try std.testing.expectEqual(@as(i32, 32), t.measured_h);
+    }
+}
+
+test "layoutTree: wrap + cross-axis grow and a nested tree" {
+    var arena_inst = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_inst.deinit();
+    var outer: Node = .{ .cfg = .{
+        .direction = .column,
+        .width = .{ .fixed = 48 },
+        .height = .{ .fixed = 80 },
+        .padding = .{ 2, 2, 2, 2 },
+    } };
+    var inner: Node = .{ .cfg = .{ .direction = .column, .width = .{ .grow = 1 }, .height = .fit } };
+    var t: Node = textLeaf("hello world", true);
+    appendChild(&inner, &t);
+    appendChild(&outer, &inner);
+    layoutTree(&outer, .{ .x = 0, .y = 0, .w = 48, .h = 80 }, test_font, arena_inst.allocator());
+    try std.testing.expectEqual(@as(u32, 44), t.rect.w);
+    try std.testing.expectEqual(@as(i32, 32), t.measured_h);
+    try std.testing.expectEqual(@as(i32, 32), inner.measured_h);
+}
+
+test "axis split: measure+place matches layoutTree for non-wrap text" {
+    var arena_inst = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_inst.deinit();
+    var a: Node = .{ .cfg = .{ .direction = .row, .width = .{ .fixed = 200 }, .height = .{ .fixed = 50 } } };
+    var ta: Node = textLeaf("Hello", false);
+    appendChild(&a, &ta);
+    measure(&a, test_font);
+    place(&a, .{ .x = 0, .y = 0, .w = 200, .h = 50 });
+
+    var b: Node = .{ .cfg = .{ .direction = .row, .width = .{ .fixed = 200 }, .height = .{ .fixed = 50 } } };
+    var tb: Node = textLeaf("Hello", false);
+    appendChild(&b, &tb);
+    layoutTree(&b, .{ .x = 0, .y = 0, .w = 200, .h = 50 }, test_font, arena_inst.allocator());
+
+    try std.testing.expectEqual(a.rect, b.rect);
+    try std.testing.expectEqual(ta.rect, tb.rect);
+    try std.testing.expectEqual(ta.measured_w, tb.measured_w);
+    try std.testing.expectEqual(ta.measured_h, tb.measured_h);
 }

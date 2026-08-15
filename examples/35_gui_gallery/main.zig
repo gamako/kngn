@@ -38,7 +38,7 @@ const SectionMeta = struct {
 const SECTIONS = [_]SectionMeta{
     .{ .name = "overview", .detail = "three axes: widget / state / context", .widgets = 0, .missing = MISSING.len },
     .{ .name = "basic", .detail = "button / label", .widgets = 2, .missing = 0 },
-    .{ .name = "text", .detail = "selectableLabel / textInputId", .widgets = 2, .missing = 0 },
+    .{ .name = "text", .detail = "selectableLabel / textInputId / wrap / overflow", .widgets = 3, .missing = 0 },
     .{ .name = "values", .detail = "slider / checkbox / toggle / radio", .widgets = 4, .missing = 0 },
     .{ .name = "color", .detail = "colorSwatch / SV+hue / imageBox", .widgets = 3, .missing = 0 },
     .{ .name = "layout", .detail = "splitter / scrollArea / iconButton / tooltip / collapsible", .widgets = 5, .missing = 0 },
@@ -69,6 +69,7 @@ const BASIC_MATRIX = [_]MatrixRow{
 const TEXT_MATRIX = [_]MatrixRow{
     .{ .name = "selectable", .cells = .{ "ok", "N/A", "drag", "ok", "N/A", "ok", "N/A", "N/A", "ok" } },
     .{ .name = "textInputId", .cells = .{ "ok", "demo", "demo", "ok", "demo", "ok", "N/A", "N/A", "ok" } },
+    .{ .name = "text wrap", .cells = .{ "ok", "N/A", "N/A", "N/A", "N/A", "ok", "N/A", "N/A", "N/A" } },
 };
 const VALUES_MATRIX = [_]MatrixRow{
     .{ .name = "slider", .cells = .{ "ok", "demo", "demo", "N/A", "demo", "N/A", "ok", "ok", "N/A" } },
@@ -409,6 +410,21 @@ fn renderText(ctx: *gui.Context, app: *App) void {
     // Cmd+C/X to the real clipboard (consumer wiring; same shape as example_28)
     if (input.copy_request) |r| platform.setClipboardText(r.text);
     if (selectable.copy_request) |r| platform.setClipboardText(r.text);
+    ctx.labelEx("wrap + overflow (declarative Context.text)", ctx.style.text_subtle);
+    ctx.beginBox(.{ .width = .{ .fixed = 200 }, .height = .fit, .bg = ctx.style.input_background, .padding = .{ 4, 4, 4, 4 } });
+    ctx.text("The quick brown fox jumps over the lazy dog.", .{ .wrap = true });
+    ctx.endBox();
+    ctx.beginBox(.{ .direction = .column, .gap = 4 });
+    ctx.beginBox(.{ .width = .{ .fixed = 160 }, .height = .{ .fixed = 16 }, .bg = ctx.style.input_background });
+    ctx.text("visible: draws past this box", .{});
+    ctx.endBox();
+    ctx.beginBox(.{ .width = .{ .fixed = 160 }, .height = .{ .fixed = 16 }, .bg = ctx.style.input_background });
+    ctx.text("clip: cut to this box width", .{ .overflow = .clip });
+    ctx.endBox();
+    ctx.beginBox(.{ .width = .{ .fixed = 160 }, .height = .{ .fixed = 16 }, .bg = ctx.style.input_background });
+    ctx.text("ellipsis: marks the cut here", .{ .overflow = .ellipsis });
+    ctx.endBox();
+    ctx.endBox();
 }
 
 fn renderValues(ctx: *gui.Context, app: *App) void {

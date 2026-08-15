@@ -195,15 +195,18 @@ contract.
 
 ### 3. Multiline text editing — likely wanted, not built yet
 
-**Current state.** `libs/gui/src/text_edit.zig`'s own doc comment already states the
-contract precisely: "Grapheme clusters, multi-line layout, and glyph fallback are not
-implemented. Newlines are rejected on the `TextBuffer` edit path; label display still
-advances one codepoint but does not wrap to the next line." This is not a gap this ADR is
-discovering — it is an existing, deliberate boundary of `Context.textInputId`, restated
-here only to record why it has been left alone rather than closed as part of the
-widget-repertoire work. Grapheme clusters and glyph fallback are already a separate,
-already-documented boundary of the same file; adding line wrap does not by itself require
-solving either of those, and this record does not fold them into what "multiline" needs.
+**Current state.** Display wrapping and declarative overflow are implemented
+(`Context.text` with `TextOptions.wrap` / `.overflow`). `label` / `labelEx` split on
+paragraphs but do not auto-wrap. `labelEllipsis` / `ellipsizeText` stay for callers that
+need `truncated` in the same frame (examples 40 / 42 / 43). That is display only.
+
+`libs/gui/src/text_edit.zig`'s own doc comment still states the *editing* contract:
+grapheme clusters, multi-line layout, and glyph fallback are not implemented, and
+newlines are rejected on the `TextBuffer` edit path. This ADR's open item is multiline
+*editing* (`textInputId` remains single-line), not display wrap. Grapheme clusters and
+glyph fallback are already a separate, already-documented boundary of the same file;
+adding line wrap on the display path does not close those, and this record does not fold
+them into what "multiline editing" needs.
 
 **Why not now.** Every reproduction shell built so far — the settings form, the list+menu
 filter field, the tracker's per-track detail panel — uses single-line `textInputId` and none

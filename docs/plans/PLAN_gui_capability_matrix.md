@@ -77,7 +77,7 @@ lands or a gap closes; nothing technical ties the two together.
 | Category | Concrete API |
 |---|---|
 | Basic | Context.buttonId, Context.label |
-| Text | gui.selectableLabelId, Context.textInputId, Context.labelEllipsis / gui.ellipsizeText |
+| Text | gui.selectableLabelId, Context.textInputId, Context.text (wrap / overflow), Context.labelEllipsis / gui.ellipsizeText |
 | Values | Context.sliderI32Id, Context.sliderF32Id, Context.checkboxId, Context.toggleId, Context.radioId |
 | Color / Image | Context.colorSwatchId, Context.svSquareId, Context.hueBarId, Context.imageBox |
 | Layout | gui.splitter, Context.beginScrollArea/endScrollArea, Context.beginFormRow/endFormRow |

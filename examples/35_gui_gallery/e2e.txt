@@ -44,7 +44,7 @@ inject key_up PAGE_DOWN
 step 1
 digest gallery
 expect gallery section=text
-expect gallery widgets=2
+expect gallery widgets=3
 snapshot fb
 # y=150 (not basic's 112): the "Disabled" checkbox demo (added by the disabled-scope work)
 # is now the first widget in this section, pushing textInputId down one row.

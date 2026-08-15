@@ -61,6 +61,10 @@ pub const draw_cmd_text = @import("draw_cmd_text.zig");
 /// and composite it after the application's own `render`. Empty is one null check.
 pub const Overlay = @import("overlay.zig").Overlay;
 
+pub const text_wrap = @import("text_wrap.zig");
+pub const WrapOpts = @import("text_wrap.zig").WrapOpts;
+pub const TextLine = @import("text_wrap.zig").Line;
+
 pub const Font = @import("font.zig").Font;
 pub const Metrics = @import("font.zig").Metrics;
 pub const BitmapFont = @import("font.zig").BitmapFont;
@@ -116,6 +120,7 @@ pub const byteIndex = @import("text_edit.zig").byteIndex;
 pub const wordRange = @import("text_edit.zig").wordRange;
 
 pub const Context = @import("context.zig").Context;
+pub const TextOptions = @import("context.zig").TextOptions;
 pub const ButtonResult = @import("context.zig").ButtonResult;
 pub const buttonBehavior = @import("context.zig").buttonBehavior;
 pub const pointHitsVisible = @import("context.zig").pointHitsVisible;
@@ -125,6 +130,7 @@ pub const CachedRect = @import("context.zig").CachedRect;
 pub const Direction = @import("layout.zig").Direction;
 pub const Sizing = @import("layout.zig").Sizing;
 pub const Align = @import("layout.zig").Align;
+pub const Overflow = @import("layout.zig").Overflow;
 pub const BoxConfig = @import("layout.zig").BoxConfig;
 pub const Border = @import("layout.zig").Border;
 pub const CustomDrawFn = @import("layout.zig").CustomDrawFn;
@@ -279,4 +285,5 @@ test {
     _ = @import("draw_cmd_text.zig");
     _ = @import("drawlist_wire.zig");
     _ = @import("overlay.zig");
+    _ = @import("text_wrap.zig");
 }

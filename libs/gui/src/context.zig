@@ -15,8 +15,9 @@
 //                    next beginFrame, so forwarding platform events before opening the frame is
 //                    just as correct as forwarding them after (see StagedInput in input.zig).
 //   widget calls: sync hit-test against the previous-frame rect_cache (never the layout rects still under construction)
-//   endFrame():      measure → place → rect_cache.clearRetainingCapacity → updateRectCache
-//                    → emitNode (emit draw cmds) → frame_active=false
+//   endFrame():      layoutTree (measureWidths → placeWidths → wrapText →
+//                    measureHeights → placeHeights) → rect_cache.clearRetainingCapacity
+//                    → updateRectCache → emitNode (emit draw cmds) → frame_active=false
 //                    → focus cleanup → active cleanup → PerIdStateStore.trim (frame boundary only)
 //                    No hit-test here. The new rect_cache is referenced from the next frame after this endFrame completes.
 //                    Does not touch the arena (Context is the contract guardian).
@@ -53,6 +54,7 @@ const id_mod = @import("id.zig");
 const input_mod = @import("input.zig");
 const state_mod = @import("state.zig");
 const layout = @import("layout.zig");
+const text_wrap_mod = @import("text_wrap.zig");
 const style_mod = @import("style.zig");
 // Mutual import with widgets.zig (widgets take *Context; Zig import cycles are legal).
 // Decl aliases inside the Context struct provide `ctx.button(...)` method syntax.
@@ -94,6 +96,16 @@ pub const DragState = dnd_mod.DragState;
 /// This node's own `clip_children` is not stored here; it only affects the child_clip passed downward.
 /// `buttonBehavior` / TextInput / SelectableLabel share the `pointHitsVisible(rect, clip, p)` predicate.
 pub const CachedRect = struct { rect: Rect, clip: Rect, measured_w: i32 = 0, measured_h: i32 = 0 };
+
+/// Options for `Context.text`. `color = null` uses `style.text`. `max_lines = 0`
+/// means unlimited for `.visible` / `.clip`, and 1 for `.ellipsis`.
+pub const TextOptions = struct {
+    color: ?Color = null,
+    font: ?Font = null,
+    wrap: bool = false,
+    max_lines: u16 = 0,
+    overflow: layout.Overflow = .visible,
+};
 
 /// Internal state carried across a scroll area's begin→end. begin computes from the previous-frame cache,
 /// pushes onto scroll_stack; end pops and builds the scrollbar.
@@ -443,16 +455,15 @@ pub const Context = struct {
         // Frames that never use the layout API (empty root) skip layout / emit / cache update
         // entirely: compatible with manual DrawList use (examples 08/09). rect_cache keeps the previous values.
         if (root.first_child != null) {
-            layout.measure(root, self.font);
             const screen_rect = Rect{ .x = 0, .y = 0, .w = self.screen_w, .h = self.screen_h };
-            layout.place(root, screen_rect);
+            layout.layoutTree(root, screen_rect, self.font, self.allocator());
             self.rect_cache.clearRetainingCapacity();
             self.updateRectCache(root, screen_rect);
             self.emitNode(root);
         }
         // tooltip overlay: after layout UI, before frame_active=false (below popupMenu; popup runs after endFrame).
-        if (self.tooltip_candidate_text) |text| {
-            popup_mod.drawTooltipOverlay(self, text, self.tooltip_candidate_anchor);
+        if (self.tooltip_candidate_text) |tip| {
+            popup_mod.drawTooltipOverlay(self, tip, self.tooltip_candidate_anchor);
         }
         // If the target was not refreshed this frame, clear the timer (suppress stale overlays for hidden widgets)
         if (self.tooltip_hover_id != 0 and !self.tooltip_hover_refreshed) {
@@ -735,7 +746,7 @@ pub const Context = struct {
     /// Attach a tooltip to the interactive widget just evaluated.
     /// No-op if not hovered this frame. When the same id+rect has been continuous for >= `tooltip_delay_s`,
     /// raise an overlay candidate at the end of endFrame. text is duped onto the frame arena.
-    pub fn tooltip(self: *Context, text: []const u8) void {
+    pub fn tooltip(self: *Context, tip: []const u8) void {
         self.requireFrame("tooltip");
         if (!self.tooltip_last_hovered or self.tooltip_last_id == 0) return;
 
@@ -750,7 +761,7 @@ pub const Context = struct {
 
         if (self.now() - self.tooltip_hover_start_s < tooltip_delay_s) return;
 
-        const dup = self.allocator().dupe(u8, text) catch @panic("tooltip: OOM");
+        const dup = self.allocator().dupe(u8, tip) catch @panic("tooltip: OOM");
         self.tooltip_candidate_text = dup;
         self.tooltip_candidate_anchor = rect;
     }
@@ -806,7 +817,8 @@ pub const Context = struct {
     }
 
     /// text leaf (default color = style.text). str is duped onto the arena, so it does not
-    /// depend on the caller buffer's lifetime.
+    /// depend on the caller buffer's lifetime. Paragraph breaks become multiple lines;
+    /// paragraphs themselves are not wrapped (`overflow = .visible`).
     pub fn label(self: *Context, str: []const u8) void {
         self.labelEx(str, self.style.text);
     }
@@ -815,6 +827,23 @@ pub const Context = struct {
         self.requireFrame("labelEx");
         const dup = self.allocator().dupe(u8, str) catch @panic("Context.labelEx: OOM");
         self.addLeaf(.{ .text = .{ .str = dup, .color = col, .font = null } });
+    }
+
+    /// Declarative text leaf. `str` is duped onto the frame arena (same ownership as `labelEx`).
+    /// `wrap` folds each paragraph at the placed width. `overflow = .ellipsis` with
+    /// `max_lines = 0` resolves to one line plus an ellipsis.
+    pub fn text(self: *Context, str: []const u8, opts: TextOptions) void {
+        self.requireFrame("text");
+        const dup = self.allocator().dupe(u8, str) catch @panic("Context.text: OOM");
+        const col = opts.color orelse self.style.text;
+        self.addLeaf(.{ .text = .{
+            .str = dup,
+            .color = col,
+            .font = opts.font,
+            .wrap = opts.wrap,
+            .max_lines = opts.max_lines,
+            .overflow = opts.overflow,
+        } });
     }
 
     /// custom leaf. size is used as the measure result; draw_fn is called with the final rect
@@ -854,8 +883,17 @@ pub const Context = struct {
     fn addLeaf(self: *Context, leaf: layout.LeafKind) void {
         const parent = self.layout_current.?;
         const node = self.allocator().create(layout.Node) catch @panic("Context.addLeaf: OOM");
+        // Wrap / clip / ellipsis need a definite width, so the leaf grows on the
+        // width axis. A fit-width ancestor still sees the leaf's intrinsic
+        // measure (leaves ignore Sizing at measure time) and expands to
+        // max-content — wrap then sees that intrinsic width and does not fold.
+        const need_definite_w = switch (leaf) {
+            .text => |t| t.wrap or t.overflow != .visible,
+            .custom => false,
+        };
         node.* = .{
             .id = id_mod.hashInt(parent.id, parent.child_count),
+            .cfg = .{ .width = if (need_definite_w) .{ .grow = 1 } else .fit },
             .leaf = leaf,
         };
         layout.appendChild(parent, node);
@@ -894,12 +932,30 @@ pub const Context = struct {
     fn emitNode(self: *Context, node: *const layout.Node) void {
         if (node.leaf) |leaf| {
             switch (leaf) {
-                .text => |t| self.draw_list.textEx(
-                    .{ .x = node.rect.x, .y = node.rect.y },
-                    t.str,
-                    t.color,
-                    t.font,
-                ) catch @panic("Context.endFrame: OOM"),
+                .text => |t| {
+                    const clip_self = t.overflow == .clip;
+                    if (clip_self) {
+                        self.draw_list.pushClip(node.rect) catch @panic("Context.endFrame: OOM");
+                    }
+                    if (node.lines.len == 0) {
+                        self.draw_list.textEx(
+                            .{ .x = node.rect.x, .y = node.rect.y },
+                            t.str,
+                            t.color,
+                            t.font,
+                        ) catch @panic("Context.endFrame: OOM");
+                    } else {
+                        for (node.lines) |line| {
+                            self.draw_list.textEx(
+                                .{ .x = node.rect.x, .y = node.rect.y + line.y_offset },
+                                line.text,
+                                t.color,
+                                t.font,
+                            ) catch @panic("Context.endFrame: OOM");
+                        }
+                    }
+                    if (clip_self) self.draw_list.popClip();
+                },
                 .custom => |c| c.draw_fn(c.ctx, &self.draw_list, node.rect),
             }
             return;
@@ -2328,4 +2384,284 @@ test "Context: a slider group opened and closed in one frame leaves no state beh
 
     try std.testing.expect(ctx.slider_group == null);
     try std.testing.expectEqual(@as(u32, 0), ctx.disabled_depth);
+}
+
+fn countTextCmds(ctx: *const Context) usize {
+    var n: usize = 0;
+    for (ctx.draw_list.cmds.items) |cmd| {
+        if (cmd == .text) n += 1;
+    }
+    return n;
+}
+
+fn firstText(ctx: *const Context) ?draw.DrawCmd {
+    for (ctx.draw_list.cmds.items) |cmd| {
+        if (cmd == .text) return cmd;
+    }
+    return null;
+}
+
+test "label: explicit newline is two lines without wrap" {
+    var ctx = testCtx();
+    defer ctx.deinit();
+    ctx.beginFrame(800, 600);
+    ctx.beginBox(.{});
+    ctx.label("a\nb");
+    ctx.endBox();
+    ctx.endFrame();
+    try std.testing.expectEqual(@as(usize, 2), countTextCmds(&ctx));
+    var i: usize = 0;
+    var texts: [2][]const u8 = .{ "", "" };
+    for (ctx.draw_list.cmds.items) |cmd| {
+        if (cmd == .text) {
+            texts[i] = cmd.text.text;
+            i += 1;
+        }
+    }
+    try std.testing.expectEqualStrings("a", texts[0]);
+    try std.testing.expectEqualStrings("b", texts[1]);
+}
+
+test "label: control-free non-wrap is one command and bit-identical to the prior contract" {
+    var ctx = testCtx();
+    defer ctx.deinit();
+    ctx.beginFrame(800, 600);
+    ctx.beginBox(.{});
+    ctx.label("hello");
+    ctx.endBox();
+    ctx.endFrame();
+    try std.testing.expectEqual(@as(usize, 1), countTextCmds(&ctx));
+    const cmd = firstText(&ctx).?.text;
+    try std.testing.expectEqualStrings("hello", cmd.text);
+    try std.testing.expectEqual(@as(i32, 0), cmd.pos.x);
+    try std.testing.expectEqual(@as(i32, 0), cmd.pos.y);
+    try std.testing.expectEqual(@as(u32, 800), cmd.clip.w);
+    try std.testing.expectEqual(@as(u32, 600), cmd.clip.h);
+}
+
+test "text: wrap emits one command per logical line" {
+    var ctx = testCtx();
+    defer ctx.deinit();
+    ctx.beginFrame(40, 200);
+    ctx.beginBox(.{ .width = .{ .fixed = 40 }, .height = .fit });
+    ctx.text("hello world", .{ .wrap = true });
+    ctx.endBox();
+    ctx.endFrame();
+    try std.testing.expectEqual(@as(usize, 2), countTextCmds(&ctx));
+}
+
+test "text: leaf clip is baked as ancestor clip intersect self rect" {
+    var ctx = testCtx();
+    defer ctx.deinit();
+    ctx.beginFrame(800, 600);
+    ctx.beginBox(.{ .width = .{ .fixed = 80 }, .height = .{ .fixed = 16 }, .clip_children = true });
+    ctx.text("abcdefghijklmnop", .{ .overflow = .clip });
+    ctx.endBox();
+    ctx.endFrame();
+    const cmd = firstText(&ctx).?.text;
+    try std.testing.expectEqual(@as(i32, 0), cmd.clip.x);
+    try std.testing.expectEqual(@as(u32, 80), cmd.clip.w);
+    try std.testing.expectEqual(@as(u32, 16), cmd.clip.h);
+}
+
+test "text: ellipsis + max_lines=0 is one line with a marker (wrap on and off)" {
+    var ctx = testCtx();
+    defer ctx.deinit();
+    ctx.beginFrame(40, 200);
+    ctx.beginBox(.{ .direction = .column, .width = .{ .fixed = 40 }, .gap = 4 });
+    ctx.text("abcdefghij", .{ .overflow = .ellipsis });
+    ctx.text("abcdefghij", .{ .wrap = true, .overflow = .ellipsis });
+    ctx.endBox();
+    ctx.endFrame();
+    try std.testing.expectEqual(@as(usize, 2), countTextCmds(&ctx));
+    for (ctx.draw_list.cmds.items) |cmd| {
+        if (cmd == .text) {
+            try std.testing.expect(std.mem.endsWith(u8, cmd.text.text, "..."));
+            try std.testing.expect(@as(i32, @intCast(ctx.font.measure(cmd.text.text))) <= 40);
+        }
+    }
+}
+
+test "text: visible + max_lines=0 is unlimited" {
+    var ctx = testCtx();
+    defer ctx.deinit();
+    ctx.beginFrame(24, 400);
+    ctx.beginBox(.{ .width = .{ .fixed = 24 }, .height = .fit });
+    ctx.text("one two three four five", .{ .wrap = true });
+    ctx.endBox();
+    ctx.endFrame();
+    try std.testing.expect(countTextCmds(&ctx) > 2);
+}
+
+test "text: clip + max_lines>0 hard-cuts without an ellipsis" {
+    var ctx = testCtx();
+    defer ctx.deinit();
+    ctx.beginFrame(24, 200);
+    ctx.beginBox(.{ .width = .{ .fixed = 24 }, .height = .fit });
+    ctx.text("one two three four", .{ .wrap = true, .max_lines = 2, .overflow = .clip });
+    ctx.endBox();
+    ctx.endFrame();
+    try std.testing.expectEqual(@as(usize, 2), countTextCmds(&ctx));
+    for (ctx.draw_list.cmds.items) |cmd| {
+        if (cmd == .text) try std.testing.expect(!std.mem.endsWith(u8, cmd.text.text, "..."));
+    }
+}
+
+test "text: ellipsis + max_lines=3 puts the marker on the last visible line" {
+    var ctx = testCtx();
+    defer ctx.deinit();
+    ctx.beginFrame(24, 200);
+    ctx.beginBox(.{ .width = .{ .fixed = 24 }, .height = .fit });
+    ctx.text("one two three four five", .{ .wrap = true, .max_lines = 3, .overflow = .ellipsis });
+    ctx.endBox();
+    ctx.endFrame();
+    try std.testing.expectEqual(@as(usize, 3), countTextCmds(&ctx));
+    var last: []const u8 = "";
+    for (ctx.draw_list.cmds.items) |cmd| {
+        if (cmd == .text) last = cmd.text.text;
+    }
+    try std.testing.expect(std.mem.endsWith(u8, last, "..."));
+}
+
+test "text: visible + max_lines>0 hard-cuts logical lines" {
+    var ctx = testCtx();
+    defer ctx.deinit();
+    ctx.beginFrame(24, 200);
+    ctx.beginBox(.{ .width = .{ .fixed = 24 }, .height = .fit });
+    ctx.text("one two three four", .{ .wrap = true, .max_lines = 2, .overflow = .visible });
+    ctx.endBox();
+    ctx.endFrame();
+    try std.testing.expectEqual(@as(usize, 2), countTextCmds(&ctx));
+}
+
+test "text: non-wrap explicit newline + ellipsis width-guarantees every line" {
+    var ctx = testCtx();
+    defer ctx.deinit();
+    ctx.beginFrame(40, 200);
+    ctx.beginBox(.{ .width = .{ .fixed = 40 } });
+    ctx.text("abcdefgh\nx", .{ .max_lines = 2, .overflow = .ellipsis });
+    ctx.endBox();
+    ctx.endFrame();
+    try std.testing.expectEqual(@as(usize, 2), countTextCmds(&ctx));
+    var i: usize = 0;
+    for (ctx.draw_list.cmds.items) |cmd| {
+        if (cmd != .text) continue;
+        try std.testing.expect(@as(i32, @intCast(ctx.font.measure(cmd.text.text))) <= 40);
+        if (i == 0) try std.testing.expect(std.mem.endsWith(u8, cmd.text.text, "..."));
+        if (i == 1) try std.testing.expectEqualStrings("x", cmd.text.text);
+        i += 1;
+    }
+}
+
+test "text: non-wrap explicit newline + max_lines ellipsis targets the last visible line" {
+    var ctx = testCtx();
+    defer ctx.deinit();
+    ctx.beginFrame(200, 200);
+    ctx.beginBox(.{ .width = .{ .fixed = 200 } });
+    ctx.text("one\ntwo\nthree", .{ .max_lines = 2, .overflow = .ellipsis });
+    ctx.endBox();
+    ctx.endFrame();
+    try std.testing.expectEqual(@as(usize, 2), countTextCmds(&ctx));
+    var last: []const u8 = "";
+    for (ctx.draw_list.cmds.items) |cmd| {
+        if (cmd == .text) last = cmd.text.text;
+    }
+    try std.testing.expect(std.mem.endsWith(u8, last, "..."));
+}
+
+test "text: explicit-ID previous-frame rect and hit-test ignore leaf overflow" {
+    var ctx = testCtx();
+    defer ctx.deinit();
+    const id: Id = 42;
+    ctx.beginFrame(200, 80);
+    ctx.beginBox(.{ .id = id, .width = .{ .fixed = 80 }, .height = .{ .fixed = 20 } });
+    ctx.text("abcdefghijklmnop", .{ .overflow = .clip });
+    ctx.endBox();
+    ctx.endFrame();
+    const cached = ctx.getNodeCachedRect(id).?;
+    try std.testing.expectEqual(@as(u32, 80), cached.rect.w);
+    try std.testing.expectEqual(@as(u32, 20), cached.rect.h);
+    try std.testing.expectEqual(@as(u32, 200), cached.clip.w);
+
+    ctx.beginFrame(200, 80);
+    const again = ctx.getNodeCachedRect(id).?;
+    try std.testing.expectEqual(cached.rect, again.rect);
+    try std.testing.expectEqual(cached.clip, again.clip);
+    const hit = buttonBehavior(&ctx, id, again.rect, again.clip);
+    _ = hit;
+    ctx.beginBox(.{ .id = id, .width = .{ .fixed = 80 }, .height = .{ .fixed = 20 } });
+    ctx.text("abcdefghijklmnop", .{ .overflow = .clip });
+    ctx.endBox();
+    ctx.endFrame();
+}
+
+test "text: ScrollArea natural height appears next frame and converges in two frames after a width change" {
+    var ctx = testCtx();
+    defer ctx.deinit();
+    const sid: Id = 100;
+    const content_id = id_mod.hashInt(sid, 1);
+    var scroll = Vec2f{ .x = 0, .y = 0 };
+    const opts = widgets.ScrollAreaOpts{ .content_width = .{ .grow = 1 } };
+
+    // Frame 1: no previous measured. After endFrame the wrap height is in the cache
+    // (the scrollbar itself appears next frame — previous-frame contract).
+    ctx.beginFrame(40, 40);
+    try std.testing.expect(ctx.getNodeMeasured(content_id) == null);
+    ctx.beginScrollArea(sid, &scroll, opts);
+    ctx.text("hello world hello world", .{ .wrap = true });
+    ctx.endScrollArea();
+    ctx.endFrame();
+    const h1 = ctx.getNodeMeasured(content_id).?.y;
+    try std.testing.expect(h1 > 16);
+
+    // Frame 2: beginScrollArea reads h1. A newly appearing scrollbar can change
+    // the wrap width, so measured_h may move once more.
+    ctx.beginFrame(40, 40);
+    try std.testing.expectEqual(h1, ctx.getNodeMeasured(content_id).?.y);
+    ctx.beginScrollArea(sid, &scroll, opts);
+    ctx.text("hello world hello world", .{ .wrap = true });
+    ctx.endScrollArea();
+    ctx.endFrame();
+
+    ctx.beginFrame(40, 40);
+    ctx.beginScrollArea(sid, &scroll, opts);
+    ctx.text("hello world hello world", .{ .wrap = true });
+    ctx.endScrollArea();
+    ctx.endFrame();
+    const h_stable = ctx.getNodeMeasured(content_id).?.y;
+    ctx.beginFrame(40, 40);
+    try std.testing.expectEqual(h_stable, ctx.getNodeMeasured(content_id).?.y);
+    ctx.beginScrollArea(sid, &scroll, opts);
+    ctx.text("hello world hello world", .{ .wrap = true });
+    ctx.endScrollArea();
+    ctx.endFrame();
+    try std.testing.expectEqual(h_stable, ctx.getNodeMeasured(content_id).?.y);
+
+    // Width change: this frame still sees the old height; the next frame settles.
+    ctx.beginFrame(80, 40);
+    try std.testing.expectEqual(h_stable, ctx.getNodeMeasured(content_id).?.y);
+    ctx.beginScrollArea(sid, &scroll, opts);
+    ctx.text("hello world hello world", .{ .wrap = true });
+    ctx.endScrollArea();
+    ctx.endFrame();
+    const h_after_resize = ctx.getNodeMeasured(content_id).?.y;
+    try std.testing.expect(h_after_resize < h_stable);
+
+    ctx.beginFrame(80, 40);
+    ctx.beginScrollArea(sid, &scroll, opts);
+    ctx.text("hello world hello world", .{ .wrap = true });
+    ctx.endScrollArea();
+    ctx.endFrame();
+    try std.testing.expectEqual(h_after_resize, ctx.getNodeMeasured(content_id).?.y);
+}
+
+test "ellipsizeText: Context wrapper matches text_wrap.truncate" {
+    var ctx = testCtx();
+    defer ctx.deinit();
+    ctx.beginFrame(200, 40);
+    const via_ctx = ctx.ellipsizeText("a-very-long-file-name-that-does-not-fit-the-column.txt", 80);
+    const via_mod = text_wrap_mod.truncate(ctx.allocator(), ctx.font, "a-very-long-file-name-that-does-not-fit-the-column.txt", 80) catch unreachable;
+    try std.testing.expectEqualStrings(via_mod.text, via_ctx.text);
+    try std.testing.expectEqual(via_mod.truncated, via_ctx.truncated);
+    ctx.endFrame();
 }

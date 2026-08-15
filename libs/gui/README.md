@@ -17,7 +17,8 @@ Immediate-mode GUI library for KNGN. Standalone and platform-independent;
 | `src/id.zig` | Widget ID (FNV-1a) + IdStack |
 | `src/state.zig` | hot / active / focused |
 | `src/context.zig` | Context (frame lifecycle + tree build + hit-test) |
-| `src/layout.zig` | Flex layout engine (measure / place) |
+| `src/layout.zig` | Flex layout engine (measureWidths / placeWidths / wrapText / measureHeights / placeHeights) |
+| `src/text_wrap.zig` | Paragraph split, wrap, declarative overflow, low-level `truncate` |
 | `src/style.zig` | Shared widget style (colours / sizes / padding, …) |
 | `src/widgets.zig` | Basic widgets (Button / Label / ColorSwatch / Slider / HSV picker / ScrollArea / checkbox / toggle / radio / Tabs / Listbox / ellipsis / form row) |
 
@@ -97,9 +98,16 @@ scope to avoid that.
 
 Two smaller helpers round out a settings-style form:
 
+- `ctx.text(str, TextOptions)` — declarative text leaf. `wrap` folds each paragraph at the
+  placed width; `overflow` is `.visible` / `.clip` / `.ellipsis` (`.ellipsis` with
+  `max_lines = 0` is one line plus a marker). Use this when the leaf should simply fit
+  its box. `label` / `labelEx` stay the terse path: no auto-wrap, but explicit paragraph
+  breaks still become multiple lines.
 - `ctx.labelEllipsis(text, max_w, color) EllipsisResult` / `gui.ellipsizeText(ctx, text, max_w)`
   — draw (or just compute) `text` truncated to a trailing `"..."` once it would exceed `max_w`
-  px, codepoint-aware. `result.truncated` says whether it was shortened.
+  px, codepoint-aware. `result.truncated` is available **in the same frame**, which is why
+  examples 40 / 42 / 43 still use this path for tooltips. The low-level helper may return
+  `"..."` even when that marker is wider than `max_w` (pixie caret / IME composition).
 - `ctx.beginFormRow(opts) / ctx.endFormRow()` — an optional label above and an optional subtle
   description below, wrapping the control(s) the caller builds in between (same begin/end
   shape as `beginCollapsible`); replaces hand-stacking `ctx.label` / `ctx.labelEx` next to a
@@ -139,7 +147,7 @@ classic slot under the hood and are unaffected by any of the above.
 
 ## Layout engine limits
 
-- No wrap
+- No flex-item wrap (text wrap is supported via `ctx.text(..., .{ .wrap = true })`)
 - No absolute positioning
 - Main-axis alignment (`justify_content`) is start only. Right-align with a grow spacer box
 - No shrink. When children exceed the parent, they overflow (visual clipping via `clip_children`)
@@ -207,7 +215,8 @@ The popup and menu-bar overlays are emitted after `endFrame` and land on top of 
 
 A widget call (`ctx.button(...)` and friends) hits-test and returns its result
 synchronously, but this frame's own layout is not known yet at that point — layout
-(`layout.measure` then `layout.place`) runs once, in `endFrame`, after every widget
+(`layout.layoutTree`: measureWidths → placeWidths → wrapText → measureHeights → placeHeights)
+runs once, in `endFrame`, after every widget
 for the frame has been built (sibling measurement and parent sizing mean it cannot
 run any earlier). So a widget call hits-test against the **rect cache from the
 previous completed frame** instead: draw uses this frame's new layout, hit-test
