@@ -19,7 +19,7 @@ Immediate-mode GUI library for KNGN. Standalone and platform-independent;
 | `src/context.zig` | Context (frame lifecycle + tree build + hit-test) |
 | `src/layout.zig` | Flex layout engine (measureWidths / placeWidths / wrapText / measureHeights / placeHeights) |
 | `src/text_wrap.zig` | Paragraph split, wrap, declarative overflow, low-level `truncate` |
-| `src/style.zig` | Shared widget style (colours / sizes / padding, …) |
+| `src/style.zig` | Shared widget style (colours / sizes / padding / text tiers, …) |
 | `src/widgets.zig` | Basic widgets (Button / Label / ColorSwatch / Slider / HSV picker / ScrollArea / checkbox / toggle / radio / Tabs / Listbox / ellipsis / form row) |
 
 ## Frame flow
@@ -92,9 +92,12 @@ scope to avoid that.
 - `ctx.beginListboxRow(id, selected: bool, opts) ListboxRowResult` / `ctx.endListboxRow()` —
   one row of a single-select list; wrap arbitrary row content between the two calls (the same
   begin/end shape as `beginCollapsible`). Registers as a Tab stop only while `selected`, so a
-  long list costs Tab one stop rather than one per row. `gui.pollListNav(ctx, active_row_id)`
-  reports Up/Down for a row that holds the focus, once per frame, before any row is built —
-  see "Keyboard focus" below for why the caller applies the move itself.
+  long list costs Tab one stop rather than one per row. `opts.depth` draws a row-local indent
+  guide (1px `style.border` lines at `x = i * style.indent_w`). `depth = 0` is bit-identical
+  to a row with no guide; `indent_w == 0` emits none; `direction == .column` with `depth > 0`
+  is a contract violation. A gap between rows breaks the vertical line. `gui.pollListNav(ctx,
+  active_row_id)` reports Up/Down for a row that holds the focus, once per frame, before any
+  row is built — see "Keyboard focus" below for why the caller applies the move itself.
 
 Two smaller helpers round out a settings-style form:
 
@@ -103,6 +106,10 @@ Two smaller helpers round out a settings-style form:
   `max_lines = 0` is one line plus a marker). Use this when the leaf should simply fit
   its box. `label` / `labelEx` stay the terse path: no auto-wrap, but explicit paragraph
   breaks still become multiple lines.
+- `ctx.labelStyled(str, tier)` — `heading` / `body` / `caption` / `muted`. Delegates to
+  `text` with that tier's `Style` color and optional font. A null font uses `ctx.font`;
+  the library never creates fonts, so a size difference appears only when the app stores
+  a generated `Font` on `style.heading` (or another tier).
 - `ctx.labelEllipsis(text, max_w, color) EllipsisResult` / `gui.ellipsizeText(ctx, text, max_w)`
   — draw (or just compute) `text` truncated to a trailing `"..."` once it would exceed `max_w`
   px, codepoint-aware. `result.truncated` is available **in the same frame**, which is why
@@ -147,14 +154,18 @@ classic slot under the hood and are unaffected by any of the above.
 
 ## Layout engine limits
 
-- No flex-item wrap (text wrap is supported via `ctx.text(..., .{ .wrap = true })`)
-- No absolute positioning
+- Flex wrap is supported (`BoxConfig.wrap`). Illegal when the main axis is `.fit`, or when a
+  grow/percent main axis is paired with a `.fit` cross axis
+- Anchored children (`BoxConfig.anchor`) are overlays: they take no part in the parent's fit
+  measure, main-axis cursor, gap, grow share, wrap line split, or line cross size. Their own
+  size is resolved against the parent content box (grow fills that box). Draw order is tree
+  order — later siblings paint on top
 - Main-axis alignment (`justify_content`) is start only. Right-align with a grow spacer box
 - No shrink. When children exceed the parent, they overflow (visual clipping via `clip_children`)
 - grow / percent children inside a fit parent measure as 0 (the fit parent shrinks accordingly)
 - percent is relative to the parent's content box (padding deducted, gap not). Floor truncation;
   leftover pixels are absorbed by grow children
-- `clip_children` affects drawing only, not layout
+- `clip_children` clips drawing (and hit-test) to the content box (rect minus padding)
 
 Full write-up of the sizing rules above, the two-pass measure/place model behind them, a worked
 example, and where the fit/grow interaction shows up in practice (`ScrollArea`'s `content_width`):

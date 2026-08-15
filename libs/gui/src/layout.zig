@@ -24,7 +24,13 @@
 //   trailing gap when no unfrozen weight>0 grow child remains (every such child
 //   max-frozen, or none existed). Freeze iteration is bit-identical to the
 //   unconstrained peel when no clamp fires.
-// - no absolute positioning
+// - anchored children (`BoxConfig.anchor != null`) are overlays: they take no
+//   part in the parent's fit measure, main-axis cursor, gap, grow share, wrap
+//   line split, or line cross size. Their own size is resolved against the
+//   parent content box (grow fills that box, ignoring weight). min/max clamp
+//   still applies. They are not in the layout size; a parent with
+//   clip_children=false still folds their visible overflow into content extent.
+//   Draw order is tree order — later siblings paint on top.
 // - main-axis alignment (justify_content) is start only; right-align etc. by inserting a grow box
 // - grow / percent children inside a fit parent measure as 0 (the fit parent shrinks accordingly).
 //   This holds on both axes, including measureHeights.
@@ -58,6 +64,25 @@ pub const Sizing = union(enum) {
 };
 
 pub const Align = enum { start, center, end };
+
+/// Nine-way attachment point of an anchored child inside the parent content box.
+pub const AnchorAt = enum {
+    top_left,
+    top_center,
+    top_right,
+    center_left,
+    center,
+    center_right,
+    bottom_left,
+    bottom_center,
+    bottom_right,
+};
+
+/// Overlay placement. `offset` is added after aligning `at` to the parent content box.
+pub const Anchor = struct {
+    at: AnchorAt,
+    offset: Vec2 = .{ .x = 0, .y = 0 },
+};
 
 /// Box border. Emit order is bg → children → border (border draws on top of children).
 /// The border is drawn inside the rect and does not affect layout math.
@@ -99,6 +124,15 @@ pub const BoxConfig = struct {
     /// [0, content_natural - viewport] before passing.
     scroll_x: i32 = 0,
     scroll_y: i32 = 0,
+    /// When set, this box is an overlay on its parent: it does not take part in
+    /// the parent's fit measure, main-axis cursor, gap, grow share, wrap line
+    /// split, or line cross size. Its own size is resolved against the parent
+    /// content box (fixed = value, fit = measured, percent = fraction of parent
+    /// content, grow = fill parent content on that axis, ignoring weight).
+    /// min/max clamp still applies. Draw order is tree order — later siblings
+    /// paint on top. An explicit `id` is cached and hit-tested like any other box.
+    /// Several siblings may be anchored.
+    anchor: ?Anchor = null,
 };
 
 /// Draw callback for a custom leaf. Called with the final rect after endFrame finalizes layout.
@@ -134,6 +168,12 @@ pub const Node = struct {
     last_child: ?*Node = null,
     next_sibling: ?*Node = null,
     child_count: u32 = 0,
+    /// Non-overlay children. `child_count - flow_child_count` is the overlay count.
+    /// Written in `appendChild` so measure/place never recounts.
+    flow_child_count: u32 = 0,
+    /// True when at least one direct child has `cfg.anchor != null`.
+    /// A false box takes the pre-overlay walk (no extra sibling scan).
+    has_anchored_child: bool = false,
     measured_w: i32 = 0,
     measured_h: i32 = 0,
     /// Content extent after place, in border-box units (max child edge + both paddings).
@@ -165,6 +205,11 @@ pub fn appendChild(parent: *Node, child: *Node) void {
     }
     parent.last_child = child;
     parent.child_count += 1;
+    if (child.cfg.anchor != null) {
+        parent.has_anchored_child = true;
+    } else {
+        parent.flow_child_count += 1;
+    }
 }
 
 /// Detect invalid Sizing values in debug builds (called from beginBox).
@@ -297,6 +342,36 @@ fn effectiveCrossGap(cfg: BoxConfig) i32 {
     return cfg.cross_gap orelse cfg.gap;
 }
 
+fn isAnchored(node: *const Node) bool {
+    return node.cfg.anchor != null;
+}
+
+fn firstFlowChild(node: *const Node) ?*Node {
+    var it = node.first_child;
+    while (it) |c| {
+        if (!isAnchored(c)) return c;
+        it = c.next_sibling;
+    }
+    return null;
+}
+
+fn firstOnLine(node: *const Node) ?*Node {
+    return if (node.has_anchored_child) firstFlowChild(node) else node.first_child;
+}
+
+fn nextFlowSibling(node: *const Node) ?*Node {
+    var it = node.next_sibling;
+    while (it) |c| {
+        if (!isAnchored(c)) return c;
+        it = c.next_sibling;
+    }
+    return null;
+}
+
+fn nextLinePeer(node: *const Node, skip_anchored: bool) ?*Node {
+    return if (skip_anchored) nextFlowSibling(node) else node.next_sibling;
+}
+
 fn crossAxis(cfg: BoxConfig) Axis {
     return switch (cfg.direction) {
         .row => .h,
@@ -395,12 +470,26 @@ fn computeMeasured(node: *const Node, axis: Axis) i32 {
             if (mainAxis(node.cfg) == axis) {
                 var sum: i32 = 0;
                 var it = node.first_child;
-                while (it) |c| : (it = c.next_sibling) sum += measuredOf(c, axis);
-                break :blk sum + gapTotal(node.cfg.gap, node.child_count) + pad;
+                if (node.has_anchored_child) {
+                    while (it) |c| : (it = c.next_sibling) {
+                        if (isAnchored(c)) continue;
+                        sum += measuredOf(c, axis);
+                    }
+                } else {
+                    while (it) |c| : (it = c.next_sibling) sum += measuredOf(c, axis);
+                }
+                break :blk sum + gapTotal(node.cfg.gap, node.flow_child_count) + pad;
             } else {
                 var max_child: i32 = 0;
                 var it = node.first_child;
-                while (it) |c| : (it = c.next_sibling) max_child = @max(max_child, measuredOf(c, axis));
+                if (node.has_anchored_child) {
+                    while (it) |c| : (it = c.next_sibling) {
+                        if (isAnchored(c)) continue;
+                        max_child = @max(max_child, measuredOf(c, axis));
+                    }
+                } else {
+                    while (it) |c| : (it = c.next_sibling) max_child = @max(max_child, measuredOf(c, axis));
+                }
                 break :blk max_child + pad;
             }
         },
@@ -478,35 +567,35 @@ fn wrapEntrySize(child: *const Node, main: Axis, content_main: i32) i32 {
     };
 }
 
-fn nextLineStart(first: *Node, content_main: i32, gap: i32, main: Axis) ?*Node {
+fn nextLineStart(first: *Node, content_main: i32, gap: i32, main: Axis, skip_anchored: bool) ?*Node {
     var used = wrapEntrySize(first, main, content_main);
-    var it = first.next_sibling;
+    var it = nextLinePeer(first, skip_anchored);
     while (it) |c| {
         const entry = wrapEntrySize(c, main, content_main);
         if (used + gap + entry > content_main) return c;
         used += gap + entry;
-        it = c.next_sibling;
+        it = nextLinePeer(c, skip_anchored);
     }
     return null;
 }
 
-fn countUntil(first: *Node, end: ?*Node) u32 {
+fn countUntil(first: *Node, end: ?*Node, skip_anchored: bool) u32 {
     var n: u32 = 0;
     var it: ?*Node = first;
     while (it) |c| {
         if (c == end) break;
         n += 1;
-        it = c.next_sibling;
+        it = nextLinePeer(c, skip_anchored);
     }
     return n;
 }
 
-fn lineHasClamp(first: *Node, end: ?*Node, axis: Axis) bool {
+fn lineHasClamp(first: *Node, end: ?*Node, axis: Axis, skip_anchored: bool) bool {
     var it: ?*Node = first;
     while (it) |c| {
         if (c == end) break;
         if (hasAxisClamp(c, axis)) return true;
-        it = c.next_sibling;
+        it = nextLinePeer(c, skip_anchored);
     }
     return false;
 }
@@ -514,7 +603,7 @@ fn lineHasClamp(first: *Node, end: ?*Node, axis: Axis) bool {
 /// Line cross size: max of (non-grow/percent children's clamped resolved size,
 /// grow/percent children's min). A line of only grow/percent children with
 /// min 0 has cross 0 (same idea as grow/percent measuring 0 inside a fit parent).
-fn lineCrossSize(first: *Node, end: ?*Node, cross: Axis) i32 {
+fn lineCrossSize(first: *Node, end: ?*Node, cross: Axis, skip_anchored: bool) i32 {
     var line_cross: i32 = 0;
     var it: ?*Node = first;
     while (it) |c| {
@@ -525,7 +614,7 @@ fn lineCrossSize(first: *Node, end: ?*Node, cross: Axis) i32 {
             .fit => clampAxis(c, cross, measuredOf(c, cross)),
         };
         line_cross = @max(line_cross, contrib);
-        it = c.next_sibling;
+        it = nextLinePeer(c, skip_anchored);
     }
     return line_cross;
 }
@@ -545,13 +634,14 @@ fn measureWrapCross(node: *const Node, cross: Axis) i32 {
     const gap = node.cfg.gap;
     const cgap = effectiveCrossGap(node.cfg);
     const pad = axisPadding(node.cfg, cross);
-    var first = node.first_child;
+    const skip = node.has_anchored_child;
+    var first = firstOnLine(node);
     if (first == null) return pad;
     var total: i32 = 0;
     var nlines: u32 = 0;
     while (first) |f| {
-        const end = nextLineStart(f, content_main, gap, main);
-        total += lineCrossSize(f, end, cross);
+        const end = nextLineStart(f, content_main, gap, main, skip);
+        total += lineCrossSize(f, end, cross, skip);
         nlines += 1;
         first = end;
     }
@@ -641,9 +731,10 @@ fn commitExtent(node: *Node, max_right: i32, max_bottom: i32) void {
 fn placeChildrenOnAxis(node: *Node, axis: Axis) void {
     if (node.cfg.wrap) {
         placeWrapOnAxis(node, axis);
-        return;
+    } else {
+        placeLinearOnAxis(node, axis);
     }
-    placeLinearOnAxis(node, axis);
+    if (node.has_anchored_child) placeAnchoredOnAxis(node, axis);
 }
 
 fn placeLinearOnAxis(node: *Node, axis: Axis) void {
@@ -664,7 +755,31 @@ fn placeLinearOnAxis(node: *Node, axis: Axis) void {
             .max_right = &max_right,
             .max_bottom = &max_bottom,
         } else null;
-        placeLineMain(node.first_child, null, node.child_count, content_origin - scroll, content_size, cfg.gap, axis, acc);
+        placeLineMain(
+            firstOnLine(node),
+            null,
+            node.flow_child_count,
+            content_origin - scroll,
+            content_size,
+            cfg.gap,
+            axis,
+            acc,
+            node.has_anchored_child,
+        );
+        if (axis == .h) commitExtent(node, max_right, max_bottom);
+    } else if (node.has_anchored_child) {
+        var it = node.first_child;
+        while (it) |c| : (it = c.next_sibling) {
+            if (isAnchored(c)) continue;
+            const size: i32 = resolveSize(c, axis, content_size, null);
+            const cross_off: i32 = switch (cfg.align_cross) {
+                .start => 0,
+                .center => @divFloor(content_size - size, 2),
+                .end => content_size - size,
+            };
+            descendPlace(c, axis, content_origin + cross_off - scroll, size);
+            if (axis == .h) accumulateExtent(node, c, &max_right, &max_bottom);
+        }
         if (axis == .h) commitExtent(node, max_right, max_bottom);
     } else {
         var it = node.first_child;
@@ -706,9 +821,10 @@ fn placeLineMain(
     gap: i32,
     axis: Axis,
     extent: ?ExtentAcc,
+    skip_anchored: bool,
 ) void {
     const start = first orelse return;
-    if (!lineHasClamp(start, end, axis)) {
+    if (!lineHasClamp(start, end, axis, skip_anchored)) {
         var used: i32 = gapTotal(gap, count);
         var grow_total: i64 = 0;
         var it: ?*Node = start;
@@ -720,7 +836,7 @@ fn placeLineMain(
                 .percent => |f| used += percentOf(content_main, f),
                 .grow => |w| grow_total += w,
             }
-            it = c.next_sibling;
+            it = nextLinePeer(c, skip_anchored);
         }
         var remaining: i64 = @max(0, content_main - used);
         var w_rest: i64 = grow_total;
@@ -742,7 +858,7 @@ fn placeLineMain(
             descendPlace(c, axis, cursor, size);
             if (extent) |acc| accumulateExtent(acc.parent, c, acc.max_right, acc.max_bottom);
             cursor += size + gap;
-            it = c.next_sibling;
+            it = nextLinePeer(c, skip_anchored);
         }
         return;
     }
@@ -767,7 +883,7 @@ fn placeLineMain(
                 used += sz;
             },
         }
-        it = c.next_sibling;
+        it = nextLinePeer(c, skip_anchored);
     }
 
     while (true) {
@@ -776,7 +892,7 @@ fn placeLineMain(
         while (it) |c| {
             if (c == end) break;
             if (isUnfrozenGrow(c, axis)) w_rest += growWeightOf(c, axis);
-            it = c.next_sibling;
+            it = nextLinePeer(c, skip_anchored);
         }
         if (w_rest == 0) break;
 
@@ -800,7 +916,7 @@ fn placeLineMain(
                     any_freeze = true;
                 }
             }
-            it = c.next_sibling;
+            it = nextLinePeer(c, skip_anchored);
         }
         if (!any_freeze) {
             peel_rem = remaining;
@@ -815,7 +931,7 @@ fn placeLineMain(
                     wr -= w;
                     setRectSizeI(c, axis, @intCast(take));
                 }
-                it = c.next_sibling;
+                it = nextLinePeer(c, skip_anchored);
             }
             break;
         }
@@ -829,7 +945,7 @@ fn placeLineMain(
         descendPlace(c, axis, cursor, size);
         if (extent) |acc| accumulateExtent(acc.parent, c, acc.max_right, acc.max_bottom);
         cursor += size + gap;
-        it = c.next_sibling;
+        it = nextLinePeer(c, skip_anchored);
     }
 }
 
@@ -856,11 +972,12 @@ fn placeWrapMain(node: *Node) void {
     else
         node.rect.y + cfg.padding[0];
     const scroll: i32 = if (main == .w) cfg.scroll_x else cfg.scroll_y;
-    var first = node.first_child;
+    const skip = node.has_anchored_child;
+    var first = firstOnLine(node);
     while (first) |f| {
-        const end = nextLineStart(f, content_main, cfg.gap, main);
-        const count = countUntil(f, end);
-        placeLineMain(f, end, count, origin - scroll, content_main, cfg.gap, main, null);
+        const end = nextLineStart(f, content_main, cfg.gap, main, skip);
+        const count = countUntil(f, end, skip);
+        placeLineMain(f, end, count, origin - scroll, content_main, cfg.gap, main, null, skip);
         first = end;
     }
 }
@@ -879,10 +996,11 @@ fn placeWrapCross(node: *Node, record_extent: bool, main_known: bool) void {
     var max_right: i32 = 0;
     var max_bottom: i32 = 0;
     var cross_cursor = origin_cross - scroll_cross;
-    var first = node.first_child;
+    const skip = node.has_anchored_child;
+    var first = firstOnLine(node);
     while (first) |f| {
-        const end = nextLineStart(f, content_main, cfg.gap, main);
-        const line_cross = lineCrossSize(f, end, cross);
+        const end = nextLineStart(f, content_main, cfg.gap, main, skip);
+        const line_cross = lineCrossSize(f, end, cross, skip);
         var it: ?*Node = f;
         while (it) |c| {
             if (c == end) break;
@@ -894,7 +1012,7 @@ fn placeWrapCross(node: *Node, record_extent: bool, main_known: bool) void {
             };
             descendPlace(c, cross, cross_cursor + cross_off, size);
             if (record_extent) accumulateExtent(node, c, &max_right, &max_bottom);
-            it = c.next_sibling;
+            it = nextLinePeer(c, skip);
         }
         cross_cursor += line_cross + cgap;
         first = end;
@@ -909,6 +1027,73 @@ fn descendPlace(child: *Node, axis: Axis, pos: i32, size: i32) void {
     } else {
         placeHeights(child, .{ .x = 0, .y = pos, .w = 0, .h = s });
     }
+}
+
+fn anchoredAlign(at: AnchorAt, axis: Axis) Align {
+    return switch (axis) {
+        .w => switch (at) {
+            .top_left, .center_left, .bottom_left => .start,
+            .top_center, .center, .bottom_center => .center,
+            .top_right, .center_right, .bottom_right => .end,
+        },
+        .h => switch (at) {
+            .top_left, .top_center, .top_right => .start,
+            .center_left, .center, .center_right => .center,
+            .bottom_left, .bottom_center, .bottom_right => .end,
+        },
+    };
+}
+
+fn anchoredPos(anchor: Anchor, axis: Axis, origin: i32, content: i32, size: i32) i32 {
+    const off: i32 = if (axis == .w) anchor.offset.x else anchor.offset.y;
+    const base: i32 = switch (anchoredAlign(anchor.at, axis)) {
+        .start => origin,
+        .center => origin + @divFloor(content - size, 2),
+        .end => origin + content - size,
+    };
+    return base + off;
+}
+
+/// Place overlay children after flow children on this axis.
+///
+/// Hot path: every frame on the GUI layout path. O(children) per box.
+/// Not a per-pixel loop; not RT.
+fn placeAnchoredOnAxis(node: *Node, axis: Axis) void {
+    const cfg = node.cfg;
+    const content_origin: i32 = if (axis == .w)
+        node.rect.x + cfg.padding[3]
+    else
+        node.rect.y + cfg.padding[0];
+    const content_size: i32 = @max(0, @as(i32, @intCast(if (axis == .w) node.rect.w else node.rect.h)) - axisPadding(cfg, axis));
+    const scroll: i32 = if (axis == .w) cfg.scroll_x else cfg.scroll_y;
+    var it = node.first_child;
+    while (it) |c| : (it = c.next_sibling) {
+        const anchor = c.cfg.anchor orelse continue;
+        const size = resolveSize(c, axis, content_size, null);
+        const pos = anchoredPos(anchor, axis, content_origin, content_size, size) - scroll;
+        descendPlace(c, axis, pos, size);
+    }
+    if (axis == .h) foldAnchoredExtent(node);
+}
+
+fn foldAnchoredExtent(node: *Node) void {
+    if (node.cfg.clip_children) return;
+    var max_right: i32 = if (node.content_w >= 0)
+        node.content_w - node.cfg.padding[3] - node.cfg.padding[1]
+    else
+        0;
+    var max_bottom: i32 = if (node.content_h >= 0)
+        node.content_h - node.cfg.padding[0] - node.cfg.padding[2]
+    else
+        0;
+    var any = false;
+    var it = node.first_child;
+    while (it) |c| : (it = c.next_sibling) {
+        if (!isAnchored(c)) continue;
+        accumulateExtent(node, c, &max_right, &max_bottom);
+        any = true;
+    }
+    if (any) commitExtent(node, max_right, max_bottom);
 }
 
 /// Fold every text leaf at its placed width, store logical lines on the node,
@@ -2172,4 +2357,321 @@ test "extent: a leaf does not record content extent (stays -1)" {
     layoutOnce(&t, 200, 50);
     try std.testing.expectEqual(@as(i32, -1), t.content_w);
     try std.testing.expectEqual(@as(i32, -1), t.content_h);
+}
+
+fn anchored(at: AnchorAt, w: i32, h: i32) Node {
+    return .{ .cfg = .{
+        .anchor = .{ .at = at },
+        .width = .{ .fixed = w },
+        .height = .{ .fixed = h },
+    } };
+}
+
+test "appendChild: overlay membership is recorded at insert" {
+    var parent: Node = .{};
+    var a: Node = boxWH(10, 10);
+    var badge: Node = anchored(.center, 8, 8);
+    var c: Node = boxWH(10, 10);
+    appendChild(&parent, &a);
+    try std.testing.expect(!parent.has_anchored_child);
+    try std.testing.expectEqual(@as(u32, 1), parent.flow_child_count);
+    try std.testing.expectEqual(@as(u32, 1), parent.child_count);
+    appendChild(&parent, &badge);
+    try std.testing.expect(parent.has_anchored_child);
+    try std.testing.expectEqual(@as(u32, 1), parent.flow_child_count);
+    try std.testing.expectEqual(@as(u32, 2), parent.child_count);
+    appendChild(&parent, &c);
+    try std.testing.expect(parent.has_anchored_child);
+    try std.testing.expectEqual(@as(u32, 2), parent.flow_child_count);
+    try std.testing.expectEqual(@as(u32, 3), parent.child_count);
+}
+
+test "anchor: a tree with no overlay keeps the pre-overlay rect contract" {
+    var root: Node = .{ .cfg = .{ .direction = .row, .width = .{ .fixed = 200 }, .height = .{ .fixed = 50 } } };
+    var f: Node = .{ .cfg = .{ .width = .{ .fixed = 50 }, .height = .{ .fixed = 10 } } };
+    var p: Node = .{ .cfg = .{ .width = .{ .percent = 0.25 }, .height = .{ .fixed = 10 } } };
+    var g1: Node = .{ .cfg = .{ .width = .{ .grow = 1 }, .height = .{ .fixed = 10 } } };
+    var g2: Node = .{ .cfg = .{ .width = .{ .grow = 2 }, .height = .{ .fixed = 10 } } };
+    appendChild(&root, &f);
+    appendChild(&root, &p);
+    appendChild(&root, &g1);
+    appendChild(&root, &g2);
+    try std.testing.expect(!root.has_anchored_child);
+    try std.testing.expectEqual(root.child_count, root.flow_child_count);
+    measure(&root, test_font);
+    place(&root, .{ .x = 0, .y = 0, .w = 200, .h = 50 });
+    try std.testing.expectEqual(@as(u32, 50), f.rect.w);
+    try std.testing.expectEqual(@as(u32, 50), p.rect.w);
+    try std.testing.expectEqual(@as(u32, 33), g1.rect.w);
+    try std.testing.expectEqual(@as(u32, 67), g2.rect.w);
+    try std.testing.expectEqual(@as(i32, 0), f.rect.x);
+    try std.testing.expectEqual(@as(i32, 50), p.rect.x);
+    try std.testing.expectEqual(@as(i32, 100), g1.rect.x);
+    try std.testing.expectEqual(@as(i32, 133), g2.rect.x);
+
+    var wrap_root: Node = .{ .cfg = .{
+        .direction = .row,
+        .wrap = true,
+        .width = .{ .fixed = 50 },
+        .height = .fit,
+    } };
+    var a: Node = boxWH(40, 10);
+    var b: Node = boxWH(40, 10);
+    appendChild(&wrap_root, &a);
+    appendChild(&wrap_root, &b);
+    try std.testing.expect(!wrap_root.has_anchored_child);
+    try std.testing.expectEqual(wrap_root.child_count, wrap_root.flow_child_count);
+    layoutOnce(&wrap_root, 50, 50);
+    try std.testing.expectEqual(@as(i32, 0), a.rect.x);
+    try std.testing.expectEqual(@as(i32, 0), a.rect.y);
+    try std.testing.expectEqual(@as(i32, 0), b.rect.x);
+    try std.testing.expectEqual(@as(i32, 10), b.rect.y);
+    try std.testing.expectEqual(@as(u32, 40), a.rect.w);
+    try std.testing.expectEqual(@as(u32, 10), a.rect.h);
+}
+
+test "anchor: a fit parent does not grow for an anchored child" {
+    var root: Node = .{ .cfg = .{ .direction = .row } };
+    var flow: Node = boxWH(10, 10);
+    var badge: Node = anchored(.top_right, 80, 80);
+    appendChild(&root, &flow);
+    appendChild(&root, &badge);
+    measure(&root, test_font);
+    try std.testing.expectEqual(@as(i32, 10), root.measured_w);
+    try std.testing.expectEqual(@as(i32, 10), root.measured_h);
+}
+
+test "anchor: wrap line split and line cross ignore the overlay" {
+    var with: Node = .{ .cfg = .{
+        .direction = .row,
+        .wrap = true,
+        .width = .{ .fixed = 50 },
+        .height = .fit,
+    } };
+    var a: Node = boxWH(40, 10);
+    var badge: Node = anchored(.center, 40, 40);
+    var b: Node = boxWH(40, 10);
+    appendChild(&with, &a);
+    appendChild(&with, &badge);
+    appendChild(&with, &b);
+    layoutOnce(&with, 50, 80);
+
+    var plain: Node = .{ .cfg = .{
+        .direction = .row,
+        .wrap = true,
+        .width = .{ .fixed = 50 },
+        .height = .fit,
+    } };
+    var c: Node = boxWH(40, 10);
+    var d: Node = boxWH(40, 10);
+    appendChild(&plain, &c);
+    appendChild(&plain, &d);
+    layoutOnce(&plain, 50, 80);
+
+    try std.testing.expectEqual(c.rect.x, a.rect.x);
+    try std.testing.expectEqual(c.rect.y, a.rect.y);
+    try std.testing.expectEqual(d.rect.x, b.rect.x);
+    try std.testing.expectEqual(d.rect.y, b.rect.y);
+    try std.testing.expectEqual(plain.measured_h, with.measured_h);
+    try std.testing.expectEqual(@as(i32, 20), with.measured_h);
+}
+
+test "anchor: gap and grow share ignore the overlay" {
+    var root: Node = .{ .cfg = .{
+        .direction = .row,
+        .width = .{ .fixed = 100 },
+        .height = .{ .fixed = 20 },
+        .gap = 10,
+    } };
+    var g1: Node = .{ .cfg = .{ .width = .{ .grow = 1 }, .height = .{ .fixed = 10 } } };
+    var badge: Node = anchored(.center, 8, 8);
+    var g2: Node = .{ .cfg = .{ .width = .{ .grow = 1 }, .height = .{ .fixed = 10 } } };
+    appendChild(&root, &g1);
+    appendChild(&root, &badge);
+    appendChild(&root, &g2);
+    layoutOnce(&root, 100, 20);
+    try std.testing.expectEqual(@as(u32, 45), g1.rect.w);
+    try std.testing.expectEqual(@as(u32, 45), g2.rect.w);
+    try std.testing.expectEqual(@as(i32, 0), g1.rect.x);
+    try std.testing.expectEqual(@as(i32, 55), g2.rect.x);
+}
+
+test "anchor: nine-way placement plus offset" {
+    var root: Node = .{ .cfg = .{
+        .direction = .column,
+        .width = .{ .fixed = 100 },
+        .height = .{ .fixed = 80 },
+        .padding = .{ 4, 4, 4, 4 },
+    } };
+    var tl: Node = .{ .cfg = .{
+        .anchor = .{ .at = .top_left, .offset = .{ .x = 2, .y = 3 } },
+        .width = .{ .fixed = 10 },
+        .height = .{ .fixed = 8 },
+    } };
+    var tc: Node = anchored(.top_center, 10, 8);
+    var tr: Node = anchored(.top_right, 10, 8);
+    var cl: Node = anchored(.center_left, 10, 8);
+    var c: Node = anchored(.center, 10, 8);
+    var cr: Node = anchored(.center_right, 10, 8);
+    var bl: Node = anchored(.bottom_left, 10, 8);
+    var bc: Node = anchored(.bottom_center, 10, 8);
+    var br: Node = anchored(.bottom_right, 10, 8);
+    appendChild(&root, &tl);
+    appendChild(&root, &tc);
+    appendChild(&root, &tr);
+    appendChild(&root, &cl);
+    appendChild(&root, &c);
+    appendChild(&root, &cr);
+    appendChild(&root, &bl);
+    appendChild(&root, &bc);
+    appendChild(&root, &br);
+    layoutOnce(&root, 100, 80);
+    const mid_x: i32 = 4 + @divFloor(92 - 10, 2);
+    const mid_y: i32 = 4 + @divFloor(72 - 8, 2);
+    try std.testing.expectEqual(@as(i32, 4 + 2), tl.rect.x);
+    try std.testing.expectEqual(@as(i32, 4 + 3), tl.rect.y);
+    try std.testing.expectEqual(mid_x, tc.rect.x);
+    try std.testing.expectEqual(@as(i32, 4), tc.rect.y);
+    try std.testing.expectEqual(@as(i32, 100 - 4 - 10), tr.rect.x);
+    try std.testing.expectEqual(@as(i32, 4), tr.rect.y);
+    try std.testing.expectEqual(@as(i32, 4), cl.rect.x);
+    try std.testing.expectEqual(mid_y, cl.rect.y);
+    try std.testing.expectEqual(mid_x, c.rect.x);
+    try std.testing.expectEqual(mid_y, c.rect.y);
+    try std.testing.expectEqual(@as(i32, 100 - 4 - 10), cr.rect.x);
+    try std.testing.expectEqual(mid_y, cr.rect.y);
+    try std.testing.expectEqual(@as(i32, 4), bl.rect.x);
+    try std.testing.expectEqual(@as(i32, 80 - 4 - 8), bl.rect.y);
+    try std.testing.expectEqual(mid_x, bc.rect.x);
+    try std.testing.expectEqual(@as(i32, 80 - 4 - 8), bc.rect.y);
+    try std.testing.expectEqual(@as(i32, 100 - 4 - 10), br.rect.x);
+    try std.testing.expectEqual(@as(i32, 80 - 4 - 8), br.rect.y);
+}
+
+test "anchor: grow fills the parent content box on both axes" {
+    var root: Node = .{ .cfg = .{
+        .direction = .column,
+        .width = .{ .fixed = 80 },
+        .height = .{ .fixed = 50 },
+        .padding = .{ 2, 6, 4, 8 },
+    } };
+    var cover: Node = .{ .cfg = .{
+        .anchor = .{ .at = .top_left },
+        .width = .{ .grow = 3 },
+        .height = .{ .grow = 9 },
+    } };
+    appendChild(&root, &cover);
+    layoutOnce(&root, 80, 50);
+    try std.testing.expectEqual(@as(u32, 66), cover.rect.w); // 80 - 8 - 6
+    try std.testing.expectEqual(@as(u32, 44), cover.rect.h); // 50 - 2 - 4
+    try std.testing.expectEqual(@as(i32, 8), cover.rect.x);
+    try std.testing.expectEqual(@as(i32, 2), cover.rect.y);
+}
+
+test "anchor: percent resolves against the parent content box" {
+    var root: Node = .{ .cfg = .{
+        .direction = .column,
+        .width = .{ .fixed = 100 },
+        .height = .{ .fixed = 80 },
+        .padding = .{ 0, 10, 0, 10 },
+    } };
+    var p: Node = .{ .cfg = .{
+        .anchor = .{ .at = .top_left },
+        .width = .{ .percent = 0.5 },
+        .height = .{ .percent = 0.25 },
+    } };
+    appendChild(&root, &p);
+    layoutOnce(&root, 100, 80);
+    try std.testing.expectEqual(@as(u32, 40), p.rect.w); // floor(80 * 0.5)
+    try std.testing.expectEqual(@as(u32, 20), p.rect.h); // floor(80 * 0.25)
+}
+
+test "anchor: min/max clamp applies to the resolved size" {
+    var root: Node = .{ .cfg = .{
+        .direction = .column,
+        .width = .{ .fixed = 100 },
+        .height = .{ .fixed = 80 },
+    } };
+    var lo: Node = .{ .cfg = .{
+        .anchor = .{ .at = .top_left },
+        .width = .{ .fixed = 10 },
+        .height = .{ .fixed = 10 },
+        .min_width = 30,
+        .min_height = 20,
+    } };
+    var hi: Node = .{ .cfg = .{
+        .anchor = .{ .at = .top_right },
+        .width = .{ .grow = 1 },
+        .height = .{ .percent = 1.0 },
+        .max_width = 40,
+        .max_height = 25,
+    } };
+    appendChild(&root, &lo);
+    appendChild(&root, &hi);
+    layoutOnce(&root, 100, 80);
+    try std.testing.expectEqual(@as(u32, 30), lo.rect.w);
+    try std.testing.expectEqual(@as(u32, 20), lo.rect.h);
+    try std.testing.expectEqual(@as(u32, 40), hi.rect.w);
+    try std.testing.expectEqual(@as(u32, 25), hi.rect.h);
+}
+
+test "anchor: wrapText still folds the overlay subtree; parent fit height ignores it" {
+    var arena_inst = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_inst.deinit();
+    var root: Node = .{ .cfg = .{ .direction = .column, .width = .{ .fixed = 40 }, .height = .fit } };
+    var badge: Node = .{ .cfg = .{
+        .anchor = .{ .at = .top_left },
+        .width = .{ .grow = 1 },
+        .height = .fit,
+        .direction = .column,
+    } };
+    var t: Node = textLeaf("hello world", true);
+    appendChild(&badge, &t);
+    appendChild(&root, &badge);
+    layoutTree(&root, .{ .x = 0, .y = 0, .w = 40, .h = 80 }, test_font, arena_inst.allocator());
+    try std.testing.expectEqual(@as(u32, 40), badge.rect.w);
+    try std.testing.expectEqual(@as(i32, 32), t.measured_h);
+    try std.testing.expectEqual(@as(usize, 2), t.lines.len);
+    try std.testing.expectEqual(@as(i32, 0), root.measured_h);
+}
+
+test "anchor: clip_children=false folds overflow into extent; clip excludes it" {
+    {
+        var root: Node = .{ .cfg = .{
+            .direction = .column,
+            .width = .{ .fixed = 40 },
+            .height = .{ .fixed = 40 },
+            .clip_children = false,
+        } };
+        var flow: Node = boxWH(10, 10);
+        var badge: Node = .{ .cfg = .{
+            .anchor = .{ .at = .top_right, .offset = .{ .x = 20, .y = 0 } },
+            .width = .{ .fixed = 20 },
+            .height = .{ .fixed = 10 },
+        } };
+        appendChild(&root, &flow);
+        appendChild(&root, &badge);
+        layoutOnce(&root, 40, 40);
+        try std.testing.expect(root.content_w > 40);
+        try std.testing.expectEqual(@as(i32, 60), root.content_w); // badge right = 40-20+20+20
+    }
+    {
+        var root: Node = .{ .cfg = .{
+            .direction = .column,
+            .width = .{ .fixed = 40 },
+            .height = .{ .fixed = 40 },
+            .clip_children = true,
+        } };
+        var flow: Node = boxWH(10, 10);
+        var badge: Node = .{ .cfg = .{
+            .anchor = .{ .at = .top_right, .offset = .{ .x = 20, .y = 0 } },
+            .width = .{ .fixed = 20 },
+            .height = .{ .fixed = 10 },
+        } };
+        appendChild(&root, &flow);
+        appendChild(&root, &badge);
+        layoutOnce(&root, 40, 40);
+        try std.testing.expectEqual(@as(i32, 10), root.content_w);
+        try std.testing.expectEqual(@as(i32, 10), root.content_h);
+    }
 }

@@ -39,10 +39,10 @@ const SectionMeta = struct {
 const SECTIONS = [_]SectionMeta{
     .{ .name = "overview", .detail = "three axes: widget / state / context", .widgets = 0, .missing = MISSING.len },
     .{ .name = "basic", .detail = "button / label", .widgets = 2, .missing = 0 },
-    .{ .name = "text", .detail = "selectableLabel / textInputId / wrap / overflow", .widgets = 3, .missing = 0 },
+    .{ .name = "text", .detail = "selectableLabel / textInputId / wrap / overflow / labelStyled", .widgets = 4, .missing = 0 },
     .{ .name = "values", .detail = "slider / checkbox / toggle / radio", .widgets = 4, .missing = 0 },
     .{ .name = "color", .detail = "colorSwatch / SV+hue / imageBox", .widgets = 3, .missing = 0 },
-    .{ .name = "layout", .detail = "splitter / scrollArea / iconButton / tooltip / collapsible", .widgets = 5, .missing = 0 },
+    .{ .name = "layout", .detail = "splitter / scrollArea / iconButton / tooltip / collapsible / anchor / indent", .widgets = 7, .missing = 0 },
     .{ .name = "menus", .detail = "popup/contextMenu / menuBar", .widgets = 2, .missing = 0 },
     .{ .name = "stepgrid", .detail = "stepgrid.widgetRow", .widgets = 1, .missing = 0 },
     .{ .name = "table", .detail = "column header / sticky scroll / selected row / ellipsis", .widgets = 1, .missing = 0 },
@@ -72,6 +72,7 @@ const TEXT_MATRIX = [_]MatrixRow{
     .{ .name = "selectable", .cells = .{ "ok", "N/A", "drag", "ok", "N/A", "ok", "N/A", "N/A", "ok" } },
     .{ .name = "textInputId", .cells = .{ "ok", "demo", "demo", "ok", "demo", "ok", "N/A", "N/A", "ok" } },
     .{ .name = "text wrap", .cells = .{ "ok", "N/A", "N/A", "N/A", "N/A", "ok", "N/A", "N/A", "N/A" } },
+    .{ .name = "labelStyled", .cells = .{ "ok", "N/A", "N/A", "N/A", "N/A", "ok", "N/A", "N/A", "N/A" } },
 };
 const VALUES_MATRIX = [_]MatrixRow{
     .{ .name = "slider", .cells = .{ "ok", "demo", "demo", "N/A", "demo", "N/A", "ok", "ok", "N/A" } },
@@ -90,6 +91,8 @@ const LAYOUT_MATRIX = [_]MatrixRow{
     .{ .name = "iconButton", .cells = .{ "ok", "demo", "demo", "N/A", "N/A", "N/A", "N/A", "N/A", "ok" } },
     .{ .name = "tooltip", .cells = .{ "ok", "demo", "N/A", "N/A", "N/A", "N/A", "N/A", "N/A", "ok" } },
     .{ .name = "collapsible", .cells = .{ "ok", "demo", "demo", "N/A", "N/A", "N/A", "N/A", "N/A", "ok" } },
+    .{ .name = "anchor", .cells = .{ "ok", "demo", "N/A", "N/A", "N/A", "ok", "N/A", "N/A", "N/A" } },
+    .{ .name = "indent", .cells = .{ "ok", "demo", "demo", "N/A", "N/A", "ok", "N/A", "N/A", "N/A" } },
 };
 const MENUS_MATRIX = [_]MatrixRow{
     .{ .name = "popup/ctx", .cells = .{ "ok", "ok", "ok", "N/A", "item", "N/A", "N/A", "N/A", "ok" } },
@@ -154,6 +157,9 @@ const Ids = struct {
     const disabled_toggle: gui.Id = 0x3570;
     const table: gui.Id = 0x3580;
     const table_row0: gui.Id = 0x3590;
+    const badge_host: gui.Id = 0x3546;
+    const badge: gui.Id = 0x3547;
+    const tree_row0: gui.Id = 0x35A0;
 };
 
 const image_pixels = [_]u32{
@@ -285,8 +291,11 @@ const App = struct {
             Ids.collapsible_child => "button",
             Ids.popup_trigger, Ids.popup => "popup",
             Ids.table => "table",
+            Ids.badge_host, Ids.badge => "anchor",
             else => if (id >= Ids.table_row0 and id < Ids.table_row0 + 16)
                 "tableRow"
+            else if (id >= Ids.tree_row0 and id < Ids.tree_row0 + 16)
+                "listboxRow"
             else if (self.current() == .menus) "menuBar" else "none",
         };
     }
@@ -438,6 +447,11 @@ fn renderText(ctx: *gui.Context, app: *App) void {
     ctx.text("ellipsis: marks the cut here", .{ .overflow = .ellipsis });
     ctx.endBox();
     ctx.endBox();
+    ctx.labelEx("labelStyled tiers (heading font is injected by the app)", ctx.style.text_subtle);
+    ctx.labelStyled("Heading", .heading);
+    ctx.labelStyled("Body text", .body);
+    ctx.labelStyled("Caption", .caption);
+    ctx.labelStyled("Muted", .muted);
 }
 
 fn renderValues(ctx: *gui.Context, app: *App) void {
@@ -534,6 +548,42 @@ fn renderLayout(ctx: *gui.Context, app: *App) void {
         });
         ctx.label(card.label);
         ctx.endBox();
+    }
+    ctx.endBox();
+
+    ctx.labelEx("anchored overlay (later sibling paints on top)", ctx.style.text_subtle);
+    ctx.beginBox(.{
+        .id = Ids.badge_host,
+        .width = .{ .fixed = 120 },
+        .height = .{ .fixed = 36 },
+        .padding = .{ 6, 8, 6, 8 },
+        .bg = gui.Color.rgba(0x30, 0x38, 0x48, 0xFF),
+    });
+    ctx.label("host");
+    ctx.beginBox(.{
+        .id = Ids.badge,
+        .anchor = .{ .at = .top_right, .offset = .{ .x = 6, .y = -6 } },
+        .width = .{ .fixed = 16 },
+        .height = .{ .fixed = 16 },
+        .bg = gui.Color.rgba(0xC0, 0x30, 0x30, 0xFF),
+    });
+    ctx.endBox();
+    ctx.endBox();
+
+    ctx.labelEx("listbox indent guides (row-local; a gap breaks the line)", ctx.style.text_subtle);
+    const tree = [_]struct { depth: u8, name: []const u8 }{
+        .{ .depth = 0, .name = "src" },
+        .{ .depth = 1, .name = "gui" },
+        .{ .depth = 2, .name = "layout.zig" },
+        .{ .depth = 2, .name = "widgets.zig" },
+        .{ .depth = 1, .name = "font" },
+    };
+    ctx.beginBox(.{ .direction = .column, .width = .{ .grow = 1 }, .gap = 2 });
+    for (tree, 0..) |item, i| {
+        const selected = i == 2;
+        _ = ctx.beginListboxRow(Ids.tree_row0 + @as(gui.Id, @intCast(i)), selected, .{ .depth = item.depth });
+        ctx.label(item.name);
+        ctx.endListboxRow();
     }
     ctx.endBox();
     ctx.endBox();
@@ -695,6 +745,7 @@ pub fn main(init: std.process.Init) !void {
     defer window.destroy();
     var ctx = gui.Context.init(gpa, gui.default_font);
     defer ctx.deinit();
+    ctx.style.heading.font = gui.defaultOutlineFont();
     var text = try gui.TextBuffer.init(gpa, "edit me");
     defer text.deinit();
     var app: App = .{ .ctx = &ctx, .text = &text };

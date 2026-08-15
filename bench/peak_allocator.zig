@@ -10,6 +10,7 @@ pub const PeakTrackingAllocator = struct {
     child: Allocator,
     current_bytes: usize = 0,
     peak_bytes: usize = 0,
+    alloc_calls: usize = 0,
 
     pub fn init(child: Allocator) PeakTrackingAllocator {
         return .{ .child = child };
@@ -30,6 +31,7 @@ pub const PeakTrackingAllocator = struct {
     /// Call just before the next measurement window (restarts peak_bytes from 0).
     pub fn reset(self: *PeakTrackingAllocator) void {
         self.peak_bytes = 0;
+        self.alloc_calls = 0;
     }
 
     fn bump(self: *PeakTrackingAllocator) void {
@@ -40,6 +42,7 @@ pub const PeakTrackingAllocator = struct {
         const self: *PeakTrackingAllocator = @ptrCast(@alignCast(ctx));
         const result = self.child.rawAlloc(len, alignment, ret_addr) orelse return null;
         self.current_bytes += len;
+        self.alloc_calls += 1;
         self.bump();
         return result;
     }

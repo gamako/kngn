@@ -55,6 +55,38 @@ grows to max-content, so the leaf does not fold.
 `measure` + `place` remain as a convenience for callers that do not wrap
 (they seed text height from the paragraph count instead of running `wrapText`).
 
+## Anchored children
+
+A child with `BoxConfig.anchor != null` is an overlay on its parent. It takes
+no part in the parent's fit measure, main-axis cursor, gap, grow share, wrap
+line split, or line cross size. Several siblings may be anchored. Draw order
+is tree order — a later sibling paints on top.
+
+The child's own size is resolved against the parent content box (border-box
+minus padding):
+
+| Mode | Result |
+|---|---|
+| `.fixed(n)` | `n` |
+| `.fit` | the child's own measured size |
+| `.percent(f)` | `floor(parent_content * f)` |
+| `.grow` | fill the parent content on that axis (weight is ignored) |
+
+`min_*` / `max_*` clamp still applies — the same uniform rule as every other
+`Sizing`. After flow children are placed on an axis, each anchored child is
+aligned to one of nine points (`top_left` … `bottom_right`) and then shifted
+by `offset`. `placeWidths` resolves widths after the flow pass; `wrapText`
+still visits the anchored subtree; `measureHeights` measures that subtree
+without folding it into the parent's fit height; `placeHeights` applies the
+nine-way placement.
+
+Content extent: the overlay is not part of the layout size. A parent with
+`clip_children = false` still folds whatever of the overlay is actually
+visible (the usual extent rule) so a ScrollArea can reach it. A clipping
+parent does not include it.
+
+An explicit `id` is cached and hit-tested like any other box.
+
 ## The pitfall: `.grow` on a `.fit` container's main axis is always exactly zero
 
 Follow what happens when a node `N` is sized `.fit` on its **main** axis and

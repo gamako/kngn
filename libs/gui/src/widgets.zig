@@ -18,10 +18,10 @@
 //   Disambiguate with the matching `*Id` API or `id_stack.push(i)` scopes.
 //
 // Text display contract (default font):
-//   `label` / `labelEx` / `text` split on paragraphs (LF / CR / CRLF) and never pass
+//   `label` / `labelEx` / `labelStyled` / `text` split on paragraphs (LF / CR / CRLF) and never pass
 //   control characters to Font. `wrap` only folds inside a paragraph. CJK/emoji also
 //   measure 8px per codepoint, no glyph, no fallback. TextInput is single-line
-//   (rejects newline / control inserts).
+//   (rejects newline / control inserts). `labelStyled` delegates to `text`.
 
 const std = @import("std");
 
@@ -2466,7 +2466,26 @@ pub const ListboxRowOpts = struct {
     /// Idle (unselected, unhovered) fill. null leaves the row transparent, so a caller can
     /// zebra-stripe rows itself underneath (as example_40 does with alternating band colors).
     idle_bg: ?Color = null,
+    /// Tree depth. `0` adds no guide nodes (bit-identical to a row with no depth).
+    /// `direction == .column` with `depth > 0` is a contract violation: indent
+    /// guides are defined only on a `.row` listbox row. Guides are row-local, so
+    /// a gap between rows breaks the vertical line (it is not a continuous tree
+    /// rule across rows).
+    depth: u8 = 0,
 };
+
+/// Indent guides are defined only on a `.row` listbox row. `depth = 0` is
+/// always legal (no guide is emitted).
+pub fn listboxIndentGuideLegal(direction: layout.Direction, depth: u8) bool {
+    return depth == 0 or direction == .row;
+}
+
+/// `depth * indent_w` saturated to i32. Used for the guide wrapper width and
+/// the inner spacer budget so place-time cursor addition stays in range.
+pub fn satIndentWidth(depth: u8, indent_w: i32) i32 {
+    const prod = @as(i64, depth) * @as(i64, indent_w);
+    return @intCast(std.math.clamp(prod, @as(i64, std.math.minInt(i32)), @as(i64, std.math.maxInt(i32))));
+}
 
 pub const ListboxRowResult = struct {
     /// Click, or Space/Enter fired while this row already holds the focus (buttonId's
@@ -2531,7 +2550,54 @@ pub fn beginListboxRow(ctx: *Context, id: Id, selected: bool, opts: ListboxRowOp
         .align_cross = opts.align_cross,
         .bg = bg,
     });
+    insertListboxIndentGuide(ctx, opts);
     return .{ .activated = activated };
+}
+
+/// Insert the indent-guide wrapper as the first children of the open row.
+///
+/// Hot path: every frame on the GUI widget-build path. O(depth) boxes and
+/// DrawCmds per row. Not a per-pixel loop; not RT.
+///
+/// Built from ordinary boxes (not a custom leaf): the wrapper and each 1px
+/// line use `height = .grow` so they fill a fit-height row without contributing
+/// to that row's measured height. Line `i` sits at `x = i * indent_w` (the
+/// left edge of that indent step). `indent_w == 0` emits nothing.
+fn insertListboxIndentGuide(ctx: *Context, opts: ListboxRowOpts) void {
+    std.debug.assert(listboxIndentGuideLegal(opts.direction, opts.depth));
+    if (opts.depth == 0) return;
+    const indent_w = ctx.style.indent_w;
+    std.debug.assert(indent_w >= 0);
+    if (indent_w == 0) return;
+
+    const guide_w = satIndentWidth(opts.depth, indent_w);
+    ctx.beginBox(.{
+        .width = .{ .fixed = guide_w },
+        .height = .{ .grow = 1 },
+        .direction = .row,
+    });
+    var remaining = guide_w;
+    var i: u8 = 0;
+    while (i < opts.depth) : (i += 1) {
+        if (remaining <= 0) break;
+        ctx.beginBox(.{
+            .width = .{ .fixed = 1 },
+            .height = .{ .grow = 1 },
+            .bg = ctx.style.border,
+        });
+        ctx.endBox();
+        remaining -= 1;
+        const spacer = @min(indent_w - 1, remaining);
+        if (spacer > 0) {
+            ctx.beginBox(.{
+                .width = .{ .fixed = spacer },
+                .height = .{ .grow = 1 },
+            });
+            ctx.endBox();
+            remaining -= spacer;
+        }
+    }
+    ctx.endBox();
 }
 
 /// Close a row opened by `beginListboxRow`.
@@ -6057,6 +6123,177 @@ test "pollListNav: reports a direction only while the given id holds the focus" 
     ctx.pushEvent(.{ .key_down = .{ .code = input_mod.key.up, .modifiers = 0, .repeat = false } });
     try std.testing.expectEqual(ListNav.prev, pollListNav(&ctx, row));
     ctx.endFrame();
+}
+
+fn countLayoutNodes(n: *const layout.Node) u32 {
+    var total: u32 = 1;
+    var it = n.first_child;
+    while (it) |c| : (it = c.next_sibling) total += countLayoutNodes(c);
+    return total;
+}
+
+fn findNode(n: *layout.Node, id: Id) ?*layout.Node {
+    if (n.cfg.id == id) return n;
+    var it = n.first_child;
+    while (it) |c| : (it = c.next_sibling) {
+        if (findNode(c, id)) |hit| return hit;
+    }
+    return null;
+}
+
+test "listboxIndentGuideLegal: column + depth>0 is a contract violation" {
+    try std.testing.expect(listboxIndentGuideLegal(.row, 0));
+    try std.testing.expect(listboxIndentGuideLegal(.column, 0));
+    try std.testing.expect(listboxIndentGuideLegal(.row, 3));
+    try std.testing.expect(!listboxIndentGuideLegal(.column, 1));
+}
+
+test "satIndentWidth: saturates depth * indent_w to i32" {
+    try std.testing.expectEqual(@as(i32, 0), satIndentWidth(0, 14));
+    try std.testing.expectEqual(@as(i32, 42), satIndentWidth(3, 14));
+    try std.testing.expectEqual(std.math.maxInt(i32), satIndentWidth(255, std.math.maxInt(i32)));
+}
+
+test "beginListboxRow: depth=0 is bit-identical to a row with no depth" {
+    var a = testCtx();
+    defer a.deinit();
+    var b = testCtx();
+    defer b.deinit();
+    const id: Id = 0x7B30;
+
+    a.beginFrame(200, 80);
+    _ = beginListboxRow(&a, id, false, .{});
+    a.label("row");
+    endListboxRow(&a);
+    a.endFrame();
+
+    b.beginFrame(200, 80);
+    _ = beginListboxRow(&b, id, false, .{ .depth = 0 });
+    b.label("row");
+    endListboxRow(&b);
+    b.endFrame();
+
+    try std.testing.expectEqual(countLayoutNodes(a.layout_root.?), countLayoutNodes(b.layout_root.?));
+    try std.testing.expectEqual(a.draw_list.cmds.items.len, b.draw_list.cmds.items.len);
+    try std.testing.expectEqual(a.getNodeRect(id).?, b.getNodeRect(id).?);
+}
+
+test "beginListboxRow: indent_w=0 emits no guide even when depth>0" {
+    var zero = testCtx();
+    defer zero.deinit();
+    var plain = testCtx();
+    defer plain.deinit();
+    const id: Id = 0x7B31;
+    zero.style.indent_w = 0;
+
+    zero.beginFrame(200, 80);
+    _ = beginListboxRow(&zero, id, false, .{ .depth = 3 });
+    zero.label("row");
+    endListboxRow(&zero);
+    zero.endFrame();
+
+    plain.beginFrame(200, 80);
+    _ = beginListboxRow(&plain, id, false, .{});
+    plain.label("row");
+    endListboxRow(&plain);
+    plain.endFrame();
+
+    try std.testing.expectEqual(countLayoutNodes(plain.layout_root.?), countLayoutNodes(zero.layout_root.?));
+    try std.testing.expectEqual(plain.draw_list.cmds.items.len, zero.draw_list.cmds.items.len);
+}
+
+test "beginListboxRow: indent width, line count, and line x sit at i*indent_w" {
+    var ctx = testCtx();
+    defer ctx.deinit();
+    const id: Id = 0x7B32;
+    const indent = ctx.style.indent_w;
+    const depth: u8 = 3;
+
+    ctx.beginFrame(240, 80);
+    _ = beginListboxRow(&ctx, id, false, .{ .depth = depth });
+    ctx.label("row");
+    endListboxRow(&ctx);
+    ctx.endFrame();
+
+    const row = findNode(ctx.layout_root.?, id).?;
+    const wrapper = row.first_child.?;
+    try std.testing.expectEqual(indent * depth, @as(i32, @intCast(wrapper.rect.w)));
+
+    var lines: u32 = 0;
+    var child = wrapper.first_child;
+    while (child) |c| : (child = c.next_sibling) {
+        if (c.cfg.bg == null) continue;
+        try std.testing.expectEqual(@as(u32, 1), c.rect.w);
+        try std.testing.expectEqual(row.rect.x + @as(i32, @intCast(lines)) * indent, c.rect.x);
+        lines += 1;
+    }
+    try std.testing.expectEqual(@as(u32, depth), lines);
+
+    var filled: usize = 0;
+    for (ctx.draw_list.cmds.items) |cmd| {
+        if (cmd == .rect_filled and std.meta.eql(cmd.rect_filled.color, ctx.style.border)) filled += 1;
+    }
+    try std.testing.expectEqual(@as(usize, depth), filled);
+}
+
+test "beginListboxRow: grow guide fills a fit row and does not inflate row height" {
+    var plain = testCtx();
+    defer plain.deinit();
+    var deep = testCtx();
+    defer deep.deinit();
+    const id: Id = 0x7B33;
+
+    plain.beginFrame(240, 80);
+    _ = beginListboxRow(&plain, id, false, .{});
+    plain.label("row");
+    endListboxRow(&plain);
+    plain.endFrame();
+
+    deep.beginFrame(240, 80);
+    _ = beginListboxRow(&deep, id, false, .{ .depth = 2 });
+    deep.label("row");
+    endListboxRow(&deep);
+    deep.endFrame();
+
+    const plain_r = plain.getNodeRect(id).?;
+    const deep_r = deep.getNodeRect(id).?;
+    try std.testing.expectEqual(plain_r.h, deep_r.h);
+    try std.testing.expect(plain_r.h > 0);
+
+    const row = findNode(deep.layout_root.?, id).?;
+    const wrapper = row.first_child.?;
+    try std.testing.expectEqual(deep_r.h, wrapper.rect.h);
+    var child = wrapper.first_child;
+    while (child) |c| : (child = c.next_sibling) {
+        if (c.cfg.bg == null) continue;
+        try std.testing.expectEqual(deep_r.h, c.rect.h);
+    }
+}
+
+test "beginListboxRow: a gap between rows breaks the indent guide (row-local)" {
+    var ctx = testCtx();
+    defer ctx.deinit();
+    const id0: Id = 0x7B34;
+    const id1: Id = 0x7B35;
+    const gap: i32 = 6;
+
+    ctx.beginFrame(240, 120);
+    ctx.beginBox(.{ .direction = .column, .gap = gap });
+    _ = beginListboxRow(&ctx, id0, false, .{ .depth = 2 });
+    ctx.label("a");
+    endListboxRow(&ctx);
+    _ = beginListboxRow(&ctx, id1, false, .{ .depth = 2 });
+    ctx.label("b");
+    endListboxRow(&ctx);
+    ctx.endBox();
+    ctx.endFrame();
+
+    const r0 = findNode(ctx.layout_root.?, id0).?;
+    const r1 = findNode(ctx.layout_root.?, id1).?;
+    const g0 = r0.first_child.?.first_child.?;
+    const g1 = r1.first_child.?.first_child.?;
+    try std.testing.expectEqual(r0.rect.y + @as(i32, @intCast(r0.rect.h)) + gap, r1.rect.y);
+    try std.testing.expect(g0.rect.y + @as(i32, @intCast(g0.rect.h)) < g1.rect.y);
 }
 
 // ── Ellipsis ──

@@ -203,6 +203,13 @@ pub fn main(init: std.process.Init) !void {
     try runWrapScenario(io, &tracker, .long_word, 1, 10000, "longword-10000");
     try runWrapScenario(io, &tracker, .cjk, 20, 0, "cjk-many");
     try runWrapScenario(io, &tracker, .mixed, 20, 0, "mixed-many");
+    std.debug.print("\n=== GUI overlay / indent-guide scenarios (scale 1.0) ===\n", .{});
+    try runAnchorScenario(io, &tracker, 0, "anchor-0");
+    try runAnchorScenario(io, &tracker, 100, "anchor-100");
+    try runIndentScenario(io, &tracker, 500, 0, "indent-d0-500");
+    try runIndentScenario(io, &tracker, 1000, 0, "indent-d0-1000");
+    try runIndentScenario(io, &tracker, 500, 3, "indent-d3-500");
+    try runIndentScenario(io, &tracker, 1000, 3, "indent-d3-1000");
     std.debug.print("\n", .{});
 }
 
@@ -257,4 +264,125 @@ fn runWrapScenario(io: std.Io, tracker: *peak_allocator.PeakTrackingAllocator, k
         percentile95(samples[0..]),
         tracker.peak_bytes,
     });
+}
+
+fn buildAnchors(ctx: *gui.Context, n: u32) void {
+    ctx.beginBox(.{
+        .direction = .column,
+        .width = .{ .grow = 1 },
+        .height = .{ .grow = 1 },
+        .padding = .{ 8, 8, 8, 8 },
+        .bg = gui.Color.rgba(0x18, 0x1C, 0x24, 0xFF),
+    });
+    ctx.label("host");
+    var i: u32 = 0;
+    while (i < n) : (i += 1) {
+        ctx.beginBox(.{
+            .anchor = .{ .at = .top_right, .offset = .{ .x = @intCast(@mod(i, 40)), .y = @intCast(@mod(i, 20)) } },
+            .width = .{ .fixed = 12 },
+            .height = .{ .fixed = 12 },
+            .bg = gui.Color.rgba(0xC0, 0x30, 0x30, 0xFF),
+        });
+        ctx.endBox();
+    }
+    ctx.endBox();
+}
+
+fn buildIndentRows(ctx: *gui.Context, rows: usize, depth: u8) void {
+    ctx.beginBox(.{
+        .direction = .column,
+        .width = .{ .grow = 1 },
+        .height = .{ .grow = 1 },
+        .gap = 1,
+    });
+    var i: usize = 0;
+    while (i < rows) : (i += 1) {
+        const id: gui.Id = @as(gui.Id, @intCast(0x6000 + i));
+        _ = ctx.beginListboxRow(id, i == 0, .{ .depth = depth });
+        ctx.label("row");
+        ctx.endListboxRow();
+    }
+    ctx.endBox();
+}
+
+fn runCountedScenario(
+    io: std.Io,
+    tracker: *peak_allocator.PeakTrackingAllocator,
+    name: []const u8,
+    build: *const fn (*gui.Context) void,
+) !void {
+    const gpa = tracker.allocator();
+    tracker.reset();
+    var ctx = gui.Context.init(gpa, gui.default_font);
+    defer ctx.deinit();
+    const pixels = try gpa.alloc(u32, W * H);
+    defer gpa.free(pixels);
+    @memset(pixels, 0);
+    const target = gui.RenderTarget{ .pixels = pixels, .width = W, .height = H };
+
+    var w: usize = 0;
+    while (w < WARMUP) : (w += 1) {
+        ctx.beginFrame(W, H);
+        build(&ctx);
+        ctx.endFrame();
+        gui.render(target, &ctx.draw_list, ctx.font, 1.0);
+    }
+
+    tracker.reset();
+    var samples: [ITERS]u64 = undefined;
+    var acc: u32 = 0;
+    var arena_peak: usize = 0;
+    var cmds: usize = 0;
+    var i: usize = 0;
+    while (i < ITERS) : (i += 1) {
+        const start = std.Io.Clock.Timestamp.now(io, .awake);
+        ctx.beginFrame(W, H);
+        build(&ctx);
+        ctx.endFrame();
+        gui.render(target, &ctx.draw_list, ctx.font, 1.0);
+        const ns: u64 = @intCast(start.untilNow(io).raw.nanoseconds);
+        samples[i] = ns;
+        arena_peak = @max(arena_peak, ctx.arena.queryCapacity());
+        cmds = ctx.draw_list.cmds.items.len;
+        acc +%= pixels[i % pixels.len];
+        acc +%= @truncate(cmds);
+    }
+    std.mem.doNotOptimizeAway(acc);
+    std.mem.sort(u64, samples[0..], {}, std.sort.asc(u64));
+    var sum: u64 = 0;
+    for (samples) |s| sum += s;
+    std.debug.print("gui.overlay {s:<16} arena_cap={d:<10} alloc_calls={d:<8} cmds={d:<6} avg={d:>9} ns  min={d:>9} ns  p95={d:>9} ns  peak_bytes={d}\n", .{
+        name,
+        arena_peak,
+        tracker.alloc_calls / ITERS,
+        cmds,
+        sum / ITERS,
+        samples[0],
+        percentile95(samples[0..]),
+        tracker.peak_bytes,
+    });
+}
+
+fn runAnchorScenario(io: std.Io, tracker: *peak_allocator.PeakTrackingAllocator, n: u32, name: []const u8) !void {
+    const Gen = struct {
+        var n_badges: u32 = 0;
+        fn build(ctx: *gui.Context) void {
+            buildAnchors(ctx, n_badges);
+        }
+    };
+    Gen.n_badges = n;
+    try runCountedScenario(io, tracker, name, Gen.build);
+}
+
+fn runIndentScenario(io: std.Io, tracker: *peak_allocator.PeakTrackingAllocator, rows: usize, depth: u8, name: []const u8) !void {
+    const Gen = struct {
+        var n_rows: usize = 0;
+        var d: u8 = 0;
+        fn build(ctx: *gui.Context) void {
+            buildIndentRows(ctx, n_rows, d);
+        }
+    };
+    Gen.n_rows = rows;
+    Gen.d = depth;
+    try runCountedScenario(io, tracker, name, Gen.build);
 }

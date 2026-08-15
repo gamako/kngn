@@ -966,6 +966,17 @@ pub const Context = struct {
         } });
     }
 
+    /// Draw `str` with the color and font of `tier`. Delegates to `text` so
+    /// paragraphs and overflow follow that path (no wrap; `overflow = .visible`).
+    /// A null tier font uses `Context.font` (the library does not create fonts).
+    ///
+    /// Hot path: every frame on the GUI widget-build path; field lookup plus the
+    /// `text` leaf. Not a per-pixel loop; not RT.
+    pub fn labelStyled(self: *Context, str: []const u8, tier: style_mod.TextTier) void {
+        const ts = self.style.textStyle(tier);
+        self.text(str, .{ .color = ts.color, .font = ts.font });
+    }
+
     /// custom leaf. size is used as the measure result; draw_fn is called with the final rect
     /// after endFrame finalizes layout (DrawList OOM is catch @panic inside the callback).
     pub fn custom(self: *Context, size: Vec2, draw_fn: layout.CustomDrawFn, ctx_ptr: *anyopaque) void {
@@ -1860,6 +1871,140 @@ test "layout: clip_children bakes the parent rect into children's draw cmds" {
     try std.testing.expectEqual(@as(u32, 40), text_clip.h);
 }
 
+test "anchor: clip_children clips an overflowing overlay's draw commands" {
+    var ctx = testCtx();
+    defer ctx.deinit();
+    const host: Id = 0xA101;
+    const badge: Id = 0xA102;
+    ctx.beginFrame(200, 200);
+    ctx.beginBox(.{
+        .id = host,
+        .width = .{ .fixed = 40 },
+        .height = .{ .fixed = 40 },
+        .clip_children = true,
+        .bg = Color.rgba(0x20, 0x20, 0x20, 0xFF),
+    });
+    ctx.beginBox(.{
+        .id = badge,
+        .anchor = .{ .at = .top_right, .offset = .{ .x = 16, .y = -8 } },
+        .width = .{ .fixed = 20 },
+        .height = .{ .fixed = 20 },
+        .bg = Color.rgba(0xC0, 0x30, 0x30, 0xFF),
+    });
+    ctx.endBox();
+    ctx.endBox();
+    ctx.endFrame();
+
+    const host_r = ctx.getNodeRect(host).?;
+    const badge_r = ctx.getNodeRect(badge).?;
+    try std.testing.expect(badge_r.x + @as(i32, @intCast(badge_r.w)) > host_r.x + @as(i32, @intCast(host_r.w)));
+    var found = false;
+    for (ctx.draw_list.cmds.items) |cmd| {
+        if (cmd != .rect_filled) continue;
+        if (!std.meta.eql(cmd.rect_filled.color, Color.rgba(0xC0, 0x30, 0x30, 0xFF))) continue;
+        try std.testing.expectEqual(@as(i32, 0), cmd.rect_filled.clip.x);
+        try std.testing.expectEqual(@as(u32, 40), cmd.rect_filled.clip.w);
+        try std.testing.expectEqual(@as(u32, 40), cmd.rect_filled.clip.h);
+        found = true;
+    }
+    try std.testing.expect(found);
+}
+
+test "anchor: an explicit id is cached and hit-tested" {
+    var ctx = testCtx();
+    defer ctx.deinit();
+    const host: Id = 0xA201;
+    const badge: Id = 0xA202;
+
+    ctx.beginFrame(200, 200);
+    ctx.beginBox(.{
+        .id = host,
+        .width = .{ .fixed = 80 },
+        .height = .{ .fixed = 40 },
+        .bg = Color.rgba(0x30, 0x30, 0x38, 0xFF),
+    });
+    ctx.label("host");
+    ctx.beginBox(.{
+        .id = badge,
+        .anchor = .{ .at = .top_right, .offset = .{ .x = 4, .y = -4 } },
+        .width = .{ .fixed = 16 },
+        .height = .{ .fixed = 16 },
+        .bg = Color.rgba(0xC0, 0x30, 0x30, 0xFF),
+    });
+    ctx.endBox();
+    ctx.endBox();
+    ctx.endFrame();
+
+    const cached = ctx.getNodeCachedRect(badge).?;
+    try std.testing.expectEqual(@as(u32, 16), cached.rect.w);
+    try std.testing.expectEqual(@as(i32, 80 - 16 + 4), cached.rect.x);
+    try std.testing.expectEqual(@as(i32, -4), cached.rect.y);
+
+    const cx = cached.rect.x + 8;
+    const cy = cached.rect.y + 8;
+    ctx.beginFrame(200, 200);
+    ctx.pushEvent(.{ .mouse_move = .{ .x = cx, .y = cy, .modifiers = 0 } });
+    ctx.pushEvent(.{ .mouse_down = .{ .x = cx, .y = cy, .button = 0, .modifiers = 0 } });
+    ctx.pushEvent(.{ .mouse_up = .{ .x = cx, .y = cy, .button = 0, .modifiers = 0 } });
+    const res = buttonBehavior(&ctx, badge, cached.rect, cached.clip);
+    ctx.endFrame();
+    try std.testing.expect(res.clicked);
+}
+
+test "anchor: a tree with no overlay keeps the pre-overlay rect and DrawCmd contract" {
+    var ctx = testCtx();
+    defer ctx.deinit();
+    const row: Id = 0xA301;
+    const left: Id = 0xA302;
+    const right: Id = 0xA303;
+    const red = Color.rgba(0x10, 0x00, 0x00, 0xFF);
+    const blue = Color.rgba(0x00, 0x10, 0x00, 0xFF);
+    const green = Color.rgba(0x00, 0x00, 0x10, 0xFF);
+
+    ctx.beginFrame(200, 40);
+    ctx.beginBox(.{
+        .id = row,
+        .direction = .row,
+        .width = .{ .fixed = 200 },
+        .height = .{ .fixed = 40 },
+        .gap = 4,
+        .bg = red,
+    });
+    ctx.beginBox(.{ .id = left, .width = .{ .fixed = 40 }, .height = .{ .fixed = 16 }, .bg = blue });
+    ctx.label("ab");
+    ctx.endBox();
+    ctx.beginBox(.{ .id = right, .width = .{ .grow = 1 }, .height = .{ .grow = 1 }, .bg = green });
+    ctx.label("cd");
+    ctx.endBox();
+    ctx.endBox();
+    ctx.endFrame();
+
+    try std.testing.expect(!ctx.layout_root.?.has_anchored_child);
+    try std.testing.expectEqual(ctx.layout_root.?.child_count, ctx.layout_root.?.flow_child_count);
+
+    const row_r = ctx.getNodeRect(row).?;
+    const left_r = ctx.getNodeRect(left).?;
+    const right_r = ctx.getNodeRect(right).?;
+    try std.testing.expectEqual(Rect{ .x = 0, .y = 0, .w = 200, .h = 40 }, row_r);
+    try std.testing.expectEqual(Rect{ .x = 0, .y = 0, .w = 40, .h = 16 }, left_r);
+    try std.testing.expectEqual(Rect{ .x = 44, .y = 0, .w = 156, .h = 40 }, right_r);
+
+    try std.testing.expectEqual(@as(usize, 5), ctx.draw_list.cmds.items.len);
+    try std.testing.expect(ctx.draw_list.cmds.items[0] == .rect_filled);
+    try std.testing.expectEqual(row_r, ctx.draw_list.cmds.items[0].rect_filled.rect);
+    try std.testing.expectEqual(red, ctx.draw_list.cmds.items[0].rect_filled.color);
+    try std.testing.expectEqual(left_r, ctx.draw_list.cmds.items[1].rect_filled.rect);
+    try std.testing.expectEqual(blue, ctx.draw_list.cmds.items[1].rect_filled.color);
+    try std.testing.expectEqualStrings("ab", ctx.draw_list.cmds.items[2].text.text);
+    try std.testing.expectEqual(@as(i32, 0), ctx.draw_list.cmds.items[2].text.pos.x);
+    try std.testing.expectEqual(@as(i32, 0), ctx.draw_list.cmds.items[2].text.pos.y);
+    try std.testing.expectEqual(right_r, ctx.draw_list.cmds.items[3].rect_filled.rect);
+    try std.testing.expectEqual(green, ctx.draw_list.cmds.items[3].rect_filled.color);
+    try std.testing.expectEqualStrings("cd", ctx.draw_list.cmds.items[4].text.text);
+    try std.testing.expectEqual(@as(i32, 44), ctx.draw_list.cmds.items[4].text.pos.x);
+    try std.testing.expectEqual(@as(i32, 0), ctx.draw_list.cmds.items[4].text.pos.y);
+}
+
 test "layout: label dupes the string onto the arena (immune to later caller-buffer rewrites)" {
     var ctx = testCtx();
     defer ctx.deinit();
@@ -2747,6 +2892,73 @@ test "text: non-wrap explicit newline + max_lines ellipsis targets the last visi
         if (cmd == .text) last = cmd.text.text;
     }
     try std.testing.expect(std.mem.endsWith(u8, last, "..."));
+}
+
+test "labelStyled: each tier uses the matching style color and a null font" {
+    var ctx = testCtx();
+    defer ctx.deinit();
+    ctx.beginFrame(400, 200);
+    ctx.beginBox(.{ .direction = .column });
+    ctx.labelStyled("H", .heading);
+    ctx.labelStyled("B", .body);
+    ctx.labelStyled("C", .caption);
+    ctx.labelStyled("M", .muted);
+    ctx.endBox();
+    ctx.endFrame();
+    var colors: [4]Color = undefined;
+    var fonts: [4]?Font = undefined;
+    var n: usize = 0;
+    for (ctx.draw_list.cmds.items) |cmd| {
+        if (cmd != .text) continue;
+        colors[n] = cmd.text.color;
+        fonts[n] = cmd.text.font;
+        n += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 4), n);
+    try std.testing.expectEqual(ctx.style.heading.color, colors[0]);
+    try std.testing.expectEqual(ctx.style.body.color, colors[1]);
+    try std.testing.expectEqual(ctx.style.caption.color, colors[2]);
+    try std.testing.expectEqual(ctx.style.muted.color, colors[3]);
+    try std.testing.expect(fonts[0] == null);
+    try std.testing.expect(fonts[1] == null);
+    try std.testing.expect(fonts[2] == null);
+    try std.testing.expect(fonts[3] == null);
+}
+
+test "labelStyled: a non-null tier font is carried onto the draw command" {
+    var ctx = testCtx();
+    defer ctx.deinit();
+    ctx.style.heading.font = font_mod.defaultOutlineFont();
+    ctx.beginFrame(400, 80);
+    ctx.labelStyled("Title", .heading);
+    ctx.endFrame();
+    const cmd = firstText(&ctx).?.text;
+    try std.testing.expect(cmd.font != null);
+    try std.testing.expectEqual(ctx.style.heading.font.?.ptr, cmd.font.?.ptr);
+}
+
+test "labelStyled: uses the text path for paragraphs and overflow" {
+    var ctx = testCtx();
+    defer ctx.deinit();
+    ctx.beginFrame(800, 200);
+    ctx.beginBox(.{ .direction = .column, .gap = 4 });
+    ctx.labelStyled("a\nb", .body);
+    ctx.text("a\nb", .{});
+    ctx.endBox();
+    ctx.endFrame();
+    try std.testing.expectEqual(@as(usize, 4), countTextCmds(&ctx));
+    var texts: [4][]const u8 = .{ "", "", "", "" };
+    var i: usize = 0;
+    for (ctx.draw_list.cmds.items) |cmd| {
+        if (cmd == .text) {
+            texts[i] = cmd.text.text;
+            i += 1;
+        }
+    }
+    try std.testing.expectEqualStrings("a", texts[0]);
+    try std.testing.expectEqualStrings("b", texts[1]);
+    try std.testing.expectEqualStrings(texts[0], texts[2]);
+    try std.testing.expectEqualStrings(texts[1], texts[3]);
 }
 
 test "text: explicit-ID previous-frame rect and hit-test ignore leaf overflow" {

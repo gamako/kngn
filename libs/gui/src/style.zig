@@ -4,8 +4,22 @@
 // directly. Sizes are i32 (same integer system as layout / Rect); cast to u32 at draw time.
 
 const color_mod = @import("color.zig");
+const font_mod = @import("font.zig");
 
 pub const Color = color_mod.Color;
+pub const Font = font_mod.Font;
+
+/// Color and optional font for one text tier. `font = null` uses `Context.font`.
+/// The library never creates fonts; a size difference appears only when the
+/// application stores a generated `Font` on the matching `Style` field
+/// (a catalog UI typically injects an 18px heading next to a 14px body).
+pub const TextStyle = struct {
+    color: Color,
+    font: ?Font = null,
+};
+
+/// Named text tier for `Context.labelStyled`.
+pub const TextTier = enum { heading, body, caption, muted };
 
 pub const Style = struct {
     /// Normal fill for button etc.
@@ -67,6 +81,18 @@ pub const Style = struct {
     // text_subtle (no new color fields).
     popup_item_h: i32 = 20,
     popup_padding: i32 = 4,
+    /// One tree-indent step for `beginListboxRow` guides. `0` emits no guide
+    /// (even when `depth > 0`). Must be `>= 0`.
+    indent_w: i32 = 14,
+    /// Heading tier. Default color matches `text`; default `font` is null
+    /// (`Context.font`). Size difference exists only after the app injects a Font.
+    heading: TextStyle = .{ .color = Color.rgba(0xFF, 0xFF, 0xFF, 0xFF) },
+    /// Body tier. Default color matches `text`; default `font` is null.
+    body: TextStyle = .{ .color = Color.rgba(0xFF, 0xFF, 0xFF, 0xFF) },
+    /// Caption tier. Default color matches `text_subtle`; default `font` is null.
+    caption: TextStyle = .{ .color = Color.rgba(0x90, 0x98, 0xA0, 0xFF) },
+    /// Muted tier. Default color is `text_subtle` blended halfway toward `bg`.
+    muted: TextStyle = .{ .color = Color.rgba(0x64, 0x68, 0x70, 0xFF) },
 
     /// The color a disabled widget draws `base` as: grayscale (so an accent color loses its hue,
     /// not just its brightness), then blended halfway toward `bg` (so a disabled widget dims
@@ -83,19 +109,46 @@ pub const Style = struct {
             0xFF,
         );
     }
+
+    /// `text_subtle` blended halfway toward `bg` (same surface, quieter than caption).
+    pub fn mutedFromSubtle(self: Style) Color {
+        return Color.rgba(
+            @intCast((@as(u16, self.text_subtle.r) + self.bg.r) / 2),
+            @intCast((@as(u16, self.text_subtle.g) + self.bg.g) / 2),
+            @intCast((@as(u16, self.text_subtle.b) + self.bg.b) / 2),
+            0xFF,
+        );
+    }
+
+    pub fn textStyle(self: Style, tier: TextTier) TextStyle {
+        return switch (tier) {
+            .heading => self.heading,
+            .body => self.body,
+            .caption => self.caption,
+            .muted => self.muted,
+        };
+    }
 };
 
 /// Dark theme in the example 09/10 family. text is white (same as earlier label default).
 pub fn defaultStyle() Style {
-    return .{
-        .bg = Color.rgba(0x38, 0x38, 0x40, 0xFF),
+    const text = Color.rgba(0xFF, 0xFF, 0xFF, 0xFF);
+    const text_subtle = Color.rgba(0x90, 0x98, 0xA0, 0xFF);
+    const bg = Color.rgba(0x38, 0x38, 0x40, 0xFF);
+    var s: Style = .{
+        .bg = bg,
         .bg_hover = Color.rgba(0x50, 0x50, 0x60, 0xFF),
         .bg_active = Color.rgba(0x30, 0x60, 0xC0, 0xFF),
         .border = Color.rgba(0x60, 0x60, 0x6C, 0xFF),
         .border_hover = Color.rgba(0xA0, 0xA0, 0xB0, 0xFF),
-        .text = Color.rgba(0xFF, 0xFF, 0xFF, 0xFF),
-        .text_subtle = Color.rgba(0x90, 0x98, 0xA0, 0xFF),
+        .text = text,
+        .text_subtle = text_subtle,
+        .heading = .{ .color = text },
+        .body = .{ .color = text },
+        .caption = .{ .color = text_subtle },
     };
+    s.muted = .{ .color = s.mutedFromSubtle() };
+    return s;
 }
 
 // ============================================================
@@ -140,4 +193,34 @@ test "disabledColor: idempotent-ish -- disabling an already-bg-colored value ret
     const bg_disabled = s.disabledColor(s.bg);
     try std.testing.expect(@as(i32, @intCast(bg_disabled.r)) - @as(i32, @intCast(s.bg.r)) <= 8);
     try std.testing.expect(@as(i32, @intCast(s.bg.r)) - @as(i32, @intCast(bg_disabled.r)) <= 8);
+}
+
+test "defaultStyle: text tiers map heading/body to text, caption to text_subtle, muted toward bg" {
+    const s = defaultStyle();
+    try std.testing.expectEqual(s.text, s.heading.color);
+    try std.testing.expectEqual(s.text, s.body.color);
+    try std.testing.expectEqual(s.text_subtle, s.caption.color);
+    try std.testing.expectEqual(s.mutedFromSubtle(), s.muted.color);
+    try std.testing.expect(s.heading.font == null);
+    try std.testing.expect(s.body.font == null);
+    try std.testing.expect(s.caption.font == null);
+    try std.testing.expect(s.muted.font == null);
+    try std.testing.expectEqual(@as(i32, 14), s.indent_w);
+}
+
+test "textStyle: tier selects the matching TextStyle field" {
+    const s = defaultStyle();
+    try std.testing.expectEqual(s.heading.color, s.textStyle(.heading).color);
+    try std.testing.expectEqual(s.body.color, s.textStyle(.body).color);
+    try std.testing.expectEqual(s.caption.color, s.textStyle(.caption).color);
+    try std.testing.expectEqual(s.muted.color, s.textStyle(.muted).color);
+}
+
+test "mutedFromSubtle: halfway from text_subtle toward bg" {
+    const s = defaultStyle();
+    const m = s.mutedFromSubtle();
+    try std.testing.expectEqual(@as(u8, 0x64), m.r);
+    try std.testing.expectEqual(@as(u8, 0x68), m.g);
+    try std.testing.expectEqual(@as(u8, 0x70), m.b);
+    try std.testing.expectEqual(@as(u8, 0xFF), m.a);
 }

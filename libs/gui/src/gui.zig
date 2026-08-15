@@ -130,6 +130,8 @@ pub const CachedRect = @import("context.zig").CachedRect;
 pub const Direction = @import("layout.zig").Direction;
 pub const Sizing = @import("layout.zig").Sizing;
 pub const Align = @import("layout.zig").Align;
+pub const AnchorAt = @import("layout.zig").AnchorAt;
+pub const Anchor = @import("layout.zig").Anchor;
 pub const Overflow = @import("layout.zig").Overflow;
 pub const BoxConfig = @import("layout.zig").BoxConfig;
 pub const Border = @import("layout.zig").Border;
@@ -138,6 +140,8 @@ pub const CustomDrawFn = @import("layout.zig").CustomDrawFn;
 // Widget layer. Widget bodies (button / colorSwatch / etc.) are invoked as Context
 // methods (e.g. ctx.button("Save"); implementations live in widgets.zig).
 pub const Style = @import("style.zig").Style;
+pub const TextStyle = @import("style.zig").TextStyle;
+pub const TextTier = @import("style.zig").TextTier;
 pub const defaultStyle = @import("style.zig").defaultStyle;
 pub const ButtonOpts = @import("widgets.zig").ButtonOpts;
 pub const SwatchOpts = @import("widgets.zig").SwatchOpts;
@@ -181,6 +185,8 @@ pub const ListboxRowResult = @import("widgets.zig").ListboxRowResult;
 pub const pollListNav = @import("widgets.zig").pollListNav;
 pub const beginListboxRow = @import("widgets.zig").beginListboxRow;
 pub const endListboxRow = @import("widgets.zig").endListboxRow;
+pub const listboxIndentGuideLegal = @import("widgets.zig").listboxIndentGuideLegal;
+pub const satIndentWidth = @import("widgets.zig").satIndentWidth;
 // Ellipsis
 pub const EllipsisResult = @import("widgets.zig").EllipsisResult;
 pub const ellipsizeText = @import("widgets.zig").ellipsizeText;

@@ -581,6 +581,30 @@ fn renderLayout(ctx: *gui.Context, app: *App) void {
     ctx.endBox();
     app.overflow = if (app.screen_w < 2000 or app.screen_h < 500) 1 else 0;
 
+    ctx.beginBox(.{
+        .width = .{ .fixed = 80 },
+        .height = .{ .fixed = 28 },
+        .bg = gui.Color.rgba(0x30, 0x38, 0x48, 0xFF),
+    });
+    ctx.label("anchor-host");
+    ctx.beginBox(.{
+        .anchor = .{ .at = .top_right, .offset = .{ .x = 6, .y = -6 } },
+        .width = .{ .fixed = 12 },
+        .height = .{ .fixed = 12 },
+        .bg = gui.Color.rgba(0xC0, 0x30, 0x30, 0xFF),
+    });
+    ctx.endBox();
+    ctx.endBox();
+
+    ctx.beginBox(.{ .direction = .column, .gap = 2 });
+    _ = ctx.beginListboxRow(0x3733, false, .{ .depth = 0 });
+    ctx.label("tree-root");
+    ctx.endListboxRow();
+    _ = ctx.beginListboxRow(0x3734, true, .{ .depth = 2 });
+    ctx.label("tree-leaf");
+    ctx.endListboxRow();
+    ctx.endBox();
+
     ctx.endBox();
 }
 
@@ -601,6 +625,8 @@ fn renderText(ctx: *gui.Context, app: *App) void {
     ctx.label(app.long_emoji);
     ctx.label(app.long_newline);
     ctx.label(app.utf8_boundary_text);
+    ctx.labelStyled("heading-tier", .heading);
+    ctx.labelStyled("muted-tier", .muted);
     _ = ctx.selectableLabelId(Ids.text_selectable, app.utf8_boundary_text, .{});
     _ = ctx.textInputId(Ids.text_input, app.text_buf, .{ .width = .{ .fixed = 480 }, .placeholder = "empty" });
     if (ctx.buttonId(Ids.text_popup_trigger, "open text popup", .{ .min_w = 160 }).clicked) {
