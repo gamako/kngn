@@ -1,8 +1,12 @@
-// example_09: libs/gui input management + hot/active + frame lifecycle
+// example_09: libs/gui raw buttonBehavior + hot/active + frame lifecycle
 //
-// - Three buttons that call buttonBehavior directly (widgets land later; here they are
-//   hand-drawn with buttonBehavior + rectFilled / rectOutline).
-//   Hover changes the outline; press changes the fill; release increments the clicked counter.
+// Composes hot/active from the raw API, then hand-drawn fill and outline
+// from the result. Two hit-test sources:
+// - The three left buttons pass a caller-supplied (fixed) rect.
+// - The "layout hit" box is an explicit-ID beginBox; buttonBehavior reads
+//   getNodeRect (previous-frame cache) and the box bg follows that result.
+// Hover changes the outline; press changes the fill; release increments the
+// clicked counter.
 // - A "canvas" region on the right draws a marker at the mouse only when
 //   ctx.wantsMouse() is false (checks GUI vs canvas input contention).
 // - Converting platform.Event → gui.InputEvent is the caller's job (this sample).
@@ -68,10 +72,12 @@ pub fn main(init: std.process.Init) !void {
         .{ .rect = .{ .x = 50, .y = 220, .w = 180, .h = 60 }, .label = "Button C" },
     };
     var click_counts = [_]u32{ 0, 0, 0 };
+    var layout_clicks: u32 = 0;
+    const layout_id: gui.Id = 0x0901;
 
     const canvas_rect = gui.Rect{ .x = 300, .y = 60, .w = 450, .h = 480 };
 
-    const help_text: []const u8 = "ESC: quit / hover-click the buttons / move into the right canvas to drop a marker";
+    const help_text: []const u8 = "ESC: quit / hover-click the buttons / layout-hit uses getNodeRect / canvas drops a marker";
 
     main_loop: while (window.pollEvents()) {
         const fb = window.lockFramebuffer() orelse continue :main_loop;
@@ -137,6 +143,36 @@ pub fn main(init: std.process.Init) !void {
                 gui.Color.rgba(0xB0, 0xB0, 0xB0, 0xFF),
             );
         }
+
+        // ── Explicit-ID box: sync hit-test against the previous-frame cache ──
+        var layout_res: gui.ButtonResult = .{};
+        if (ctx.getNodeRect(layout_id)) |prev| {
+            layout_res = gui.buttonBehavior(&ctx, layout_id, prev, full_clip);
+        }
+        if (layout_res.clicked) layout_clicks += 1;
+        const layout_bg = if (layout_res.held)
+            gui.Color.rgba(0x30, 0x60, 0xC0, 0xFF)
+        else if (ctx.state.hot_id == layout_id)
+            gui.Color.rgba(0x50, 0x50, 0x60, 0xFF)
+        else
+            gui.Color.rgba(0x38, 0x38, 0x40, 0xFF);
+        const layout_border = if (ctx.state.hot_id == layout_id)
+            gui.Color.rgba(0xFF, 0xD0, 0x40, 0xFF)
+        else
+            gui.Color.rgba(0x80, 0x80, 0x90, 0xFF);
+        ctx.beginBox(.{ .direction = .column, .padding = .{ 298, 0, 0, 50 } });
+        ctx.beginBox(.{
+            .id = layout_id,
+            .padding = .{ 8, 12, 8, 12 },
+            .bg = layout_bg,
+            .border = .{ .color = layout_border, .thickness = 2 },
+        });
+        ctx.label("layout hit");
+        var layout_buf: [24]u8 = undefined;
+        const layout_txt = std.fmt.bufPrint(&layout_buf, "clicks: {d}", .{layout_clicks}) catch "";
+        ctx.labelEx(layout_txt, gui.Color.rgba(0xB0, 0xB0, 0xB0, 0xFF));
+        ctx.endBox();
+        ctx.endBox();
 
         // ── Canvas region ──
         try ctx.draw_list.rectFilled(canvas_rect, gui.Color.rgba(0x18, 0x18, 0x1C, 0xFF));

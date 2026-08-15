@@ -253,6 +253,29 @@ a `bar_thickness`-px strip of height for the viewport.
   only restricts where children are drawn and hit-tested, clamping both to
   the intersection of the parent's rect and any effective ancestor clip.
 
+## Layout catalog (`examples/10_gui_layout`)
+
+`examples/10_gui_layout` is a live catalog of these rules. The width slider
+(or harness `action layout_width <px>`) re-solves every item on the same
+screen. Each item prints the resolved numbers (child widths, wrap line
+membership, leftover, visible range). `digest layout` exposes the same
+figures for harness `expect`, including `an_plain_h` / `an_ovl_h` / `an_dh`
+(anchor does not change parent size), `an_badge_x` / `an_badge_y` (overlay
+placement), and `wrap_gap_y0` / `wrap_gap_y1` / `wrap_gap_dy` (measured
+cross-axis spacing).
+
+| Contract | Catalog item |
+|---|---|
+| fixed / fit / grow / percent mix: grow stretches, percent follows the content box, fixed and fit hold | 1. Mixed sizing |
+| min/max clamp is orthogonal to `Sizing`; a clamped child freezes and the remainder is redistributed; weight-0 + min still meets min | 2. min/max clamp |
+| leftover remainder is a trailing gap when every grow child is max-frozen | 3. Leftover |
+| wrap line split: percent enters at its resolved size, grow enters at its min; `cross_gap` is independent of `gap` | 4. Wrap |
+| wrap cross-axis grow fills its own line, not the container | 5. Wrap cross grow |
+| an anchored child is an overlay: it takes no part in fit, cursor, gap, grow share, or wrap line split | 6. Anchor |
+| ScrollArea scroll range is declared fixed → recorded content extent → measured | 7. Content extent |
+| table columns: fit is content-sized, fixed holds, grow absorbs the remainder | 8. Table columns |
+| virtual list visible window (`first..end`) follows height and scroll, not width | 9. Virtual list |
+
 ## Verification
 
 `zig build test-gui` runs `layout.zig`'s own `measure`/`place` unit tests
