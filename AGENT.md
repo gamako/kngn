@@ -479,6 +479,24 @@ all implemented:
   `libs/modular/src/modules.zig`)
 - SIMD bit-identical to a scalar reference (`libs/pixelops`)
 
+#### A contract stated as an absolute is pinned the same way
+
+The rule above is written for performance, but it applies to every contract phrased as
+*never*, *always*, or *unbounded*: "the declarative path never exceeds the width it was
+given", "zero means no line limit", "the chain is fixed for the frame". Such a sentence is
+prose until a test states it in the form that fails.
+
+Prefer the form that quantifies over inputs rather than one example of it: a case built
+from the one input the author had in mind passes while the general claim is false. Two
+defects that reached review here read exactly that way — an ellipsis that respected the
+width on its last line only, and an "unbounded" line count silently capped a few thousand
+lines in. Both had tests, and both tests agreed with the implementation, because the same
+reading produced them.
+
+That is the reason a contract is worth restating in the review request in the words of the
+design, not in the words of the code: a reader comparing prose against code is the only
+check that survives an author who misread the prose.
+
 #### Asserting on a whole frame, not a microbenchmark
 
 The three above pin a component. To pin **the assembled frame**, assert on the `frameprof`
@@ -504,6 +522,43 @@ about the work.
 A caveat that applies to any number this produces: these are wall-clock values on the
 machine that ran them. **Do not put a frame-time assertion in a build gate** — the drift
 between runs on one machine is already the size of the effects worth catching.
+
+### A new feature costs nothing to the code that does not use it
+
+A feature added to a shared path — layout, the frame build, a widget everything else is
+built from — must not make the trees that never use it slower. The trap is that the
+behaviour is correct either way, so nothing fails: detecting "is this feature present
+here?" by walking the children every frame is a perfectly correct implementation, and it
+taxes every caller that does not use the feature.
+
+**Record the answer where the structure is built, not where it is consumed.** A flag set
+when a child is inserted turns a per-frame search into a branch. `has_anchored_child` in
+`libs/gui/src/layout.zig` is the worked example: without it, a tree holding no overlay
+still paid two extra walks per box per frame.
+
+Two obligations follow for such a change:
+
+1. Its benchmark carries **a scenario where the feature is switched off or absent**, next
+   to the scenarios that exercise it.
+2. That scenario is reported **against the numbers from before the change**. A zero-case
+   scenario measured only after the fact says nothing: it reports what the new path costs,
+   not whether the old path grew.
+
+### A test, a benchmark or a probe that cannot fail proves nothing
+
+Writing a check and having a check are different things, and the difference is invisible
+in a green run. Three real cases, all of which passed while measuring nothing:
+
+- a horizontal-scroll benchmark whose columns summed to a third of the table width, so it
+  never scrolled;
+- a digest that reported the number of wrap lines but not the spacing between them, so
+  setting `cross_gap` to zero still satisfied it;
+- an assertion on a widget that had already been proven by the surrounding test.
+
+**Before trusting a new test, benchmark or probe key, break the thing it watches and
+confirm it reacts** — set the gap to zero, shrink the container until it overflows, remove
+the clamp. Record in the change notes that this was done. A check that stays green under
+the fault it is named after is worse than no check, because it also removes the doubt.
 
 ### Measure
 
