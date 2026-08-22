@@ -58,6 +58,10 @@ pub const rasterize = raster.rasterize;
 pub const Bitmap = raster.Bitmap;
 pub const FontFace = outline_font.FontFace;
 pub const OutlineFont = outline_font.OutlineFont;
+pub const OutlineFontFamily = outline_font.OutlineFontFamily;
+pub const GlyphKey = outline_font.GlyphKey;
+pub const GlyphCoverageCache = outline_font.GlyphCoverageCache;
+pub const CachedGlyph = outline_font.CachedGlyph;
 pub const BMFont = bmfont.BMFont;
 
 // sbix (embedded color bitmap) table parser

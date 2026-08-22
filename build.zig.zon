@@ -32,6 +32,14 @@
     // Once all dependencies are fetched, `zig build` no longer requires
     // internet connectivity.
     .dependencies = .{
+        .noto_sans_jp = .{
+            .url = "https://github.com/notofonts/noto-cjk/releases/download/Sans2.004/02_NotoSansCJK-TTF-VF.zip",
+            .hash = "N-V-__8AAMlpdx0-3kW2h1hORSwYZEJLZWWkLc3EC8LrdbCD",
+            .paths = .{
+                "Variable/TTF/Subset/NotoSansJP-VF.ttf",
+                "LICENSE",
+            },
+        },
         // See `zig fetch --save <url>` for a command-line interface for adding dependencies.
         //.example = .{
         //    // When updating this field to a new URL, be sure to delete the corresponding

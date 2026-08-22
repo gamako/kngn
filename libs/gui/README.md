@@ -11,7 +11,7 @@ Immediate-mode GUI library for KNGN. Standalone and platform-independent;
 | `src/geom.zig` | Rect / Vec2 / RenderTarget |
 | `src/color.zig` | Color (straight alpha, canonical BGRA 0xAARRGGBB, memory [B,G,R,A]) |
 | `src/draw.zig` | DrawList (draw cmds with clip baked in) |
-| `src/font.zig` | BitmapFont (fixed-width ASCII, comptime BDF parser) |
+| `src/font.zig` | Font interface, bitmap opt-in, and the lazy Noto Sans JP outline family |
 | `src/render.zig` | Software renderer: DrawList → pixel buffer |
 | `src/input.zig` | Input aggregation (platform-independent InputEvent) |
 | `src/id.zig` | Widget ID (FNV-1a) + IdStack |
@@ -135,9 +135,10 @@ Two smaller helpers round out a settings-style form:
   its box. `label` / `labelEx` stay the terse path: no auto-wrap, but explicit paragraph
   breaks still become multiple lines.
 - `ctx.labelStyled(str, tier)` — `heading` / `body` / `caption` / `muted`. Delegates to
-  `text` with that tier's `Style` color and optional font. A null font uses `ctx.font`;
-  the library never creates fonts, so a size difference appears only when the app stores
-  a generated `Font` on `style.heading` (or another tier).
+  `text` with that tier's `Style` colour and resolved font. With `gui.default_font`, a null
+  tier font resolves through the shared Noto Sans JP family using the tier's size and weight:
+  heading 20/700, body 16/400, caption 13/400, muted 12/400. An explicit font wins. A
+  bitmap or family-less custom font uses the context font and ignores tier size and weight.
 - `ctx.labelEllipsis(text, max_w, color) EllipsisResult` / `gui.ellipsizeText(ctx, text, max_w)`
   — draw (or just compute) `text` truncated to a trailing `"..."` once it would exceed `max_w`
   px, codepoint-aware. `result.truncated` is available **in the same frame**, which is why
@@ -317,17 +318,19 @@ two-dimensional drag widgets), is in `docs/adr/021_gui-keyboard-focus-traversal.
 
 ## Text measurement and drawing
 
-The default font (`BitmapFont`, `src/font.zig`) covers ASCII `32..127` at a fixed
-8px advance per codepoint and draws a single line only — no wrap, no newline
-handling (a `\n` in a label is not stripped but does not start a new line
-either). A codepoint outside ASCII (CJK, emoji, any other non-ASCII text) has no
-glyph: drawing it is skipped, but measurement and the draw cursor still advance
-8px, so **logical width is not ink pixel width** for such text. There is no font
-chain or fallback glyph. `measure` and `drawTo` always agree on advance, by
-construction. The full contract, including invalid-UTF-8 handling, is the doc
-comment at the top of `font.zig`; codepoint-indexed layout, caret and selection
-(`TextLayout`, `hitTest`, `wordRange`) are documented at the top of
-`text_edit.zig` and used by `selectableLabel` / `textInputId`.
+`gui.default_font` is a lazy Noto Sans JP variable outline font. It covers the Japanese
+default-label path and produces anti-aliased coverage at the requested draw scale. Its
+family shares a bounded glyph coverage cache across size/weight variants: the payload is
+limited to 4 MiB and 512 entries, with LRU eviction and negative entries for oversized
+glyphs. `measure`, intrinsic-width calculation, and wrapping read advances and metrics only;
+they do not rasterise or populate the coverage cache.
+
+`gui.default_bitmap_font` is the explicit fixed 8x16 ASCII bitmap option. It covers ASCII
+`32..127` at an 8px advance per codepoint, skips non-ASCII ink while preserving advance,
+and is useful for pixel-stable callers. Both font paths keep measurement and drawing
+advances consistent. The full contract, including invalid UTF-8 handling, is in the
+doc comment at the top of `font.zig`; codepoint-indexed layout, caret and selection
+(`TextLayout`, `hitTest`, `wordRange`) are documented at the top of `text_edit.zig`.
 
 Auto-generated widget IDs hash the label text (`IdStack.make`); using the same
 label twice in the same ID-stack scope collides on ID, which

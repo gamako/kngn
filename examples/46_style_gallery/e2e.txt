@@ -122,7 +122,7 @@ expect showcase aa_on=6
 expect showcase aa_off=3
 snapshot fb
 digest drawlist
-expect drawlist hash=A440AB3B
+expect drawlist hash=77A795C4
 expect drawlist rect_filled=3
 expect drawlist rect_outline=0
 expect drawlist line=0
@@ -152,7 +152,7 @@ expect showcase aa_on=11
 expect showcase aa_off=2
 snapshot fb
 digest drawlist
-expect drawlist hash=BD291F9F
+expect drawlist hash=0187BDEE
 expect drawlist rect_filled=11
 expect drawlist rect_outline=3
 expect drawlist line=0

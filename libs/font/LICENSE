@@ -1,9 +1,21 @@
-This library bundles the "Press Start 2P" outline font
-(assets/PressStart2P-Regular.ttf) as the default vendored font for
-headless/deterministic text rasterization. Source:
-https://github.com/google/fonts/tree/main/ofl/pressstart2p
+The GUI default outline font is Noto Sans JP Variable.
 
-Copyright 2012 The Press Start 2P Project Authors (cody@zone38.net), with Reserved Font Name "Press Start 2P".
+Source release: Noto CJK `Sans2.004`, source commit
+`523d033d6cb47f4a80c58a35753646f5c3608a78`.
+Archive URL:
+https://github.com/notofonts/noto-cjk/releases/download/Sans2.004/02_NotoSansCJK-TTF-VF.zip
+Archive SHA-256: `b73a1f90988d6ccc3f60ce44ee3d1e82479a92710cd49cd950950c9adab50fc1e`.
+Package path: `Variable/TTF/Subset/NotoSansJP-VF.ttf`.
+TTF size: 9,590,732 bytes.
+TTF SHA-256: `f4b373b226668ee33a6e54b02823dcd2d1209f17159f777421ae8c2275160369`.
+The Google Fonts metadata for the corresponding fixed commit is
+`ec626514f79f831f1ab848a82114a0ce7e2d6372`; the release archive is used because
+Zig 0.16 does not accept the raw single-file URL. The variable axis is `wght`
+with the upstream range 100..900.
+
+The existing `assets/PressStart2P-Regular.ttf` bitmap/text-layer asset remains
+covered by its original copyright: 2012 The Press Start 2P Project Authors
+(cody@zone38.net), with Reserved Font Name "Press Start 2P".
 
 This Font Software is licensed under the SIL Open Font License, Version 1.1.
 This license is copied below, and is also available with a FAQ at:

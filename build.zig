@@ -2437,6 +2437,7 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
     gui_test_root.addImport("font", shared_modules.font.mod);
+    gui_test_root.addImport("font_asset", shared_modules.font_asset);
     gui_test_root.addImport("pixelops", shared_modules.pixelops.mod);
     gui_test_root.addImport("vector", shared_modules.vector.mod);
     gui_test_root.addImport("command_types", shared_modules.command_types.mod);
@@ -2478,6 +2479,7 @@ pub fn build(b: *std.Build) void {
             .optimize = guard_optimize,
         });
         guard_gui.addImport("font", shared_modules.font.mod);
+        guard_gui.addImport("font_asset", shared_modules.font_asset);
         guard_gui.addImport("pixelops", shared_modules.pixelops.mod);
         guard_gui.addImport("vector", shared_modules.vector.mod);
         guard_gui.addImport("command_types", shared_modules.command_types.mod);
@@ -3163,6 +3165,7 @@ pub fn build(b: *std.Build) void {
         .optimize = .ReleaseFast,
     });
     bench_gui_mod.addImport("font", bench_font_mod);
+    bench_gui_mod.addImport("font_asset", shared_modules.font_asset);
     bench_gui_mod.addImport("pixelops", bench_pixelops_mod);
     bench_gui_mod.addImport("vector", shared_modules.vector.mod);
     bench_gui_mod.addImport("command_types", shared_modules.command_types.mod);
@@ -3253,6 +3256,7 @@ pub fn build(b: *std.Build) void {
         .optimize = .ReleaseFast,
     });
     bench_list_menu_gui.addImport("font", bench_font_mod);
+    bench_list_menu_gui.addImport("font_asset", shared_modules.font_asset);
     bench_list_menu_gui.addImport("pixelops", bench_pixelops_mod);
     bench_list_menu_gui.addImport("vector", shared_modules.vector.mod);
     bench_list_menu_gui.addImport("command_types", bench_list_menu_cmd);
@@ -3588,6 +3592,16 @@ fn addMainExe(
 // mainly for external consumers (dep.module("platform")) and tests.
 // ADR-007: each shared module is created with a layer tag (TaggedModule) and wired through link().
 // ============================================================
+fn makeDefaultFontAssetModule(b: *std.Build) *std.Build.Module {
+    const package = b.dependency("noto_sans_jp", .{});
+    const files = b.addWriteFiles();
+    _ = files.addCopyFile(package.path("Variable/TTF/Subset/NotoSansJP-VF.ttf"), "NotoSansJP-VF.ttf");
+    const source = files.add("font_asset.zig",
+        \\pub const bytes = @embedFile("NotoSansJP-VF.ttf");
+    );
+    return b.createModule(.{ .root_source_file = source });
+}
+
 const SharedModules = struct {
     platform: TaggedModule, // External public facade (platform_backend gets the OS default; for dep.module("platform") and tests)
     keyboard: *std.Build.Module, // Legacy src/ helpers (examples only; outside layer management)
@@ -3598,6 +3612,7 @@ const SharedModules = struct {
     png: TaggedModule,
     font: TaggedModule,
     gui: TaggedModule,
+    font_asset: *std.Build.Module,
     command_types: TaggedModule,
     audio: TaggedModule,
     synth: TaggedModule,
@@ -3807,6 +3822,8 @@ const SharedModules = struct {
         link(gui, pixelops); // drawImage SIMD in render.zig
         link(gui, vector); // path fill coverage rasterizer
         link(gui, command_types);
+        const font_asset = makeDefaultFontAssetModule(b);
+        gui.mod.addImport("font_asset", font_asset);
 
         // objc_runtime (L1): minimal Objective-C runtime FFI helper. Used by both camera_macos.zig
         // (camera module) and audio_macos.zig (audio module; mic permission checks), so
@@ -3977,6 +3994,7 @@ const SharedModules = struct {
             .png = png,
             .font = font,
             .gui = gui,
+            .font_asset = font_asset,
             .command_types = command_types,
             .audio = audio,
             .synth = synth,

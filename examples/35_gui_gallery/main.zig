@@ -449,8 +449,9 @@ fn renderText(ctx: *gui.Context, app: *App) void {
     ctx.text("ellipsis: marks the cut here", .{ .overflow = .ellipsis });
     ctx.endBox();
     ctx.endBox();
-    ctx.labelEx("labelStyled tiers (heading font is injected by the app)", ctx.style.text_subtle);
+    ctx.labelEx("labelStyled tiers (size and weight are resolved by the default family)", ctx.style.text_subtle);
     ctx.labelStyled("Heading", .heading);
+    ctx.labelStyled("日本語ラベル", .body);
     ctx.labelStyled("Body text", .body);
     ctx.labelStyled("Caption", .caption);
     ctx.labelStyled("Muted", .muted);
@@ -764,7 +765,6 @@ pub fn main(init: std.process.Init) !void {
     defer window.destroy();
     var ctx = gui.Context.init(gpa, gui.default_font);
     defer ctx.deinit();
-    ctx.style.heading.font = gui.defaultOutlineFont();
     var text = try gui.TextBuffer.init(gpa, "edit me");
     defer text.deinit();
     var app: App = .{ .ctx = &ctx, .text = &text };

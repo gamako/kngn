@@ -1,8 +1,9 @@
 # Variable fonts (OpenType Font Variations) API
 
 How to use OpenType variable fonts in `libs/font` (TrueType glyf + CFF2). The axis API is local
-to an `OutlineFont` instance; draw caches and the advance cache are invalidated and rebuilt when
-axes change.
+to an `OutlineFont` instance. Standalone fonts own their coverage cache; variants produced by
+`OutlineFontFamily` share the family's bounded coverage cache. Advance data is invalidated and
+rebuilt when axes change.
 
 ## Overview
 
@@ -58,9 +59,17 @@ of.normalizedAxes(&norm); // normalised coords after avar
 
 ## Caches and advance
 
-- **Raster cache** / **sbix colour cache**: cleared by `setAxis` / `setAxes` / `selectNamedInstance` / `resetAxes`.
+- **Standalone raster cache** / **sbix colour cache**: cleared by `setAxis` / `setAxes` /
+  `selectNamedInstance` / `resetAxes`.
+- **Family coverage cache**: keyed by `(gid, logical size, wght value, draw scale)`, capped at
+  4 MiB and 512 entries, and shared by all size/weight variants. A weight-axis change selects
+  a different key; a non-weight axis clears the shared cache because it is not represented in
+  the key. Oversized glyphs are retained as negative entries.
+- **Diagnostics**: `rasterizationCount`, `evictionCount`, `retainedCoverageBytes`, and
+  `coverageEntryCount` expose bounded-cache behaviour. Cache hits do not increment a counter.
 - **advance_cache** (`?[]f32`, length `numGlyphs`): **eagerly built** on axis change.
-  - `measure` / colour drawing read the built cache read-only (no per-frame gvar/HVAR decode).
+  - `measure` / wrapping / colour drawing read the built cache read-only (no per-frame gvar/HVAR decode).
+  - Coverage rasterisation is draw-only; measure, intrinsic width, and wrapping never fill it.
   - Allocation failure surfaces as `error.OutOfMemory` from the axis-change API.
 - **Advance priority**:
   1. If a composite has `USE_MY_METRICS` → advance of the **last** such component (recursive: HVAR > phantom > hmtx)
@@ -103,6 +112,18 @@ of.drawTo(target, pos, "あ", col, clip); // outline follows the axes
 | Broken fvar/avar/gvar/HVAR | `FontFace.init` → `error.InvalidFont` |
 | Missing table | non-variable / default outline / phantom fallback |
 | OOM during axis change | `error.OutOfMemory` |
+
+## GUI default asset
+
+The GUI default family is built from the Noto Sans JP variable TTF declared in the root
+`build.zig.zon`. The manifest pins a versioned archive URL, a package hash, and the exact
+archive path; the TTF is not copied into the repository.
+
+An ordinary `zig build` fetches the package on a cold cache. To prefetch it explicitly, run
+`zig fetch --save-exact=noto_sans_jp https://github.com/notofonts/noto-cjk/releases/download/Sans2.004/02_NotoSansCJK-TTF-VF.zip` from the repository root,
+or run the normal build once while network access is available. Warm and offline-cache
+builds reuse the same content-addressed package. Native and WebAssembly builds consume the
+same generated `@embedFile` wrapper, so they use identical font bytes.
 
 ## Related
 

@@ -9,13 +9,14 @@ const font_mod = @import("font.zig");
 pub const Color = color_mod.Color;
 pub const Font = font_mod.Font;
 
-/// Color and optional font for one text tier. `font = null` uses `Context.font`.
-/// The library never creates fonts; a size difference appears only when the
-/// application stores a generated `Font` on the matching `Style` field
-/// (a catalog UI typically injects an 18px heading next to a 14px body).
+/// Color, size, weight, and optional explicit font for one text tier. `font = null` lets Context
+/// resolve the size/weight through its default family; an explicit font always wins and ignores
+/// the tier size/weight.
 pub const TextStyle = struct {
     color: Color,
     font: ?Font = null,
+    size: f32 = 16,
+    weight: u16 = 400,
 };
 
 /// Named text tier for `Context.labelStyled`.
@@ -88,15 +89,14 @@ pub const Style = struct {
     /// One tree-indent step for `beginListboxRow` guides. `0` emits no guide
     /// (even when `depth > 0`). Must be `>= 0`.
     indent_w: i32 = 14,
-    /// Heading tier. Default color matches `text`; default `font` is null
-    /// (`Context.font`). Size difference exists only after the app injects a Font.
-    heading: TextStyle = .{ .color = Color.rgba(0xFF, 0xFF, 0xFF, 0xFF) },
-    /// Body tier. Default color matches `text`; default `font` is null.
-    body: TextStyle = .{ .color = Color.rgba(0xFF, 0xFF, 0xFF, 0xFF) },
-    /// Caption tier. Default color matches `text_subtle`; default `font` is null.
-    caption: TextStyle = .{ .color = Color.rgba(0x90, 0x98, 0xA0, 0xFF) },
-    /// Muted tier. Default color is `text_subtle` blended halfway toward `bg`.
-    muted: TextStyle = .{ .color = Color.rgba(0x64, 0x68, 0x70, 0xFF) },
+    /// Heading tier. Default 20px / weight 700.
+    heading: TextStyle = .{ .color = Color.rgba(0xFF, 0xFF, 0xFF, 0xFF), .size = 20, .weight = 700 },
+    /// Body tier. Default 16px / weight 400.
+    body: TextStyle = .{ .color = Color.rgba(0xFF, 0xFF, 0xFF, 0xFF), .size = 16, .weight = 400 },
+    /// Caption tier. Default 13px / weight 400.
+    caption: TextStyle = .{ .color = Color.rgba(0x90, 0x98, 0xA0, 0xFF), .size = 13, .weight = 400 },
+    /// Muted tier. Default 12px / weight 400.
+    muted: TextStyle = .{ .color = Color.rgba(0x64, 0x68, 0x70, 0xFF), .size = 12, .weight = 400 },
 
     /// The color a disabled widget draws `base` as: grayscale (so an accent color loses its hue,
     /// not just its brightness), then blended halfway toward `bg` (so a disabled widget dims
@@ -149,11 +149,11 @@ pub fn defaultStyle() Style {
         .text_subtle = text_subtle,
         .control_radius = 6,
         .checkbox_radius = 4,
-        .heading = .{ .color = text },
-        .body = .{ .color = text },
-        .caption = .{ .color = text_subtle },
+        .heading = .{ .color = text, .size = 20, .weight = 700 },
+        .body = .{ .color = text, .size = 16, .weight = 400 },
+        .caption = .{ .color = text_subtle, .size = 13, .weight = 400 },
     };
-    s.muted = .{ .color = s.mutedFromSubtle() };
+    s.muted = .{ .color = s.mutedFromSubtle(), .size = 12, .weight = 400 };
     return s;
 }
 
@@ -211,6 +211,14 @@ test "defaultStyle: text tiers map heading/body to text, caption to text_subtle,
     try std.testing.expect(s.body.font == null);
     try std.testing.expect(s.caption.font == null);
     try std.testing.expect(s.muted.font == null);
+    try std.testing.expectEqual(@as(f32, 20), s.heading.size);
+    try std.testing.expectEqual(@as(u16, 700), s.heading.weight);
+    try std.testing.expectEqual(@as(f32, 16), s.body.size);
+    try std.testing.expectEqual(@as(u16, 400), s.body.weight);
+    try std.testing.expectEqual(@as(f32, 13), s.caption.size);
+    try std.testing.expectEqual(@as(u16, 400), s.caption.weight);
+    try std.testing.expectEqual(@as(f32, 12), s.muted.size);
+    try std.testing.expectEqual(@as(u16, 400), s.muted.weight);
     try std.testing.expectEqual(@as(i32, 14), s.indent_w);
 }
 

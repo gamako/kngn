@@ -73,14 +73,14 @@ pub const TextLine = @import("text_wrap.zig").Line;
 pub const Font = @import("font.zig").Font;
 pub const Metrics = @import("font.zig").Metrics;
 pub const BitmapFont = @import("font.zig").BitmapFont;
+/// The fixed 8x16 bitmap font is opt-in and remains available for pixel-stable callers.
 pub const default_bitmap_font = @import("font.zig").default_bitmap_font;
+pub const defaultFontFamily = @import("font.zig").defaultFontFamily;
 /// Default font (shared Font interface value). Pass to Context.init / render.
-/// Vtable wrapper around default_bitmap_font (fixed-width 8×16 bitmap for ASCII 32..127).
-/// Non-ASCII is a missing glyph (draw skipped; advance is still 8px). No font chain / fallback.
-/// measure is codepoint count × 8; drawTo also advances 8px per codepoint (logical widths match.
-/// Advance still moves for undrawn glyphs, so ink width may differ).
-pub const default_font = @import("font.zig").default_font;
-/// Embedded Press Start 2P OutlineFont (lazy init; logical 16px). Distinct from bitmap `default_font`.
+/// This is a lazy Noto Sans JP variable outline family proxy. `Context.labelStyled` resolves
+/// tier size/weight variants when this value is used; direct DrawList text uses the body variant.
+pub const default_font = @import("font.zig").default_outline_font;
+/// Embedded Noto Sans JP OutlineFont variants are selected by the default text tiers.
 pub const defaultOutlineFont = @import("font.zig").defaultOutlineFont;
 /// Logical ink height (ascent+descent) and vertically centered y within a row. Also exposed for direct DrawList writing.
 pub const inkHeight = @import("font.zig").inkHeight;

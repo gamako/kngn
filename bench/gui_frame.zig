@@ -130,6 +130,8 @@ fn runScenario(io: std.Io, tracker: *peak_allocator.PeakTrackingAllocator, rows:
     defer gpa.free(pixels);
     @memset(pixels, 0);
     const target = gui.RenderTarget{ .pixels = pixels, .width = pw, .height = ph };
+    const family = gui.defaultFontFamily();
+    const raster_before = family.coverage.rasterization_count;
 
     // warmup
     var w: usize = 0;
@@ -139,6 +141,7 @@ fn runScenario(io: std.Io, tracker: *peak_allocator.PeakTrackingAllocator, rows:
         ctx.endFrame();
         gui.render(target, &ctx.draw_list, ctx.font, scale);
     }
+    const raster_after_warmup = family.coverage.rasterization_count;
 
     var samples: [ITERS]u64 = undefined;
     var acc: u32 = 0;
@@ -163,8 +166,9 @@ fn runScenario(io: std.Io, tracker: *peak_allocator.PeakTrackingAllocator, rows:
     const avg = sum / ITERS;
     const min_ns = samples[0];
     const p95 = percentile95(samples[0..]);
+    const raster_after = family.coverage.rasterization_count;
 
-    std.debug.print("gui.frame rows={d:<4} scale={d:.1} phys={d}x{d} warmup={d} iters={d}  avg={d:>9} ns  min={d:>9} ns  p95={d:>9} ns  peak_bytes={d}\n", .{
+    std.debug.print("gui.frame rows={d:<4} scale={d:.1} phys={d}x{d} warmup={d} iters={d}  avg={d:>9} ns  min={d:>9} ns  p95={d:>9} ns  peak_bytes={d}  raster_warmup={d}  raster_steady={d}\n", .{
         rows,
         scale,
         pw,
@@ -175,6 +179,8 @@ fn runScenario(io: std.Io, tracker: *peak_allocator.PeakTrackingAllocator, rows:
         min_ns,
         p95,
         tracker.peak_bytes,
+        raster_after_warmup - raster_before,
+        raster_after - raster_after_warmup,
     });
 }
 
@@ -224,6 +230,8 @@ fn runWrapScenario(io: std.Io, tracker: *peak_allocator.PeakTrackingAllocator, k
     defer gpa.free(pixels);
     @memset(pixels, 0);
     const target = gui.RenderTarget{ .pixels = pixels, .width = W, .height = H };
+    const family = gui.defaultFontFamily();
+    const raster_before = family.coverage.rasterization_count;
 
     var w: usize = 0;
     while (w < WARMUP) : (w += 1) {
@@ -232,6 +240,7 @@ fn runWrapScenario(io: std.Io, tracker: *peak_allocator.PeakTrackingAllocator, k
         ctx.endFrame();
         gui.render(target, &ctx.draw_list, ctx.font, 1.0);
     }
+    const raster_after_warmup = family.coverage.rasterization_count;
 
     counter.count = 0;
     var samples: [ITERS]u64 = undefined;
@@ -255,7 +264,8 @@ fn runWrapScenario(io: std.Io, tracker: *peak_allocator.PeakTrackingAllocator, k
     var sum: u64 = 0;
     for (samples) |s| sum += s;
     const avg = sum / ITERS;
-    std.debug.print("gui.wrap {s:<16} measure_calls={d:<8} arena_cap={d:<10} avg={d:>9} ns  min={d:>9} ns  p95={d:>9} ns  peak_bytes={d}\n", .{
+    const raster_after = family.coverage.rasterization_count;
+    std.debug.print("gui.wrap {s:<16} measure_calls={d:<8} arena_cap={d:<10} avg={d:>9} ns  min={d:>9} ns  p95={d:>9} ns  peak_bytes={d}  raster_warmup={d}  raster_steady={d}\n", .{
         name,
         counter.count / ITERS,
         arena_peak,
@@ -263,6 +273,8 @@ fn runWrapScenario(io: std.Io, tracker: *peak_allocator.PeakTrackingAllocator, k
         samples[0],
         percentile95(samples[0..]),
         tracker.peak_bytes,
+        raster_after_warmup - raster_before,
+        raster_after - raster_after_warmup,
     });
 }
 

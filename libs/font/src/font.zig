@@ -113,6 +113,8 @@ pub fn clipCoverage(target: RenderTarget, dst_x: i32, dst_y: i32, w: u32, h: u32
 /// For OutlineFont / BMFont glyph drawing.
 /// Hot path every frame (text draw): clip once via clipCoverage outside the loop;
 /// the inner loop is unchecked (eliminates plotCoverage's 5 per-pixel clip compares).
+/// The four-pixel path delegates coverage scaling and compositing to pixelops; the scalar tail
+/// uses the matching scalar primitive so both paths have one rounding contract.
 pub fn blitCoverage(
     target: RenderTarget,
     dst_x: i32,
@@ -131,15 +133,17 @@ pub fn blitCoverage(
         // clipCoverage guarantees dst_y+row / dst_x+cx are non-negative and inside target
         const py: u32 = @intCast(dst_y + @as(i32, @intCast(row)));
         const dst_base = py * target.width + @as(u32, @intCast(dst_x + @as(i32, @intCast(cc.cx0))));
+        const src_color: u32 = @bitCast(col);
         var cx = cc.cx0;
+        while (cx + 4 <= cc.cx1) : (cx += 4) {
+            const src_chunk: pixelops.Vec16u8 = @bitCast([4]u32{ src_color, src_color, src_color, src_color });
+            const dst_chunk: *[4]u32 = target.pixels[dst_base + (cx - cc.cx0) ..][0..4];
+            const cov_chunk: @Vector(4, u8) = @bitCast(coverage[cov_base + cx ..][0..4].*);
+            dst_chunk.* = @bitCast(pixelops.srcOverCoverage4(@bitCast(dst_chunk.*), src_chunk, cov_chunk));
+        }
         while (cx < cc.cx1) : (cx += 1) {
-            const cov = coverage[cov_base + cx];
-            if (cov == 0) continue;
             const idx = dst_base + (cx - cc.cx0);
-            const eff_a: u8 = @intCast((@as(u32, col.a) * @as(u32, cov) + 127) / 255);
-            const src = Color{ .r = col.r, .g = col.g, .b = col.b, .a = eff_a };
-            const dst: Color = @bitCast(target.pixels[idx]);
-            target.pixels[idx] = @bitCast(Color.blend(dst, src));
+            target.pixels[idx] = pixelops.srcOverCoverage(target.pixels[idx], src_color, coverage[cov_base + cx]);
         }
     }
 }
@@ -387,7 +391,7 @@ test "Font: measure/metrics callable via vtable" {
     try std.testing.expectEqual(@as(u32, 10), Stub.font.metrics().line_height);
 }
 
-test "blitCoverage: hoist version bit-matches per-pixel reference (plotCoverage loop)" {
+test "blitCoverage: SIMD and scalar tail bit-match per-pixel reference" {
     var prng = std.Random.DefaultPrng.init(0xB117);
     const rng = prng.random();
     const w: u32 = 9;

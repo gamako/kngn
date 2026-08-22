@@ -3,7 +3,7 @@
 //
 //   FontFace  … immutable parsed font (borrows `data`; `data` must outlive FontFace).
 //   OutlineFont … mutable drawable instance binding a FontFace to a pixel size.
-//                 Glyphs rasterize lazily and cache by (GID, physical_px_q) key.
+//                 Glyphs rasterize lazily; family variants share a bounded key-based coverage cache.
 //
 // Usage contract: OutlineFont is **not thread-safe** (thread-confined). drawTo lazily fills
 // the cache (= interior mutability), so asFont() must be called only from a **mutable** instance,
@@ -164,16 +164,16 @@ pub const FontFace = struct {
     }
 };
 
-const CachedGlyph = struct {
+pub const CachedGlyph = struct {
     bitmap: ?raster.Bitmap, // null = empty glyph (space, etc.)
-    left: i32, // device offset from pen x
-    top: i32, // device offset from baseline (up is negative)
-    advance: f32, // physical px (matches key.physical_px_q)
+    left: i32 = 0, // device offset from pen x
+    top: i32 = 0, // device offset from baseline (up is negative)
+    advance: f32 = 0, // physical px (matches key.physical_px_q)
     oom: bool = false, // negative cache (rasterize OOM / oversized)
 };
 
-/// outline glyph cache key: GID × physical font size (1/64px quantized).
-/// Prevents cache splits from tiny f32 scale jitter while keeping sub-pixel coverage differences.
+/// Legacy standalone outline glyph cache key: GID × physical font size (1/64px quantized).
+/// Family variants use GlyphKey below so logical size, weight, and draw scale remain distinct.
 const PhysicalGlyphKey = struct {
     gid: u16,
     physical_px_q: u32,
@@ -194,6 +194,139 @@ const CachedColorGlyph = struct {
     failed: bool = false,
 };
 
+/// Coverage cache identity. Logical size and draw scale stay in the key even when their
+/// product produces the same raster size so style variants cannot alias one another.
+pub const GlyphKey = struct {
+    gid: u16,
+    size_q: u32,
+    weight_q: u32,
+    scale_q: u32,
+};
+
+const GlyphCacheEntry = struct {
+    glyph: CachedGlyph,
+    stamp: u64,
+};
+
+/// Shared per-family coverage cache. The cache owns bitmap payloads and evicts by least-recently
+/// used stamp; a negative entry owns no payload and prevents repeated failed rasterization.
+pub const GlyphCoverageCache = struct {
+    alloc: std.mem.Allocator,
+    entries: std.AutoHashMapUnmanaged(GlyphKey, GlyphCacheEntry) = .empty,
+    payload_cap: usize = 4 * 1024 * 1024,
+    entry_cap: usize = 512,
+    retained_bytes: usize = 0,
+    rasterization_count: u64 = 0,
+    eviction_count: u64 = 0,
+    clock: u64 = 0,
+
+    pub fn init(alloc: std.mem.Allocator) GlyphCoverageCache {
+        return .{ .alloc = alloc };
+    }
+
+    pub fn deinit(self: *GlyphCoverageCache) void {
+        self.clear();
+        self.entries.deinit(self.alloc);
+        self.* = undefined;
+    }
+
+    pub fn entryCount(self: *const GlyphCoverageCache) u32 {
+        return self.entries.count();
+    }
+
+    pub fn get(self: *GlyphCoverageCache, key: GlyphKey) ?CachedGlyph {
+        const entry = self.entries.getPtr(key) orelse return null;
+        self.clock +%= 1;
+        entry.stamp = self.clock;
+        return entry.glyph;
+    }
+
+    /// Store a glyph and return false when the payload was too large and was retained as a tombstone.
+    /// Ownership of `glyph.bitmap.data` transfers to the cache on success or is freed on rejection.
+    pub fn put(self: *GlyphCoverageCache, key: GlyphKey, glyph: CachedGlyph) std.mem.Allocator.Error!bool {
+        var incoming = glyph;
+        var drawable = true;
+        if (incoming.bitmap) |bm| {
+            if (bm.data.len > self.payload_cap) {
+                self.alloc.free(bm.data);
+                incoming.bitmap = null;
+                incoming.oom = true;
+                drawable = false;
+            }
+        }
+
+        if (self.entries.getPtr(key) != null) self.remove(key);
+        if (self.entry_cap == 0) {
+            if (incoming.bitmap) |bm| self.alloc.free(bm.data);
+            incoming.bitmap = null;
+            incoming.oom = true;
+            self.clock +%= 1;
+            try self.entries.put(self.alloc, key, .{ .glyph = incoming, .stamp = self.clock });
+            return false;
+        }
+        const payload_len = if (incoming.bitmap) |bm| bm.data.len else 0;
+        while (self.entries.count() >= self.entry_cap or
+            (payload_len > 0 and self.retained_bytes + payload_len > self.payload_cap))
+        {
+            if (self.entries.count() == 0) break;
+            self.evictOldest();
+        }
+
+        self.clock +%= 1;
+        self.entries.put(self.alloc, key, .{ .glyph = incoming, .stamp = self.clock }) catch |err| {
+            if (incoming.bitmap) |bm| self.alloc.free(bm.data);
+            return err;
+        };
+        self.retained_bytes += payload_len;
+        return drawable;
+    }
+
+    pub fn clear(self: *GlyphCoverageCache) void {
+        var it = self.entries.valueIterator();
+        while (it.next()) |entry| {
+            if (entry.glyph.bitmap) |bm| self.alloc.free(bm.data);
+        }
+        self.entries.clearRetainingCapacity();
+        self.retained_bytes = 0;
+    }
+
+    fn remove(self: *GlyphCoverageCache, key: GlyphKey) void {
+        if (self.entries.get(key)) |entry| {
+            if (entry.glyph.bitmap) |bm| self.alloc.free(bm.data);
+            self.retained_bytes -= if (entry.glyph.bitmap) |bm| bm.data.len else 0;
+            _ = self.entries.remove(key);
+        }
+    }
+
+    fn evictOldest(self: *GlyphCoverageCache) void {
+        var oldest_key: ?GlyphKey = null;
+        var oldest_stamp: u64 = std.math.maxInt(u64);
+        var it = self.entries.iterator();
+        while (it.next()) |entry| {
+            if (entry.value_ptr.stamp < oldest_stamp) {
+                oldest_stamp = entry.value_ptr.stamp;
+                oldest_key = entry.key_ptr.*;
+            }
+        }
+        if (oldest_key) |key| {
+            self.remove(key);
+            self.eviction_count += 1;
+        }
+    }
+};
+
+fn quantizePx(px: f32) u32 {
+    const q = @round(px * 64.0);
+    if (!std.math.isFinite(q) or q < 1.0) return 1;
+    if (q >= @as(f32, @floatFromInt(std.math.maxInt(u32)))) return std.math.maxInt(u32);
+    return @intFromFloat(q);
+}
+
+fn quantizeScale(scale: f32) u32 {
+    const s = if (std.math.isFinite(scale) and scale > 0) scale else 1.0;
+    return quantizePx(s);
+}
+
 pub const OutlineFont = struct {
     alloc: std.mem.Allocator,
     face: *const FontFace,
@@ -202,6 +335,11 @@ pub const OutlineFont = struct {
     cache: std.AutoHashMapUnmanaged(PhysicalGlyphKey, CachedGlyph) = .empty,
     cache_bytes: usize = 0,
     cache_cap: usize = 4 * 1024 * 1024,
+    /// Non-null for family-owned variants. Standalone fonts use the local cache above.
+    shared_coverage_cache: ?*GlyphCoverageCache = null,
+    logical_size_q: u32 = 1024,
+    weight_q: u32 = 0,
+    rasterization_count: u64 = 0,
     /// Whether the latest drawTo hit rasterize OOM/oversized or color-cache capacity overflow
     /// (diagnostic; avoids fully silent failure; shared by outline/color).
     last_oom: bool = false,
@@ -235,6 +373,7 @@ pub const OutlineFont = struct {
             .face = face,
             .px = safe_px,
             .scale = face.sfnt.scaleForPixelSize(safe_px),
+            .logical_size_q = quantizePx(safe_px),
         };
         if (face.fvar) |fv| {
             result.axis_count = fv.axis_count;
@@ -243,7 +382,15 @@ pub const OutlineFont = struct {
                 result.axis_design[i] = fv.axes[i].def;
                 result.axis_norm[i] = 0; // default → norm 0
             }
+            result.updateWeightKey();
         }
+        return result;
+    }
+
+    /// Initialize a size-bound variant that shares coverage payloads with its family.
+    pub fn initWithCache(alloc: std.mem.Allocator, face: *const FontFace, px: f32, cache: *GlyphCoverageCache) OutlineFont {
+        var result = init(alloc, face, px);
+        result.shared_coverage_cache = cache;
         return result;
     }
 
@@ -286,6 +433,7 @@ pub const OutlineFont = struct {
         const ax = fv.axes[idx];
         self.axis_design[idx] = std.math.clamp(value, ax.min, ax.max);
         self.recomputeNormFromDesign();
+        self.updateWeightKey();
         try self.onAxesChanged();
     }
 
@@ -302,6 +450,7 @@ pub const OutlineFont = struct {
             self.axis_design[i] = std.math.clamp(v, ax.min, ax.max);
         }
         self.recomputeNormFromDesign();
+        self.updateWeightKey();
         try self.onAxesChanged();
     }
 
@@ -324,14 +473,41 @@ pub const OutlineFont = struct {
             self.axis_design[i] = fv.axes[i].def;
         }
         self.recomputeNormFromDesign();
+        self.updateWeightKey();
         try self.onAxesChanged();
     }
 
     fn onAxesChanged(self: *OutlineFont) Error!void {
-        self.clearCache();
+        self.clearLocalCoverageCache();
+        if (self.shared_coverage_cache) |cache| {
+            if (self.hasNonWeightAxis()) cache.clear();
+        }
         self.clearColorCache();
         self.axes_generation +%= 1;
         try self.rebuildAdvanceCache();
+    }
+
+    fn hasNonWeightAxis(self: *const OutlineFont) bool {
+        const fv = self.face.fvar orelse return false;
+        for (fv.axes[0..fv.axis_count]) |axis| {
+            if (!std.mem.eql(u8, &axis.tag, "wght")) return true;
+        }
+        return false;
+    }
+
+    fn updateWeightKey(self: *OutlineFont) void {
+        self.weight_q = 0;
+        const fv = self.face.fvar orelse return;
+        for (fv.axes[0..fv.axis_count], 0..) |axis, i| {
+            if (std.mem.eql(u8, &axis.tag, "wght")) {
+                const value = self.axis_design[i];
+                self.weight_q = if (std.math.isFinite(value) and value > 0)
+                    @intFromFloat(@round(value))
+                else
+                    0;
+                return;
+            }
+        }
     }
 
     fn freeAdvanceCache(self: *OutlineFont) void {
@@ -452,7 +628,7 @@ pub const OutlineFont = struct {
     }
 
     pub fn deinit(self: *OutlineFont) void {
-        self.freeBitmaps();
+        self.clearLocalCoverageCache();
         self.cache.deinit(self.alloc);
         self.freeColorBitmaps();
         self.color_cache.deinit(self.alloc);
@@ -466,9 +642,33 @@ pub const OutlineFont = struct {
     }
 
     pub fn clearCache(self: *OutlineFont) void {
+        if (self.shared_coverage_cache) |cache| {
+            cache.clear();
+            return;
+        }
+        self.clearLocalCoverageCache();
+    }
+
+    fn clearLocalCoverageCache(self: *OutlineFont) void {
         self.freeBitmaps();
         self.cache.clearRetainingCapacity();
         self.cache_bytes = 0;
+    }
+
+    pub fn rasterizationCount(self: *const OutlineFont) u64 {
+        return if (self.shared_coverage_cache) |cache| cache.rasterization_count else self.rasterization_count;
+    }
+
+    pub fn evictionCount(self: *const OutlineFont) u64 {
+        return if (self.shared_coverage_cache) |cache| cache.eviction_count else 0;
+    }
+
+    pub fn retainedCoverageBytes(self: *const OutlineFont) usize {
+        return if (self.shared_coverage_cache) |cache| cache.retained_bytes else self.cache_bytes;
+    }
+
+    pub fn coverageEntryCount(self: *const OutlineFont) u32 {
+        return if (self.shared_coverage_cache) |cache| cache.entryCount() else self.cache.count();
     }
 
     fn freeColorBitmaps(self: *OutlineFont) void {
@@ -602,7 +802,7 @@ pub const OutlineFont = struct {
                 cx += self.advancePx(gid); // advance via hmtx (logical for both color and mono; sbix does not support draw scale)
                 continue;
             }
-            const cg = self.getCached(gid, physical_px_q) catch {
+            const cg = self.getCachedAtScale(gid, physical_px_q, quantizeScale(draw_scale)) catch {
                 cx += self.advancePx(gid) * effective; // Skip drawing; advance the physical pen only
                 continue;
             };
@@ -620,6 +820,57 @@ pub const OutlineFont = struct {
     }
 
     fn getCached(self: *OutlineFont, gid: u16, physical_px_q: u32) Error!CachedGlyph {
+        return self.getCachedAtScale(gid, physical_px_q, quantizeScale(self.effectiveScaleFromQ(physical_px_q)));
+    }
+
+    fn getCachedAtScale(self: *OutlineFont, gid: u16, physical_px_q: u32, scale_q: u32) Error!CachedGlyph {
+        if (self.shared_coverage_cache != null) return self.getSharedCached(gid, physical_px_q, scale_q);
+        return self.getLocalCached(gid, physical_px_q);
+    }
+
+    fn getSharedCached(self: *OutlineFont, gid: u16, physical_px_q: u32, scale_q: u32) Error!CachedGlyph {
+        const cache = self.shared_coverage_cache.?;
+        const key = GlyphKey{
+            .gid = gid,
+            .size_q = self.logical_size_q,
+            .weight_q = self.weight_q,
+            .scale_q = scale_q,
+        };
+        if (cache.get(key)) |g| {
+            if (g.oom) {
+                self.last_oom = true;
+                return error.OutOfMemory;
+            }
+            return g;
+        }
+        cache.rasterization_count += 1;
+        const cg = self.buildGlyph(gid, physical_px_q) catch |e| switch (e) {
+            error.OutOfMemory => {
+                self.last_oom = true;
+                const effective = self.effectiveScaleFromQ(physical_px_q);
+                _ = cache.put(key, .{
+                    .bitmap = null,
+                    .left = 0,
+                    .top = 0,
+                    .advance = self.advancePx(gid) * effective,
+                    .oom = true,
+                }) catch {};
+                return error.OutOfMemory;
+            },
+            else => return e,
+        };
+        const drawable = cache.put(key, cg) catch |e| {
+            self.last_oom = true;
+            return e;
+        };
+        if (!drawable) {
+            self.last_oom = true;
+            return error.OutOfMemory;
+        }
+        return cg;
+    }
+
+    fn getLocalCached(self: *OutlineFont, gid: u16, physical_px_q: u32) Error!CachedGlyph {
         const key = PhysicalGlyphKey{ .gid = gid, .physical_px_q = physical_px_q };
         if (self.cache.get(key)) |g| {
             if (g.oom) {
@@ -628,6 +879,7 @@ pub const OutlineFont = struct {
             }
             return g;
         }
+        self.rasterization_count += 1;
         const cg = self.buildGlyph(gid, physical_px_q) catch |e| switch (e) {
             error.OutOfMemory => {
                 self.last_oom = true;
@@ -878,6 +1130,66 @@ pub const OutlineFont = struct {
         const top: i32 = -(@as(i32, @intFromFloat(@round(oy_f))) + @as(i32, @intCast(h)));
 
         return .{ .pixels = pixels, .w = w, .h = h, .left = left, .top = top, .failed = false };
+    }
+};
+
+const VariantKey = struct {
+    size_q: u32,
+    weight_q: u32,
+};
+
+/// Immutable font face plus stable, size/weight-bound variants sharing one coverage cache.
+pub const OutlineFontFamily = struct {
+    alloc: std.mem.Allocator,
+    face: FontFace,
+    coverage: GlyphCoverageCache,
+    variants: std.AutoHashMapUnmanaged(VariantKey, *OutlineFont) = .empty,
+
+    pub fn init(alloc: std.mem.Allocator, data: []const u8) Error!OutlineFontFamily {
+        return .{
+            .alloc = alloc,
+            .face = try FontFace.init(data),
+            .coverage = GlyphCoverageCache.init(alloc),
+        };
+    }
+
+    pub fn deinit(self: *OutlineFontFamily) void {
+        var it = self.variants.valueIterator();
+        while (it.next()) |variant_ptr| {
+            variant_ptr.*.deinit();
+            self.alloc.destroy(variant_ptr.*);
+        }
+        self.variants.deinit(self.alloc);
+        self.coverage.deinit();
+        self.* = undefined;
+    }
+
+    pub fn variant(self: *OutlineFontFamily, size: f32, weight: u16) Error!Font {
+        return (try self.variantOutline(size, weight)).asFont();
+    }
+
+    pub fn variantOutline(self: *OutlineFontFamily, size: f32, weight: u16) Error!*OutlineFont {
+        const safe_size = if (std.math.isFinite(size) and size > 0) @min(size, max_glyph_dim) else 16;
+        const key = VariantKey{ .size_q = quantizePx(safe_size), .weight_q = weight };
+        if (self.variants.get(key)) |variant_ptr| return variant_ptr;
+
+        const variant_ptr = try self.alloc.create(OutlineFont);
+        errdefer self.alloc.destroy(variant_ptr);
+        variant_ptr.* = OutlineFont.initWithCache(self.alloc, &self.face, safe_size, &self.coverage);
+        errdefer variant_ptr.deinit();
+
+        if (variant_ptr.face.fvar) |fv| {
+            for (fv.axes[0..fv.axis_count]) |axis| {
+                if (std.mem.eql(u8, &axis.tag, "wght")) {
+                    const tag = axis.tag;
+                    try variant_ptr.setAxis(&tag, @floatFromInt(weight));
+                    break;
+                }
+            }
+        }
+
+        try self.variants.put(self.alloc, key, variant_ptr);
+        return variant_ptr;
     }
 };
 
@@ -3628,4 +3940,106 @@ test "glyph coverage hashes stay bit-identical" {
         try testing.expectEqual(e.h, bm.h);
         try testing.expectEqual(e.hash, std.hash.Fnv1a_32.hash(bm.data));
     }
+}
+
+test "GlyphCoverageCache: LRU evicts the oldest entry within payload and entry limits" {
+    const a = testing.allocator;
+    var cache = GlyphCoverageCache.init(a);
+    defer cache.deinit();
+    cache.payload_cap = 8;
+    cache.entry_cap = 2;
+
+    const key_a = GlyphKey{ .gid = 1, .size_q = 1024, .weight_q = 400, .scale_q = 64 };
+    const key_b = GlyphKey{ .gid = 2, .size_q = 1024, .weight_q = 400, .scale_q = 64 };
+    const key_c = GlyphKey{ .gid = 3, .size_q = 1024, .weight_q = 400, .scale_q = 64 };
+    _ = try cache.put(key_a, .{ .bitmap = .{ .data = try a.dupe(u8, &.{ 1, 2, 3 }), .w = 3, .h = 1 } });
+    _ = try cache.put(key_b, .{ .bitmap = .{ .data = try a.dupe(u8, &.{ 4, 5, 6 }), .w = 3, .h = 1 } });
+    _ = cache.get(key_a);
+    _ = try cache.put(key_c, .{ .bitmap = .{ .data = try a.dupe(u8, &.{ 7, 8, 9 }), .w = 3, .h = 1 } });
+
+    try testing.expect(cache.get(key_a) != null);
+    try testing.expect(cache.get(key_b) == null);
+    try testing.expect(cache.get(key_c) != null);
+    try testing.expectEqual(@as(usize, 6), cache.retained_bytes);
+    try testing.expectEqual(@as(u32, 2), cache.entryCount());
+    try testing.expectEqual(@as(u64, 1), cache.eviction_count);
+}
+
+test "GlyphCoverageCache: oversized glyph becomes a stable negative cache entry" {
+    const a = testing.allocator;
+    var cache = GlyphCoverageCache.init(a);
+    defer cache.deinit();
+    cache.payload_cap = 4;
+    const key = GlyphKey{ .gid = 7, .size_q = 1024, .weight_q = 700, .scale_q = 96 };
+    _ = try cache.put(key, .{ .bitmap = .{ .data = try a.dupe(u8, &.{ 1, 2, 3, 4, 5 }), .w = 5, .h = 1 } });
+    try testing.expect(cache.get(key).?.oom);
+    try testing.expectEqual(@as(usize, 0), cache.retained_bytes);
+    try testing.expectEqual(@as(u32, 1), cache.entryCount());
+    try testing.expect(cache.get(key).?.oom);
+}
+
+test "OutlineFontFamily: variants share cache and separate size weight scale keys" {
+    const a = testing.allocator;
+    const data = try buildVarTestFont(a, 64, null);
+    defer a.free(data);
+    var family = try OutlineFontFamily.init(a, data);
+    defer family.deinit();
+
+    var regular = try family.variantOutline(64, 400);
+    const regular_again = try family.variantOutline(64, 400);
+    var bold = try family.variantOutline(64, 700);
+    var large = try family.variantOutline(96, 400);
+    try testing.expect(regular == regular_again);
+
+    var pixels = [_]u32{0xFF000000} ** (160 * 160);
+    const target = RenderTarget{ .pixels = &pixels, .width = 160, .height = 160 };
+    const clip = Rect{ .x = 0, .y = 0, .w = 160, .h = 160 };
+    regular.drawTo(target, .{ .x = 4, .y = 60 }, "A", Color.rgba(0xFF, 0xFF, 0xFF, 0xFF), clip, 1.0);
+    const after_regular = family.coverage.rasterization_count;
+    regular.drawTo(target, .{ .x = 4, .y = 60 }, "A", Color.rgba(0xFF, 0xFF, 0xFF, 0xFF), clip, 1.0);
+    try testing.expectEqual(after_regular, family.coverage.rasterization_count);
+    bold.drawTo(target, .{ .x = 60, .y = 60 }, "A", Color.rgba(0xFF, 0xFF, 0xFF, 0xFF), clip, 1.0);
+    large.drawTo(target, .{ .x = 100, .y = 90 }, "A", Color.rgba(0xFF, 0xFF, 0xFF, 0xFF), clip, 1.0);
+    regular.drawTo(target, .{ .x = 4, .y = 60 }, "A", Color.rgba(0xFF, 0xFF, 0xFF, 0xFF), clip, 1.5);
+    try testing.expectEqual(@as(u64, 4), family.coverage.rasterization_count);
+    try testing.expectEqual(@as(u32, 4), family.coverage.entryCount());
+}
+
+test "OutlineFontFamily: non-variable fonts ignore weight without pseudo-bold" {
+    const a = testing.allocator;
+    const data = try buildTestFont(a, 64);
+    defer a.free(data);
+    var family = try OutlineFontFamily.init(a, data);
+    defer family.deinit();
+    var regular = try family.variantOutline(32, 400);
+    var bold = try family.variantOutline(32, 700);
+    var pixels = [_]u32{0xFF000000} ** (80 * 80);
+    const target = RenderTarget{ .pixels = &pixels, .width = 80, .height = 80 };
+    const clip = Rect{ .x = 0, .y = 0, .w = 80, .h = 80 };
+    regular.drawTo(target, .{ .x = 2, .y = 30 }, "A", Color.rgba(0xFF, 0xFF, 0xFF, 0xFF), clip, 1.0);
+    bold.drawTo(target, .{ .x = 2, .y = 30 }, "A", Color.rgba(0xFF, 0xFF, 0xFF, 0xFF), clip, 1.0);
+    try testing.expectEqual(@as(u64, 1), family.coverage.rasterization_count);
+    try testing.expectEqual(@as(u32, 1), family.coverage.entryCount());
+    try testing.expectEqual(regular.measure("A"), bold.measure("A"));
+}
+
+test "OutlineFont: oversized shared glyph is a stable negative cache hit" {
+    const a = testing.allocator;
+    const data = try buildTestFont(a, 64);
+    defer a.free(data);
+    const face = try FontFace.init(data);
+    var cache = GlyphCoverageCache.init(a);
+    defer cache.deinit();
+    cache.payload_cap = 0;
+    var of = OutlineFont.initWithCache(a, &face, 64, &cache);
+    defer of.deinit();
+    var pixels = [_]u32{0xFF000000} ** (80 * 80);
+    const target = RenderTarget{ .pixels = &pixels, .width = 80, .height = 80 };
+    const clip = Rect{ .x = 0, .y = 0, .w = 80, .h = 80 };
+    of.drawTo(target, .{ .x = 4, .y = 4 }, "A", Color.rgba(0xFF, 0xFF, 0xFF, 0xFF), clip, 1.0);
+    const count = of.rasterizationCount();
+    of.drawTo(target, .{ .x = 4, .y = 4 }, "A", Color.rgba(0xFF, 0xFF, 0xFF, 0xFF), clip, 1.0);
+    try testing.expectEqual(@as(u64, 1), count);
+    try testing.expectEqual(count, of.rasterizationCount());
+    try testing.expect(cache.get(.{ .gid = 1, .size_q = 4096, .weight_q = 0, .scale_q = 64 }).?.oom);
 }

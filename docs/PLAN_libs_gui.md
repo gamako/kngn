@@ -221,7 +221,8 @@ layout runs in `endFrame`. Dear ImGui–style synchronous hit-test reconciles th
 
 1. **Do not `@import` anything under `src/`**
    - No text / sprite / platform; define `BitmapFont` / `RenderTarget` inside libs/gui
-   - Default 8×16 ASCII font is embedded (`@embedFile`)
+   - `gui.default_font` is supplied by the hashed Noto Sans JP build dependency; the fixed
+     8×16 ASCII bitmap remains available as `gui.default_bitmap_font`
 2. **Independent event type**: `gui.InputEvent`. No dependency on `platform.Event`
    - Callers (pixie, …) write a thin `platform.Event → gui.InputEvent` adapter
 3. **`cd libs/gui && zig build` / `zig build test` succeed alone**
@@ -255,17 +256,15 @@ When a caller needs a widget rect from outside GUI ("canvas area", "status bar",
   copy / IME preedit). See `examples/28_text_input`.
 - **scroll view**: `beginScrollArea` / `endScrollArea` (vertical and horizontal scroll + scrollbar;
   wheel end-of-range propagation). See `examples/16_gui_scroll`.
-- **CJK fonts (partial)**: injecting `libs/font`'s `OutlineFont.asFont()` into `gui.Context.init`
-  draws Japanese (established in the font-injection work; demonstrated by examples 21 / 28).
-  **`gui.default_font` is still the ASCII bitmap (spleen)**; callers that do not inject
-  (pixie / synth / patch apps) omit non-ASCII glyphs → rolling that into real apps is separate work.
+- **CJK fonts**: `gui.default_font` resolves the fetched Noto Sans JP outline family and
+  draws Japanese labels. Applications may still inject `libs/font`'s `OutlineFont.asFont()`
+  into `gui.Context.init` or select `gui.default_bitmap_font` for a fixed bitmap contract.
 
 ### Still unsupported
 
 - **Flex layout extensions**: wrap / absolute positioning / `justify_content` beyond `start`
   (`center` / `end` / `space-between`, … → right-align with an empty grow box)
 - **Line drawing**: anti-aliased strokes thicker than 1
-- **CJK as the default font**: `gui.default_font` remains ASCII bitmap (see "Resolved · partial")
 - **Style push/pop scopes**: Dear ImGui–style `PushStyleColor` / `PopStyleColor`. Today only direct
   writes to `Context.style`
 - **Dedicated dropdown / combo box**: `popup.zig` + `menu.zig` (`menuBar` / `menuBarPopup`) cover

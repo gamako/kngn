@@ -15,7 +15,7 @@ const Scenario = enum {
     rect_opaque, // Opaque rect_filled x64 (the common GUI fill case)
     rect_translucent, // Semi-transparent rect_filled x64 (blend path)
     image_blit, // 128x128 image x16 (mixed alpha range)
-    text_draw, // Bitmap-font text x40 lines
+    text_draw, // Outline and bitmap control text x40 lines
 };
 
 pub fn main(init: std.process.Init) !void {
@@ -52,7 +52,12 @@ pub fn main(init: std.process.Init) !void {
         dl.reset(W, H);
         try buildScene(&dl, sc, img);
 
-        for (scales) |s| {
+        for ([_]struct { name: []const u8, font: gui.Font, outline: bool }{
+            .{ .name = "outline", .font = gui.default_font, .outline = true },
+            .{ .name = "bitmap", .font = gui.default_bitmap_font.asFont(), .outline = false },
+        }) |font_case| {
+            if (sc != .text_draw and !font_case.outline) continue;
+            for (scales) |s| {
             // peak_bytes: peak from allocating this scale's physical target
             tracker.reset();
             const pw: u32 = @intFromFloat(@floor(@as(f32, @floatFromInt(W)) * s));
@@ -62,8 +67,10 @@ pub fn main(init: std.process.Init) !void {
             const phys_target = gui.RenderTarget{ .pixels = phys, .width = pw, .height = ph };
 
             const iters: usize = 200;
+            const raster_before = if (font_case.outline) gui.defaultFontFamily().coverage.rasterization_count else 0;
             // warmup
-            gui.render(phys_target, &dl, gui.default_font, s);
+            gui.render(phys_target, &dl, font_case.font, s);
+            const raster_after_warmup = if (font_case.outline) gui.defaultFontFamily().coverage.rasterization_count else 0;
 
             var total_ns: u64 = 0;
             var min_ns: u64 = std.math.maxInt(u64);
@@ -71,7 +78,7 @@ pub fn main(init: std.process.Init) !void {
             var i: usize = 0;
             while (i < iters) : (i += 1) {
                 const start = std.Io.Clock.Timestamp.now(io, .awake);
-                gui.render(phys_target, &dl, gui.default_font, s);
+                gui.render(phys_target, &dl, font_case.font, s);
                 const ns: u64 = @intCast(start.untilNow(io).raw.nanoseconds);
                 acc +%= phys[i % phys.len];
                 total_ns += ns;
@@ -80,7 +87,16 @@ pub fn main(init: std.process.Init) !void {
             std.mem.doNotOptimizeAway(acc);
 
             const avg = total_ns / iters;
-            std.debug.print("gui.{s:<16} scale={d:.1}  avg={d:>9} ns  min={d:>9} ns  peak_bytes={d}\n", .{ @tagName(sc), s, avg, min_ns, tracker.peak_bytes });
+            const raster_after = if (font_case.outline) gui.defaultFontFamily().coverage.rasterization_count else 0;
+            if (sc == .text_draw) {
+                std.debug.print("gui.{s:<16} font={s:<7} scale={d:.1}  avg={d:>9} ns  min={d:>9} ns  peak_bytes={d}  raster_warmup={d}  raster_steady={d}\n", .{
+                    @tagName(sc), font_case.name, s, avg, min_ns, tracker.peak_bytes,
+                    raster_after_warmup - raster_before, raster_after - raster_after_warmup,
+                });
+            } else {
+                std.debug.print("gui.{s:<16} scale={d:.1}  avg={d:>9} ns  min={d:>9} ns  peak_bytes={d}\n", .{ @tagName(sc), s, avg, min_ns, tracker.peak_bytes });
+            }
+            }
         }
     }
     // Compat: keep a standalone scale=1 line (target logical = physical)

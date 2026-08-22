@@ -258,6 +258,9 @@ pub const Context = struct {
     per_id_state: state_mod.PerIdStateStore = .{},
     draw_list: DrawList,
     font: Font,
+    /// Non-null only when `font` is the deterministic default proxy. Tier variants borrow this
+    /// family; custom bitmap or outline fonts stay untouched by tier size/weight.
+    default_family: ?*font_mod.OutlineFontFamily = null,
     screen_w: u32 = 0,
     screen_h: u32 = 0,
     frame_active: bool = false,
@@ -459,6 +462,7 @@ pub const Context = struct {
             .id_stack = IdStack.init(gpa),
             .draw_list = DrawList.init(gpa),
             .font = font,
+            .default_family = if (font_mod.isDefaultFont(font)) font_mod.defaultFontFamily() else null,
             .style = style_mod.defaultStyle(),
         };
     }
@@ -1165,7 +1169,11 @@ pub const Context = struct {
     /// `text` leaf. Not a per-pixel loop; not RT.
     pub fn labelStyled(self: *Context, str: []const u8, tier: style_mod.TextTier) void {
         const ts = self.style.textStyle(tier);
-        self.text(str, .{ .color = ts.color, .font = ts.font });
+        const resolved_font = if (ts.font) |explicit| explicit else if (self.default_family) |family|
+            family.variant(ts.size, ts.weight) catch @panic("Context.labelStyled: font variant creation failed")
+        else
+            self.font;
+        self.text(str, .{ .color = ts.color, .font = resolved_font });
     }
 
     /// custom leaf. size is used as the measure result; draw_fn is called with the final rect
@@ -3371,7 +3379,7 @@ test "text: non-wrap explicit newline + max_lines ellipsis targets the last visi
     try std.testing.expect(std.mem.endsWith(u8, last, "..."));
 }
 
-test "labelStyled: each tier uses the matching style color and a null font" {
+test "labelStyled: each tier uses the matching style color and context font" {
     var ctx = testCtx();
     defer ctx.deinit();
     ctx.beginFrame(400, 200);
@@ -3396,10 +3404,10 @@ test "labelStyled: each tier uses the matching style color and a null font" {
     try std.testing.expectEqual(ctx.style.body.color, colors[1]);
     try std.testing.expectEqual(ctx.style.caption.color, colors[2]);
     try std.testing.expectEqual(ctx.style.muted.color, colors[3]);
-    try std.testing.expect(fonts[0] == null);
-    try std.testing.expect(fonts[1] == null);
-    try std.testing.expect(fonts[2] == null);
-    try std.testing.expect(fonts[3] == null);
+    try std.testing.expectEqual(ctx.font.ptr, fonts[0].?.ptr);
+    try std.testing.expectEqual(ctx.font.ptr, fonts[1].?.ptr);
+    try std.testing.expectEqual(ctx.font.ptr, fonts[2].?.ptr);
+    try std.testing.expectEqual(ctx.font.ptr, fonts[3].?.ptr);
 }
 
 test "labelStyled: a non-null tier font is carried onto the draw command" {
@@ -3412,6 +3420,34 @@ test "labelStyled: a non-null tier font is carried onto the draw command" {
     const cmd = firstText(&ctx).?.text;
     try std.testing.expect(cmd.font != null);
     try std.testing.expectEqual(ctx.style.heading.font.?.ptr, cmd.font.?.ptr);
+}
+
+test "labelStyled: outline default resolves distinct size and weight variants" {
+    var ctx = Context.init(std.testing.allocator, font_mod.default_outline_font);
+    defer ctx.deinit();
+    ctx.beginFrame(800, 200);
+    ctx.beginBox(.{ .direction = .column });
+    ctx.labelStyled("Heading", .heading);
+    ctx.labelStyled("Body", .body);
+    ctx.labelStyled("Caption", .caption);
+    ctx.labelStyled("Muted", .muted);
+    ctx.endBox();
+    ctx.endFrame();
+
+    var fonts: [4]Font = undefined;
+    var n: usize = 0;
+    for (ctx.draw_list.cmds.items) |cmd| {
+        if (cmd != .text) continue;
+        fonts[n] = cmd.text.font orelse return error.TestUnexpectedResult;
+        n += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 4), n);
+    try std.testing.expect(fonts[0].ptr != fonts[1].ptr);
+    try std.testing.expect(fonts[1].ptr != fonts[2].ptr);
+    try std.testing.expect(fonts[2].ptr != fonts[3].ptr);
+    try std.testing.expect(fonts[0].metrics().line_height >= fonts[1].metrics().line_height);
+    try std.testing.expect(fonts[1].metrics().line_height >= fonts[2].metrics().line_height);
+    try std.testing.expect(fonts[2].metrics().line_height >= fonts[3].metrics().line_height);
 }
 
 test "labelStyled: uses the text path for paragraphs and overflow" {

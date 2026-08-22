@@ -164,11 +164,10 @@ needs `measure()` to be logical width and `drawTo()` to rasterise at physical pi
   preserves the existing `Font` vtable contract; the alternative of having the
   renderer pass a scale separately was rejected. **The glyph cache is keyed by the
   physical pixel size** (`(codepoint, px_size)`).
-- **Bitmap fonts are not rejected under `.physical`**: `default_font` (the spleen
-  bitmap, `gui/font.zig`) still works under `.physical`, but **nearest
-  upscaling will not make it crisp**. UI that
-  needs crispness switches to an **outline default font** — recommended, and the real
-  answer for crisp text.
+- **Bitmap fonts are not rejected under `.physical`**: `default_bitmap_font` remains an
+  explicit fixed-pixel option, but nearest upscaling will not make it crisp. The public
+  `gui.default_font` uses the fetched Noto Sans JP outline family, which is the default
+  crisp path for Japanese and fractional display scales.
 
 The vertical-centring work covers only centring within a line. The physical-pixel font
 work stated here (the logical-measure / physical-raster `Font` API, the glyph cache, the

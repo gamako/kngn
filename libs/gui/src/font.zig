@@ -9,6 +9,7 @@ pub const RenderTarget = fnt.RenderTarget;
 pub const Color = fnt.Color;
 pub const Font = fnt.Font;
 pub const Metrics = fnt.Metrics;
+pub const OutlineFontFamily = fnt.OutlineFontFamily;
 
 /// Fixed-width 8x(glyph_h) bitmap font covering ASCII 32-127.
 /// glyphs layout: glyphs[(ch - 32) * glyph_h + row] = 8-bit row data (MSB is the left edge)
@@ -293,34 +294,77 @@ pub const default_bitmap_font: BitmapFont = .{
     .glyphs = &spleen_glyphs,
 };
 
-/// gui default font, published as a shared `Font` interface value.
-/// (Kept as BitmapFont. For the Outline default use `defaultOutlineFont()`.)
-pub const default_font: Font = default_bitmap_font.asFont();
-
-// ── default OutlineFont (embedded Press Start 2P TTF, lazy init) ──
-// GUI main-thread only, process-lifetime (no deinit). face address is stable after init.
+// ── default outline family (build-fetched Noto Sans JP, lazy init) ──
 const outline_font_mod = @import("font").OutlineFont;
-const FontFace = @import("font").FontFace;
+const outline_family_mod = @import("font").OutlineFontFamily;
+const fetched_font_bytes = @import("font_asset").bytes;
 
 var default_outline_state: struct {
     initialized: bool = false,
-    face: FontFace = undefined,
-    outline: outline_font_mod = undefined,
+    family: outline_family_mod = undefined,
+    body: ?*outline_font_mod = null,
 } = .{};
 
-/// Embedded Press Start 2P OutlineFont (logical 16px). Lazy-initialized on first call.
-/// For crisp draw verification and explicit selection. Does not replace `default_font` (bitmap).
-pub fn defaultOutlineFont() Font {
+fn defaultFamily() *outline_family_mod {
     if (!default_outline_state.initialized) {
-        default_outline_state.face = FontFace.init(@import("font").default_font_bytes) catch unreachable;
-        default_outline_state.outline = outline_font_mod.init(
-            std.heap.page_allocator,
-            &default_outline_state.face,
-            16,
-        );
+        default_outline_state.family = outline_family_mod.init(std.heap.page_allocator, fetched_font_bytes) catch unreachable;
         default_outline_state.initialized = true;
     }
-    return default_outline_state.outline.asFont();
+    return &default_outline_state.family;
+}
+
+fn defaultBody() *outline_font_mod {
+    _ = defaultFamily();
+    if (default_outline_state.body == null) {
+        default_outline_state.body = default_outline_state.family.variantOutline(16, 400) catch unreachable;
+    }
+    return default_outline_state.body.?;
+}
+
+/// Resolve a stable outline variant from the process-wide default family.
+pub fn defaultFontVariant(size: f32, weight: u16) Font {
+    return defaultFamily().variant(size, weight) catch unreachable;
+}
+
+/// The default family is available to Context for text-tier resolution.
+pub fn defaultFontFamily() *outline_family_mod {
+    return defaultFamily();
+}
+
+const default_font_proxy: u8 = 0;
+
+fn defaultMeasure(_: *const anyopaque, text: []const u8) u32 {
+    return defaultBody().measure(text);
+}
+
+fn defaultDraw(_: *const anyopaque, target: RenderTarget, pos: Vec2, text: []const u8, col: Color, clip: Rect, scale: f32) void {
+    defaultBody().drawTo(target, pos, text, col, clip, scale);
+}
+
+fn defaultMetrics(_: *const anyopaque) Metrics {
+    return defaultBody().metrics();
+}
+
+const default_font_vtable: Font.VTable = .{
+    .measure = defaultMeasure,
+    .drawTo = defaultDraw,
+    .metrics = defaultMetrics,
+};
+
+/// Legacy bitmap font value for low-level callers that explicitly opt into the fixed 8x16 font.
+pub const default_font: Font = default_bitmap_font.asFont();
+
+/// GUI's deterministic outline default. It is a proxy so the fetched face and its body variant are
+/// initialized only when first used; Context recognizes this value and resolves tier variants.
+pub const default_outline_font: Font = .{ .ptr = &default_font_proxy, .vtable = &default_font_vtable };
+
+pub fn isDefaultFont(font: Font) bool {
+    return @intFromPtr(font.ptr) == @intFromPtr(&default_font_proxy);
+}
+
+/// Explicit body-sized outline variant for callers that want a concrete Font override.
+pub fn defaultOutlineFont() Font {
+    return defaultBody().asFont();
 }
 
 // ============================================================
@@ -450,10 +494,10 @@ test "BitmapFont measure/metrics are scale-independent" {
     try std.testing.expectEqual(m.ascent, default_bitmap_font.metrics().ascent);
 }
 
-test "defaultOutlineFont has logical 16px metrics and non-transparent ASCII pixels" {
+test "defaultOutlineFont draws ASCII pixels with valid metrics" {
     const f = defaultOutlineFont();
     const m = f.metrics();
-    try std.testing.expectEqual(@as(u32, 16), m.line_height);
+    try std.testing.expect(m.line_height > 0);
     try std.testing.expect(m.ascent > 0);
     try std.testing.expect(m.ascent + m.descent <= @as(i32, @intCast(m.line_height)));
 
@@ -479,6 +523,18 @@ test "defaultOutlineFont has logical 16px metrics and non-transparent ASCII pixe
     // Second call returns the same Font (already lazy-initialized)
     const f2 = defaultOutlineFont();
     try std.testing.expect(f.ptr == f2.ptr);
+}
+
+test "default outline proxy draws Japanese coverage" {
+    var px = [_]u32{0xFF000000} ** (256 * 64);
+    const target = RenderTarget{ .pixels = &px, .width = 256, .height = 64 };
+    const clip = Rect{ .x = 0, .y = 0, .w = 256, .h = 64 };
+    default_outline_font.drawTo(target, .{ .x = 4, .y = 4 }, "日本語", Color.rgba(0xFF, 0xFF, 0xFF, 0xFF), clip, 1.0);
+    var any: bool = false;
+    for (px) |p| {
+        if (p != 0xFF000000) any = true;
+    }
+    try std.testing.expect(any);
 }
 
 test "inkHeight is 16 for the default bitmap (ascent+descent)" {

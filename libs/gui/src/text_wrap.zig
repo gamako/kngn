@@ -994,6 +994,20 @@ test "measureIntrinsicWidth agrees with wrapParagraphs paragraphs" {
     }
 }
 
+test "outline measure and wrap do not populate the coverage cache" {
+    const family = font_mod.defaultFontFamily();
+    const f = try family.variant(16, 400);
+    const before = family.coverage.rasterization_count;
+    _ = f.measure("日本語 mixed text");
+    _ = measureIntrinsicWidth(f, "日本語\nmixed text");
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const result = try wrapParagraphs(arena.allocator(), f, "日本語 mixed text", 64, .{ .wrap = true });
+    try std.testing.expect(result.lines.len > 0);
+    _ = f.measure("日本語 mixed text");
+    try std.testing.expectEqual(before, family.coverage.rasterization_count);
+}
+
 test "truncate: CR LF folds to one space" {
     var arena_inst = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_inst.deinit();
