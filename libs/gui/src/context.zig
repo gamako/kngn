@@ -1317,7 +1317,8 @@ pub const Context = struct {
             return;
         }
         if (node.cfg.bg) |bg| {
-            self.draw_list.rectFilled(node.rect, bg) catch @panic("Context.endFrame: OOM");
+            self.draw_list.rectFilledEx(node.rect, bg, .{ .radius = node.cfg.radius }) catch
+                @panic("Context.endFrame: OOM");
         }
         if (node.cfg.clip_children) {
             self.draw_list.pushClip(layout.contentBox(node.rect, node.cfg.padding)) catch
@@ -1327,7 +1328,7 @@ pub const Context = struct {
         while (it) |c| : (it = c.next_sibling) self.emitNode(c);
         if (node.cfg.clip_children) self.draw_list.popClip();
         if (node.cfg.border) |b| {
-            self.draw_list.rectOutline(node.rect, b.color, b.thickness) catch
+            self.draw_list.rectOutlineEx(node.rect, b.color, b.thickness, .{ .radius = node.cfg.radius }) catch
                 @panic("Context.endFrame: OOM");
         }
         // Focus ring, on the same terms as the border: this frame's rect, after popClip, so it sits
@@ -1339,7 +1340,12 @@ pub const Context = struct {
         if (self.popup_state == null and self.popup_stack.len == 0 and self.state.focus_visible and
             node.cfg.id != 0 and node.cfg.id == self.state.focused_id)
         {
-            self.draw_list.rectOutline(node.rect, self.style.focus_ring, self.style.focus_ring_thickness) catch
+            self.draw_list.rectOutlineEx(
+                node.rect,
+                self.style.focus_ring,
+                self.style.focus_ring_thickness,
+                .{ .radius = node.cfg.radius },
+            ) catch
                 @panic("Context.endFrame: OOM");
         }
     }
@@ -1476,6 +1482,33 @@ const btn_rect = Rect{ .x = 0, .y = 0, .w = 100, .h = 50 };
 
 fn testCtx() Context {
     return Context.init(std.testing.allocator, font_mod.default_font);
+}
+
+test "layout: rounded box and focus ring preserve the configured radius" {
+    var ctx = testCtx();
+    defer ctx.deinit();
+
+    ctx.beginFrame(100, 60);
+    ctx.state.focused_id = 77;
+    ctx.state.focus_visible = true;
+    ctx.beginBox(.{
+        .id = 77,
+        .width = .{ .fixed = 40 },
+        .height = .{ .fixed = 20 },
+        .bg = Color.rgba(0x20, 0x20, 0x20, 0xFF),
+        .border = .{ .color = Color.rgba(0xA0, 0xA0, 0xB0, 0xFF), .thickness = 1 },
+        .radius = 9,
+    });
+    ctx.endBox();
+    ctx.endFrame();
+
+    try std.testing.expectEqual(@as(usize, 3), ctx.draw_list.cmds.items.len);
+    try std.testing.expectEqual(@as(u32, 9), ctx.draw_list.cmds.items[0].rect_filled.radius);
+    try std.testing.expect(ctx.draw_list.cmds.items[0].rect_filled.aa);
+    try std.testing.expectEqual(@as(u32, 9), ctx.draw_list.cmds.items[1].rect_outline.radius);
+    try std.testing.expect(ctx.draw_list.cmds.items[1].rect_outline.aa);
+    try std.testing.expectEqual(@as(u32, 9), ctx.draw_list.cmds.items[2].rect_outline.radius);
+    try std.testing.expect(ctx.draw_list.cmds.items[2].rect_outline.aa);
 }
 
 test "buttonBehavior: down→up across frames while hovered makes clicked true for one frame only" {

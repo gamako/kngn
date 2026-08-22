@@ -115,6 +115,8 @@ pub const BoxConfig = struct {
     bg: ?Color = null,
     /// Border (null = none). Emitted bg → children → border
     border: ?Border = null,
+    /// Visual corner radius for this box. Does not affect measure, placement, or hit-testing.
+    radius: u32 = 0,
     /// If true, bake a clip from the content box (rect minus padding) into
     /// children's draw cmds (does not affect layout math).
     clip_children: bool = false,
@@ -2674,4 +2676,9 @@ test "anchor: clip_children=false folds overflow into extent; clip excludes it" 
         try std.testing.expectEqual(@as(i32, 10), root.content_w);
         try std.testing.expectEqual(@as(i32, 10), root.content_h);
     }
+}
+
+test "BoxConfig: radius defaults to zero" {
+    const cfg: BoxConfig = .{};
+    try std.testing.expectEqual(@as(u32, 0), cfg.radius);
 }

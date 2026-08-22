@@ -46,6 +46,10 @@ pub const Style = struct {
     /// the keyboard, so it has to stand out against every widget fill rather than blend in.
     focus_ring: Color = Color.rgba(0x7A, 0xB8, 0xFF, 0xFF),
     focus_ring_thickness: u32 = 2,
+    /// Radius shared by button-like chrome and focus rings.
+    control_radius: u32 = 6,
+    /// Radius used by the checkbox glyph's rounded rectangles.
+    checkbox_radius: u32 = 4,
     swatch_size: i32 = 18,
     swatch_border: i32 = 1,
     swatch_border_selected: i32 = 2,
@@ -143,6 +147,8 @@ pub fn defaultStyle() Style {
         .border_hover = Color.rgba(0xA0, 0xA0, 0xB0, 0xFF),
         .text = text,
         .text_subtle = text_subtle,
+        .control_radius = 6,
+        .checkbox_radius = 4,
         .heading = .{ .color = text },
         .body = .{ .color = text },
         .caption = .{ .color = text_subtle },
@@ -223,4 +229,10 @@ test "mutedFromSubtle: halfway from text_subtle toward bg" {
     try std.testing.expectEqual(@as(u8, 0x68), m.g);
     try std.testing.expectEqual(@as(u8, 0x70), m.b);
     try std.testing.expectEqual(@as(u8, 0xFF), m.a);
+}
+
+test "defaultStyle: widget radii use the compact control defaults" {
+    const s = defaultStyle();
+    try std.testing.expectEqual(@as(u32, 6), s.control_radius);
+    try std.testing.expectEqual(@as(u32, 4), s.checkbox_radius);
 }

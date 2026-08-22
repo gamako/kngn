@@ -174,6 +174,7 @@ pub fn buttonId(ctx: *Context, id: Id, label: []const u8, opts: ButtonOpts) Butt
         .padding = pad,
         .bg = bg,
         .border = makeBorder(border_color, thickness),
+        .radius = style.control_radius,
     });
     ctx.labelEx(label, if (disabled) style.disabledColor(style.text) else style.text);
     ctx.endBox();
@@ -271,6 +272,7 @@ pub fn iconButtonId(ctx: *Context, id: Id, icon: IconBitmap, selected: bool) But
         .padding = pad,
         .bg = bg,
         .border = makeBorder(border_color, thickness),
+        .radius = style.control_radius,
     });
     const data = ctx.allocator().create(IconButtonDraw) catch @panic("iconButton: OOM");
     @memcpy(&data.rows, icon[0..16]);
@@ -1544,10 +1546,17 @@ pub fn checkboxId(ctx: *Context, id: Id, label: []const u8, value: *bool) bool {
     std.debug.assert(size > 0);
     const hot = ctx.state.hot_id == id;
 
-    ctx.beginBox(.{ .id = id, .direction = .row, .gap = style.checkbox_gap, .align_cross = .center });
+    ctx.beginBox(.{
+        .id = id,
+        .direction = .row,
+        .gap = style.checkbox_gap,
+        .align_cross = .center,
+        .radius = style.control_radius,
+    });
     const data = ctx.allocator().create(CheckGlyph) catch @panic("checkbox: OOM");
     data.* = .{
         .size = size,
+        .radius = style.checkbox_radius,
         .checked = value.*,
         .border = if (disabled) style.disabledColor(style.border) else if (hot) style.border_hover else style.border,
         .bg = if (disabled) style.disabledColor(style.slider_track_bg) else style.slider_track_bg,
@@ -1561,6 +1570,7 @@ pub fn checkboxId(ctx: *Context, id: Id, label: []const u8, value: *bool) bool {
 
 const CheckGlyph = struct {
     size: i32,
+    radius: u32,
     checked: bool,
     border: Color,
     bg: Color,
@@ -1568,21 +1578,21 @@ const CheckGlyph = struct {
 
     fn draw(ctx_ptr: *anyopaque, dl: *DrawList, rect: Rect) void {
         const self: *const CheckGlyph = @ptrCast(@alignCast(ctx_ptr));
-        dl.rectFilled(rect, self.bg) catch @panic("checkbox: OOM");
+        dl.rectFilledEx(rect, self.bg, .{ .radius = self.radius }) catch @panic("checkbox: OOM");
         if (self.checked) {
             const inset: i32 = @max(2, @divTrunc(self.size, 5));
             const iw: i32 = @as(i32, @intCast(rect.w)) - 2 * inset;
             const ih: i32 = @as(i32, @intCast(rect.h)) - 2 * inset;
             if (iw > 0 and ih > 0) {
-                dl.rectFilled(.{
+                dl.rectFilledEx(.{
                     .x = rect.x + inset,
                     .y = rect.y + inset,
                     .w = @intCast(iw),
                     .h = @intCast(ih),
-                }, self.fill) catch @panic("checkbox: OOM");
+                }, self.fill, .{ .radius = self.radius }) catch @panic("checkbox: OOM");
             }
         }
-        dl.rectOutline(rect, self.border, 1) catch @panic("checkbox: OOM");
+        dl.rectOutlineEx(rect, self.border, 1, .{ .radius = self.radius }) catch @panic("checkbox: OOM");
     }
 };
 
@@ -1604,7 +1614,13 @@ pub fn toggleId(ctx: *Context, id: Id, label: []const u8, value: *bool) bool {
     std.debug.assert(w > 0 and h > 0 and w >= h); // Keep the knob from going non-positive or past the track
     const hot = ctx.state.hot_id == id;
 
-    ctx.beginBox(.{ .id = id, .direction = .row, .gap = style.checkbox_gap, .align_cross = .center });
+    ctx.beginBox(.{
+        .id = id,
+        .direction = .row,
+        .gap = style.checkbox_gap,
+        .align_cross = .center,
+        .radius = style.control_radius,
+    });
     const data = ctx.allocator().create(ToggleGlyph) catch @panic("toggle: OOM");
     data.* = .{
         .checked = value.*,
@@ -1630,19 +1646,20 @@ const ToggleGlyph = struct {
 
     fn draw(ctx_ptr: *anyopaque, dl: *DrawList, rect: Rect) void {
         const self: *const ToggleGlyph = @ptrCast(@alignCast(ctx_ptr));
-        dl.rectFilled(rect, if (self.checked) self.track_on else self.track_off) catch @panic("toggle: OOM");
+        const track_radius: u32 = rect.h / 2;
+        dl.rectFilledEx(rect, if (self.checked) self.track_on else self.track_off, .{ .radius = track_radius }) catch
+            @panic("toggle: OOM");
         const h: i32 = @intCast(rect.h);
         const w: i32 = @intCast(rect.w);
         const knob_side = @max(1, h - 2 * margin);
         // OFF=left-packed / ON=right-packed (stays in range when w>=h)
         const kx = if (self.checked) rect.x + w - margin - knob_side else rect.x + margin;
-        dl.rectFilled(.{
-            .x = kx,
-            .y = rect.y + margin,
-            .w = @intCast(knob_side),
-            .h = @intCast(knob_side),
-        }, self.knob) catch @panic("toggle: OOM");
-        dl.rectOutline(rect, self.border, 1) catch @panic("toggle: OOM");
+        const knob_radius: u32 = @intCast(@max(1, @divTrunc(knob_side, 2)));
+        dl.circleFilled(.{
+            .x = kx + @divTrunc(knob_side, 2),
+            .y = rect.y + margin + @divTrunc(knob_side, 2),
+        }, knob_radius, self.knob, .{}) catch @panic("toggle: OOM");
+        dl.rectOutlineEx(rect, self.border, 1, .{ .radius = track_radius }) catch @panic("toggle: OOM");
     }
 };
 
@@ -1662,7 +1679,13 @@ pub fn radioId(ctx: *Context, id: Id, label: []const u8, selected: bool) bool {
     std.debug.assert(size > 0);
     const hot = ctx.state.hot_id == id;
 
-    ctx.beginBox(.{ .id = id, .direction = .row, .gap = style.checkbox_gap, .align_cross = .center });
+    ctx.beginBox(.{
+        .id = id,
+        .direction = .row,
+        .gap = style.checkbox_gap,
+        .align_cross = .center,
+        .radius = style.control_radius,
+    });
     const data = ctx.allocator().create(RadioGlyph) catch @panic("radio: OOM");
     data.* = .{
         .size = size,
@@ -1686,12 +1709,19 @@ const RadioGlyph = struct {
 
     fn draw(ctx_ptr: *anyopaque, dl: *DrawList, rect: Rect) void {
         const self: *const RadioGlyph = @ptrCast(@alignCast(ctx_ptr));
-        const r: f32 = @as(f32, @floatFromInt(@min(rect.w, rect.h))) / 2.0;
-        const cx: f32 = @as(f32, @floatFromInt(rect.x)) + @as(f32, @floatFromInt(rect.w)) / 2.0;
-        const cy: f32 = @as(f32, @floatFromInt(rect.y)) + @as(f32, @floatFromInt(rect.h)) / 2.0;
-        fillDisc(dl, cx, cy, r, self.ring); // Outer ring
-        fillDisc(dl, cx, cy, r - 1.5, self.bg); // Punch the interior (remaining ring is the border)
-        if (self.selected) fillDisc(dl, cx, cy, r * 0.45, self.dot); // Center dot
+        const radius: u32 = @min(rect.w, rect.h) / 2;
+        if (radius == 0) return;
+        const inner_radius = radius -| 1;
+        const glyph_center: draw_mod.Vec2 = .{
+            .x = rect.x + @as(i32, @intCast(rect.w / 2)),
+            .y = rect.y + @as(i32, @intCast(rect.h / 2)),
+        };
+        dl.circleFilled(glyph_center, inner_radius, self.bg, .{}) catch @panic("radio: OOM");
+        dl.circleOutline(glyph_center, radius, self.ring, 1, .{}) catch @panic("radio: OOM");
+        if (self.selected) {
+            const dot_radius: u32 = @intFromFloat(@round(@as(f32, @floatFromInt(radius)) * 0.45));
+            dl.circleFilled(glyph_center, dot_radius, self.dot, .{}) catch @panic("radio: OOM");
+        }
     }
 };
 
@@ -1736,9 +1766,10 @@ pub fn beginCollapsible(ctx: *Context, id: Id, title: []const u8, open: *bool) b
         .padding = pad,
         .bg = bg,
         .border = makeBorder(border_color, style.button_border),
+        .radius = style.control_radius,
     });
     const data = ctx.allocator().create(CollapsibleGlyph) catch @panic("collapsible: OOM");
-    data.* = .{ .open = open.*, .fg = style.text };
+    data.* = .{ .ctx = ctx, .open = open.*, .fg = style.text };
     ctx.custom(.{ .x = collapsible_glyph_px, .y = collapsible_glyph_px }, CollapsibleGlyph.draw, data);
     ctx.labelEx(title, style.text);
     ctx.endBox(); // Header always closes inside begin
@@ -1763,12 +1794,13 @@ pub fn endCollapsible(ctx: *Context) void {
     ctx.endBox();
 }
 
-/// Open/close triangle. closed=right / open=down. Opaque `rectFilled` runs only (no alpha blend).
+/// Open/close triangle. closed=right / open=down. The path lives in the frame arena until render.
 const CollapsibleGlyph = struct {
+    ctx: *Context,
     open: bool,
     fg: Color,
 
-    fn draw(ctx_ptr: *anyopaque, dl: *DrawList, rect: Rect) void {
+    fn draw(ctx_ptr: *anyopaque, _: *DrawList, rect: Rect) void {
         const self: *const CollapsibleGlyph = @ptrCast(@alignCast(ctx_ptr));
         const w: i32 = @intCast(rect.w);
         const h: i32 = @intCast(rect.h);
@@ -1781,59 +1813,26 @@ const CollapsibleGlyph = struct {
         const ox = rect.x + m;
         const oy = rect.y + m;
 
+        const fx = @as(f32, @floatFromInt(ox));
+        const fy = @as(f32, @floatFromInt(oy));
+        const fw = @as(f32, @floatFromInt(iw));
+        const fh = @as(f32, @floatFromInt(ih));
+        var path = self.ctx.beginPath();
         if (self.open) {
-            // Pointing down: wide top edge, tapering downward
-            var row: i32 = 0;
-            while (row < ih) : (row += 1) {
-                const t = @divTrunc(row * iw, ih); // 0..iw
-                const half = @divTrunc(t, 2);
-                const x0 = half;
-                const x1 = iw - half;
-                if (x1 <= x0) continue;
-                dl.rectFilled(.{
-                    .x = ox + x0,
-                    .y = oy + row,
-                    .w = @intCast(x1 - x0),
-                    .h = 1,
-                }, self.fg) catch @panic("collapsible: OOM");
-            }
+            // Pointing down: wide top edge, tapering downward.
+            path.moveTo(.{ .x = fx, .y = fy }) catch @panic("collapsible: Invalid path");
+            path.lineTo(.{ .x = fx + fw, .y = fy }) catch @panic("collapsible: Invalid path");
+            path.lineTo(.{ .x = fx + fw / 2.0, .y = fy + fh }) catch @panic("collapsible: Invalid path");
         } else {
-            // Pointing right: wide left edge, tapering rightward
-            const half = @divTrunc(ih, 2);
-            var row: i32 = 0;
-            while (row < ih) : (row += 1) {
-                // Upper half widens with row; lower half is symmetric
-                const dist = if (row <= half) row else (ih - 1 - row);
-                const run = @max(1, @divTrunc((dist + 1) * iw, half + 1));
-                dl.rectFilled(.{
-                    .x = ox,
-                    .y = oy + row,
-                    .w = @intCast(@min(run, iw)),
-                    .h = 1,
-                }, self.fg) catch @panic("collapsible: OOM");
-            }
+            // Pointing right: wide left edge, tapering rightward.
+            path.moveTo(.{ .x = fx, .y = fy }) catch @panic("collapsible: Invalid path");
+            path.lineTo(.{ .x = fx + fw, .y = fy + fh / 2.0 }) catch @panic("collapsible: Invalid path");
+            path.lineTo(.{ .x = fx, .y = fy + fh }) catch @panic("collapsible: Invalid path");
         }
+        path.close() catch @panic("collapsible: Invalid path");
+        path.finish(.{ .color = self.fg }) catch @panic("collapsible: OOM");
     }
 };
-
-/// Filled circle at (cx,cy) radius `radius` via scanlines (1px-tall `rectFilled` bands per row).
-/// Local helper because render has no circle primitive.
-fn fillDisc(dl: *DrawList, cx: f32, cy: f32, radius: f32, col: Color) void {
-    if (radius < 0.5) return;
-    const y0: i32 = @intFromFloat(@floor(cy - radius));
-    const y1: i32 = @intFromFloat(@ceil(cy + radius));
-    var y: i32 = y0;
-    while (y < y1) : (y += 1) {
-        const dy = (@as(f32, @floatFromInt(y)) + 0.5) - cy; // Row center
-        const under = radius * radius - dy * dy;
-        if (under <= 0) continue;
-        const hw = @sqrt(under);
-        const xl: i32 = @intFromFloat(@round(cx - hw));
-        const xr: i32 = @intFromFloat(@round(cx + hw));
-        if (xr <= xl) continue;
-        dl.rectFilled(.{ .x = xl, .y = y, .w = @intCast(xr - xl), .h = 1 }, col) catch @panic("radio: OOM");
-    }
-}
 
 // ============================================================
 // Splitter (pane-boundary drag)
@@ -2449,6 +2448,7 @@ pub fn tabId(ctx: *Context, id: Id, label: []const u8, selected: bool, opts: Tab
         .padding = pad,
         .bg = bg,
         .align_cross = .center,
+        .radius = style.control_radius,
     });
     ctx.labelEx(label, style.text);
     ctx.endBox();
@@ -4691,6 +4691,97 @@ test "radio: selected center dot is accent; non-selected is box interior color" 
     const uns_i = (@as(u32, @intCast(uns.y)) + uns.h / 2) * 200 + @as(u32, @intCast(uns.x)) + half;
     try std.testing.expectEqual(@as(u32, @bitCast(ctx.style.bg_active)), pixels[sel_i]); // selected = center dot
     try std.testing.expectEqual(@as(u32, @bitCast(ctx.style.slider_track_bg)), pixels[uns_i]); // non-selected = hollow
+}
+
+test "widget chrome: button background and border use the control radius" {
+    var ctx = testCtx();
+    defer ctx.deinit();
+
+    ctx.beginFrame(200, 40);
+    _ = ctx.buttonId(0xB001, "Button", .{});
+    ctx.endFrame();
+
+    try std.testing.expectEqual(@as(usize, 3), ctx.draw_list.cmds.items.len);
+    try std.testing.expectEqual(@as(u32, 6), ctx.draw_list.cmds.items[0].rect_filled.radius);
+    try std.testing.expect(ctx.draw_list.cmds.items[0].rect_filled.aa);
+    try std.testing.expectEqual(@as(u32, 6), ctx.draw_list.cmds.items[2].rect_outline.radius);
+    try std.testing.expect(ctx.draw_list.cmds.items[2].rect_outline.aa);
+}
+
+test "widget chrome: checkbox glyph uses the checkbox radius for every rect" {
+    var ctx = testCtx();
+    defer ctx.deinit();
+    var value = true;
+
+    ctx.beginFrame(200, 40);
+    _ = ctx.checkboxId(0xB002, "Check", &value);
+    ctx.endFrame();
+
+    try std.testing.expectEqual(@as(u32, 4), ctx.draw_list.cmds.items[0].rect_filled.radius);
+    try std.testing.expectEqual(@as(u32, 4), ctx.draw_list.cmds.items[1].rect_filled.radius);
+    try std.testing.expectEqual(@as(u32, 4), ctx.draw_list.cmds.items[2].rect_outline.radius);
+    for (ctx.draw_list.cmds.items[0..3]) |cmd| switch (cmd) {
+        .rect_filled => |c| try std.testing.expect(c.aa),
+        .rect_outline => |c| try std.testing.expect(c.aa),
+        else => try std.testing.expect(false),
+    };
+}
+
+test "widget chrome: toggle uses a pill track and a circular knob" {
+    var ctx = testCtx();
+    defer ctx.deinit();
+    var value = true;
+
+    ctx.beginFrame(200, 40);
+    _ = ctx.toggleId(0xB003, "Toggle", &value);
+    ctx.endFrame();
+
+    try std.testing.expectEqual(@as(u32, 8), ctx.draw_list.cmds.items[0].rect_filled.radius);
+    try std.testing.expect(ctx.draw_list.cmds.items[0].rect_filled.aa);
+    try std.testing.expect(ctx.draw_list.cmds.items[1] == .circle_filled);
+    try std.testing.expectEqual(@as(u32, 6), ctx.draw_list.cmds.items[1].circle_filled.radius);
+    try std.testing.expect(ctx.draw_list.cmds.items[1].circle_filled.aa);
+    try std.testing.expectEqual(@as(u32, 8), ctx.draw_list.cmds.items[2].rect_outline.radius);
+}
+
+test "widget chrome: radio uses analytic circles without scanline rects" {
+    var ctx = testCtx();
+    defer ctx.deinit();
+
+    ctx.beginFrame(200, 40);
+    _ = ctx.radioId(0xB004, "Radio", true);
+    ctx.endFrame();
+
+    try std.testing.expect(ctx.draw_list.cmds.items[0] == .circle_filled);
+    try std.testing.expect(ctx.draw_list.cmds.items[1] == .circle_outline);
+    try std.testing.expect(ctx.draw_list.cmds.items[2] == .circle_filled);
+    try std.testing.expect(ctx.draw_list.cmds.items[0].circle_filled.aa);
+    try std.testing.expect(ctx.draw_list.cmds.items[1].circle_outline.aa);
+    try std.testing.expect(ctx.draw_list.cmds.items[2].circle_filled.aa);
+    for (ctx.draw_list.cmds.items[0..3]) |cmd| {
+        try std.testing.expect(cmd != .rect_filled);
+    }
+}
+
+test "widget chrome: collapsible arrow is one closed antialiased path" {
+    var ctx = testCtx();
+    defer ctx.deinit();
+    var open = false;
+
+    ctx.beginFrame(200, 40);
+    _ = ctx.beginCollapsible(0xB005, "Section", &open);
+    ctx.endFrame();
+
+    var path_count: usize = 0;
+    for (ctx.draw_list.cmds.items) |cmd| {
+        if (cmd == .path) {
+            path_count += 1;
+            try std.testing.expect(cmd.path.aa);
+            try std.testing.expectEqual(@as(usize, 4), cmd.path.verbs.len);
+            try std.testing.expectEqual(@as(usize, 3), cmd.path.points.len);
+        }
+    }
+    try std.testing.expectEqual(@as(usize, 1), path_count);
 }
 
 test "radio: returns clicked (activated even when already selected)" {
