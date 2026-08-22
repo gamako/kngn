@@ -9,6 +9,16 @@ const std = @import("std");
 const platform = @import("platform");
 const gui = @import("gui");
 
+fn drawlistDigest(ctx_ptr: *anyopaque, buf: []u8) []const u8 {
+    const draw_list: *const gui.DrawList = @ptrCast(@alignCast(ctx_ptr));
+    return gui.drawlistDigest(draw_list, buf);
+}
+
+fn drawlistDumpAlloc(ctx_ptr: *anyopaque, allocator: std.mem.Allocator) anyerror![]u8 {
+    const draw_list: *const gui.DrawList = @ptrCast(@alignCast(ctx_ptr));
+    return gui.drawlistDumpAlloc(allocator, draw_list);
+}
+
 pub fn main(init: std.process.Init) !void {
     const gpa = init.gpa;
 
@@ -20,6 +30,15 @@ pub fn main(init: std.process.Init) !void {
 
     var draw_list = gui.DrawList.init(gpa);
     defer draw_list.deinit();
+
+    platform.registerProbe(.{
+        .name = "drawlist",
+        .ctx = &draw_list,
+        .ext = "txt",
+        .digest = drawlistDigest,
+        .snapshot = drawlistDumpAlloc,
+        .desc = "path drawing command digest and structure dump",
+    });
 
     var arena = std.heap.ArenaAllocator.init(gpa);
     defer arena.deinit();

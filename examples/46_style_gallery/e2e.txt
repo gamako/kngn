@@ -1,0 +1,135 @@
+# Style showcase replay: overview, widget states, selected state, and paths.
+step 2
+digest showcase
+expect showcase section=overview
+expect showcase index=0
+expect showcase selected=states
+expect showcase disabled=0
+snapshot fb
+
+# overview -> states
+inject key_down PAGE_DOWN
+step 1
+inject key_up PAGE_DOWN
+step 1
+digest showcase
+expect showcase section=states
+expect showcase index=1
+expect showcase hot=none
+expect showcase active=none
+expect showcase focused=none
+expect showcase selected=states
+expect showcase disabled=1
+snapshot fb
+
+# Primary button: hover and press.
+inject mouse_move 120 190
+step 2
+digest showcase
+expect showcase hot=button
+expect showcase active=none
+snapshot fb
+inject mouse_down left
+step 1
+digest showcase
+expect showcase hot=button
+expect showcase active=button
+expect showcase focused=button
+snapshot fb
+inject mouse_up left
+step 1
+digest showcase
+expect showcase active=none
+expect showcase focused=button
+
+# Disabled button: it does not become hot or active and selection stays unchanged.
+inject mouse_move 300 190
+step 2
+digest showcase
+expect showcase hot=none
+expect showcase active=none
+expect showcase selected=states
+inject mouse_down left
+step 1
+digest showcase
+expect showcase hot=none
+expect showcase active=none
+expect showcase selected=states
+inject mouse_up left
+step 1
+digest showcase
+expect showcase hot=none
+expect showcase active=none
+expect showcase selected=states
+
+# Tab focus follows the submitted focus order after the one-frame traversal delay.
+inject mouse_move 1000 620
+inject key_down TAB
+step 1
+inject key_up TAB
+step 1
+digest showcase
+expect showcase hot=none
+expect showcase active=none
+expect showcase focused=tab_overview
+
+# Click the Overview tab to prove selected state changes.
+inject mouse_move 92 150
+inject mouse_down left
+step 1
+inject mouse_up left
+step 1
+digest showcase
+expect showcase section=states
+expect showcase index=1
+expect showcase hot=tab_overview
+expect showcase active=none
+expect showcase focused=tab_overview
+expect showcase selected=overview
+snapshot fb
+
+# Click the States tab to restore the selected state before changing section.
+inject mouse_move 212 150
+inject mouse_down left
+step 1
+inject mouse_up left
+step 1
+digest showcase
+expect showcase section=states
+expect showcase index=1
+expect showcase hot=tab_states
+expect showcase active=none
+expect showcase focused=tab_states
+expect showcase selected=states
+
+# states -> paths
+inject mouse_move 1000 620
+inject key_down PAGE_DOWN
+step 1
+inject key_up PAGE_DOWN
+step 1
+digest showcase
+expect showcase section=paths
+expect showcase index=2
+expect showcase hot=none
+expect showcase active=none
+expect showcase focused=none
+expect showcase selected=states
+expect showcase disabled=0
+expect showcase fill=3
+expect showcase stroke=6
+expect showcase aa_on=6
+expect showcase aa_off=3
+snapshot fb
+digest drawlist
+expect drawlist hash=A440AB3B
+expect drawlist rect_filled=3
+expect drawlist rect_outline=0
+expect drawlist line=0
+expect drawlist text=3
+expect drawlist image=0
+expect drawlist path=9
+expect drawlist offclip=0
+digest frameprof
+expect frameprof body_ms>0
+quit

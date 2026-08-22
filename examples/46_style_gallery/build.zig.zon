@@ -1,0 +1,16 @@
+.{
+    .name = .example_46_style_gallery,
+    .version = "0.0.0",
+    .fingerprint = 0x54b6c2c3e73d4533,
+    .minimum_zig_version = "0.16.0",
+    .dependencies = .{
+        .kngn = .{
+            .path = "../..",
+        },
+    },
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "main.zig",
+    },
+}

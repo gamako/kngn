@@ -1,0 +1,8 @@
+# Path drawing command probe and framebuffer snapshot.
+step 2
+digest drawlist
+expect drawlist hash=A838E9E0
+expect drawlist path=12
+expect drawlist offclip=1
+snapshot fb
+quit
