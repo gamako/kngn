@@ -330,6 +330,9 @@ fn quantizeScale(scale: f32) u32 {
 pub const OutlineFont = struct {
     alloc: std.mem.Allocator,
     face: *const FontFace,
+    /// Optional family-owned raw-GID table for BMP codepoints. Lookup is frame-time/per character;
+    /// standalone fonts leave this null and use the cmap search path.
+    bmp_dense: ?[]const u16 = null,
     px: f32,
     scale: f32,
     cache: std.AutoHashMapUnmanaged(PhysicalGlyphKey, CachedGlyph) = .empty,
@@ -388,9 +391,10 @@ pub const OutlineFont = struct {
     }
 
     /// Initialize a size-bound variant that shares coverage payloads with its family.
-    pub fn initWithCache(alloc: std.mem.Allocator, face: *const FontFace, px: f32, cache: *GlyphCoverageCache) OutlineFont {
+    pub fn initWithCache(alloc: std.mem.Allocator, face: *const FontFace, px: f32, cache: *GlyphCoverageCache, bmp_dense: ?[]const u16) OutlineFont {
         var result = init(alloc, face, px);
         result.shared_coverage_cache = cache;
+        result.bmp_dense = bmp_dense;
         return result;
     }
 
@@ -713,8 +717,13 @@ pub const OutlineFont = struct {
         return self.face.sfnt.pixelMetrics(self.px);
     }
 
+    /// Resolve a character to a raw GID. The family BMP table is an O(1) frame-time/per-character
+    /// lookup; non-BMP and standalone fonts retain the cmap fallback search.
     fn gidOf(self: *const OutlineFont, cp: u32) u16 {
-        const gid = self.face.cmap.lookup(cp);
+        const gid = if (cp <= 0xFFFF) blk: {
+            if (self.bmp_dense) |dense| break :blk dense[@intCast(cp)];
+            break :blk self.face.cmap.lookup(cp);
+        } else self.face.cmap.lookup(cp);
         return if (gid >= self.face.sfnt.num_glyphs) 0 else gid;
     }
 
@@ -1142,13 +1151,18 @@ const VariantKey = struct {
 pub const OutlineFontFamily = struct {
     alloc: std.mem.Allocator,
     face: FontFace,
+    /// One 128 KiB raw-GID table shared by all variants. Built at initialization and freed after variants.
+    bmp_dense: []u16,
     coverage: GlyphCoverageCache,
     variants: std.AutoHashMapUnmanaged(VariantKey, *OutlineFont) = .empty,
 
     pub fn init(alloc: std.mem.Allocator, data: []const u8) Error!OutlineFontFamily {
+        const face = try FontFace.init(data);
+        const bmp_dense = try face.cmap.buildBmpDense(alloc);
         return .{
             .alloc = alloc,
-            .face = try FontFace.init(data),
+            .face = face,
+            .bmp_dense = bmp_dense,
             .coverage = GlyphCoverageCache.init(alloc),
         };
     }
@@ -1161,6 +1175,7 @@ pub const OutlineFontFamily = struct {
         }
         self.variants.deinit(self.alloc);
         self.coverage.deinit();
+        self.alloc.free(self.bmp_dense);
         self.* = undefined;
     }
 
@@ -1175,7 +1190,7 @@ pub const OutlineFontFamily = struct {
 
         const variant_ptr = try self.alloc.create(OutlineFont);
         errdefer self.alloc.destroy(variant_ptr);
-        variant_ptr.* = OutlineFont.initWithCache(self.alloc, &self.face, safe_size, &self.coverage);
+        variant_ptr.* = OutlineFont.initWithCache(self.alloc, &self.face, safe_size, &self.coverage, self.bmp_dense);
         errdefer variant_ptr.deinit();
 
         if (variant_ptr.face.fvar) |fv| {
@@ -4023,6 +4038,67 @@ test "OutlineFontFamily: non-variable fonts ignore weight without pseudo-bold" {
     try testing.expectEqual(regular.measure("A"), bold.measure("A"));
 }
 
+test "OutlineFontFamily: dense and cmap paths measure and draw identically" {
+    const a = testing.allocator;
+    const data = try buildTestFont(a, 64);
+    defer a.free(data);
+    var family = try OutlineFontFamily.init(a, data);
+    defer family.deinit();
+
+    var dense_font = try family.variantOutline(64, 400);
+    var cmap_font = OutlineFont.init(a, &family.face, 64);
+    defer cmap_font.deinit();
+
+    const texts = [_][]const u8{ "A", "A漢B", "A漢B😀\u{FFFF}Z" };
+    for (texts) |text| {
+        try testing.expectEqual(cmap_font.measure(text), dense_font.measure(text));
+    }
+
+    const W = 192;
+    const H = 96;
+    var dense_pixels = [_]u32{0xFF101820} ** (W * H);
+    var cmap_pixels = [_]u32{0xFF101820} ** (W * H);
+    const dense_target = RenderTarget{ .pixels = &dense_pixels, .width = W, .height = H };
+    const cmap_target = RenderTarget{ .pixels = &cmap_pixels, .width = W, .height = H };
+    const clip = Rect{ .x = 0, .y = 0, .w = W, .h = H };
+    const text = "A漢B😀\u{FFFF}Z";
+    dense_font.drawTo(dense_target, .{ .x = 4, .y = 60 }, text, Color.rgba(0xE0, 0xF0, 0xFF, 0xFF), clip, 1.0);
+    cmap_font.drawTo(cmap_target, .{ .x = 4, .y = 60 }, text, Color.rgba(0xE0, 0xF0, 0xFF, 0xFF), clip, 1.0);
+    try testing.expectEqualSlices(u32, &cmap_pixels, &dense_pixels);
+}
+
+test "OutlineFontFamily: dense table allocates once and steady state does not allocate" {
+    const a = testing.allocator;
+    const data = try buildTestFont(a, 64);
+    defer a.free(data);
+
+    var failing_init = std.testing.FailingAllocator.init(a, .{ .fail_index = 0 });
+    try testing.expectError(error.OutOfMemory, OutlineFontFamily.init(failing_init.allocator(), data));
+    try testing.expectEqual(@as(usize, 0), failing_init.allocations);
+    try testing.expectEqual(failing_init.allocated_bytes, failing_init.freed_bytes);
+
+    var failing = std.testing.FailingAllocator.init(a, .{});
+    const init_start = std.Io.Clock.Timestamp.now(std.testing.io, .awake);
+    var family = try OutlineFontFamily.init(failing.allocator(), data);
+    const init_ns: u64 = @intCast(init_start.untilNow(std.testing.io).raw.nanoseconds);
+    std.debug.print("font family dense init: {d} ns\n", .{init_ns});
+    defer family.deinit();
+    try testing.expectEqual(@as(usize, 1), failing.alloc_index);
+    try testing.expectEqual(@as(usize, 0x10000) * @sizeOf(u16), failing.allocated_bytes);
+
+    var of = try family.variantOutline(64, 400);
+    var pixels = [_]u32{0xFF000000} ** (96 * 96);
+    const target = RenderTarget{ .pixels = &pixels, .width = 96, .height = 96 };
+    const clip = Rect{ .x = 0, .y = 0, .w = 96, .h = 96 };
+    of.drawTo(target, .{ .x = 4, .y = 60 }, "A", Color.rgba(0xFF, 0xFF, 0xFF, 0xFF), clip, 1.0);
+
+    const steady_alloc_index = failing.alloc_index;
+    failing.fail_index = steady_alloc_index;
+    _ = of.measure("A漢B😀\u{FFFF}Z");
+    of.drawTo(target, .{ .x = 4, .y = 60 }, "A漢B😀\u{FFFF}Z", Color.rgba(0xFF, 0xFF, 0xFF, 0xFF), clip, 1.0);
+    try testing.expectEqual(steady_alloc_index, failing.alloc_index);
+}
+
 test "OutlineFont: oversized shared glyph is a stable negative cache hit" {
     const a = testing.allocator;
     const data = try buildTestFont(a, 64);
@@ -4031,7 +4107,7 @@ test "OutlineFont: oversized shared glyph is a stable negative cache hit" {
     var cache = GlyphCoverageCache.init(a);
     defer cache.deinit();
     cache.payload_cap = 0;
-    var of = OutlineFont.initWithCache(a, &face, 64, &cache);
+    var of = OutlineFont.initWithCache(a, &face, 64, &cache, null);
     defer of.deinit();
     var pixels = [_]u32{0xFF000000} ** (80 * 80);
     const target = RenderTarget{ .pixels = &pixels, .width = 80, .height = 80 };

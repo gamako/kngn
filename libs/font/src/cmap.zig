@@ -15,6 +15,8 @@ const Reader = @import("byte_reader.zig").Reader;
 
 pub const Error = error{InvalidFont};
 
+const bmp_codepoint_count = 0x10000;
+
 pub const Cmap = struct {
     /// table-local slice of the selected format 4 subtable (null if none)
     f4: ?[]const u8 = null,
@@ -82,6 +84,18 @@ pub const Cmap = struct {
         }
         return 0;
     }
+
+    /// Build a raw-GID lookup table for the BMP. Construction runs at family initialization only;
+    /// the table is read once per character on the frame-time text path.
+    pub fn buildBmpDense(self: Cmap, alloc: std.mem.Allocator) std.mem.Allocator.Error![]u16 {
+        const dense = try alloc.alloc(u16, bmp_codepoint_count);
+        errdefer alloc.free(dense);
+        @memset(dense, 0);
+
+        if (self.f12) |sub| fillDense12(dense, sub);
+        if (self.f4) |sub| fillDense4(dense, sub);
+        return dense;
+    }
 };
 
 // ── format 4 ──────────────────────────────────────────────
@@ -137,19 +151,49 @@ fn lookup4(sub: []const u8, cp: u32) u16 {
         if (sc > c) return 0; // Codepoints below this seg are unsupported
         const id_delta = sr.i16At(id_delta_off + 2 * i) catch return 0;
         const id_range_offset = sr.u16At(id_range_off + 2 * i) catch return 0;
-        if (id_range_offset == 0) {
-            return c +% @as(u16, @bitCast(id_delta)); // (c + idDelta) mod 65536
-        }
-        // self-relative byte-address: glyph_addr = entry_addr + idRangeOffset + 2*(c - startCode)
-        if (id_range_offset % 2 != 0) return 0;
         const entry_addr = id_range_off + 2 * i;
-        const glyph_addr = entry_addr + @as(usize, id_range_offset) + 2 * (@as(usize, c) - sc);
-        if (glyph_addr + 2 > sub.len) return 0;
-        const g = sr.u16At(glyph_addr) catch return 0;
-        if (g == 0) return 0; // .notdef (do not add idDelta)
-        return g +% @as(u16, @bitCast(id_delta));
+        return lookup4Entry(sr, sub, entry_addr, sc, c, id_delta, id_range_offset);
     }
     return 0;
+}
+
+fn lookup4Entry(sr: Reader, sub: []const u8, entry_addr: usize, start_code: u16, c: u16, id_delta: i16, id_range_offset: u16) u16 {
+    if (id_range_offset == 0) {
+        return c +% @as(u16, @bitCast(id_delta)); // (c + idDelta) mod 65536
+    }
+    // self-relative byte-address: glyph_addr = entry_addr + idRangeOffset + 2*(c - startCode)
+    if (id_range_offset % 2 != 0) return 0;
+    const glyph_addr = entry_addr + @as(usize, id_range_offset) + 2 * (@as(usize, c) - start_code);
+    if (glyph_addr + 2 > sub.len) return 0;
+    const g = sr.u16At(glyph_addr) catch return 0;
+    if (g == 0) return 0; // .notdef (do not add idDelta)
+    return g +% @as(u16, @bitCast(id_delta));
+}
+
+fn fillDense4(dense: []u16, sub: []const u8) void {
+    const sr = Reader{ .data = sub };
+    const seg_x2 = sr.u16At(6) catch return;
+    const seg_count: usize = seg_x2 / 2;
+    const end_off = 14;
+    const start_off = end_off + 2 * seg_count + 2;
+    const id_delta_off = start_off + 2 * seg_count;
+    const id_range_off = id_delta_off + 2 * seg_count;
+
+    var i: usize = 0;
+    while (i < seg_count) : (i += 1) {
+        const end_code = sr.u16At(end_off + 2 * i) catch return;
+        const start_code = sr.u16At(start_off + 2 * i) catch return;
+        const id_delta = sr.i16At(id_delta_off + 2 * i) catch return;
+        const id_range_offset = sr.u16At(id_range_off + 2 * i) catch return;
+        const entry_addr = id_range_off + 2 * i;
+
+        var c: u32 = start_code;
+        while (c <= end_code) : (c += 1) {
+            const index: usize = @intCast(c);
+            if (dense[index] != 0) continue;
+            dense[index] = lookup4Entry(sr, sub, entry_addr, start_code, @intCast(c), id_delta, id_range_offset);
+        }
+    }
 }
 
 // ── format 12 ─────────────────────────────────────────────
@@ -197,6 +241,26 @@ fn lookup12(sub: []const u8, cp: u32) u16 {
         }
     }
     return 0;
+}
+
+fn fillDense12(dense: []u16, sub: []const u8) void {
+    const sr = Reader{ .data = sub };
+    const num_groups = sr.u32At(12) catch return;
+    var i: u32 = 0;
+    while (i < num_groups) : (i += 1) {
+        const g = 16 + @as(usize, i) * 12;
+        const start = sr.u32At(g) catch return;
+        const end = sr.u32At(g + 4) catch return;
+        const start_gid = sr.u32At(g + 8) catch return;
+        if (start > 0xFFFF) continue;
+
+        const bmp_end = @min(end, 0xFFFF);
+        var cp: u32 = start;
+        while (cp <= bmp_end) : (cp += 1) {
+            const gid: u64 = @as(u64, start_gid) + (@as(u64, cp) - start);
+            if (gid <= 0xFFFF) dense[@intCast(cp)] = @intCast(gid);
+        }
+    }
 }
 
 // ============================================================
@@ -466,4 +530,41 @@ test "cmap: non-zero header version is InvalidFont" {
     defer a.free(bytes);
     putU16(bytes, 0, 1); // version = 1
     try testing.expectError(error.InvalidFont, Cmap.parse(bytes));
+}
+
+test "cmap: BMP dense table matches lookup across all codepoints" {
+    const a = testing.allocator;
+    const f12 = try buildFormat12(a, &.{
+        .{ 0x41, 0x42, 40 },
+        .{ 0x43, 0x43, 0 },
+        .{ 0xFFFE, 0xFFFF, 0xFFFE },
+        .{ 0x1F600, 0x1F601, 200 },
+    });
+    defer a.free(f12);
+    const segs = [_]Seg{
+        .{ .start = 0x41, .end = 0x43, .id_delta = @intCast(@as(i32, 10) - 0x41), .id_range_offset = 0 },
+        .{ .start = 0x1000, .end = 0x1001, .id_delta = 1, .id_range_offset = 4 },
+        .{ .start = 0xFFFF, .end = 0xFFFF, .id_delta = 1, .id_range_offset = 0 },
+    };
+    const f4 = try buildFormat4(a, &segs, &.{ 0x1234, 0 });
+    defer a.free(f4);
+    const bytes = try Builder.build(a, &.{
+        .{ .platform = 3, .encoding = 10, .body = f12 },
+        .{ .platform = 3, .encoding = 1, .body = f4 },
+    });
+    defer a.free(bytes);
+
+    const cm = try Cmap.parse(bytes);
+    const dense = try cm.buildBmpDense(a);
+    defer a.free(dense);
+    try testing.expectEqual(@as(usize, 0x10000), dense.len);
+    for (0..0x10000) |cp| {
+        try testing.expectEqual(cm.lookup(@intCast(cp)), dense[cp]);
+    }
+    try testing.expectEqual(@as(u16, 40), dense[0x41]); // format 12 wins over format 4
+    try testing.expectEqual(@as(u16, 12), dense[0x43]); // format 12 GID 0 falls back
+    try testing.expectEqual(@as(u16, 0x1235), dense[0x1000]); // indirect glyph plus idDelta
+    try testing.expectEqual(@as(u16, 0), dense[0x1001]); // indirect .notdef stays zero
+    try testing.expectEqual(@as(u16, 0xFFFE), dense[0xFFFE]);
+    try testing.expectEqual(@as(u16, 0xFFFF), dense[0xFFFF]);
 }
