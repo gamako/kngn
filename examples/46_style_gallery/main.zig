@@ -1,4 +1,4 @@
-//! GUI style showcase: widget states and path rendering in three fixed sections.
+//! GUI style showcase: widget states, paths, and rounded primitives in four fixed sections.
 //!
 //! Hot path declaration:
 //! - The GUI tree and DrawList commands are built once per frame.
@@ -18,6 +18,7 @@ const Section = enum(u8) {
     overview,
     states,
     paths,
+    rounded,
 };
 
 const FrameSection = enum {
@@ -264,10 +265,75 @@ fn renderFrame(ctx: *gui.Context, app: *App) void {
         .overview => renderOverview(ctx),
         .states => renderStates(ctx, app),
         .paths => renderPathLabels(ctx),
+        .rounded => {
+            ctx.beginBox(.{ .direction = .column, .gap = 4, .padding = .{ 12, 12, 12, 12 } });
+            ctx.labelEx("sharp / rounded fills / outlines / circles / translucent / clipped", ctx.style.text_subtle);
+            ctx.endBox();
+        },
     }
     ctx.endBox();
     ctx.endBox();
     ctx.endFrame();
+}
+
+/// Appends a fixed rounded-primitive scene once per frame.
+fn appendRounded(app: *App) !void {
+    const draw_list = &app.ctx.draw_list;
+    app.fill_count = 0;
+    app.stroke_count = 0;
+    app.aa_on_count = 0;
+    app.aa_off_count = 0;
+
+    const blue = gui.Color.rgba(0x48, 0xA8, 0xF0, 0xFF);
+    const green = gui.Color.rgba(0x58, 0xD0, 0x80, 0xFF);
+    const amber = gui.Color.rgba(0xF0, 0xB8, 0x48, 0xFF);
+    const violet = gui.Color.rgba(0xA0, 0x78, 0xF0, 0xFF);
+
+    try draw_list.rectFilled(.{ .x = 44, .y = 164, .w = 136, .h = 64 }, blue);
+    app.fill_count += 1;
+    app.aa_on_count += 1;
+    try draw_list.rectFilledEx(.{ .x = 200, .y = 164, .w = 136, .h = 64 }, blue, .{ .radius = 0 });
+    app.fill_count += 1;
+    app.aa_on_count += 1;
+    try draw_list.rectFilledEx(.{ .x = 356, .y = 164, .w = 136, .h = 64 }, green, .{ .radius = 6 });
+    app.fill_count += 1;
+    app.aa_on_count += 1;
+    try draw_list.rectFilledEx(.{ .x = 512, .y = 164, .w = 136, .h = 64 }, amber, .{ .radius = 16 });
+    app.fill_count += 1;
+    app.aa_on_count += 1;
+    try draw_list.rectFilledEx(.{ .x = 668, .y = 164, .w = 136, .h = 64 }, violet, .{ .radius = 32, .aa = false });
+    app.fill_count += 1;
+    app.aa_off_count += 1;
+
+    try draw_list.rectOutlineEx(.{ .x = 44, .y = 270, .w = 210, .h = 92 }, blue, 2, .{ .radius = 12 });
+    app.stroke_count += 1;
+    app.aa_on_count += 1;
+    try draw_list.rectOutlineEx(.{ .x = 282, .y = 270, .w = 210, .h = 92 }, green, 12, .{ .radius = 20 });
+    app.stroke_count += 1;
+    app.aa_on_count += 1;
+    try draw_list.rectOutlineEx(.{ .x = 520, .y = 270, .w = 210, .h = 92 }, amber, 30, .{ .radius = 18, .aa = false });
+    app.stroke_count += 1;
+    app.aa_off_count += 1;
+
+    try draw_list.circleFilled(.{ .x = 108, .y = 470 }, 48, blue, .{});
+    app.fill_count += 1;
+    app.aa_on_count += 1;
+    try draw_list.circleOutline(.{ .x = 250, .y = 470 }, 48, green, 10, .{});
+    app.stroke_count += 1;
+    app.aa_on_count += 1;
+
+    try draw_list.rectFilled(.{ .x = 340, .y = 414, .w = 220, .h = 112 }, gui.Color.rgba(0x30, 0x38, 0x48, 0xFF));
+    app.fill_count += 1;
+    app.aa_on_count += 1;
+    try draw_list.rectFilledEx(.{ .x = 364, .y = 434, .w = 172, .h = 72 }, gui.Color.rgba(0xF0, 0x78, 0xA0, 0x88), .{ .radius = 24 });
+    app.fill_count += 1;
+    app.aa_on_count += 1;
+
+    try draw_list.pushClip(.{ .x = 680, .y = 424, .w = 180, .h = 92 });
+    try draw_list.rectFilledEx(.{ .x = 640, .y = 392, .w = 260, .h = 156 }, violet, .{ .radius = 40 });
+    draw_list.popClip();
+    app.fill_count += 1;
+    app.aa_on_count += 1;
 }
 
 /// Appends the fixed path scene once per frame; all shapes are inside the framebuffer.
@@ -415,7 +481,11 @@ pub fn main(init: std.process.Init) !void {
         Prof.mark(.ui_build);
 
         _ = path_arena.reset(.retain_capacity);
-        if (app.section == .paths) try appendPaths(&app, &path_arena) else {
+        if (app.section == .paths) {
+            try appendPaths(&app, &path_arena);
+        } else if (app.section == .rounded) {
+            try appendRounded(&app);
+        } else {
             app.fill_count = 0;
             app.stroke_count = 0;
             app.aa_on_count = 0;

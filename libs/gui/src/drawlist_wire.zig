@@ -1,4 +1,6 @@
 //! Binary wire form of a path verb stream (the payload of a `DrawCmd.path`).
+//! DrawCmd structure uses the separate canonical text wire in
+//! `draw_cmd_text.zig`; adding non-path primitives does not change this schema.
 //!
 //! The table is the contract the overlay inject parser follows: each verb's
 //! tag, how many points it consumes, the schema version, and the error set
@@ -60,21 +62,21 @@ fn writeF32(out: *std.ArrayList(u8), alloc: Allocator, v: f32) Allocator.Error!v
 
 fn readU16(bytes: []const u8, i: *usize) WireError!u16 {
     if (i.* + 2 > bytes.len) return error.Truncated;
-    const v = std.mem.readInt(u16, bytes[i.* ..][0..2], .little);
+    const v = std.mem.readInt(u16, bytes[i.*..][0..2], .little);
     i.* += 2;
     return v;
 }
 
 fn readU32(bytes: []const u8, i: *usize) WireError!u32 {
     if (i.* + 4 > bytes.len) return error.Truncated;
-    const v = std.mem.readInt(u32, bytes[i.* ..][0..4], .little);
+    const v = std.mem.readInt(u32, bytes[i.*..][0..4], .little);
     i.* += 4;
     return v;
 }
 
 fn readF32(bytes: []const u8, i: *usize) WireError!f32 {
     if (i.* + 4 > bytes.len) return error.Truncated;
-    const bits = std.mem.readInt(u32, bytes[i.* ..][0..4], .little);
+    const bits = std.mem.readInt(u32, bytes[i.*..][0..4], .little);
     i.* += 4;
     return @bitCast(bits);
 }
@@ -183,9 +185,11 @@ test "drawlist_wire: validate rejects truncated, unknown tag, overflow, NaN, mis
 
     // schema 1, 1 verb, 0 points, tag 99 (unknown)
     const unknown = [_]u8{
-        1, 0,
-        1, 0, 0, 0,
-        0, 0, 0, 0,
+        1,  0,
+        1,  0,
+        0,  0,
+        0,  0,
+        0,  0,
         99,
     };
     try testing.expectError(error.UnknownVerb, validate(&unknown));
@@ -200,8 +204,10 @@ test "drawlist_wire: validate rejects truncated, unknown tag, overflow, NaN, mis
     // move (1 point) with n_points=0
     const mismatch = [_]u8{
         1, 0,
-        1, 0, 0, 0,
-        0, 0, 0, 0,
+        1, 0,
+        0, 0,
+        0, 0,
+        0, 0,
         0,
     };
     try testing.expectError(error.ArgumentMismatch, validate(&mismatch));

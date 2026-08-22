@@ -3223,6 +3223,18 @@ pub fn build(b: *std.Build) void {
     const bench_path_step = b.step("bench-path", "Run GUI path-fill benchmark small/medium/full (ReleaseFast)");
     bench_path_step.dependOn(&b.addRunArtifact(bench_path_exe).step);
 
+    // bench-rounded-primitives: sharp/rounded panels and filled/outline circles
+    const bench_rounded_root = b.createModule(.{
+        .root_source_file = b.path("bench/rounded_primitives.zig"),
+        .target = target,
+        .optimize = .ReleaseFast,
+    });
+    bench_rounded_root.addImport("gui", bench_gui_mod);
+    bench_rounded_root.addImport("peak_allocator", bench_peak_allocator_mod);
+    const bench_rounded_exe = b.addExecutable(.{ .name = "bench_rounded_primitives", .root_module = bench_rounded_root });
+    const bench_rounded_step = b.step("bench-rounded-primitives", "Run rounded rectangle and circle benchmark (ReleaseFast)");
+    bench_rounded_step.dependOn(&b.addRunArtifact(bench_rounded_exe).step);
+
     // bench-gui-list-menu: list/menu shell 500-row full Context frame (ReleaseFast fixed)
     // menuBar needs command_types, so build a separate gui module from bench_gui_mod.
     const bench_list_menu_cmd = b.createModule(.{

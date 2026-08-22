@@ -116,6 +116,8 @@ pub const verbs = [_]VerbSpec{
             .{ .name = "w", .role = .u32 },
             .{ .name = "h", .role = .u32 },
             .{ .name = "color", .role = .color },
+            .{ .name = "radius", .role = .u32, .required = false },
+            .{ .name = "aa", .role = .u32, .required = false },
             .{ .name = "clip_x", .role = .i32, .required = false },
             .{ .name = "clip_y", .role = .i32, .required = false },
             .{ .name = "clip_w", .role = .u32, .required = false },
@@ -133,6 +135,41 @@ pub const verbs = [_]VerbSpec{
             .{ .name = "h", .role = .u32 },
             .{ .name = "thickness", .role = .u32 },
             .{ .name = "color", .role = .color },
+            .{ .name = "radius", .role = .u32, .required = false },
+            .{ .name = "aa", .role = .u32, .required = false },
+            .{ .name = "clip_x", .role = .i32, .required = false },
+            .{ .name = "clip_y", .role = .i32, .required = false },
+            .{ .name = "clip_w", .role = .u32, .required = false },
+            .{ .name = "clip_h", .role = .u32, .required = false },
+            .{ .name = "offclip", .role = .derived, .required = false },
+        },
+    },
+    .{
+        .name = "circle_filled",
+        .tag = .circle_filled,
+        .fields = &.{
+            .{ .name = "x", .role = .i32 },
+            .{ .name = "y", .role = .i32 },
+            .{ .name = "radius", .role = .u32 },
+            .{ .name = "color", .role = .color },
+            .{ .name = "aa", .role = .u32, .required = false },
+            .{ .name = "clip_x", .role = .i32, .required = false },
+            .{ .name = "clip_y", .role = .i32, .required = false },
+            .{ .name = "clip_w", .role = .u32, .required = false },
+            .{ .name = "clip_h", .role = .u32, .required = false },
+            .{ .name = "offclip", .role = .derived, .required = false },
+        },
+    },
+    .{
+        .name = "circle_outline",
+        .tag = .circle_outline,
+        .fields = &.{
+            .{ .name = "x", .role = .i32 },
+            .{ .name = "y", .role = .i32 },
+            .{ .name = "radius", .role = .u32 },
+            .{ .name = "thickness", .role = .u32 },
+            .{ .name = "color", .role = .color },
+            .{ .name = "aa", .role = .u32, .required = false },
             .{ .name = "clip_x", .role = .i32, .required = false },
             .{ .name = "clip_y", .role = .i32, .required = false },
             .{ .name = "clip_w", .role = .u32, .required = false },
@@ -261,11 +298,18 @@ pub fn offclipOf(cmd: DrawCmd) u32 {
     return switch (cmd) {
         .rect_filled => |c| @intFromBool(!rectFullyInside(c.rect, c.clip)),
         .rect_outline => |c| @intFromBool(!rectFullyInside(c.rect, c.clip)),
+        .circle_filled => |c| @intFromBool(!rectFullyInside(circleBounds(c.center, c.radius), c.clip)),
+        .circle_outline => |c| @intFromBool(!rectFullyInside(circleBounds(c.center, c.radius), c.clip)),
         .line => |c| @intFromBool(!(c.clip.contains(c.p0) and c.clip.contains(c.p1))),
         .text => |c| @intFromBool(!c.clip.contains(c.pos)),
         .image => |c| @intFromBool(!rectFullyInside(c.rect, c.clip)),
         .path => |c| @intFromBool(!pathPointsInsideClip(c.points, c.clip)),
     };
+}
+
+fn circleBounds(center: Vec2, radius: u32) Rect {
+    const r: i32 = @intCast(radius);
+    return .{ .x = center.x - r, .y = center.y - r, .w = radius * 2, .h = radius * 2 };
 }
 
 fn pathPointsInsideClip(points: []const Vec2f, clip: Rect) bool {
@@ -312,6 +356,26 @@ fn readI32(cmd: DrawCmd, name: []const u8) i32 {
             c.rect.x
         else if (std.mem.eql(u8, name, "y"))
             c.rect.y
+        else if (std.mem.eql(u8, name, "clip_x"))
+            c.clip.x
+        else if (std.mem.eql(u8, name, "clip_y"))
+            c.clip.y
+        else
+            unreachable,
+        .circle_filled => |c| if (std.mem.eql(u8, name, "x"))
+            c.center.x
+        else if (std.mem.eql(u8, name, "y"))
+            c.center.y
+        else if (std.mem.eql(u8, name, "clip_x"))
+            c.clip.x
+        else if (std.mem.eql(u8, name, "clip_y"))
+            c.clip.y
+        else
+            unreachable,
+        .circle_outline => |c| if (std.mem.eql(u8, name, "x"))
+            c.center.x
+        else if (std.mem.eql(u8, name, "y"))
+            c.center.y
         else if (std.mem.eql(u8, name, "clip_x"))
             c.clip.x
         else if (std.mem.eql(u8, name, "clip_y"))
@@ -367,6 +431,10 @@ fn readU32(cmd: DrawCmd, name: []const u8) u32 {
             c.rect.w
         else if (std.mem.eql(u8, name, "h"))
             c.rect.h
+        else if (std.mem.eql(u8, name, "radius"))
+            c.radius
+        else if (std.mem.eql(u8, name, "aa"))
+            @intFromBool(c.aa)
         else if (std.mem.eql(u8, name, "clip_w"))
             c.clip.w
         else if (std.mem.eql(u8, name, "clip_h"))
@@ -379,6 +447,32 @@ fn readU32(cmd: DrawCmd, name: []const u8) u32 {
             c.rect.h
         else if (std.mem.eql(u8, name, "thickness"))
             c.thickness
+        else if (std.mem.eql(u8, name, "radius"))
+            c.radius
+        else if (std.mem.eql(u8, name, "aa"))
+            @intFromBool(c.aa)
+        else if (std.mem.eql(u8, name, "clip_w"))
+            c.clip.w
+        else if (std.mem.eql(u8, name, "clip_h"))
+            c.clip.h
+        else
+            unreachable,
+        .circle_filled => |c| if (std.mem.eql(u8, name, "radius"))
+            c.radius
+        else if (std.mem.eql(u8, name, "aa"))
+            @intFromBool(c.aa)
+        else if (std.mem.eql(u8, name, "clip_w"))
+            c.clip.w
+        else if (std.mem.eql(u8, name, "clip_h"))
+            c.clip.h
+        else
+            unreachable,
+        .circle_outline => |c| if (std.mem.eql(u8, name, "radius"))
+            c.radius
+        else if (std.mem.eql(u8, name, "thickness"))
+            c.thickness
+        else if (std.mem.eql(u8, name, "aa"))
+            @intFromBool(c.aa)
         else if (std.mem.eql(u8, name, "clip_w"))
             c.clip.w
         else if (std.mem.eql(u8, name, "clip_h"))
@@ -428,6 +522,8 @@ fn readColor(cmd: DrawCmd) u32 {
     return switch (cmd) {
         .rect_filled => |c| colorBits(c.color),
         .rect_outline => |c| colorBits(c.color),
+        .circle_filled => |c| colorBits(c.color),
+        .circle_outline => |c| colorBits(c.color),
         .line => |c| colorBits(c.color),
         .text => |c| colorBits(c.color),
         .image => 0,
@@ -552,6 +648,7 @@ pub fn appendCmd(list: *std.ArrayList(u8), allocator: Allocator, cmd: DrawCmd) !
     const verb = verbByTag(cmd);
     try appendFmt(list, allocator, "cmd={s}", .{verb.name});
     for (verb.fields) |field| {
+        if (!shouldEmitField(cmd, field)) continue;
         try list.append(allocator, ' ');
         switch (field.role) {
             .i32 => try appendFmt(list, allocator, "{s}={d}", .{ field.name, readI32(cmd, field.name) }),
@@ -589,6 +686,27 @@ pub fn appendCmd(list: *std.ArrayList(u8), allocator: Allocator, cmd: DrawCmd) !
         }
     }
     try list.append(allocator, '\n');
+}
+
+fn shouldEmitField(cmd: DrawCmd, field: FieldSpec) bool {
+    if (std.mem.eql(u8, field.name, "radius")) {
+        return switch (cmd) {
+            .rect_filled => |c| c.radius != 0,
+            .rect_outline => |c| c.radius != 0,
+            .circle_filled, .circle_outline => true,
+            else => true,
+        };
+    }
+    if (std.mem.eql(u8, field.name, "aa")) {
+        return switch (cmd) {
+            .rect_filled => |c| c.radius != 0 and !c.aa,
+            .rect_outline => |c| c.radius != 0 and !c.aa,
+            .circle_filled => |c| !c.aa,
+            .circle_outline => |c| !c.aa,
+            else => true,
+        };
+    }
+    return true;
 }
 
 const Pair = struct { key: []const u8, value: []const u8 };
@@ -698,6 +816,7 @@ const Staging = struct {
     x1: ?i32 = null,
     y1: ?i32 = null,
     thickness: ?u32 = null,
+    radius: ?u32 = null,
     color: ?u32 = null,
     clip_x: ?i32 = null,
     clip_y: ?i32 = null,
@@ -755,6 +874,9 @@ const Staging = struct {
         } else if (std.mem.eql(u8, name, "thickness")) {
             if (self.thickness != null) return error.DuplicateField;
             self.thickness = v;
+        } else if (std.mem.eql(u8, name, "radius")) {
+            if (self.radius != null) return error.DuplicateField;
+            self.radius = v;
         } else if (std.mem.eql(u8, name, "src_w")) {
             if (self.src_w != null) return error.DuplicateField;
             self.src_w = v;
@@ -825,6 +947,12 @@ fn buildCmd(verb: *const VerbSpec, st: Staging, arena: Allocator) (ParseError ||
                 .h = try checkExtent(try requireU32(st.h)),
             },
             .color = colorFromBits(st.color orelse return error.MissingField),
+            .radius = try checkExtent(st.radius orelse 0),
+            .aa = blk: {
+                const aa = st.aa orelse 1;
+                if (aa > 1) return error.InvalidValue;
+                break :blk aa != 0;
+            },
             .clip = clip,
         } },
         .rect_outline => .{ .rect_outline = .{
@@ -836,6 +964,35 @@ fn buildCmd(verb: *const VerbSpec, st: Staging, arena: Allocator) (ParseError ||
             },
             .color = colorFromBits(st.color orelse return error.MissingField),
             .thickness = try checkThickness(try requireU32(st.thickness)),
+            .radius = try checkExtent(st.radius orelse 0),
+            .aa = blk: {
+                const aa = st.aa orelse 1;
+                if (aa > 1) return error.InvalidValue;
+                break :blk aa != 0;
+            },
+            .clip = clip,
+        } },
+        .circle_filled => .{ .circle_filled = .{
+            .center = .{ .x = try checkCoord(try requireI32(st.x)), .y = try checkCoord(try requireI32(st.y)) },
+            .radius = try checkExtent(try requireU32(st.radius)),
+            .color = colorFromBits(st.color orelse return error.MissingField),
+            .aa = blk: {
+                const aa = st.aa orelse 1;
+                if (aa > 1) return error.InvalidValue;
+                break :blk aa != 0;
+            },
+            .clip = clip,
+        } },
+        .circle_outline => .{ .circle_outline = .{
+            .center = .{ .x = try checkCoord(try requireI32(st.x)), .y = try checkCoord(try requireI32(st.y)) },
+            .radius = try checkExtent(try requireU32(st.radius)),
+            .color = colorFromBits(st.color orelse return error.MissingField),
+            .thickness = try checkThickness(try requireU32(st.thickness)),
+            .aa = blk: {
+                const aa = st.aa orelse 1;
+                if (aa > 1) return error.InvalidValue;
+                break :blk aa != 0;
+            },
             .clip = clip,
         } },
         .line => .{ .line = .{
@@ -1130,9 +1287,11 @@ pub fn parseDump(
 const testing = std.testing;
 
 test "draw_cmd_text: verb table covers every DrawCmd tag by name" {
-    try testing.expectEqual(@as(usize, 6), verbs.len);
+    try testing.expectEqual(@as(usize, 8), verbs.len);
     try testing.expect(verbByName("rect_filled") != null);
     try testing.expect(verbByName("rect_outline") != null);
+    try testing.expect(verbByName("circle_filled") != null);
+    try testing.expect(verbByName("circle_outline") != null);
     try testing.expect(verbByName("line") != null);
     try testing.expect(verbByName("text") != null);
     try testing.expect(verbByName("image") != null);
@@ -1154,6 +1313,7 @@ test "draw_cmd_text: serialize walks the table field order" {
     try testing.expect(std.mem.startsWith(u8, list.items, "cmd=rect_filled "));
     pos = "cmd=rect_filled ".len;
     for (verb.fields) |f| {
+        if (!shouldEmitField(dl.cmds.items[0], f)) continue;
         const needle = try std.fmt.allocPrint(testing.allocator, "{s}=", .{f.name});
         defer testing.allocator.free(needle);
         const found = std.mem.indexOfPos(u8, list.items, pos, needle) orelse {
@@ -1165,6 +1325,94 @@ test "draw_cmd_text: serialize walks the table field order" {
         while (pos < list.items.len and list.items[pos] != ' ' and list.items[pos] != '\n') pos += 1;
         if (pos < list.items.len and list.items[pos] == ' ') pos += 1;
     }
+}
+
+test "draw_cmd_text: sharp rectangle fixture and FNV hash stay byte-identical" {
+    var dl = DrawList.init(testing.allocator);
+    defer dl.deinit();
+    dl.reset(64, 64);
+    try dl.rectFilled(.{ .x = 1, .y = 2, .w = 3, .h = 4 }, Color.rgba(1, 2, 3, 4));
+    var list: std.ArrayList(u8) = .empty;
+    defer list.deinit(testing.allocator);
+    try appendCmd(&list, testing.allocator, dl.cmds.items[0]);
+    const fixture = "cmd=rect_filled x=1 y=2 w=3 h=4 color=#04010203 clip_x=0 clip_y=0 clip_w=64 clip_h=64 offclip=0\n";
+    try testing.expectEqualStrings(fixture, list.items);
+    try testing.expectEqual(@as(u32, 0x194031E0), std.hash.Fnv1a_32.hash(list.items));
+}
+
+test "draw_cmd_text: omitted and explicit sharp defaults canonicalize to the same text" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const omitted = "cmd=rect_filled x=1 y=2 w=3 h=4 color=#04010203 clip_x=0 clip_y=0 clip_w=64 clip_h=64 offclip=0";
+    const explicit = "cmd=rect_filled x=1 y=2 w=3 h=4 color=#04010203 radius=0 aa=1 clip_x=0 clip_y=0 clip_w=64 clip_h=64 offclip=0";
+    const a = try parseCmdLine(omitted, arena.allocator());
+    const b = try parseCmdLine(explicit, arena.allocator());
+    var a_text: std.ArrayList(u8) = .empty;
+    defer a_text.deinit(testing.allocator);
+    var b_text: std.ArrayList(u8) = .empty;
+    defer b_text.deinit(testing.allocator);
+    try appendCmd(&a_text, testing.allocator, a);
+    try appendCmd(&b_text, testing.allocator, b);
+    try testing.expectEqualSlices(u8, a_text.items, b_text.items);
+    try testing.expect(std.mem.indexOf(u8, a_text.items, "radius=") == null);
+    try testing.expect(std.mem.indexOf(u8, a_text.items, " aa=") == null);
+}
+
+test "draw_cmd_text: rounded rectangles emit radius and only non-default AA" {
+    var dl = DrawList.init(testing.allocator);
+    defer dl.deinit();
+    dl.reset(64, 64);
+    try dl.rectFilledEx(.{ .x = 1, .y = 2, .w = 20, .h = 16 }, Color.rgba(1, 2, 3, 4), .{ .radius = 6 });
+    try dl.rectOutlineEx(.{ .x = 3, .y = 4, .w = 22, .h = 18 }, Color.rgba(5, 6, 7, 8), 2, .{ .radius = 7, .aa = false });
+    var first: std.ArrayList(u8) = .empty;
+    defer first.deinit(testing.allocator);
+    var second: std.ArrayList(u8) = .empty;
+    defer second.deinit(testing.allocator);
+    try appendCmd(&first, testing.allocator, dl.cmds.items[0]);
+    try appendCmd(&second, testing.allocator, dl.cmds.items[1]);
+    try testing.expect(std.mem.indexOf(u8, first.items, "radius=6") != null);
+    try testing.expect(std.mem.indexOf(u8, first.items, " aa=") == null);
+    try testing.expect(std.mem.indexOf(u8, second.items, "radius=7 aa=0") != null);
+}
+
+test "draw_cmd_text: circle canonical dump round trips" {
+    var dl = DrawList.init(testing.allocator);
+    defer dl.deinit();
+    dl.reset(80, 80);
+    try dl.circleFilled(.{ .x = 20, .y = 21 }, 9, Color.rgba(1, 2, 3, 4), .{});
+    try dl.circleOutline(.{ .x = 40, .y = 41 }, 10, Color.rgba(5, 6, 7, 8), 3, .{ .aa = false });
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    for (dl.cmds.items) |cmd| {
+        var first: std.ArrayList(u8) = .empty;
+        defer first.deinit(testing.allocator);
+        try appendCmd(&first, testing.allocator, cmd);
+        const parsed = try parseCmdLine(std.mem.trimEnd(u8, first.items, "\n"), arena.allocator());
+        var second: std.ArrayList(u8) = .empty;
+        defer second.deinit(testing.allocator);
+        try appendCmd(&second, testing.allocator, parsed);
+        try testing.expectEqualSlices(u8, first.items, second.items);
+    }
+}
+
+test "draw_cmd_text: rounded radius and AA differences change the canonical hash" {
+    var dl = DrawList.init(testing.allocator);
+    defer dl.deinit();
+    dl.reset(64, 64);
+    const rect = Rect{ .x = 1, .y = 2, .w = 20, .h = 16 };
+    const color = Color.rgba(1, 2, 3, 4);
+    try dl.rectFilledEx(rect, color, .{ .radius = 5 });
+    try dl.rectFilledEx(rect, color, .{ .radius = 6 });
+    try dl.rectFilledEx(rect, color, .{ .radius = 5, .aa = false });
+    var hashes: [3]u32 = undefined;
+    for (dl.cmds.items, 0..) |cmd, i| {
+        var text: std.ArrayList(u8) = .empty;
+        defer text.deinit(testing.allocator);
+        try appendCmd(&text, testing.allocator, cmd);
+        hashes[i] = std.hash.Fnv1a_32.hash(text.items);
+    }
+    try testing.expect(hashes[0] != hashes[1]);
+    try testing.expect(hashes[0] != hashes[2]);
 }
 
 test "draw_cmd_text: rect/line/text dump parses back" {

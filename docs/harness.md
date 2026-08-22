@@ -246,9 +246,17 @@ command's line, not just as a pixel difference a human has to spot.
   pixels — only `src_w`/`src_h` and a content hash (`pixfnv=#XXXXXXXX`, FNV-1a 32-bit
   over the raw pixel bytes). Every line ends with `offclip=0|1`: whether that command's
   own extent (its rect for `rect_filled`/`rect_outline`/`image`, both endpoints for
-  `line`, the draw position for `text`, the point AABB for `path`) is fully contained
+  `line`, the draw position for `text`, the center ± radius bbox for circles, the
+  point AABB for `path`) is fully contained
   by its own baked-in clip rect. `offclip=1` is the same signal a truncated shape or
   a mis-placed label would leave in a screenshot, just readable without one.
+  Sharp rectangles omit `radius` and `aa`, so their canonical lines remain
+  byte-for-byte identical to the original text form. Rounded rectangles always
+  emit `radius`; `aa=true` is omitted and `aa=false` emits `aa=0`. The parser
+  accepts explicit defaults such as `radius=0 aa=1`, then serializes them in the
+  omitted canonical form. `circle_filled` and `circle_outline` always emit their
+  shape-defining `radius`; circle outlines also emit `thickness`, with the same
+  AA omission rule. Circle `offclip` uses the center ± radius bounding box.
   `path` carries `color`, `aa`, `winding`, `style=fill|stroke`, stroke
   parameters (`width`, `join=miter|bevel`, `cap=butt|square|round`,
   `miter_limit`), a compact `verbs="MLQCZ"` string and `pts` as
@@ -257,9 +265,12 @@ command's line, not just as a pixel difference a human has to spot.
   table for both paints.
 - `digest drawlist` hashes the same per-command dump text (plus the path-wire schema
   version) into one line:
-  `hash=#XXXXXXXX rect_filled=N rect_outline=N line=N text=N image=N path=N offclip=N`.
-  `hash` changes whenever anything the dump would show changes; the six counts and
-  `offclip` are the coarser, more stable half.
+  `hash=#XXXXXXXX rect_filled=N rect_outline=N line=N text=N image=N path=N circle_filled=N circle_outline=N offclip=N`.
+  `hash` changes whenever anything the dump would show changes; the counts and
+  `offclip` are the coarser, more stable half. The schema version folded into the
+  hash belongs only to the binary path-verb stream in `drawlist_wire.zig`;
+  DrawCmd structure is this canonical text wire, so adding circle commands does
+  not change the path binary schema.
 - **Handling jitter**: an app with animated or continuously-varying draw positions
   (a running clock label, a live cursor trail) makes `hash` change every frame by
   design — do not `expect drawlist hash=...` there. The per-kind counts and `offclip`

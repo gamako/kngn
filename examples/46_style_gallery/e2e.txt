@@ -132,4 +132,34 @@ expect drawlist path=9
 expect drawlist offclip=0
 digest frameprof
 expect frameprof body_ms>0
+
+# paths -> rounded primitives
+inject key_down PAGE_DOWN
+step 1
+inject key_up PAGE_DOWN
+step 1
+digest showcase
+expect showcase section=rounded
+expect showcase index=3
+expect showcase hot=none
+expect showcase active=none
+expect showcase focused=none
+expect showcase selected=states
+expect showcase disabled=0
+expect showcase fill=9
+expect showcase stroke=4
+expect showcase aa_on=11
+expect showcase aa_off=2
+snapshot fb
+digest drawlist
+expect drawlist hash=BD291F9F
+expect drawlist rect_filled=11
+expect drawlist rect_outline=3
+expect drawlist line=0
+expect drawlist text=3
+expect drawlist image=0
+expect drawlist path=0
+expect drawlist circle_filled=1
+expect drawlist circle_outline=1
+expect drawlist offclip=1
 quit

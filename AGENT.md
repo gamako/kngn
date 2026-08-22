@@ -640,6 +640,7 @@ zig build bench-upscale         # nearest-neighbour upscale at present time (nai
 zig build bench-synth           # Synth(16 voices).render and MasterEffects.process: ns/block and × realtime
 zig build bench-gui-frame       # a full gui Context frame (beginFrame → build → endFrame → render; 500/1000 rows, avg/min/p95)
 zig build bench-path            # path fill: small/medium/fullscreen × AA × scale × one/many, plus scratch peak
+zig build bench-rounded-primitives # sharp/rounded panels and filled/outline circles: cold/warm timings, cache and corner work
 zig build bench-frameprof       # what the frame section profiler costs per frame (disabled / bookkeeping only / with real clock reads)
 
 # The pixel editor (macOS has one backend; -Dplatform picks x11/wayland on Linux and gdi/d3d11 on Windows)

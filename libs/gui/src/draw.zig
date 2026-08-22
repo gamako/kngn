@@ -3,6 +3,7 @@ const Allocator = std.mem.Allocator;
 const geom = @import("geom.zig");
 const color_mod = @import("color.zig");
 const font_mod = @import("font.zig");
+const corner_mask = @import("corner_mask.zig");
 
 pub const Rect = geom.Rect;
 pub const Vec2 = geom.Vec2;
@@ -215,6 +216,15 @@ pub const PathStrokeParams = struct {
 
 pub const PathError = error{ InvalidPath, OutOfMemory };
 
+pub const RoundedRectOptions = struct {
+    radius: u32 = 0,
+    aa: bool = true,
+};
+
+pub const CircleOptions = struct {
+    aa: bool = true,
+};
+
 /// One shape's coverage scratch is this many bytes or less. A larger bbox is
 /// split into horizontal bands so the peak stays at this cap.
 pub const path_scratch_limit_bytes: usize = 4 * 1024 * 1024;
@@ -224,8 +234,10 @@ pub const path_scratch_limit_bytes: usize = 4 * 1024 * 1024;
 pub const path_scratch_bytes_per_pixel: usize = @sizeOf(f32) * 2 + @sizeOf(u8);
 
 pub const DrawCmd = union(enum) {
-    rect_filled: struct { rect: Rect, color: Color, clip: Rect },
-    rect_outline: struct { rect: Rect, color: Color, thickness: u32, clip: Rect },
+    rect_filled: struct { rect: Rect, color: Color, radius: u32 = 0, aa: bool = true, clip: Rect },
+    rect_outline: struct { rect: Rect, color: Color, thickness: u32, radius: u32 = 0, aa: bool = true, clip: Rect },
+    circle_filled: struct { center: Vec2, radius: u32, color: Color, aa: bool = true, clip: Rect },
+    circle_outline: struct { center: Vec2, radius: u32, color: Color, thickness: u32, aa: bool = true, clip: Rect },
     /// Integer-thickness Bresenham span. Widget chrome uses this. Path
     /// stroke does not replace it: a Bresenham span and an analytic AA
     /// offset-contour disagree on pixels, so swapping would change every
@@ -412,6 +424,12 @@ pub const DrawList = struct {
     /// so a value of 0 still draws (one row at a time) and a value above the
     /// production ceiling cannot break the 4 MiB peak.
     path_scratch_limit: usize = path_scratch_limit_bytes,
+    /// Rounded masks survive `reset` and are released by `deinit`. The cache
+    /// and its counters are touched only by non-zero-radius primitives.
+    corner_masks: corner_mask.Cache = .{},
+    /// Retained outer coverage for an uncached giant quarter-ring band. The
+    /// ordinary cached path does not use this buffer.
+    corner_band: []u8 = &.{},
 
     pub fn init(alloc: Allocator) DrawList {
         return .{ .alloc = alloc };
@@ -435,6 +453,9 @@ pub const DrawList = struct {
         self.path_stroke_aux.deinit(self.alloc);
         self.path_stroke_left.deinit(self.alloc);
         self.path_stroke_right.deinit(self.alloc);
+        self.corner_masks.deinit(self.alloc);
+        if (self.corner_band.len != 0) self.alloc.free(self.corner_band);
+        self.corner_band = &.{};
     }
 
     /// Call at the start of every frame. Sets root clip = Rect{0,0,w,h}.
@@ -455,6 +476,18 @@ pub const DrawList = struct {
         try self.cmds.append(self.alloc, .{ .rect_filled = .{
             .rect = rect,
             .color = col,
+            .radius = 0,
+            .aa = true,
+            .clip = self.currentClip(),
+        } });
+    }
+
+    pub fn rectFilledEx(self: *DrawList, rect: Rect, col: Color, options: RoundedRectOptions) Allocator.Error!void {
+        try self.cmds.append(self.alloc, .{ .rect_filled = .{
+            .rect = rect,
+            .color = col,
+            .radius = options.radius,
+            .aa = options.aa,
             .clip = self.currentClip(),
         } });
     }
@@ -464,6 +497,59 @@ pub const DrawList = struct {
             .rect = rect,
             .color = col,
             .thickness = thickness,
+            .radius = 0,
+            .aa = true,
+            .clip = self.currentClip(),
+        } });
+    }
+
+    pub fn rectOutlineEx(
+        self: *DrawList,
+        rect: Rect,
+        col: Color,
+        thickness: u32,
+        options: RoundedRectOptions,
+    ) Allocator.Error!void {
+        try self.cmds.append(self.alloc, .{ .rect_outline = .{
+            .rect = rect,
+            .color = col,
+            .thickness = thickness,
+            .radius = options.radius,
+            .aa = options.aa,
+            .clip = self.currentClip(),
+        } });
+    }
+
+    pub fn circleFilled(
+        self: *DrawList,
+        center: Vec2,
+        radius: u32,
+        col: Color,
+        options: CircleOptions,
+    ) Allocator.Error!void {
+        try self.cmds.append(self.alloc, .{ .circle_filled = .{
+            .center = center,
+            .radius = radius,
+            .color = col,
+            .aa = options.aa,
+            .clip = self.currentClip(),
+        } });
+    }
+
+    pub fn circleOutline(
+        self: *DrawList,
+        center: Vec2,
+        radius: u32,
+        col: Color,
+        thickness: u32,
+        options: CircleOptions,
+    ) Allocator.Error!void {
+        try self.cmds.append(self.alloc, .{ .circle_outline = .{
+            .center = center,
+            .radius = radius,
+            .color = col,
+            .thickness = thickness,
+            .aa = options.aa,
             .clip = self.currentClip(),
         } });
     }
@@ -544,6 +630,21 @@ pub const DrawList = struct {
         if (used > self.path_scratch_peak_bytes) self.path_scratch_peak_bytes = used;
     }
 
+    pub fn ensureCornerBand(self: *DrawList, pixels: usize) void {
+        if (pixels <= self.corner_band.len) return;
+        if (self.corner_band.len == 0) {
+            self.corner_band = self.alloc.alloc(u8, pixels) catch
+                @panic("DrawList.ensureCornerBand: OOM");
+        } else {
+            self.corner_band = self.alloc.realloc(self.corner_band, pixels) catch
+                @panic("DrawList.ensureCornerBand: OOM");
+        }
+    }
+
+    pub fn cornerMaskDiagnostics(self: *const DrawList) corner_mask.Diagnostics {
+        return self.corner_masks.diagnostics;
+    }
+
     /// Push clip onto the stack. Intersects with the current clip.
     pub fn pushClip(self: *DrawList, rect: Rect) Allocator.Error!void {
         const current = self.currentClip();
@@ -596,6 +697,35 @@ test "DrawList: rectFilled bakes in clip" {
     try std.testing.expectEqual(@as(usize, 1), dl.cmds.items.len);
     const clip = dl.cmds.items[0].rect_filled.clip;
     try std.testing.expectEqual(@as(u32, 100), clip.w);
+}
+
+test "DrawList: sharp wrappers append explicit zero-radius payloads" {
+    var dl = DrawList.init(std.testing.allocator);
+    defer dl.deinit();
+    dl.reset(32, 32);
+    try dl.rectFilled(.{ .x = 1, .y = 2, .w = 3, .h = 4 }, Color.rgba(1, 2, 3, 4));
+    try dl.rectOutline(.{ .x = 5, .y = 6, .w = 7, .h = 8 }, Color.rgba(5, 6, 7, 8), 2);
+    try std.testing.expectEqual(@as(u32, 0), dl.cmds.items[0].rect_filled.radius);
+    try std.testing.expectEqual(@as(u32, 0), dl.cmds.items[1].rect_outline.radius);
+}
+
+test "DrawList: rounded and circle APIs bake options and clip" {
+    var dl = DrawList.init(std.testing.allocator);
+    defer dl.deinit();
+    dl.reset(64, 64);
+    try dl.pushClip(.{ .x = 4, .y = 5, .w = 40, .h = 41 });
+    try dl.rectFilledEx(.{ .x = 1, .y = 2, .w = 20, .h = 18 }, Color.rgba(1, 2, 3, 4), .{ .radius = 7, .aa = false });
+    try dl.rectOutlineEx(.{ .x = 2, .y = 3, .w = 20, .h = 18 }, Color.rgba(5, 6, 7, 8), 3, .{ .radius = 8 });
+    try dl.circleFilled(.{ .x = 20, .y = 21 }, 9, Color.rgba(9, 10, 11, 12), .{ .aa = false });
+    try dl.circleOutline(.{ .x = 30, .y = 31 }, 10, Color.rgba(13, 14, 15, 16), 4, .{});
+    dl.popClip();
+    try std.testing.expectEqual(@as(u32, 7), dl.cmds.items[0].rect_filled.radius);
+    try std.testing.expect(!dl.cmds.items[0].rect_filled.aa);
+    try std.testing.expectEqual(@as(i32, 4), dl.cmds.items[0].rect_filled.clip.x);
+    try std.testing.expectEqual(@as(u32, 8), dl.cmds.items[1].rect_outline.radius);
+    try std.testing.expectEqual(@as(u32, 9), dl.cmds.items[2].circle_filled.radius);
+    try std.testing.expect(!dl.cmds.items[2].circle_filled.aa);
+    try std.testing.expectEqual(@as(u32, 4), dl.cmds.items[3].circle_outline.thickness);
 }
 
 test "DrawList: pushClip / popClip intersection" {

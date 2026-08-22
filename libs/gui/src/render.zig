@@ -6,6 +6,7 @@ const color_mod = @import("color.zig");
 const draw_mod = @import("draw.zig");
 const font_mod = @import("font.zig");
 const path_stroke = @import("path_stroke.zig");
+const corner_mask = @import("corner_mask.zig");
 
 pub const Rect = geom.Rect;
 pub const Vec2 = geom.Vec2;
@@ -32,8 +33,10 @@ pub fn scaleWithinDomain(scale: f32) bool {
 /// `(0, path_stroke_width_max]`; `miter_limit` must be finite and `>= 1`.
 pub fn cmdWithinDomain(cmd: draw_mod.DrawCmd) bool {
     return switch (cmd) {
-        .rect_filled => |c| rectInDomain(c.rect) and rectInDomain(c.clip),
-        .rect_outline => |c| rectInDomain(c.rect) and rectInDomain(c.clip) and thicknessInDomain(c.thickness),
+        .rect_filled => |c| rectInDomain(c.rect) and rectInDomain(c.clip) and extentInDomain(c.radius),
+        .rect_outline => |c| rectInDomain(c.rect) and rectInDomain(c.clip) and thicknessInDomain(c.thickness) and extentInDomain(c.radius),
+        .circle_filled => |c| pointInDomain(c.center) and extentInDomain(c.radius) and rectInDomain(c.clip),
+        .circle_outline => |c| pointInDomain(c.center) and extentInDomain(c.radius) and thicknessInDomain(c.thickness) and rectInDomain(c.clip),
         .line => |c| pointInDomain(c.p0) and pointInDomain(c.p1) and rectInDomain(c.clip) and thicknessInDomain(c.thickness),
         .text => |c| pointInDomain(c.pos) and rectInDomain(c.clip),
         .image => |c| rectInDomain(c.rect) and rectInDomain(c.clip),
@@ -111,8 +114,28 @@ pub fn render(target: RenderTarget, draw_list: *DrawList, font: Font, scale: f32
     if (scale == 1.0) {
         for (draw_list.cmds.items) |cmd| {
             switch (cmd) {
-                .rect_filled => |c| if (!c.clip.isEmpty()) drawRectFilled(target, c.rect, c.color, c.clip),
-                .rect_outline => |c| if (!c.clip.isEmpty()) drawRectOutline(target, c.rect, c.color, c.thickness, c.clip),
+                .rect_filled => |c| if (!c.clip.isEmpty()) {
+                    if (c.radius == 0) {
+                        drawRectFilled(target, c.rect, c.color, c.clip);
+                    } else {
+                        drawRoundedFilled(target, draw_list, c.rect, c.color, c.radius, c.aa, c.clip, 1.0, true);
+                    }
+                },
+                .rect_outline => |c| if (!c.clip.isEmpty()) {
+                    if (c.radius == 0) {
+                        drawRectOutline(target, c.rect, c.color, c.thickness, c.clip);
+                    } else {
+                        drawRoundedOutline(target, draw_list, c.rect, c.color, c.thickness, c.radius, c.aa, c.clip, 1.0, true);
+                    }
+                },
+                .circle_filled => |c| if (!c.clip.isEmpty() and c.radius != 0) {
+                    const r = scaleRadiusUnclamped(c.radius, 1.0);
+                    drawRoundedFilledDevice(target, draw_list, circleRect(c.center, r), c.color, r, c.aa, c.clip, 1.0, true);
+                },
+                .circle_outline => |c| if (!c.clip.isEmpty() and c.radius != 0) {
+                    const r = scaleRadiusUnclamped(c.radius, 1.0);
+                    drawRoundedOutlineDevice(target, draw_list, circleRect(c.center, r), c.color, c.thickness, r, c.aa, c.clip, 1.0, true);
+                },
                 .line => |c| if (!c.clip.isEmpty()) drawLine(target, c.p0, c.p1, c.color, c.thickness, c.clip),
                 .text => |c| if (!c.clip.isEmpty()) (c.font orelse font).drawTo(target, c.pos, c.text, c.color, c.clip, 1.0),
                 .image => |c| if (!c.clip.isEmpty()) drawImage(target, c.rect, c.pixels, c.src_w, c.src_h, c.clip),
@@ -130,18 +153,62 @@ pub fn render(target: RenderTarget, draw_list: *DrawList, font: Font, scale: f32
             .rect_filled => |c| {
                 const phys_clip = scaleRect(c.clip, scale);
                 if (!phys_clip.isEmpty()) {
-                    drawRectFilled(target, scaleRect(c.rect, scale), c.color, phys_clip);
+                    if (c.radius == 0) {
+                        drawRectFilled(target, scaleRect(c.rect, scale), c.color, phys_clip);
+                    } else {
+                        drawRoundedFilled(target, draw_list, scaleRect(c.rect, scale), c.color, c.radius, c.aa, phys_clip, scale, true);
+                    }
                 }
             },
             .rect_outline => |c| {
                 const phys_clip = scaleRect(c.clip, scale);
                 if (!phys_clip.isEmpty()) {
-                    drawRectOutline(
+                    if (c.radius == 0) {
+                        drawRectOutline(
+                            target,
+                            scaleRect(c.rect, scale),
+                            c.color,
+                            scaleThickness(c.thickness, scale),
+                            phys_clip,
+                        );
+                    } else {
+                        drawRoundedOutline(
+                            target,
+                            draw_list,
+                            scaleRect(c.rect, scale),
+                            c.color,
+                            scaleThickness(c.thickness, scale),
+                            c.radius,
+                            c.aa,
+                            phys_clip,
+                            scale,
+                            true,
+                        );
+                    }
+                }
+            },
+            .circle_filled => |c| {
+                const phys_clip = scaleRect(c.clip, scale);
+                if (!phys_clip.isEmpty() and c.radius != 0) {
+                    const r = scaleRadiusUnclamped(c.radius, scale);
+                    drawRoundedFilledDevice(target, draw_list, circleRect(scalePoint(c.center, scale), r), c.color, r, c.aa, phys_clip, scale, true);
+                }
+            },
+            .circle_outline => |c| {
+                const phys_clip = scaleRect(c.clip, scale);
+                if (!phys_clip.isEmpty() and c.radius != 0) {
+                    const r = scaleRadiusUnclamped(c.radius, scale);
+                    drawRoundedOutlineDevice(
                         target,
-                        scaleRect(c.rect, scale),
+                        draw_list,
+                        circleRect(scalePoint(c.center, scale), r),
                         c.color,
                         scaleThickness(c.thickness, scale),
+                        r,
+                        c.aa,
                         phys_clip,
+                        scale,
+                        true,
                     );
                 }
             },
@@ -303,6 +370,558 @@ fn drawRectOutline(target: RenderTarget, rect: Rect, col: Color, thickness: u32,
                     drawRectFilled(target, .{ .x = right_start, .y = mid_y, .w = right_w, .h = mid_h }, col, clip);
                 }
             }
+        }
+    }
+}
+
+const CornerOrientation = enum { top_left, top_right, bottom_left, bottom_right };
+
+const CachedMask = struct {
+    coverage: []const u8,
+    radius: u32,
+};
+
+fn scaleRadiusUnclamped(radius: u32, scale: f32) u32 {
+    std.debug.assert(radius != 0);
+    const scaled = @round(@as(f32, @floatFromInt(radius)) * scale);
+    if (scaled < 1.0) return 1;
+    return @intFromFloat(scaled);
+}
+
+fn clampedDeviceRadius(rect: Rect, radius: u32, scale: f32) u32 {
+    if (radius == 0) return 0;
+    return @min(scaleRadiusUnclamped(radius, scale), @min(rect.w, rect.h) / 2);
+}
+
+fn circleRect(center: Vec2, radius: u32) Rect {
+    const ri: i32 = @intCast(radius);
+    return .{
+        .x = center.x - ri,
+        .y = center.y - ri,
+        .w = radius * 2,
+        .h = radius * 2,
+    };
+}
+
+fn cornerRect(rect: Rect, radius: u32, orientation: CornerOrientation) Rect {
+    const right = rect.x + @as(i32, @intCast(rect.w - radius));
+    const bottom = rect.y + @as(i32, @intCast(rect.h - radius));
+    return switch (orientation) {
+        .top_left => .{ .x = rect.x, .y = rect.y, .w = radius, .h = radius },
+        .top_right => .{ .x = right, .y = rect.y, .w = radius, .h = radius },
+        .bottom_left => .{ .x = rect.x, .y = bottom, .w = radius, .h = radius },
+        .bottom_right => .{ .x = right, .y = bottom, .w = radius, .h = radius },
+    };
+}
+
+fn getCornerMask(draw_list: *DrawList, radius: u32, scale: f32) ?CachedMask {
+    const key = corner_mask.CornerMaskKey.init(radius, scale);
+    if (draw_list.corner_masks.lookup(key)) |coverage| {
+        return .{ .coverage = coverage, .radius = radius };
+    }
+    if (!corner_mask.Cache.cacheable(radius)) return null;
+
+    const len = corner_mask.Cache.payloadBytes(radius).?;
+    const owned = draw_list.alloc.alloc(u8, len) catch
+        @panic("gui rounded mask: OOM");
+    errdefer draw_list.alloc.free(owned);
+    const max_pixels = draw_mod.path_scratch_limit_bytes / draw_mod.path_scratch_bytes_per_pixel;
+    const band_h: u32 = @max(1, @as(u32, @intCast(max_pixels / radius)));
+    var y: u32 = 0;
+    while (y < radius) {
+        const h = @min(band_h, radius - y);
+        const pixels = @as(usize, radius) * h;
+        draw_list.ensurePathScratch(pixels);
+        corner_mask.rasterizeBand(
+            radius,
+            0,
+            y,
+            radius,
+            h,
+            draw_list.path_area,
+            draw_list.path_cover,
+            draw_list.path_coverage,
+        );
+        @memcpy(owned[@as(usize, y) * radius ..][0..pixels], draw_list.path_coverage[0..pixels]);
+        y += h;
+    }
+    const coverage = draw_list.corner_masks.insertOwned(draw_list.alloc, key, owned) catch
+        @panic("gui rounded mask cache: OOM");
+    return .{ .coverage = coverage, .radius = radius };
+}
+
+fn sourceX(orientation: CornerOrientation, radius: u32, local_x: u32) u32 {
+    return switch (orientation) {
+        .top_left, .bottom_left => local_x,
+        .top_right, .bottom_right => radius - 1 - local_x,
+    };
+}
+
+fn sourceY(orientation: CornerOrientation, radius: u32, local_y: u32) u32 {
+    return switch (orientation) {
+        .top_left, .top_right => local_y,
+        .bottom_left, .bottom_right => radius - 1 - local_y,
+    };
+}
+
+fn finalCoverage(
+    outer: CachedMask,
+    inner: ?CachedMask,
+    inset: u32,
+    sx: u32,
+    sy: u32,
+    aa: bool,
+) u8 {
+    var coverage = outer.coverage[@as(usize, sy) * outer.radius + sx];
+    if (inner) |mask| {
+        if (sx >= inset and sy >= inset and sx - inset < mask.radius and sy - inset < mask.radius) {
+            const inner_coverage = mask.coverage[@as(usize, sy - inset) * mask.radius + (sx - inset)];
+            coverage -|= inner_coverage;
+        }
+    }
+    if (!aa) coverage = if (coverage >= 128) 255 else 0;
+    return coverage;
+}
+
+/// Hot path: composites at most four `radius * radius` corner masks per
+/// rounded primitive per frame. Clip and source orientation are resolved per
+/// row; four adjacent coverages use `srcOverCoverage4` with a scalar tail.
+fn blitCachedCorner(
+    target: RenderTarget,
+    draw_list: *DrawList,
+    dst: Rect,
+    clip: Rect,
+    orientation: CornerOrientation,
+    outer: CachedMask,
+    inner: ?CachedMask,
+    inset: u32,
+    aa: bool,
+    col: Color,
+    comptime use_simd: bool,
+) void {
+    const bounds = clipRect(dst, clip, target);
+    if (bounds.isEmpty()) return;
+    draw_list.corner_masks.addCoveragePixels(@as(usize, bounds.w) * bounds.h);
+
+    const src_u32: u32 = @bitCast(col);
+    const src4 = [4]u32{ src_u32, src_u32, src_u32, src_u32 };
+    const dst_x: u32 = @intCast(bounds.x);
+    const dst_y: u32 = @intCast(bounds.y);
+    const local_x0: u32 = @intCast(bounds.x - dst.x);
+    const local_y0: u32 = @intCast(bounds.y - dst.y);
+
+    var row: u32 = 0;
+    while (row < bounds.h) : (row += 1) {
+        const sy = sourceY(orientation, outer.radius, local_y0 + row);
+        const dst_base = (dst_y + row) * target.width + dst_x;
+        var x: u32 = 0;
+        if (col.a == 255) {
+            while (x < bounds.w) {
+                const sx = sourceX(orientation, outer.radius, local_x0 + x);
+                const coverage = finalCoverage(outer, inner, inset, sx, sy, aa);
+                if (coverage == 0) {
+                    x += 1;
+                    continue;
+                }
+                if (coverage == 255) {
+                    var run = x + 1;
+                    while (run < bounds.w) : (run += 1) {
+                        const run_sx = sourceX(orientation, outer.radius, local_x0 + run);
+                        if (finalCoverage(outer, inner, inset, run_sx, sy, aa) != 255) break;
+                    }
+                    pixelops.fill32(target.pixels[dst_base + x ..][0 .. run - x], src_u32);
+                    x = run;
+                    continue;
+                }
+                if (comptime use_simd) {
+                    if (x + 4 <= bounds.w) {
+                        var cov: [4]u8 = undefined;
+                        inline for (0..4) |lane| {
+                            const lane_sx = sourceX(orientation, outer.radius, local_x0 + x + @as(u32, @intCast(lane)));
+                            cov[lane] = finalCoverage(outer, inner, inset, lane_sx, sy, aa);
+                        }
+                        const cov4: @Vector(4, u8) = cov;
+                        const dst_chunk: *[4]u32 = target.pixels[dst_base + x ..][0..4];
+                        dst_chunk.* = @bitCast(pixelops.srcOverCoverage4(@bitCast(dst_chunk.*), @bitCast(src4), cov4));
+                        x += 4;
+                        continue;
+                    }
+                }
+                target.pixels[dst_base + x] = pixelops.srcOverCoverage(target.pixels[dst_base + x], src_u32, coverage);
+                x += 1;
+            }
+            continue;
+        }
+        if (comptime use_simd) {
+            while (x + 4 <= bounds.w) : (x += 4) {
+                var cov: [4]u8 = undefined;
+                inline for (0..4) |lane| {
+                    const sx = sourceX(orientation, outer.radius, local_x0 + x + @as(u32, @intCast(lane)));
+                    cov[lane] = finalCoverage(outer, inner, inset, sx, sy, aa);
+                }
+                const cov4: @Vector(4, u8) = cov;
+                if (@reduce(.Or, cov4) == 0) continue;
+                const dst_chunk: *[4]u32 = target.pixels[dst_base + x ..][0..4];
+                dst_chunk.* = @bitCast(pixelops.srcOverCoverage4(@bitCast(dst_chunk.*), @bitCast(src4), cov4));
+            }
+        }
+        while (x < bounds.w) : (x += 1) {
+            const sx = sourceX(orientation, outer.radius, local_x0 + x);
+            const coverage = finalCoverage(outer, inner, inset, sx, sy, aa);
+            if (coverage == 0) continue;
+            target.pixels[dst_base + x] = pixelops.srcOverCoverage(target.pixels[dst_base + x], src_u32, coverage);
+        }
+    }
+}
+
+fn drawCornerSet(
+    target: RenderTarget,
+    draw_list: *DrawList,
+    rect: Rect,
+    radius: u32,
+    inner_radius: u32,
+    inset: u32,
+    aa: bool,
+    col: Color,
+    clip: Rect,
+    scale: f32,
+    comptime use_simd: bool,
+) void {
+    if (getCornerMask(draw_list, radius, scale)) |outer_mask| {
+        const inner = if (inner_radius != 0) getCornerMask(draw_list, inner_radius, scale) else null;
+        inline for (std.meta.tags(CornerOrientation)) |orientation| {
+            blitCachedCorner(
+                target,
+                draw_list,
+                cornerRect(rect, radius, orientation),
+                clip,
+                orientation,
+                outer_mask,
+                inner,
+                inset,
+                aa,
+                col,
+                use_simd,
+            );
+        }
+        return;
+    }
+    inline for (std.meta.tags(CornerOrientation)) |orientation| {
+        blitGeneratedCorner(
+            target,
+            draw_list,
+            cornerRect(rect, radius, orientation),
+            clip,
+            orientation,
+            radius,
+            inner_radius,
+            inset,
+            aa,
+            col,
+            use_simd,
+        );
+    }
+}
+
+fn drawRoundedFilled(
+    target: RenderTarget,
+    draw_list: *DrawList,
+    rect: Rect,
+    col: Color,
+    logical_radius: u32,
+    aa: bool,
+    clip: Rect,
+    scale: f32,
+    comptime use_simd: bool,
+) void {
+    const radius = clampedDeviceRadius(rect, logical_radius, scale);
+    if (radius == 0) return drawRectFilled(target, rect, col, clip);
+    drawRoundedFilledDevice(target, draw_list, rect, col, radius, aa, clip, scale, use_simd);
+}
+
+fn drawRoundedFilledDevice(
+    target: RenderTarget,
+    draw_list: *DrawList,
+    rect: Rect,
+    col: Color,
+    radius: u32,
+    aa: bool,
+    clip: Rect,
+    scale: f32,
+    comptime use_simd: bool,
+) void {
+    if (rect.w == 0 or rect.h == 0 or radius == 0) return;
+    const center_w = rect.w - radius * 2;
+    drawRectFilled(target, .{
+        .x = rect.x + @as(i32, @intCast(radius)),
+        .y = rect.y,
+        .w = center_w,
+        .h = rect.h,
+    }, col, clip);
+    const middle_h = rect.h - radius * 2;
+    if (middle_h != 0) {
+        const middle_y = rect.y + @as(i32, @intCast(radius));
+        drawRectFilled(target, .{ .x = rect.x, .y = middle_y, .w = radius, .h = middle_h }, col, clip);
+        drawRectFilled(target, .{
+            .x = rect.x + @as(i32, @intCast(rect.w - radius)),
+            .y = middle_y,
+            .w = radius,
+            .h = middle_h,
+        }, col, clip);
+    }
+    drawCornerSet(target, draw_list, rect, radius, 0, 0, aa, col, clip, scale, use_simd);
+}
+
+fn drawRoundedOutline(
+    target: RenderTarget,
+    draw_list: *DrawList,
+    rect: Rect,
+    col: Color,
+    thickness: u32,
+    logical_radius: u32,
+    aa: bool,
+    clip: Rect,
+    scale: f32,
+    comptime use_simd: bool,
+) void {
+    const radius = clampedDeviceRadius(rect, logical_radius, scale);
+    if (radius == 0) return drawRectOutline(target, rect, col, thickness, clip);
+    drawRoundedOutlineDevice(target, draw_list, rect, col, thickness, radius, aa, clip, scale, use_simd);
+}
+
+fn drawRoundedOutlineDevice(
+    target: RenderTarget,
+    draw_list: *DrawList,
+    rect: Rect,
+    col: Color,
+    thickness: u32,
+    radius: u32,
+    aa: bool,
+    clip: Rect,
+    scale: f32,
+    comptime use_simd: bool,
+) void {
+    if (rect.w == 0 or rect.h == 0 or radius == 0) return;
+    const t = if (thickness == 0) @as(u32, 1) else thickness;
+    if (t >= @min(rect.w, rect.h) / 2) {
+        return drawRoundedFilledDevice(target, draw_list, rect, col, radius, aa, clip, scale, use_simd);
+    }
+
+    const inner_radius = radius -| t;
+    const center_x = rect.x + @as(i32, @intCast(radius));
+    const center_w = rect.w - radius * 2;
+    drawRectFilled(target, .{ .x = center_x, .y = rect.y, .w = center_w, .h = t }, col, clip);
+    drawRectFilled(target, .{
+        .x = center_x,
+        .y = rect.y + @as(i32, @intCast(rect.h - t)),
+        .w = center_w,
+        .h = t,
+    }, col, clip);
+
+    const middle_y = rect.y + @as(i32, @intCast(radius));
+    const middle_h = rect.h - radius * 2;
+    const side_w = @min(t, radius);
+    drawRectFilled(target, .{ .x = rect.x, .y = middle_y, .w = side_w, .h = middle_h }, col, clip);
+    drawRectFilled(target, .{
+        .x = rect.x + @as(i32, @intCast(rect.w - side_w)),
+        .y = middle_y,
+        .w = side_w,
+        .h = middle_h,
+    }, col, clip);
+
+    if (t > radius) {
+        const extra = t - radius;
+        const inner_y = rect.y + @as(i32, @intCast(t));
+        const inner_h = rect.h - t * 2;
+        drawRectFilled(target, .{
+            .x = rect.x + @as(i32, @intCast(radius)),
+            .y = inner_y,
+            .w = extra,
+            .h = inner_h,
+        }, col, clip);
+        drawRectFilled(target, .{
+            .x = rect.x + @as(i32, @intCast(rect.w - t)),
+            .y = inner_y,
+            .w = extra,
+            .h = inner_h,
+        }, col, clip);
+    }
+    drawCornerSet(target, draw_list, rect, radius, inner_radius, t, aa, col, clip, scale, use_simd);
+}
+
+/// Hot path for a single uncached giant corner. It rasterizes only the visible
+/// source rectangle in bands, so work stays proportional to corner coverage
+/// and retained scratch remains bounded independently of the panel bbox.
+fn blitGeneratedCorner(
+    target: RenderTarget,
+    draw_list: *DrawList,
+    dst: Rect,
+    clip: Rect,
+    orientation: CornerOrientation,
+    radius: u32,
+    inner_radius: u32,
+    inset: u32,
+    aa: bool,
+    col: Color,
+    comptime use_simd: bool,
+) void {
+    const bounds = clipRect(dst, clip, target);
+    if (bounds.isEmpty()) return;
+    const max_pixels = draw_mod.path_scratch_limit_bytes / draw_mod.path_scratch_bytes_per_pixel;
+    const band_h: u32 = @max(1, @as(u32, @intCast(max_pixels / bounds.w)));
+    var dy: u32 = 0;
+    while (dy < bounds.h) {
+        const h = @min(band_h, bounds.h - dy);
+        const band_dst = Rect{ .x = bounds.x, .y = bounds.y + @as(i32, @intCast(dy)), .w = bounds.w, .h = h };
+        const local_x: u32 = @intCast(band_dst.x - dst.x);
+        const local_y: u32 = @intCast(band_dst.y - dst.y);
+        const source_x = switch (orientation) {
+            .top_left, .bottom_left => local_x,
+            .top_right, .bottom_right => radius - local_x - band_dst.w,
+        };
+        const source_y = switch (orientation) {
+            .top_left, .top_right => local_y,
+            .bottom_left, .bottom_right => radius - local_y - band_dst.h,
+        };
+        const pixels = @as(usize, band_dst.w) * band_dst.h;
+        draw_list.ensurePathScratch(pixels);
+        draw_list.ensureCornerBand(pixels);
+        corner_mask.rasterizeBand(
+            radius,
+            source_x,
+            source_y,
+            band_dst.w,
+            band_dst.h,
+            draw_list.path_area,
+            draw_list.path_cover,
+            draw_list.path_coverage,
+        );
+        @memcpy(draw_list.corner_band[0..pixels], draw_list.path_coverage[0..pixels]);
+
+        if (inner_radius != 0) {
+            const ix0 = @max(source_x, inset);
+            const iy0 = @max(source_y, inset);
+            const ix1 = @min(source_x + band_dst.w, inset + inner_radius);
+            const iy1 = @min(source_y + band_dst.h, inset + inner_radius);
+            if (ix1 > ix0 and iy1 > iy0) {
+                const iw = ix1 - ix0;
+                const ih = iy1 - iy0;
+                corner_mask.rasterizeBand(
+                    inner_radius,
+                    ix0 - inset,
+                    iy0 - inset,
+                    iw,
+                    ih,
+                    draw_list.path_area,
+                    draw_list.path_cover,
+                    draw_list.path_coverage,
+                );
+                var iy: u32 = 0;
+                while (iy < ih) : (iy += 1) {
+                    var ix: u32 = 0;
+                    while (ix < iw) : (ix += 1) {
+                        const outer_index = @as(usize, iy0 - source_y + iy) * band_dst.w + (ix0 - source_x + ix);
+                        const inner_index = @as(usize, iy) * iw + ix;
+                        draw_list.corner_band[outer_index] -|= draw_list.path_coverage[inner_index];
+                    }
+                }
+            }
+        }
+
+        const generated = CachedMask{ .coverage = draw_list.corner_band[0..pixels], .radius = radius };
+        blitGeneratedBand(target, draw_list, band_dst, dst, orientation, generated, source_x, source_y, aa, col, use_simd);
+        dy += h;
+    }
+}
+
+fn blitGeneratedBand(
+    target: RenderTarget,
+    draw_list: *DrawList,
+    bounds: Rect,
+    corner: Rect,
+    orientation: CornerOrientation,
+    mask: CachedMask,
+    source_x: u32,
+    source_y: u32,
+    aa: bool,
+    col: Color,
+    comptime use_simd: bool,
+) void {
+    draw_list.corner_masks.addCoveragePixels(@as(usize, bounds.w) * bounds.h);
+    const src_u32: u32 = @bitCast(col);
+    const src4 = [4]u32{ src_u32, src_u32, src_u32, src_u32 };
+    const dst_x: u32 = @intCast(bounds.x);
+    const dst_y: u32 = @intCast(bounds.y);
+    const local_x0: u32 = @intCast(bounds.x - corner.x);
+    const local_y0: u32 = @intCast(bounds.y - corner.y);
+    var row: u32 = 0;
+    while (row < bounds.h) : (row += 1) {
+        const sy = sourceY(orientation, mask.radius, local_y0 + row);
+        const dst_base = (dst_y + row) * target.width + dst_x;
+        var x: u32 = 0;
+        if (col.a == 255) {
+            while (x < bounds.w) {
+                const sx = sourceX(orientation, mask.radius, local_x0 + x);
+                var coverage = mask.coverage[@as(usize, sy - source_y) * bounds.w + (sx - source_x)];
+                if (!aa) coverage = if (coverage >= 128) 255 else 0;
+                if (coverage == 0) {
+                    x += 1;
+                    continue;
+                }
+                if (coverage == 255) {
+                    var run = x + 1;
+                    while (run < bounds.w) : (run += 1) {
+                        const run_sx = sourceX(orientation, mask.radius, local_x0 + run);
+                        var run_coverage = mask.coverage[@as(usize, sy - source_y) * bounds.w + (run_sx - source_x)];
+                        if (!aa) run_coverage = if (run_coverage >= 128) 255 else 0;
+                        if (run_coverage != 255) break;
+                    }
+                    pixelops.fill32(target.pixels[dst_base + x ..][0 .. run - x], src_u32);
+                    x = run;
+                    continue;
+                }
+                if (comptime use_simd) {
+                    if (x + 4 <= bounds.w) {
+                        var cov: [4]u8 = undefined;
+                        inline for (0..4) |lane| {
+                            const lane_sx = sourceX(orientation, mask.radius, local_x0 + x + @as(u32, @intCast(lane)));
+                            var c = mask.coverage[@as(usize, sy - source_y) * bounds.w + (lane_sx - source_x)];
+                            if (!aa) c = if (c >= 128) 255 else 0;
+                            cov[lane] = c;
+                        }
+                        const cov4: @Vector(4, u8) = cov;
+                        const dst_chunk: *[4]u32 = target.pixels[dst_base + x ..][0..4];
+                        dst_chunk.* = @bitCast(pixelops.srcOverCoverage4(@bitCast(dst_chunk.*), @bitCast(src4), cov4));
+                        x += 4;
+                        continue;
+                    }
+                }
+                target.pixels[dst_base + x] = pixelops.srcOverCoverage(target.pixels[dst_base + x], src_u32, coverage);
+                x += 1;
+            }
+            continue;
+        }
+        if (comptime use_simd) {
+            while (x + 4 <= bounds.w) : (x += 4) {
+                var cov: [4]u8 = undefined;
+                inline for (0..4) |lane| {
+                    const sx = sourceX(orientation, mask.radius, local_x0 + x + @as(u32, @intCast(lane)));
+                    var c = mask.coverage[@as(usize, sy - source_y) * bounds.w + (sx - source_x)];
+                    if (!aa) c = if (c >= 128) 255 else 0;
+                    cov[lane] = c;
+                }
+                const cov4: @Vector(4, u8) = cov;
+                if (@reduce(.Or, cov4) == 0) continue;
+                const dst_chunk: *[4]u32 = target.pixels[dst_base + x ..][0..4];
+                dst_chunk.* = @bitCast(pixelops.srcOverCoverage4(@bitCast(dst_chunk.*), @bitCast(src4), cov4));
+            }
+        }
+        while (x < bounds.w) : (x += 1) {
+            const sx = sourceX(orientation, mask.radius, local_x0 + x);
+            var coverage = mask.coverage[@as(usize, sy - source_y) * bounds.w + (sx - source_x)];
+            if (!aa) coverage = if (coverage >= 128) 255 else 0;
+            if (coverage == 0) continue;
+            target.pixels[dst_base + x] = pixelops.srcOverCoverage(target.pixels[dst_base + x], src_u32, coverage);
         }
     }
 }
@@ -2235,6 +2854,199 @@ test "path stroke: a closed one-point or two-point contour paints nothing" {
     for (pixels) |px| {
         try std.testing.expectEqual(@as(u32, 0xFF000000), px);
     }
+}
+
+test "rounded render: zero radius is bit-identical to the sharp rectangle route" {
+    var sharp_pixels = [_]u32{0xFF102030} ** (32 * 24);
+    var rounded_pixels = sharp_pixels;
+    const sharp_target = RenderTarget{ .pixels = &sharp_pixels, .width = 32, .height = 24 };
+    const rounded_target = RenderTarget{ .pixels = &rounded_pixels, .width = 32, .height = 24 };
+    var sharp = DrawList.init(std.testing.allocator);
+    defer sharp.deinit();
+    sharp.reset(32, 24);
+    var rounded = DrawList.init(std.testing.allocator);
+    defer rounded.deinit();
+    rounded.reset(32, 24);
+    const rect = Rect{ .x = 3, .y = 4, .w = 21, .h = 15 };
+    const color = Color.rgba(0x90, 0x40, 0xD0, 0x80);
+    try sharp.rectFilled(rect, color);
+    try sharp.rectOutline(rect, color, 3);
+    try rounded.rectFilledEx(rect, color, .{ .radius = 0, .aa = false });
+    try rounded.rectOutlineEx(rect, color, 3, .{ .radius = 0, .aa = false });
+    render(sharp_target, &sharp, font_mod.default_font, 1.0);
+    render(rounded_target, &rounded, font_mod.default_font, 1.0);
+    try std.testing.expectEqualSlices(u32, &sharp_pixels, &rounded_pixels);
+    try std.testing.expectEqual(@as(u64, 0), rounded.cornerMaskDiagnostics().hits);
+    try std.testing.expectEqual(@as(u64, 0), rounded.cornerMaskDiagnostics().misses);
+    try std.testing.expectEqual(@as(usize, 0), rounded.path_scratch_pixels);
+}
+
+test "rounded fill: corner edge interior clip and translucent seams are correct" {
+    const background: u32 = 0xFF102030;
+    var pixels = [_]u32{background} ** (32 * 24);
+    const target = RenderTarget{ .pixels = &pixels, .width = 32, .height = 24 };
+    var dl = DrawList.init(std.testing.allocator);
+    defer dl.deinit();
+    dl.reset(32, 24);
+    try dl.pushClip(.{ .x = 4, .y = 3, .w = 20, .h = 16 });
+    const color = Color.rgba(0xE0, 0x60, 0x20, 0x80);
+    try dl.rectFilledEx(.{ .x = 2, .y = 2, .w = 24, .h = 18 }, color, .{ .radius = 6, .aa = false });
+    dl.popClip();
+    render(target, &dl, font_mod.default_font, 1.0);
+    try std.testing.expectEqual(background, pixels[2 * 32 + 2]);
+    try std.testing.expectEqual(background, pixels[4 * 32 + 3]);
+    const blended = @as(u32, @bitCast(Color.blend(@bitCast(background), color)));
+    try std.testing.expectEqual(blended, pixels[3 * 32 + 10]);
+    try std.testing.expectEqual(blended, pixels[6 * 32 + 6]);
+    try std.testing.expectEqual(blended, pixels[10 * 32 + 4]);
+    try std.testing.expectEqual(blended, pixels[10 * 32 + 12]);
+    try std.testing.expectEqual(background, pixels[10 * 32 + 24]);
+}
+
+test "rounded fill: radius clamps after scale and tiny rectangles collapse to sharp" {
+    try std.testing.expectEqual(@as(u32, 1), clampedDeviceRadius(.{ .x = 0, .y = 0, .w = 20, .h = 20 }, 1, 0.1));
+    try std.testing.expectEqual(@as(u32, 5), clampedDeviceRadius(.{ .x = 0, .y = 0, .w = 20, .h = 20 }, 3, 1.5));
+    try std.testing.expectEqual(@as(u32, 4), clampedDeviceRadius(.{ .x = 0, .y = 0, .w = 20, .h = 8 }, 99, 2.0));
+    try std.testing.expectEqual(@as(u32, 0), clampedDeviceRadius(.{ .x = 0, .y = 0, .w = 20, .h = 1 }, 8, 1.0));
+    for ([_]f32{ 1.0, 1.5, 2.0 }) |scale| {
+        var pixels = [_]u32{0xFF000000} ** (48 * 48);
+        var dl = DrawList.init(std.testing.allocator);
+        defer dl.deinit();
+        dl.reset(24, 24);
+        try dl.rectFilledEx(.{ .x = 2, .y = 2, .w = 12, .h = 8 }, Color.rgba(0xFF, 0xFF, 0xFF, 0xFF), .{ .radius = 99 });
+        render(.{ .pixels = &pixels, .width = 48, .height = 48 }, &dl, font_mod.default_font, scale);
+        try std.testing.expect(dl.cornerMaskDiagnostics().coverage_pixels != 0);
+    }
+
+    var tiny_pixels = [_]u32{0xFF000000} ** 8;
+    var tiny = DrawList.init(std.testing.allocator);
+    defer tiny.deinit();
+    tiny.reset(8, 1);
+    try tiny.rectFilledEx(.{ .x = 0, .y = 0, .w = 8, .h = 1 }, Color.rgba(0xFF, 0, 0, 0xFF), .{ .radius = 8 });
+    render(.{ .pixels = &tiny_pixels, .width = 8, .height = 1 }, &tiny, font_mod.default_font, 1.0);
+    const tiny_color: u32 = @bitCast(Color.rgba(0xFF, 0, 0, 0xFF));
+    for (tiny_pixels) |pixel| try std.testing.expectEqual(tiny_color, pixel);
+    try std.testing.expectEqual(@as(u64, 0), tiny.cornerMaskDiagnostics().misses);
+}
+
+test "rounded outline: thickness zero through filled collapse keep the center contract" {
+    for ([_]u32{ 0, 3, 6, 9, 12 }) |thickness| {
+        var pixels = [_]u32{0xFF000000} ** (32 * 32);
+        var dl = DrawList.init(std.testing.allocator);
+        defer dl.deinit();
+        dl.reset(32, 32);
+        try dl.rectOutlineEx(.{ .x = 4, .y = 5, .w = 24, .h = 20 }, Color.rgba(0x40, 0xC0, 0xFF, 0xFF), thickness, .{ .radius = 6 });
+        render(.{ .pixels = &pixels, .width = 32, .height = 32 }, &dl, font_mod.default_font, 1.0);
+        try std.testing.expect(pixels[5 * 32 + 16] != 0xFF000000);
+        if (thickness < 10) {
+            try std.testing.expectEqual(@as(u32, 0xFF000000), pixels[15 * 32 + 16]);
+        } else {
+            try std.testing.expect(pixels[15 * 32 + 16] != 0xFF000000);
+        }
+    }
+}
+
+test "rounded render: circles equal the same device bounding rounded square" {
+    var circle_pixels = [_]u32{0xFF111111} ** (40 * 40);
+    var square_pixels = circle_pixels;
+    var circle = DrawList.init(std.testing.allocator);
+    defer circle.deinit();
+    circle.reset(40, 40);
+    var square = DrawList.init(std.testing.allocator);
+    defer square.deinit();
+    square.reset(40, 40);
+    const color = Color.rgba(0x80, 0xD0, 0x40, 0xB0);
+    try circle.circleFilled(.{ .x = 20, .y = 20 }, 10, color, .{});
+    try circle.circleOutline(.{ .x = 20, .y = 20 }, 8, color, 3, .{ .aa = false });
+    try square.rectFilledEx(.{ .x = 10, .y = 10, .w = 20, .h = 20 }, color, .{ .radius = 10 });
+    try square.rectOutlineEx(.{ .x = 12, .y = 12, .w = 16, .h = 16 }, color, 3, .{ .radius = 8, .aa = false });
+    render(.{ .pixels = &circle_pixels, .width = 40, .height = 40 }, &circle, font_mod.default_font, 1.0);
+    render(.{ .pixels = &square_pixels, .width = 40, .height = 40 }, &square, font_mod.default_font, 1.0);
+    try std.testing.expect(circle_pixels[20 * 40 + 20] != 0xFF111111);
+    try std.testing.expectEqualSlices(u32, &circle_pixels, &square_pixels);
+}
+
+test "rounded render: a warm second render allocates nothing and hits retained masks" {
+    var dl = DrawList.init(std.testing.allocator);
+    defer dl.deinit();
+    dl.reset(64, 64);
+    try dl.rectFilledEx(.{ .x = 4, .y = 4, .w = 50, .h = 30 }, Color.rgba(0x20, 0x80, 0xE0, 0xFF), .{ .radius = 9 });
+    try dl.rectOutlineEx(.{ .x = 6, .y = 38, .w = 48, .h = 22 }, Color.rgba(0xE0, 0x80, 0x20, 0xA0), 3, .{ .radius = 8 });
+    var pixels = [_]u32{0xFF101010} ** (64 * 64);
+    const target = RenderTarget{ .pixels = &pixels, .width = 64, .height = 64 };
+    render(target, &dl, font_mod.default_font, 1.0);
+    const cold = dl.cornerMaskDiagnostics();
+
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
+    dl.alloc = failing.allocator();
+    render(target, &dl, font_mod.default_font, 1.0);
+    try std.testing.expectEqual(@as(usize, 0), failing.allocated_bytes);
+    try std.testing.expect(dl.cornerMaskDiagnostics().hits > cold.hits);
+    dl.alloc = std.testing.allocator;
+}
+
+test "rounded render: reset retains masks and AA variants reuse the same entry" {
+    var pixels = [_]u32{0xFF000000} ** (32 * 32);
+    const target = RenderTarget{ .pixels = &pixels, .width = 32, .height = 32 };
+    var dl = DrawList.init(std.testing.allocator);
+    defer dl.deinit();
+    dl.reset(32, 32);
+    try dl.rectFilledEx(.{ .x = 2, .y = 2, .w = 24, .h = 20 }, Color.rgba(0xFF, 0xFF, 0xFF, 0xFF), .{ .radius = 7 });
+    render(target, &dl, font_mod.default_font, 1.0);
+    const first = dl.cornerMaskDiagnostics();
+    try std.testing.expectEqual(@as(usize, 1), first.entries);
+    dl.reset(32, 32);
+    try dl.rectFilledEx(.{ .x = 2, .y = 2, .w = 24, .h = 20 }, Color.rgba(0xFF, 0xFF, 0xFF, 0xFF), .{ .radius = 7, .aa = false });
+    render(target, &dl, font_mod.default_font, 1.0);
+    const second = dl.cornerMaskDiagnostics();
+    try std.testing.expectEqual(first.allocations, second.allocations);
+    try std.testing.expect(second.hits > first.hits);
+}
+
+test "rounded render: an oversized mask uses bounded visible-band scratch without retention" {
+    var pixels = [_]u32{0xFF000000} ** (16 * 16);
+    const target = RenderTarget{ .pixels = &pixels, .width = 16, .height = 16 };
+    var dl = DrawList.init(std.testing.allocator);
+    defer dl.deinit();
+    dl.reset(16, 16);
+    try dl.rectFilledEx(.{ .x = 0, .y = 0, .w = 4098, .h = 4098 }, Color.rgba(0xFF, 0xFF, 0xFF, 0xFF), .{ .radius = 2049 });
+    try dl.rectOutlineEx(.{ .x = 0, .y = 0, .w = 4098, .h = 4098 }, Color.rgba(0xFF, 0, 0, 0x80), 5, .{ .radius = 2049 });
+    render(target, &dl, font_mod.default_font, 1.0);
+    const diagnostics = dl.cornerMaskDiagnostics();
+    try std.testing.expectEqual(@as(usize, 0), diagnostics.entries);
+    try std.testing.expect(diagnostics.coverage_pixels != 0);
+    try std.testing.expect(dl.path_scratch_peak_bytes <= draw_mod.path_scratch_limit_bytes);
+}
+
+test "rounded render: zero-radius circles are no-ops without cache activity" {
+    var pixels = [_]u32{0xFF123456} ** (8 * 8);
+    const before = pixels;
+    var dl = DrawList.init(std.testing.allocator);
+    defer dl.deinit();
+    dl.reset(8, 8);
+    try dl.circleFilled(.{ .x = 4, .y = 4 }, 0, Color.rgba(0xFF, 0, 0, 0xFF), .{});
+    try dl.circleOutline(.{ .x = 4, .y = 4 }, 0, Color.rgba(0, 0xFF, 0, 0xFF), 0, .{});
+    render(.{ .pixels = &pixels, .width = 8, .height = 8 }, &dl, font_mod.default_font, 1.0);
+    try std.testing.expectEqualSlices(u32, &before, &pixels);
+    try std.testing.expectEqual(@as(u64, 0), dl.cornerMaskDiagnostics().misses);
+}
+
+test "rounded render: SIMD and scalar corner coverage are framebuffer-identical" {
+    var simd_pixels = [_]u32{0xFF17202A} ** (64 * 48);
+    var scalar_pixels = simd_pixels;
+    var simd = DrawList.init(std.testing.allocator);
+    defer simd.deinit();
+    var scalar = DrawList.init(std.testing.allocator);
+    defer scalar.deinit();
+    simd.reset(64, 48);
+    scalar.reset(64, 48);
+    const rect = Rect{ .x = 3, .y = 5, .w = 44, .h = 30 };
+    const color = Color.rgba(0x50, 0xB0, 0xF0, 0x91);
+    drawRoundedFilledDevice(.{ .pixels = &simd_pixels, .width = 64, .height = 48 }, &simd, rect, color, 11, true, .{ .x = 0, .y = 0, .w = 64, .h = 48 }, 1.0, true);
+    drawRoundedOutlineDevice(.{ .pixels = &simd_pixels, .width = 64, .height = 48 }, &simd, .{ .x = 18, .y = 12, .w = 40, .h = 30 }, color, 5, 12, false, .{ .x = 0, .y = 0, .w = 64, .h = 48 }, 1.0, true);
+    drawRoundedFilledDevice(.{ .pixels = &scalar_pixels, .width = 64, .height = 48 }, &scalar, rect, color, 11, true, .{ .x = 0, .y = 0, .w = 64, .h = 48 }, 1.0, false);
+    drawRoundedOutlineDevice(.{ .pixels = &scalar_pixels, .width = 64, .height = 48 }, &scalar, .{ .x = 18, .y = 12, .w = 40, .h = 30 }, color, 5, 12, false, .{ .x = 0, .y = 0, .w = 64, .h = 48 }, 1.0, false);
+    try std.testing.expectEqualSlices(u32, &simd_pixels, &scalar_pixels);
 }
 
 // ── render input domain ────────────────────────────────────────────

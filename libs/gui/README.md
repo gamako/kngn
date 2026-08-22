@@ -36,6 +36,34 @@ from `fb.width`/`fb.height`, and `gui.render`'s `scale` has to agree with it —
 [app-authoring.md](../../docs/app-authoring.md) for how the two relate to `content_scale` and
 the framebuffer mode.
 
+## Low-level rounded primitives
+
+`DrawList.rectFilled` and `rectOutline` remain the sharp, zero-radius calls.
+Their extended forms accept one uniform logical radius:
+
+```zig
+try dl.rectFilledEx(rect, color, .{ .radius = 8 });
+try dl.rectOutlineEx(rect, color, 2, .{ .radius = 8, .aa = false });
+try dl.circleFilled(.{ .x = 80, .y = 64 }, 16, color, .{});
+try dl.circleOutline(.{ .x = 128, .y = 64 }, 16, color, 3, .{});
+```
+
+Rectangle radius and circle center/radius use logical DrawList coordinates. At
+render time a non-zero radius is multiplied by `scale`, rounded to the nearest
+device pixel, kept at least 1 px, and clamped to half the rectangle's shorter
+device-space side. A rectangle whose shorter side leaves no effective radius
+uses the sharp route. A circle's device-space bounding square is exactly
+`2 * snapped_radius` around its scaled center; radius zero is a no-op. Outline
+thickness zero means 1 px, matching sharp rectangle outlines, and an outline at
+least half the shorter side becomes a fill.
+
+AA is enabled by default. Setting `.aa = false` thresholds the same cached
+coverage at 128; it does not create another cache entry. Each DrawList retains
+canonical quarter-circle masks across `reset`, keyed by snapped device radius
+and the exact scale bits, and frees them in `deinit`. A mask payload is limited
+to 4 MiB and the cache to 64 whole entries with LRU eviction. Larger corners
+are rasterized in bounded visible bands instead of allocating a full mask.
+
 ### What may be called when
 
 | | Before the first frame | Frame open | After `endFrame` |

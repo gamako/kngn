@@ -11,6 +11,8 @@
 //! Text format (one command per line, k=v pairs, space separated):
 //!   `cmd=rect_filled x=.. y=.. w=.. h=.. color=#AARRGGBB clip_x=.. clip_y=.. clip_w=.. clip_h=.. offclip=0|1`
 //!   `cmd=rect_outline` adds `thickness=..` after `h=..`.
+//!   Rounded rectangles add `radius=..`; default AA is omitted and AA off adds `aa=0`.
+//!   `cmd=circle_filled` / `cmd=circle_outline` always carry `radius`; outline adds `thickness`.
 //!   `cmd=line x0=.. y0=.. x1=.. y1=.. thickness=.. color=.. clip_.. offclip=..`
 //!   `cmd=text x=.. y=.. color=.. font=default|custom clip_.. offclip=.. text="<escaped content>"`
 //!   `cmd=image x=.. y=.. w=.. h=.. src_w=.. src_h=.. pixfnv=#XXXXXXXX clip_.. offclip=..`
@@ -25,6 +27,8 @@
 //! frames whose dump lines are byte-for-byte the same produce the same `hash`; the
 //! counts alone stay stable across a frame with animated coordinates, because they
 //! do not fold in position (see docs/harness.md for the trade-off between the two).
+//! The schema version folded into the hash is the path-verb binary wire version;
+//! the command dump itself is the canonical public text wire.
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
@@ -56,6 +60,8 @@ pub fn digest(dl: *const DrawList, buf: []u8) []const u8 {
     var n_text: u32 = 0;
     var n_image: u32 = 0;
     var n_path: u32 = 0;
+    var n_circle_filled: u32 = 0;
+    var n_circle_outline: u32 = 0;
     var n_offclip: u32 = 0;
 
     var line: std.ArrayList(u8) = .empty;
@@ -73,6 +79,14 @@ pub fn digest(dl: *const DrawList, buf: []u8) []const u8 {
             .rect_outline => |c| {
                 n_rect_outline += 1;
                 if (!rectFullyInside(c.rect, c.clip)) n_offclip += 1;
+            },
+            .circle_filled => {
+                n_circle_filled += 1;
+                if (cmd_text.offclipOf(cmd) == 1) n_offclip += 1;
+            },
+            .circle_outline => {
+                n_circle_outline += 1;
+                if (cmd_text.offclipOf(cmd) == 1) n_offclip += 1;
             },
             .line => |c| {
                 n_line += 1;
@@ -93,8 +107,8 @@ pub fn digest(dl: *const DrawList, buf: []u8) []const u8 {
         }
     }
 
-    return std.fmt.bufPrint(buf, "hash={X:0>8} rect_filled={d} rect_outline={d} line={d} text={d} image={d} path={d} offclip={d}", .{
-        h.final(), n_rect_filled, n_rect_outline, n_line, n_text, n_image, n_path, n_offclip,
+    return std.fmt.bufPrint(buf, "hash={X:0>8} rect_filled={d} rect_outline={d} line={d} text={d} image={d} path={d} circle_filled={d} circle_outline={d} offclip={d}", .{
+        h.final(), n_rect_filled, n_rect_outline, n_line, n_text, n_image, n_path, n_circle_filled, n_circle_outline, n_offclip,
     }) catch buf[0..0];
 }
 
@@ -173,6 +187,17 @@ test "digest: deterministic across repeated calls on the same DrawList" {
     const a = digest(&dl, &buf_a);
     const b = digest(&dl, &buf_b);
     try testing.expectEqualStrings(a, b);
+}
+
+test "digest: circle counts append after the existing command counts" {
+    var dl = DrawList.init(testing.allocator);
+    defer dl.deinit();
+    dl.reset(64, 64);
+    try dl.circleFilled(.{ .x = 20, .y = 20 }, 8, draw_mod.Color.rgba(1, 2, 3, 4), .{});
+    try dl.circleOutline(.{ .x = 40, .y = 40 }, 9, draw_mod.Color.rgba(5, 6, 7, 8), 2, .{});
+    var buf: [1024]u8 = undefined;
+    const line = digest(&dl, &buf);
+    try testing.expect(std.mem.indexOf(u8, line, "path=0 circle_filled=1 circle_outline=1 offclip=0") != null);
 }
 
 test "digest: hash changes when text content changes (position and counts held equal)" {

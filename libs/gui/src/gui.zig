@@ -20,6 +20,11 @@ pub const Color = @import("color.zig").Color;
 
 pub const DrawCmd = @import("draw.zig").DrawCmd;
 pub const DrawList = @import("draw.zig").DrawList;
+pub const RoundedRectOptions = @import("draw.zig").RoundedRectOptions;
+pub const CircleOptions = @import("draw.zig").CircleOptions;
+pub const CornerMaskDiagnostics = @import("corner_mask.zig").Diagnostics;
+pub const corner_mask_payload_limit_bytes = @import("corner_mask.zig").payload_limit_bytes;
+pub const corner_mask_entry_limit = @import("corner_mask.zig").entry_limit;
 pub const PathVec2f = @import("draw.zig").Vec2f;
 pub const PathVerb = @import("draw.zig").PathVerb;
 pub const PathVerbSpec = @import("draw.zig").PathVerbSpec;
@@ -299,6 +304,7 @@ test {
     _ = @import("geom.zig");
     _ = @import("color.zig");
     _ = @import("draw.zig");
+    _ = @import("corner_mask.zig");
     _ = @import("font.zig");
     _ = @import("render.zig");
     _ = @import("input.zig");
