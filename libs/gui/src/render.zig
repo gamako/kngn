@@ -12,6 +12,9 @@ pub const Rect = geom.Rect;
 pub const Vec2 = geom.Vec2;
 pub const RenderTarget = geom.RenderTarget;
 pub const Color = color_mod.Color;
+pub const Paint = draw_mod.Paint;
+pub const LinearGradient = draw_mod.LinearGradient;
+pub const RadialGradient = draw_mod.RadialGradient;
 pub const DrawList = draw_mod.DrawList;
 pub const BitmapFont = font_mod.BitmapFont;
 pub const Font = font_mod.Font;
@@ -33,7 +36,7 @@ pub fn scaleWithinDomain(scale: f32) bool {
 /// `(0, path_stroke_width_max]`; `miter_limit` must be finite and `>= 1`.
 pub fn cmdWithinDomain(cmd: draw_mod.DrawCmd) bool {
     return switch (cmd) {
-        .rect_filled => |c| rectInDomain(c.rect) and rectInDomain(c.clip) and extentInDomain(c.radius),
+        .rect_filled => |c| rectInDomain(c.rect) and rectInDomain(c.clip) and extentInDomain(c.radius) and paintInDomain(c.paint),
         .rect_outline => |c| rectInDomain(c.rect) and rectInDomain(c.clip) and thicknessInDomain(c.thickness) and extentInDomain(c.radius),
         .circle_filled => |c| pointInDomain(c.center) and extentInDomain(c.radius) and rectInDomain(c.clip),
         .circle_outline => |c| pointInDomain(c.center) and extentInDomain(c.radius) and thicknessInDomain(c.thickness) and rectInDomain(c.clip),
@@ -42,6 +45,25 @@ pub fn cmdWithinDomain(cmd: draw_mod.DrawCmd) bool {
         .image => |c| rectInDomain(c.rect) and rectInDomain(c.clip),
         .path => |c| pathInDomain(c),
     };
+}
+
+fn paintInDomain(paint: Paint) bool {
+    return switch (paint) {
+        .solid => true,
+        .linear => |g| std.math.isFinite(g.start.x) and std.math.isFinite(g.start.y) and
+            std.math.isFinite(g.end.x) and std.math.isFinite(g.end.y) and
+            coordFloatInDomain(g.start.x) and coordFloatInDomain(g.start.y) and
+            coordFloatInDomain(g.end.x) and coordFloatInDomain(g.end.y) and
+            (g.start.x != g.end.x or g.start.y != g.end.y),
+        .radial => |g| std.math.isFinite(g.center.x) and std.math.isFinite(g.center.y) and
+            coordFloatInDomain(g.center.x) and coordFloatInDomain(g.center.y) and
+            std.math.isFinite(g.radius) and g.radius > 0 and g.radius <= @as(f32, @floatFromInt(geom.MAX_EXTENT)),
+    };
+}
+
+fn coordFloatInDomain(v: f32) bool {
+    return v >= @as(f32, @floatFromInt(geom.MIN_COORD)) and
+        v <= @as(f32, @floatFromInt(geom.MAX_COORD));
 }
 
 fn coordInDomain(v: i32) bool {
@@ -115,10 +137,22 @@ pub fn render(target: RenderTarget, draw_list: *DrawList, font: Font, scale: f32
         for (draw_list.cmds.items) |cmd| {
             switch (cmd) {
                 .rect_filled => |c| if (!c.clip.isEmpty()) {
-                    if (c.radius == 0) {
-                        drawRectFilled(target, c.rect, c.color, c.clip);
+                    if (!paintInDomain(c.paint)) {
+                        std.debug.panic("gui.render: rect_filled paint is outside the accepted domain", .{});
+                    }
+                    if (c.paint == .solid) {
+                        if (c.radius == 0) {
+                            drawRectFilled(target, c.rect, c.paint.solid, c.clip);
+                        } else {
+                            drawRoundedFilled(target, draw_list, c.rect, c.paint.solid, c.radius, c.aa, c.clip, 1.0, true);
+                        }
                     } else {
-                        drawRoundedFilled(target, draw_list, c.rect, c.color, c.radius, c.aa, c.clip, 1.0, true);
+                        const plan = makeGradientPlan(c.paint, 1.0);
+                        if (c.radius == 0) {
+                            drawGradientRect(target, draw_list, c.rect, plan, c.clip, true);
+                        } else {
+                            drawRoundedGradientFilled(target, draw_list, c.rect, plan, c.radius, c.aa, c.clip, 1.0, true);
+                        }
                     }
                 },
                 .rect_outline => |c| if (!c.clip.isEmpty()) {
@@ -153,10 +187,19 @@ pub fn render(target: RenderTarget, draw_list: *DrawList, font: Font, scale: f32
             .rect_filled => |c| {
                 const phys_clip = scaleRect(c.clip, scale);
                 if (!phys_clip.isEmpty()) {
-                    if (c.radius == 0) {
-                        drawRectFilled(target, scaleRect(c.rect, scale), c.color, phys_clip);
+                    if (c.paint == .solid) {
+                        if (c.radius == 0) {
+                            drawRectFilled(target, scaleRect(c.rect, scale), c.paint.solid, phys_clip);
+                        } else {
+                            drawRoundedFilled(target, draw_list, scaleRect(c.rect, scale), c.paint.solid, c.radius, c.aa, phys_clip, scale, true);
+                        }
                     } else {
-                        drawRoundedFilled(target, draw_list, scaleRect(c.rect, scale), c.color, c.radius, c.aa, phys_clip, scale, true);
+                        const plan = makeGradientPlan(c.paint, scale);
+                        if (c.radius == 0) {
+                            drawGradientRect(target, draw_list, scaleRect(c.rect, scale), plan, phys_clip, true);
+                        } else {
+                            drawRoundedGradientFilled(target, draw_list, scaleRect(c.rect, scale), plan, c.radius, c.aa, phys_clip, scale, true);
+                        }
                     }
                 }
             },
@@ -295,6 +338,226 @@ fn scaleThickness(thickness: u32, scale: f32) u32 {
 /// implies `|v| <= 2^29`.
 fn floorI32(v: f32) i32 {
     return @intFromFloat(@floor(v));
+}
+
+const LinearPlan = struct {
+    start_color: Color,
+    end_color: Color,
+    base_q8: i64,
+    step_x_q8: i64,
+    step_y_q8: i64,
+    vertical: bool,
+};
+
+const RadialPlan = struct {
+    inner_color: Color,
+    outer_color: Color,
+    center: draw_mod.Vec2f,
+    inv_radius_squared: f32,
+};
+
+const GradientPlan = union(enum) {
+    linear: LinearPlan,
+    radial: RadialPlan,
+};
+
+fn makeGradientPlan(paint: Paint, scale: f32) GradientPlan {
+    return switch (paint) {
+        .solid => unreachable,
+        .linear => |g| {
+            const start = draw_mod.Vec2f{ .x = g.start.x * scale, .y = g.start.y * scale };
+            const end = draw_mod.Vec2f{ .x = g.end.x * scale, .y = g.end.y * scale };
+            const dx = end.x - start.x;
+            const dy = end.y - start.y;
+            const inv_length_squared = 1.0 / (dx * dx + dy * dy);
+            const x_step = fixedQ8(dx * inv_length_squared * 255.0);
+            const y_step = fixedQ8(dy * inv_length_squared * 255.0);
+            return .{ .linear = .{
+                .start_color = g.start_color,
+                .end_color = g.end_color,
+                .base_q8 = fixedQ8(-start.x * dx * inv_length_squared * 255.0 - start.y * dy * inv_length_squared * 255.0),
+                .step_x_q8 = x_step,
+                .step_y_q8 = y_step,
+                .vertical = dx == 0.0,
+            } };
+        },
+        .radial => |g| {
+            const radius = g.radius * scale;
+            return .{ .radial = .{
+                .inner_color = g.inner_color,
+                .outer_color = g.outer_color,
+                .center = .{ .x = g.center.x * scale, .y = g.center.y * scale },
+                .inv_radius_squared = 1.0 / (radius * radius),
+            } };
+        },
+    };
+}
+
+fn fixedQ8(value: f32) i64 {
+    const bounded = std.math.clamp(value * 256.0, -9.0e15, 9.0e15);
+    return @intFromFloat(@round(bounded));
+}
+
+inline fn gradientCoefficient(q8: i64) u8 {
+    if (q8 <= 0) return 0;
+    if (q8 >= 255 * 256) return 255;
+    return @intCast((q8 + 128) >> 8);
+}
+
+fn gradientIsOpaque(plan: GradientPlan) bool {
+    return switch (plan) {
+        .linear => |p| p.start_color.a == 255 and p.end_color.a == 255,
+        .radial => |p| p.inner_color.a == 255 and p.outer_color.a == 255,
+    };
+}
+
+fn gradientColors4(start: u32, end: u32, t: @Vector(4, u8), comptime use_simd: bool) @Vector(16, u8) {
+    if (comptime use_simd) return pixelops.lerpColor4(@bitCast([4]u32{ start, start, start, start }), @bitCast([4]u32{ end, end, end, end }), t);
+    var out: [4]u32 = undefined;
+    for (0..4) |i| out[i] = pixelops.lerpColor(start, end, t[i]);
+    return @bitCast(out);
+}
+
+fn storeGradient4(dst: *[4]u32, colors: @Vector(16, u8), is_opaque: bool, comptime use_simd: bool) void {
+    if (comptime use_simd) {
+        if (is_opaque) {
+            dst.* = @bitCast(colors);
+        } else {
+            dst.* = @bitCast(pixelops.srcOverOpaque4(@bitCast(dst.*), colors));
+        }
+        return;
+    }
+    const scalar: [4]u32 = @bitCast(colors);
+    for (0..4) |i| {
+        dst[i] = if (is_opaque) scalar[i] else pixelops.srcOverOpaque(dst[i], scalar[i]);
+    }
+}
+
+fn buildLinearColumns(draw_list: *DrawList, bounds: Rect, plan: LinearPlan) []i64 {
+    const columns = draw_list.ensureLinearGradientColumns(bounds.w);
+    var q = plan.base_q8 + @as(i64, bounds.x) * plan.step_x_q8;
+    for (columns) |*column| {
+        column.* = q;
+        q += plan.step_x_q8;
+    }
+    return columns;
+}
+
+/// Runs over every gradient pixel, every frame. The command-level plan hoists
+/// reciprocal setup; the row loop uses four-pixel interpolation and a scalar tail.
+fn drawGradientRect(target: RenderTarget, draw_list: *DrawList, rect: Rect, plan: GradientPlan, clip: Rect, comptime use_simd: bool) void {
+    const bounds = clipRect(rect, clip, target);
+    if (bounds.isEmpty()) return;
+    switch (plan) {
+        .linear => |linear| drawLinearRect(target, draw_list, bounds, linear, comptime use_simd),
+        .radial => |radial| drawRadialRect(target, draw_list, bounds, radial, comptime use_simd),
+    }
+}
+
+fn drawLinearRect(target: RenderTarget, draw_list: *DrawList, bounds: Rect, plan: LinearPlan, comptime use_simd: bool) void {
+    const is_opaque = plan.start_color.a == 255 and plan.end_color.a == 255;
+    const start_u32: u32 = @bitCast(plan.start_color);
+    const end_u32: u32 = @bitCast(plan.end_color);
+    const x0: u32 = @intCast(bounds.x);
+    const y0: u32 = @intCast(bounds.y);
+    var row: u32 = 0;
+    if (plan.vertical) {
+        while (row < bounds.h) : (row += 1) {
+            const t = gradientCoefficient(plan.base_q8 + @as(i64, y0 + row) * plan.step_y_q8);
+            const color = pixelops.lerpColor(start_u32, end_u32, t);
+            const base = (@as(usize, y0) + row) * target.width + x0;
+            if (is_opaque) {
+                pixelops.fill32(target.pixels[base..][0..bounds.w], color);
+                continue;
+            }
+            var x: u32 = 0;
+            while (x + 4 <= bounds.w) : (x += 4) {
+                const dst: *[4]u32 = target.pixels[base + x ..][0..4];
+                const colors = @as(@Vector(16, u8), @bitCast([4]u32{ color, color, color, color }));
+                storeGradient4(dst, colors, false, comptime use_simd);
+            }
+            while (x < bounds.w) : (x += 1) {
+                target.pixels[base + x] = pixelops.srcOverOpaque(target.pixels[base + x], color);
+            }
+        }
+        return;
+    }
+
+    const columns = buildLinearColumns(draw_list, bounds, plan);
+    while (row < bounds.h) : (row += 1) {
+        const row_q8 = @as(i64, y0 + row) * plan.step_y_q8;
+        const base = (@as(usize, y0) + row) * target.width + x0;
+        var x: u32 = 0;
+        while (x + 4 <= bounds.w) : (x += 4) {
+            const t: @Vector(4, u8) = .{
+                gradientCoefficient(columns[x] + row_q8),
+                gradientCoefficient(columns[x + 1] + row_q8),
+                gradientCoefficient(columns[x + 2] + row_q8),
+                gradientCoefficient(columns[x + 3] + row_q8),
+            };
+            const colors = gradientColors4(start_u32, end_u32, t, comptime use_simd);
+            storeGradient4(target.pixels[base + x ..][0..4], colors, is_opaque, comptime use_simd);
+        }
+        while (x < bounds.w) : (x += 1) {
+            const t = gradientCoefficient(columns[x] + row_q8);
+            const color = pixelops.lerpColor(start_u32, end_u32, t);
+            target.pixels[base + x] = if (is_opaque) color else pixelops.srcOverOpaque(target.pixels[base + x], color);
+        }
+    }
+}
+
+fn ensureRadialGradientLut(draw_list: *DrawList) []const u8 {
+    const lut = draw_list.ensureRadialGradientLut();
+    if (!draw_list.radial_gradient_lut_ready) {
+        for (lut, 0..) |*entry, i| {
+            const normalized_squared: f32 = @as(f32, @floatFromInt(i)) / 1023.0;
+            entry.* = @intFromFloat(@round(std.math.sqrt(normalized_squared) * 255.0));
+        }
+        draw_list.radial_gradient_lut_ready = true;
+    }
+    return lut;
+}
+
+inline fn radialCoefficient(lut: []const u8, squared_distance: f32, inv_radius_squared: f32) u8 {
+    const normalized = @min(1.0, squared_distance * inv_radius_squared);
+    const index: usize = @intFromFloat(normalized * 1023.0);
+    return lut[index];
+}
+
+fn drawRadialRect(target: RenderTarget, draw_list: *DrawList, bounds: Rect, plan: RadialPlan, comptime use_simd: bool) void {
+    const lut = ensureRadialGradientLut(draw_list);
+    const is_opaque = plan.inner_color.a == 255 and plan.outer_color.a == 255;
+    const inner_u32: u32 = @bitCast(plan.inner_color);
+    const outer_u32: u32 = @bitCast(plan.outer_color);
+    const x0: f32 = @floatFromInt(bounds.x);
+    var row: u32 = 0;
+    while (row < bounds.h) : (row += 1) {
+        var dx = x0 - plan.center.x;
+        const dy = @as(f32, @floatFromInt(@as(i32, bounds.y) + @as(i32, @intCast(row)))) - plan.center.y;
+        var squared_distance = dx * dx + dy * dy;
+        var delta = 2.0 * dx + 1.0;
+        const base = (@as(usize, @intCast(bounds.y)) + row) * target.width + @as(usize, @intCast(bounds.x));
+        var x: u32 = 0;
+        while (x + 4 <= bounds.w) : (x += 4) {
+            var t: [4]u8 = undefined;
+            inline for (0..4) |lane| {
+                t[lane] = radialCoefficient(lut, squared_distance, plan.inv_radius_squared);
+                squared_distance += delta;
+                delta += 2.0;
+            }
+            const colors = gradientColors4(inner_u32, outer_u32, t, comptime use_simd);
+            storeGradient4(target.pixels[base + x ..][0..4], colors, is_opaque, comptime use_simd);
+            dx += 4.0;
+        }
+        while (x < bounds.w) : (x += 1) {
+            const t = radialCoefficient(lut, squared_distance, plan.inv_radius_squared);
+            const color = pixelops.lerpColor(inner_u32, outer_u32, t);
+            target.pixels[base + x] = if (is_opaque) color else pixelops.srcOverOpaque(target.pixels[base + x], color);
+            squared_distance += delta;
+            delta += 2.0;
+            dx += 1.0;
+        }
+    }
 }
 
 // ── pixel helpers ─────────────────────────────────────────────────────────────
@@ -606,7 +869,7 @@ fn drawCornerSet(
         }
         return;
     }
-    inline for (std.meta.tags(CornerOrientation)) |orientation| {
+    for (std.meta.tags(CornerOrientation)) |orientation| {
         blitGeneratedCorner(
             target,
             draw_list,
@@ -670,6 +933,257 @@ fn drawRoundedFilledDevice(
         }, col, clip);
     }
     drawCornerSet(target, draw_list, rect, radius, 0, 0, aa, col, clip, scale, use_simd);
+}
+
+fn gradientColorAt(draw_list: *DrawList, plan: GradientPlan, x: i32, y: i32) u32 {
+    return switch (plan) {
+        .linear => |p| {
+            const q8 = p.base_q8 + @as(i64, x) * p.step_x_q8 + @as(i64, y) * p.step_y_q8;
+            return pixelops.lerpColor(@bitCast(p.start_color), @bitCast(p.end_color), gradientCoefficient(q8));
+        },
+        .radial => |p| {
+            const lut = ensureRadialGradientLut(draw_list);
+            const dx = @as(f32, @floatFromInt(x)) - p.center.x;
+            const dy = @as(f32, @floatFromInt(y)) - p.center.y;
+            const t = radialCoefficient(lut, dx * dx + dy * dy, p.inv_radius_squared);
+            return pixelops.lerpColor(@bitCast(p.inner_color), @bitCast(p.outer_color), t);
+        },
+    };
+}
+
+fn gradientColors4At(
+    draw_list: *DrawList,
+    plan: GradientPlan,
+    x: i32,
+    y: i32,
+    comptime use_simd: bool,
+) @Vector(16, u8) {
+    if (comptime !use_simd) {
+        return @bitCast([4]u32{
+            gradientColorAt(draw_list, plan, x, y),
+            gradientColorAt(draw_list, plan, x + 1, y),
+            gradientColorAt(draw_list, plan, x + 2, y),
+            gradientColorAt(draw_list, plan, x + 3, y),
+        });
+    }
+    return switch (plan) {
+        .linear => |p| {
+            const x0 = @as(i64, x);
+            const row_q8 = @as(i64, y) * p.step_y_q8;
+            const t: @Vector(4, u8) = .{
+                gradientCoefficient(p.base_q8 + x0 * p.step_x_q8 + row_q8),
+                gradientCoefficient(p.base_q8 + (x0 + 1) * p.step_x_q8 + row_q8),
+                gradientCoefficient(p.base_q8 + (x0 + 2) * p.step_x_q8 + row_q8),
+                gradientCoefficient(p.base_q8 + (x0 + 3) * p.step_x_q8 + row_q8),
+            };
+            return gradientColors4(@bitCast(p.start_color), @bitCast(p.end_color), t, true);
+        },
+        .radial => |p| {
+            const lut = ensureRadialGradientLut(draw_list);
+            const fy = @as(f32, @floatFromInt(y)) - p.center.y;
+            var t: [4]u8 = undefined;
+            inline for (0..4) |lane| {
+                const fx = @as(f32, @floatFromInt(x + @as(i32, @intCast(lane)))) - p.center.x;
+                t[lane] = radialCoefficient(lut, fx * fx + fy * fy, p.inv_radius_squared);
+            }
+            return gradientColors4(@bitCast(p.inner_color), @bitCast(p.outer_color), t, true);
+        },
+    };
+}
+
+fn gradientCoverage(
+    mask: CachedMask,
+    inner: ?CachedMask,
+    inset: u32,
+    sx: u32,
+    sy: u32,
+    source_x: u32,
+    source_y: u32,
+    stride: u32,
+    aa: bool,
+) u8 {
+    var coverage: u8 = if (inner != null)
+        finalCoverage(mask, inner, inset, sx, sy, true)
+    else
+        mask.coverage[@as(usize, sy - source_y) * stride + (sx - source_x)];
+    if (!aa) coverage = if (coverage >= 128) 255 else 0;
+    return coverage;
+}
+
+/// Hot path for gradient rounded corners. Absolute target coordinates are
+/// sampled, so all four corners and the centre bands share one gradient plan.
+fn blitGradientBand(
+    target: RenderTarget,
+    draw_list: *DrawList,
+    bounds: Rect,
+    corner: Rect,
+    orientation: CornerOrientation,
+    mask: CachedMask,
+    source_x: u32,
+    source_y: u32,
+    stride: u32,
+    inner: ?CachedMask,
+    inset: u32,
+    aa: bool,
+    plan: GradientPlan,
+    comptime use_simd: bool,
+) void {
+    const is_opaque = gradientIsOpaque(plan);
+    const dst_x: u32 = @intCast(bounds.x);
+    const dst_y: u32 = @intCast(bounds.y);
+    const local_x0: u32 = @intCast(bounds.x - corner.x);
+    const local_y0: u32 = @intCast(bounds.y - corner.y);
+    var row: u32 = 0;
+    while (row < bounds.h) : (row += 1) {
+        const sy = sourceY(orientation, mask.radius, local_y0 + row);
+        const absolute_y = bounds.y + @as(i32, @intCast(row));
+        const dst_base = (@as(usize, dst_y) + row) * target.width + dst_x;
+        var x: u32 = 0;
+        if (comptime use_simd) {
+            while (x + 4 <= bounds.w) : (x += 4) {
+                var cov: [4]u8 = undefined;
+                inline for (0..4) |lane| {
+                    const local_x = local_x0 + x + @as(u32, @intCast(lane));
+                    const sx = sourceX(orientation, mask.radius, local_x);
+                    cov[lane] = gradientCoverage(mask, inner, inset, sx, sy, source_x, source_y, stride, aa);
+                }
+                const cov4: @Vector(4, u8) = cov;
+                if (@reduce(.Or, cov4) == 0) continue;
+                const colors = gradientColors4At(draw_list, plan, bounds.x + @as(i32, @intCast(x)), absolute_y, true);
+                const dst: *[4]u32 = target.pixels[dst_base + x ..][0..4];
+                if (@reduce(.And, cov4 == @as(@Vector(4, u8), @splat(255))) and is_opaque) {
+                    dst.* = @bitCast(colors);
+                } else if (@reduce(.And, cov4 == @as(@Vector(4, u8), @splat(255))) and !is_opaque) {
+                    dst.* = @bitCast(pixelops.srcOverOpaque4(@bitCast(dst.*), colors));
+                } else {
+                    dst.* = @bitCast(pixelops.srcOverCoverage4(@bitCast(dst.*), colors, cov4));
+                }
+            }
+        }
+        while (x < bounds.w) : (x += 1) {
+            const sx = sourceX(orientation, mask.radius, local_x0 + x);
+            const coverage = gradientCoverage(mask, inner, inset, sx, sy, source_x, source_y, stride, aa);
+            if (coverage == 0) continue;
+            const color = gradientColorAt(draw_list, plan, bounds.x + @as(i32, @intCast(x)), absolute_y);
+            const dst_index = dst_base + x;
+            if (coverage == 255 and is_opaque) {
+                target.pixels[dst_index] = color;
+            } else if (coverage == 255) {
+                target.pixels[dst_index] = pixelops.srcOverOpaque(target.pixels[dst_index], color);
+            } else {
+                target.pixels[dst_index] = pixelops.srcOverCoverage(target.pixels[dst_index], color, coverage);
+            }
+        }
+    }
+}
+
+fn blitGradientCachedCorner(
+    target: RenderTarget,
+    draw_list: *DrawList,
+    dst: Rect,
+    clip: Rect,
+    orientation: CornerOrientation,
+    outer: CachedMask,
+    inner: ?CachedMask,
+    inset: u32,
+    aa: bool,
+    plan: GradientPlan,
+    comptime use_simd: bool,
+) void {
+    const bounds = clipRect(dst, clip, target);
+    if (bounds.isEmpty()) return;
+    draw_list.corner_masks.addCoveragePixels(@as(usize, bounds.w) * bounds.h);
+    blitGradientBand(target, draw_list, bounds, dst, orientation, outer, 0, 0, outer.radius, inner, inset, aa, plan, comptime use_simd);
+}
+
+fn blitGradientGeneratedBand(
+    target: RenderTarget,
+    draw_list: *DrawList,
+    bounds: Rect,
+    corner: Rect,
+    orientation: CornerOrientation,
+    mask: CachedMask,
+    source_x: u32,
+    source_y: u32,
+    aa: bool,
+    plan: GradientPlan,
+    comptime use_simd: bool,
+) void {
+    blitGradientBand(target, draw_list, bounds, corner, orientation, mask, source_x, source_y, bounds.w, null, 0, aa, plan, comptime use_simd);
+}
+
+fn drawGradientCornerSet(
+    target: RenderTarget,
+    draw_list: *DrawList,
+    rect: Rect,
+    radius: u32,
+    aa: bool,
+    plan: GradientPlan,
+    clip: Rect,
+    scale: f32,
+    comptime use_simd: bool,
+) void {
+    if (getCornerMask(draw_list, radius, scale)) |outer_mask| {
+        inline for (std.meta.tags(CornerOrientation)) |orientation| {
+            blitGradientCachedCorner(target, draw_list, cornerRect(rect, radius, orientation), clip, orientation, outer_mask, null, 0, aa, plan, comptime use_simd);
+        }
+        return;
+    }
+    const max_pixels = draw_mod.path_scratch_limit_bytes / draw_mod.path_scratch_bytes_per_pixel;
+    for (std.meta.tags(CornerOrientation)) |orientation| {
+        const dst = cornerRect(rect, radius, orientation);
+        const bounds = clipRect(dst, clip, target);
+        if (bounds.isEmpty()) continue;
+        const band_h: u32 = @max(1, @as(u32, @intCast(max_pixels / bounds.w)));
+        var dy: u32 = 0;
+        while (dy < bounds.h) {
+            const h = @min(band_h, bounds.h - dy);
+            const band_dst = Rect{ .x = bounds.x, .y = bounds.y + @as(i32, @intCast(dy)), .w = bounds.w, .h = h };
+            const local_x: u32 = @intCast(band_dst.x - dst.x);
+            const local_y: u32 = @intCast(band_dst.y - dst.y);
+            const source_x = switch (orientation) {
+                .top_left, .bottom_left => local_x,
+                .top_right, .bottom_right => radius - local_x - band_dst.w,
+            };
+            const source_y = switch (orientation) {
+                .top_left, .top_right => local_y,
+                .bottom_left, .bottom_right => radius - local_y - band_dst.h,
+            };
+            const pixels = @as(usize, band_dst.w) * band_dst.h;
+            draw_list.ensurePathScratch(pixels);
+            draw_list.ensureCornerBand(pixels);
+            corner_mask.rasterizeBand(radius, source_x, source_y, band_dst.w, band_dst.h, draw_list.path_area, draw_list.path_cover, draw_list.path_coverage);
+            @memcpy(draw_list.corner_band[0..pixels], draw_list.path_coverage[0..pixels]);
+            const generated = CachedMask{ .coverage = draw_list.corner_band[0..pixels], .radius = radius };
+            blitGradientGeneratedBand(target, draw_list, band_dst, dst, orientation, generated, source_x, source_y, aa, plan, comptime use_simd);
+            dy += h;
+        }
+    }
+}
+
+fn drawRoundedGradientFilled(
+    target: RenderTarget,
+    draw_list: *DrawList,
+    rect: Rect,
+    plan: GradientPlan,
+    logical_radius: u32,
+    aa: bool,
+    clip: Rect,
+    scale: f32,
+    comptime use_simd: bool,
+) void {
+    const radius = clampedDeviceRadius(rect, logical_radius, scale);
+    if (radius == 0) return drawGradientRect(target, draw_list, rect, plan, clip, comptime use_simd);
+    if (rect.w == 0 or rect.h == 0) return;
+    const center_w = rect.w - radius * 2;
+    drawGradientRect(target, draw_list, .{ .x = rect.x + @as(i32, @intCast(radius)), .y = rect.y, .w = center_w, .h = rect.h }, plan, clip, comptime use_simd);
+    const middle_h = rect.h - radius * 2;
+    if (middle_h != 0) {
+        const middle_y = rect.y + @as(i32, @intCast(radius));
+        drawGradientRect(target, draw_list, .{ .x = rect.x, .y = middle_y, .w = radius, .h = middle_h }, plan, clip, comptime use_simd);
+        drawGradientRect(target, draw_list, .{ .x = rect.x + @as(i32, @intCast(rect.w - radius)), .y = middle_y, .w = radius, .h = middle_h }, plan, clip, comptime use_simd);
+    }
+    drawGradientCornerSet(target, draw_list, rect, radius, aa, plan, clip, scale, comptime use_simd);
 }
 
 fn drawRoundedOutline(
@@ -3049,6 +3563,128 @@ test "rounded render: SIMD and scalar corner coverage are framebuffer-identical"
     try std.testing.expectEqualSlices(u32, &simd_pixels, &scalar_pixels);
 }
 
+test "gradient render: vertical horizontal diagonal radial and rounded coverage" {
+    var dl = DrawList.init(std.testing.allocator);
+    defer dl.deinit();
+    dl.reset(64, 64);
+    try dl.rectFilledPaint(.{ .x = 0, .y = 0, .w = 16, .h = 16 }, .{ .linear = .{
+        .start = .{ .x = 0, .y = 0 },
+        .end = .{ .x = 0, .y = 16 },
+        .start_color = Color.rgba(0, 0, 0, 255),
+        .end_color = Color.rgba(255, 0, 0, 255),
+    } });
+    try dl.rectFilledPaint(.{ .x = 16, .y = 0, .w = 16, .h = 16 }, .{ .linear = .{
+        .start = .{ .x = 16, .y = 0 },
+        .end = .{ .x = 32, .y = 0 },
+        .start_color = Color.rgba(0, 0, 0, 255),
+        .end_color = Color.rgba(0, 255, 0, 255),
+    } });
+    try dl.rectFilledPaint(.{ .x = 32, .y = 0, .w = 16, .h = 16 }, .{ .linear = .{
+        .start = .{ .x = 32, .y = 0 },
+        .end = .{ .x = 48, .y = 16 },
+        .start_color = Color.rgba(0, 0, 0, 255),
+        .end_color = Color.rgba(0, 0, 255, 255),
+    } });
+    try dl.rectFilledPaintEx(.{ .x = 0, .y = 20, .w = 24, .h = 24 }, .{ .radial = .{
+        .center = .{ .x = 12, .y = 32 },
+        .radius = 12,
+        .inner_color = Color.rgba(255, 255, 255, 255),
+        .outer_color = Color.rgba(0, 0, 0, 255),
+    } }, .{ .radius = 6 });
+    try dl.rectFilledPaint(.{ .x = 28, .y = 20, .w = 20, .h = 20 }, .{ .linear = .{
+        .start = .{ .x = 28, .y = 20 },
+        .end = .{ .x = 48, .y = 20 },
+        .start_color = Color.rgba(255, 0, 0, 128),
+        .end_color = Color.rgba(0, 0, 255, 128),
+    } });
+    var pixels = [_]u32{0xFF202020} ** (64 * 64);
+    render(.{ .pixels = &pixels, .width = 64, .height = 64 }, &dl, font_mod.default_font, 1.0);
+    try std.testing.expect(@as(u32, @bitCast(Color.rgba(0, 0, 0, 255))) != pixels[15 * 64]);
+    try std.testing.expectEqual(@as(u32, 0xFF202020), pixels[20 * 64]);
+    try std.testing.expectEqual(@as(u32, 0xFFFFFFFF), pixels[32 * 64 + 12]);
+    try std.testing.expectEqual(@as(u32, 0xFF000000), pixels[20 * 64 + 12]);
+    try std.testing.expect(pixels[12 * 64 + 12] != pixels[32 * 64 + 12]);
+    try std.testing.expect(pixels[32 * 64 + 12] != pixels[32 * 64 + 36]);
+}
+
+test "gradient render: SIMD and scalar paths are framebuffer-identical" {
+    var simd = DrawList.init(std.testing.allocator);
+    defer simd.deinit();
+    var scalar = DrawList.init(std.testing.allocator);
+    defer scalar.deinit();
+    simd.reset(37, 29);
+    scalar.reset(37, 29);
+    const paint: Paint = .{ .linear = .{
+        .start = .{ .x = -3, .y = 2 },
+        .end = .{ .x = 34, .y = 27 },
+        .start_color = Color.rgba(20, 40, 80, 120),
+        .end_color = Color.rgba(220, 180, 140, 230),
+    } };
+    try simd.rectFilledPaintEx(.{ .x = -2, .y = 1, .w = 37, .h = 27 }, paint, .{ .radius = 7 });
+    try scalar.rectFilledPaintEx(.{ .x = -2, .y = 1, .w = 37, .h = 27 }, paint, .{ .radius = 7 });
+    var a = [_]u32{0xFF102030} ** (37 * 29);
+    var b = a;
+    render(.{ .pixels = &a, .width = 37, .height = 29 }, &simd, font_mod.default_font, 1.0);
+    render(.{ .pixels = &b, .width = 37, .height = 29 }, &scalar, font_mod.default_font, 1.0);
+    try std.testing.expectEqualSlices(u32, &b, &a);
+}
+
+test "gradient render: warm render performs no retained-scratch allocation" {
+    var dl = DrawList.init(std.testing.allocator);
+    defer dl.deinit();
+    dl.reset(32, 24);
+    try dl.rectFilledPaintEx(.{ .x = 0, .y = 0, .w = 32, .h = 24 }, .{ .radial = .{
+        .center = .{ .x = 16, .y = 12 },
+        .radius = 16,
+        .inner_color = Color.rgba(255, 255, 255, 255),
+        .outer_color = Color.rgba(0, 0, 0, 255),
+    } }, .{ .radius = 6 });
+    var pixels = [_]u32{0xFF000000} ** (32 * 24);
+    const target = RenderTarget{ .pixels = &pixels, .width = 32, .height = 24 };
+    render(target, &dl, font_mod.default_font, 1.0);
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
+    dl.alloc = failing.allocator();
+    render(target, &dl, font_mod.default_font, 1.0);
+    try std.testing.expectEqual(@as(usize, 0), failing.allocated_bytes);
+    dl.alloc = std.testing.allocator;
+}
+
+test "gradient render: solid warm path does not build gradient scratch" {
+    var dl = DrawList.init(std.testing.allocator);
+    defer dl.deinit();
+    dl.reset(24, 18);
+    try dl.rectFilled(.{ .x = 2, .y = 3, .w = 16, .h = 10 }, Color.rgba(40, 80, 120, 255));
+    var pixels = [_]u32{0xFF000000} ** (24 * 18);
+    const target = RenderTarget{ .pixels = &pixels, .width = 24, .height = 18 };
+    render(target, &dl, font_mod.default_font, 1.0);
+    try std.testing.expectEqual(@as(usize, 0), dl.linear_gradient_columns.len);
+    try std.testing.expectEqual(@as(usize, 0), dl.radial_gradient_lut.len);
+
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
+    dl.alloc = failing.allocator();
+    render(target, &dl, font_mod.default_font, 1.0);
+    try std.testing.expectEqual(@as(usize, 0), failing.allocated_bytes);
+    try std.testing.expectEqual(@as(usize, 0), dl.linear_gradient_columns.len);
+    try std.testing.expectEqual(@as(usize, 0), dl.radial_gradient_lut.len);
+    dl.alloc = std.testing.allocator;
+}
+
+test "gradient render: scaled dispatch uses physical gradient coordinates" {
+    var dl = DrawList.init(std.testing.allocator);
+    defer dl.deinit();
+    dl.reset(12, 12);
+    try dl.rectFilledPaint(.{ .x = 1, .y = 1, .w = 6, .h = 6 }, .{ .linear = .{
+        .start = .{ .x = 1, .y = 1 },
+        .end = .{ .x = 7, .y = 1 },
+        .start_color = Color.rgba(255, 0, 0, 255),
+        .end_color = Color.rgba(0, 0, 255, 255),
+    } });
+    var pixels = [_]u32{0xFF202020} ** (18 * 18);
+    render(.{ .pixels = &pixels, .width = 18, .height = 18 }, &dl, font_mod.default_font, 1.5);
+    try std.testing.expect(pixels[2 * 18 + 2] != 0xFF202020);
+    try std.testing.expect(pixels[2 * 18 + 8] != pixels[8 * 18 + 2]);
+}
+
 // ── render input domain ────────────────────────────────────────────
 
 test "scaleWithinDomain: rejects values outside (0, MAX_SCALE]" {
@@ -3071,7 +3707,19 @@ test "cmdWithinDomain: rejects coordinates, extents, thicknesses, and non-finite
     const ok_path_pts = [_]draw_mod.Vec2f{ .{ .x = 0, .y = 0 }, .{ .x = 4, .y = 0 } };
     const ok_path_verbs = [_]draw_mod.PathVerb{ .move, .line };
 
-    try std.testing.expect(cmdWithinDomain(.{ .rect_filled = .{ .rect = ok_rect, .color = col, .clip = ok_rect } }));
+    try std.testing.expect(cmdWithinDomain(.{ .rect_filled = .{ .rect = ok_rect, .paint = .{ .solid = col }, .clip = ok_rect } }));
+    try std.testing.expect(cmdWithinDomain(.{ .rect_filled = .{ .rect = ok_rect, .paint = .{ .linear = .{
+        .start = .{ .x = 0, .y = 0 },
+        .end = .{ .x = 8, .y = 0 },
+        .start_color = col,
+        .end_color = col,
+    } }, .clip = ok_rect } }));
+    try std.testing.expect(cmdWithinDomain(.{ .rect_filled = .{ .rect = ok_rect, .paint = .{ .radial = .{
+        .center = .{ .x = 4, .y = 4 },
+        .radius = 4,
+        .inner_color = col,
+        .outer_color = col,
+    } }, .clip = ok_rect } }));
     try std.testing.expect(cmdWithinDomain(.{ .rect_outline = .{ .rect = ok_rect, .color = col, .thickness = geom.MAX_THICKNESS, .clip = ok_rect } }));
     try std.testing.expect(cmdWithinDomain(.{ .line = .{ .p0 = ok_pt, .p1 = ok_pt, .color = col, .thickness = 1, .clip = ok_rect } }));
     try std.testing.expect(cmdWithinDomain(.{ .text = .{ .pos = ok_pt, .text = "A", .color = col, .clip = ok_rect } }));
@@ -3088,17 +3736,37 @@ test "cmdWithinDomain: rejects coordinates, extents, thicknesses, and non-finite
 
     try std.testing.expect(!cmdWithinDomain(.{ .rect_filled = .{
         .rect = .{ .x = geom.MAX_COORD + 1, .y = 0, .w = 1, .h = 1 },
-        .color = col,
+        .paint = .{ .solid = col },
         .clip = ok_rect,
     } }));
     try std.testing.expect(!cmdWithinDomain(.{ .rect_filled = .{
         .rect = .{ .x = geom.MIN_COORD - 1, .y = 0, .w = 1, .h = 1 },
-        .color = col,
+        .paint = .{ .solid = col },
         .clip = ok_rect,
     } }));
     try std.testing.expect(!cmdWithinDomain(.{ .rect_filled = .{
         .rect = .{ .x = 0, .y = 0, .w = geom.MAX_EXTENT + 1, .h = 1 },
-        .color = col,
+        .paint = .{ .solid = col },
+        .clip = ok_rect,
+    } }));
+    try std.testing.expect(!cmdWithinDomain(.{ .rect_filled = .{
+        .rect = ok_rect,
+        .paint = .{ .linear = .{
+            .start = .{ .x = 3, .y = 3 },
+            .end = .{ .x = 3, .y = 3 },
+            .start_color = col,
+            .end_color = col,
+        } },
+        .clip = ok_rect,
+    } }));
+    try std.testing.expect(!cmdWithinDomain(.{ .rect_filled = .{
+        .rect = ok_rect,
+        .paint = .{ .radial = .{
+            .center = .{ .x = 3, .y = 3 },
+            .radius = 0,
+            .inner_color = col,
+            .outer_color = col,
+        } },
         .clip = ok_rect,
     } }));
     try std.testing.expect(!cmdWithinDomain(.{ .rect_outline = .{
@@ -3246,7 +3914,7 @@ test "render: domain maxima at MAX_SCALE do not panic" {
     const cover = Rect{ .x = 0, .y = 0, .w = max_e, .h = max_e };
     const img = [_]u32{0xFFFFFFFF};
 
-    try dl.cmds.append(dl.alloc, .{ .rect_filled = .{ .rect = far_pos, .color = col, .clip = far_pos } });
+    try dl.cmds.append(dl.alloc, .{ .rect_filled = .{ .rect = far_pos, .paint = .{ .solid = col }, .clip = far_pos } });
     try dl.cmds.append(dl.alloc, .{ .rect_outline = .{ .rect = far_neg, .color = col, .thickness = max_t, .clip = far_neg } });
     try dl.cmds.append(dl.alloc, .{ .line = .{
         .p0 = .{ .x = max_c, .y = min_c },

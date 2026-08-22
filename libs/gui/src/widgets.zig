@@ -3079,14 +3079,14 @@ test "button: held frame paints bg_active; hover frame paints bg_hover" {
     moveTo(&ctx, c.x, c.y);
     _ = ctx.button("Btn");
     ctx.endFrame();
-    try std.testing.expectEqual(@as(u32, @bitCast(ctx.style.bg)), @as(u32, @bitCast(ctx.draw_list.cmds.items[0].rect_filled.color)));
+    try std.testing.expectEqual(@as(u32, @bitCast(ctx.style.bg)), @as(u32, @bitCast(ctx.draw_list.cmds.items[0].rect_filled.paint.solid)));
 
     // Frame 3: hover continues (hot_id promoted) → bg_hover
     ctx.beginFrame(800, 600);
     moveTo(&ctx, c.x, c.y);
     _ = ctx.button("Btn");
     ctx.endFrame();
-    try std.testing.expectEqual(@as(u32, @bitCast(ctx.style.bg_hover)), @as(u32, @bitCast(ctx.draw_list.cmds.items[0].rect_filled.color)));
+    try std.testing.expectEqual(@as(u32, @bitCast(ctx.style.bg_hover)), @as(u32, @bitCast(ctx.draw_list.cmds.items[0].rect_filled.paint.solid)));
 
     // Frame 4: press → held → bg_active
     ctx.beginFrame(800, 600);
@@ -3094,7 +3094,7 @@ test "button: held frame paints bg_active; hover frame paints bg_hover" {
     const res = ctx.button("Btn");
     ctx.endFrame();
     try std.testing.expect(!res);
-    try std.testing.expectEqual(@as(u32, @bitCast(ctx.style.bg_active)), @as(u32, @bitCast(ctx.draw_list.cmds.items[0].rect_filled.color)));
+    try std.testing.expectEqual(@as(u32, @bitCast(ctx.style.bg_active)), @as(u32, @bitCast(ctx.draw_list.cmds.items[0].rect_filled.paint.solid)));
 }
 
 // ── iconButton tests ──────────────────────────
@@ -3178,14 +3178,14 @@ test "iconButton: hot uses bg_hover; held uses bg_active" {
     moveTo(&ctx, c.x, c.y);
     _ = ctx.iconButtonId(0x1452, &test_icon_center, false);
     ctx.endFrame();
-    try std.testing.expectEqual(@as(u32, @bitCast(ctx.style.bg)), @as(u32, @bitCast(ctx.draw_list.cmds.items[0].rect_filled.color)));
+    try std.testing.expectEqual(@as(u32, @bitCast(ctx.style.bg)), @as(u32, @bitCast(ctx.draw_list.cmds.items[0].rect_filled.paint.solid)));
 
     // Hover continues → bg_hover
     ctx.beginFrame(800, 600);
     moveTo(&ctx, c.x, c.y);
     _ = ctx.iconButtonId(0x1452, &test_icon_center, false);
     ctx.endFrame();
-    try std.testing.expectEqual(@as(u32, @bitCast(ctx.style.bg_hover)), @as(u32, @bitCast(ctx.draw_list.cmds.items[0].rect_filled.color)));
+    try std.testing.expectEqual(@as(u32, @bitCast(ctx.style.bg_hover)), @as(u32, @bitCast(ctx.draw_list.cmds.items[0].rect_filled.paint.solid)));
 
     // press → held → bg_active
     ctx.beginFrame(800, 600);
@@ -3194,7 +3194,7 @@ test "iconButton: hot uses bg_hover; held uses bg_active" {
     ctx.endFrame();
     try std.testing.expect(res.held);
     try std.testing.expect(!res.clicked);
-    try std.testing.expectEqual(@as(u32, @bitCast(ctx.style.bg_active)), @as(u32, @bitCast(ctx.draw_list.cmds.items[0].rect_filled.color)));
+    try std.testing.expectEqual(@as(u32, @bitCast(ctx.style.bg_active)), @as(u32, @bitCast(ctx.draw_list.cmds.items[0].rect_filled.paint.solid)));
 }
 
 test "iconButton: mouse down-up yields clicked" {
@@ -3579,7 +3579,7 @@ test "colorSwatch: opaque emits bg+border only; semi-transparent emits checker+b
     try std.testing.expect(cmds[cmds.len - 1] == .rect_outline);
     try std.testing.expectEqual(
         @as(u32, @bitCast(translucent)),
-        @as(u32, @bitCast(cmds[cmds.len - 2].rect_filled.color)),
+        @as(u32, @bitCast(cmds[cmds.len - 2].rect_filled.paint.solid)),
     );
 }
 
@@ -6353,7 +6353,7 @@ test "beginListboxRow: indent width, line count, and line x sit at i*indent_w" {
 
     var filled: usize = 0;
     for (ctx.draw_list.cmds.items) |cmd| {
-        if (cmd == .rect_filled and std.meta.eql(cmd.rect_filled.color, ctx.style.border)) filled += 1;
+        if (cmd == .rect_filled and cmd.rect_filled.paint == .solid and std.meta.eql(cmd.rect_filled.paint.solid, ctx.style.border)) filled += 1;
     }
     try std.testing.expectEqual(@as(usize, depth), filled);
 }

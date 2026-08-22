@@ -181,6 +181,37 @@ pub fn scaleAlpha(c: u32, cov: u8) u32 {
 // straight family, opaque-dst (bit-identical to libs/font/src/color.zig Color.blend)
 // ============================================================
 
+/// Straight-alpha colour interpolation with an 8-bit coefficient.
+/// `t=0` returns `start`, `t=255` returns `end`; all four BGRA channels use
+/// the rounded integer form shared by the blend family.
+pub inline fn lerpColor(start: u32, end: u32, t: u8) u32 {
+    const ti: u32 = t;
+    const inv: u32 = 255 - ti;
+    const b = div255Round(ch(start, 0) * inv + ch(end, 0) * ti);
+    const g = div255Round(ch(start, 8) * inv + ch(end, 8) * ti);
+    const r = div255Round(ch(start, 16) * inv + ch(end, 16) * ti);
+    const a = div255Round(ch(start, 24) * inv + ch(end, 24) * ti);
+    return (a << 24) | (r << 16) | (g << 8) | b;
+}
+
+/// Four-pixel straight-alpha colour interpolation. The lane order is
+/// `[B0 G0 R0 A0, B1 G1 R1 A1, B2 G2 R2 A2, B3 G3 R3 A3]`.
+/// Bit-identical to four `lerpColor` calls, including the rounded endpoints.
+pub inline fn lerpColor4(start: Vec16u8, end: Vec16u8, t: @Vector(4, u8)) Vec16u8 {
+    const t_idx: @Vector(16, i32) = .{
+        0, 0, 0, 0,
+        1, 1, 1, 1,
+        2, 2, 2, 2,
+        3, 3, 3, 3,
+    };
+    const t4: Vec16u8 = @shuffle(u8, t, undefined, t_idx);
+    const t16: Vec16u16 = @intCast(t4);
+    const inv16: Vec16u16 = @as(Vec16u16, @splat(255)) - t16;
+    const start16: Vec16u16 = @intCast(start);
+    const end16: Vec16u16 = @intCast(end);
+    return @intCast(div255RoundVec16(start16 * inv16 + end16 * t16));
+}
+
 /// Straight src-over treating dst as opaque (scalar). Output alpha fixed at 0xFF.
 /// Partial alpha: bit-identical to (sa*src + (255-sa)*dst + 127) / 255 per channel.
 /// Also bit-identical to `srcOver` when dst is opaque (pinned by tests).
@@ -1064,6 +1095,28 @@ test "srcOverStraightScalar: identity (bit-keeps src when dst=0, opacity=255, a>
         const dst = rng.int(u32);
         const expected: u32 = if ((dst >> 24) == 0) 0x00000000 else dst;
         try testing.expectEqual(expected, srcOverStraightScalar(dst, rng.int(u32) & 0x00FFFFFF, 255));
+    }
+}
+
+test "lerpColor4 matches scalar straight-alpha interpolation" {
+    var prng = std.Random.DefaultPrng.init(0x1E2F);
+    const rng = prng.random();
+    const coefficients = [_]u8{ 0, 1, 127, 128, 254, 255 };
+    for (coefficients) |t| {
+        var trial: usize = 0;
+        while (trial < 128) : (trial += 1) {
+            var start: [4]u32 = undefined;
+            var end: [4]u32 = undefined;
+            for (&start, &end) |*a, *b| {
+                a.* = rng.int(u32);
+                b.* = rng.int(u32);
+            }
+            var expected: [4]u32 = undefined;
+            const lane_t: [4]u8 = .{ t, rng.int(u8), rng.int(u8), 255 -% t };
+            for (0..4) |i| expected[i] = lerpColor(start[i], end[i], lane_t[i]);
+            const actual: [4]u32 = @bitCast(lerpColor4(@bitCast(start), @bitCast(end), lane_t));
+            try std.testing.expectEqualSlices(u32, &expected, &actual);
+        }
     }
 }
 

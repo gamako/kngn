@@ -51,6 +51,12 @@ pub fn main(init: std.process.Init) !void {
         defer dl.deinit();
         dl.reset(W, H);
         try buildScene(&dl, sc, img);
+        if (sc == .rect_opaque or sc == .rect_translucent) {
+            for (dl.cmds.items) |cmd| switch (cmd) {
+                .rect_filled => |rect| if (rect.paint != .solid) return error.FeatureOffSceneContainsGradient,
+                else => {},
+            };
+        }
 
         for ([_]struct { name: []const u8, font: gui.Font, outline: bool }{
             .{ .name = "outline", .font = gui.default_font, .outline = true },
@@ -58,44 +64,44 @@ pub fn main(init: std.process.Init) !void {
         }) |font_case| {
             if (sc != .text_draw and !font_case.outline) continue;
             for (scales) |s| {
-            // peak_bytes: peak from allocating this scale's physical target
-            tracker.reset();
-            const pw: u32 = @intFromFloat(@floor(@as(f32, @floatFromInt(W)) * s));
-            const ph: u32 = @intFromFloat(@floor(@as(f32, @floatFromInt(H)) * s));
-            const phys = try gpa.alloc(u32, pw * ph);
-            defer gpa.free(phys);
-            const phys_target = gui.RenderTarget{ .pixels = phys, .width = pw, .height = ph };
+                // peak_bytes: peak from allocating this scale's physical target
+                tracker.reset();
+                const pw: u32 = @intFromFloat(@floor(@as(f32, @floatFromInt(W)) * s));
+                const ph: u32 = @intFromFloat(@floor(@as(f32, @floatFromInt(H)) * s));
+                const phys = try gpa.alloc(u32, pw * ph);
+                defer gpa.free(phys);
+                const phys_target = gui.RenderTarget{ .pixels = phys, .width = pw, .height = ph };
 
-            const iters: usize = 200;
-            const raster_before = if (font_case.outline) gui.defaultFontFamily().coverage.rasterization_count else 0;
-            // warmup
-            gui.render(phys_target, &dl, font_case.font, s);
-            const raster_after_warmup = if (font_case.outline) gui.defaultFontFamily().coverage.rasterization_count else 0;
-
-            var total_ns: u64 = 0;
-            var min_ns: u64 = std.math.maxInt(u64);
-            var acc: u32 = 0;
-            var i: usize = 0;
-            while (i < iters) : (i += 1) {
-                const start = std.Io.Clock.Timestamp.now(io, .awake);
+                const iters: usize = 200;
+                const raster_before = if (font_case.outline) gui.defaultFontFamily().coverage.rasterization_count else 0;
+                // warmup
                 gui.render(phys_target, &dl, font_case.font, s);
-                const ns: u64 = @intCast(start.untilNow(io).raw.nanoseconds);
-                acc +%= phys[i % phys.len];
-                total_ns += ns;
-                min_ns = @min(min_ns, ns);
-            }
-            std.mem.doNotOptimizeAway(acc);
+                const raster_after_warmup = if (font_case.outline) gui.defaultFontFamily().coverage.rasterization_count else 0;
 
-            const avg = total_ns / iters;
-            const raster_after = if (font_case.outline) gui.defaultFontFamily().coverage.rasterization_count else 0;
-            if (sc == .text_draw) {
-                std.debug.print("gui.{s:<16} font={s:<7} scale={d:.1}  avg={d:>9} ns  min={d:>9} ns  peak_bytes={d}  raster_warmup={d}  raster_steady={d}\n", .{
-                    @tagName(sc), font_case.name, s, avg, min_ns, tracker.peak_bytes,
-                    raster_after_warmup - raster_before, raster_after - raster_after_warmup,
-                });
-            } else {
-                std.debug.print("gui.{s:<16} scale={d:.1}  avg={d:>9} ns  min={d:>9} ns  peak_bytes={d}\n", .{ @tagName(sc), s, avg, min_ns, tracker.peak_bytes });
-            }
+                var total_ns: u64 = 0;
+                var min_ns: u64 = std.math.maxInt(u64);
+                var acc: u32 = 0;
+                var i: usize = 0;
+                while (i < iters) : (i += 1) {
+                    const start = std.Io.Clock.Timestamp.now(io, .awake);
+                    gui.render(phys_target, &dl, font_case.font, s);
+                    const ns: u64 = @intCast(start.untilNow(io).raw.nanoseconds);
+                    acc +%= phys[i % phys.len];
+                    total_ns += ns;
+                    min_ns = @min(min_ns, ns);
+                }
+                std.mem.doNotOptimizeAway(acc);
+
+                const avg = total_ns / iters;
+                const raster_after = if (font_case.outline) gui.defaultFontFamily().coverage.rasterization_count else 0;
+                if (sc == .text_draw) {
+                    std.debug.print("gui.{s:<16} font={s:<7} scale={d:.1}  avg={d:>9} ns  min={d:>9} ns  peak_bytes={d}  raster_warmup={d}  raster_steady={d}\n", .{
+                        @tagName(sc),                        font_case.name,                     s, avg, min_ns, tracker.peak_bytes,
+                        raster_after_warmup - raster_before, raster_after - raster_after_warmup,
+                    });
+                } else {
+                    std.debug.print("gui.{s:<16} scale={d:.1}  avg={d:>9} ns  min={d:>9} ns  peak_bytes={d}\n", .{ @tagName(sc), s, avg, min_ns, tracker.peak_bytes });
+                }
             }
         }
     }

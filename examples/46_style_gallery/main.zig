@@ -1,4 +1,4 @@
-//! GUI style showcase: widget states, paths, and rounded primitives in four fixed sections.
+//! GUI style showcase: widget states, paths, rounded primitives, and gradient paints in five fixed sections.
 //!
 //! Hot path declaration:
 //! - The GUI tree and DrawList commands are built once per frame.
@@ -19,6 +19,7 @@ const Section = enum(u8) {
     states,
     paths,
     rounded,
+    gradients,
 };
 
 const FrameSection = enum {
@@ -270,6 +271,11 @@ fn renderFrame(ctx: *gui.Context, app: *App) void {
             ctx.labelEx("sharp / rounded fills / outlines / circles / translucent / clipped", ctx.style.text_subtle);
             ctx.endBox();
         },
+        .gradients => {
+            ctx.beginBox(.{ .direction = .column, .gap = 4, .padding = .{ 12, 12, 12, 12 } });
+            ctx.labelEx("linear vertical / diagonal / rounded and radial rounded paints", ctx.style.text_subtle);
+            ctx.endBox();
+        },
     }
     ctx.endBox();
     ctx.endBox();
@@ -334,6 +340,53 @@ fn appendRounded(app: *App) !void {
     draw_list.popClip();
     app.fill_count += 1;
     app.aa_on_count += 1;
+}
+
+/// Appends a fixed scene covering the supported rectangle paint variants.
+fn appendGradients(app: *App) !void {
+    const draw_list = &app.ctx.draw_list;
+    app.fill_count = 0;
+    app.stroke_count = 0;
+    app.aa_on_count = 0;
+    app.aa_off_count = 0;
+
+    const blue = gui.Color.rgba(0x38, 0x78, 0xE8, 0xFF);
+    const cyan = gui.Color.rgba(0x40, 0xD8, 0xC0, 0xFF);
+    const violet = gui.Color.rgba(0xA8, 0x60, 0xF0, 0xFF);
+    const amber = gui.Color.rgba(0xF0, 0xB0, 0x38, 0xFF);
+
+    try draw_list.rectFilledPaint(.{ .x = 44, .y = 164, .w = 180, .h = 108 }, .{ .linear = .{
+        .start = .{ .x = 44, .y = 164 },
+        .end = .{ .x = 44, .y = 272 },
+        .start_color = blue,
+        .end_color = cyan,
+    } });
+    try draw_list.rectFilledPaint(.{ .x = 248, .y = 164, .w = 180, .h = 108 }, .{ .linear = .{
+        .start = .{ .x = 248, .y = 164 },
+        .end = .{ .x = 428, .y = 272 },
+        .start_color = violet,
+        .end_color = amber,
+    } });
+    try draw_list.rectFilledPaintEx(.{ .x = 452, .y = 164, .w = 180, .h = 108 }, .{ .linear = .{
+        .start = .{ .x = 452, .y = 164 },
+        .end = .{ .x = 632, .y = 164 },
+        .start_color = cyan,
+        .end_color = violet,
+    } }, .{ .radius = 24 });
+    try draw_list.rectFilledPaintEx(.{ .x = 656, .y = 164, .w = 260, .h = 148 }, .{ .radial = .{
+        .center = .{ .x = 786, .y = 238 },
+        .radius = 130,
+        .inner_color = amber,
+        .outer_color = blue,
+    } }, .{ .radius = 32 });
+
+    try draw_list.rectFilled(.{ .x = 44, .y = 340, .w = 588, .h = 172 }, gui.Color.rgba(0x30, 0x38, 0x50, 0xFF));
+    try draw_list.rectFilledPaint(.{ .x = 44, .y = 340, .w = 588, .h = 172 }, .{ .linear = .{
+        .start = .{ .x = 44, .y = 340 },
+        .end = .{ .x = 632, .y = 512 },
+        .start_color = gui.Color.rgba(0x20, 0xA0, 0xFF, 0x88),
+        .end_color = gui.Color.rgba(0xF0, 0x50, 0xA0, 0x88),
+    } });
 }
 
 /// Appends the fixed path scene once per frame; all shapes are inside the framebuffer.
@@ -484,6 +537,8 @@ pub fn main(init: std.process.Init) !void {
             try appendPaths(&app, &path_arena);
         } else if (app.section == .rounded) {
             try appendRounded(&app);
+        } else if (app.section == .gradients) {
+            try appendGradients(&app);
         } else {
             app.fill_count = 0;
             app.stroke_count = 0;

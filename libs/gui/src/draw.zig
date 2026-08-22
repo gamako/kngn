@@ -13,6 +13,26 @@ pub const Font = font_mod.Font;
 /// Logical / device-space point used by path verbs. Distinct from integer `Vec2`.
 pub const Vec2f = struct { x: f32, y: f32 };
 
+pub const LinearGradient = struct {
+    start: Vec2f,
+    end: Vec2f,
+    start_color: Color,
+    end_color: Color,
+};
+
+pub const RadialGradient = struct {
+    center: Vec2f,
+    radius: f32,
+    inner_color: Color,
+    outer_color: Color,
+};
+
+pub const Paint = union(enum) {
+    solid: Color,
+    linear: LinearGradient,
+    radial: RadialGradient,
+};
+
 /// Path verbs. `fill` is a command attribute, not a verb.
 pub const PathVerb = enum(u8) {
     move,
@@ -234,7 +254,7 @@ pub const path_scratch_limit_bytes: usize = 4 * 1024 * 1024;
 pub const path_scratch_bytes_per_pixel: usize = @sizeOf(f32) * 2 + @sizeOf(u8);
 
 pub const DrawCmd = union(enum) {
-    rect_filled: struct { rect: Rect, color: Color, radius: u32 = 0, aa: bool = true, clip: Rect },
+    rect_filled: struct { rect: Rect, paint: Paint, radius: u32 = 0, aa: bool = true, clip: Rect },
     rect_outline: struct { rect: Rect, color: Color, thickness: u32, radius: u32 = 0, aa: bool = true, clip: Rect },
     circle_filled: struct { center: Vec2, radius: u32, color: Color, aa: bool = true, clip: Rect },
     circle_outline: struct { center: Vec2, radius: u32, color: Color, thickness: u32, aa: bool = true, clip: Rect },
@@ -430,6 +450,13 @@ pub const DrawList = struct {
     /// Retained outer coverage for an uncached giant quarter-ring band. The
     /// ordinary cached path does not use this buffer.
     corner_band: []u8 = &.{},
+    /// Retained fixed-point x contribution for linear gradient rows. It is
+    /// grown only when a gradient command needs a wider visible row.
+    linear_gradient_columns: []i64 = &.{},
+    /// Retained radial distance correction table. Solid and linear-only frames
+    /// never allocate it.
+    radial_gradient_lut: []u8 = &.{},
+    radial_gradient_lut_ready: bool = false,
 
     pub fn init(alloc: Allocator) DrawList {
         return .{ .alloc = alloc };
@@ -456,6 +483,11 @@ pub const DrawList = struct {
         self.corner_masks.deinit(self.alloc);
         if (self.corner_band.len != 0) self.alloc.free(self.corner_band);
         self.corner_band = &.{};
+        if (self.linear_gradient_columns.len != 0) self.alloc.free(self.linear_gradient_columns);
+        self.linear_gradient_columns = &.{};
+        if (self.radial_gradient_lut.len != 0) self.alloc.free(self.radial_gradient_lut);
+        self.radial_gradient_lut = &.{};
+        self.radial_gradient_lut_ready = false;
     }
 
     /// Call at the start of every frame. Sets root clip = Rect{0,0,w,h}.
@@ -473,9 +505,13 @@ pub const DrawList = struct {
     }
 
     pub fn rectFilled(self: *DrawList, rect: Rect, col: Color) Allocator.Error!void {
+        return self.rectFilledPaint(rect, .{ .solid = col });
+    }
+
+    pub fn rectFilledPaint(self: *DrawList, rect: Rect, paint: Paint) Allocator.Error!void {
         try self.cmds.append(self.alloc, .{ .rect_filled = .{
             .rect = rect,
-            .color = col,
+            .paint = paint,
             .radius = 0,
             .aa = true,
             .clip = self.currentClip(),
@@ -483,9 +519,13 @@ pub const DrawList = struct {
     }
 
     pub fn rectFilledEx(self: *DrawList, rect: Rect, col: Color, options: RoundedRectOptions) Allocator.Error!void {
+        return self.rectFilledPaintEx(rect, .{ .solid = col }, options);
+    }
+
+    pub fn rectFilledPaintEx(self: *DrawList, rect: Rect, paint: Paint, options: RoundedRectOptions) Allocator.Error!void {
         try self.cmds.append(self.alloc, .{ .rect_filled = .{
             .rect = rect,
-            .color = col,
+            .paint = paint,
             .radius = options.radius,
             .aa = options.aa,
             .clip = self.currentClip(),
@@ -641,6 +681,25 @@ pub const DrawList = struct {
         }
     }
 
+    pub fn ensureLinearGradientColumns(self: *DrawList, columns: usize) []i64 {
+        if (columns > self.linear_gradient_columns.len) {
+            self.linear_gradient_columns = if (self.linear_gradient_columns.len == 0)
+                self.alloc.alloc(i64, columns) catch @panic("DrawList linear gradient scratch: OOM")
+            else
+                self.alloc.realloc(self.linear_gradient_columns, columns) catch
+                    @panic("DrawList linear gradient scratch: OOM");
+        }
+        return self.linear_gradient_columns[0..columns];
+    }
+
+    pub fn ensureRadialGradientLut(self: *DrawList) []u8 {
+        if (self.radial_gradient_lut.len == 0) {
+            self.radial_gradient_lut = self.alloc.alloc(u8, 1024) catch
+                @panic("DrawList radial gradient LUT: OOM");
+        }
+        return self.radial_gradient_lut;
+    }
+
     pub fn cornerMaskDiagnostics(self: *const DrawList) corner_mask.Diagnostics {
         return self.corner_masks.diagnostics;
     }
@@ -707,6 +766,31 @@ test "DrawList: sharp wrappers append explicit zero-radius payloads" {
     try dl.rectOutline(.{ .x = 5, .y = 6, .w = 7, .h = 8 }, Color.rgba(5, 6, 7, 8), 2);
     try std.testing.expectEqual(@as(u32, 0), dl.cmds.items[0].rect_filled.radius);
     try std.testing.expectEqual(@as(u32, 0), dl.cmds.items[1].rect_outline.radius);
+}
+
+test "DrawList: paint wrappers retain solid, linear, and radial payloads" {
+    var dl = DrawList.init(std.testing.allocator);
+    defer dl.deinit();
+    dl.reset(64, 64);
+    const solid = Color.rgba(1, 2, 3, 4);
+    const linear: Paint = .{ .linear = .{
+        .start = .{ .x = 0, .y = 1 },
+        .end = .{ .x = 32, .y = 33 },
+        .start_color = solid,
+        .end_color = Color.rgba(5, 6, 7, 8),
+    } };
+    const radial: Paint = .{ .radial = .{
+        .center = .{ .x = 16, .y = 17 },
+        .radius = 12,
+        .inner_color = solid,
+        .outer_color = Color.rgba(9, 10, 11, 12),
+    } };
+    try dl.rectFilled(.{ .x = 0, .y = 0, .w = 8, .h = 8 }, solid);
+    try dl.rectFilledPaint(.{ .x = 8, .y = 0, .w = 8, .h = 8 }, linear);
+    try dl.rectFilledPaintEx(.{ .x = 16, .y = 0, .w = 8, .h = 8 }, radial, .{ .radius = 3 });
+    try std.testing.expectEqualDeep(Paint{ .solid = solid }, dl.cmds.items[0].rect_filled.paint);
+    try std.testing.expectEqualDeep(linear, dl.cmds.items[1].rect_filled.paint);
+    try std.testing.expectEqualDeep(radial, dl.cmds.items[2].rect_filled.paint);
 }
 
 test "DrawList: rounded and circle APIs bake options and clip" {

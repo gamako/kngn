@@ -25,6 +25,7 @@ pub const PathWinding = draw_mod.PathWinding;
 pub const PathJoin = draw_mod.PathJoin;
 pub const PathCap = draw_mod.PathCap;
 pub const Vec2f = draw_mod.Vec2f;
+pub const Paint = draw_mod.Paint;
 
 /// How many overlay commands a single inject may install. Sized so a full list still
 /// fits inside the copilot/harness 64 KiB wire limit at the current per-line width.
@@ -90,6 +91,9 @@ pub const FieldRole = enum {
     path_verbs,
     /// Path points as comma-separated IEEE-754 hex bits (`xxxxxxxx,yyyyyyyy,...`).
     path_points,
+    paint,
+    paint_color,
+    paint_f32,
 };
 
 pub const FieldSpec = struct {
@@ -115,7 +119,19 @@ pub const verbs = [_]VerbSpec{
             .{ .name = "y", .role = .i32 },
             .{ .name = "w", .role = .u32 },
             .{ .name = "h", .role = .u32 },
-            .{ .name = "color", .role = .color },
+            .{ .name = "color", .role = .color, .required = false },
+            .{ .name = "paint", .role = .paint, .required = false },
+            .{ .name = "from", .role = .paint_color, .required = false },
+            .{ .name = "to", .role = .paint_color, .required = false },
+            .{ .name = "x0", .role = .paint_f32, .required = false },
+            .{ .name = "y0", .role = .paint_f32, .required = false },
+            .{ .name = "x1", .role = .paint_f32, .required = false },
+            .{ .name = "y1", .role = .paint_f32, .required = false },
+            .{ .name = "inner", .role = .paint_color, .required = false },
+            .{ .name = "outer", .role = .paint_color, .required = false },
+            .{ .name = "cx", .role = .paint_f32, .required = false },
+            .{ .name = "cy", .role = .paint_f32, .required = false },
+            .{ .name = "gr", .role = .paint_f32, .required = false },
             .{ .name = "radius", .role = .u32, .required = false },
             .{ .name = "aa", .role = .u32, .required = false },
             .{ .name = "clip_x", .role = .i32, .required = false },
@@ -520,7 +536,10 @@ fn readU32(cmd: DrawCmd, name: []const u8) u32 {
 
 fn readColor(cmd: DrawCmd) u32 {
     return switch (cmd) {
-        .rect_filled => |c| colorBits(c.color),
+        .rect_filled => |c| switch (c.paint) {
+            .solid => |color| colorBits(color),
+            else => 0,
+        },
         .rect_outline => |c| colorBits(c.color),
         .circle_filled => |c| colorBits(c.color),
         .circle_outline => |c| colorBits(c.color),
@@ -528,6 +547,57 @@ fn readColor(cmd: DrawCmd) u32 {
         .text => |c| colorBits(c.color),
         .image => 0,
         .path => |c| colorBits(c.color),
+    };
+}
+
+fn readPaintName(cmd: DrawCmd) []const u8 {
+    return switch (cmd) {
+        .rect_filled => |c| switch (c.paint) {
+            .solid => "solid",
+            .linear => "linear",
+            .radial => "radial",
+        },
+        else => unreachable,
+    };
+}
+
+fn readPaintColor(cmd: DrawCmd, name: []const u8) u32 {
+    return switch (cmd) {
+        .rect_filled => |c| switch (c.paint) {
+            .linear => |g| if (std.mem.eql(u8, name, "from"))
+                colorBits(g.start_color)
+            else
+                colorBits(g.end_color),
+            .radial => |g| if (std.mem.eql(u8, name, "inner"))
+                colorBits(g.inner_color)
+            else
+                colorBits(g.outer_color),
+            .solid => unreachable,
+        },
+        else => unreachable,
+    };
+}
+
+fn readPaintF32(cmd: DrawCmd, name: []const u8) f32 {
+    return switch (cmd) {
+        .rect_filled => |c| switch (c.paint) {
+            .linear => |g| if (std.mem.eql(u8, name, "x0"))
+                g.start.x
+            else if (std.mem.eql(u8, name, "y0"))
+                g.start.y
+            else if (std.mem.eql(u8, name, "x1"))
+                g.end.x
+            else
+                g.end.y,
+            .radial => |g| if (std.mem.eql(u8, name, "cx"))
+                g.center.x
+            else if (std.mem.eql(u8, name, "cy"))
+                g.center.y
+            else
+                g.radius,
+            .solid => unreachable,
+        },
+        else => unreachable,
     };
 }
 
@@ -673,6 +743,9 @@ pub fn appendCmd(list: *std.ArrayList(u8), allocator: Allocator, cmd: DrawCmd) !
             .path_join => try appendFmt(list, allocator, "{s}={s}", .{ field.name, joinName(cmd) }),
             .path_cap => try appendFmt(list, allocator, "{s}={s}", .{ field.name, capName(cmd) }),
             .f32 => try appendFmt(list, allocator, "{s}={d}", .{ field.name, readF32(cmd, field.name) }),
+            .paint => try appendFmt(list, allocator, "{s}={s}", .{ field.name, readPaintName(cmd) }),
+            .paint_color => try appendFmt(list, allocator, "{s}=#{X:0>8}", .{ field.name, readPaintColor(cmd, field.name) }),
+            .paint_f32 => try appendFmt(list, allocator, "{s}={X:0>8}", .{ field.name, @as(u32, @bitCast(readPaintF32(cmd, field.name))) }),
             .path_verbs => {
                 try appendFmt(list, allocator, "{s}=\"", .{field.name});
                 try appendPathVerbs(list, allocator, cmd);
@@ -689,6 +762,22 @@ pub fn appendCmd(list: *std.ArrayList(u8), allocator: Allocator, cmd: DrawCmd) !
 }
 
 fn shouldEmitField(cmd: DrawCmd, field: FieldSpec) bool {
+    if (cmd == .rect_filled) {
+        const paint = cmd.rect_filled.paint;
+        if (std.mem.eql(u8, field.name, "color")) return paint == .solid;
+        if (std.mem.eql(u8, field.name, "paint")) return paint != .solid;
+        if (field.role == .paint_color or field.role == .paint_f32) {
+            return switch (paint) {
+                .solid => false,
+                .linear => std.mem.eql(u8, field.name, "from") or std.mem.eql(u8, field.name, "to") or
+                    std.mem.eql(u8, field.name, "x0") or std.mem.eql(u8, field.name, "y0") or
+                    std.mem.eql(u8, field.name, "x1") or std.mem.eql(u8, field.name, "y1"),
+                .radial => std.mem.eql(u8, field.name, "inner") or std.mem.eql(u8, field.name, "outer") or
+                    std.mem.eql(u8, field.name, "cx") or std.mem.eql(u8, field.name, "cy") or
+                    std.mem.eql(u8, field.name, "gr"),
+            };
+        }
+    }
     if (std.mem.eql(u8, field.name, "radius")) {
         return switch (cmd) {
             .rect_filled => |c| c.radius != 0,
@@ -799,6 +888,14 @@ fn parseColorBits(s: []const u8) ParseError!u32 {
     return std.fmt.parseUnsigned(u32, hex, 16) catch error.InvalidValue;
 }
 
+fn parsePaintF32(s: []const u8) ParseError!f32 {
+    if (s.len != 8) return error.InvalidValue;
+    const bits = std.fmt.parseUnsigned(u32, s, 16) catch return error.InvalidValue;
+    const value: f32 = @bitCast(bits);
+    if (!std.math.isFinite(value)) return error.InvalidValue;
+    return value;
+}
+
 fn fieldSpec(verb: *const VerbSpec, name: []const u8) ?*const FieldSpec {
     for (verb.fields) |*f| {
         if (std.mem.eql(u8, f.name, name)) return f;
@@ -818,6 +915,18 @@ const Staging = struct {
     thickness: ?u32 = null,
     radius: ?u32 = null,
     color: ?u32 = null,
+    paint: ?enum { linear, radial, solid } = null,
+    paint_from: ?u32 = null,
+    paint_to: ?u32 = null,
+    paint_inner: ?u32 = null,
+    paint_outer: ?u32 = null,
+    paint_x0: ?f32 = null,
+    paint_y0: ?f32 = null,
+    paint_x1: ?f32 = null,
+    paint_y1: ?f32 = null,
+    paint_cx: ?f32 = null,
+    paint_cy: ?f32 = null,
+    paint_gr: ?f32 = null,
     clip_x: ?i32 = null,
     clip_y: ?i32 = null,
     clip_w: ?u32 = null,
@@ -895,6 +1004,61 @@ const Staging = struct {
         } else return error.UnknownField;
     }
 
+    fn putPaintColor(self: *Staging, name: []const u8, v: u32) ParseError!void {
+        if (std.mem.eql(u8, name, "from")) {
+            if (self.paint_from != null) return error.DuplicateField;
+            self.paint_from = v;
+        } else if (std.mem.eql(u8, name, "to")) {
+            if (self.paint_to != null) return error.DuplicateField;
+            self.paint_to = v;
+        } else if (std.mem.eql(u8, name, "inner")) {
+            if (self.paint_inner != null) return error.DuplicateField;
+            self.paint_inner = v;
+        } else if (std.mem.eql(u8, name, "outer")) {
+            if (self.paint_outer != null) return error.DuplicateField;
+            self.paint_outer = v;
+        } else return error.UnknownField;
+    }
+
+    fn putPaintF32(self: *Staging, name: []const u8, v: f32) ParseError!void {
+        if (std.mem.eql(u8, name, "x0")) {
+            if (self.paint_x0 != null) return error.DuplicateField;
+            self.paint_x0 = v;
+        } else if (std.mem.eql(u8, name, "y0")) {
+            if (self.paint_y0 != null) return error.DuplicateField;
+            self.paint_y0 = v;
+        } else if (std.mem.eql(u8, name, "x1")) {
+            if (self.paint_x1 != null) return error.DuplicateField;
+            self.paint_x1 = v;
+        } else if (std.mem.eql(u8, name, "y1")) {
+            if (self.paint_y1 != null) return error.DuplicateField;
+            self.paint_y1 = v;
+        } else if (std.mem.eql(u8, name, "cx")) {
+            if (self.paint_cx != null) return error.DuplicateField;
+            self.paint_cx = v;
+        } else if (std.mem.eql(u8, name, "cy")) {
+            if (self.paint_cy != null) return error.DuplicateField;
+            self.paint_cy = v;
+        } else if (std.mem.eql(u8, name, "gr")) {
+            if (self.paint_gr != null) return error.DuplicateField;
+            self.paint_gr = v;
+        } else return error.UnknownField;
+    }
+
+    fn putPaint(self: *Staging, name: []const u8, value: []const u8) ParseError!void {
+        if (self.paint != null) return error.DuplicateField;
+        if (std.mem.eql(u8, value, "linear")) {
+            self.paint = .linear;
+        } else if (std.mem.eql(u8, value, "radial")) {
+            self.paint = .radial;
+        } else if (std.mem.eql(u8, value, "solid")) {
+            self.paint = .solid;
+        } else {
+            _ = name;
+            return error.InvalidValue;
+        }
+    }
+
     fn clip(self: Staging) Rect {
         return .{
             .x = self.clip_x orelse default_clip.x,
@@ -911,6 +1075,51 @@ fn requireI32(v: ?i32) ParseError!i32 {
 
 fn requireU32(v: ?u32) ParseError!u32 {
     return v orelse error.MissingField;
+}
+
+fn requirePaintF32(v: ?f32) ParseError!f32 {
+    return v orelse error.MissingField;
+}
+
+fn checkPaintCoord(v: f32) ParseError!f32 {
+    if (!std.math.isFinite(v) or v < @as(f32, @floatFromInt(MIN_COORD)) or
+        v > @as(f32, @floatFromInt(MAX_COORD))) return error.ValueOutOfRange;
+    return v;
+}
+
+fn buildRectPaint(st: Staging) ParseError!Paint {
+    if (st.paint == null) {
+        return .{ .solid = colorFromBits(st.color orelse return error.MissingField) };
+    }
+    if (st.color != null) return error.InvalidValue;
+    return switch (st.paint.?) {
+        .solid => .{ .solid = colorFromBits(st.color orelse return error.MissingField) },
+        .linear => blk: {
+            const x0 = try checkPaintCoord(try requirePaintF32(st.paint_x0));
+            const y0 = try checkPaintCoord(try requirePaintF32(st.paint_y0));
+            const x1 = try checkPaintCoord(try requirePaintF32(st.paint_x1));
+            const y1 = try checkPaintCoord(try requirePaintF32(st.paint_y1));
+            if (x0 == x1 and y0 == y1) return error.InvalidValue;
+            break :blk .{ .linear = .{
+                .start = .{ .x = x0, .y = y0 },
+                .end = .{ .x = x1, .y = y1 },
+                .start_color = colorFromBits(st.paint_from orelse return error.MissingField),
+                .end_color = colorFromBits(st.paint_to orelse return error.MissingField),
+            } };
+        },
+        .radial => blk: {
+            const cx = try checkPaintCoord(try requirePaintF32(st.paint_cx));
+            const cy = try checkPaintCoord(try requirePaintF32(st.paint_cy));
+            const radius = try checkPaintCoord(try requirePaintF32(st.paint_gr));
+            if (radius <= 0) return error.InvalidValue;
+            break :blk .{ .radial = .{
+                .center = .{ .x = cx, .y = cy },
+                .radius = radius,
+                .inner_color = colorFromBits(st.paint_inner orelse return error.MissingField),
+                .outer_color = colorFromBits(st.paint_outer orelse return error.MissingField),
+            } };
+        },
+    };
 }
 
 fn checkCoord(v: i32) ParseError!i32 {
@@ -946,7 +1155,7 @@ fn buildCmd(verb: *const VerbSpec, st: Staging, arena: Allocator) (ParseError ||
                 .w = try checkExtent(try requireU32(st.w)),
                 .h = try checkExtent(try requireU32(st.h)),
             },
-            .color = colorFromBits(st.color orelse return error.MissingField),
+            .paint = try buildRectPaint(st),
             .radius = try checkExtent(st.radius orelse 0),
             .aa = blk: {
                 const aa = st.aa orelse 1;
@@ -1128,6 +1337,9 @@ pub fn parseCmdLine(line: []const u8, arena: Allocator) (ParseError || Allocator
                 if (st.color != null) return error.DuplicateField;
                 st.color = try parseColorBits(pair.value);
             },
+            .paint => try st.putPaint(spec.name, pair.value),
+            .paint_color => try st.putPaintColor(spec.name, try parseColorBits(pair.value)),
+            .paint_f32 => try st.putPaintF32(spec.name, try parsePaintF32(pair.value)),
             .font => {
                 if (!std.mem.eql(u8, pair.value, "default")) return error.FontNotRestorable;
                 st.font = pair.value;
@@ -1375,6 +1587,44 @@ test "draw_cmd_text: rounded rectangles emit radius and only non-default AA" {
     try testing.expect(std.mem.indexOf(u8, second.items, "radius=7 aa=0") != null);
 }
 
+test "draw_cmd_text: gradient dumps use canonical IEEE bit fields and round trip" {
+    var src = DrawList.init(testing.allocator);
+    defer src.deinit();
+    src.reset(64, 64);
+    try src.rectFilledPaint(.{ .x = 1, .y = 2, .w = 20, .h = 16 }, .{ .linear = .{
+        .start = .{ .x = 0.5, .y = 1.0 },
+        .end = .{ .x = 20.25, .y = 18.0 },
+        .start_color = Color.rgba(1, 2, 3, 4),
+        .end_color = Color.rgba(5, 6, 7, 8),
+    } });
+    var first: std.ArrayList(u8) = .empty;
+    defer first.deinit(testing.allocator);
+    try appendCmd(&first, testing.allocator, src.cmds.items[0]);
+    try testing.expect(std.mem.indexOf(u8, first.items, "paint=linear") != null);
+    try testing.expect(std.mem.indexOf(u8, first.items, "x0=3F000000") != null);
+    try testing.expect(std.mem.indexOf(u8, first.items, "color=") == null);
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const parsed = try parseCmdLine(std.mem.trimEnd(u8, first.items, "\n"), arena.allocator());
+    var second: std.ArrayList(u8) = .empty;
+    defer second.deinit(testing.allocator);
+    try appendCmd(&second, testing.allocator, parsed);
+    try testing.expectEqualSlices(u8, first.items, second.items);
+}
+
+test "draw_cmd_text: invalid gradient domains are rejected" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    try testing.expectError(error.InvalidValue, parseCmdLine(
+        "cmd=rect_filled x=0 y=0 w=4 h=4 paint=linear from=#FF000000 to=#FFFFFFFF x0=00000000 y0=00000000 x1=00000000 y1=00000000",
+        arena.allocator(),
+    ));
+    try testing.expectError(error.InvalidValue, parseCmdLine(
+        "cmd=rect_filled x=0 y=0 w=4 h=4 paint=radial inner=#FFFFFFFF outer=#FF000000 cx=00000000 cy=00000000 gr=00000000",
+        arena.allocator(),
+    ));
+}
+
 test "draw_cmd_text: circle canonical dump round trips" {
     var dl = DrawList.init(testing.allocator);
     defer dl.deinit();
@@ -1435,7 +1685,7 @@ test "draw_cmd_text: rect/line/text dump parses back" {
 
     try testing.expectEqual(src.cmds.items.len, dst.cmds.items.len);
     try testing.expectEqual(src.cmds.items[0].rect_filled.rect, dst.cmds.items[0].rect_filled.rect);
-    try testing.expectEqual(colorBits(src.cmds.items[0].rect_filled.color), colorBits(dst.cmds.items[0].rect_filled.color));
+    try testing.expectEqual(src.cmds.items[0].rect_filled.paint, dst.cmds.items[0].rect_filled.paint);
     try testing.expectEqual(src.cmds.items[1].line.p0, dst.cmds.items[1].line.p0);
     try testing.expectEqual(src.cmds.items[1].line.p1, dst.cmds.items[1].line.p1);
     try testing.expectEqualStrings("hi there", dst.cmds.items[2].text.text);

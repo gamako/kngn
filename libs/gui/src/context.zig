@@ -2180,7 +2180,7 @@ test "anchor: clip_children clips an overflowing overlay's draw commands" {
     var found = false;
     for (ctx.draw_list.cmds.items) |cmd| {
         if (cmd != .rect_filled) continue;
-        if (!std.meta.eql(cmd.rect_filled.color, Color.rgba(0xC0, 0x30, 0x30, 0xFF))) continue;
+        if (cmd.rect_filled.paint != .solid or !std.meta.eql(cmd.rect_filled.paint.solid, Color.rgba(0xC0, 0x30, 0x30, 0xFF))) continue;
         try std.testing.expectEqual(@as(i32, 0), cmd.rect_filled.clip.x);
         try std.testing.expectEqual(@as(u32, 40), cmd.rect_filled.clip.w);
         try std.testing.expectEqual(@as(u32, 40), cmd.rect_filled.clip.h);
@@ -2271,14 +2271,14 @@ test "anchor: a tree with no overlay keeps the pre-overlay rect and DrawCmd cont
     try std.testing.expectEqual(@as(usize, 5), ctx.draw_list.cmds.items.len);
     try std.testing.expect(ctx.draw_list.cmds.items[0] == .rect_filled);
     try std.testing.expectEqual(row_r, ctx.draw_list.cmds.items[0].rect_filled.rect);
-    try std.testing.expectEqual(red, ctx.draw_list.cmds.items[0].rect_filled.color);
+    try std.testing.expectEqual(red, ctx.draw_list.cmds.items[0].rect_filled.paint.solid);
     try std.testing.expectEqual(left_r, ctx.draw_list.cmds.items[1].rect_filled.rect);
-    try std.testing.expectEqual(blue, ctx.draw_list.cmds.items[1].rect_filled.color);
+    try std.testing.expectEqual(blue, ctx.draw_list.cmds.items[1].rect_filled.paint.solid);
     try std.testing.expectEqualStrings("ab", ctx.draw_list.cmds.items[2].text.text);
     try std.testing.expectEqual(@as(i32, 0), ctx.draw_list.cmds.items[2].text.pos.x);
     try std.testing.expectEqual(@as(i32, 0), ctx.draw_list.cmds.items[2].text.pos.y);
     try std.testing.expectEqual(right_r, ctx.draw_list.cmds.items[3].rect_filled.rect);
-    try std.testing.expectEqual(green, ctx.draw_list.cmds.items[3].rect_filled.color);
+    try std.testing.expectEqual(green, ctx.draw_list.cmds.items[3].rect_filled.paint.solid);
     try std.testing.expectEqualStrings("cd", ctx.draw_list.cmds.items[4].text.text);
     try std.testing.expectEqual(@as(i32, 44), ctx.draw_list.cmds.items[4].text.pos.x);
     try std.testing.expectEqual(@as(i32, 0), ctx.draw_list.cmds.items[4].text.pos.y);

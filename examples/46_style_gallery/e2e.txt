@@ -162,4 +162,35 @@ expect drawlist path=0
 expect drawlist circle_filled=1
 expect drawlist circle_outline=1
 expect drawlist offclip=1
+
+# rounded primitives -> gradient paints
+inject key_down PAGE_DOWN
+step 1
+inject key_up PAGE_DOWN
+step 1
+digest showcase
+expect showcase section=gradients
+expect showcase index=4
+expect showcase hot=none
+expect showcase active=none
+expect showcase focused=none
+expect showcase selected=states
+expect showcase disabled=0
+expect showcase fill=0
+expect showcase stroke=0
+expect showcase aa_on=0
+expect showcase aa_off=0
+snapshot fb
+snapshot drawlist
+digest drawlist
+expect drawlist hash=C61CA366
+expect drawlist rect_filled=9
+expect drawlist rect_outline=0
+expect drawlist line=0
+expect drawlist text=3
+expect drawlist image=0
+expect drawlist path=0
+expect drawlist circle_filled=0
+expect drawlist circle_outline=0
+expect drawlist offclip=0
 quit

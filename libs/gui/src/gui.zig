@@ -17,6 +17,9 @@ pub const Vec2 = @import("geom.zig").Vec2;
 pub const RenderTarget = @import("geom.zig").RenderTarget;
 
 pub const Color = @import("color.zig").Color;
+pub const LinearGradient = @import("draw.zig").LinearGradient;
+pub const RadialGradient = @import("draw.zig").RadialGradient;
+pub const Paint = @import("draw.zig").Paint;
 
 pub const DrawCmd = @import("draw.zig").DrawCmd;
 pub const DrawList = @import("draw.zig").DrawList;

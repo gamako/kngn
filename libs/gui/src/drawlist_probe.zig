@@ -9,6 +9,8 @@
 //! the per-frame draw path, so the per-pixel and real-time performance rules do not apply.
 //!
 //! Text format (one command per line, k=v pairs, space separated):
+//!   Solid rectangles use `color=#AARRGGBB`; gradient rectangles use `paint=linear` or
+//!   `paint=radial` followed by canonical colors and IEEE-754 bit fields.
 //!   `cmd=rect_filled x=.. y=.. w=.. h=.. color=#AARRGGBB clip_x=.. clip_y=.. clip_w=.. clip_h=.. offclip=0|1`
 //!   `cmd=rect_outline` adds `thickness=..` after `h=..`.
 //!   Rounded rectangles add `radius=..`; default AA is omitted and AA off adds `aa=0`.
@@ -187,6 +189,29 @@ test "digest: deterministic across repeated calls on the same DrawList" {
     const a = digest(&dl, &buf_a);
     const b = digest(&dl, &buf_b);
     try testing.expectEqualStrings(a, b);
+}
+
+test "digest: gradients keep the command counts and use the canonical paint dump" {
+    var dl = DrawList.init(testing.allocator);
+    defer dl.deinit();
+    dl.reset(64, 64);
+    try dl.rectFilledPaint(.{ .x = 4, .y = 5, .w = 20, .h = 12 }, .{ .linear = .{
+        .start = .{ .x = 4, .y = 5 },
+        .end = .{ .x = 24, .y = 17 },
+        .start_color = draw_mod.Color.rgba(0x10, 0x20, 0x30, 0xFF),
+        .end_color = draw_mod.Color.rgba(0xA0, 0xB0, 0xC0, 0x80),
+    } });
+
+    var digest_buf: [1024]u8 = undefined;
+    const line = digest(&dl, &digest_buf);
+    try testing.expect(std.mem.indexOf(u8, line, "rect_filled=1") != null);
+    try testing.expect(std.mem.indexOf(u8, line, "offclip=0") != null);
+
+    const dump = try dumpAlloc(testing.allocator, &dl);
+    defer testing.allocator.free(dump);
+    try testing.expect(std.mem.indexOf(u8, dump, "paint=linear") != null);
+    try testing.expect(std.mem.indexOf(u8, dump, "color=") == null);
+    try testing.expect(std.mem.indexOf(u8, dump, "x0=40800000") != null);
 }
 
 test "digest: circle counts append after the existing command counts" {
