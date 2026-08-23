@@ -146,21 +146,25 @@ pub fn buttonId(ctx: *Context, id: Id, label: []const u8, opts: ButtonOpts) Butt
     const disabled = ctx.isDisabled();
     const hot = ctx.state.hot_id == id;
     const base_bg = if (opts.selected) style.button_bg_selected else style.bg;
-    // disabled > held > hover > selected > normal (selected adds accent fill)
-    const bg = if (disabled)
-        style.disabledColor(base_bg)
-    else if (result.held)
-        style.bg_active
-    else if (hot)
-        style.bg_hover
+    const colors: Context.ButtonColors = if (!style.animation.enabled)
+        .{
+            .bg = if (disabled)
+                style.disabledColor(base_bg)
+            else if (result.held)
+                style.bg_active
+            else if (hot)
+                style.bg_hover
+            else
+                base_bg,
+            .border = if (disabled)
+                style.disabledColor(style.border)
+            else if (hot or opts.selected)
+                style.border_hover
+            else
+                style.border,
+        }
     else
-        base_bg;
-    const border_color = if (disabled)
-        style.disabledColor(style.border)
-    else if (hot or opts.selected)
-        style.border_hover
-    else
-        style.border;
+        ctx.resolveButtonColors(id, base_bg, opts.selected, result.held, disabled);
     const thickness = if (opts.selected) style.button_border_selected else style.button_border;
     const pad = opts.padding orelse style.button_padding;
     // With `min_w`, width is fixed at call time assuming fixed-width font (`measure = 8×len`)
@@ -172,8 +176,8 @@ pub fn buttonId(ctx: *Context, id: Id, label: []const u8, opts: ButtonOpts) Butt
         .id = id,
         .width = width,
         .padding = pad,
-        .bg = bg,
-        .border = makeBorder(border_color, thickness),
+        .bg = colors.bg,
+        .border = makeBorder(colors.border, thickness),
         .radius = style.control_radius,
     });
     ctx.labelEx(label, if (disabled) style.disabledColor(style.text) else style.text);
@@ -2430,15 +2434,14 @@ pub fn tabId(ctx: *Context, id: Id, label: []const u8, selected: bool, opts: Tab
     const result = behaviorFromCache(ctx, id);
     const style = ctx.style;
     const hot = ctx.state.hot_id == id;
-    // held > hover > selected > normal — the same priority buttonId uses.
-    const bg = if (result.held)
-        style.bg_active
-    else if (hot)
-        style.bg_hover
-    else if (selected)
-        style.button_bg_selected
+    const base_bg = if (selected) style.button_bg_selected else style.bg;
+    const colors: Context.ButtonColors = if (!style.animation.enabled)
+        .{
+            .bg = if (result.held) style.bg_active else if (hot) style.bg_hover else base_bg,
+            .border = style.border,
+        }
     else
-        style.bg;
+        ctx.resolveButtonColors(id, base_bg, selected, result.held, false);
     const pad = opts.padding orelse style.button_padding;
 
     ctx.beginBox(.{
@@ -2446,7 +2449,7 @@ pub fn tabId(ctx: *Context, id: Id, label: []const u8, selected: bool, opts: Tab
         .width = opts.width,
         .height = opts.height,
         .padding = pad,
-        .bg = bg,
+        .bg = colors.bg,
         .align_cross = .center,
         .radius = style.control_radius,
     });

@@ -168,7 +168,7 @@ fn runScenario(io: std.Io, tracker: *peak_allocator.PeakTrackingAllocator, rows:
     const p95 = percentile95(samples[0..]);
     const raster_after = family.coverage.rasterization_count;
 
-    std.debug.print("gui.frame rows={d:<4} scale={d:.1} phys={d}x{d} warmup={d} iters={d}  avg={d:>9} ns  min={d:>9} ns  p95={d:>9} ns  peak_bytes={d}  raster_warmup={d}  raster_steady={d}\n", .{
+    std.debug.print("gui.frame animation=off rows={d:<4} scale={d:.1} phys={d}x{d} warmup={d} iters={d}  avg={d:>9} ns  min={d:>9} ns  p95={d:>9} ns  peak_bytes={d}  raster_warmup={d}  raster_steady={d}\n", .{
         rows,
         scale,
         pw,
@@ -190,7 +190,7 @@ pub fn main(init: std.process.Init) !void {
     var tracker = peak_allocator.PeakTrackingAllocator.init(debug_allocator.allocator());
     const io = init.io;
 
-    std.debug.print("\n=== GUI full Context frame benchmark (ReleaseFast, logical {d}x{d}) ===\n", .{ W, H });
+    std.debug.print("\n=== GUI full Context frame benchmark (ReleaseFast, animation=off, logical {d}x{d}) ===\n", .{ W, H });
     std.debug.print("measure: beginFrame + widget build + endFrame + gui.render (scale matrix)\n", .{});
     // scale 1x / 1.5x / 2x x rows 500/1000
     // peak_bytes: peak allocation of one scenario, measured after reset() inside runScenario

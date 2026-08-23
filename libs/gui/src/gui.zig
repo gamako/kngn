@@ -114,6 +114,9 @@ pub const IdStack = @import("id.zig").IdStack;
 pub const InteractionState = @import("state.zig").InteractionState;
 pub const PerIdState = @import("state.zig").PerIdState;
 pub const PerIdStateStore = @import("state.zig").PerIdStateStore;
+pub const TweenState = @import("animation.zig").TweenState;
+pub const AnimationState = @import("animation.zig").AnimationState;
+pub const AnimationStyle = @import("style.zig").AnimationStyle;
 
 // Single-line text_edit core.
 // TextLayout: mapping among codepoint index (0..count), UTF-8 byte offset, and cumulative logical width.

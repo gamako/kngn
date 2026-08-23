@@ -22,7 +22,15 @@ pub const TextStyle = struct {
 /// Named text tier for `Context.labelStyled`.
 pub const TextTier = enum { heading, body, caption, muted };
 
+pub const AnimationStyle = struct {
+    enabled: bool = false,
+    hover_tau_s: f32 = 0.10,
+    press_tau_s: f32 = 0.06,
+};
+
 pub const Style = struct {
+    /// Time-based button and tab color transitions. Disabled by default.
+    animation: AnimationStyle = .{},
     /// Normal fill for button etc.
     bg: Color,
     /// Fill while hovered (`state.hot_id == id`)
@@ -165,6 +173,9 @@ const std = @import("std");
 
 test "defaultStyle: text is white (compatible with earlier label default)" {
     const s = defaultStyle();
+    try std.testing.expect(!s.animation.enabled);
+    try std.testing.expectEqual(@as(f32, 0.10), s.animation.hover_tau_s);
+    try std.testing.expectEqual(@as(f32, 0.06), s.animation.press_tau_s);
     try std.testing.expectEqual(Color.rgba(0xFF, 0xFF, 0xFF, 0xFF), s.text);
     try std.testing.expect(s.swatch_border_selected > s.swatch_border);
     try std.testing.expect(s.button_border_selected > s.button_border);

@@ -49,6 +49,7 @@ const Allocator = std.mem.Allocator;
 
 const geom = @import("geom.zig");
 const color_mod = @import("color.zig");
+const animation_mod = @import("animation.zig");
 const draw = @import("draw.zig");
 const font_mod = @import("font.zig");
 const id_mod = @import("id.zig");
@@ -81,6 +82,9 @@ pub const BitmapFont = font_mod.BitmapFont;
 pub const Font = font_mod.Font;
 pub const BoxConfig = layout.BoxConfig;
 pub const Style = style_mod.Style;
+pub const AnimationStyle = style_mod.AnimationStyle;
+pub const TweenState = animation_mod.TweenState;
+pub const AnimationState = animation_mod.AnimationState;
 pub const PerIdState = state_mod.PerIdState;
 // Popup / context menu. Implementation and doc comments live in popup.zig.
 pub const PopupState = popup_mod.PopupState;
@@ -298,6 +302,12 @@ pub const Context = struct {
     wheel_chain_mouse: Vec2 = .{ .x = 0, .y = 0 },
     /// Shared widget style. Caller may rewrite directly (no push/pop).
     style: Style,
+    /// At most one current or fading hover and press widget is woken each frame.
+    animation_wake_hover: Id = 0,
+    animation_wake_press: Id = 0,
+    /// Frame-local presence markers used to drop wake IDs for widgets absent from the tree.
+    animation_seen_hover: Id = 0,
+    animation_seen_press: Id = 0,
     /// Popup / context-menu open state. The classic mechanism (openPopup/closePopup/popupMenu)
     /// allows only one of these open at a time. null = closed. When non-null, buttonBehavior
     /// suppresses hover/active on background widgets (modal absorption; see buttonBehavior's doc
@@ -536,6 +546,8 @@ pub const Context = struct {
         self.id_stack.clear();
         self.state.beginFrame();
         self.per_id_state.beginFrame();
+        self.animation_seen_hover = 0;
+        self.animation_seen_press = 0;
         self.composition = .{};
         self.focus_order.clearRetainingCapacity();
         self.focus_move = .none;
@@ -708,12 +720,21 @@ pub const Context = struct {
         // Tab traversal, after the draw commands are out (so the move shows next frame) and before
         // the trim below (so the widget just focused is protected from it).
         self.resolveFocusMove();
+        // A wake ID is only retained while its widget is submitted in the current tree.
+        if (self.animation_wake_hover != 0 and self.animation_seen_hover != self.animation_wake_hover) {
+            self.animation_wake_hover = 0;
+        }
+        if (self.animation_wake_press != 0 and self.animation_seen_press != self.animation_wake_press) {
+            self.animation_wake_press = 0;
+        }
         // PerIdStateStore LRU trim. Frame boundary only. Protects visible and in-use IDs.
         self.per_id_state.trim(.{
             .active_id = self.state.active_id,
             .focused_id = self.state.focused_id,
             .hot_id = self.state.hot_id,
             .next_hot_id = self.state.next_hot_id,
+            .animation_hover_id = self.animation_wake_hover,
+            .animation_press_id = self.animation_wake_press,
         });
         // Neither the arena nor draw_list is reset here (Context is the contract guardian).
     }
@@ -1093,6 +1114,85 @@ pub const Context = struct {
         self.requireInteractiveAllowed("perIdState");
         std.debug.assert(id != 0);
         return self.per_id_state.getOrPut(self.gpa, id);
+    }
+
+    pub const ButtonColors = struct {
+        bg: Color,
+        border: Color,
+    };
+
+    /// Resolve button-like colors while preserving the immediate-mode interaction contract.
+    /// Feature-off and inactive paths do not touch the per-ID store.
+    pub fn resolveButtonColors(
+        self: *Context,
+        id: Id,
+        base_bg: Color,
+        selected: bool,
+        held: bool,
+        disabled: bool,
+    ) ButtonColors {
+        const style = self.style;
+        const hot = self.state.hot_id == id;
+        if (disabled) {
+            return .{
+                .bg = style.disabledColor(base_bg),
+                .border = style.disabledColor(style.border),
+            };
+        }
+
+        const immediate_bg = if (held)
+            style.bg_active
+        else if (hot)
+            style.bg_hover
+        else
+            base_bg;
+        const immediate_border = if (hot or selected) style.border_hover else style.border;
+        if (!style.animation.enabled) return .{ .bg = immediate_bg, .border = immediate_border };
+
+        const hover_woken = self.animation_wake_hover == id;
+        const press_woken = self.animation_wake_press == id;
+        const hover_needed = hot or hover_woken;
+        const press_needed = held or press_woken;
+        if (!hover_needed and !press_needed) return .{ .bg = immediate_bg, .border = immediate_border };
+
+        if (hot) self.animation_wake_hover = id;
+        if (held) self.animation_wake_press = id;
+        if (hover_needed) self.animation_seen_hover = id;
+        if (press_needed) self.animation_seen_press = id;
+
+        const per_id = self.perIdState(id);
+        const animation = per_id.animationState();
+        const hover_amount = if (hover_needed)
+            animation.hover.update(if (hot) 1.0 else 0.0, self.now(), style.animation.hover_tau_s)
+        else
+            0.0;
+        const press_amount = if (press_needed)
+            animation.press.update(if (held) 1.0 else 0.0, self.now(), style.animation.press_tau_s)
+        else
+            0.0;
+
+        if (hover_needed) {
+            if (hot or !animation.hover.isSettled()) {
+                self.animation_wake_hover = id;
+            } else {
+                if (self.animation_wake_hover == id) self.animation_wake_hover = 0;
+            }
+        }
+        if (press_needed) {
+            if (held or !animation.press.isSettled()) {
+                self.animation_wake_press = id;
+            } else {
+                if (self.animation_wake_press == id) self.animation_wake_press = 0;
+            }
+        }
+
+        var bg = animation_mod.mixColor(base_bg, style.bg_hover, hover_amount);
+        bg = animation_mod.mixColor(bg, style.bg_active, press_amount);
+        const border = if (selected)
+            style.border_hover
+        else
+            animation_mod.mixColor(style.border, style.border_hover, hover_amount);
+        return .{ .bg = bg, .border = border };
     }
 
     fn tooltipRectEq(a: Rect, b: Rect) bool {
@@ -3715,4 +3815,56 @@ test "wrap: beginBox accepts a legal wrap config" {
     ctx.endBox();
     ctx.endBox();
     ctx.endFrame();
+}
+
+test "Context: disabled animation does not create per-ID state" {
+    var ctx = testCtx();
+    defer ctx.deinit();
+
+    ctx.beginFrameAt(160, 80, 0);
+    ctx.state.hot_id = 41;
+    const colors = ctx.resolveButtonColors(41, ctx.style.bg, false, true, false);
+    ctx.endFrame();
+
+    try std.testing.expectEqual(ctx.style.bg_active, colors.bg);
+    try std.testing.expectEqual(@as(usize, 0), ctx.per_id_state.count());
+}
+
+test "Context: enabled animation avoids lookup for inactive widgets" {
+    var ctx = testCtx();
+    defer ctx.deinit();
+    ctx.style.animation.enabled = true;
+
+    ctx.beginFrameAt(160, 80, 0);
+    const colors = ctx.resolveButtonColors(42, ctx.style.bg, false, false, false);
+    ctx.endFrame();
+
+    try std.testing.expectEqual(ctx.style.bg, colors.bg);
+    try std.testing.expectEqual(@as(usize, 0), ctx.per_id_state.count());
+}
+
+test "Context: animated button colors settle through an intermediate value" {
+    var ctx = testCtx();
+    defer ctx.deinit();
+    ctx.style.animation.enabled = true;
+
+    ctx.beginFrameAt(160, 80, 0);
+    ctx.state.hot_id = 43;
+    const first = ctx.resolveButtonColors(43, ctx.style.bg, false, false, false);
+    ctx.endFrame();
+
+    ctx.beginFrameAt(160, 80, 0.05);
+    ctx.state.hot_id = 43;
+    const middle = ctx.resolveButtonColors(43, ctx.style.bg, false, false, false);
+    ctx.endFrame();
+
+    ctx.beginFrameAt(160, 80, 1.0);
+    ctx.state.hot_id = 43;
+    const settled = ctx.resolveButtonColors(43, ctx.style.bg, false, false, false);
+    ctx.endFrame();
+
+    try std.testing.expectEqual(ctx.style.bg, first.bg);
+    try std.testing.expect(!std.meta.eql(ctx.style.bg, middle.bg));
+    try std.testing.expect(!std.meta.eql(ctx.style.bg_hover, middle.bg));
+    try std.testing.expectEqual(ctx.style.bg_hover, settled.bg);
 }

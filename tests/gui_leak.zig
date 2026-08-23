@@ -86,6 +86,10 @@ fn runLeakScenario(counter: *CountingAllocator) !struct {
     entries_frame_300: usize,
     entries_final: usize,
     max_observed: usize,
+    animation_entries_frame_1: usize,
+    animation_entries_frame_300: usize,
+    animation_entries_final: usize,
+    animation_max_observed: usize,
     capacity: usize,
     live_after: usize,
     peak: usize,
@@ -101,6 +105,11 @@ fn runLeakScenario(counter: *CountingAllocator) !struct {
     var entries_frame_1: usize = 0;
     var entries_frame_300: usize = 0;
     var max_observed: usize = 0;
+    var animation_entries_frame_1: usize = 0;
+    var animation_entries_frame_300: usize = 0;
+    var animation_entries_final: usize = 0;
+    var animation_max_observed: usize = 0;
+    ctx.style.animation.enabled = true;
 
     var frame: usize = 0;
     while (frame < FRAMES) : (frame += 1) {
@@ -111,6 +120,10 @@ fn runLeakScenario(counter: *CountingAllocator) !struct {
             const id: gui.Id = @as(gui.Id, @intCast(frame * IDS_PER_FRAME + i + 1));
             // Touch PerIdStateStore (text/selectable path) and layout id path
             _ = ctx.perIdState(id);
+            // Use the same ID for a button-like color resolution so animation state is lazy but
+            // exercised through the public Context path.
+            ctx.state.hot_id = id;
+            _ = ctx.resolveButtonColors(id, ctx.style.bg, false, false, false);
             var lab: [24]u8 = undefined;
             const s = std.fmt.bufPrint(&lab, "w{d}", .{i}) catch "w";
             const owned = ctx.allocator().dupe(u8, s) catch s;
@@ -118,12 +131,24 @@ fn runLeakScenario(counter: *CountingAllocator) !struct {
         }
         ctx.endFrame();
         const n = ctx.per_id_state.map.count();
+        var animation_n: usize = 0;
+        var values = ctx.per_id_state.map.valueIterator();
+        while (values.next()) |entry| {
+            if (entry.state.animation != null) animation_n += 1;
+        }
         if (n > max_observed) max_observed = n;
+        if (animation_n > animation_max_observed) animation_max_observed = animation_n;
         if (frame == 0) entries_frame_1 = n;
         if (frame == FRAMES - 1) entries_frame_300 = n;
+        if (frame == 0) animation_entries_frame_1 = animation_n;
+        if (frame == FRAMES - 1) animation_entries_frame_300 = animation_n;
     }
 
     const entries_final = ctx.per_id_state.map.count();
+    var values = ctx.per_id_state.map.valueIterator();
+    while (values.next()) |entry| {
+        if (entry.state.animation != null) animation_entries_final += 1;
+    }
     const capacity = ctx.per_id_state.map.capacity();
     const live_after = counter.live_bytes;
     const peak = counter.peak_bytes;
@@ -139,6 +164,10 @@ fn runLeakScenario(counter: *CountingAllocator) !struct {
         .entries_frame_300 = entries_frame_300,
         .entries_final = entries_final,
         .max_observed = max_observed,
+        .animation_entries_frame_1 = animation_entries_frame_1,
+        .animation_entries_frame_300 = animation_entries_frame_300,
+        .animation_entries_final = animation_entries_final,
+        .animation_max_observed = animation_max_observed,
         .capacity = capacity,
         .live_after = live_after,
         .peak = peak,
@@ -163,9 +192,14 @@ test "gui leak: 100 unique IDs/frame x 300 frames stays within PerIdStateStore c
     try testing.expect(r.entries_frame_300 <= MAX_ENTRIES);
     try testing.expect(r.entries_final <= MAX_ENTRIES);
     try testing.expect(r.max_observed <= MAX_ENTRIES);
+    try testing.expectEqual(@as(usize, IDS_PER_FRAME), r.animation_entries_frame_1);
+    try testing.expect(r.animation_entries_frame_300 <= MAX_ENTRIES);
+    try testing.expect(r.animation_entries_final <= MAX_ENTRIES);
+    try testing.expect(r.animation_max_observed <= MAX_ENTRIES);
     // Must not regress to the old uncapped behaviour (30000).
     try testing.expect(r.entries_final <= TRIM_TO + IDS_PER_FRAME * 12);
     try testing.expect(r.entries_final < IDS_PER_FRAME * FRAMES / 2);
+    try testing.expect(r.animation_entries_final < IDS_PER_FRAME * FRAMES / 2);
 
     // Print allocator metrics for notes (not hard-asserted; environment-dependent)
     std.debug.print(
@@ -174,6 +208,10 @@ test "gui leak: 100 unique IDs/frame x 300 frames stays within PerIdStateStore c
         \\[gui-leak] state_entries_frame_300={d}
         \\[gui-leak] state_entries_final={d}
         \\[gui-leak] state_entries_max_observed={d}
+        \\[gui-leak] animation_entries_frame_1={d}
+        \\[gui-leak] animation_entries_frame_300={d}
+        \\[gui-leak] animation_entries_final={d}
+        \\[gui-leak] animation_entries_max_observed={d}
         \\[gui-leak] per_id_state.map.capacity={d}
         \\[gui-leak] live_bytes_before_deinit={d}
         \\[gui-leak] peak_bytes={d}
@@ -188,6 +226,10 @@ test "gui leak: 100 unique IDs/frame x 300 frames stays within PerIdStateStore c
             r.entries_frame_300,
             r.entries_final,
             r.max_observed,
+            r.animation_entries_frame_1,
+            r.animation_entries_frame_300,
+            r.animation_entries_final,
+            r.animation_max_observed,
             r.capacity,
             r.live_after,
             r.peak,

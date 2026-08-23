@@ -29,6 +29,17 @@ digest showcase
 expect showcase hot=button
 expect showcase active=none
 snapshot fb
+
+# Hover tween intermediate and settled frames.
+step 1
+digest drawlist
+expect drawlist hash=A82C59E5
+snapshot fb
+step 60
+digest drawlist
+expect drawlist hash=47989152
+snapshot fb
+
 inject mouse_down left
 step 1
 digest showcase
@@ -36,11 +47,33 @@ expect showcase hot=button
 expect showcase active=button
 expect showcase focused=button
 snapshot fb
+
+# Press tween intermediate and settled frames.
+step 1
+digest drawlist
+expect drawlist hash=2BBE16AA
+snapshot fb
+step 60
+digest drawlist
+expect drawlist hash=5E6013AA
+snapshot fb
+
 inject mouse_up left
 step 1
 digest showcase
 expect showcase active=none
 expect showcase focused=button
+digest drawlist
+expect drawlist hash=5E6013AA
+snapshot fb
+step 1
+digest drawlist
+expect drawlist hash=10F38F3F
+snapshot fb
+step 60
+digest drawlist
+expect drawlist hash=47989152
+snapshot fb
 
 # Disabled button: it does not become hot or active and selection stays unchanged.
 inject mouse_move 300 190

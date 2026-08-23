@@ -7,6 +7,7 @@
 
 const id_mod = @import("id.zig");
 const text_edit = @import("text_edit.zig");
+const animation_mod = @import("animation.zig");
 
 pub const Id = id_mod.Id;
 
@@ -21,6 +22,13 @@ pub const PerIdState = struct {
     scroll_x: i32 = 0,
     /// Context virtual time when the caret became visible.
     caret_blink_start_s: f64 = 0,
+    /// Lazily created transition state for button-like widgets.
+    animation: ?animation_mod.AnimationState = null,
+
+    pub fn animationState(self: *PerIdState) *animation_mod.AnimationState {
+        if (self.animation == null) self.animation = .{};
+        return &self.animation.?;
+    }
 };
 
 /// State store that lazily allocates per-ID state only for IDs that need it.
@@ -63,6 +71,8 @@ pub const PerIdStateStore = struct {
         focused_id: Id = 0,
         hot_id: Id = 0,
         next_hot_id: Id = 0,
+        animation_hover_id: Id = 0,
+        animation_press_id: Id = 0,
     };
 
     map: std.AutoHashMapUnmanaged(Id, Entry) = .empty,
@@ -134,6 +144,8 @@ pub const PerIdStateStore = struct {
         if (id == protected.focused_id and id != 0) return true;
         if (id == protected.hot_id and id != 0) return true;
         if (id == protected.next_hot_id and id != 0) return true;
+        if (id == protected.animation_hover_id and id != 0) return true;
+        if (id == protected.animation_press_id and id != 0) return true;
         return false;
     }
 
@@ -454,4 +466,48 @@ test "PerIdStateStore: no trim while at or below max" {
     // Hidden with count==max → fire condition is count > max, so do nothing
     store.trim(.{});
     try testing.expectEqual(@as(usize, 10), store.count());
+}
+
+test "PerIdState: animation state is created lazily" {
+    const gpa = testing.allocator;
+    var store: PerIdStateStore = .{};
+    defer store.deinit(gpa);
+
+    store.beginFrame();
+    const state = store.getOrPut(gpa, 77);
+    try testing.expect(state.animation == null);
+    state.animationState().hover.target = 1;
+    try testing.expect(state.animation != null);
+    try testing.expectEqual(@as(f32, 1), state.animation.?.hover.target);
+}
+
+test "PerIdStateStore: animation wake IDs are protected during trim" {
+    const gpa = testing.allocator;
+    var store: PerIdStateStore = .{ .max_entries = 1, .trim_to = 1 };
+    defer store.deinit(gpa);
+
+    store.beginFrame();
+    store.getOrPut(gpa, 1).animationState().hover.value = 1;
+    store.beginFrame();
+    _ = store.getOrPut(gpa, 2);
+    store.trim(.{ .animation_hover_id = 1 });
+    try testing.expect(store.get(1) != null);
+}
+
+test "PerIdStateStore: trimmed animation state restarts from defaults" {
+    const gpa = testing.allocator;
+    var store: PerIdStateStore = .{ .max_entries = 1, .trim_to = 1 };
+    defer store.deinit(gpa);
+
+    store.beginFrame();
+    store.getOrPut(gpa, 1).animationState().hover.value = 1;
+    store.beginFrame();
+    _ = store.getOrPut(gpa, 2);
+    store.trim(.{});
+    try testing.expect(store.get(1) == null);
+
+    store.beginFrame();
+    const recreated = store.getOrPut(gpa, 1);
+    try testing.expect(recreated.animation == null);
+    try testing.expectEqual(@as(f32, 0), recreated.animationState().hover.value);
 }
