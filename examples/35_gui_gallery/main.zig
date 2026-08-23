@@ -392,25 +392,34 @@ fn matrixFor(section: Section) []const MatrixRow {
 }
 
 fn renderMatrix(ctx: *gui.Context, rows: []const MatrixRow) void {
-    // Column headers are abbreviations sized to the cell width (34px ≈ 4+ chars). Formal names are in the overview State axis row.
+    // Column widths follow the active font so proportional glyphs keep a readable gap.
     const HEADERS = [_][]const u8{ "norm", "hovr", "actv", "focs", "dsbl", "emp", "min", "max", "none" };
+    const cell_padding = ctx.style.popup_padding;
+    var label_width: i32 = @as(i32, @intCast(ctx.font.measure("widget"))) + cell_padding;
+    for (rows) |row| label_width = @max(label_width, @as(i32, @intCast(ctx.font.measure(row.name))) + cell_padding);
+    var column_widths: [HEADERS.len]i32 = undefined;
+    for (HEADERS, 0..) |header, i| column_widths[i] = @as(i32, @intCast(ctx.font.measure(header))) + cell_padding;
+    for (rows) |row| for (row.cells, 0..) |cell, i| {
+        column_widths[i] = @max(column_widths[i], @as(i32, @intCast(ctx.font.measure(cell))) + cell_padding);
+    };
+
     ctx.beginBox(.{ .direction = .row, .gap = 2 });
-    ctx.beginBox(.{ .width = .{ .fixed = 104 } });
+    ctx.beginBox(.{ .width = .{ .fixed = label_width } });
     ctx.labelEx("widget", ctx.style.text_tokens.subtle);
     ctx.endBox();
-    for (HEADERS) |h| {
-        ctx.beginBox(.{ .width = .{ .fixed = 34 } });
+    for (HEADERS, 0..) |h, i| {
+        ctx.beginBox(.{ .width = .{ .fixed = column_widths[i] } });
         ctx.labelEx(h, ctx.style.text_tokens.subtle);
         ctx.endBox();
     }
     ctx.endBox();
     for (rows) |row| {
         ctx.beginBox(.{ .direction = .row, .gap = 2 });
-        ctx.beginBox(.{ .width = .{ .fixed = 104 } });
+        ctx.beginBox(.{ .width = .{ .fixed = label_width } });
         ctx.label(row.name);
         ctx.endBox();
-        for (row.cells) |cell| {
-            ctx.beginBox(.{ .width = .{ .fixed = 34 } });
+        for (row.cells, 0..) |cell, i| {
+            ctx.beginBox(.{ .width = .{ .fixed = column_widths[i] } });
             ctx.label(cell);
             ctx.endBox();
         }
@@ -703,6 +712,7 @@ fn renderTable(ctx: *gui.Context, app: *App) void {
         .{ .width = .{ .grow = 1 }, .header = "Path" },
         .{ .width = .{ .fixed = 36 }, .header = "On" },
     };
+    ctx.beginBox(.{ .width = .{ .grow = 1 }, .height = .{ .grow = 1 }, .padding = .{ 0, 0, 0, ctx.style.button_padding[3] } });
     ctx.beginTable(Ids.table, &cols, .{
         .width = .{ .grow = 1 },
         .height = .{ .grow = 1 },
@@ -734,6 +744,7 @@ fn renderTable(ctx: *gui.Context, app: *App) void {
         if (ctx.endTableRow().activated) app.table_selected = i;
     }
     ctx.endTable();
+    ctx.endBox();
 }
 
 fn renderMissing(ctx: *gui.Context) void {
@@ -745,7 +756,7 @@ fn renderMissing(ctx: *gui.Context) void {
             ctx.beginBox(.{ .direction = .column, .width = .{ .grow = 1 }, .height = .{ .grow = 1 }, .gap = 6 });
         }
         const item = MISSING[i];
-        ctx.beginBox(.{ .height = .{ .fixed = 54 }, .bg = ctx.style.surface.danger_subtle, .padding = .{ 6, 6, 6, 6 } });
+        ctx.beginBox(.{ .height = .fit, .bg = ctx.style.surface.danger_subtle, .padding = .{ 6, 6, 6, 6 } });
         ctx.label(item.name);
         ctx.labelEx("NOT IMPLEMENTED", gui.Color.rgba(0xFF, 0xB0, 0x80, 0xFF));
         ctx.labelEx(item.category, ctx.style.text_tokens.subtle);

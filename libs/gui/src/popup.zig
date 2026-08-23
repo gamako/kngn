@@ -511,6 +511,8 @@ const DialogGeometry = struct {
     actions: Rect,
 };
 
+const dialog_panel_padding: i32 = 20;
+
 fn dialogGeometry(pos: Vec2, options: DialogOptions, screen_w: u32, screen_h: u32) DialogGeometry {
     std.debug.assert(screen_w > 0 and screen_h > 0);
     const requested = dialogSize(options);
@@ -525,16 +527,20 @@ fn dialogGeometry(pos: Vec2, options: DialogOptions, screen_w: u32, screen_h: u3
     if (x < 0) x = 0;
     if (y < 0) y = 0;
     const outer: Rect = .{ .x = @intCast(x), .y = @intCast(y), .w = @intCast(w), .h = @intCast(h) };
-    const content_w = if (outer.w > 40) outer.w - 40 else 0;
+    const content_w = if (outer.w > @as(u32, @intCast(dialog_panel_padding * 2)))
+        outer.w - @as(u32, @intCast(dialog_panel_padding * 2))
+    else
+        0;
     const title_y = outer.y + @min(@as(i32, 16), @as(i32, @intCast(outer.h)));
     const body_y = @min(outer.y + 48, outer.y + @as(i32, @intCast(outer.h)));
     const actions_h = @min(@as(u32, 32), outer.h);
-    const actions_y = outer.y + @as(i32, @intCast(outer.h - actions_h));
+    const actions_bottom = @min(dialog_panel_padding, @as(i32, @intCast(outer.h - actions_h)));
+    const actions_y = outer.y + @as(i32, @intCast(outer.h - actions_h)) - actions_bottom;
     return .{
         .outer = outer,
-        .title = .{ .x = outer.x + @min(@as(i32, 20), @as(i32, @intCast(outer.w))), .y = title_y, .w = content_w, .h = @min(@as(u32, 24), outer.h) },
-        .body = .{ .x = outer.x + @min(@as(i32, 20), @as(i32, @intCast(outer.w))), .y = body_y, .w = content_w, .h = @min(@as(u32, 48), outer.h) },
-        .actions = .{ .x = outer.x + @min(@as(i32, 20), @as(i32, @intCast(outer.w))), .y = actions_y, .w = content_w, .h = actions_h },
+        .title = .{ .x = outer.x + @min(dialog_panel_padding, @as(i32, @intCast(outer.w))), .y = title_y, .w = content_w, .h = @min(@as(u32, 24), outer.h) },
+        .body = .{ .x = outer.x + @min(dialog_panel_padding, @as(i32, @intCast(outer.w))), .y = body_y, .w = content_w, .h = @min(@as(u32, 48), outer.h) },
+        .actions = .{ .x = outer.x + @min(dialog_panel_padding, @as(i32, @intCast(outer.w))), .y = actions_y, .w = content_w, .h = actions_h },
     };
 }
 
@@ -1322,6 +1328,46 @@ test "Dialog: scrim absorbs outside input and focus stays within enabled actions
     const dismissed = ctx.dialog(42);
     try std.testing.expect(dismissed.dismissed);
     try std.testing.expect(!ctx.hasOpenDialog());
+}
+
+test "Dialog: action row stays inside the panel padding" {
+    var ctx = testCtx();
+    defer ctx.deinit();
+    const actions = [_]DialogAction{
+        .{ .label = "Cancel" },
+        .{ .label = "Continue" },
+    };
+    const options = DialogOptions{ .title = "Confirm", .body = "Continue?", .actions = &actions };
+
+    ctx.beginFrame(800, 600);
+    ctx.endFrame();
+    ctx.openDialog(42, options);
+    _ = ctx.dialog(42);
+
+    const geo = dialogGeometry(ctx.popup_state.?.pos, options, 800, 600);
+    var action_rects: [2]Rect = undefined;
+    var action_count: usize = 0;
+    for (ctx.draw_list.cmds.items) |command| switch (command) {
+        .rect_filled => |filled| if (filled.radius == ctx.style.control_radius) {
+            if (action_count < action_rects.len) action_rects[action_count] = filled.rect;
+            action_count += 1;
+        },
+        else => {},
+    };
+
+    try std.testing.expectEqual(@as(usize, action_rects.len), action_count);
+    for (action_rects, 0..) |rect, i| {
+        try std.testing.expectEqualDeep(dialogActionRect(geo, i, actions.len), rect);
+        if (i == 0) try std.testing.expectEqual(geo.title.x, rect.x);
+        if (i + 1 == action_rects.len) try std.testing.expectEqual(
+            @as(i64, geo.title.x) + geo.title.w,
+            @as(i64, rect.x) + rect.w,
+        );
+        try std.testing.expectEqual(
+            geo.outer.y + @as(i32, @intCast(geo.outer.h)) - dialog_panel_padding,
+            rect.y + @as(i32, @intCast(rect.h)),
+        );
+    }
 }
 
 test "openPopup: clears active_id/hot_id just before opening" {
