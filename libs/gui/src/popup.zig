@@ -30,11 +30,38 @@ const geom = @import("geom.zig");
 const id_mod = @import("id.zig");
 const font_mod = @import("font.zig");
 const layout = @import("layout.zig");
+const input_mod = @import("input.zig");
 
 pub const Context = context_mod.Context;
 pub const Rect = geom.Rect;
 pub const Vec2 = geom.Vec2;
 pub const Id = id_mod.Id;
+
+pub const PopupKind = enum { menu, dialog };
+
+pub const DialogAction = struct {
+    label: []const u8,
+    enabled: bool = true,
+};
+
+pub const DialogOptions = struct {
+    title: []const u8 = "",
+    body: []const u8 = "",
+    actions: []const DialogAction = &.{},
+    width: u32 = 360,
+    dismiss_on_escape: bool = true,
+};
+
+pub const DialogResult = struct {
+    open: bool = false,
+    selected: ?usize = null,
+    dismissed: bool = false,
+};
+
+pub const DialogState = struct {
+    options: DialogOptions,
+    focus_index: ?usize = null,
+};
 
 /// Popup open/close state held by Context. The classic mechanism (`openPopup` / `closePopup` /
 /// `popupMenu` / `isPopupOpen` / `hasOpenPopup`) allows only one of these open at a time, exactly
@@ -44,6 +71,8 @@ pub const PopupState = struct {
     id: Id,
     /// Requested open position (top-left, before clamp).
     pos: Vec2,
+    kind: PopupKind = .menu,
+    dialog: ?DialogState = null,
 };
 
 /// How many popups `PopupStack` can hold open at once, beyond the classic single slot above.
@@ -85,7 +114,17 @@ pub const PopupStack = struct {
             return;
         }
         if (self.len >= max_stacked_popups) return;
-        self.items[self.len] = .{ .id = id, .pos = pos };
+        self.items[self.len] = .{ .id = id, .pos = pos, .kind = .menu, .dialog = null };
+        self.len += 1;
+    }
+
+    fn openDialog(self: *PopupStack, id: Id, pos: Vec2, options: DialogOptions) void {
+        if (self.indexOf(id)) |i| {
+            self.items[i] = .{ .id = id, .pos = pos, .kind = .dialog, .dialog = .{ .options = options } };
+            return;
+        }
+        if (self.len >= max_stacked_popups) return;
+        self.items[self.len] = .{ .id = id, .pos = pos, .kind = .dialog, .dialog = .{ .options = options } };
         self.len += 1;
     }
 
@@ -274,11 +313,56 @@ pub fn hitTestItem(geo: PopupGeometry, item_count: usize, p: Vec2) ?usize {
 /// drag stuck forever behind a modal popup, at the cost of losing that payload silently).
 pub fn openPopup(ctx: *Context, id: Id, pos: Vec2) void {
     ctx.requireInteractiveAllowed("openPopup");
-    ctx.popup_state = .{ .id = id, .pos = pos };
+    ctx.popup_state = .{ .id = id, .pos = pos, .kind = .menu, .dialog = null };
     ctx.state.active_id = 0;
     ctx.state.hot_id = 0;
     ctx.state.next_hot_id = 0;
     ctx.drag = null;
+}
+
+fn dialogSize(options: DialogOptions) struct { w: i32, h: i32 } {
+    return .{
+        .w = @intCast(@max(@min(options.width, @as(u32, 1 << 20)), 280)),
+        .h = 168,
+    };
+}
+
+fn centeredDialogPos(ctx: *const Context, options: DialogOptions) Vec2 {
+    const size = dialogSize(options);
+    return .{
+        .x = @as(i32, @intCast(ctx.screen_w / 2)) - @divTrunc(size.w, 2),
+        .y = @as(i32, @intCast(ctx.screen_h / 2)) - @divTrunc(size.h, 2),
+    };
+}
+
+pub fn openDialogAt(ctx: *Context, id: Id, pos: Vec2, options: DialogOptions) void {
+    ctx.requireInteractiveAllowed("openDialogAt");
+    ctx.popup_state = .{ .id = id, .pos = pos, .kind = .dialog, .dialog = .{ .options = options } };
+    ctx.state.active_id = 0;
+    ctx.state.hot_id = 0;
+    ctx.state.next_hot_id = 0;
+    ctx.state.focused_id = 0;
+    ctx.state.focus_visible = false;
+    ctx.drag = null;
+}
+
+pub fn openDialog(ctx: *Context, id: Id, options: DialogOptions) void {
+    openDialogAt(ctx, id, centeredDialogPos(ctx, options), options);
+}
+
+pub fn openDialogStackedAt(ctx: *Context, id: Id, pos: Vec2, options: DialogOptions) void {
+    ctx.requireInteractiveAllowed("openDialogStackedAt");
+    ctx.popup_stack.openDialog(id, pos, options);
+    ctx.state.active_id = 0;
+    ctx.state.hot_id = 0;
+    ctx.state.next_hot_id = 0;
+    ctx.state.focused_id = 0;
+    ctx.state.focus_visible = false;
+    ctx.drag = null;
+}
+
+pub fn openDialogStacked(ctx: *Context, id: Id, options: DialogOptions) void {
+    openDialogStackedAt(ctx, id, centeredDialogPos(ctx, options), options);
 }
 
 /// Explicitly close the popup. Caller decides ESC etc. (libs/gui does not know platform.KeyCode,
@@ -294,10 +378,29 @@ pub fn hasOpenPopup(ctx: *const Context) bool {
     return ctx.popup_state != null or ctx.popup_stack.len != 0;
 }
 
+pub fn hasOpenDialog(ctx: *const Context) bool {
+    if (ctx.popup_state) |state| if (state.kind == .dialog) return true;
+    var i: usize = 0;
+    while (i < ctx.popup_stack.len) : (i += 1) {
+        if (ctx.popup_stack.items[i].kind == .dialog) return true;
+    }
+    return false;
+}
+
 /// Whether the popup with id is open (classic slot only; use `isPopupOpenStacked` for the
 /// stacked side channel, or `isPopupOpenAny` to check both).
 pub fn isPopupOpen(ctx: *const Context, id: Id) bool {
     return if (ctx.popup_state) |s| s.id == id else false;
+}
+
+pub fn isDialogOpen(ctx: *const Context, id: Id) bool {
+    return if (ctx.popup_state) |s| s.id == id and s.kind == .dialog else false;
+}
+
+pub fn isDialogOpenAny(ctx: *const Context, id: Id) bool {
+    if (isDialogOpen(ctx, id)) return true;
+    if (ctx.popup_stack.indexOf(id)) |i| return ctx.popup_stack.items[i].kind == .dialog;
+    return false;
 }
 
 /// Whether `id` is open through `openPopupStacked`. Independent of the classic slot: a popup
@@ -401,6 +504,147 @@ fn runPopup(ctx: *Context, items: []const PopupItem, pos: Vec2) PopupInteraction
     return .{ .open = true, .selected = clicked_idx };
 }
 
+const DialogGeometry = struct {
+    outer: Rect,
+    title: Rect,
+    body: Rect,
+    actions: Rect,
+};
+
+fn dialogGeometry(pos: Vec2, options: DialogOptions, screen_w: u32, screen_h: u32) DialogGeometry {
+    std.debug.assert(screen_w > 0 and screen_h > 0);
+    const requested = dialogSize(options);
+    const sw: i64 = screen_w;
+    const sh: i64 = screen_h;
+    const w: i64 = @max(@min(@as(i64, requested.w), sw), 1);
+    const h: i64 = @max(@min(@as(i64, requested.h), sh), 1);
+    var x: i64 = pos.x;
+    var y: i64 = pos.y;
+    if (x + w > sw) x = sw - w;
+    if (y + h > sh) y = sh - h;
+    if (x < 0) x = 0;
+    if (y < 0) y = 0;
+    const outer: Rect = .{ .x = @intCast(x), .y = @intCast(y), .w = @intCast(w), .h = @intCast(h) };
+    const content_w = if (outer.w > 40) outer.w - 40 else 0;
+    const title_y = outer.y + @min(@as(i32, 16), @as(i32, @intCast(outer.h)));
+    const body_y = @min(outer.y + 48, outer.y + @as(i32, @intCast(outer.h)));
+    const actions_h = @min(@as(u32, 32), outer.h);
+    const actions_y = outer.y + @as(i32, @intCast(outer.h - actions_h));
+    return .{
+        .outer = outer,
+        .title = .{ .x = outer.x + @min(@as(i32, 20), @as(i32, @intCast(outer.w))), .y = title_y, .w = content_w, .h = @min(@as(u32, 24), outer.h) },
+        .body = .{ .x = outer.x + @min(@as(i32, 20), @as(i32, @intCast(outer.w))), .y = body_y, .w = content_w, .h = @min(@as(u32, 48), outer.h) },
+        .actions = .{ .x = outer.x + @min(@as(i32, 20), @as(i32, @intCast(outer.w))), .y = actions_y, .w = content_w, .h = actions_h },
+    };
+}
+
+fn firstEnabledAction(actions: []const DialogAction) ?usize {
+    for (actions, 0..) |action, i| if (action.enabled) return i;
+    return null;
+}
+
+fn moveDialogFocus(actions: []const DialogAction, current: ?usize, reverse: bool) ?usize {
+    if (actions.len == 0) return null;
+    var i = if (current) |index|
+        if (reverse) (if (index == 0) actions.len - 1 else index - 1) else (index + 1) % actions.len
+    else if (reverse) actions.len - 1 else 0;
+    var attempts: usize = 0;
+    while (attempts < actions.len) : (attempts += 1) {
+        if (actions[i].enabled) return i;
+        i = if (reverse) (if (i == 0) actions.len - 1 else i - 1) else (i + 1) % actions.len;
+    }
+    return null;
+}
+
+fn dialogActionRect(geo: DialogGeometry, index: usize, count: usize) Rect {
+    if (count == 0 or index >= count or geo.actions.w == 0 or geo.actions.h == 0) return .{ .x = 0, .y = 0, .w = 0, .h = 0 };
+    const gap: u32 = 8;
+    const total_gap = gap * @as(u32, @intCast(count - 1));
+    const available = geo.actions.w -| total_gap;
+    const base_w = available / @as(u32, @intCast(count));
+    const remainder = available - base_w * @as(u32, @intCast(count));
+    const x_offset = index * (base_w + gap) + @min(index, @as(usize, @intCast(remainder)));
+    const width = base_w + @intFromBool(index < remainder);
+    return .{
+        .x = geo.actions.x + @as(i32, @intCast(x_offset)),
+        .y = geo.actions.y,
+        .w = width,
+        .h = geo.actions.h,
+    };
+}
+
+fn dialogFocusId(id: Id, index: usize) Id {
+    return id_mod.hashInt(id, @as(u64, @intCast(index)) + 1);
+}
+
+fn runDialog(ctx: *Context, state: *PopupState) DialogResult {
+    const dialog_state = &(state.dialog orelse return .{});
+    const options = dialog_state.options;
+    const geo = dialogGeometry(state.pos, options, ctx.screen_w, ctx.screen_h);
+    if (dialog_state.focus_index == null) dialog_state.focus_index = firstEnabledAction(options.actions);
+
+    const input = &ctx.input;
+    const shift_tab = input.pressedPlain(input_mod.key.tab, input_mod.mod.shift, input_mod.mod.ctrl | input_mod.mod.alt | input_mod.mod.cmd);
+    const plain_tab = input.pressedPlain(input_mod.key.tab, 0, input_mod.mod.ctrl | input_mod.mod.alt | input_mod.mod.cmd | input_mod.mod.shift);
+    if (shift_tab) {
+        dialog_state.focus_index = moveDialogFocus(options.actions, dialog_state.focus_index, true);
+    } else if (plain_tab) {
+        dialog_state.focus_index = moveDialogFocus(options.actions, dialog_state.focus_index, false);
+    }
+
+    if (options.dismiss_on_escape and input.pressedPlain(input_mod.key.escape, 0, input_mod.mod.all)) {
+        return .{ .dismissed = true };
+    }
+
+    var selected: ?usize = null;
+    for (options.actions, 0..) |action, i| {
+        if (!action.enabled) continue;
+        const action_rect = dialogActionRect(geo, i, options.actions.len);
+        if (input.mouse_pressed.left and action_rect.contains(input.mouse_pressed_pos)) {
+            dialog_state.focus_index = i;
+            selected = i;
+        }
+    }
+    if (selected == null and (input.pressedPlain(input_mod.key.enter, 0, input_mod.mod.all) or
+        input.pressedPlain(input_mod.key.space, 0, input_mod.mod.all)))
+    {
+        if (dialog_state.focus_index) |i| {
+            if (options.actions[i].enabled) selected = i;
+        }
+    }
+
+    drawDialog(ctx, state.id, geo, options, dialog_state.focus_index);
+    if (selected) |i| return .{ .selected = i };
+    return .{ .open = true };
+}
+
+fn drawDialog(ctx: *Context, id: Id, geo: DialogGeometry, options: DialogOptions, focus_index: ?usize) void {
+    const dl = &ctx.draw_list;
+    const style = ctx.style;
+    dl.rectFilled(.{ .x = 0, .y = 0, .w = ctx.screen_w, .h = ctx.screen_h }, Color.rgba(0, 0, 0, 0x88)) catch @panic("dialog: OOM");
+    dl.shadow(geo.outer, Color.rgba(0, 0, 0, 0xB0), .{ .radius = 10, .blur = 16, .offset = .{ .x = 0, .y = 6 } }) catch @panic("dialog shadow: OOM");
+    dl.rectFilledEx(geo.outer, style.bg, .{ .radius = 8 }) catch @panic("dialog: OOM");
+    dl.rectOutlineEx(geo.outer, style.border, 1, .{ .radius = 8 }) catch @panic("dialog: OOM");
+    if (geo.title.w != 0 and geo.title.h != 0) dl.textEx(.{ .x = geo.title.x, .y = geo.title.y }, options.title, style.text, null) catch @panic("dialog title: OOM");
+    if (geo.body.w != 0 and geo.body.h != 0) dl.textEx(.{ .x = geo.body.x, .y = geo.body.y }, options.body, style.text_subtle, null) catch @panic("dialog body: OOM");
+
+    for (options.actions, 0..) |action, i| {
+        const r = dialogActionRect(geo, i, options.actions.len);
+        if (r.isEmpty()) continue;
+        const hovered = action.enabled and r.contains(ctx.input.mouse_pos);
+        const fill = if (!action.enabled) style.bg else if (hovered) style.bg_hover else style.bg;
+        dl.rectFilledEx(r, fill, .{ .radius = style.control_radius }) catch @panic("dialog action: OOM");
+        dl.rectOutlineEx(r, if (action.enabled) style.border_hover else style.border, 1, .{ .radius = style.control_radius }) catch @panic("dialog action: OOM");
+        const text_y = font_mod.centeredTextY(r.y, @intCast(r.h), font_mod.fontInkHeight(ctx.font));
+        dl.textEx(.{ .x = r.x + 8, .y = text_y }, action.label, if (action.enabled) style.text else style.text_subtle, null) catch @panic("dialog action label: OOM");
+        if (focus_index != null and focus_index.? == i and action.enabled) {
+            ctx.state.focused_id = dialogFocusId(id, i);
+            ctx.state.focus_visible = true;
+            dl.rectOutlineEx(r, style.focus_ring, style.focus_ring_thickness, .{ .radius = style.control_radius }) catch @panic("dialog focus ring: OOM");
+        }
+    }
+}
+
 /// If the popup for id is open, draw + hit-test and return the result.
 /// If not open, do nothing and return `.{}` (open=false) — safe to call unconditionally every frame
 /// (immediate-mode style).
@@ -416,7 +660,7 @@ pub fn popupMenu(ctx: *Context, id: Id, items: []const PopupItem) PopupResult {
 pub fn popupMenuEx(ctx: *Context, id: Id, items: []const PopupItem, opts: PopupMenuOpts) PopupResult {
     ctx.requireNoFrame("popupMenu");
     const state = ctx.popup_state orelse return .{};
-    if (state.id != id) return .{};
+    if (state.id != id or state.kind != .menu) return .{};
 
     const r = runPopup(ctx, items, state.pos);
     if (r.dismissed_outside) {
@@ -430,6 +674,17 @@ pub fn popupMenuEx(ctx: *Context, id: Id, items: []const PopupItem, opts: PopupM
     return .{ .open = r.open };
 }
 
+pub fn dialog(ctx: *Context, id: Id) DialogResult {
+    ctx.requireNoFrame("dialog");
+    if (ctx.popup_state) |*state| {
+        if (state.id != id or state.kind != .dialog) return .{};
+        const result = runDialog(ctx, state);
+        if (result.selected != null or result.dismissed) closePopup(ctx);
+        return result;
+    }
+    return .{};
+}
+
 /// Same contract as `popupMenuEx`, but against a popup opened with `openPopupStacked` instead of
 /// the classic slot — see `PopupStack`'s doc comment. Draw order across several stacked popups
 /// follows call order (call the one that should appear on top last), the same rule the ordinary
@@ -437,6 +692,7 @@ pub fn popupMenuEx(ctx: *Context, id: Id, items: []const PopupItem, opts: PopupM
 pub fn popupMenuStacked(ctx: *Context, id: Id, items: []const PopupItem, opts: PopupMenuOpts) PopupResult {
     ctx.requireNoFrame("popupMenuStacked");
     const idx = ctx.popup_stack.indexOf(id) orelse return .{};
+    if (ctx.popup_stack.items[idx].kind != .menu) return .{};
     const pos = ctx.popup_stack.items[idx].pos;
 
     const r = runPopup(ctx, items, pos);
@@ -449,6 +705,15 @@ pub fn popupMenuStacked(ctx: *Context, id: Id, items: []const PopupItem, opts: P
         return .{ .selected = sel, .open = opts.keep_open_on_select };
     }
     return .{ .open = r.open };
+}
+
+pub fn dialogStacked(ctx: *Context, id: Id) DialogResult {
+    ctx.requireNoFrame("dialogStacked");
+    const idx = ctx.popup_stack.indexOf(id) orelse return .{};
+    if (ctx.popup_stack.items[idx].kind != .dialog) return .{};
+    const result = runDialog(ctx, &ctx.popup_stack.items[idx]);
+    if (result.selected != null or result.dismissed) closePopupStacked(ctx, id);
+    return result;
 }
 
 fn draw(ctx: *Context, geo: PopupGeometry, items: []const PopupItem, hovered_idx: ?usize) void {
@@ -966,6 +1231,97 @@ test "Modal absorption: a stacked-only popup (no classic slot open) also suppres
     const r2 = context_mod.buttonBehavior(&ctx, 1, btn_rect, full_clip);
     try std.testing.expect(r2.hovered);
     ctx.endFrame();
+}
+
+test "Dialog: scrim absorbs outside input and focus stays within enabled actions" {
+    var ctx = testCtx();
+    defer ctx.deinit();
+    const actions = [_]DialogAction{
+        .{ .label = "Cancel" },
+        .{ .label = "Continue" },
+    };
+    const options = DialogOptions{ .title = "Confirm", .body = "Continue?", .actions = &actions };
+    const btn_rect = geom.Rect{ .x = 0, .y = 0, .w = 100, .h = 50 };
+    const full_clip = geom.Rect{ .x = 0, .y = 0, .w = 800, .h = 600 };
+
+    ctx.beginFrame(800, 600);
+    ctx.endFrame();
+    ctx.openDialog(42, options);
+    const opened = ctx.dialog(42);
+    try std.testing.expect(opened.open);
+    try std.testing.expect(ctx.hasOpenDialog());
+    try std.testing.expectEqual(PopupKind.dialog, ctx.popup_state.?.kind);
+    var shadow_commands: usize = 0;
+    for (ctx.draw_list.cmds.items) |command| switch (command) {
+        .shadow => shadow_commands += 1,
+        else => {},
+    };
+    try std.testing.expectEqual(@as(usize, 1), shadow_commands);
+    try std.testing.expectEqual(@as(Id, dialogFocusId(42, 0)), ctx.state.focused_id);
+
+    ctx.beginFrame(800, 600);
+    ctx.pushEvent(.{ .mouse_move = .{ .x = 10, .y = 10, .modifiers = 0 } });
+    ctx.pushEvent(.{ .mouse_down = .{ .x = 10, .y = 10, .button = 0, .modifiers = 0 } });
+    const background = context_mod.buttonBehavior(&ctx, 9, btn_rect, full_clip);
+    try std.testing.expect(!background.hovered);
+    try std.testing.expect(!background.clicked);
+    ctx.endFrame();
+    const outside = ctx.dialog(42);
+    try std.testing.expect(outside.open);
+    try std.testing.expect(ctx.hasOpenDialog());
+
+    ctx.beginFrame(800, 600);
+    ctx.pushEvent(.{ .key_down = .{ .code = input_mod.key.tab, .modifiers = 0, .repeat = false } });
+    ctx.endFrame();
+    const tabbed = ctx.dialog(42);
+    try std.testing.expect(tabbed.open);
+    try std.testing.expectEqual(@as(?usize, 1), ctx.popup_state.?.dialog.?.focus_index);
+
+    ctx.beginFrame(800, 600);
+    ctx.pushEvent(.{ .key_down = .{ .code = input_mod.key.tab, .modifiers = input_mod.mod.shift, .repeat = false } });
+    ctx.endFrame();
+    const reverse_tabbed = ctx.dialog(42);
+    try std.testing.expect(reverse_tabbed.open);
+    try std.testing.expectEqual(@as(?usize, 0), ctx.popup_state.?.dialog.?.focus_index);
+
+    ctx.beginFrame(800, 600);
+    const geo = dialogGeometry(ctx.popup_state.?.pos, options, 800, 600);
+    const action = dialogActionRect(geo, 0, options.actions.len);
+    ctx.pushEvent(.{ .mouse_down = .{ .x = action.x + 4, .y = action.y + 4, .button = 0, .modifiers = 0 } });
+    ctx.endFrame();
+    const clicked = ctx.dialog(42);
+    try std.testing.expectEqual(@as(?usize, 0), clicked.selected);
+    try std.testing.expect(!ctx.hasOpenDialog());
+
+    ctx.beginFrame(800, 600);
+    ctx.endFrame();
+    ctx.openDialog(42, options);
+    ctx.beginFrame(800, 600);
+    ctx.pushEvent(.{ .key_down = .{ .code = input_mod.key.enter, .modifiers = 0, .repeat = false } });
+    ctx.endFrame();
+    const entered = ctx.dialog(42);
+    try std.testing.expectEqual(@as(?usize, 0), entered.selected);
+    try std.testing.expect(!ctx.hasOpenDialog());
+
+    ctx.beginFrame(800, 600);
+    ctx.endFrame();
+    ctx.openDialog(42, options);
+    ctx.beginFrame(800, 600);
+    ctx.pushEvent(.{ .key_down = .{ .code = input_mod.key.space, .modifiers = 0, .repeat = false } });
+    ctx.endFrame();
+    const spaced = ctx.dialog(42);
+    try std.testing.expectEqual(@as(?usize, 0), spaced.selected);
+    try std.testing.expect(!ctx.hasOpenDialog());
+
+    ctx.beginFrame(800, 600);
+    ctx.endFrame();
+    ctx.openDialog(42, options);
+    ctx.beginFrame(800, 600);
+    ctx.pushEvent(.{ .key_down = .{ .code = input_mod.key.escape, .modifiers = 0, .repeat = false } });
+    ctx.endFrame();
+    const dismissed = ctx.dialog(42);
+    try std.testing.expect(dismissed.dismissed);
+    try std.testing.expect(!ctx.hasOpenDialog());
 }
 
 test "openPopup: clears active_id/hot_id just before opening" {

@@ -25,9 +25,14 @@ pub const DrawCmd = @import("draw.zig").DrawCmd;
 pub const DrawList = @import("draw.zig").DrawList;
 pub const RoundedRectOptions = @import("draw.zig").RoundedRectOptions;
 pub const CircleOptions = @import("draw.zig").CircleOptions;
+pub const ShadowOptions = @import("draw.zig").ShadowOptions;
 pub const CornerMaskDiagnostics = @import("corner_mask.zig").Diagnostics;
 pub const corner_mask_payload_limit_bytes = @import("corner_mask.zig").payload_limit_bytes;
 pub const corner_mask_entry_limit = @import("corner_mask.zig").entry_limit;
+pub const ShadowMaskDiagnostics = @import("shadow_mask.zig").Diagnostics;
+pub const shadow_mask_payload_limit_bytes = @import("shadow_mask.zig").payload_limit_bytes;
+pub const shadow_mask_retained_limit_bytes = @import("shadow_mask.zig").retained_limit_bytes;
+pub const shadow_mask_entry_limit = @import("shadow_mask.zig").entry_limit;
 pub const PathVec2f = @import("draw.zig").Vec2f;
 pub const PathVerb = @import("draw.zig").PathVerb;
 pub const PathVerbSpec = @import("draw.zig").PathVerbSpec;
@@ -252,12 +257,16 @@ pub const Shortcut = @import("command_types").Shortcut;
 // Usual call site is as Context methods (ctx.openPopup / ctx.closePopup / ctx.hasOpenPopup / ctx.isPopupOpen /
 // ctx.popupMenu), same shape as other widgets.
 pub const PopupState = @import("popup.zig").PopupState;
+pub const PopupKind = @import("popup.zig").PopupKind;
 pub const PopupStack = @import("popup.zig").PopupStack;
 pub const max_stacked_popups = @import("popup.zig").max_stacked_popups;
 pub const PopupItem = @import("popup.zig").PopupItem;
 pub const PopupResult = @import("popup.zig").PopupResult;
 pub const PopupMenuOpts = @import("popup.zig").PopupMenuOpts;
 pub const PopupGeometry = @import("popup.zig").PopupGeometry;
+pub const DialogAction = @import("popup.zig").DialogAction;
+pub const DialogOptions = @import("popup.zig").DialogOptions;
+pub const DialogResult = @import("popup.zig").DialogResult;
 pub const layoutPopup = @import("popup.zig").layoutPopup;
 pub const itemRect = @import("popup.zig").itemRect;
 pub const hitTestItem = @import("popup.zig").hitTestItem;
@@ -271,6 +280,15 @@ pub const isPopupOpenAny = @import("popup.zig").isPopupOpenAny;
 pub const openPopupCount = @import("popup.zig").openPopupCount;
 pub const popupMenuStacked = @import("popup.zig").popupMenuStacked;
 pub const popupMenuEx = @import("popup.zig").popupMenuEx;
+pub const openDialog = @import("popup.zig").openDialog;
+pub const openDialogAt = @import("popup.zig").openDialogAt;
+pub const dialog = @import("popup.zig").dialog;
+pub const hasOpenDialog = @import("popup.zig").hasOpenDialog;
+pub const isDialogOpen = @import("popup.zig").isDialogOpen;
+pub const openDialogStacked = @import("popup.zig").openDialogStacked;
+pub const openDialogStackedAt = @import("popup.zig").openDialogStackedAt;
+pub const dialogStacked = @import("popup.zig").dialogStacked;
+pub const isDialogOpenAny = @import("popup.zig").isDialogOpenAny;
 pub const popupPos = @import("popup.zig").popupPos;
 
 // Menu bar / dropdown built from Command definitions.
@@ -308,6 +326,7 @@ test {
     _ = @import("color.zig");
     _ = @import("draw.zig");
     _ = @import("corner_mask.zig");
+    _ = @import("shadow_mask.zig");
     _ = @import("font.zig");
     _ = @import("render.zig");
     _ = @import("input.zig");

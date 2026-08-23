@@ -1,7 +1,7 @@
 //! Rounded rectangle and circle micro-benchmark.
 //! Run with `zig build bench-rounded-primitives` (ReleaseFast; no display).
 //! Hot path declaration: each measured render redraws a framebuffer and visits
-//! only four `O(radius^2)` corner masks beyond the existing rectangle routes.
+//! only retained corner or nine-slice shadow masks beyond the existing rectangle routes.
 
 const std = @import("std");
 const gui = @import("gui");
@@ -17,6 +17,7 @@ const Shape = enum {
     rounded_outline,
     circle_fill,
     circle_outline,
+    shadow,
 };
 
 const Panel = enum { small, large };
@@ -37,6 +38,10 @@ const Result = struct {
     cold_allocs: usize,
     warm_allocs: usize,
     scratch_peak: usize,
+    shadow_pixels: u64,
+    shadow_hits: u64,
+    shadow_misses: u64,
+    shadow_bytes: usize,
 };
 
 fn panelRect(panel: Panel) gui.Rect {
@@ -55,6 +60,7 @@ fn buildScene(dl: *gui.DrawList, shape: Shape, panel: Panel, radius: u32) !void 
         .rounded_outline => try dl.rectOutlineEx(rect, color, 5, .{ .radius = radius }),
         .circle_fill => try dl.circleFilled(.{ .x = 160, .y = 160 }, radius, color, .{}),
         .circle_outline => try dl.circleOutline(.{ .x = 160, .y = 160 }, radius, color, 5, .{}),
+        .shadow => try dl.shadow(rect, gui.Color.rgba(0, 0, 0, 0xA0), .{ .radius = radius, .blur = 16, .offset = .{ .x = 6, .y = 8 } }),
     }
 }
 
@@ -82,6 +88,7 @@ fn runCase(
     const cold_ns: u64 = @intCast(cold_start.untilNow(io).raw.nanoseconds);
     const cold_allocs = tracker.alloc_calls;
     const before = dl.cornerMaskDiagnostics();
+    const shadow_before = dl.shadowMaskDiagnostics();
 
     tracker.reset();
     var samples: [ITERS]u64 = undefined;
@@ -94,6 +101,7 @@ fn runCase(
     }
     const warm_allocs = tracker.alloc_calls;
     const after = dl.cornerMaskDiagnostics();
+    const shadow_after = dl.shadowMaskDiagnostics();
     std.mem.sort(u64, &samples, {}, std.sort.asc(u64));
     var sum: u64 = 0;
     for (samples) |sample| sum += sample;
@@ -116,12 +124,16 @@ fn runCase(
         .cold_allocs = cold_allocs,
         .warm_allocs = warm_allocs,
         .scratch_peak = dl.path_scratch_peak_bytes,
+        .shadow_pixels = (shadow_after.blit_pixels - shadow_before.blit_pixels) / ITERS,
+        .shadow_hits = shadow_after.hits - shadow_before.hits,
+        .shadow_misses = shadow_after.misses - shadow_before.misses,
+        .shadow_bytes = shadow_after.retained_bytes,
     };
 }
 
 fn printResult(result: Result) void {
     std.debug.print(
-        "rounded shape={s:<15} panel={s:<5} radius={d:<2} cold={d:>9} ns avg={d:>9} ns min={d:>9} ns p95={d:>9} ns checksum={X:0>8} corner_pixels={d} cache_hit={d} cache_miss={d} cache_bytes={d} cold_allocs={d} warm_allocs={d} scratch_peak={d}\n",
+        "rounded shape={s:<15} panel={s:<5} radius={d:<2} cold={d:>9} ns avg={d:>9} ns min={d:>9} ns p95={d:>9} ns checksum={X:0>8} corner_pixels={d} cache_hit={d} cache_miss={d} cache_bytes={d} cold_allocs={d} warm_allocs={d} scratch_peak={d} shadow_pixels={d} shadow_hit={d} shadow_miss={d} shadow_bytes={d}\n",
         .{
             @tagName(result.shape),
             @tagName(result.panel),
@@ -138,12 +150,21 @@ fn printResult(result: Result) void {
             result.cold_allocs,
             result.warm_allocs,
             result.scratch_peak,
+            result.shadow_pixels,
+            result.shadow_hits,
+            result.shadow_misses,
+            result.shadow_bytes,
         },
     );
 }
 
 fn requireWarmCache(result: Result) !void {
     if (result.shape == .sharp_fill) return;
+    if (result.shape == .shadow) {
+        if (result.shadow_hits == 0 or result.shadow_misses != 0) return error.WarmShadowCacheGuardFailed;
+        if (result.warm_allocs != 0) return error.WarmAllocationGuardFailed;
+        return;
+    }
     if (result.cache_hits == 0 or result.cache_misses != 0) return error.WarmCacheGuardFailed;
     if (result.warm_allocs != 0) return error.WarmAllocationGuardFailed;
 }
@@ -187,6 +208,11 @@ pub fn main(init: std.process.Init) !void {
             printResult(result);
             try requireWarmCache(result);
         }
+    }
+    for ([_]u32{ 8, 32 }) |radius| {
+        const result = try runCase(io, &tracker, .shadow, .large, radius);
+        printResult(result);
+        try requireWarmCache(result);
     }
     std.debug.print("guards=ok corner_work=panel_invariant warm_allocs=0 checksums=different\n\n", .{});
 }

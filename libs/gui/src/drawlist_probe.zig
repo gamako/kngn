@@ -19,6 +19,7 @@
 //!   `cmd=text x=.. y=.. color=.. font=default|custom clip_.. offclip=.. text="<escaped content>"`
 //!   `cmd=image x=.. y=.. w=.. h=.. src_w=.. src_h=.. pixfnv=#XXXXXXXX clip_.. offclip=..`
 //!   `cmd=path color=.. aa=0|1 winding=nonzero style=fill|stroke width=.. join=miter|bevel cap=butt|square|round miter_limit=.. verbs="MLQCZ" pts="<f32-hex pairs>" clip_.. offclip=..`
+//!   `cmd=shadow x=.. y=.. w=.. h=.. color=.. radius=.. blur=.. dx=.. dy=.. clip_.. offclip=..`
 //! `offclip=1` means the command's own extent is not fully contained by the clip rect baked
 //! into it (for `line`/`text`, "extent" is the endpoints/the draw position — the same signal
 //! a truncated shape or a mis-placed label would produce). A scene with nothing accidentally
@@ -64,6 +65,7 @@ pub fn digest(dl: *const DrawList, buf: []u8) []const u8 {
     var n_path: u32 = 0;
     var n_circle_filled: u32 = 0;
     var n_circle_outline: u32 = 0;
+    var n_shadow: u32 = 0;
     var n_offclip: u32 = 0;
 
     var line: std.ArrayList(u8) = .empty;
@@ -106,11 +108,15 @@ pub fn digest(dl: *const DrawList, buf: []u8) []const u8 {
                 n_path += 1;
                 if (cmd_text.offclipOf(cmd) == 1) n_offclip += 1;
             },
+            .shadow => {
+                n_shadow += 1;
+                if (cmd_text.offclipOf(cmd) == 1) n_offclip += 1;
+            },
         }
     }
 
-    return std.fmt.bufPrint(buf, "hash={X:0>8} rect_filled={d} rect_outline={d} line={d} text={d} image={d} path={d} circle_filled={d} circle_outline={d} offclip={d}", .{
-        h.final(), n_rect_filled, n_rect_outline, n_line, n_text, n_image, n_path, n_circle_filled, n_circle_outline, n_offclip,
+    return std.fmt.bufPrint(buf, "hash={X:0>8} rect_filled={d} rect_outline={d} line={d} text={d} image={d} path={d} circle_filled={d} circle_outline={d} shadow={d} offclip={d}", .{
+        h.final(), n_rect_filled, n_rect_outline, n_line, n_text, n_image, n_path, n_circle_filled, n_circle_outline, n_shadow, n_offclip,
     }) catch buf[0..0];
 }
 
@@ -222,7 +228,7 @@ test "digest: circle counts append after the existing command counts" {
     try dl.circleOutline(.{ .x = 40, .y = 40 }, 9, draw_mod.Color.rgba(5, 6, 7, 8), 2, .{});
     var buf: [1024]u8 = undefined;
     const line = digest(&dl, &buf);
-    try testing.expect(std.mem.indexOf(u8, line, "path=0 circle_filled=1 circle_outline=1 offclip=0") != null);
+    try testing.expect(std.mem.indexOf(u8, line, "path=0 circle_filled=1 circle_outline=1 shadow=0 offclip=0") != null);
 }
 
 test "digest: hash changes when text content changes (position and counts held equal)" {

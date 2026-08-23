@@ -193,4 +193,27 @@ expect drawlist path=0
 expect drawlist circle_filled=0
 expect drawlist circle_outline=0
 expect drawlist offclip=0
+
+# gradient paints -> shadow masks
+inject key_down PAGE_DOWN
+step 1
+inject key_up PAGE_DOWN
+step 1
+digest showcase
+expect showcase section=shadow
+expect showcase index=5
+expect showcase shadow=5
+expect showcase fill=5
+expect showcase stroke=5
+snapshot fb
+digest drawlist
+expect drawlist hash=CB7D4F68
+expect drawlist rect_filled=8
+expect drawlist rect_outline=5
+expect drawlist path=0
+expect drawlist shadow=5
+expect drawlist offclip=0
+snapshot drawlist
+digest frameprof
+expect frameprof body_ms<16.7
 quit

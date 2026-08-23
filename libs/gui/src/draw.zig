@@ -4,6 +4,7 @@ const geom = @import("geom.zig");
 const color_mod = @import("color.zig");
 const font_mod = @import("font.zig");
 const corner_mask = @import("corner_mask.zig");
+const shadow_mask = @import("shadow_mask.zig");
 
 pub const Rect = geom.Rect;
 pub const Vec2 = geom.Vec2;
@@ -245,6 +246,14 @@ pub const CircleOptions = struct {
     aa: bool = true,
 };
 
+/// Independent shadow geometry. The radius and blur are logical pixels and are
+/// physicalized by `render`; offset is applied after physicalization.
+pub const ShadowOptions = struct {
+    radius: u32 = 0,
+    blur: u32 = 0,
+    offset: Vec2 = .{ .x = 0, .y = 0 },
+};
+
 /// One shape's coverage scratch is this many bytes or less. A larger bbox is
 /// split into horizontal bands so the peak stays at this cap.
 pub const path_scratch_limit_bytes: usize = 4 * 1024 * 1024;
@@ -286,6 +295,12 @@ pub const DrawCmd = union(enum) {
         aa: bool,
         clip: Rect,
         stroke: ?PathStrokeParams = null,
+    },
+    shadow: struct {
+        rect: Rect,
+        color: Color,
+        options: ShadowOptions,
+        clip: Rect,
     },
 };
 
@@ -447,6 +462,8 @@ pub const DrawList = struct {
     /// Rounded masks survive `reset` and are released by `deinit`. The cache
     /// and its counters are touched only by non-zero-radius primitives.
     corner_masks: corner_mask.Cache = .{},
+    /// Shadow masks survive `reset` and are released by `deinit`.
+    shadow_masks: shadow_mask.Cache = .{},
     /// Retained outer coverage for an uncached giant quarter-ring band. The
     /// ordinary cached path does not use this buffer.
     corner_band: []u8 = &.{},
@@ -481,6 +498,7 @@ pub const DrawList = struct {
         self.path_stroke_left.deinit(self.alloc);
         self.path_stroke_right.deinit(self.alloc);
         self.corner_masks.deinit(self.alloc);
+        self.shadow_masks.deinit(self.alloc);
         if (self.corner_band.len != 0) self.alloc.free(self.corner_band);
         self.corner_band = &.{};
         if (self.linear_gradient_columns.len != 0) self.alloc.free(self.linear_gradient_columns);
@@ -556,6 +574,17 @@ pub const DrawList = struct {
             .thickness = thickness,
             .radius = options.radius,
             .aa = options.aa,
+            .clip = self.currentClip(),
+        } });
+    }
+
+    /// Append an independent box-shadow command. The shadow is composited before
+    /// later commands, so a panel can cover its center without a second pass.
+    pub fn shadow(self: *DrawList, rect: Rect, col: Color, options: ShadowOptions) Allocator.Error!void {
+        try self.cmds.append(self.alloc, .{ .shadow = .{
+            .rect = rect,
+            .color = col,
+            .options = options,
             .clip = self.currentClip(),
         } });
     }
@@ -702,6 +731,14 @@ pub const DrawList = struct {
 
     pub fn cornerMaskDiagnostics(self: *const DrawList) corner_mask.Diagnostics {
         return self.corner_masks.diagnostics;
+    }
+
+    pub fn shadowMaskDiagnostics(self: *const DrawList) shadow_mask.Diagnostics {
+        return self.shadow_masks.diagnostics;
+    }
+
+    pub fn resetShadowCache(self: *DrawList) void {
+        self.shadow_masks.reset(self.alloc);
     }
 
     /// Push clip onto the stack. Intersects with the current clip.

@@ -265,6 +265,26 @@ pub const verbs = [_]VerbSpec{
             .{ .name = "offclip", .role = .derived, .required = false },
         },
     },
+    .{
+        .name = "shadow",
+        .tag = .shadow,
+        .fields = &.{
+            .{ .name = "x", .role = .i32 },
+            .{ .name = "y", .role = .i32 },
+            .{ .name = "w", .role = .u32 },
+            .{ .name = "h", .role = .u32 },
+            .{ .name = "color", .role = .color },
+            .{ .name = "radius", .role = .u32, .required = false },
+            .{ .name = "blur", .role = .u32, .required = false },
+            .{ .name = "dx", .role = .i32, .required = false },
+            .{ .name = "dy", .role = .i32, .required = false },
+            .{ .name = "clip_x", .role = .i32, .required = false },
+            .{ .name = "clip_y", .role = .i32, .required = false },
+            .{ .name = "clip_w", .role = .u32, .required = false },
+            .{ .name = "clip_h", .role = .u32, .required = false },
+            .{ .name = "offclip", .role = .derived, .required = false },
+        },
+    },
 };
 
 comptime {
@@ -320,6 +340,17 @@ pub fn offclipOf(cmd: DrawCmd) u32 {
         .text => |c| @intFromBool(!c.clip.contains(c.pos)),
         .image => |c| @intFromBool(!rectFullyInside(c.rect, c.clip)),
         .path => |c| @intFromBool(!pathPointsInsideClip(c.points, c.clip)),
+        .shadow => |c| @intFromBool(!rectFullyInside(shadowBounds(c), c.clip)),
+    };
+}
+
+fn shadowBounds(c: @FieldType(DrawCmd, "shadow")) Rect {
+    const blur: i32 = @intCast(c.options.blur);
+    return .{
+        .x = c.rect.x + c.options.offset.x - blur,
+        .y = c.rect.y + c.options.offset.y - blur,
+        .w = c.rect.w + c.options.blur * 2,
+        .h = c.rect.h + c.options.blur * 2,
     };
 }
 
@@ -438,6 +469,20 @@ fn readI32(cmd: DrawCmd, name: []const u8) i32 {
             c.clip.y
         else
             unreachable,
+        .shadow => |c| if (std.mem.eql(u8, name, "x"))
+            c.rect.x
+        else if (std.mem.eql(u8, name, "y"))
+            c.rect.y
+        else if (std.mem.eql(u8, name, "dx"))
+            c.options.offset.x
+        else if (std.mem.eql(u8, name, "dy"))
+            c.options.offset.y
+        else if (std.mem.eql(u8, name, "clip_x"))
+            c.clip.x
+        else if (std.mem.eql(u8, name, "clip_y"))
+            c.clip.y
+        else
+            unreachable,
     };
 }
 
@@ -531,6 +576,20 @@ fn readU32(cmd: DrawCmd, name: []const u8) u32 {
             c.clip.h
         else
             unreachable,
+        .shadow => |c| if (std.mem.eql(u8, name, "w"))
+            c.rect.w
+        else if (std.mem.eql(u8, name, "h"))
+            c.rect.h
+        else if (std.mem.eql(u8, name, "radius"))
+            c.options.radius
+        else if (std.mem.eql(u8, name, "blur"))
+            c.options.blur
+        else if (std.mem.eql(u8, name, "clip_w"))
+            c.clip.w
+        else if (std.mem.eql(u8, name, "clip_h"))
+            c.clip.h
+        else
+            unreachable,
     };
 }
 
@@ -547,6 +606,7 @@ fn readColor(cmd: DrawCmd) u32 {
         .text => |c| colorBits(c.color),
         .image => 0,
         .path => |c| colorBits(c.color),
+        .shadow => |c| colorBits(c.color),
     };
 }
 
@@ -783,8 +843,18 @@ fn shouldEmitField(cmd: DrawCmd, field: FieldSpec) bool {
             .rect_filled => |c| c.radius != 0,
             .rect_outline => |c| c.radius != 0,
             .circle_filled, .circle_outline => true,
+            .shadow => |c| c.options.radius != 0,
             else => true,
         };
+    }
+    if (std.mem.eql(u8, field.name, "blur")) {
+        return cmd.shadow.options.blur != 0;
+    }
+    if (std.mem.eql(u8, field.name, "dx")) {
+        return cmd.shadow.options.offset.x != 0;
+    }
+    if (std.mem.eql(u8, field.name, "dy")) {
+        return cmd.shadow.options.offset.y != 0;
     }
     if (std.mem.eql(u8, field.name, "aa")) {
         return switch (cmd) {
@@ -912,8 +982,11 @@ const Staging = struct {
     y0: ?i32 = null,
     x1: ?i32 = null,
     y1: ?i32 = null,
+    dx: ?i32 = null,
+    dy: ?i32 = null,
     thickness: ?u32 = null,
     radius: ?u32 = null,
+    blur: ?u32 = null,
     color: ?u32 = null,
     paint: ?enum { linear, radial, solid } = null,
     paint_from: ?u32 = null,
@@ -964,6 +1037,12 @@ const Staging = struct {
         } else if (std.mem.eql(u8, name, "y1")) {
             if (self.y1 != null) return error.DuplicateField;
             self.y1 = v;
+        } else if (std.mem.eql(u8, name, "dx")) {
+            if (self.dx != null) return error.DuplicateField;
+            self.dx = v;
+        } else if (std.mem.eql(u8, name, "dy")) {
+            if (self.dy != null) return error.DuplicateField;
+            self.dy = v;
         } else if (std.mem.eql(u8, name, "clip_x")) {
             if (self.clip_x != null) return error.DuplicateField;
             self.clip_x = v;
@@ -986,6 +1065,9 @@ const Staging = struct {
         } else if (std.mem.eql(u8, name, "radius")) {
             if (self.radius != null) return error.DuplicateField;
             self.radius = v;
+        } else if (std.mem.eql(u8, name, "blur")) {
+            if (self.blur != null) return error.DuplicateField;
+            self.blur = v;
         } else if (std.mem.eql(u8, name, "src_w")) {
             if (self.src_w != null) return error.DuplicateField;
             self.src_w = v;
@@ -1267,6 +1349,24 @@ fn buildCmd(verb: *const VerbSpec, st: Staging, arena: Allocator) (ParseError ||
                 .stroke = stroke,
             } };
         },
+        .shadow => .{ .shadow = .{
+            .rect = .{
+                .x = try checkCoord(try requireI32(st.x)),
+                .y = try checkCoord(try requireI32(st.y)),
+                .w = try checkExtent(try requireU32(st.w)),
+                .h = try checkExtent(try requireU32(st.h)),
+            },
+            .color = colorFromBits(st.color orelse return error.MissingField),
+            .options = .{
+                .radius = try checkExtent(st.radius orelse 0),
+                .blur = try checkExtent(st.blur orelse 0),
+                .offset = .{
+                    .x = try checkCoord(st.dx orelse 0),
+                    .y = try checkCoord(st.dy orelse 0),
+                },
+            },
+            .clip = clip,
+        } },
     };
 }
 
@@ -1499,7 +1599,7 @@ pub fn parseDump(
 const testing = std.testing;
 
 test "draw_cmd_text: verb table covers every DrawCmd tag by name" {
-    try testing.expectEqual(@as(usize, 8), verbs.len);
+    try testing.expectEqual(@as(usize, 9), verbs.len);
     try testing.expect(verbByName("rect_filled") != null);
     try testing.expect(verbByName("rect_outline") != null);
     try testing.expect(verbByName("circle_filled") != null);
@@ -1508,6 +1608,7 @@ test "draw_cmd_text: verb table covers every DrawCmd tag by name" {
     try testing.expect(verbByName("text") != null);
     try testing.expect(verbByName("image") != null);
     try testing.expect(verbByName("path") != null);
+    try testing.expect(verbByName("shadow") != null);
 }
 
 test "draw_cmd_text: serialize walks the table field order" {
@@ -1585,6 +1686,29 @@ test "draw_cmd_text: rounded rectangles emit radius and only non-default AA" {
     try testing.expect(std.mem.indexOf(u8, first.items, "radius=6") != null);
     try testing.expect(std.mem.indexOf(u8, first.items, " aa=") == null);
     try testing.expect(std.mem.indexOf(u8, second.items, "radius=7 aa=0") != null);
+}
+
+test "draw_cmd_text: shadow canonical fields round trip without changing existing commands" {
+    var dl = DrawList.init(testing.allocator);
+    defer dl.deinit();
+    dl.reset(64, 64);
+    try dl.shadow(.{ .x = 6, .y = 8, .w = 32, .h = 24 }, Color.rgba(0, 0, 0, 0xA0), .{
+        .radius = 10,
+        .blur = 6,
+        .offset = .{ .x = 3, .y = -2 },
+    });
+    var first: std.ArrayList(u8) = .empty;
+    defer first.deinit(testing.allocator);
+    try appendCmd(&first, testing.allocator, dl.cmds.items[0]);
+    try testing.expect(std.mem.indexOf(u8, first.items, "cmd=shadow x=6 y=8 w=32 h=24 color=#A0000000 radius=10 blur=6 dx=3 dy=-2") != null);
+
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const parsed = try parseCmdLine(std.mem.trimEnd(u8, first.items, "\n"), arena.allocator());
+    var second: std.ArrayList(u8) = .empty;
+    defer second.deinit(testing.allocator);
+    try appendCmd(&second, testing.allocator, parsed);
+    try testing.expectEqualSlices(u8, first.items, second.items);
 }
 
 test "draw_cmd_text: gradient dumps use canonical IEEE bit fields and round trip" {

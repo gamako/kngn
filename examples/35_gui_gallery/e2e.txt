@@ -6,7 +6,7 @@ digest gallery
 expect gallery section=overview
 expect gallery index=0
 expect gallery widgets=0
-expect gallery missing=11
+expect gallery missing=9
 expect gallery schema=v0
 snapshot fb
 
@@ -147,6 +147,74 @@ step 2
 digest gallery
 snapshot fb
 inject mouse_move 1000 620
+# Open alert dialog from the menus section.
+inject mouse_move 120 180
+step 2
+inject mouse_down left
+step 1
+inject mouse_up left
+step 1
+digest gallery
+expect gallery dialog=open
+expect gallery dialog_last=alert
+expect gallery focused=dialog
+expect gallery dialog_focus=1
+expect gallery dialog_shadow=1
+snapshot fb
+# The scrim absorbs an outside click and leaves the dialog open.
+inject mouse_move 20 600
+inject mouse_down left
+step 1
+inject mouse_up left
+step 1
+digest gallery
+expect gallery dialog=open
+expect gallery focused=dialog
+expect gallery dialog_focus=1
+expect gallery dialog_shadow=1
+# Escape dismisses the alert.
+inject key_down ESCAPE
+step 1
+inject key_up ESCAPE
+step 1
+digest gallery
+expect gallery dialog=closed
+expect gallery dialog_result=dismissed_escape
+# Open the two-action message dialog.
+inject mouse_move 320 180
+inject mouse_down left
+step 1
+inject mouse_up left
+step 1
+digest gallery
+expect gallery dialog=open
+expect gallery dialog_last=message
+expect gallery focused=dialog
+expect gallery dialog_focus=1
+expect gallery dialog_shadow=1
+snapshot fb
+# Tab and Shift+Tab stay inside the dialog action scope.
+inject key_down TAB
+step 1
+inject key_up TAB
+step 1
+digest gallery
+expect gallery dialog_focus=2
+snapshot fb
+inject key_down TAB shift
+step 1
+inject key_up TAB shift
+step 1
+digest gallery
+expect gallery dialog_focus=1
+# Enter activates the focused action.
+inject key_down ENTER
+step 1
+inject key_up ENTER
+step 1
+digest gallery
+expect gallery dialog=closed
+expect gallery dialog_result=cancel
 # menus -> stepgrid
 inject key_down PAGE_DOWN
 step 1
@@ -173,7 +241,7 @@ step 1
 digest gallery
 expect gallery section=missing
 expect gallery index=9
-expect gallery widgets=11
-expect gallery missing=11
+expect gallery widgets=9
+expect gallery missing=9
 snapshot fb
 quit

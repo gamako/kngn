@@ -434,9 +434,15 @@ pub const Context = struct {
     pub const openPopup = popup_mod.openPopup;
     pub const closePopup = popup_mod.closePopup;
     pub const hasOpenPopup = popup_mod.hasOpenPopup;
+    pub const hasOpenDialog = popup_mod.hasOpenDialog;
     pub const isPopupOpen = popup_mod.isPopupOpen;
+    pub const isDialogOpen = popup_mod.isDialogOpen;
+    pub const isDialogOpenAny = popup_mod.isDialogOpenAny;
     pub const popupMenu = popup_mod.popupMenu;
     pub const popupMenuEx = popup_mod.popupMenuEx;
+    pub const openDialog = popup_mod.openDialog;
+    pub const openDialogAt = popup_mod.openDialogAt;
+    pub const dialog = popup_mod.dialog;
     // Stacked popups (coexist with the classic slot above; see PopupStack in popup.zig).
     pub const openPopupStacked = popup_mod.openPopupStacked;
     pub const closePopupStacked = popup_mod.closePopupStacked;
@@ -444,6 +450,9 @@ pub const Context = struct {
     pub const isPopupOpenAny = popup_mod.isPopupOpenAny;
     pub const openPopupCount = popup_mod.openPopupCount;
     pub const popupMenuStacked = popup_mod.popupMenuStacked;
+    pub const openDialogStacked = popup_mod.openDialogStacked;
+    pub const openDialogStackedAt = popup_mod.openDialogStackedAt;
+    pub const dialogStacked = popup_mod.dialogStacked;
     pub const popupPos = popup_mod.popupPos;
     // Cross-widget drag-and-drop. Implementation and contract: see dnd.zig.
     pub const dragSource = dnd_mod.dragSource;

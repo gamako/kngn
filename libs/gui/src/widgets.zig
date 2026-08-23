@@ -334,7 +334,7 @@ const IconButtonDraw = struct {
 /// the chord into something else (Cmd+Space belongs to the system, Shift+Enter to text), so only
 /// the bare key counts, and auto-repeat does not activate twice.
 ///
-/// While a popup is open it never fires: the popup has taken over input, and the focus left behind
+/// While a popup or dialog is open it never fires: the overlay has taken over input, and the focus left behind
 /// it still points at a background widget. Nor does it fire in a frame the pointer is taking part
 /// in, for the reason `pointerEngaged` gives.
 fn keyboardActivated(ctx: *const Context, id: Id) bool {

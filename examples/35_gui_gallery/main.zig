@@ -39,10 +39,10 @@ const SectionMeta = struct {
 const SECTIONS = [_]SectionMeta{
     .{ .name = "overview", .detail = "three axes: widget / state / context", .widgets = 0, .missing = MISSING.len },
     .{ .name = "basic", .detail = "button / label", .widgets = 2, .missing = 0 },
-    .{ .name = "text", .detail = "selectableLabel / textInputId / wrap / overflow / labelStyled", .widgets = 4, .missing = 0 },
+    .{ .name = "text", .detail = "selectableLabel / textInputId / wrap / overflow / labelStyled", .widgets = 3, .missing = 0 },
     .{ .name = "values", .detail = "slider / checkbox / toggle / radio", .widgets = 4, .missing = 0 },
     .{ .name = "color", .detail = "colorSwatch / SV+hue / imageBox", .widgets = 3, .missing = 0 },
-    .{ .name = "layout", .detail = "splitter / scrollArea / iconButton / tooltip / collapsible / anchor / indent", .widgets = 7, .missing = 0 },
+    .{ .name = "layout", .detail = "splitter / scrollArea / iconButton / tooltip / collapsible / anchor / indent", .widgets = 5, .missing = 0 },
     .{ .name = "menus", .detail = "popup/contextMenu / menuBar", .widgets = 2, .missing = 0 },
     .{ .name = "stepgrid", .detail = "stepgrid.widgetRow", .widgets = 1, .missing = 0 },
     .{ .name = "table", .detail = "column header / sticky scroll / selected row / ellipsis", .widgets = 1, .missing = 0 },
@@ -118,11 +118,9 @@ const MISSING = [_]MissingEntry{
     // is one flat, independent expand/collapse header (used, for example, by panel_host and by
     // this gallery's own layout section) with no cross-section coordination.
     .{ .name = "Accordion", .category = "settings shell" },
-    .{ .name = "Alert / Message Dialog", .category = "torture suite" },
     .{ .name = "Breadcrumb", .category = "settings shell" },
     .{ .name = "Carousel", .category = "deferred" },
     .{ .name = "Combobox", .category = "settings shell" },
-    .{ .name = "Dialog (Modal)", .category = "settings shell" },
     .{ .name = "Disclosure", .category = "settings shell" },
     .{ .name = "Meter", .category = "settings shell" },
     .{ .name = "Spinbutton", .category = "settings shell" },
@@ -153,6 +151,8 @@ const Ids = struct {
     const collapsible_child: gui.Id = 0x3545;
     const popup_trigger: gui.Id = 0x3550;
     const popup: gui.Id = 0x3551;
+    const alert_dialog: gui.Id = 0x3552;
+    const message_dialog: gui.Id = 0x3553;
     const grid: gui.Id = 0x3560;
     const disabled_toggle: gui.Id = 0x3570;
     const table: gui.Id = 0x3580;
@@ -217,6 +217,12 @@ const popup_items = [_]gui.PopupItem{
     .{ .label = "Disabled action", .enabled = false },
 };
 
+const alert_actions = [_]gui.DialogAction{.{ .label = "OK" }};
+const message_actions = [_]gui.DialogAction{
+    .{ .label = "Cancel" },
+    .{ .label = "Continue" },
+};
+
 const commands = [_]gui.Command{
     .{ .id = 1, .label = "Open", .menu = .{ .title = "File", .order = 0 }, .shortcut = .{ .key = .O, .modifiers = .{ .cmd = true } } },
     .{ .id = 2, .label = "Save (disabled)", .menu = .{ .title = "File", .order = 1 }, .enabled = false },
@@ -250,6 +256,8 @@ const App = struct {
     // Frame-local paste for Cmd+V (consumer wiring. set in the event loop; clear at frame start)
     paste_buf: [4096]u8 = undefined,
     paste_text: ?[]const u8 = null,
+    dialog_last: []const u8 = "none",
+    dialog_result: []const u8 = "none",
 
     fn current(self: *const App) Section {
         return @enumFromInt(self.section);
@@ -271,6 +279,7 @@ const App = struct {
     }
 
     fn widgetName(self: *const App, id: gui.Id) []const u8 {
+        if (self.ctx.hasOpenDialog() and id != 0) return "dialog";
         if (id >= Ids.grid and id < Ids.grid + 16) return "stepgrid";
         return switch (id) {
             0 => "none",
@@ -339,7 +348,18 @@ fn toGuiEvent(ev: platform.Event) ?gui.InputEvent {
 fn galleryDigest(ctx_ptr: *anyopaque, buf: []u8) []const u8 {
     const app: *App = @ptrCast(@alignCast(ctx_ptr));
     const meta = SECTIONS[app.section];
-    return std.fmt.bufPrint(buf, "section={s} index={d} widgets={d} missing={d} schema={s} hot={s} active={s} focused={s} disabled={d}", .{
+    const dialog_state = if (app.ctx.hasOpenDialog()) "open" else "closed";
+    var dialog_shadow: u32 = 0;
+    var dialog_focus: u32 = 0;
+    if (app.ctx.hasOpenDialog()) {
+        for (app.ctx.draw_list.cmds.items) |cmd| {
+            if (cmd == .shadow) dialog_shadow += 1;
+        }
+        if (app.ctx.popup_state) |state| if (state.kind == .dialog) if (state.dialog) |dialog_state_data| {
+            if (dialog_state_data.focus_index) |index| dialog_focus = @intCast(index + 1);
+        };
+    }
+    return std.fmt.bufPrint(buf, "section={s} index={d} widgets={d} missing={d} schema={s} hot={s} active={s} focused={s} disabled={d} dialog={s} dialog_last={s} dialog_result={s} dialog_focus={d} dialog_shadow={d}", .{
         meta.name,
         app.section,
         meta.widgets,
@@ -349,6 +369,11 @@ fn galleryDigest(ctx_ptr: *anyopaque, buf: []u8) []const u8 {
         app.widgetName(app.ctx.state.active_id),
         app.widgetName(app.ctx.state.focused_id),
         @as(u32, if (app.disabled_demo) 1 else 0),
+        dialog_state,
+        app.dialog_last,
+        app.dialog_result,
+        dialog_focus,
+        dialog_shadow,
     }) catch buf[0..0];
 }
 
@@ -619,6 +644,26 @@ fn renderMenus(ctx: *gui.Context, app: *App) void {
     if (ctx.buttonId(Ids.popup_trigger, "Open context popup", .{ .min_w = 180 }).clicked) {
         ctx.openPopup(Ids.popup, .{ .x = 160, .y = 128 });
     }
+    ctx.beginBox(.{ .direction = .row, .height = .{ .fixed = 32 }, .gap = 8 });
+    if (ctx.buttonId(Ids.alert_dialog, "Open alert dialog", .{ .min_w = 180 }).clicked) {
+        app.dialog_last = "alert";
+        app.dialog_result = "none";
+        ctx.openDialog(Ids.alert_dialog, .{
+            .title = "Alert",
+            .body = "The operation needs your attention.",
+            .actions = &alert_actions,
+        });
+    }
+    if (ctx.buttonId(Ids.message_dialog, "Open message dialog", .{ .min_w = 180 }).clicked) {
+        app.dialog_last = "message";
+        app.dialog_result = "none";
+        ctx.openDialog(Ids.message_dialog, .{
+            .title = "Message",
+            .body = "Continue with the selected action?",
+            .actions = &message_actions,
+        });
+    }
+    ctx.endBox();
     ctx.label("PopupItem and Command expose enabled / disabled / checked / shortcut / separator.");
     ctx.endBox();
 }
@@ -791,7 +836,9 @@ pub fn main(init: std.process.Init) !void {
             switch (ev) {
                 .quit => running = false,
                 .key_down => |k| switch (k.key) {
-                    .ESCAPE => running = false,
+                    .ESCAPE => {
+                        if (!ctx.hasOpenDialog()) running = false;
+                    },
                     .PAGE_DOWN => app.changeSection(1),
                     .PAGE_UP => app.changeSection(-1),
                     // For keyboards without PAGE keys (hardware feedback 2026-07-17).
@@ -811,6 +858,14 @@ pub fn main(init: std.process.Init) !void {
         renderFrame(&ctx, &app);
         _ = gui.menuBarPopup(&ctx, &commands, &app.menu);
         _ = ctx.popupMenu(Ids.popup, &popup_items);
+        const dialog_result = ctx.dialog(Ids.alert_dialog);
+        const message_result = ctx.dialog(Ids.message_dialog);
+        const result = if (dialog_result.selected != null or dialog_result.dismissed) dialog_result else message_result;
+        if (result.selected) |index| {
+            app.dialog_result = if (app.dialog_last[0] == 'a') "selected_ok" else if (index == 0) "cancel" else "continue";
+        } else if (result.dismissed) {
+            app.dialog_result = "dismissed_escape";
+        }
         const target: gui.RenderTarget = .{ .pixels = fb.pixels, .width = fb.width, .height = fb.height };
         gui.render(target, &ctx.draw_list, ctx.font, 1.0);
         window.present();

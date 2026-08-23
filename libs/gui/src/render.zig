@@ -7,6 +7,7 @@ const draw_mod = @import("draw.zig");
 const font_mod = @import("font.zig");
 const path_stroke = @import("path_stroke.zig");
 const corner_mask = @import("corner_mask.zig");
+const shadow_mask = @import("shadow_mask.zig");
 
 pub const Rect = geom.Rect;
 pub const Vec2 = geom.Vec2;
@@ -44,6 +45,9 @@ pub fn cmdWithinDomain(cmd: draw_mod.DrawCmd) bool {
         .text => |c| pointInDomain(c.pos) and rectInDomain(c.clip),
         .image => |c| rectInDomain(c.rect) and rectInDomain(c.clip),
         .path => |c| pathInDomain(c),
+        .shadow => |c| rectInDomain(c.rect) and rectInDomain(c.clip) and
+            pointInDomain(c.options.offset) and extentInDomain(c.options.radius) and
+            extentInDomain(c.options.blur),
     };
 }
 
@@ -174,6 +178,7 @@ pub fn render(target: RenderTarget, draw_list: *DrawList, font: Font, scale: f32
                 .text => |c| if (!c.clip.isEmpty()) (c.font orelse font).drawTo(target, c.pos, c.text, c.color, c.clip, 1.0),
                 .image => |c| if (!c.clip.isEmpty()) drawImage(target, c.rect, c.pixels, c.src_w, c.src_h, c.clip),
                 .path => |c| if (!c.clip.isEmpty()) drawPath(target, draw_list, c, 1.0, true),
+                .shadow => |c| if (!c.clip.isEmpty()) drawShadow(target, draw_list, c.rect, c.color, c.options, c.clip, 1.0, true),
             }
         }
         return;
@@ -295,6 +300,9 @@ pub fn render(target: RenderTarget, draw_list: *DrawList, font: Font, scale: f32
                     drawPath(target, draw_list, scaled, scale, true);
                 }
             },
+            .shadow => |c| {
+                drawShadow(target, draw_list, scaleRect(c.rect, scale), c.color, c.options, scaleRect(c.clip, scale), scale, true);
+            },
         }
     }
 }
@@ -332,6 +340,13 @@ fn scaleThickness(thickness: u32, scale: f32) u32 {
     const t = @round(@as(f32, @floatFromInt(thickness)) * scale);
     if (t < 1.0) return 1;
     return @intFromFloat(t);
+}
+
+fn scaleBlurUnclamped(blur: u32, scale: f32) u32 {
+    if (blur == 0) return 0;
+    const scaled = @round(@as(f32, @floatFromInt(blur)) * scale);
+    if (scaled < 1.0) return 1;
+    return @intFromFloat(scaled);
 }
 
 /// Caller guarantees `v` is finite and inside i32. The `render` contract
@@ -571,6 +586,160 @@ fn blendPixel(dst: u32, src: Color) u32 {
 fn clipRect(rect: Rect, clip: Rect, target: RenderTarget) Rect {
     const target_rect = Rect{ .x = 0, .y = 0, .w = target.width, .h = target.height };
     return Rect.intersect(Rect.intersect(rect, clip), target_rect);
+}
+
+const ShadowRegion = enum { corner, horizontal_edge, vertical_edge, center };
+
+fn shadowCoverage(mask: shadow_mask.Mask, region: ShadowRegion, source_x: u32, source_y: u32, mirror_x: bool, mirror_y: bool, x: u32, y: u32) u8 {
+    return switch (region) {
+        .center => 255,
+        .horizontal_edge => mask.edge[if (mirror_y) mask.extent - 1 - (source_y + y) else source_y + y],
+        .vertical_edge => mask.edge[if (mirror_x) mask.extent - 1 - (source_x + x) else source_x + x],
+        .corner => mask.corner[
+            @as(usize, if (mirror_y) mask.extent - 1 - (source_y + y) else source_y + y) * mask.extent +
+                (if (mirror_x) mask.extent - 1 - (source_x + x) else source_x + x)
+        ],
+    };
+}
+
+/// Composite one disjoint nine-slice region. All clipping and source coordinates are
+/// resolved before the row loop; the loop only indexes retained coverage and blends pixels.
+fn blitShadowRegion(
+    target: RenderTarget,
+    draw_list: *DrawList,
+    dst: Rect,
+    clip: Rect,
+    mask: shadow_mask.Mask,
+    color: Color,
+    region: ShadowRegion,
+    source_x: u32,
+    source_y: u32,
+    mirror_x: bool,
+    mirror_y: bool,
+    comptime use_simd: bool,
+) void {
+    const bounds = clipRect(dst, clip, target);
+    if (bounds.isEmpty() or color.a == 0) return;
+    draw_list.shadow_masks.addBlitPixels(@as(usize, bounds.w) * bounds.h);
+
+    const src_u32: u32 = @bitCast(color);
+    const src4 = [4]u32{ src_u32, src_u32, src_u32, src_u32 };
+    const local_x0: u32 = @intCast(bounds.x - dst.x);
+    const local_y0: u32 = @intCast(bounds.y - dst.y);
+    const dst_x: u32 = @intCast(bounds.x);
+    const dst_y: u32 = @intCast(bounds.y);
+
+    var row: u32 = 0;
+    while (row < bounds.h) : (row += 1) {
+        const dst_base = (@as(usize, dst_y) + row) * target.width + dst_x;
+        var x: u32 = 0;
+        while (x + 4 <= bounds.w) : (x += 4) {
+            var coverage: [4]u8 = undefined;
+            inline for (0..4) |lane| {
+                coverage[lane] = shadowCoverage(
+                    mask,
+                    region,
+                    source_x,
+                    source_y,
+                    mirror_x,
+                    mirror_y,
+                    local_x0 + x + @as(u32, @intCast(lane)),
+                    local_y0 + row,
+                );
+            }
+            const cov4: @Vector(4, u8) = coverage;
+            if (@reduce(.Or, cov4) != 0) {
+                const dst_chunk: *[4]u32 = target.pixels[dst_base + x ..][0..4];
+                if (comptime use_simd) {
+                    dst_chunk.* = @bitCast(pixelops.srcOverCoverage4(@bitCast(dst_chunk.*), @bitCast(src4), cov4));
+                } else {
+                    for (0..4) |lane| {
+                        if (coverage[lane] != 0) {
+                            dst_chunk[lane] = pixelops.srcOverCoverage(dst_chunk[lane], src_u32, coverage[lane]);
+                        }
+                    }
+                }
+            }
+        }
+        while (x < bounds.w) : (x += 1) {
+            const coverage = shadowCoverage(mask, region, source_x, source_y, mirror_x, mirror_y, local_x0 + x, local_y0 + row);
+            if (coverage != 0) {
+                target.pixels[dst_base + x] = pixelops.srcOverCoverage(target.pixels[dst_base + x], src_u32, coverage);
+            }
+        }
+    }
+}
+
+fn drawShadow(
+    target: RenderTarget,
+    draw_list: *DrawList,
+    rect: Rect,
+    color: Color,
+    options: draw_mod.ShadowOptions,
+    clip: Rect,
+    scale: f32,
+    comptime use_simd: bool,
+) void {
+    if (rect.isEmpty() or clip.isEmpty() or color.a == 0) return;
+    const radius = if (options.radius == 0) 0 else scaleRadiusUnclamped(options.radius, scale);
+    const blur = scaleBlurUnclamped(options.blur, scale);
+    const base = if (scale == 1.0 and options.offset.x == 0 and options.offset.y == 0)
+        rect
+    else
+        scaleRect(rect, scale);
+    const offset = scalePoint(options.offset, scale);
+    const blur_i: i32 = @intCast(blur);
+    const outer = Rect{
+        .x = base.x + offset.x - blur_i,
+        .y = base.y + offset.y - blur_i,
+        .w = base.w + blur * 2,
+        .h = base.h + blur * 2,
+    };
+    const visible = clipRect(outer, clip, target);
+    if (visible.isEmpty()) return;
+
+    const key = shadow_mask.ShadowMaskKey.init(radius, blur, scale);
+    const mask = draw_list.shadow_masks.getOrCreate(draw_list.alloc, key) catch |err| switch (err) {
+        error.KeyTooLarge => @panic("gui shadow mask key exceeds bounded cache"),
+        error.OutOfMemory => @panic("gui shadow mask cache: OOM"),
+    };
+    const half_w = outer.w / 2;
+    const half_h = outer.h / 2;
+    const slice = @min(mask.extent, @min(half_w, half_h));
+    if (slice == 0) return;
+    const center_w = outer.w - slice * 2;
+    const center_h = outer.h - slice * 2;
+    const far_x = mask.extent - slice;
+    const far_y = mask.extent - slice;
+    const horizontal_a = center_w / 2;
+    const horizontal_b = center_w - horizontal_a;
+    const vertical_a = center_h / 2;
+    const vertical_b = center_h - vertical_a;
+
+    blitShadowRegion(target, draw_list, .{ .x = outer.x, .y = outer.y, .w = slice, .h = slice }, clip, mask, color, .corner, 0, 0, false, false, use_simd);
+    blitShadowRegion(target, draw_list, .{ .x = outer.x + @as(i32, @intCast(outer.w - slice)), .y = outer.y, .w = slice, .h = slice }, clip, mask, color, .corner, far_x, 0, true, false, use_simd);
+    blitShadowRegion(target, draw_list, .{ .x = outer.x, .y = outer.y + @as(i32, @intCast(outer.h - slice)), .w = slice, .h = slice }, clip, mask, color, .corner, 0, far_y, false, true, use_simd);
+    blitShadowRegion(target, draw_list, .{ .x = outer.x + @as(i32, @intCast(outer.w - slice)), .y = outer.y + @as(i32, @intCast(outer.h - slice)), .w = slice, .h = slice }, clip, mask, color, .corner, far_x, far_y, true, true, use_simd);
+
+    if (center_w != 0) {
+        if (horizontal_a != 0) {
+            blitShadowRegion(target, draw_list, .{ .x = outer.x + @as(i32, @intCast(slice)), .y = outer.y, .w = horizontal_a, .h = slice }, clip, mask, color, .horizontal_edge, 0, 0, false, false, use_simd);
+            blitShadowRegion(target, draw_list, .{ .x = outer.x + @as(i32, @intCast(slice)), .y = outer.y + @as(i32, @intCast(outer.h - slice)), .w = horizontal_a, .h = slice }, clip, mask, color, .horizontal_edge, 0, far_y, false, true, use_simd);
+        }
+        blitShadowRegion(target, draw_list, .{ .x = outer.x + @as(i32, @intCast(slice + horizontal_a)), .y = outer.y, .w = horizontal_b, .h = slice }, clip, mask, color, .horizontal_edge, 0, 0, false, false, use_simd);
+        blitShadowRegion(target, draw_list, .{ .x = outer.x + @as(i32, @intCast(slice + horizontal_a)), .y = outer.y + @as(i32, @intCast(outer.h - slice)), .w = horizontal_b, .h = slice }, clip, mask, color, .horizontal_edge, 0, far_y, false, true, use_simd);
+    }
+    if (center_h != 0) {
+        if (vertical_a != 0) {
+            blitShadowRegion(target, draw_list, .{ .x = outer.x, .y = outer.y + @as(i32, @intCast(slice)), .w = slice, .h = vertical_a }, clip, mask, color, .vertical_edge, 0, 0, false, false, use_simd);
+            blitShadowRegion(target, draw_list, .{ .x = outer.x + @as(i32, @intCast(outer.w - slice)), .y = outer.y + @as(i32, @intCast(slice)), .w = slice, .h = vertical_a }, clip, mask, color, .vertical_edge, far_x, 0, true, false, use_simd);
+        }
+        blitShadowRegion(target, draw_list, .{ .x = outer.x, .y = outer.y + @as(i32, @intCast(slice + vertical_a)), .w = slice, .h = vertical_b }, clip, mask, color, .vertical_edge, 0, 0, false, false, use_simd);
+        blitShadowRegion(target, draw_list, .{ .x = outer.x + @as(i32, @intCast(outer.w - slice)), .y = outer.y + @as(i32, @intCast(slice + vertical_a)), .w = slice, .h = vertical_b }, clip, mask, color, .vertical_edge, far_x, 0, true, false, use_simd);
+    }
+    if (center_w != 0 and center_h != 0) {
+        blitShadowRegion(target, draw_list, .{ .x = outer.x + @as(i32, @intCast(slice)), .y = outer.y + @as(i32, @intCast(slice)), .w = center_w, .h = center_h }, clip, mask, color, .center, 0, 0, false, false, use_simd);
+    }
 }
 
 // ── draw primitives ───────────────────────────────────────────────────────────
@@ -3561,6 +3730,111 @@ test "rounded render: SIMD and scalar corner coverage are framebuffer-identical"
     drawRoundedFilledDevice(.{ .pixels = &scalar_pixels, .width = 64, .height = 48 }, &scalar, rect, color, 11, true, .{ .x = 0, .y = 0, .w = 64, .h = 48 }, 1.0, false);
     drawRoundedOutlineDevice(.{ .pixels = &scalar_pixels, .width = 64, .height = 48 }, &scalar, .{ .x = 18, .y = 12, .w = 40, .h = 30 }, color, 5, 12, false, .{ .x = 0, .y = 0, .w = 64, .h = 48 }, 1.0, false);
     try std.testing.expectEqualSlices(u32, &simd_pixels, &scalar_pixels);
+}
+
+test "shadow render: SIMD and scalar nine-slice coverage are framebuffer-identical and warm" {
+    var simd_pixels = [_]u32{0xFF17202A} ** (96 * 64);
+    var scalar_pixels = simd_pixels;
+    var simd = DrawList.init(std.testing.allocator);
+    defer simd.deinit();
+    var scalar = DrawList.init(std.testing.allocator);
+    defer scalar.deinit();
+    simd.reset(96, 64);
+    scalar.reset(96, 64);
+    const rect = Rect{ .x = 14, .y = 12, .w = 58, .h = 32 };
+    const clip = Rect{ .x = 0, .y = 0, .w = 96, .h = 64 };
+    const options: draw_mod.ShadowOptions = .{ .radius = 12, .blur = 8, .offset = .{ .x = 3, .y = 4 } };
+    const color = Color.rgba(0x00, 0x00, 0x00, 0xA0);
+    const simd_target = RenderTarget{ .pixels = &simd_pixels, .width = 96, .height = 64 };
+    const scalar_target = RenderTarget{ .pixels = &scalar_pixels, .width = 96, .height = 64 };
+    drawShadow(simd_target, &simd, rect, color, options, clip, 1.0, true);
+    const first_pixels = simd_pixels;
+    try std.testing.expect(first_pixels[32 * 96 + 40] != 0xFF17202A);
+    drawShadow(scalar_target, &scalar, rect, color, options, clip, 1.0, false);
+    try std.testing.expectEqualSlices(u32, &first_pixels, &scalar_pixels);
+
+    const cold = simd.shadowMaskDiagnostics();
+    drawShadow(simd_target, &simd, rect, color, options, clip, 1.0, true);
+    const warm = simd.shadowMaskDiagnostics();
+    try std.testing.expectEqual(cold.evaluations, warm.evaluations);
+    try std.testing.expectEqual(cold.allocations, warm.allocations);
+    try std.testing.expect(warm.hits > cold.hits);
+    try std.testing.expect(warm.blit_pixels > cold.blit_pixels);
+}
+
+test "shadow render: fractional scale and clip boundaries use the retained key" {
+    var pixels = [_]u32{0xFF202020} ** (96 * 64);
+    var dl = DrawList.init(std.testing.allocator);
+    defer dl.deinit();
+    dl.reset(64, 48);
+    try dl.shadow(.{ .x = 4, .y = 4, .w = 28, .h = 20 }, Color.rgba(0, 0, 0, 0x90), .{
+        .radius = 6,
+        .blur = 4,
+        .offset = .{ .x = 2, .y = -1 },
+    });
+    const target = RenderTarget{ .pixels = &pixels, .width = 96, .height = 64 };
+    render(target, &dl, font_mod.default_font, 1.5);
+    const first = dl.shadowMaskDiagnostics();
+    render(target, &dl, font_mod.default_font, 1.5);
+    const second = dl.shadowMaskDiagnostics();
+    try std.testing.expectEqual(@as(u64, 1), first.evaluations);
+    try std.testing.expectEqual(first.evaluations, second.evaluations);
+    try std.testing.expectEqual(first.allocations, second.allocations);
+    try std.testing.expect(second.hits > first.hits);
+}
+
+test "shadow render: zero radius and zero blur use the non-analytic cached route" {
+    var pixels = [_]u32{0xFF202020} ** (48 * 32);
+    var dl = DrawList.init(std.testing.allocator);
+    defer dl.deinit();
+    dl.reset(48, 32);
+    try dl.shadow(.{ .x = 8, .y = 6, .w = 24, .h = 16 }, Color.rgba(0, 0, 0, 0xA0), .{});
+    render(.{ .pixels = &pixels, .width = 48, .height = 32 }, &dl, font_mod.default_font, 1.0);
+    const diagnostics = dl.shadowMaskDiagnostics();
+    try std.testing.expectEqual(@as(u64, 1), diagnostics.evaluations);
+    try std.testing.expect(diagnostics.blit_pixels > 0);
+    try std.testing.expect(pixels[6 * 48 + 8] != 0xFF202020);
+}
+
+test "shadow render: a tree without shadow commands does not touch the shadow cache" {
+    var pixels = [_]u32{0xFF202020} ** (32 * 24);
+    var dl = DrawList.init(std.testing.allocator);
+    defer dl.deinit();
+    dl.reset(32, 24);
+    try dl.rectFilled(.{ .x = 2, .y = 2, .w = 12, .h = 8 }, Color.rgba(0x40, 0x80, 0xC0, 0xFF));
+    render(.{ .pixels = &pixels, .width = 32, .height = 24 }, &dl, font_mod.default_font, 1.0);
+    const diagnostics = dl.shadowMaskDiagnostics();
+    try std.testing.expectEqual(@as(u64, 0), diagnostics.evaluations);
+    try std.testing.expectEqual(@as(u64, 0), diagnostics.hits);
+    try std.testing.expectEqual(@as(u64, 0), diagnostics.misses);
+    try std.testing.expectEqual(@as(u64, 0), diagnostics.allocations);
+    try std.testing.expectEqual(@as(u64, 0), diagnostics.blit_pixels);
+}
+
+test "shadow render: DrawList reset retains masks until the explicit cache reset" {
+    var pixels = [_]u32{0xFF202020} ** (48 * 32);
+    var dl = DrawList.init(std.testing.allocator);
+    defer dl.deinit();
+    const rect = Rect{ .x = 8, .y = 6, .w = 24, .h = 16 };
+    const clip = Rect{ .x = 0, .y = 0, .w = 48, .h = 32 };
+    const color = Color.rgba(0, 0, 0, 0xA0);
+    const target = RenderTarget{ .pixels = &pixels, .width = 48, .height = 32 };
+
+    dl.reset(48, 32);
+    drawShadow(target, &dl, rect, color, .{ .radius = 6, .blur = 4 }, clip, 1.0, true);
+    const cold = dl.shadowMaskDiagnostics();
+    dl.reset(48, 32);
+    drawShadow(target, &dl, rect, color, .{ .radius = 6, .blur = 4 }, clip, 1.0, true);
+    const warm = dl.shadowMaskDiagnostics();
+    try std.testing.expectEqual(@as(u64, 1), cold.evaluations);
+    try std.testing.expectEqual(cold.evaluations, warm.evaluations);
+    try std.testing.expect(warm.hits > cold.hits);
+    try std.testing.expect(warm.retained_bytes > 0);
+
+    dl.resetShadowCache();
+    const cleared = dl.shadowMaskDiagnostics();
+    try std.testing.expectEqual(@as(usize, 0), cleared.entries);
+    try std.testing.expectEqual(@as(usize, 0), cleared.retained_bytes);
 }
 
 test "gradient render: vertical horizontal diagonal radial and rounded coverage" {

@@ -1,4 +1,4 @@
-//! GUI style showcase: widget states, paths, rounded primitives, and gradient paints in five fixed sections.
+//! GUI style showcase: widget states, paths, rounded primitives, gradient paints, and shadows.
 //!
 //! Hot path declaration:
 //! - The GUI tree and DrawList commands are built once per frame.
@@ -20,6 +20,7 @@ const Section = enum(u8) {
     paths,
     rounded,
     gradients,
+    shadow,
 };
 
 const FrameSection = enum {
@@ -117,6 +118,7 @@ const App = struct {
     stroke_count: u32 = 0,
     aa_on_count: u32 = 0,
     aa_off_count: u32 = 0,
+    shadow_count: u32 = 0,
 
     fn sectionIndex(self: *const App) u8 {
         return @intFromEnum(self.section);
@@ -165,7 +167,7 @@ const App = struct {
 
 fn showcaseDigest(ctx_ptr: *anyopaque, buf: []u8) []const u8 {
     const app: *App = @ptrCast(@alignCast(ctx_ptr));
-    return std.fmt.bufPrint(buf, "section={s} index={d} hot={s} active={s} focused={s} selected={s} disabled={d} fill={d} stroke={d} aa_on={d} aa_off={d}", .{
+    return std.fmt.bufPrint(buf, "section={s} index={d} hot={s} active={s} focused={s} selected={s} disabled={d} fill={d} stroke={d} aa_on={d} aa_off={d} shadow={d}", .{
         app.sectionName(),
         app.sectionIndex(),
         App.widgetName(app.ctx.state.hot_id),
@@ -177,6 +179,7 @@ fn showcaseDigest(ctx_ptr: *anyopaque, buf: []u8) []const u8 {
         app.stroke_count,
         app.aa_on_count,
         app.aa_off_count,
+        app.shadow_count,
     }) catch buf[0..0];
 }
 
@@ -276,6 +279,11 @@ fn renderFrame(ctx: *gui.Context, app: *App) void {
             ctx.labelEx("linear vertical / diagonal / rounded and radial rounded paints", ctx.style.text_subtle);
             ctx.endBox();
         },
+        .shadow => {
+            ctx.beginBox(.{ .direction = .column, .gap = 4, .padding = .{ 12, 12, 12, 12 } });
+            ctx.labelEx("nine-slice shadow masks: radius / blur / offset / slice boundaries", ctx.style.text_subtle);
+            ctx.endBox();
+        },
     }
     ctx.endBox();
     ctx.endBox();
@@ -289,6 +297,7 @@ fn appendRounded(app: *App) !void {
     app.stroke_count = 0;
     app.aa_on_count = 0;
     app.aa_off_count = 0;
+    app.shadow_count = 0;
 
     const blue = gui.Color.rgba(0x48, 0xA8, 0xF0, 0xFF);
     const green = gui.Color.rgba(0x58, 0xD0, 0x80, 0xFF);
@@ -349,6 +358,7 @@ fn appendGradients(app: *App) !void {
     app.stroke_count = 0;
     app.aa_on_count = 0;
     app.aa_off_count = 0;
+    app.shadow_count = 0;
 
     const blue = gui.Color.rgba(0x38, 0x78, 0xE8, 0xFF);
     const cyan = gui.Color.rgba(0x40, 0xD8, 0xC0, 0xFF);
@@ -389,6 +399,41 @@ fn appendGradients(app: *App) !void {
     } });
 }
 
+fn appendShadows(app: *App) !void {
+    const draw_list = &app.ctx.draw_list;
+    app.fill_count = 0;
+    app.stroke_count = 0;
+    app.aa_on_count = 0;
+    app.aa_off_count = 0;
+    app.shadow_count = 0;
+
+    const panels = [_]struct {
+        rect: gui.Rect,
+        radius: u32,
+        blur: u32,
+        offset: gui.Vec2,
+        color: gui.Color,
+    }{
+        .{ .rect = .{ .x = 56, .y = 164, .w = 220, .h = 104 }, .radius = 10, .blur = 8, .offset = .{ .x = 0, .y = 0 }, .color = gui.Color.rgba(0x48, 0xA8, 0xF0, 0xFF) },
+        .{ .rect = .{ .x = 350, .y = 164, .w = 220, .h = 104 }, .radius = 28, .blur = 18, .offset = .{ .x = 8, .y = 8 }, .color = gui.Color.rgba(0x58, 0xD0, 0x80, 0xFF) },
+        .{ .rect = .{ .x = 644, .y = 164, .w = 220, .h = 104 }, .radius = 42, .blur = 4, .offset = .{ .x = -8, .y = 12 }, .color = gui.Color.rgba(0xF0, 0xB8, 0x48, 0xFF) },
+        .{ .rect = .{ .x = 56, .y = 360, .w = 128, .h = 128 }, .radius = 52, .blur = 12, .offset = .{ .x = 0, .y = 0 }, .color = gui.Color.rgba(0xA0, 0x78, 0xF0, 0xFF) },
+        .{ .rect = .{ .x = 248, .y = 360, .w = 300, .h = 128 }, .radius = 6, .blur = 24, .offset = .{ .x = 4, .y = 4 }, .color = gui.Color.rgba(0x40, 0xD8, 0xC0, 0xFF) },
+    };
+    for (panels) |panel| {
+        try draw_list.shadow(panel.rect, gui.Color.rgba(0x00, 0x00, 0x00, 0xB0), .{
+            .radius = panel.radius,
+            .blur = panel.blur,
+            .offset = panel.offset,
+        });
+        app.shadow_count += 1;
+        try draw_list.rectFilledEx(panel.rect, panel.color, .{ .radius = panel.radius });
+        try draw_list.rectOutlineEx(panel.rect, gui.Color.rgba(0xFF, 0xFF, 0xFF, 0x60), 1, .{ .radius = panel.radius });
+        app.fill_count += 1;
+        app.stroke_count += 1;
+    }
+}
+
 /// Appends the fixed path scene once per frame; all shapes are inside the framebuffer.
 fn appendPaths(app: *App, arena: *std.heap.ArenaAllocator) !void {
     const ctx = app.ctx;
@@ -397,6 +442,7 @@ fn appendPaths(app: *App, arena: *std.heap.ArenaAllocator) !void {
     app.stroke_count = 0;
     app.aa_on_count = 0;
     app.aa_off_count = 0;
+    app.shadow_count = 0;
 
     var p = draw_list.beginPath(arena.allocator());
     try p.moveTo(.{ .x = 56, .y = 240 });
@@ -539,11 +585,14 @@ pub fn main(init: std.process.Init) !void {
             try appendRounded(&app);
         } else if (app.section == .gradients) {
             try appendGradients(&app);
+        } else if (app.section == .shadow) {
+            try appendShadows(&app);
         } else {
             app.fill_count = 0;
             app.stroke_count = 0;
             app.aa_on_count = 0;
             app.aa_off_count = 0;
+            app.shadow_count = 0;
         }
         Prof.mark(.paths);
 
