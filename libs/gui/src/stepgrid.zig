@@ -220,7 +220,7 @@ pub fn widgetRow(ctx: *Context, options: WidgetOptions) ?GridCell {
             offColor(step, options.off_color, options.off_beat_color);
         const color = if (disabled) style.disabledColor(color_raw) else color_raw;
         // Same opaque path as colorSwatchId: box bg + style border (align clickable-cell look with other widgets)
-        const border_color = if (disabled) style.disabledColor(style.border) else style.border;
+        const border_color = if (disabled) style.disabledColor(style.border_tokens.normal) else style.border_tokens.normal;
         const border: ?layout_mod.Border = if (style.swatch_border <= 0)
             null
         else

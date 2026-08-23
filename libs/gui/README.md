@@ -101,6 +101,35 @@ Splitter / ScrollArea, plus bool toggles:
 - `ctx.toggle(label, *bool) bool` — toggle switch (knob moves left/right). Same return as checkbox.
 - `ctx.radio(label, selected: bool) bool` — ○/◉. `selected` is display-only; returns true when clicked (activated).
 
+### Style tokens and themes
+
+`Context.style` is a complete `Style` value. Its semantic color groups are `surface`, `accent`,
+`border_tokens`, `text_tokens`, and `elevation`. The `border_tokens` and `text_tokens` names keep
+their meaning distinct from the legacy flat `Style.border` and `Style.text` mirrors. The surface
+tokens cover canvas, panel, raised, elevated, control, hover control, input, subtle control, and
+status surfaces. Accent tokens cover primary, selected, selection, danger, and focus colors;
+text tokens cover primary and subtle ink; elevation supplies the shadow color. Text tier sizes and
+weights, dimensions, radii, and animation timing remain part of `Style`.
+
+`gui.defaultStyle()` is the canonical dark style and preserves the existing drawing colors.
+`gui.lightStyle()` returns a complete light style with the same geometry and animation defaults.
+Switch themes by replacing the value as a unit:
+
+```zig
+ctx.style = gui.lightStyle();
+ctx.style = gui.defaultStyle();
+```
+
+Button-like controls accept a partial `WidgetStyle` through `ButtonOpts.style`, `TabOpts.style`,
+`CheckboxOpts.style`, `ToggleOpts.style`, or `RadioOpts.style`. The `*Ex` and `*IdEx` forms accept
+these option values; the short forms pass empty options. Each field is optional and keeps the
+active theme token when unset. Disabled colors are derived from the effective override through
+`Style.disabledColor`, and animation resolves between the effective override endpoints.
+
+Styles intentionally have no mutable push/pop stack. A whole-style replacement makes the active
+theme explicit at the context boundary, while local widget changes stay local to an option value
+and cannot leak through build order or nesting.
+
 All use automatic IDs (label hash + id_stack). The **whole box** (glyph + label) is the click
 target (same as button). Radio groups are owned by the caller (IM style; gui holds no group state):
 

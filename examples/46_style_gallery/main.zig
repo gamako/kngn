@@ -110,6 +110,7 @@ const App = struct {
     text: *gui.TextBuffer,
     section: Section = .overview,
     selected_tab: Section = .states,
+    theme: enum { dark, light } = .dark,
     checked: bool = true,
     toggled: bool = true,
     radio_b: bool = false,
@@ -130,6 +131,16 @@ const App = struct {
 
     fn selectedName(self: *const App) []const u8 {
         return @tagName(self.selected_tab);
+    }
+
+    fn themeName(self: *const App) []const u8 {
+        return @tagName(self.theme);
+    }
+
+    fn toggleTheme(self: *App) void {
+        self.theme = if (self.theme == .dark) .light else .dark;
+        self.ctx.style = if (self.theme == .light) gui.lightStyle() else gui.defaultStyle();
+        self.ctx.style.animation.enabled = true;
     }
 
     fn widgetName(id: gui.Id) []const u8 {
@@ -167,9 +178,10 @@ const App = struct {
 
 fn showcaseDigest(ctx_ptr: *anyopaque, buf: []u8) []const u8 {
     const app: *App = @ptrCast(@alignCast(ctx_ptr));
-    return std.fmt.bufPrint(buf, "section={s} index={d} hot={s} active={s} focused={s} selected={s} disabled={d} fill={d} stroke={d} aa_on={d} aa_off={d} shadow={d}", .{
+    return std.fmt.bufPrint(buf, "section={s} index={d} theme={s} hot={s} active={s} focused={s} selected={s} disabled={d} fill={d} stroke={d} aa_on={d} aa_off={d} shadow={d}", .{
         app.sectionName(),
         app.sectionIndex(),
+        app.themeName(),
         App.widgetName(app.ctx.state.hot_id),
         App.widgetName(app.ctx.state.active_id),
         App.widgetName(app.ctx.state.focused_id),
@@ -188,11 +200,12 @@ fn renderHeader(ctx: *gui.Context, app: *const App) void {
         .height = .{ .fixed = 64 },
         .width = .{ .grow = 1 },
         .padding = .{ 8, 12, 8, 12 },
-        .bg = gui.Color.rgba(0x28, 0x30, 0x3C, 0xFF),
+        .bg = ctx.style.surface.raised,
     });
     ctx.labelStyled("GUI Style Showcase", .heading);
     var line: [128]u8 = undefined;
-    ctx.labelEx(std.fmt.bufPrint(&line, "section={s}  |  PAGE_DOWN/PAGE_UP or N/P", .{app.sectionName()}) catch "section=?", ctx.style.text_subtle);
+    ctx.labelEx(std.fmt.bufPrint(&line, "section={s}  |  PAGE_DOWN/PAGE_UP or N/P", .{app.sectionName()}) catch "section=?", ctx.style.text_tokens.subtle);
+    if (app.theme == .light) ctx.labelEx("theme=light", ctx.style.accent.primary);
     ctx.endBox();
 }
 
@@ -208,7 +221,7 @@ fn renderOverview(ctx: *gui.Context) void {
 
 fn renderStates(ctx: *gui.Context, app: *App) void {
     ctx.beginBox(.{ .direction = .column, .gap = 8, .padding = .{ 12, 12, 12, 12 } });
-    ctx.labelEx("normal / hover / press / disabled / focus / selected", ctx.style.text_subtle);
+    ctx.labelEx("normal / hover / press / disabled / focus / selected", ctx.style.text_tokens.subtle);
 
     ctx.beginBox(.{ .direction = .row, .gap = 8 });
     const overview_tab = ctx.tabId(Ids.tab_overview, "Overview", app.selected_tab == .overview, .{ .width = .{ .fixed = 112 }, .height = .{ .fixed = 30 } });
@@ -243,14 +256,14 @@ fn renderStates(ctx: *gui.Context, app: *App) void {
     ctx.beginBox(.{ .direction = .row, .gap = 8 });
     _ = ctx.iconButtonId(Ids.icon_a, &ICON_A, true);
     _ = ctx.iconButtonId(Ids.icon_b, &ICON_B, false);
-    ctx.labelEx("selected icon / normal icon", ctx.style.text_subtle);
+    ctx.labelEx("selected icon / normal icon", ctx.style.text_tokens.subtle);
     ctx.endBox();
     ctx.endBox();
 }
 
 fn renderPathLabels(ctx: *gui.Context) void {
     ctx.beginBox(.{ .direction = .column, .gap = 4, .padding = .{ 12, 12, 12, 12 } });
-    ctx.labelEx("fills (curve / concave / hole), stroke caps and joins, hairline; AA off on the middle shapes", ctx.style.text_subtle);
+    ctx.labelEx("fills (curve / concave / hole), stroke caps and joins, hairline; AA off on the middle shapes", ctx.style.text_tokens.subtle);
     ctx.endBox();
 }
 
@@ -261,27 +274,27 @@ fn renderFrame(ctx: *gui.Context, app: *App) void {
         .height = .{ .grow = 1 },
         .padding = .{ 24, 24, 24, 24 },
         .gap = 12,
-        .bg = gui.Color.rgba(0x18, 0x1C, 0x24, 0xFF),
+        .bg = ctx.style.surface.canvas,
     });
     renderHeader(ctx, app);
-    ctx.beginBox(.{ .width = .{ .grow = 1 }, .height = .{ .grow = 1 }, .bg = gui.Color.rgba(0x20, 0x24, 0x2C, 0xFF) });
+    ctx.beginBox(.{ .width = .{ .grow = 1 }, .height = .{ .grow = 1 }, .bg = ctx.style.surface.panel });
     switch (app.section) {
         .overview => renderOverview(ctx),
         .states => renderStates(ctx, app),
         .paths => renderPathLabels(ctx),
         .rounded => {
             ctx.beginBox(.{ .direction = .column, .gap = 4, .padding = .{ 12, 12, 12, 12 } });
-            ctx.labelEx("sharp / rounded fills / outlines / circles / translucent / clipped", ctx.style.text_subtle);
+            ctx.labelEx("sharp / rounded fills / outlines / circles / translucent / clipped", ctx.style.text_tokens.subtle);
             ctx.endBox();
         },
         .gradients => {
             ctx.beginBox(.{ .direction = .column, .gap = 4, .padding = .{ 12, 12, 12, 12 } });
-            ctx.labelEx("linear vertical / diagonal / rounded and radial rounded paints", ctx.style.text_subtle);
+            ctx.labelEx("linear vertical / diagonal / rounded and radial rounded paints", ctx.style.text_tokens.subtle);
             ctx.endBox();
         },
         .shadow => {
             ctx.beginBox(.{ .direction = .column, .gap = 4, .padding = .{ 12, 12, 12, 12 } });
-            ctx.labelEx("nine-slice shadow masks: radius / blur / offset / slice boundaries", ctx.style.text_subtle);
+            ctx.labelEx("nine-slice shadow masks: radius / blur / offset / slice boundaries", ctx.style.text_tokens.subtle);
             ctx.endBox();
         },
     }
@@ -337,7 +350,7 @@ fn appendRounded(app: *App) !void {
     app.stroke_count += 1;
     app.aa_on_count += 1;
 
-    try draw_list.rectFilled(.{ .x = 340, .y = 414, .w = 220, .h = 112 }, gui.Color.rgba(0x30, 0x38, 0x48, 0xFF));
+    try draw_list.rectFilled(.{ .x = 340, .y = 414, .w = 220, .h = 112 }, app.ctx.style.surface.elevated);
     app.fill_count += 1;
     app.aa_on_count += 1;
     try draw_list.rectFilledEx(.{ .x = 364, .y = 434, .w = 172, .h = 72 }, gui.Color.rgba(0xF0, 0x78, 0xA0, 0x88), .{ .radius = 24 });
@@ -421,7 +434,7 @@ fn appendShadows(app: *App) !void {
         .{ .rect = .{ .x = 248, .y = 360, .w = 300, .h = 128 }, .radius = 6, .blur = 24, .offset = .{ .x = 4, .y = 4 }, .color = gui.Color.rgba(0x40, 0xD8, 0xC0, 0xFF) },
     };
     for (panels) |panel| {
-        try draw_list.shadow(panel.rect, gui.Color.rgba(0x00, 0x00, 0x00, 0xB0), .{
+        try draw_list.shadow(panel.rect, app.ctx.style.elevation.shadow, .{
             .radius = panel.radius,
             .blur = panel.blur,
             .offset = panel.offset,
@@ -557,7 +570,7 @@ pub fn main(init: std.process.Init) !void {
         Prof.begin();
         const fb = window.lockFramebuffer() orelse continue :main_loop;
         defer fb.unlock();
-        kit.pixelops.fill32(fb.pixels, 0xFF_18_1C_24);
+        kit.pixelops.fill32(fb.pixels, @bitCast(ctx.style.surface.canvas));
         ctx.beginFrame(fb.width, fb.height);
         Prof.mark(.begin);
 
@@ -568,6 +581,7 @@ pub fn main(init: std.process.Init) !void {
                     .ESCAPE => running = false,
                     .PAGE_DOWN, .N => app.changeSection(1),
                     .PAGE_UP, .P => app.changeSection(-1),
+                    .T => app.toggleTheme(),
                     else => {},
                 },
                 else => {},

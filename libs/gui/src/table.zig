@@ -288,11 +288,11 @@ fn rowFill(ctx: *const Context, id: Id, selected: bool, held: bool, idle_bg: ?Co
     const style = ctx.style;
     const hot = ctx.state.hot_id == id;
     if (ctx.isDisabled()) {
-        return if (selected) style.disabledColor(style.button_bg_selected) else idle_bg;
+        return if (selected) style.disabledColor(style.accent.selected) else idle_bg;
     }
-    if (held) return style.bg_active;
-    if (hot) return style.bg_hover;
-    if (selected) return style.button_bg_selected;
+    if (held) return style.accent.primary;
+    if (hot) return style.surface.control_hover;
+    if (selected) return style.accent.selected;
     return idle_bg;
 }
 
@@ -390,7 +390,7 @@ fn buildHeaderCells(ctx: *Context) void {
     ctx.id_stack.push("header");
     for (t.cols, 0..) |col, i| {
         _ = beginCellBox(ctx, i);
-        if (col.header) |text| ctx.labelEx(text, ctx.style.text_subtle);
+        if (col.header) |text| ctx.labelEx(text, ctx.style.text_tokens.subtle);
         ctx.endBox();
     }
     ctx.id_stack.pop();

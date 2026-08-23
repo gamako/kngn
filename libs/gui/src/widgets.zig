@@ -36,6 +36,7 @@ const text_edit = @import("text_edit.zig");
 const text_wrap = @import("text_wrap.zig");
 const state_mod = @import("state.zig");
 const font_mod = @import("font.zig");
+const style_mod = @import("style.zig");
 pub const Vec2f = input_mod.Vec2f;
 
 pub const Context = context_mod.Context;
@@ -49,6 +50,7 @@ pub const CopyRequest = text_edit.CopyRequest;
 pub const CopyKind = text_edit.CopyKind;
 pub const TextBuffer = text_edit.TextBuffer;
 pub const MoveKey = text_edit.MoveKey;
+pub const WidgetStyle = style_mod.WidgetStyle;
 
 pub const SelectableLabelOpts = struct {
     /// null → `Context.style.text`
@@ -99,6 +101,20 @@ pub const ButtonOpts = struct {
     /// Selected look (accent fill + thick border). For tool-selection toggles.
     /// Draw priority: held > hover > selected > normal.
     selected: bool = false,
+    /// Partial color override. Null keeps the active theme token.
+    style: ?WidgetStyle = null,
+};
+
+pub const CheckboxOpts = struct {
+    style: ?WidgetStyle = null,
+};
+
+pub const ToggleOpts = struct {
+    style: ?WidgetStyle = null,
+};
+
+pub const RadioOpts = struct {
+    style: ?WidgetStyle = null,
 };
 
 pub const SwatchOpts = struct {
@@ -145,26 +161,30 @@ pub fn buttonId(ctx: *Context, id: Id, label: []const u8, opts: ButtonOpts) Butt
     const style = ctx.style;
     const disabled = ctx.isDisabled();
     const hot = ctx.state.hot_id == id;
-    const base_bg = if (opts.selected) style.button_bg_selected else style.bg;
+    const base_bg = if (opts.selected) style.accent.selected else style.surface.control;
     const colors: Context.ButtonColors = if (!style.animation.enabled)
-        .{
-            .bg = if (disabled)
-                style.disabledColor(base_bg)
-            else if (result.held)
-                style.bg_active
-            else if (hot)
-                style.bg_hover
-            else
-                base_bg,
-            .border = if (disabled)
-                style.disabledColor(style.border)
-            else if (hot or opts.selected)
-                style.border_hover
-            else
-                style.border,
-        }
+        if (opts.style) |override|
+            ctx.resolveButtonColorsWithStyle(id, base_bg, opts.selected, result.held, disabled, override)
+        else
+            .{
+                .bg = if (disabled)
+                    style.disabledColor(base_bg)
+                else if (result.held)
+                    style.accent.primary
+                else if (hot)
+                    style.surface.control_hover
+                else
+                    base_bg,
+                .border = if (disabled)
+                    style.disabledColor(style.border_tokens.normal)
+                else if (hot or opts.selected)
+                    style.border_tokens.hover
+                else
+                    style.border_tokens.normal,
+                .text = if (disabled) style.disabledColor(style.text_tokens.primary) else style.text_tokens.primary,
+            }
     else
-        ctx.resolveButtonColors(id, base_bg, opts.selected, result.held, disabled);
+        ctx.resolveButtonColorsWithStyle(id, base_bg, opts.selected, result.held, disabled, opts.style);
     const thickness = if (opts.selected) style.button_border_selected else style.button_border;
     const pad = opts.padding orelse style.button_padding;
     // With `min_w`, width is fixed at call time assuming fixed-width font (`measure = 8×len`)
@@ -180,7 +200,7 @@ pub fn buttonId(ctx: *Context, id: Id, label: []const u8, opts: ButtonOpts) Butt
         .border = makeBorder(colors.border, thickness),
         .radius = style.control_radius,
     });
-    ctx.labelEx(label, if (disabled) style.disabledColor(style.text) else style.text);
+    ctx.labelEx(label, colors.text);
     ctx.endBox();
     return result;
 }
@@ -202,9 +222,9 @@ pub fn colorSwatchId(ctx: *Context, id: Id, opts: SwatchOpts) ButtonResult {
     const style = ctx.style;
     const size = opts.size orelse style.swatch_size;
     const border = if (opts.selected)
-        makeBorder(style.border_hover, style.swatch_border_selected)
+        makeBorder(style.border_tokens.hover, style.swatch_border_selected)
     else
-        makeBorder(style.border, style.swatch_border);
+        makeBorder(style.border_tokens.normal, style.swatch_border);
     if (opts.color.a == 0xFF) {
         ctx.beginBox(.{
             .id = id,
@@ -257,14 +277,14 @@ pub fn iconButtonId(ctx: *Context, id: Id, icon: IconBitmap, selected: bool) But
     const hot = ctx.state.hot_id == id;
     // held > hover > selected > normal (same contract as `buttonId`)
     const bg = if (result.held)
-        style.bg_active
+        style.accent.primary
     else if (hot)
-        style.bg_hover
+        style.surface.control_hover
     else if (selected)
-        style.button_bg_selected
+        style.accent.selected
     else
-        style.bg;
-    const border_color = if (hot or selected) style.border_hover else style.border;
+        style.surface.control;
+    const border_color = if (hot or selected) style.border_tokens.hover else style.border_tokens.normal;
     const thickness = if (selected) style.button_border_selected else style.button_border;
     const pad = style.button_padding;
     const w = icon_px + pad[1] + pad[3];
@@ -280,7 +300,7 @@ pub fn iconButtonId(ctx: *Context, id: Id, icon: IconBitmap, selected: bool) But
     });
     const data = ctx.allocator().create(IconButtonDraw) catch @panic("iconButton: OOM");
     @memcpy(&data.rows, icon[0..16]);
-    data.fg = style.text;
+    data.fg = style.text_tokens.primary;
     ctx.custom(.{ .x = icon_px, .y = icon_px }, IconButtonDraw.draw, data);
     ctx.endBox();
     return result;
@@ -481,8 +501,8 @@ pub fn selectableLabelId(
         .text = text,
         .layout = layout_data,
         .selection = per_id.selection.normalized(),
-        .text_color = opts.text_color orelse ctx.style.text,
-        .selection_background = opts.selection_background orelse ctx.style.selection_background,
+        .text_color = opts.text_color orelse ctx.style.text_tokens.primary,
+        .selection_background = opts.selection_background orelse ctx.style.accent.selection,
     };
     ctx.beginBox(.{
         .id = id,
@@ -752,11 +772,11 @@ pub fn textInputId(
         .focused = focused,
         .caret_visible = focused and blinkVisible(ctx.now(), per_id.caret_blink_start_s),
         .padding = opts.padding,
-        .background = if (disabled) ctx.style.disabledColor(ctx.style.input_background) else ctx.style.input_background,
-        .selection_background = if (disabled) ctx.style.disabledColor(ctx.style.selection_background) else ctx.style.selection_background,
-        .caret_color = if (disabled) ctx.style.disabledColor(ctx.style.caret) else ctx.style.caret,
-        .text_color = if (disabled) ctx.style.disabledColor(ctx.style.text) else ctx.style.text,
-        .placeholder_color = if (disabled) ctx.style.disabledColor(ctx.style.text_subtle) else ctx.style.text_subtle,
+        .background = if (disabled) ctx.style.disabledColor(ctx.style.surface.input) else ctx.style.surface.input,
+        .selection_background = if (disabled) ctx.style.disabledColor(ctx.style.accent.selection) else ctx.style.accent.selection,
+        .caret_color = if (disabled) ctx.style.disabledColor(ctx.style.text_tokens.primary) else ctx.style.text_tokens.primary,
+        .text_color = if (disabled) ctx.style.disabledColor(ctx.style.text_tokens.primary) else ctx.style.text_tokens.primary,
+        .placeholder_color = if (disabled) ctx.style.disabledColor(ctx.style.text_tokens.subtle) else ctx.style.text_tokens.subtle,
         .preedit = preedit,
         .committed_prefix_w = committed_prefix_w,
         .preedit_w = preedit_w,
@@ -771,7 +791,7 @@ pub fn textInputId(
         .height = .{ .fixed = height },
         .clip_children = true,
         .border = .{
-            .color = if (disabled) ctx.style.disabledColor(ctx.style.border) else if (focused) ctx.style.border_hover else ctx.style.border,
+            .color = if (disabled) ctx.style.disabledColor(ctx.style.border_tokens.normal) else if (focused) ctx.style.border_tokens.hover else ctx.style.border_tokens.normal,
             .thickness = 1,
         },
     });
@@ -1210,7 +1230,7 @@ fn sliderCore(ctx: *Context, id: Id, label: []const u8, cur: f64, spec: SliderSp
     }
 
     // Build/draw: [label] [track(id)] [value text]
-    const text_col = if (disabled) style.disabledColor(style.text) else style.text;
+    const text_col = if (disabled) style.disabledColor(style.text_tokens.primary) else style.text_tokens.primary;
     const group = if (ctx.slider_group) |*g| g else null;
 
     if (group) |g| {
@@ -1238,14 +1258,14 @@ fn sliderCore(ctx: *Context, id: Id, label: []const u8, cur: f64, spec: SliderSp
         .knob_w = knob_w,
         .knob_h = knob_h,
         .track_h = style.slider_track_h,
-        .track_bg = if (disabled) style.disabledColor(style.slider_track_bg) else style.slider_track_bg,
+        .track_bg = if (disabled) style.disabledColor(style.surface.control_subtle) else style.surface.control_subtle,
         .knob_bg = if (disabled)
-            style.disabledColor(style.slider_knob_bg)
+            style.disabledColor(style.text_tokens.subtle)
         else if (ctx.state.active_id == id)
-            style.slider_knob_active_bg
+            style.accent.primary
         else
-            style.slider_knob_bg,
-        .border = if (disabled) style.disabledColor(style.border) else style.border,
+            style.text_tokens.subtle,
+        .border = if (disabled) style.disabledColor(style.border_tokens.normal) else style.border_tokens.normal,
     };
     ctx.beginBox(.{
         .id = id,
@@ -1367,7 +1387,7 @@ pub fn svSquareId(ctx: *Context, id: Id, hue: f32, s: *f32, v: *f32, opts: SvSqu
         .size = size,
         .s = s.*,
         .v = v.*,
-        .marker_light = ctx.style.picker_marker_light,
+        .marker_light = ctx.style.text_tokens.primary,
         .marker_dark = ctx.style.picker_marker_dark,
     };
     ctx.beginBox(.{ .id = id, .width = .{ .fixed = size }, .height = .{ .fixed = size } });
@@ -1443,7 +1463,7 @@ pub fn hueBarId(ctx: *Context, id: Id, h: *f32, opts: HueBarOpts) bool {
         .w = bw,
         .h = bh,
         .hue = h.*,
-        .marker_light = ctx.style.picker_marker_light,
+        .marker_light = ctx.style.text_tokens.primary,
         .marker_dark = ctx.style.picker_marker_dark,
     };
     ctx.beginBox(.{ .id = id, .width = .{ .fixed = bw }, .height = .{ .fixed = bh } });
@@ -1536,19 +1556,37 @@ const ImageBoxDraw = struct {
 
 /// Bool checkbox (auto ID: label hash). Click flips `*value`; returns true when it changed.
 pub fn checkbox(ctx: *Context, label: []const u8, value: *bool) bool {
-    return checkboxId(ctx, ctx.id_stack.make(label), label, value);
+    return checkboxEx(ctx, label, value, .{});
 }
 
-/// Explicit-ID form. Use for duplicate labels in one scope or external rect lookup.
+pub fn checkboxEx(ctx: *Context, label: []const u8, value: *bool, opts: CheckboxOpts) bool {
+    return checkboxIdEx(ctx, ctx.id_stack.make(label), label, value, opts);
+}
+
+/// Explicit-ID form with the default theme colors.
 pub fn checkboxId(ctx: *Context, id: Id, label: []const u8, value: *bool) bool {
+    return checkboxIdEx(ctx, id, label, value, .{});
+}
+
+/// Explicit-ID form with a partial local color override.
+pub fn checkboxIdEx(ctx: *Context, id: Id, label: []const u8, value: *bool, opts: CheckboxOpts) bool {
     ctx.requireInteractiveAllowed("checkbox");
     const result = behaviorFromCache(ctx, id);
     if (result.clicked) value.* = !value.*;
     const style = ctx.style;
+    const widget = opts.style orelse WidgetStyle{};
     const disabled = ctx.isDisabled();
     const size = style.checkbox_size;
     std.debug.assert(size > 0);
     const hot = ctx.state.hot_id == id;
+    const normal_bg = widget.background orelse style.surface.control_subtle;
+    const hover_bg = widget.hover orelse normal_bg;
+    const active_bg = widget.active orelse style.accent.primary;
+    const selected_bg = widget.selected orelse style.accent.primary;
+    const border = widget.border orelse style.border_tokens.normal;
+    const hover_border = widget.hover_border orelse style.border_tokens.hover;
+    const text = widget.text orelse style.text_tokens.primary;
+    const box_bg = if (result.held) active_bg else if (hot) hover_bg else normal_bg;
 
     ctx.beginBox(.{
         .id = id,
@@ -1562,12 +1600,12 @@ pub fn checkboxId(ctx: *Context, id: Id, label: []const u8, value: *bool) bool {
         .size = size,
         .radius = style.checkbox_radius,
         .checked = value.*,
-        .border = if (disabled) style.disabledColor(style.border) else if (hot) style.border_hover else style.border,
-        .bg = if (disabled) style.disabledColor(style.slider_track_bg) else style.slider_track_bg,
-        .fill = if (disabled) style.disabledColor(style.bg_active) else style.bg_active,
+        .border = if (disabled) style.disabledColor(border) else if (hot) hover_border else border,
+        .bg = if (disabled) style.disabledColor(box_bg) else box_bg,
+        .fill = if (disabled) style.disabledColor(selected_bg) else selected_bg,
     };
     ctx.custom(.{ .x = size, .y = size }, CheckGlyph.draw, data);
-    ctx.labelEx(label, if (disabled) style.disabledColor(style.text) else style.text);
+    ctx.labelEx(label, if (disabled) style.disabledColor(text) else text);
     ctx.endBox();
     return result.clicked;
 }
@@ -1603,20 +1641,39 @@ const CheckGlyph = struct {
 /// Bool toggle switch (auto ID: label hash). Click flips `*value`; returns true when it changed.
 /// Named `toggle` because `switch` is a Zig keyword.
 pub fn toggle(ctx: *Context, label: []const u8, value: *bool) bool {
-    return toggleId(ctx, ctx.id_stack.make(label), label, value);
+    return toggleEx(ctx, label, value, .{});
 }
 
-/// Explicit-ID form.
+pub fn toggleEx(ctx: *Context, label: []const u8, value: *bool, opts: ToggleOpts) bool {
+    return toggleIdEx(ctx, ctx.id_stack.make(label), label, value, opts);
+}
+
+/// Explicit-ID form with the default theme colors.
 pub fn toggleId(ctx: *Context, id: Id, label: []const u8, value: *bool) bool {
+    return toggleIdEx(ctx, id, label, value, .{});
+}
+
+/// Explicit-ID form with a partial local color override.
+pub fn toggleIdEx(ctx: *Context, id: Id, label: []const u8, value: *bool, opts: ToggleOpts) bool {
     ctx.requireInteractiveAllowed("toggle");
     const result = behaviorFromCache(ctx, id);
     if (result.clicked) value.* = !value.*;
     const style = ctx.style;
+    const widget = opts.style orelse WidgetStyle{};
     const disabled = ctx.isDisabled();
     const w = style.switch_w;
     const h = style.switch_h;
     std.debug.assert(w > 0 and h > 0 and w >= h); // Keep the knob from going non-positive or past the track
     const hot = ctx.state.hot_id == id;
+    const normal_bg = widget.background orelse style.surface.control_subtle;
+    const hover_bg = widget.hover orelse normal_bg;
+    const active_bg = widget.active orelse style.accent.primary;
+    const selected_bg = widget.selected orelse style.accent.primary;
+    const border = widget.border orelse style.border_tokens.normal;
+    const hover_border = widget.hover_border orelse style.border_tokens.hover;
+    const knob = widget.text orelse style.text_tokens.subtle;
+    const track_off = if (result.held) active_bg else if (hot) hover_bg else normal_bg;
+    const track_on = if (result.held) active_bg else selected_bg;
 
     ctx.beginBox(.{
         .id = id,
@@ -1628,13 +1685,13 @@ pub fn toggleId(ctx: *Context, id: Id, label: []const u8, value: *bool) bool {
     const data = ctx.allocator().create(ToggleGlyph) catch @panic("toggle: OOM");
     data.* = .{
         .checked = value.*,
-        .border = if (disabled) style.disabledColor(style.border) else if (hot) style.border_hover else style.border,
-        .track_off = if (disabled) style.disabledColor(style.slider_track_bg) else style.slider_track_bg,
-        .track_on = if (disabled) style.disabledColor(style.bg_active) else style.bg_active,
-        .knob = if (disabled) style.disabledColor(style.slider_knob_bg) else style.slider_knob_bg,
+        .border = if (disabled) style.disabledColor(border) else if (hot) hover_border else border,
+        .track_off = if (disabled) style.disabledColor(track_off) else track_off,
+        .track_on = if (disabled) style.disabledColor(track_on) else track_on,
+        .knob = if (disabled) style.disabledColor(knob) else knob,
     };
     ctx.custom(.{ .x = w, .y = h }, ToggleGlyph.draw, data);
-    ctx.labelEx(label, if (disabled) style.disabledColor(style.text) else style.text);
+    ctx.labelEx(label, if (disabled) style.disabledColor(widget.text orelse style.text_tokens.primary) else widget.text orelse style.text_tokens.primary);
     ctx.endBox();
     return result.clicked;
 }
@@ -1670,18 +1727,35 @@ const ToggleGlyph = struct {
 /// Radio (auto ID: label hash). `selected` is display-only (whether this item is current).
 /// Returns true when clicked (activated, not changed). Selection state is caller-owned.
 pub fn radio(ctx: *Context, label: []const u8, selected: bool) bool {
-    return radioId(ctx, ctx.id_stack.make(label), label, selected);
+    return radioEx(ctx, label, selected, .{});
 }
 
-/// Explicit-ID form. Use when identical radio labels share a scope (or `id_stack.push`).
+pub fn radioEx(ctx: *Context, label: []const u8, selected: bool, opts: RadioOpts) bool {
+    return radioIdEx(ctx, ctx.id_stack.make(label), label, selected, opts);
+}
+
+/// Explicit-ID form with the default theme colors.
 pub fn radioId(ctx: *Context, id: Id, label: []const u8, selected: bool) bool {
+    return radioIdEx(ctx, id, label, selected, .{});
+}
+
+/// Explicit-ID form with a partial local color override.
+pub fn radioIdEx(ctx: *Context, id: Id, label: []const u8, selected: bool, opts: RadioOpts) bool {
     ctx.requireInteractiveAllowed("radio");
     const result = behaviorFromCache(ctx, id);
     const style = ctx.style;
+    const widget = opts.style orelse WidgetStyle{};
     const disabled = ctx.isDisabled();
     const size = style.radio_size;
     std.debug.assert(size > 0);
     const hot = ctx.state.hot_id == id;
+    const normal_bg = widget.background orelse style.surface.control_subtle;
+    const hover_bg = widget.hover orelse normal_bg;
+    const active_bg = widget.active orelse style.accent.primary;
+    const selected_bg = widget.selected orelse style.accent.primary;
+    const ring = widget.border orelse style.border_tokens.normal;
+    const hover_ring = widget.hover_border orelse style.border_tokens.hover;
+    const text = widget.text orelse style.text_tokens.primary;
 
     ctx.beginBox(.{
         .id = id,
@@ -1694,12 +1768,12 @@ pub fn radioId(ctx: *Context, id: Id, label: []const u8, selected: bool) bool {
     data.* = .{
         .size = size,
         .selected = selected,
-        .ring = if (disabled) style.disabledColor(style.border) else if (hot) style.border_hover else style.border,
-        .bg = if (disabled) style.disabledColor(style.slider_track_bg) else style.slider_track_bg,
-        .dot = if (disabled) style.disabledColor(style.bg_active) else style.bg_active,
+        .ring = if (disabled) style.disabledColor(ring) else if (hot) hover_ring else ring,
+        .bg = if (disabled) style.disabledColor(if (hot) hover_bg else normal_bg) else if (hot) hover_bg else normal_bg,
+        .dot = if (disabled) style.disabledColor(if (result.held) active_bg else selected_bg) else if (result.held) active_bg else selected_bg,
     };
     ctx.custom(.{ .x = size, .y = size }, RadioGlyph.draw, data);
-    ctx.labelEx(label, if (disabled) style.disabledColor(style.text) else style.text);
+    ctx.labelEx(label, if (disabled) style.disabledColor(text) else text);
     ctx.endBox();
     return result.clicked;
 }
@@ -1757,8 +1831,8 @@ pub fn beginCollapsible(ctx: *Context, id: Id, title: []const u8, open: *bool) b
 
     const style = ctx.style;
     const hot = ctx.state.hot_id == id;
-    const bg = if (result.held) style.bg_active else if (hot) style.bg_hover else style.bg;
-    const border_color = if (hot) style.border_hover else style.border;
+    const bg = if (result.held) style.accent.primary else if (hot) style.surface.control_hover else style.surface.control;
+    const border_color = if (hot) style.border_tokens.hover else style.border_tokens.normal;
     const pad = style.button_padding;
 
     // header: row box (glyph + title). id covers the whole header hit region.
@@ -1773,9 +1847,9 @@ pub fn beginCollapsible(ctx: *Context, id: Id, title: []const u8, open: *bool) b
         .radius = style.control_radius,
     });
     const data = ctx.allocator().create(CollapsibleGlyph) catch @panic("collapsible: OOM");
-    data.* = .{ .ctx = ctx, .open = open.*, .fg = style.text };
+    data.* = .{ .ctx = ctx, .open = open.*, .fg = style.text_tokens.primary };
     ctx.custom(.{ .x = collapsible_glyph_px, .y = collapsible_glyph_px }, CollapsibleGlyph.draw, data);
-    ctx.labelEx(title, style.text);
+    ctx.labelEx(title, style.text_tokens.primary);
     ctx.endBox(); // Header always closes inside begin
 
     if (!open.*) return false;
@@ -1881,11 +1955,11 @@ pub fn splitter(ctx: *Context, id: Id, orient: Orient, size: *i32, opts: Splitte
     // Place the band as an explicit-id box. Color from stable hot_id/active_id (immutable for the frame).
     const style = ctx.style;
     const col = if (ctx.state.active_id == id)
-        style.bg_active
+        style.accent.primary
     else if (ctx.state.hot_id == id)
-        style.border_hover
+        style.border_tokens.hover
     else
-        style.border;
+        style.border_tokens.normal;
     switch (orient) {
         .vertical => ctx.beginBox(.{ .id = id, .width = .{ .fixed = opts.thickness }, .height = .{ .grow = 1 }, .bg = col }),
         .horizontal => ctx.beginBox(.{ .id = id, .width = .{ .grow = 1 }, .height = .{ .fixed = opts.thickness }, .bg = col }),
@@ -2005,10 +2079,10 @@ pub fn beginScrollArea(ctx: *Context, id: Id, scroll: *Vec2f, opts: ScrollAreaOp
     // Thumb geometry (px) from the clamped scroll
     var st: context_mod.ScrollState = .{
         .bar_thickness = opts.bar_thickness,
-        .track_col = ctx.style.slider_track_bg,
-        .thumb_col = ctx.style.border_hover,
-        .thumb_hot = ctx.style.text_subtle,
-        .thumb_active = ctx.style.bg_active,
+        .track_col = ctx.style.surface.control_subtle,
+        .thumb_col = ctx.style.border_tokens.hover,
+        .thumb_hot = ctx.style.text_tokens.subtle,
+        .thumb_active = ctx.style.accent.primary,
         .need_v = need_v,
         .need_h = need_h,
         .v_off = 0,
@@ -2418,6 +2492,8 @@ pub const TabOpts = struct {
     height: layout.Sizing = .fit,
     /// null → style.button_padding
     padding: ?[4]i32 = null,
+    /// Partial color override. Null keeps the active theme token.
+    style: ?WidgetStyle = null,
 };
 
 pub const TabResult = struct {
@@ -2434,14 +2510,26 @@ pub fn tabId(ctx: *Context, id: Id, label: []const u8, selected: bool, opts: Tab
     const result = behaviorFromCache(ctx, id);
     const style = ctx.style;
     const hot = ctx.state.hot_id == id;
-    const base_bg = if (selected) style.button_bg_selected else style.bg;
+    const disabled = ctx.isDisabled();
+    const base_bg = if (selected) style.accent.selected else style.surface.control;
     const colors: Context.ButtonColors = if (!style.animation.enabled)
-        .{
-            .bg = if (result.held) style.bg_active else if (hot) style.bg_hover else base_bg,
-            .border = style.border,
-        }
+        if (opts.style) |override|
+            ctx.resolveButtonColorsWithStyle(id, base_bg, selected, result.held, disabled, override)
+        else
+            .{
+                .bg = if (disabled)
+                    style.disabledColor(base_bg)
+                else if (result.held)
+                    style.accent.primary
+                else if (hot)
+                    style.surface.control_hover
+                else
+                    base_bg,
+                .border = if (disabled) style.disabledColor(style.border_tokens.normal) else style.border_tokens.normal,
+                .text = if (disabled) style.disabledColor(style.text_tokens.primary) else style.text_tokens.primary,
+            }
     else
-        ctx.resolveButtonColors(id, base_bg, selected, result.held, false);
+        ctx.resolveButtonColorsWithStyle(id, base_bg, selected, result.held, disabled, opts.style);
     const pad = opts.padding orelse style.button_padding;
 
     ctx.beginBox(.{
@@ -2451,9 +2539,10 @@ pub fn tabId(ctx: *Context, id: Id, label: []const u8, selected: bool, opts: Tab
         .padding = pad,
         .bg = colors.bg,
         .align_cross = .center,
+        .border = if (opts.style != null) makeBorder(colors.border, style.button_border) else null,
         .radius = style.control_radius,
     });
-    ctx.labelEx(label, style.text);
+    ctx.labelEx(label, colors.text);
     ctx.endBox();
 
     return .{ .activated = result.clicked, .focused = ctx.state.focused_id == id };
@@ -2562,13 +2651,13 @@ pub fn beginListboxRow(ctx: *Context, id: Id, selected: bool, opts: ListboxRowOp
     const hot = ctx.state.hot_id == id;
     // disabled > held > hover > selected > normal — the same priority buttonId uses.
     const bg = if (disabled)
-        (if (selected) style.disabledColor(style.button_bg_selected) else opts.idle_bg)
+        (if (selected) style.disabledColor(style.accent.selected) else opts.idle_bg)
     else if (btn.held)
-        style.bg_active
+        style.accent.primary
     else if (hot)
-        style.bg_hover
+        style.surface.control_hover
     else if (selected)
-        style.button_bg_selected
+        style.accent.selected
     else
         opts.idle_bg;
 
@@ -2617,7 +2706,7 @@ fn insertListboxIndentGuide(ctx: *Context, opts: ListboxRowOpts) void {
         ctx.beginBox(.{
             .width = .{ .fixed = 1 },
             .height = .{ .grow = 1 },
-            .bg = ctx.style.border,
+            .bg = ctx.style.border_tokens.normal,
         });
         ctx.endBox();
         remaining -= 1;
@@ -2674,9 +2763,9 @@ pub fn labelEllipsis(ctx: *Context, text: []const u8, max_w: i32, color: Color) 
 // a control with no declared relationship between them.
 
 pub const FormRowOpts = struct {
-    /// Drawn above the control in `style.text`, when set.
+    /// Drawn above the control in `style.text_tokens.primary`, when set.
     label: ?[]const u8 = null,
-    /// Drawn between the label and the control in `style.text_subtle`, when set.
+    /// Drawn between the label and the control in `style.text_tokens.subtle`, when set.
     description: ?[]const u8 = null,
     gap: i32 = 4,
 };
@@ -2686,8 +2775,8 @@ pub const FormRowOpts = struct {
 pub fn beginFormRow(ctx: *Context, opts: FormRowOpts) void {
     ctx.beginBox(.{ .direction = .column, .gap = opts.gap });
     const style = ctx.style;
-    if (opts.label) |l| ctx.labelEx(l, style.text);
-    if (opts.description) |d| ctx.labelEx(d, style.text_subtle);
+    if (opts.label) |l| ctx.labelEx(l, style.text_tokens.primary);
+    if (opts.description) |d| ctx.labelEx(d, style.text_tokens.subtle);
 }
 
 /// Close a row opened by `beginFormRow`.
@@ -2732,6 +2821,72 @@ fn center(rect: Rect) struct { x: i32, y: i32 } {
         .x = rect.x + @as(i32, @intCast(rect.w / 2)),
         .y = rect.y + @as(i32, @intCast(rect.h / 2)),
     };
+}
+
+fn expectButtonDrawColors(ctx: *Context, background: Color, border: Color, text: Color) !void {
+    try std.testing.expectEqual(background, ctx.draw_list.cmds.items[0].rect_filled.paint.solid);
+    try std.testing.expectEqual(text, ctx.draw_list.cmds.items[1].text.color);
+    try std.testing.expectEqual(border, ctx.draw_list.cmds.items[2].rect_outline.color);
+}
+
+test "button style override: draw commands cover the full state matrix" {
+    var ctx = testCtx();
+    defer ctx.deinit();
+    const id: Id = 0x309D;
+    const background = Color.rgba(0x11, 0x22, 0x33, 0xFF);
+    const hover = Color.rgba(0x44, 0x55, 0x66, 0xFF);
+    const active = Color.rgba(0x77, 0x88, 0x99, 0xFF);
+    const selected = Color.rgba(0xAA, 0xBB, 0xCC, 0xFF);
+    const border = Color.rgba(0x12, 0x34, 0x56, 0xFF);
+    const hover_border = Color.rgba(0x65, 0x43, 0x21, 0xFF);
+    const text = Color.rgba(0xDE, 0xAD, 0xBE, 0xFF);
+    const opts = ButtonOpts{ .style = .{
+        .background = background,
+        .hover = hover,
+        .active = active,
+        .selected = selected,
+        .border = border,
+        .hover_border = hover_border,
+        .text = text,
+    } };
+    const selected_opts = ButtonOpts{ .selected = true, .style = opts.style };
+
+    ctx.beginFrame(240, 200);
+    ctx.state.hot_id = 0;
+    ctx.state.active_id = 0;
+    _ = ctx.buttonId(id, "Button", opts);
+    ctx.endFrame();
+    try expectButtonDrawColors(&ctx, background, border, text);
+
+    ctx.beginFrame(240, 200);
+    ctx.state.hot_id = id;
+    ctx.state.active_id = 0;
+    _ = ctx.buttonId(id, "Button", opts);
+    ctx.endFrame();
+    try expectButtonDrawColors(&ctx, hover, hover_border, text);
+
+    ctx.beginFrame(240, 200);
+    ctx.state.hot_id = id;
+    ctx.state.active_id = id;
+    _ = ctx.buttonId(id, "Button", opts);
+    ctx.endFrame();
+    try expectButtonDrawColors(&ctx, active, hover_border, text);
+
+    ctx.beginFrame(240, 200);
+    ctx.state.hot_id = 0;
+    ctx.state.active_id = 0;
+    _ = ctx.buttonId(id, "Button", selected_opts);
+    ctx.endFrame();
+    try expectButtonDrawColors(&ctx, selected, hover_border, text);
+
+    ctx.beginFrame(240, 200);
+    ctx.state.hot_id = id;
+    ctx.state.active_id = 0;
+    ctx.beginDisabled();
+    _ = ctx.buttonId(id, "Button", opts);
+    ctx.endDisabled();
+    ctx.endFrame();
+    try expectButtonDrawColors(&ctx, ctx.style.disabledColor(background), ctx.style.disabledColor(border), ctx.style.disabledColor(text));
 }
 
 test "button: clicked is true only on the release frame (1-frame edge)" {
@@ -4694,6 +4849,58 @@ test "radio: selected center dot is accent; non-selected is box interior color" 
     const uns_i = (@as(u32, @intCast(uns.y)) + uns.h / 2) * 200 + @as(u32, @intCast(uns.x)) + half;
     try std.testing.expectEqual(@as(u32, @bitCast(ctx.style.bg_active)), pixels[sel_i]); // selected = center dot
     try std.testing.expectEqual(@as(u32, @bitCast(ctx.style.slider_track_bg)), pixels[uns_i]); // non-selected = hollow
+}
+
+test "checkbox toggle radio: partial style overrides reach glyph border and label draw commands" {
+    var ctx = testCtx();
+    defer ctx.deinit();
+    var checkbox_value = true;
+    var toggle_value = false;
+    const bg = Color.rgba(0x10, 0x20, 0x30, 0xFF);
+    const fill = Color.rgba(0x40, 0x50, 0x60, 0xFF);
+    const border = Color.rgba(0x70, 0x80, 0x90, 0xFF);
+    const text = Color.rgba(0xA0, 0xB0, 0xC0, 0xFF);
+    const opts = WidgetStyle{
+        .background = bg,
+        .selected = fill,
+        .border = border,
+        .text = text,
+    };
+
+    ctx.beginFrame(600, 80);
+    _ = ctx.checkboxIdEx(0x309A, "Checkbox", &checkbox_value, .{ .style = opts });
+    _ = ctx.toggleIdEx(0x309B, "Toggle", &toggle_value, .{ .style = opts });
+    _ = ctx.radioIdEx(0x309C, "Radio", true, .{ .style = opts });
+    ctx.endFrame();
+
+    var saw_bg = false;
+    var saw_fill = false;
+    var saw_border = false;
+    var saw_text = false;
+    for (ctx.draw_list.cmds.items) |cmd| switch (cmd) {
+        .rect_filled => |c| if (c.paint == .solid) {
+            if (std.meta.eql(c.paint.solid, bg)) saw_bg = true;
+            if (std.meta.eql(c.paint.solid, fill)) saw_fill = true;
+        },
+        .rect_outline => |c| {
+            if (std.meta.eql(c.color, border)) saw_border = true;
+        },
+        .circle_filled => |c| {
+            if (std.meta.eql(c.color, bg)) saw_bg = true;
+            if (std.meta.eql(c.color, fill)) saw_fill = true;
+        },
+        .circle_outline => |c| {
+            if (std.meta.eql(c.color, border)) saw_border = true;
+        },
+        .text => |c| {
+            if (std.meta.eql(c.color, text)) saw_text = true;
+        },
+        else => {},
+    };
+    try std.testing.expect(saw_bg);
+    try std.testing.expect(saw_fill);
+    try std.testing.expect(saw_border);
+    try std.testing.expect(saw_text);
 }
 
 test "widget chrome: button background and border use the control radius" {

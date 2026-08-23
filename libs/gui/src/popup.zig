@@ -622,25 +622,25 @@ fn drawDialog(ctx: *Context, id: Id, geo: DialogGeometry, options: DialogOptions
     const dl = &ctx.draw_list;
     const style = ctx.style;
     dl.rectFilled(.{ .x = 0, .y = 0, .w = ctx.screen_w, .h = ctx.screen_h }, Color.rgba(0, 0, 0, 0x88)) catch @panic("dialog: OOM");
-    dl.shadow(geo.outer, Color.rgba(0, 0, 0, 0xB0), .{ .radius = 10, .blur = 16, .offset = .{ .x = 0, .y = 6 } }) catch @panic("dialog shadow: OOM");
-    dl.rectFilledEx(geo.outer, style.bg, .{ .radius = 8 }) catch @panic("dialog: OOM");
-    dl.rectOutlineEx(geo.outer, style.border, 1, .{ .radius = 8 }) catch @panic("dialog: OOM");
-    if (geo.title.w != 0 and geo.title.h != 0) dl.textEx(.{ .x = geo.title.x, .y = geo.title.y }, options.title, style.text, null) catch @panic("dialog title: OOM");
-    if (geo.body.w != 0 and geo.body.h != 0) dl.textEx(.{ .x = geo.body.x, .y = geo.body.y }, options.body, style.text_subtle, null) catch @panic("dialog body: OOM");
+    dl.shadow(geo.outer, style.elevation.shadow, .{ .radius = 10, .blur = 16, .offset = .{ .x = 0, .y = 6 } }) catch @panic("dialog shadow: OOM");
+    dl.rectFilledEx(geo.outer, style.surface.control, .{ .radius = 8 }) catch @panic("dialog: OOM");
+    dl.rectOutlineEx(geo.outer, style.border_tokens.normal, 1, .{ .radius = 8 }) catch @panic("dialog: OOM");
+    if (geo.title.w != 0 and geo.title.h != 0) dl.textEx(.{ .x = geo.title.x, .y = geo.title.y }, options.title, style.text_tokens.primary, null) catch @panic("dialog title: OOM");
+    if (geo.body.w != 0 and geo.body.h != 0) dl.textEx(.{ .x = geo.body.x, .y = geo.body.y }, options.body, style.text_tokens.subtle, null) catch @panic("dialog body: OOM");
 
     for (options.actions, 0..) |action, i| {
         const r = dialogActionRect(geo, i, options.actions.len);
         if (r.isEmpty()) continue;
         const hovered = action.enabled and r.contains(ctx.input.mouse_pos);
-        const fill = if (!action.enabled) style.bg else if (hovered) style.bg_hover else style.bg;
+        const fill = if (!action.enabled) style.surface.control else if (hovered) style.surface.control_hover else style.surface.control;
         dl.rectFilledEx(r, fill, .{ .radius = style.control_radius }) catch @panic("dialog action: OOM");
-        dl.rectOutlineEx(r, if (action.enabled) style.border_hover else style.border, 1, .{ .radius = style.control_radius }) catch @panic("dialog action: OOM");
+        dl.rectOutlineEx(r, if (action.enabled) style.border_tokens.hover else style.border_tokens.normal, 1, .{ .radius = style.control_radius }) catch @panic("dialog action: OOM");
         const text_y = font_mod.centeredTextY(r.y, @intCast(r.h), font_mod.fontInkHeight(ctx.font));
-        dl.textEx(.{ .x = r.x + 8, .y = text_y }, action.label, if (action.enabled) style.text else style.text_subtle, null) catch @panic("dialog action label: OOM");
+        dl.textEx(.{ .x = r.x + 8, .y = text_y }, action.label, if (action.enabled) style.text_tokens.primary else style.text_tokens.subtle, null) catch @panic("dialog action label: OOM");
         if (focus_index != null and focus_index.? == i and action.enabled) {
             ctx.state.focused_id = dialogFocusId(id, i);
             ctx.state.focus_visible = true;
-            dl.rectOutlineEx(r, style.focus_ring, style.focus_ring_thickness, .{ .radius = style.control_radius }) catch @panic("dialog focus ring: OOM");
+            dl.rectOutlineEx(r, style.accent.focus, style.focus_ring_thickness, .{ .radius = style.control_radius }) catch @panic("dialog focus ring: OOM");
         }
     }
 }
@@ -725,8 +725,8 @@ fn draw(ctx: *Context, geo: PopupGeometry, items: []const PopupItem, hovered_idx
     dl.pushClip(geo.outer) catch @panic("popupMenu: OOM");
     defer dl.popClip();
 
-    dl.rectFilled(geo.outer, style.bg) catch @panic("popupMenu: OOM");
-    dl.rectOutline(geo.outer, style.border, 1) catch @panic("popupMenu: OOM");
+    dl.rectFilled(geo.outer, style.surface.control) catch @panic("popupMenu: OOM");
+    dl.rectOutline(geo.outer, style.border_tokens.normal, 1) catch @panic("popupMenu: OOM");
 
     // Text height is logical ink (ascent+descent). item_h / hit-test / outer frame keep style.
     const text_h = font_mod.fontInkHeight(ctx.font);
@@ -739,9 +739,9 @@ fn draw(ctx: *Context, geo: PopupGeometry, items: []const PopupItem, hovered_idx
         // The right side of long text is cut by pushClip(outer) (text width itself unchanged).
         if (r.isEmpty()) continue;
         if (hovered_idx != null and hovered_idx.? == i and it.enabled) {
-            dl.rectFilled(r, style.bg_hover) catch @panic("popupMenu: OOM");
+            dl.rectFilled(r, style.surface.control_hover) catch @panic("popupMenu: OOM");
         }
-        const text_col = if (it.enabled) style.text else style.text_subtle;
+        const text_col = if (it.enabled) style.text_tokens.primary else style.text_tokens.subtle;
         // Vertical center uses natural item_h (keeps row appearance even when partially clipped)
         const text_y = font_mod.centeredTextY(r.y, geo.item_h, text_h);
         if (it.checked) {
@@ -781,13 +781,13 @@ pub fn drawTooltipOverlay(ctx: *Context, text: []const u8, anchor: Rect) void {
     const dl = &ctx.draw_list;
     dl.pushClip(geo.outer) catch @panic("tooltip: OOM");
     defer dl.popClip();
-    dl.rectFilled(geo.outer, style.bg) catch @panic("tooltip: OOM");
-    dl.rectOutline(geo.outer, style.border, 1) catch @panic("tooltip: OOM");
+    dl.rectFilled(geo.outer, style.surface.control) catch @panic("tooltip: OOM");
+    dl.rectOutline(geo.outer, style.border_tokens.normal, 1) catch @panic("tooltip: OOM");
 
     const r = itemRect(geo, 0);
     if (r.isEmpty()) return;
     const text_y = font_mod.centeredTextY(r.y, geo.item_h, text_h);
-    dl.textEx(.{ .x = r.x + 4, .y = text_y }, text, style.text, null) catch @panic("tooltip: OOM");
+    dl.textEx(.{ .x = r.x + 4, .y = text_y }, text, style.text_tokens.primary, null) catch @panic("tooltip: OOM");
 }
 
 /// Add the same (dx, dy) to `node` and every descendant. Layout rects are absolute;

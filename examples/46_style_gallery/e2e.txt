@@ -7,6 +7,23 @@ expect showcase selected=states
 expect showcase disabled=0
 snapshot fb
 
+# Theme toggle from the overview. The light snapshot makes the token replacement visible.
+inject key_down T
+step 1
+inject key_up T
+step 1
+digest showcase
+expect showcase theme=light
+snapshot fb
+digest drawlist
+expect drawlist hash=5227D30C
+inject key_down T
+step 1
+inject key_up T
+step 1
+digest showcase
+expect showcase theme=dark
+
 # overview -> states
 inject key_down PAGE_DOWN
 step 1
@@ -249,4 +266,5 @@ expect drawlist offclip=0
 snapshot drawlist
 digest frameprof
 expect frameprof body_ms<16.7
+
 quit

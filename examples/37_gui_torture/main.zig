@@ -484,7 +484,7 @@ fn renderLayout(ctx: *gui.Context, app: *App) void {
         .height = .{ .grow = 1 },
         .padding = .{ 4, 4, 4, 4 },
         .gap = 4,
-        .bg = gui.Color.rgba(0x18, 0x1C, 0x24, 0xFF),
+        .bg = ctx.style.surface.canvas,
     });
     ctx.label("layout torture: nested splitters / nested scroll / zero-size");
 
@@ -494,7 +494,7 @@ fn renderLayout(ctx: *gui.Context, app: *App) void {
         .id = Ids.pane0,
         .width = .{ .fixed = app.split0_size },
         .height = .{ .grow = 1 },
-        .bg = gui.Color.rgba(0x30, 0x38, 0x48, 0xFF),
+        .bg = ctx.style.surface.elevated,
         .padding = .{ 4, 4, 4, 4 },
     });
     ctx.label("pane0");
@@ -505,7 +505,7 @@ fn renderLayout(ctx: *gui.Context, app: *App) void {
         .id = Ids.pane1,
         .width = .{ .fixed = app.split1_size },
         .height = .{ .grow = 1 },
-        .bg = gui.Color.rgba(0x28, 0x40, 0x38, 0xFF),
+        .bg = ctx.style.surface.success,
         .padding = .{ 4, 4, 4, 4 },
     });
     ctx.label("pane1");
@@ -516,7 +516,7 @@ fn renderLayout(ctx: *gui.Context, app: *App) void {
         .id = Ids.pane2,
         .width = .{ .fixed = app.split2_size },
         .height = .{ .grow = 1 },
-        .bg = gui.Color.rgba(0x40, 0x30, 0x38, 0xFF),
+        .bg = ctx.style.surface.danger,
         .padding = .{ 4, 4, 4, 4 },
     });
     ctx.label("pane2");
@@ -526,7 +526,7 @@ fn renderLayout(ctx: *gui.Context, app: *App) void {
         .id = Ids.pane3,
         .width = .{ .grow = 1 },
         .height = .{ .grow = 1 },
-        .bg = gui.Color.rgba(0x38, 0x38, 0x30, 0xFF),
+        .bg = ctx.style.surface.warning,
         .padding = .{ 4, 4, 4, 4 },
     });
     ctx.label("pane3");
@@ -541,7 +541,7 @@ fn renderLayout(ctx: *gui.Context, app: *App) void {
         .height = .{ .fixed = 240 },
         .padding = .{ 4, 4, 4, 4 },
         .gap = 4,
-        .bg = gui.Color.rgba(0x20, 0x24, 0x2C, 0xFF),
+        .bg = ctx.style.surface.panel,
     });
     ctx.label("outer scroll content");
     ctx.beginScrollArea(Ids.inner_scroll, &app.inner_scroll, .{
@@ -549,7 +549,7 @@ fn renderLayout(ctx: *gui.Context, app: *App) void {
         .height = .{ .fixed = 120 },
         .padding = .{ 4, 4, 4, 4 },
         .gap = 2,
-        .bg = gui.Color.rgba(0x18, 0x28, 0x38, 0xFF),
+        .bg = ctx.style.surface.info,
     });
     ctx.label("inner scroll");
     for (0..20) |i| {
@@ -576,7 +576,7 @@ fn renderLayout(ctx: *gui.Context, app: *App) void {
     ctx.endBox();
 
     // Overflow content markers (for 100x100 and general)
-    ctx.beginBox(.{ .direction = .row, .width = .{ .fixed = 2000 }, .height = .{ .fixed = 40 }, .bg = gui.Color.rgba(0x50, 0x20, 0x20, 0xFF) });
+    ctx.beginBox(.{ .direction = .row, .width = .{ .fixed = 2000 }, .height = .{ .fixed = 40 }, .bg = ctx.style.surface.danger_strong });
     ctx.label("wide-overflow-strip-2000px");
     ctx.endBox();
     app.overflow = if (app.screen_w < 2000 or app.screen_h < 500) 1 else 0;
@@ -584,14 +584,14 @@ fn renderLayout(ctx: *gui.Context, app: *App) void {
     ctx.beginBox(.{
         .width = .{ .fixed = 80 },
         .height = .{ .fixed = 28 },
-        .bg = gui.Color.rgba(0x30, 0x38, 0x48, 0xFF),
+        .bg = ctx.style.surface.elevated,
     });
     ctx.label("anchor-host");
     ctx.beginBox(.{
         .anchor = .{ .at = .top_right, .offset = .{ .x = 6, .y = -6 } },
         .width = .{ .fixed = 12 },
         .height = .{ .fixed = 12 },
-        .bg = gui.Color.rgba(0xC0, 0x30, 0x30, 0xFF),
+        .bg = ctx.style.accent.danger,
     });
     ctx.endBox();
     ctx.endBox();
@@ -615,7 +615,7 @@ fn renderText(ctx: *gui.Context, app: *App) void {
         .height = .{ .grow = 1 },
         .padding = .{ 8, 8, 8, 8 },
         .gap = 6,
-        .bg = gui.Color.rgba(0x18, 0x1C, 0x24, 0xFF),
+        .bg = ctx.style.surface.canvas,
     });
     ctx.label("text torture: long / empty / CJK / emoji / newline / caret");
     // Put long text on label / popup items; keep button labels short (huge min width would break layout)
@@ -643,7 +643,7 @@ fn renderInputState(ctx: *gui.Context, app: *App) void {
         .height = .{ .grow = 1 },
         .padding = .{ 12, 12, 12, 12 },
         .gap = 10,
-        .bg = gui.Color.rgba(0x18, 0x1C, 0x24, 0xFF),
+        .bg = ctx.style.surface.canvas,
     });
     ctx.label("input/state torture: active drag / disappear / popup modal");
 
@@ -679,7 +679,7 @@ fn renderIdsPopup(ctx: *gui.Context, app: *App) void {
         .height = .{ .grow = 1 },
         .padding = .{ 8, 8, 8, 8 },
         .gap = 6,
-        .bg = gui.Color.rgba(0x18, 0x1C, 0x24, 0xFF),
+        .bg = ctx.style.surface.canvas,
     });
     ctx.label("ids/popup torture: 100 same-label buttonId / id stack / corner popup");
 
@@ -688,7 +688,7 @@ fn renderIdsPopup(ctx: *gui.Context, app: *App) void {
         .height = .{ .fixed = 360 },
         .gap = 2,
         .padding = .{ 4, 4, 4, 4 },
-        .bg = gui.Color.rgba(0x20, 0x24, 0x2C, 0xFF),
+        .bg = ctx.style.surface.panel,
     });
     var i: u32 = 0;
     while (i < app.button_count) : (i += 1) {
@@ -728,7 +728,7 @@ fn renderVolume(ctx: *gui.Context, app: *App) void {
         .height = .{ .grow = 1 },
         .padding = .{ 4, 4, 4, 4 },
         .gap = 2,
-        .bg = gui.Color.rgba(0x18, 0x1C, 0x24, 0xFF),
+        .bg = ctx.style.surface.canvas,
     });
     var hdr: [64]u8 = undefined;
     ctx.label(std.fmt.bufPrint(&hdr, "volume torture: rows={d}", .{app.row_count}) catch "volume");
@@ -738,7 +738,7 @@ fn renderVolume(ctx: *gui.Context, app: *App) void {
         .height = .{ .grow = 1 },
         .gap = 1,
         .padding = .{ 2, 2, 2, 2 },
-        .bg = gui.Color.rgba(0x20, 0x24, 0x2C, 0xFF),
+        .bg = ctx.style.surface.panel,
     });
     var n: u32 = 0;
     while (n < app.row_count) : (n += 1) {

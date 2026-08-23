@@ -396,11 +396,11 @@ fn renderMatrix(ctx: *gui.Context, rows: []const MatrixRow) void {
     const HEADERS = [_][]const u8{ "norm", "hovr", "actv", "focs", "dsbl", "emp", "min", "max", "none" };
     ctx.beginBox(.{ .direction = .row, .gap = 2 });
     ctx.beginBox(.{ .width = .{ .fixed = 104 } });
-    ctx.labelEx("widget", ctx.style.text_subtle);
+    ctx.labelEx("widget", ctx.style.text_tokens.subtle);
     ctx.endBox();
     for (HEADERS) |h| {
         ctx.beginBox(.{ .width = .{ .fixed = 34 } });
-        ctx.labelEx(h, ctx.style.text_subtle);
+        ctx.labelEx(h, ctx.style.text_tokens.subtle);
         ctx.endBox();
     }
     ctx.endBox();
@@ -424,14 +424,14 @@ fn renderOverview(ctx: *gui.Context) void {
     ctx.label("Use PAGE_DOWN / PAGE_UP (or N / P) to cycle sections.");
     ctx.label("Current implementation is normal + endpoint focused; demo cells are exercised by E2E.");
     ctx.beginBox(.{ .direction = .row, .gap = 12 });
-    ctx.beginBox(.{ .width = .{ .fixed = 270 }, .bg = gui.Color.rgba(0x20, 0x24, 0x2C, 0xFF), .padding = .{ 8, 8, 8, 8 } });
+    ctx.beginBox(.{ .width = .{ .fixed = 270 }, .bg = ctx.style.surface.panel, .padding = .{ 8, 8, 8, 8 } });
     var api_buf: [48]u8 = undefined;
     ctx.label(std.fmt.bufPrint(&api_buf, "Existing API: {d} semantic widgets", .{semanticWidgetTotal()}) catch "Existing API: ?");
     var miss_buf: [40]u8 = undefined;
     ctx.label(std.fmt.bufPrint(&miss_buf, "Missing placeholders: {d}", .{MISSING.len}) catch "Missing placeholders: ?");
     ctx.label("Context: normal / demo / gaps");
     ctx.endBox();
-    ctx.beginBox(.{ .width = .{ .fixed = 270 }, .bg = gui.Color.rgba(0x20, 0x24, 0x2C, 0xFF), .padding = .{ 8, 8, 8, 8 } });
+    ctx.beginBox(.{ .width = .{ .fixed = 270 }, .bg = ctx.style.surface.panel, .padding = .{ 8, 8, 8, 8 } });
     ctx.label("APG × ImGui × libs/gui");
     ctx.label("Capability gaps are noted in the overview");
     ctx.label("abnormal cases live in the torture example");
@@ -447,7 +447,7 @@ fn renderBasic(ctx: *gui.Context, app: *App) void {
     if (ctx.buttonId(Ids.secondary_button, "Secondary", .{ .min_w = 160 }).clicked) app.clicks += 1;
     if (app.disabled_demo) ctx.endDisabled();
     var buf: [32]u8 = undefined;
-    ctx.labelEx(std.fmt.bufPrint(&buf, "clicked={d}", .{app.clicks}) catch "clicked=?", ctx.style.text_subtle);
+    ctx.labelEx(std.fmt.bufPrint(&buf, "clicked={d}", .{app.clicks}) catch "clicked=?", ctx.style.text_tokens.subtle);
 }
 
 fn renderText(ctx: *gui.Context, app: *App) void {
@@ -459,22 +459,22 @@ fn renderText(ctx: *gui.Context, app: *App) void {
     // Cmd+C/X to the real clipboard (consumer wiring; same shape as example_28)
     if (input.copy_request) |r| platform.setClipboardText(r.text);
     if (selectable.copy_request) |r| platform.setClipboardText(r.text);
-    ctx.labelEx("wrap + overflow (declarative Context.text)", ctx.style.text_subtle);
-    ctx.beginBox(.{ .width = .{ .fixed = 200 }, .height = .fit, .bg = ctx.style.input_background, .padding = .{ 4, 4, 4, 4 } });
+    ctx.labelEx("wrap + overflow (declarative Context.text)", ctx.style.text_tokens.subtle);
+    ctx.beginBox(.{ .width = .{ .fixed = 200 }, .height = .fit, .bg = ctx.style.surface.input, .padding = .{ 4, 4, 4, 4 } });
     ctx.text("The quick brown fox jumps over the lazy dog.", .{ .wrap = true });
     ctx.endBox();
     ctx.beginBox(.{ .direction = .column, .gap = 4 });
-    ctx.beginBox(.{ .width = .{ .fixed = 160 }, .height = .{ .fixed = 16 }, .bg = ctx.style.input_background });
+    ctx.beginBox(.{ .width = .{ .fixed = 160 }, .height = .{ .fixed = 16 }, .bg = ctx.style.surface.input });
     ctx.text("visible: draws past this box", .{});
     ctx.endBox();
-    ctx.beginBox(.{ .width = .{ .fixed = 160 }, .height = .{ .fixed = 16 }, .bg = ctx.style.input_background });
+    ctx.beginBox(.{ .width = .{ .fixed = 160 }, .height = .{ .fixed = 16 }, .bg = ctx.style.surface.input });
     ctx.text("clip: cut to this box width", .{ .overflow = .clip });
     ctx.endBox();
-    ctx.beginBox(.{ .width = .{ .fixed = 160 }, .height = .{ .fixed = 16 }, .bg = ctx.style.input_background });
+    ctx.beginBox(.{ .width = .{ .fixed = 160 }, .height = .{ .fixed = 16 }, .bg = ctx.style.surface.input });
     ctx.text("ellipsis: marks the cut here", .{ .overflow = .ellipsis });
     ctx.endBox();
     ctx.endBox();
-    ctx.labelEx("labelStyled tiers (size and weight are resolved by the default family)", ctx.style.text_subtle);
+    ctx.labelEx("labelStyled tiers (size and weight are resolved by the default family)", ctx.style.text_tokens.subtle);
     ctx.labelStyled("Heading", .heading);
     ctx.labelStyled("日本語ラベル", .body);
     ctx.labelStyled("Body text", .body);
@@ -513,7 +513,7 @@ fn renderColor(ctx: *gui.Context, app: *App) void {
 fn itemTooltip(ptr: *anyopaque, ctx: *gui.Context) void {
     _ = ptr;
     ctx.beginBox(.{ .direction = .row, .gap = 8, .align_cross = .center });
-    ctx.imageBox(0x35B0, &image_pixels, 8, 8, .{ .border = ctx.style.border });
+    ctx.imageBox(0x35B0, &image_pixels, 8, 8, .{ .border = ctx.style.border_tokens.normal });
     ctx.beginBox(.{ .direction = .column, .gap = 2 });
     ctx.labelStyled("Item", .heading);
     ctx.label("A custom tooltip");
@@ -537,7 +537,7 @@ fn renderLayout(ctx: *gui.Context, app: *App) void {
     });
     var unused: u8 = 0;
     ctx.tooltipBox(itemTooltip, &unused);
-    ctx.labelEx("selected / normal + tooltip / custom box", ctx.style.text_subtle);
+    ctx.labelEx("selected / normal + tooltip / custom box", ctx.style.text_tokens.subtle);
     ctx.endBox();
 
     // Collapsible: dynamic title (tied to tool name) + body child (open/closed changes the screen)
@@ -551,12 +551,12 @@ fn renderLayout(ctx: *gui.Context, app: *App) void {
     }
 
     ctx.beginBox(.{ .direction = .row, .width = .{ .grow = 1 }, .height = .{ .grow = 1 }, .gap = 8 });
-    ctx.beginBox(.{ .width = .{ .fixed = 250 }, .height = .{ .grow = 1 }, .bg = gui.Color.rgba(0x20, 0x24, 0x2C, 0xFF), .padding = .{ 8, 8, 8, 8 } });
+    ctx.beginBox(.{ .width = .{ .fixed = 250 }, .height = .{ .grow = 1 }, .bg = ctx.style.surface.panel, .padding = .{ 8, 8, 8, 8 } });
     ctx.label("left pane");
     ctx.label("splitter is draggable");
     ctx.endBox();
     _ = ctx.splitter(Ids.splitter, .vertical, &app.splitter_size, .{ .min = 160, .max = 400 });
-    ctx.beginScrollArea(Ids.scroll, &app.scroll, .{ .width = .{ .grow = 1 }, .height = .{ .grow = 1 }, .padding = .{ 8, 8, 8, 8 }, .gap = 4, .bg = gui.Color.rgba(0x20, 0x24, 0x2C, 0xFF) });
+    ctx.beginScrollArea(Ids.scroll, &app.scroll, .{ .width = .{ .grow = 1 }, .height = .{ .grow = 1 }, .padding = .{ 8, 8, 8, 8 }, .gap = 4, .bg = ctx.style.surface.panel });
     ctx.label("scroll viewport");
     for (0..24) |i| {
         var buf: [32]u8 = undefined;
@@ -565,7 +565,7 @@ fn renderLayout(ctx: *gui.Context, app: *App) void {
     ctx.endScrollArea();
     ctx.endBox();
 
-    ctx.labelEx("wrap + min/max", ctx.style.text_subtle);
+    ctx.labelEx("wrap + min/max", ctx.style.text_tokens.subtle);
     ctx.beginBox(.{
         .direction = .row,
         .wrap = true,
@@ -589,20 +589,20 @@ fn renderLayout(ctx: *gui.Context, app: *App) void {
             .min_width = card.min_w,
             .max_width = card.max_w,
             .padding = .{ 4, 6, 4, 6 },
-            .bg = gui.Color.rgba(0x30, 0x38, 0x48, 0xFF),
+            .bg = ctx.style.surface.elevated,
         });
         ctx.label(card.label);
         ctx.endBox();
     }
     ctx.endBox();
 
-    ctx.labelEx("anchored overlay (later sibling paints on top)", ctx.style.text_subtle);
+    ctx.labelEx("anchored overlay (later sibling paints on top)", ctx.style.text_tokens.subtle);
     ctx.beginBox(.{
         .id = Ids.badge_host,
         .width = .{ .fixed = 120 },
         .height = .{ .fixed = 36 },
         .padding = .{ 6, 8, 6, 8 },
-        .bg = gui.Color.rgba(0x30, 0x38, 0x48, 0xFF),
+        .bg = ctx.style.surface.elevated,
     });
     ctx.label("host");
     ctx.beginBox(.{
@@ -610,12 +610,12 @@ fn renderLayout(ctx: *gui.Context, app: *App) void {
         .anchor = .{ .at = .top_right, .offset = .{ .x = 6, .y = -6 } },
         .width = .{ .fixed = 16 },
         .height = .{ .fixed = 16 },
-        .bg = gui.Color.rgba(0xC0, 0x30, 0x30, 0xFF),
+        .bg = ctx.style.accent.danger,
     });
     ctx.endBox();
     ctx.endBox();
 
-    ctx.labelEx("listbox indent guides (row-local; a gap breaks the line)", ctx.style.text_subtle);
+    ctx.labelEx("listbox indent guides (row-local; a gap breaks the line)", ctx.style.text_tokens.subtle);
     const tree = [_]struct { depth: u8, name: []const u8 }{
         .{ .depth = 0, .name = "src" },
         .{ .depth = 1, .name = "gui" },
@@ -708,16 +708,16 @@ fn renderTable(ctx: *gui.Context, app: *App) void {
         .height = .{ .grow = 1 },
         .column_gap = 6,
         .scroll = &app.table_scroll,
-        .header_bg = gui.Color.rgba(0x28, 0x30, 0x3C, 0xFF),
-        .bg = gui.Color.rgba(0x18, 0x1C, 0x24, 0xFF),
-        .border = .{ .color = ctx.style.border, .thickness = 1 },
+        .header_bg = ctx.style.surface.raised,
+        .bg = ctx.style.surface.canvas,
+        .border = .{ .color = ctx.style.border_tokens.normal, .thickness = 1 },
     });
     ctx.tableHeaderRow();
     for (TABLE_ROWS, 0..) |row, i| {
         const rid: gui.Id = Ids.table_row0 + i;
         ctx.beginTableRow(.{
             .interactive = .{ .id = rid, .selected = i == app.table_selected },
-            .idle_bg = if (i % 2 == 0) gui.Color.rgba(0x20, 0x24, 0x2C, 0xFF) else null,
+            .idle_bg = if (i % 2 == 0) ctx.style.surface.panel else null,
         });
         ctx.beginTableCell();
         ctx.label(row.name);
@@ -726,7 +726,7 @@ fn renderTable(ctx: *gui.Context, app: *App) void {
         ctx.label(row.status);
         ctx.endTableCell();
         ctx.beginTableCell();
-        _ = ctx.labelEllipsis(row.path, 160, ctx.style.text);
+        _ = ctx.labelEllipsis(row.path, 160, ctx.style.text_tokens.primary);
         ctx.endTableCell();
         ctx.beginTableCell();
         _ = ctx.checkbox(" ", &app.table_on[i]);
@@ -745,10 +745,10 @@ fn renderMissing(ctx: *gui.Context) void {
             ctx.beginBox(.{ .direction = .column, .width = .{ .grow = 1 }, .height = .{ .grow = 1 }, .gap = 6 });
         }
         const item = MISSING[i];
-        ctx.beginBox(.{ .height = .{ .fixed = 54 }, .bg = gui.Color.rgba(0x30, 0x24, 0x2C, 0xFF), .padding = .{ 6, 6, 6, 6 } });
+        ctx.beginBox(.{ .height = .{ .fixed = 54 }, .bg = ctx.style.surface.danger_subtle, .padding = .{ 6, 6, 6, 6 } });
         ctx.label(item.name);
         ctx.labelEx("NOT IMPLEMENTED", gui.Color.rgba(0xFF, 0xB0, 0x80, 0xFF));
-        ctx.labelEx(item.category, ctx.style.text_subtle);
+        ctx.labelEx(item.category, ctx.style.text_tokens.subtle);
         ctx.endBox();
     }
     ctx.endBox();
@@ -771,27 +771,27 @@ fn renderSection(ctx: *gui.Context, app: *App) void {
 }
 
 fn renderFrame(ctx: *gui.Context, app: *App) void {
-    ctx.beginBox(.{ .direction = .column, .width = .{ .grow = 1 }, .height = .{ .grow = 1 }, .padding = .{ 16, 16, 16, 16 }, .gap = 16, .bg = gui.Color.rgba(0x18, 0x1C, 0x24, 0xFF) });
+    ctx.beginBox(.{ .direction = .column, .width = .{ .grow = 1 }, .height = .{ .grow = 1 }, .padding = .{ 16, 16, 16, 16 }, .gap = 16, .bg = ctx.style.surface.canvas });
     const meta = SECTIONS[app.section];
-    ctx.beginBox(.{ .height = .{ .fixed = 64 }, .width = .{ .grow = 1 }, .padding = .{ 8, 8, 8, 8 }, .bg = gui.Color.rgba(0x28, 0x30, 0x3C, 0xFF) });
+    ctx.beginBox(.{ .height = .{ .fixed = 64 }, .width = .{ .grow = 1 }, .padding = .{ 8, 8, 8, 8 }, .bg = ctx.style.surface.raised });
     ctx.label("GUI Capability Gallery v0");
     var section_buf: [128]u8 = undefined;
-    ctx.labelEx(std.fmt.bufPrint(&section_buf, "section {d}/{d}: {s} — {s}", .{ app.section, SECTIONS.len - 1, meta.name, meta.detail }) catch "section=?", ctx.style.text_subtle);
-    ctx.labelEx("PAGE_DOWN/UP or N/P: navigate | ESC / Q: quit", ctx.style.text_subtle);
+    ctx.labelEx(std.fmt.bufPrint(&section_buf, "section {d}/{d}: {s} — {s}", .{ app.section, SECTIONS.len - 1, meta.name, meta.detail }) catch "section=?", ctx.style.text_tokens.subtle);
+    ctx.labelEx("PAGE_DOWN/UP or N/P: navigate | ESC / Q: quit", ctx.style.text_tokens.subtle);
     ctx.endBox();
 
     if (app.current() == .menus) {
         renderMenus(ctx, app);
     } else if (app.current() == .overview or app.current() == .missing) {
-        ctx.beginBox(.{ .width = .{ .grow = 1 }, .height = .{ .grow = 1 }, .padding = .{ 16, 16, 16, 16 }, .bg = gui.Color.rgba(0x20, 0x24, 0x2C, 0xFF) });
+        ctx.beginBox(.{ .width = .{ .grow = 1 }, .height = .{ .grow = 1 }, .padding = .{ 16, 16, 16, 16 }, .bg = ctx.style.surface.panel });
         renderSection(ctx, app);
         ctx.endBox();
     } else {
-        ctx.beginBox(.{ .direction = .row, .width = .{ .grow = 1 }, .height = .{ .grow = 1 }, .padding = .{ 16, 16, 16, 16 }, .gap = 16, .bg = gui.Color.rgba(0x20, 0x24, 0x2C, 0xFF) });
+        ctx.beginBox(.{ .direction = .row, .width = .{ .grow = 1 }, .height = .{ .grow = 1 }, .padding = .{ 16, 16, 16, 16 }, .gap = 16, .bg = ctx.style.surface.panel });
         ctx.beginBox(.{ .width = .{ .fixed = 500 }, .height = .{ .grow = 1 }, .gap = 10 });
         renderSection(ctx, app);
         ctx.endBox();
-        ctx.beginBox(.{ .width = .{ .grow = 1 }, .height = .{ .grow = 1 }, .padding = .{ 8, 8, 8, 8 }, .bg = gui.Color.rgba(0x28, 0x30, 0x3C, 0xFF) });
+        ctx.beginBox(.{ .width = .{ .grow = 1 }, .height = .{ .grow = 1 }, .padding = .{ 8, 8, 8, 8 }, .bg = ctx.style.surface.raised });
         ctx.label("State matrix");
         renderMatrix(ctx, matrixFor(app.current()));
         ctx.endBox();

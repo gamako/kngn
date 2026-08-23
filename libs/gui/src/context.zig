@@ -83,6 +83,7 @@ pub const Font = font_mod.Font;
 pub const BoxConfig = layout.BoxConfig;
 pub const Style = style_mod.Style;
 pub const AnimationStyle = style_mod.AnimationStyle;
+pub const WidgetStyle = style_mod.WidgetStyle;
 pub const TweenState = animation_mod.TweenState;
 pub const AnimationState = animation_mod.AnimationState;
 pub const PerIdState = state_mod.PerIdState;
@@ -395,11 +396,17 @@ pub const Context = struct {
     pub const imageBox = widgets.imageBox;
     // Checkbox / Toggle(switch) / Radio (bool toggles)
     pub const checkbox = widgets.checkbox;
+    pub const checkboxEx = widgets.checkboxEx;
     pub const checkboxId = widgets.checkboxId;
+    pub const checkboxIdEx = widgets.checkboxIdEx;
     pub const toggle = widgets.toggle;
+    pub const toggleEx = widgets.toggleEx;
     pub const toggleId = widgets.toggleId;
+    pub const toggleIdEx = widgets.toggleIdEx;
     pub const radio = widgets.radio;
+    pub const radioEx = widgets.radioEx;
     pub const radioId = widgets.radioId;
+    pub const radioIdEx = widgets.radioIdEx;
     // Collapsible
     pub const beginCollapsible = widgets.beginCollapsible;
     pub const endCollapsible = widgets.endCollapsible;
@@ -676,8 +683,8 @@ pub const Context = struct {
                         self.allocator(),
                     );
                     const style = self.style;
-                    self.draw_list.rectFilled(tip_root.rect, style.bg) catch @panic("tooltip: OOM");
-                    self.draw_list.rectOutline(tip_root.rect, style.border, 1) catch @panic("tooltip: OOM");
+                    self.draw_list.rectFilled(tip_root.rect, style.surface.control) catch @panic("tooltip: OOM");
+                    self.draw_list.rectOutline(tip_root.rect, style.border_tokens.normal, 1) catch @panic("tooltip: OOM");
                     self.emitNode(tip_root);
                 },
             }
@@ -1119,6 +1126,7 @@ pub const Context = struct {
     pub const ButtonColors = struct {
         bg: Color,
         border: Color,
+        text: Color,
     };
 
     /// Resolve button-like colors while preserving the immediate-mode interaction contract.
@@ -1131,29 +1139,54 @@ pub const Context = struct {
         held: bool,
         disabled: bool,
     ) ButtonColors {
+        return self.resolveButtonColorsWithStyle(id, base_bg, selected, held, disabled, null);
+    }
+
+    /// Resolve effective widget colors after applying an optional local override.
+    /// The animation endpoints are the effective colors, so an override cannot bypass a tween.
+    pub fn resolveButtonColorsWithStyle(
+        self: *Context,
+        id: Id,
+        base_bg: Color,
+        selected: bool,
+        held: bool,
+        disabled: bool,
+        overrides: ?WidgetStyle,
+    ) ButtonColors {
         const style = self.style;
         const hot = self.state.hot_id == id;
+        const widget = overrides orelse WidgetStyle{};
+        const normal_bg = if (selected)
+            widget.selected orelse widget.background orelse base_bg
+        else
+            widget.background orelse base_bg;
+        const hover_bg = widget.hover orelse style.surface.control_hover;
+        const active_bg = widget.active orelse style.accent.primary;
+        const normal_border = widget.border orelse style.border_tokens.normal;
+        const hover_border = widget.hover_border orelse style.border_tokens.hover;
+        const text_color = widget.text orelse style.text_tokens.primary;
         if (disabled) {
             return .{
-                .bg = style.disabledColor(base_bg),
-                .border = style.disabledColor(style.border),
+                .bg = style.disabledColor(normal_bg),
+                .border = style.disabledColor(normal_border),
+                .text = style.disabledColor(text_color),
             };
         }
 
         const immediate_bg = if (held)
-            style.bg_active
+            active_bg
         else if (hot)
-            style.bg_hover
+            hover_bg
         else
-            base_bg;
-        const immediate_border = if (hot or selected) style.border_hover else style.border;
-        if (!style.animation.enabled) return .{ .bg = immediate_bg, .border = immediate_border };
+            normal_bg;
+        const immediate_border = if (hot or selected) hover_border else normal_border;
+        if (!style.animation.enabled) return .{ .bg = immediate_bg, .border = immediate_border, .text = text_color };
 
         const hover_woken = self.animation_wake_hover == id;
         const press_woken = self.animation_wake_press == id;
         const hover_needed = hot or hover_woken;
         const press_needed = held or press_woken;
-        if (!hover_needed and !press_needed) return .{ .bg = immediate_bg, .border = immediate_border };
+        if (!hover_needed and !press_needed) return .{ .bg = immediate_bg, .border = immediate_border, .text = text_color };
 
         if (hot) self.animation_wake_hover = id;
         if (held) self.animation_wake_press = id;
@@ -1186,13 +1219,13 @@ pub const Context = struct {
             }
         }
 
-        var bg = animation_mod.mixColor(base_bg, style.bg_hover, hover_amount);
-        bg = animation_mod.mixColor(bg, style.bg_active, press_amount);
+        var bg = animation_mod.mixColor(normal_bg, hover_bg, hover_amount);
+        bg = animation_mod.mixColor(bg, active_bg, press_amount);
         const border = if (selected)
-            style.border_hover
+            hover_border
         else
-            animation_mod.mixColor(style.border, style.border_hover, hover_amount);
-        return .{ .bg = bg, .border = border };
+            animation_mod.mixColor(normal_border, hover_border, hover_amount);
+        return .{ .bg = bg, .border = border, .text = text_color };
     }
 
     fn tooltipRectEq(a: Rect, b: Rect) bool {
@@ -1244,7 +1277,7 @@ pub const Context = struct {
     /// depend on the caller buffer's lifetime. Paragraph breaks become multiple lines;
     /// paragraphs themselves are not wrapped (`overflow = .visible`).
     pub fn label(self: *Context, str: []const u8) void {
-        self.labelEx(str, self.style.text);
+        self.labelEx(str, self.style.text_tokens.primary);
     }
 
     pub fn labelEx(self: *Context, str: []const u8, col: Color) void {
@@ -1259,7 +1292,7 @@ pub const Context = struct {
     pub fn text(self: *Context, str: []const u8, opts: TextOptions) void {
         self.requireFrame("text");
         const dup = self.allocator().dupe(u8, str) catch @panic("Context.text: OOM");
-        const col = opts.color orelse self.style.text;
+        const col = opts.color orelse self.style.text_tokens.primary;
         self.addLeaf(.{ .text = .{
             .str = dup,
             .color = col,
@@ -1459,7 +1492,7 @@ pub const Context = struct {
         {
             self.draw_list.rectOutlineEx(
                 node.rect,
-                self.style.focus_ring,
+                self.style.accent.focus,
                 self.style.focus_ring_thickness,
                 .{ .radius = node.cfg.radius },
             ) catch
@@ -2482,12 +2515,12 @@ test "layout: border emits in order bg → children → border" {
     try std.testing.expectEqual(@as(u32, 100), outline.rect.w);
 }
 
-test "label: default color follows style.text" {
+test "label: default color follows the primary text token" {
     var ctx = testCtx();
     defer ctx.deinit();
 
     const red = Color.rgba(0xFF, 0x00, 0x00, 0xFF);
-    ctx.style.text = red;
+    ctx.style.text_tokens.primary = red;
     ctx.beginFrame(800, 600);
     ctx.beginBox(.{});
     ctx.label("hello");
@@ -3867,4 +3900,111 @@ test "Context: animated button colors settle through an intermediate value" {
     try std.testing.expect(!std.meta.eql(ctx.style.bg, middle.bg));
     try std.testing.expect(!std.meta.eql(ctx.style.bg_hover, middle.bg));
     try std.testing.expectEqual(ctx.style.bg_hover, settled.bg);
+}
+
+test "button style override: normal hover held selected and disabled resolve every color" {
+    var ctx = testCtx();
+    defer ctx.deinit();
+    const id: Id = 0x3098;
+    const override: WidgetStyle = .{
+        .background = Color.rgba(0x11, 0x22, 0x33, 0xFF),
+        .hover = Color.rgba(0x44, 0x55, 0x66, 0xFF),
+        .active = Color.rgba(0x77, 0x88, 0x99, 0xFF),
+        .selected = Color.rgba(0xAA, 0xBB, 0xCC, 0xFF),
+        .border = Color.rgba(0x12, 0x34, 0x56, 0xFF),
+        .hover_border = Color.rgba(0x65, 0x43, 0x21, 0xFF),
+        .text = Color.rgba(0xDE, 0xAD, 0xBE, 0xFF),
+    };
+
+    ctx.beginFrameAt(160, 80, 0);
+    ctx.state.hot_id = 0;
+    const normal = ctx.resolveButtonColorsWithStyle(id, ctx.style.surface.control, false, false, false, override);
+    ctx.endFrame();
+    try std.testing.expectEqual(override.background.?, normal.bg);
+    try std.testing.expectEqual(override.border.?, normal.border);
+    try std.testing.expectEqual(override.text.?, normal.text);
+
+    ctx.beginFrameAt(160, 80, 1);
+    ctx.state.hot_id = id;
+    const hover = ctx.resolveButtonColorsWithStyle(id, ctx.style.surface.control, false, false, false, override);
+    ctx.endFrame();
+    try std.testing.expectEqual(override.hover.?, hover.bg);
+    try std.testing.expectEqual(override.hover_border.?, hover.border);
+    try std.testing.expectEqual(override.text.?, hover.text);
+
+    ctx.beginFrameAt(160, 80, 2);
+    ctx.state.hot_id = id;
+    const held = ctx.resolveButtonColorsWithStyle(id, ctx.style.surface.control, false, true, false, override);
+    ctx.endFrame();
+    try std.testing.expectEqual(override.active.?, held.bg);
+    try std.testing.expectEqual(override.hover_border.?, held.border);
+    try std.testing.expectEqual(override.text.?, held.text);
+
+    ctx.beginFrameAt(160, 80, 3);
+    ctx.state.hot_id = 0;
+    const selected = ctx.resolveButtonColorsWithStyle(id, ctx.style.surface.control, true, false, false, override);
+    ctx.endFrame();
+    try std.testing.expectEqual(override.selected.?, selected.bg);
+    try std.testing.expectEqual(override.hover_border.?, selected.border);
+    try std.testing.expectEqual(override.text.?, selected.text);
+
+    ctx.beginFrameAt(160, 80, 4);
+    ctx.state.hot_id = id;
+    const disabled = ctx.resolveButtonColorsWithStyle(id, ctx.style.surface.control, false, false, true, override);
+    ctx.endFrame();
+    try std.testing.expectEqual(ctx.style.disabledColor(override.background.?), disabled.bg);
+    try std.testing.expectEqual(ctx.style.disabledColor(override.border.?), disabled.border);
+    try std.testing.expectEqual(ctx.style.disabledColor(override.text.?), disabled.text);
+}
+
+test "button style override: animation uses override colors as tween endpoints" {
+    var ctx = testCtx();
+    defer ctx.deinit();
+    ctx.style.animation.enabled = true;
+    const id: Id = 0x3099;
+    const override: WidgetStyle = .{
+        .background = Color.rgba(0x10, 0x20, 0x30, 0xFF),
+        .hover = Color.rgba(0x40, 0x50, 0x60, 0xFF),
+        .active = Color.rgba(0x70, 0x80, 0x90, 0xFF),
+        .border = Color.rgba(0x12, 0x23, 0x34, 0xFF),
+        .hover_border = Color.rgba(0x56, 0x67, 0x78, 0xFF),
+        .text = Color.rgba(0x9A, 0xAB, 0xBC, 0xFF),
+    };
+
+    ctx.beginFrameAt(160, 80, 0);
+    ctx.state.hot_id = 0;
+    _ = ctx.resolveButtonColorsWithStyle(id, ctx.style.surface.control, false, false, false, override);
+    ctx.endFrame();
+
+    ctx.beginFrameAt(160, 80, 0.01);
+    ctx.state.hot_id = id;
+    _ = ctx.resolveButtonColorsWithStyle(id, ctx.style.surface.control, false, false, false, override);
+    ctx.endFrame();
+
+    ctx.beginFrameAt(160, 80, 0.05);
+    ctx.state.hot_id = id;
+    const hover_middle = ctx.resolveButtonColorsWithStyle(id, ctx.style.surface.control, false, false, false, override);
+    ctx.endFrame();
+    try std.testing.expect(!std.meta.eql(override.background.?, hover_middle.bg));
+    try std.testing.expect(!std.meta.eql(override.hover.?, hover_middle.bg));
+
+    ctx.beginFrameAt(160, 80, 1.0);
+    ctx.state.hot_id = id;
+    const hover_settled = ctx.resolveButtonColorsWithStyle(id, ctx.style.surface.control, false, false, false, override);
+    ctx.endFrame();
+    try std.testing.expectEqual(override.hover.?, hover_settled.bg);
+    try std.testing.expectEqual(override.hover_border.?, hover_settled.border);
+
+    ctx.beginFrameAt(160, 80, 1.05);
+    ctx.state.hot_id = id;
+    _ = ctx.resolveButtonColorsWithStyle(id, ctx.style.surface.control, false, true, false, override);
+    ctx.endFrame();
+
+    ctx.beginFrameAt(160, 80, 2.0);
+    ctx.state.hot_id = id;
+    const press_settled = ctx.resolveButtonColorsWithStyle(id, ctx.style.surface.control, false, true, false, override);
+    ctx.endFrame();
+    try std.testing.expectEqual(override.active.?, press_settled.bg);
+    try std.testing.expectEqual(override.hover_border.?, press_settled.border);
+    try std.testing.expectEqual(override.text.?, press_settled.text);
 }

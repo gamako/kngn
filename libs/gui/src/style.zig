@@ -28,7 +28,65 @@ pub const AnimationStyle = struct {
     press_tau_s: f32 = 0.06,
 };
 
+pub const SurfaceTokens = struct {
+    canvas: Color,
+    panel: Color,
+    raised: Color,
+    elevated: Color,
+    control: Color,
+    control_hover: Color,
+    input: Color,
+    control_subtle: Color,
+    success: Color,
+    info: Color,
+    warning: Color,
+    danger_subtle: Color,
+    danger: Color,
+    danger_strong: Color,
+};
+
+pub const AccentTokens = struct {
+    primary: Color,
+    selected: Color,
+    selection: Color,
+    danger: Color,
+    focus: Color,
+};
+
+pub const BorderTokens = struct {
+    normal: Color,
+    hover: Color,
+};
+
+pub const TextTokens = struct {
+    primary: Color,
+    subtle: Color,
+};
+
+pub const ElevationTokens = struct {
+    shadow: Color,
+};
+
+/// Partial color override for button-like widgets. A null field keeps the active theme token.
+/// Disabled colors are always derived from the effective override, never stored separately.
+pub const WidgetStyle = struct {
+    background: ?Color = null,
+    hover: ?Color = null,
+    active: ?Color = null,
+    selected: ?Color = null,
+    border: ?Color = null,
+    hover_border: ?Color = null,
+    text: ?Color = null,
+};
+
 pub const Style = struct {
+    /// Meaning-based colors. The legacy flat fields below mirror these values for source-level
+    /// consumers that still draw directly with the public Style object.
+    surface: SurfaceTokens,
+    accent: AccentTokens,
+    border_tokens: BorderTokens,
+    text_tokens: TextTokens,
+    elevation: ElevationTokens,
     /// Time-based button and tab color transitions. Disabled by default.
     animation: AnimationStyle = .{},
     /// Normal fill for button etc.
@@ -115,19 +173,19 @@ pub const Style = struct {
         // ITU-R BT.601 luma weights (fixed-point, /256), same rounding shape as pixelops' div255.
         const y: u32 = (77 * @as(u32, base.r) + 150 * @as(u32, base.g) + 29 * @as(u32, base.b) + 128) / 256;
         return Color.rgba(
-            @intCast((y + self.bg.r) / 2),
-            @intCast((y + self.bg.g) / 2),
-            @intCast((y + self.bg.b) / 2),
+            @intCast((y + self.surface.control.r) / 2),
+            @intCast((y + self.surface.control.g) / 2),
+            @intCast((y + self.surface.control.b) / 2),
             0xFF,
         );
     }
 
-    /// `text_subtle` blended halfway toward `bg` (same surface, quieter than caption).
+    /// `text_tokens.subtle` blended halfway toward `surface.control`.
     pub fn mutedFromSubtle(self: Style) Color {
         return Color.rgba(
-            @intCast((@as(u16, self.text_subtle.r) + self.bg.r) / 2),
-            @intCast((@as(u16, self.text_subtle.g) + self.bg.g) / 2),
-            @intCast((@as(u16, self.text_subtle.b) + self.bg.b) / 2),
+            @intCast((@as(u16, self.text_tokens.subtle.r) + self.surface.control.r) / 2),
+            @intCast((@as(u16, self.text_tokens.subtle.g) + self.surface.control.g) / 2),
+            @intCast((@as(u16, self.text_tokens.subtle.b) + self.surface.control.b) / 2),
             0xFF,
         );
     }
@@ -142,27 +200,106 @@ pub const Style = struct {
     }
 };
 
-/// Dark theme in the example 09/10 family. text is white (same as earlier label default).
-pub fn defaultStyle() Style {
-    const text = Color.rgba(0xFF, 0xFF, 0xFF, 0xFF);
-    const text_subtle = Color.rgba(0x90, 0x98, 0xA0, 0xFF);
-    const bg = Color.rgba(0x38, 0x38, 0x40, 0xFF);
+fn styleForTokens(
+    surface: SurfaceTokens,
+    accent: AccentTokens,
+    border_tokens: BorderTokens,
+    text_tokens: TextTokens,
+    elevation: ElevationTokens,
+) Style {
     var s: Style = .{
-        .bg = bg,
-        .bg_hover = Color.rgba(0x50, 0x50, 0x60, 0xFF),
-        .bg_active = Color.rgba(0x30, 0x60, 0xC0, 0xFF),
-        .border = Color.rgba(0x60, 0x60, 0x6C, 0xFF),
-        .border_hover = Color.rgba(0xA0, 0xA0, 0xB0, 0xFF),
-        .text = text,
-        .text_subtle = text_subtle,
-        .control_radius = 6,
-        .checkbox_radius = 4,
-        .heading = .{ .color = text, .size = 20, .weight = 700 },
-        .body = .{ .color = text, .size = 16, .weight = 400 },
-        .caption = .{ .color = text_subtle, .size = 13, .weight = 400 },
+        .surface = surface,
+        .accent = accent,
+        .border_tokens = border_tokens,
+        .text_tokens = text_tokens,
+        .elevation = elevation,
+        .bg = surface.control,
+        .bg_hover = surface.control_hover,
+        .bg_active = accent.primary,
+        .border = border_tokens.normal,
+        .border_hover = border_tokens.hover,
+        .text = text_tokens.primary,
+        .text_subtle = text_tokens.subtle,
+        .input_background = surface.input,
+        .selection_background = accent.selection,
+        .caret = text_tokens.primary,
+        .focus_ring = accent.focus,
+        .button_bg_selected = accent.selected,
+        .slider_track_bg = surface.control_subtle,
+        .slider_knob_bg = text_tokens.subtle,
+        .slider_knob_active_bg = accent.primary,
+        .picker_marker_light = text_tokens.primary,
+        .picker_marker_dark = Color.rgba(0x00, 0x00, 0x00, 0xFF),
+        .heading = .{ .color = text_tokens.primary, .size = 20, .weight = 700 },
+        .body = .{ .color = text_tokens.primary, .size = 16, .weight = 400 },
+        .caption = .{ .color = text_tokens.subtle, .size = 13, .weight = 400 },
     };
     s.muted = .{ .color = s.mutedFromSubtle(), .size = 12, .weight = 400 };
     return s;
+}
+
+/// Canonical dark theme. Every legacy flat color is derived from the semantic values here.
+pub fn defaultStyle() Style {
+    return styleForTokens(
+        .{
+            .canvas = Color.rgba(0x18, 0x1C, 0x24, 0xFF),
+            .panel = Color.rgba(0x20, 0x24, 0x2C, 0xFF),
+            .raised = Color.rgba(0x28, 0x30, 0x3C, 0xFF),
+            .elevated = Color.rgba(0x30, 0x38, 0x48, 0xFF),
+            .control = Color.rgba(0x38, 0x38, 0x40, 0xFF),
+            .control_hover = Color.rgba(0x50, 0x50, 0x60, 0xFF),
+            .input = Color.rgba(0x24, 0x24, 0x2C, 0xFF),
+            .control_subtle = Color.rgba(0x30, 0x30, 0x38, 0xFF),
+            .success = Color.rgba(0x28, 0x40, 0x38, 0xFF),
+            .info = Color.rgba(0x18, 0x28, 0x38, 0xFF),
+            .warning = Color.rgba(0x38, 0x38, 0x30, 0xFF),
+            .danger_subtle = Color.rgba(0x30, 0x24, 0x2C, 0xFF),
+            .danger = Color.rgba(0x40, 0x30, 0x38, 0xFF),
+            .danger_strong = Color.rgba(0x50, 0x20, 0x20, 0xFF),
+        },
+        .{
+            .primary = Color.rgba(0x30, 0x60, 0xC0, 0xFF),
+            .selected = Color.rgba(0x24, 0x48, 0x7A, 0xFF),
+            .selection = Color.rgba(0x30, 0x60, 0xC0, 0xFF),
+            .danger = Color.rgba(0xC0, 0x30, 0x30, 0xFF),
+            .focus = Color.rgba(0x7A, 0xB8, 0xFF, 0xFF),
+        },
+        .{ .normal = Color.rgba(0x60, 0x60, 0x6C, 0xFF), .hover = Color.rgba(0xA0, 0xA0, 0xB0, 0xFF) },
+        .{ .primary = Color.rgba(0xFF, 0xFF, 0xFF, 0xFF), .subtle = Color.rgba(0x90, 0x98, 0xA0, 0xFF) },
+        .{ .shadow = Color.rgba(0x00, 0x00, 0x00, 0xB0) },
+    );
+}
+
+/// Light theme with the same dimensions, text tiers, and animation defaults as dark.
+pub fn lightStyle() Style {
+    return styleForTokens(
+        .{
+            .canvas = Color.rgba(0xF5, 0xF7, 0xFA, 0xFF),
+            .panel = Color.rgba(0xFF, 0xFF, 0xFF, 0xFF),
+            .raised = Color.rgba(0xEE, 0xF2, 0xF7, 0xFF),
+            .elevated = Color.rgba(0xE2, 0xE8, 0xF0, 0xFF),
+            .control = Color.rgba(0xE8, 0xED, 0xF3, 0xFF),
+            .control_hover = Color.rgba(0xD7, 0xE0, 0xEB, 0xFF),
+            .input = Color.rgba(0xFF, 0xFF, 0xFF, 0xFF),
+            .control_subtle = Color.rgba(0xC7, 0xD0, 0xDC, 0xFF),
+            .success = Color.rgba(0xDC, 0xFC, 0xE7, 0xFF),
+            .info = Color.rgba(0xDB, 0xEA, 0xFE, 0xFF),
+            .warning = Color.rgba(0xFE, 0xF3, 0xC7, 0xFF),
+            .danger_subtle = Color.rgba(0xFE, 0xE2, 0xE2, 0xFF),
+            .danger = Color.rgba(0xC0, 0x39, 0x2B, 0xFF),
+            .danger_strong = Color.rgba(0x99, 0x1B, 0x1B, 0xFF),
+        },
+        .{
+            .primary = Color.rgba(0x25, 0x63, 0xEB, 0xFF),
+            .selected = Color.rgba(0x1D, 0x4E, 0xD8, 0xFF),
+            .selection = Color.rgba(0xBB, 0xD3, 0xFF, 0xFF),
+            .danger = Color.rgba(0xC0, 0x39, 0x2B, 0xFF),
+            .focus = Color.rgba(0x25, 0x63, 0xEB, 0xFF),
+        },
+        .{ .normal = Color.rgba(0xAA, 0xB6, 0xC6, 0xFF), .hover = Color.rgba(0x63, 0x73, 0x8A, 0xFF) },
+        .{ .primary = Color.rgba(0x17, 0x20, 0x33, 0xFF), .subtle = Color.rgba(0x52, 0x61, 0x76, 0xFF) },
+        .{ .shadow = Color.rgba(0x00, 0x00, 0x00, 0x38) },
+    );
 }
 
 // ============================================================
@@ -254,4 +391,80 @@ test "defaultStyle: widget radii use the compact control defaults" {
     const s = defaultStyle();
     try std.testing.expectEqual(@as(u32, 6), s.control_radius);
     try std.testing.expectEqual(@as(u32, 4), s.checkbox_radius);
+}
+
+test "defaultStyle: semantic dark tokens preserve every canonical surface color" {
+    const s = defaultStyle();
+    try std.testing.expectEqual(Color.rgba(0x18, 0x1C, 0x24, 0xFF), s.surface.canvas);
+    try std.testing.expectEqual(Color.rgba(0x20, 0x24, 0x2C, 0xFF), s.surface.panel);
+    try std.testing.expectEqual(Color.rgba(0x28, 0x30, 0x3C, 0xFF), s.surface.raised);
+    try std.testing.expectEqual(Color.rgba(0x30, 0x38, 0x48, 0xFF), s.surface.elevated);
+    try std.testing.expectEqual(Color.rgba(0x38, 0x38, 0x40, 0xFF), s.surface.control);
+    try std.testing.expectEqual(Color.rgba(0x50, 0x50, 0x60, 0xFF), s.surface.control_hover);
+    try std.testing.expectEqual(Color.rgba(0x24, 0x24, 0x2C, 0xFF), s.surface.input);
+    try std.testing.expectEqual(Color.rgba(0x30, 0x30, 0x38, 0xFF), s.surface.control_subtle);
+    try std.testing.expectEqual(Color.rgba(0x28, 0x40, 0x38, 0xFF), s.surface.success);
+    try std.testing.expectEqual(Color.rgba(0x18, 0x28, 0x38, 0xFF), s.surface.info);
+    try std.testing.expectEqual(Color.rgba(0x38, 0x38, 0x30, 0xFF), s.surface.warning);
+    try std.testing.expectEqual(Color.rgba(0x30, 0x24, 0x2C, 0xFF), s.surface.danger_subtle);
+    try std.testing.expectEqual(Color.rgba(0x40, 0x30, 0x38, 0xFF), s.surface.danger);
+    try std.testing.expectEqual(Color.rgba(0x50, 0x20, 0x20, 0xFF), s.surface.danger_strong);
+}
+
+test "defaultStyle: semantic dark accent border text and elevation tokens are exact" {
+    const s = defaultStyle();
+    try std.testing.expectEqual(Color.rgba(0x30, 0x60, 0xC0, 0xFF), s.accent.primary);
+    try std.testing.expectEqual(Color.rgba(0x24, 0x48, 0x7A, 0xFF), s.accent.selected);
+    try std.testing.expectEqual(Color.rgba(0x30, 0x60, 0xC0, 0xFF), s.accent.selection);
+    try std.testing.expectEqual(Color.rgba(0xC0, 0x30, 0x30, 0xFF), s.accent.danger);
+    try std.testing.expectEqual(Color.rgba(0x7A, 0xB8, 0xFF, 0xFF), s.accent.focus);
+    try std.testing.expectEqual(Color.rgba(0x60, 0x60, 0x6C, 0xFF), s.border_tokens.normal);
+    try std.testing.expectEqual(Color.rgba(0xA0, 0xA0, 0xB0, 0xFF), s.border_tokens.hover);
+    try std.testing.expectEqual(Color.rgba(0xFF, 0xFF, 0xFF, 0xFF), s.text_tokens.primary);
+    try std.testing.expectEqual(Color.rgba(0x90, 0x98, 0xA0, 0xFF), s.text_tokens.subtle);
+    try std.testing.expectEqual(Color.rgba(0x00, 0x00, 0x00, 0xB0), s.elevation.shadow);
+    try std.testing.expectEqual(Color.rgba(0x24, 0x24, 0x2C, 0xFF), s.input_background);
+    try std.testing.expectEqual(Color.rgba(0x30, 0x60, 0xC0, 0xFF), s.selection_background);
+    try std.testing.expectEqual(Color.rgba(0x30, 0x30, 0x38, 0xFF), s.slider_track_bg);
+    try std.testing.expectEqual(Color.rgba(0x90, 0x98, 0xA0, 0xFF), s.slider_knob_bg);
+    try std.testing.expectEqual(Color.rgba(0x30, 0x60, 0xC0, 0xFF), s.slider_knob_active_bg);
+    try std.testing.expectEqual(Color.rgba(0x7A, 0xB8, 0xFF, 0xFF), s.focus_ring);
+    try std.testing.expectEqual(Color.rgba(0x24, 0x48, 0x7A, 0xFF), s.button_bg_selected);
+}
+
+test "lightStyle: values and derived colors are theme-local" {
+    const s = lightStyle();
+    try std.testing.expectEqual(Color.rgba(0xF5, 0xF7, 0xFA, 0xFF), s.surface.canvas);
+    try std.testing.expectEqual(Color.rgba(0xFF, 0xFF, 0xFF, 0xFF), s.surface.panel);
+    try std.testing.expectEqual(Color.rgba(0xEE, 0xF2, 0xF7, 0xFF), s.surface.raised);
+    try std.testing.expectEqual(Color.rgba(0xE2, 0xE8, 0xF0, 0xFF), s.surface.elevated);
+    try std.testing.expectEqual(Color.rgba(0xE8, 0xED, 0xF3, 0xFF), s.surface.control);
+    try std.testing.expectEqual(Color.rgba(0xD7, 0xE0, 0xEB, 0xFF), s.surface.control_hover);
+    try std.testing.expectEqual(Color.rgba(0xFF, 0xFF, 0xFF, 0xFF), s.surface.input);
+    try std.testing.expectEqual(Color.rgba(0xC7, 0xD0, 0xDC, 0xFF), s.surface.control_subtle);
+    try std.testing.expectEqual(Color.rgba(0x25, 0x63, 0xEB, 0xFF), s.accent.primary);
+    try std.testing.expectEqual(Color.rgba(0x1D, 0x4E, 0xD8, 0xFF), s.accent.selected);
+    try std.testing.expectEqual(Color.rgba(0xBB, 0xD3, 0xFF, 0xFF), s.accent.selection);
+    try std.testing.expectEqual(Color.rgba(0xAA, 0xB6, 0xC6, 0xFF), s.border_tokens.normal);
+    try std.testing.expectEqual(Color.rgba(0x63, 0x73, 0x8A, 0xFF), s.border_tokens.hover);
+    try std.testing.expectEqual(Color.rgba(0x17, 0x20, 0x33, 0xFF), s.text_tokens.primary);
+    try std.testing.expectEqual(Color.rgba(0x52, 0x61, 0x76, 0xFF), s.text_tokens.subtle);
+    try std.testing.expectEqual(Color.rgba(0x25, 0x63, 0xEB, 0xFF), s.accent.focus);
+    try std.testing.expectEqual(Color.rgba(0xC0, 0x39, 0x2B, 0xFF), s.accent.danger);
+    try std.testing.expectEqual(Color.rgba(0x00, 0x00, 0x00, 0x38), s.elevation.shadow);
+    try std.testing.expectEqual(Color.rgba(0xEA, 0xEC, 0xEF, 0xFF), s.disabledColor(s.surface.control));
+    try std.testing.expectEqual(Color.rgba(0x9D, 0xA7, 0xB4, 0xFF), s.mutedFromSubtle());
+    try std.testing.expectEqual(s.text_tokens.primary, s.heading.color);
+    try std.testing.expectEqual(s.text_tokens.subtle, s.caption.color);
+}
+
+test "WidgetStyle: every override is optional" {
+    const empty: WidgetStyle = .{};
+    try std.testing.expect(empty.background == null);
+    try std.testing.expect(empty.hover == null);
+    try std.testing.expect(empty.active == null);
+    try std.testing.expect(empty.selected == null);
+    try std.testing.expect(empty.border == null);
+    try std.testing.expect(empty.hover_border == null);
+    try std.testing.expect(empty.text == null);
 }
