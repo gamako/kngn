@@ -185,6 +185,221 @@ smooth edge. Do not implement one in terms of the other: a Bresenham
 span and an analytic coverage stroke do not agree on pixels, and
 replacing the widget path would change every existing UI frame.
 
+## 4b. GUI visual expression
+
+The GUI's visual defaults and low-level drawing APIs are public through `kit.gui`. The runnable
+reference for the examples in this section is [`examples/46_style_gallery/`](../examples/46_style_gallery/);
+use its `main.zig` as the working copy source when you need a complete arrangement of these calls.
+
+### The default look
+
+`gui.default_font` is a lazy, anti-aliased, proportional Noto Sans JP variable outline family. It
+covers Japanese text without application-side font setup. `Context.init` recognises this default family, so
+`labelStyled` can resolve a tier's size and weight:
+
+```zig
+var ctx = gui.Context.init(gpa, gui.default_font);
+ctx.labelStyled("GUI Style Showcase", .heading);
+```
+
+The default text tiers are:
+
+| Tier | Size | Weight |
+|---|---:|---:|
+| `heading` | 20 px | 700 |
+| `body` | 16 px | 400 |
+| `caption` | 13 px | 400 |
+| `muted` | 12 px | 400 |
+
+The font is a URL package with a pinned content hash, fetched at build time. The first build
+therefore needs network access unless the package is already in Zig's global cache. To prefetch the
+font package, use the Zig package manager directly, or fetch all dependencies named by a manifest
+with the build fetch option:
+
+```bash
+zig fetch https://github.com/notofonts/noto-cjk/releases/download/Sans2.004/02_NotoSansCJK-TTF-VF.zip
+zig build --fetch
+```
+
+Subsequent builds reuse the global cache. `gui.default_bitmap_font` remains available as an
+explicit fixed 8x16 bitmap option for callers that need pixel-stable ASCII rendering. See the
+font section of [`libs/gui/README.md`](../libs/gui/README.md) and the font behaviour in
+[`examples/46_style_gallery/main.zig`](../examples/46_style_gallery/main.zig).
+
+### Rounded rectangles and circles
+
+`DrawList.rectFilled` and `rectOutline` are the sharp calls. The extended rectangle calls accept a
+uniform logical radius; circles take a center, radius, colour, and circle options:
+
+```zig
+try draw_list.rectFilledEx(rect, color, .{ .radius = 8 });
+try draw_list.rectOutlineEx(rect, color, 2, .{ .radius = 8 });
+try draw_list.circleFilled(.{ .x = 80, .y = 64 }, 16, color, .{});
+try draw_list.circleOutline(.{ .x = 128, .y = 64 }, 16, color, 3, .{});
+```
+
+`radius = 0` uses the same sharp drawing route as the existing filled and outline rectangle
+calls. Anti-aliasing is enabled by default; pass `.aa = false` in `RoundedRectOptions` or
+`CircleOptions` when a thresholded edge is wanted. The rounded masks are retained by the
+`DrawList` across `reset`. The rounded section of [`examples/46_style_gallery/main.zig`](../examples/46_style_gallery/main.zig)
+shows zero-radius, rounded, outlined, and circular variants together.
+
+### Gradients
+
+`Paint` is a tagged union with `solid`, `linear`, and `radial` cases. `rectFilledPaint` accepts a
+paint, and `rectFilledPaintEx` combines a paint with rounded-rectangle options:
+
+```zig
+const solid: gui.Paint = .{ .solid = color };
+const linear: gui.Paint = .{ .linear = .{
+    .start = .{ .x = 0, .y = 0 },
+    .end = .{ .x = 160, .y = 0 },
+    .start_color = blue,
+    .end_color = cyan,
+} };
+const radial: gui.Paint = .{ .radial = .{
+    .center = .{ .x = 80, .y = 40 },
+    .radius = 80,
+    .inner_color = white,
+    .outer_color = blue,
+} };
+try draw_list.rectFilledPaint(rect, solid);
+try draw_list.rectFilledPaint(rect, linear);
+try draw_list.rectFilledPaintEx(rect, radial, .{ .radius = 24 });
+```
+
+The ordinary `rectFilled` and `rectFilledEx` calls are solid-paint wrappers, so solid paint is
+the default and existing solid drawing does not change. The gradient section of
+[`examples/46_style_gallery/main.zig`](../examples/46_style_gallery/main.zig) is a complete
+linear/radial paint arrangement.
+
+### Shadows
+
+Add a shadow as an independent `DrawList` command before drawing the panel over it:
+
+```zig
+try draw_list.shadow(panel_rect, gui.Color.rgba(0, 0, 0, 0xB0), .{
+    .radius = 12,
+    .blur = 8,
+    .offset = .{ .x = 4, .y = 6 },
+});
+```
+
+`ShadowOptions.radius` and `.blur` are logical pixels; `.offset` is applied after physicalisation.
+Shadow masks are cached by `DrawList`, so a warm frame does not rerun the blur calculation every
+frame. The shadow section of [`examples/46_style_gallery/main.zig`](../examples/46_style_gallery/main.zig)
+shows the option combinations.
+
+### Modal dialogs
+
+Dialogs use the same popup mechanism as existing popups: opening a dialog takes the modal slot,
+absorbs background interaction, and drawing/hit-testing happens through the post-`endFrame`
+overlay call. `DialogOptions` carries the title, body, actions, width, and Escape policy:
+
+```zig
+const DIALOG_ACTIONS = [_]gui.DialogAction{
+    .{ .label = "Cancel" },
+    .{ .label = "Continue" },
+};
+
+ctx.openDialog(0xD1, .{
+    .title = "Confirm",
+    .body = "Continue with this operation?",
+    .actions = &DIALOG_ACTIONS,
+});
+
+ctx.endFrame();
+const result = ctx.dialog(0xD1);
+if (result.selected) |index| {
+    _ = index;
+}
+if (result.dismissed) {
+    // Escape, when enabled, reports a dismissal and closes the dialog.
+}
+```
+
+Call `openDialogAt` when the position should be supplied explicitly; `openDialog` centres the
+dialog. `dismiss_on_escape` defaults to `true`. While the dialog is open, Tab and Shift+Tab
+cycle through enabled actions, and Enter or Space activates the focused action. The returned
+`DialogResult` reports `open`, the selected action index, or `dismissed`. The popup/dialog API is
+also re-exported as `openDialogStacked` and `dialogStacked` for the stacked popup channel.
+
+### Animation (opt-in)
+
+Animation is disabled by default. Enable it on the active style to fade button and tab colours
+between normal, hover, and press states:
+
+```zig
+ctx.style.animation.enabled = true;
+```
+
+`hover_tau_s` and `press_tau_s` control the transition timing. The per-widget transitions use
+the context's deterministic frame time, so replay and harness-driven verification remain
+deterministic. The style gallery enables the option during setup; applications that need static
+frames can leave it off.
+
+### Themes and overrides
+
+`Context.style` is one complete `Style` value. Replace it as a unit for a theme change:
+
+```zig
+ctx.style = gui.lightStyle();
+ctx.style = gui.defaultStyle();
+```
+
+The style contains semantic colour tokens (`surface`, `accent`, `border_tokens`, `text_tokens`,
+and `elevation`), spacing tokens under `style.spacing`, text tiers, dimensions, radii, and
+animation settings. A widget can override only the colours it needs with `WidgetStyle`; unset
+fields keep the active theme token:
+
+```zig
+_ = ctx.buttonEx("Delete", .{
+    .style = .{
+        .background = gui.Color.rgba(0x60, 0x20, 0x20, 0xFF),
+        .hover = gui.Color.rgba(0x90, 0x30, 0x30, 0xFF),
+        .text = gui.Color.rgba(0xFF, 0xFF, 0xFF, 0xFF),
+    },
+});
+```
+
+`ButtonOpts`, `TabOpts`, `CheckboxOpts`, `ToggleOpts`, and `RadioOpts` accept this partial
+override. The style gallery switches between `lightStyle()` and `defaultStyle()` and keeps the
+animation setting explicit.
+
+### Verifying your own app's layout
+
+The opt-in `layout_sanity` probe reports structural layout problems without changing the draw
+list or framebuffer. Register it after creating the context and before entering the main loop:
+
+```zig
+ctx.setLayoutSanityEnabled(kit.layout_sanity.isEnabled());
+platform.registerProbe(.{
+    .name = gui.layout_sanity_probe_name,
+    .ctx = &ctx.layout_sanity_result,
+    .ext = "txt",
+    .digest = gui.layoutSanityDigest,
+    .desc = "GUI layout overflow and overlap counters",
+});
+```
+
+With the harness running, `digest layout_sanity` returns a line such as:
+
+```text
+enabled=1 scanned=1 text_overflow=0 sibling_overlap=0 content_overflow=0 total=0
+```
+
+`text_overflow` counts visible text whose logical advance or ink height leaves its leaf rectangle;
+`sibling_overlap` counts positive-area overlap between direct flow siblings; and
+`content_overflow` counts ordinary flow content plus padding exceeding its parent rectangle.
+Ellipsis, clipping, scrolling, anchored overlays, and explicit min/max constraints are treated as
+intentional boundaries. `total` is the sum of the three counters, so `total=0` is the normal
+healthy layout result. Popups, dialogs, and tooltips are outside this probe's normal-layout root.
+
+Set `KNGN_LAYOUT_SANITY=1` to force the scan on or `KNGN_LAYOUT_SANITY=0` to force it off. With
+the setting unset, it follows harness enablement. The registration and the `layout_sanity`
+checkpoint in [`examples/46_style_gallery/e2e.txt`](../examples/46_style_gallery/e2e.txt) are the
+copyable reference for an application's own layout checks.
+
 ## 5. Native build
 
 - `.path` (or fetch) dependency on kngn with matching `target` / `optimize` / `platform`
