@@ -3,6 +3,8 @@
 # expect values baked from a 2026-07-17 headless replay
 step 4
 digest state
+digest layout_sanity
+expect layout_sanity total=0
 expect state case=ids_popup
 expect state button_count=100
 expect state same_label_independent=1

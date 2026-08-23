@@ -3,6 +3,8 @@
 # Coords measured with unshifted pad_top=12 (slider knob @ value0)
 step 4
 digest layout
+digest layout_sanity
+expect layout_sanity total=0
 expect layout case=input_state
 expect layout slider_x=59
 expect layout slider_y=56

@@ -552,6 +552,14 @@ pub fn main(init: std.process.Init) !void {
 
     var ctx = gui.Context.init(gpa, gui.default_font);
     defer ctx.deinit();
+    ctx.setLayoutSanityEnabled(kit.layout_sanity.isEnabled());
+    platform.registerProbe(.{
+        .name = gui.layout_sanity_probe_name,
+        .ctx = &ctx.layout_sanity_result,
+        .ext = "txt",
+        .digest = gui.layoutSanityDigest,
+        .desc = "GUI layout overflow and overlap counters",
+    });
     ctx.style.animation.enabled = true;
     var text = try gui.TextBuffer.init(gpa, "edit me");
     defer text.deinit();

@@ -3,6 +3,8 @@
 step 4
 digest state
 digest layout
+digest layout_sanity
+expect layout_sanity total=0
 expect state case=volume
 expect state row_count=500
 expect state constructed_rows=500

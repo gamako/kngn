@@ -8,8 +8,9 @@
 //! - No all-pixel loop, full framebuffer copy, custom rasterizer, or RT path is added.
 
 const std = @import("std");
-const platform = @import("platform");
-const gui = @import("gui");
+const kit = @import("kit");
+const platform = kit.platform;
+const gui = kit.gui;
 
 const DEFAULT_W: u32 = 1024;
 const DEFAULT_H: u32 = 768;
@@ -799,6 +800,14 @@ pub fn main(init: std.process.Init) !void {
 
     var ctx = gui.Context.init(gpa, gui.default_font);
     defer ctx.deinit();
+    ctx.setLayoutSanityEnabled(kit.layout_sanity.isEnabled());
+    platform.registerProbe(.{
+        .name = gui.layout_sanity_probe_name,
+        .ctx = &ctx.layout_sanity_result,
+        .ext = "txt",
+        .digest = gui.layoutSanityDigest,
+        .desc = "GUI layout overflow and overlap counters",
+    });
 
     var zero_text = try gui.TextBuffer.init(gpa, "");
     defer zero_text.deinit();

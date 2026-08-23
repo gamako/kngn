@@ -3,6 +3,10 @@
 # expect values baked from a 2026-07-17 headless replay
 step 3
 digest state
+digest layout_sanity
+expect layout_sanity text_overflow=0
+expect layout_sanity sibling_overlap=0
+expect layout_sanity content_overflow=2
 expect state case=text
 expect state text_empty=1
 expect state text_bytes=0
@@ -11,8 +15,8 @@ expect state utf8_boundary=1
 expect state popup_text_bytes=500
 snapshot fb
 
-# focus empty text input (text_input y=192)
-inject mouse_move 100 200
+# focus empty text input (text_input y=315)
+inject mouse_move 100 320
 step 2
 inject mouse_down left
 inject mouse_up left
@@ -74,7 +78,7 @@ expect state utf8_boundary=1
 snapshot fb
 
 # open text popup with 500-codepoint item (separate frames for down/up)
-inject mouse_move 80 230
+inject mouse_move 80 360
 step 2
 inject mouse_down left
 step 1

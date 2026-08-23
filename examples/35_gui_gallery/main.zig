@@ -9,8 +9,9 @@
 //! - SV square / hue bar / stepgrid draw and the fixed gradient buffer are delegated to libs/gui.
 
 const std = @import("std");
-const platform = @import("platform");
-const gui = @import("gui");
+const kit = @import("kit");
+const platform = kit.platform;
+const gui = kit.gui;
 
 const WINDOW_W: u32 = 1024;
 const WINDOW_H: u32 = 640;
@@ -439,14 +440,14 @@ fn renderOverview(ctx: *gui.Context) void {
     ctx.label("Use PAGE_DOWN / PAGE_UP (or N / P) to cycle sections.");
     ctx.label("Current implementation is normal + endpoint focused; demo cells are exercised by E2E.");
     ctx.beginBox(.{ .direction = .row, .gap = 12 });
-    ctx.beginBox(.{ .width = .{ .fixed = 270 }, .bg = ctx.style.surface.panel, .padding = .{ 8, 8, 8, 8 } });
+    ctx.beginBox(.{ .width = .fit, .bg = ctx.style.surface.panel, .padding = .{ 8, 8, 8, 8 } });
     var api_buf: [48]u8 = undefined;
     ctx.label(std.fmt.bufPrint(&api_buf, "Existing API: {d} semantic widgets", .{semanticWidgetTotal()}) catch "Existing API: ?");
     var miss_buf: [40]u8 = undefined;
     ctx.label(std.fmt.bufPrint(&miss_buf, "Missing placeholders: {d}", .{MISSING.len}) catch "Missing placeholders: ?");
     ctx.label("Context: normal / demo / gaps");
     ctx.endBox();
-    ctx.beginBox(.{ .width = .{ .fixed = 270 }, .bg = ctx.style.surface.panel, .padding = .{ 8, 8, 8, 8 } });
+    ctx.beginBox(.{ .width = .fit, .bg = ctx.style.surface.panel, .padding = .{ 8, 8, 8, 8 } });
     ctx.label("APG × ImGui × libs/gui");
     ctx.label("Capability gaps are noted in the overview");
     ctx.label("abnormal cases live in the torture example");
@@ -522,7 +523,7 @@ fn renderColor(ctx: *gui.Context, app: *App) void {
     _ = ctx.hueBarId(Ids.hue, &app.hue, .{ .w = 16, .h = 96 });
     ctx.imageBox(Ids.image, &image_pixels, 8, 8, .{ .border = gui.Color.rgba(0xFF, 0xFF, 0xFF, 0xFF) });
     ctx.endBox();
-    ctx.label("HSV controls use libs/gui gradient buffers; gallery adds no rasterizer.");
+    ctx.text("HSV controls use libs/gui gradient buffers; gallery adds no rasterizer.", .{ .wrap = true });
 }
 
 fn itemTooltip(ptr: *anyopaque, ctx: *gui.Context) void {
@@ -827,6 +828,14 @@ pub fn main(init: std.process.Init) !void {
     defer window.destroy();
     var ctx = gui.Context.init(gpa, gui.default_font);
     defer ctx.deinit();
+    ctx.setLayoutSanityEnabled(kit.layout_sanity.isEnabled());
+    platform.registerProbe(.{
+        .name = gui.layout_sanity_probe_name,
+        .ctx = &ctx.layout_sanity_result,
+        .ext = "txt",
+        .digest = gui.layoutSanityDigest,
+        .desc = "GUI layout overflow and overlap counters",
+    });
     var text = try gui.TextBuffer.init(gpa, "edit me");
     defer text.deinit();
     var app: App = .{ .ctx = &ctx, .text = &text };

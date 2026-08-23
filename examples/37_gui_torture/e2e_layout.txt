@@ -2,6 +2,10 @@
 # expect values baked from a 2026-07-18 headless replay (inner-priority scroll)
 step 3
 digest layout
+digest layout_sanity
+expect layout_sanity text_overflow=0
+expect layout_sanity sibling_overlap=0
+expect layout_sanity content_overflow=7
 expect layout case=layout
 expect layout screen_w=1024
 expect layout screen_h=768

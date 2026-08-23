@@ -171,6 +171,51 @@ built-in. Currently:
 **The framework does not interpret the contents of a custom probe** (it only routes
 raw bytes and a one-line digest).
 
+### Layout sanity observability (`layout_sanity`)
+
+GUI applications may register the `layout_sanity` probe to report structural layout
+problems without changing rendering. Its digest is:
+
+```text
+enabled=1 scanned=1 text_overflow=0 sibling_overlap=0 content_overflow=0 total=0
+```
+
+The counters have these meanings:
+
+- `text_overflow` counts a text leaf whose emitted lines' logical advance width or
+  ink height extends beyond that leaf's rectangle. The probe checks each placed line,
+  so correctly wrapped text is not an overflow. Only visible text is counted;
+  ellipsis, an ancestor `clip_children`, and a scroll viewport are excluded.
+- `sibling_overlap` counts positive-area intersections between direct flow children of
+  one parent. The children are ordered by x coordinate and checked with a sweep; an
+  anchored child is not a flow sibling for this purpose.
+- `content_overflow` counts a non-leaf whose flow content extent plus padding exceeds
+  its rectangle. Anchored children do not contribute to that extent. A clipping box,
+  a scrolled viewport, and an explicit min/max constraint are intentional boundaries
+  and are excluded.
+
+The scan starts at the normal layout root after layout and before detached popup,
+dialog, and tooltip layers are emitted. Those retained layers are therefore outside
+the probe's ownership boundary. There are no widget-specific exceptions.
+
+`KNGN_LAYOUT_SANITY=1` forces the probe on and `=0` forces it off. Unset or unknown
+values follow the harness state, like the other opt-in instrumentation. When disabled,
+the digest reports `enabled=0 scanned=0` and the frame performs no tree walk, scratch
+allocation, or font measurement. When enabled, one layout-tree walk runs per frame;
+the sibling check uses an x-sweep rather than comparing x-disjoint pairs.
+
+For example, a replay can pin a checkpoint with:
+
+```text
+digest layout_sanity
+expect layout_sanity text_overflow=0
+expect layout_sanity sibling_overlap=0
+expect layout_sanity content_overflow=0
+```
+
+The probe is observational only. `snapshot fb`, DrawList hashes, and rendered pixels
+are not changed by enabling it.
+
 ### Frame section timing (`frameprof`)
 
 `digest frameprof` breaks one frame body into named sections, so a performance question can

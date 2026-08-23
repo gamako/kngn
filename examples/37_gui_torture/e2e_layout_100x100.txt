@@ -3,6 +3,10 @@
 # expect values baked from a 2026-07-17 headless replay
 step 3
 digest layout
+digest layout_sanity
+expect layout_sanity text_overflow=0
+expect layout_sanity sibling_overlap=0
+expect layout_sanity content_overflow=11
 expect layout case=layout
 expect layout screen_w=100
 expect layout screen_h=100

@@ -66,6 +66,10 @@ pub const drawlist_wire = @import("drawlist_wire.zig");
 pub const drawlistDigest = @import("drawlist_probe.zig").digest;
 pub const drawlistDumpAlloc = @import("drawlist_probe.zig").dumpAlloc;
 
+pub const LayoutSanityResult = @import("layout_sanity_probe.zig").Result;
+pub const layout_sanity_probe_name = @import("layout_sanity_probe.zig").probe_name;
+pub const layoutSanityDigest = @import("layout_sanity_probe.zig").digest;
+
 /// Shared DrawCmd text form (verb table, serializer, parser). The dump written by
 /// `drawlistDumpAlloc` and the text an overlay inject parses are the same format.
 pub const draw_cmd_text = @import("draw_cmd_text.zig");

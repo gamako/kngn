@@ -835,9 +835,9 @@ pub fn build(b: *std.Build) void {
             .{ .name = "example_32", .path = "examples/32_sprite_anim/main.zig", .needs_sprite = false, .needs_fps_counter = false, .needs_fixed_timestep = false, .needs_text = false, .needs_gui = false, .needs_png = false, .needs_font = false, .needs_audio = false, .needs_gamepad = false, .needs_gmath = false, .needs_sound = false },
             .{ .name = "example_33", .path = "examples/33_camera/main.zig", .needs_sprite = false, .needs_fps_counter = false, .needs_fixed_timestep = false, .needs_text = false, .needs_gui = false, .needs_png = false, .needs_font = false, .needs_audio = false, .needs_gamepad = false, .needs_gmath = false, .needs_sound = false },
             .{ .name = "example_34", .path = "examples/34_action_map/main.zig", .needs_sprite = false, .needs_fps_counter = false, .needs_fixed_timestep = false, .needs_text = false, .needs_gui = false, .needs_png = false, .needs_font = false, .needs_audio = false, .needs_gamepad = true, .needs_gmath = false, .needs_sound = false },
-            .{ .name = "example_35", .path = "examples/35_gui_gallery/main.zig", .needs_sprite = false, .needs_fps_counter = false, .needs_fixed_timestep = false, .needs_text = false, .needs_gui = true, .needs_png = false, .needs_font = false, .needs_audio = false, .needs_gamepad = false, .needs_gmath = false, .needs_sound = false },
+            .{ .name = "example_35", .path = "examples/35_gui_gallery/main.zig", .needs_sprite = false, .needs_fps_counter = false, .needs_fixed_timestep = false, .needs_text = false, .needs_gui = true, .needs_png = false, .needs_font = false, .needs_audio = false, .needs_gamepad = false, .needs_gmath = false, .needs_sound = false, .needs_kit = true },
             .{ .name = "example_36", .path = "examples/36_tilemap/main.zig", .needs_sprite = false, .needs_fps_counter = false, .needs_fixed_timestep = false, .needs_text = false, .needs_gui = false, .needs_png = false, .needs_font = false, .needs_audio = false, .needs_gamepad = false, .needs_gmath = false, .needs_sound = false },
-            .{ .name = "example_37", .path = "examples/37_gui_torture/main.zig", .needs_sprite = false, .needs_fps_counter = false, .needs_fixed_timestep = false, .needs_text = false, .needs_gui = true, .needs_png = false, .needs_font = false, .needs_audio = false, .needs_gamepad = false, .needs_gmath = false, .needs_sound = false },
+            .{ .name = "example_37", .path = "examples/37_gui_torture/main.zig", .needs_sprite = false, .needs_fps_counter = false, .needs_fixed_timestep = false, .needs_text = false, .needs_gui = true, .needs_png = false, .needs_font = false, .needs_audio = false, .needs_gamepad = false, .needs_gmath = false, .needs_sound = false, .needs_kit = true },
             .{ .name = "example_38", .path = "examples/38_minigame/main.zig", .needs_sprite = false, .needs_fps_counter = false, .needs_fixed_timestep = false, .needs_text = false, .needs_gui = false, .needs_png = false, .needs_font = false, .needs_audio = true, .needs_gamepad = false, .needs_gmath = false, .needs_sound = true },
             .{ .name = "example_39", .path = "examples/39_settings_shell/main.zig", .needs_sprite = false, .needs_fps_counter = false, .needs_fixed_timestep = false, .needs_text = false, .needs_gui = true, .needs_png = false, .needs_font = false, .needs_audio = false, .needs_gamepad = false, .needs_gmath = false, .needs_sound = false },
             .{ .name = "example_40", .path = "examples/40_list_menu/main.zig", .needs_sprite = false, .needs_fps_counter = false, .needs_fixed_timestep = false, .needs_text = false, .needs_gui = true, .needs_png = false, .needs_font = false, .needs_audio = false, .needs_gamepad = false, .needs_gmath = false, .needs_sound = false },
@@ -864,7 +864,7 @@ pub fn build(b: *std.Build) void {
                 .needs_sound = example.needs_sound,
                 .needs_pixelops = std.mem.eql(u8, example.name, "example_23"),
                 .platform_features = if (@hasField(@TypeOf(example), "platform_features")) example.platform_features else exe_features.base,
-                .needs_kit = std.mem.eql(u8, example.name, "example_31") or std.mem.eql(u8, example.name, "example_32") or std.mem.eql(u8, example.name, "example_33") or std.mem.eql(u8, example.name, "example_34") or std.mem.eql(u8, example.name, "example_36") or std.mem.eql(u8, example.name, "example_38") or std.mem.eql(u8, example.name, "example_44") or std.mem.eql(u8, example.name, "example_46") or std.mem.startsWith(u8, example.name, "example_26"),
+                .needs_kit = std.mem.eql(u8, example.name, "example_31") or std.mem.eql(u8, example.name, "example_32") or std.mem.eql(u8, example.name, "example_33") or std.mem.eql(u8, example.name, "example_34") or std.mem.eql(u8, example.name, "example_35") or std.mem.eql(u8, example.name, "example_36") or std.mem.eql(u8, example.name, "example_37") or std.mem.eql(u8, example.name, "example_38") or std.mem.eql(u8, example.name, "example_44") or std.mem.eql(u8, example.name, "example_46") or std.mem.startsWith(u8, example.name, "example_26"),
             };
             // audio examples: audio-capable OSes only (macOS/Linux/Windows). All other examples: every OS.
             if (!needs.needs_audio or audio_supported) {
@@ -2443,8 +2443,21 @@ pub fn build(b: *std.Build) void {
     gui_test_root.addImport("command_types", shared_modules.command_types.mod);
     const gui_test = b.addTest(.{ .root_module = gui_test_root });
     const run_gui_test = b.addRunArtifact(gui_test);
+    const layout_sanity_test_root = b.createModule(.{
+        .root_source_file = b.path("libs/gui/src/layout_sanity_probe.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    layout_sanity_test_root.addImport("font", shared_modules.font.mod);
+    layout_sanity_test_root.addImport("font_asset", shared_modules.font_asset);
+    layout_sanity_test_root.addImport("pixelops", shared_modules.pixelops.mod);
+    layout_sanity_test_root.addImport("vector", shared_modules.vector.mod);
+    layout_sanity_test_root.addImport("command_types", shared_modules.command_types.mod);
+    const layout_sanity_test = b.addTest(.{ .root_module = layout_sanity_test_root });
+    const run_layout_sanity_test = b.addRunArtifact(layout_sanity_test);
     const test_gui_step = b.step("test-gui", "Run libs/gui unit tests");
     test_gui_step.dependOn(&run_gui_test.step);
+    test_gui_step.dependOn(&run_layout_sanity_test.step);
 
     // test-gui-leak: measure PerIdStateStore unique-ID monotonic growth
     // (do not change libs/gui. Assert entry count for regression; print allocator bytes for notes)
@@ -3465,6 +3478,7 @@ const PlatformModules = struct {
 fn wireKitImports(kit: TaggedModule, platform_mod: TaggedModule, common: *const SharedModules, app_runtime: TaggedModule) void {
     link(kit, platform_mod);
     link(kit, common.harness); // kit.control
+    link(kit, common.layout_sanity); // kit.layout_sanity
     link(kit, common.frame_prof); // kit.frame_prof
     link(kit, common.types); // kit.types
     link(kit, common.command_types); // kit.command_types
@@ -3619,6 +3633,7 @@ const SharedModules = struct {
     modular: TaggedModule,
     dsp: TaggedModule,
     harness: TaggedModule,
+    layout_sanity: TaggedModule, // core/control/layout_sanity.zig (GUI probe gate)
     frame_prof: TaggedModule, // core/control/frame_prof.zig (per-section frame timing for the observation plane)
     types: TaggedModule,
     pixelops: TaggedModule,
@@ -3873,6 +3888,12 @@ const SharedModules = struct {
         // The audio facade (core/audio.zig) calls onAudioSamples via `@import("harness")`.
         link(audio, harness);
 
+        const layout_sanity: TaggedModule = .{ .layer = .core, .name = "layout_sanity", .mod = b.createModule(.{
+            .root_source_file = b.path("core/control/layout_sanity.zig"),
+            .single_threaded = if (is_wasm) platform.wasm_single_threaded else null,
+        }) };
+        link(layout_sanity, harness);
+
         // frame_prof (core/control; the observation plane): per-section frame timing. It reads the
         // harness for its enable rule and for `readEnv`, and takes its clock from the caller — so it
         // does not depend on the platform facade, and a unit test of it needs no backend.
@@ -4001,6 +4022,7 @@ const SharedModules = struct {
             .modular = modular,
             .dsp = dsp,
             .harness = harness,
+            .layout_sanity = layout_sanity,
             .frame_prof = frame_prof,
             .types = types,
             .pixelops = pixelops,

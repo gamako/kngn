@@ -56,6 +56,7 @@ const id_mod = @import("id.zig");
 const input_mod = @import("input.zig");
 const state_mod = @import("state.zig");
 const layout = @import("layout.zig");
+const layout_sanity_probe = @import("layout_sanity_probe.zig");
 const text_wrap_mod = @import("text_wrap.zig");
 const style_mod = @import("style.zig");
 // Mutual import with widgets.zig (widgets take *Context; Zig import cycles are legal).
@@ -81,6 +82,7 @@ pub const DrawList = draw.DrawList;
 pub const BitmapFont = font_mod.BitmapFont;
 pub const Font = font_mod.Font;
 pub const BoxConfig = layout.BoxConfig;
+pub const LayoutSanityResult = layout_sanity_probe.Result;
 pub const Style = style_mod.Style;
 pub const AnimationStyle = style_mod.AnimationStyle;
 pub const WidgetStyle = style_mod.WidgetStyle;
@@ -275,6 +277,9 @@ pub const Context = struct {
     layout_root: ?*layout.Node = null,
     /// beginBox / endBox cursor (current parent)
     layout_current: ?*layout.Node = null,
+    /// Layout sanity is opt-in; the result is copied out of the frame arena after the tree scan.
+    layout_sanity_enabled: bool = false,
+    layout_sanity_result: layout_sanity_probe.Result = .{},
     /// Explicit-ID (cfg.id != 0) node id → {rect, clip}. GPA-owned, survives across frames, and
     /// is updated only in endFrame (first half of the frame still holds previous-frame values = sync hit-test contract).
     rect_cache: std.AutoHashMapUnmanaged(Id, CachedRect) = .empty,
@@ -516,6 +521,12 @@ pub const Context = struct {
         return self.arena.allocator();
     }
 
+    /// Enable or disable the layout sanity scan for subsequent frames.
+    pub fn setLayoutSanityEnabled(self: *Context, enabled: bool) void {
+        self.layout_sanity_enabled = enabled;
+        self.layout_sanity_result = .{ .enabled = enabled };
+    }
+
     /// Copy `pixels` onto the frame arena. Valid until the next beginFrame.
     /// Use this when a tooltip builder generates a thumbnail that must outlive the call.
     pub fn dupePixels(self: *Context, pixels: []const u32) []u32 {
@@ -662,6 +673,9 @@ pub const Context = struct {
             self.rect_cache.clearRetainingCapacity();
             self.updateRectCache(root, screen_rect);
             self.emitNode(root);
+        }
+        if (self.layout_sanity_enabled) {
+            self.layout_sanity_result = layout_sanity_probe.scan(root, self.font, self.allocator());
         }
         // Seal this frame's viewport rects so the next frame's wheel chain reads
         // previous-frame geometry (same 1-frame lag as hit-test).

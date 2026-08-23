@@ -3,6 +3,10 @@
 # expect values baked from a 2026-08-02 headless replay (digest gallery).
 step 2
 digest gallery
+digest layout_sanity
+expect layout_sanity text_overflow=0
+expect layout_sanity sibling_overlap=0
+expect layout_sanity content_overflow=0
 expect gallery section=overview
 expect gallery index=0
 expect gallery widgets=0
@@ -16,6 +20,8 @@ step 1
 inject key_up PAGE_DOWN
 step 1
 digest gallery
+digest layout_sanity
+expect layout_sanity total=0
 expect gallery section=basic
 expect gallery index=1
 expect gallery widgets=2
@@ -43,6 +49,10 @@ step 1
 inject key_up PAGE_DOWN
 step 1
 digest gallery
+digest layout_sanity
+expect layout_sanity text_overflow=0
+expect layout_sanity sibling_overlap=0
+expect layout_sanity content_overflow=5
 expect gallery section=text
 expect gallery widgets=3
 snapshot fb
@@ -63,6 +73,8 @@ step 1
 inject key_up PAGE_DOWN
 step 1
 digest gallery
+digest layout_sanity
+expect layout_sanity total=0
 expect gallery section=values
 expect gallery widgets=4
 snapshot fb
@@ -72,6 +84,10 @@ step 1
 inject key_up PAGE_DOWN
 step 1
 digest gallery
+digest layout_sanity
+expect layout_sanity text_overflow=0
+expect layout_sanity sibling_overlap=0
+expect layout_sanity content_overflow=0
 expect gallery section=color
 expect gallery widgets=3
 snapshot fb
@@ -81,6 +97,8 @@ step 1
 inject key_up PAGE_DOWN
 step 1
 digest gallery
+digest layout_sanity
+expect layout_sanity total=0
 expect gallery section=layout
 expect gallery widgets=5
 snapshot fb
@@ -139,6 +157,8 @@ step 1
 inject key_up PAGE_DOWN
 step 1
 digest gallery
+digest layout_sanity
+expect layout_sanity total=0
 expect gallery section=menus
 expect gallery widgets=2
 snapshot fb
@@ -221,6 +241,10 @@ step 1
 inject key_up PAGE_DOWN
 step 1
 digest gallery
+digest layout_sanity
+expect layout_sanity text_overflow=0
+expect layout_sanity sibling_overlap=0
+expect layout_sanity content_overflow=4
 expect gallery section=stepgrid
 expect gallery widgets=1
 snapshot fb
@@ -230,6 +254,8 @@ step 1
 inject key_up PAGE_DOWN
 step 1
 digest gallery
+digest layout_sanity
+expect layout_sanity total=0
 expect gallery section=table
 expect gallery widgets=1
 snapshot fb
@@ -239,6 +265,8 @@ step 1
 inject key_up PAGE_DOWN
 step 1
 digest gallery
+digest layout_sanity
+expect layout_sanity total=0
 expect gallery section=missing
 expect gallery index=9
 expect gallery widgets=9

@@ -1,6 +1,8 @@
 # Style showcase replay: overview, widget states, selected state, and paths.
 step 2
 digest showcase
+digest layout_sanity
+expect layout_sanity total=0
 expect showcase section=overview
 expect showcase index=0
 expect showcase selected=states
@@ -30,6 +32,8 @@ step 1
 inject key_up PAGE_DOWN
 step 1
 digest showcase
+digest layout_sanity
+expect layout_sanity total=0
 expect showcase section=states
 expect showcase index=1
 expect showcase hot=none
@@ -159,6 +163,8 @@ step 1
 inject key_up PAGE_DOWN
 step 1
 digest showcase
+digest layout_sanity
+expect layout_sanity total=0
 expect showcase section=paths
 expect showcase index=2
 expect showcase hot=none
@@ -189,6 +195,8 @@ step 1
 inject key_up PAGE_DOWN
 step 1
 digest showcase
+digest layout_sanity
+expect layout_sanity total=0
 expect showcase section=rounded
 expect showcase index=3
 expect showcase hot=none
@@ -219,6 +227,8 @@ step 1
 inject key_up PAGE_DOWN
 step 1
 digest showcase
+digest layout_sanity
+expect layout_sanity total=0
 expect showcase section=gradients
 expect showcase index=4
 expect showcase hot=none
@@ -250,6 +260,8 @@ step 1
 inject key_up PAGE_DOWN
 step 1
 digest showcase
+digest layout_sanity
+expect layout_sanity total=0
 expect showcase section=shadow
 expect showcase index=5
 expect showcase shadow=5
