@@ -4,12 +4,12 @@
 step 4
 digest layout
 expect layout case=input_state
-expect layout slider_x=66
-expect layout slider_y=50
+expect layout slider_x=59
+expect layout slider_y=56
 snapshot fb
 
 # 1) slider active + layout shift (F1) while held
-inject mouse_move 71 58
+inject mouse_move 64 64
 step 2
 inject mouse_down left
 step 2
@@ -61,7 +61,7 @@ inject key_up F3
 step 3
 
 # 3) open popup, behind widget must not hot/active/click
-inject mouse_move 92 182
+inject mouse_move 92 196
 step 2
 inject mouse_down left
 step 1
@@ -71,7 +71,7 @@ digest state
 expect state popup_open=1
 expect state wants_mouse=1
 # over behind button area while popup open
-inject mouse_move 92 150
+inject mouse_move 92 160
 step 2
 digest state
 expect state hot=none

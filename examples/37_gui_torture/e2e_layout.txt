@@ -60,13 +60,13 @@ step 1
 inject scroll 0 -10
 step 2
 digest scroll
-expect scroll inner_scroll_y=264
-expect scroll outer_scroll_y=216
+expect scroll inner_scroll_y=348
+expect scroll outer_scroll_y=132
 # further wheel same direction: inner stays at max; only outer grows
 inject scroll 0 -1
 step 2
 digest scroll
-expect scroll inner_scroll_y=264
-expect scroll outer_scroll_y=228
+expect scroll inner_scroll_y=348
+expect scroll outer_scroll_y=164
 snapshot fb
 quit

@@ -8,7 +8,7 @@ expect state button_count=100
 expect state same_label_independent=1
 digest layout
 expect layout btn0_x=12
-expect layout btn1_y=60
+expect layout btn1_y=68
 snapshot fb
 
 # click btn1 (index 1)
