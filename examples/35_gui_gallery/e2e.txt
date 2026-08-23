@@ -23,7 +23,7 @@ expect gallery missing=0
 snapshot fb
 
 # basic: hover / active representative
-inject mouse_move 96 112
+inject mouse_move 96 124
 step 2
 digest gallery
 expect gallery hot=button
@@ -48,7 +48,7 @@ expect gallery widgets=3
 snapshot fb
 # y=150 (not basic's 112): the "Disabled" checkbox demo (added by the disabled-scope work)
 # is now the first widget in this section, pushing textInputId down one row.
-inject mouse_move 96 150
+inject mouse_move 96 162
 inject mouse_down left
 inject mouse_up left
 step 1
@@ -87,20 +87,20 @@ snapshot fb
 # layout: iconButton hover 500ms → tooltip (beginFrame is frame_index/60 → step 32 ≈ 0.53s)
 # pen center ≈ (144,124): outer pad16 + header64 + gap16 + content pad16 + icon pad4
 #   x: 16+16 + "iconButton:"(11*8=88) + gap8 + half icon_w(16) = 144
-inject mouse_move 144 124
+inject mouse_move 144 136
 step 32
 digest gallery
 expect gallery hot=iconButton
 snapshot fb
 # brush center ≈ (184,124) long tip visibility (edge clamp covered by context.zig unit tests)
-inject mouse_move 184 124
+inject mouse_move 184 136
 step 32
 digest gallery
 expect gallery hot=iconButton
 snapshot fb
 # custom tooltipBox on the 16px swatch after the brush
 # brush center 184, icon 16, gap 8, half swatch 8 → 184+8+8+8 = 208
-inject mouse_move 208 124
+inject mouse_move 208 136
 step 32
 digest gallery
 expect gallery hot=tooltipBox
@@ -112,7 +112,7 @@ digest gallery
 expect gallery hot=none
 snapshot fb
 # collapsible header (below icon row ≈ y=160, x=120): hover / click shows body / click again hides
-inject mouse_move 120 160
+inject mouse_move 120 172
 step 2
 digest gallery
 expect gallery hot=collapsible
@@ -142,13 +142,13 @@ digest gallery
 expect gallery section=menus
 expect gallery widgets=2
 snapshot fb
-inject mouse_move 180 96
+inject mouse_move 180 108
 step 2
 digest gallery
 snapshot fb
 inject mouse_move 1000 620
 # Open alert dialog from the menus section.
-inject mouse_move 120 180
+inject mouse_move 120 192
 step 2
 inject mouse_down left
 step 1
@@ -162,7 +162,7 @@ expect gallery dialog_focus=1
 expect gallery dialog_shadow=1
 snapshot fb
 # The scrim absorbs an outside click and leaves the dialog open.
-inject mouse_move 20 600
+inject mouse_move 20 612
 inject mouse_down left
 step 1
 inject mouse_up left
@@ -181,7 +181,7 @@ digest gallery
 expect gallery dialog=closed
 expect gallery dialog_result=dismissed_escape
 # Open the two-action message dialog.
-inject mouse_move 320 180
+inject mouse_move 320 192
 inject mouse_down left
 step 1
 inject mouse_up left
