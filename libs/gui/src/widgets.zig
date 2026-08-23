@@ -96,7 +96,7 @@ pub const TextInputResult = struct {
 pub const ButtonOpts = struct {
     /// If > 0, minimum button width (ensures `min_w` even when text + padding is smaller).
     min_w: i32 = 0,
-    /// null → `style.button_padding`
+    /// null → `style.spacing.control_padding`
     padding: ?[4]i32 = null,
     /// Selected look (accent fill + thick border). For tool-selection toggles.
     /// Draw priority: held > hover > selected > normal.
@@ -186,7 +186,7 @@ pub fn buttonId(ctx: *Context, id: Id, label: []const u8, opts: ButtonOpts) Butt
     else
         ctx.resolveButtonColorsWithStyle(id, base_bg, opts.selected, result.held, disabled, opts.style);
     const thickness = if (opts.selected) style.button_border_selected else style.button_border;
-    const pad = opts.padding orelse style.button_padding;
+    const pad = opts.padding orelse style.spacing.control_padding;
     // With `min_w`, width is fixed at call time assuming fixed-width font (`measure = 8×len`)
     const width: layout.Sizing = if (opts.min_w > 0)
         .{ .fixed = @max(opts.min_w, @as(i32, @intCast(ctx.font.measure(label))) + pad[3] + pad[1]) }
@@ -286,7 +286,7 @@ pub fn iconButtonId(ctx: *Context, id: Id, icon: IconBitmap, selected: bool) But
         style.surface.control;
     const border_color = if (hot or selected) style.border_tokens.hover else style.border_tokens.normal;
     const thickness = if (selected) style.button_border_selected else style.button_border;
-    const pad = style.button_padding;
+    const pad = style.spacing.control_padding;
     const w = icon_px + pad[1] + pad[3];
     const h = icon_px + pad[0] + pad[2];
     ctx.beginBox(.{
@@ -1248,7 +1248,7 @@ fn sliderCore(ctx: *Context, id: Id, label: []const u8, cur: f64, spec: SliderSp
         g.label_w = @max(g.label_w, @as(i32, @intCast(ctx.font.measure(label))));
         g.value_w = @max(g.value_w, valueColumnWidth(ctx.font, spec));
     } else {
-        ctx.beginBox(.{ .direction = .row, .gap = 6, .align_cross = .center });
+        ctx.beginBox(.{ .direction = .row, .gap = ctx.style.spacing.control_gap, .align_cross = .center });
         ctx.labelEx(label, text_col);
     }
 
@@ -1591,7 +1591,7 @@ pub fn checkboxIdEx(ctx: *Context, id: Id, label: []const u8, value: *bool, opts
     ctx.beginBox(.{
         .id = id,
         .direction = .row,
-        .gap = style.checkbox_gap,
+        .gap = style.spacing.control_gap,
         .align_cross = .center,
         .radius = style.control_radius,
     });
@@ -1678,7 +1678,7 @@ pub fn toggleIdEx(ctx: *Context, id: Id, label: []const u8, value: *bool, opts: 
     ctx.beginBox(.{
         .id = id,
         .direction = .row,
-        .gap = style.checkbox_gap,
+        .gap = style.spacing.control_gap,
         .align_cross = .center,
         .radius = style.control_radius,
     });
@@ -1760,7 +1760,7 @@ pub fn radioIdEx(ctx: *Context, id: Id, label: []const u8, selected: bool, opts:
     ctx.beginBox(.{
         .id = id,
         .direction = .row,
-        .gap = style.checkbox_gap,
+        .gap = style.spacing.control_gap,
         .align_cross = .center,
         .radius = style.control_radius,
     });
@@ -1833,13 +1833,13 @@ pub fn beginCollapsible(ctx: *Context, id: Id, title: []const u8, open: *bool) b
     const hot = ctx.state.hot_id == id;
     const bg = if (result.held) style.accent.primary else if (hot) style.surface.control_hover else style.surface.control;
     const border_color = if (hot) style.border_tokens.hover else style.border_tokens.normal;
-    const pad = style.button_padding;
+    const pad = style.spacing.control_padding;
 
     // header: row box (glyph + title). id covers the whole header hit region.
     ctx.beginBox(.{
         .id = id,
         .direction = .row,
-        .gap = style.checkbox_gap,
+        .gap = style.spacing.control_gap,
         .align_cross = .center,
         .padding = pad,
         .bg = bg,
@@ -1858,7 +1858,7 @@ pub fn beginCollapsible(ctx: *Context, id: Id, title: []const u8, open: *bool) b
     // The body takes the width its parent offers rather than shrinking to its contents, so a
     // control built inside it can fill the section it belongs to — a panel's collapsible section is
     // as wide as the panel. A `fit` parent still offers nothing to fill, as everywhere else.
-    ctx.beginBox(.{ .direction = .column, .width = .{ .grow = 1 }, .gap = 4, .padding = .{ 0, 0, 0, pad[3] + collapsible_glyph_px + style.checkbox_gap } });
+    ctx.beginBox(.{ .direction = .column, .width = .{ .grow = 1 }, .gap = style.spacing.scale.sm, .padding = .{ 0, 0, 0, pad[3] + collapsible_glyph_px + style.spacing.control_gap } });
     collapsible_body_depth += 1;
     return true;
 }
@@ -2490,7 +2490,7 @@ pub fn virtualScrollToRow(ctx: *Context, id: Id, scroll: *Vec2f, opts: VirtualLi
 pub const TabOpts = struct {
     width: layout.Sizing = .fit,
     height: layout.Sizing = .fit,
-    /// null → style.button_padding
+    /// null → style.spacing.control_padding
     padding: ?[4]i32 = null,
     /// Partial color override. Null keeps the active theme token.
     style: ?WidgetStyle = null,
@@ -2530,7 +2530,7 @@ pub fn tabId(ctx: *Context, id: Id, label: []const u8, selected: bool, opts: Tab
             }
     else
         ctx.resolveButtonColorsWithStyle(id, base_bg, selected, result.held, disabled, opts.style);
-    const pad = opts.padding orelse style.button_padding;
+    const pad = opts.padding orelse style.spacing.control_padding;
 
     ctx.beginBox(.{
         .id = id,
@@ -3222,6 +3222,27 @@ test "buttonId: getNodeRect returns the rect and min_w applies" {
     try std.testing.expectEqual(@as(u32, 120), ctx.getNodeRect(79).?.w);
 }
 
+test "button and tab padding overrides take precedence over spacing tokens" {
+    var ctx = testCtx();
+    defer ctx.deinit();
+    const padding: [4]i32 = .{ 1, 2, 3, 4 };
+    try std.testing.expect(!std.mem.eql(i32, &padding, &ctx.style.spacing.control_padding));
+
+    ctx.beginFrame(800, 200);
+    _ = ctx.buttonId(77, "Button", .{ .padding = padding });
+    _ = ctx.tabId(78, "Tab", false, .{ .padding = padding });
+    ctx.endFrame();
+
+    const expected_button_w = @as(i32, @intCast(ctx.font.measure("Button"))) + padding[1] + padding[3];
+    const expected_button_h = @as(i32, @intCast(font_mod.fontInkHeight(ctx.font))) + padding[0] + padding[2];
+    try std.testing.expectEqual(expected_button_w, @as(i32, @intCast(ctx.getNodeRect(77).?.w)));
+    try std.testing.expectEqual(expected_button_h, @as(i32, @intCast(ctx.getNodeRect(77).?.h)));
+    const expected_tab_w = @as(i32, @intCast(ctx.font.measure("Tab"))) + padding[1] + padding[3];
+    const expected_tab_h = @as(i32, @intCast(font_mod.fontInkHeight(ctx.font))) + padding[0] + padding[2];
+    try std.testing.expectEqual(expected_tab_w, @as(i32, @intCast(ctx.getNodeRect(78).?.w)));
+    try std.testing.expectEqual(expected_tab_h, @as(i32, @intCast(ctx.getNodeRect(78).?.h)));
+}
+
 test "button: held frame paints bg_active; hover frame paints bg_hover" {
     var ctx = testCtx();
     defer ctx.deinit();
@@ -3284,7 +3305,7 @@ test "iconButtonId: first frame builds the rect cache" {
     ctx.endFrame();
 
     const r = ctx.getNodeRect(0x1451).?;
-    const pad = ctx.style.button_padding;
+    const pad = ctx.style.spacing.control_padding;
     try std.testing.expectEqual(@as(u32, @intCast(16 + pad[1] + pad[3])), r.w);
     try std.testing.expectEqual(@as(u32, @intCast(16 + pad[0] + pad[2])), r.h);
 }
@@ -3384,7 +3405,7 @@ test "iconButton: set bits are foreground; clear bits stay background" {
     render_mod.render(target, &ctx.draw_list, ctx.font, 1.0);
 
     const r = ctx.getNodeRect(1).?;
-    const pad = ctx.style.button_padding;
+    const pad = ctx.style.spacing.control_padding;
     // Icon leaf origin is (pad.left, pad.top) inside padding. Top-left 1px is set.
     const ix: u32 = @intCast(r.x + pad[3]);
     const iy: u32 = @intCast(r.y + pad[0]);
@@ -3692,7 +3713,7 @@ test "collapsible: glyph right/down shapes are distinguishable in pixels" {
 
     const ra = ctx.getNodeRect(1).?;
     const rb = ctx.getNodeRect(2).?;
-    const pad = ctx.style.button_padding;
+    const pad = ctx.style.spacing.control_padding;
     // glyph is row + align_cross.center, so vertically centered in content height
     const content_ha: i32 = @as(i32, @intCast(ra.h)) - pad[0] - pad[2];
     const content_hb: i32 = @as(i32, @intCast(rb.h)) - pad[0] - pad[2];
@@ -4747,7 +4768,7 @@ test "checkbox: hit region is the whole glyph+label box (label-side click respon
     try std.testing.expect(rect.w > @as(u32, @intCast(size)));
 
     // Click to the right of the glyph (label side) → responds (would not if id were on glyph only)
-    const lx = rect.x + size + ctx.style.checkbox_gap + 4;
+    const lx = rect.x + size + ctx.style.spacing.control_gap + 4;
     const ly = rect.y + @as(i32, @intCast(rect.h / 2));
     try std.testing.expect(lx > rect.x + size); // Right of the glyph
     try std.testing.expect(lx < rect.x + @as(i32, @intCast(rect.w))); // Still inside the box
@@ -5537,8 +5558,8 @@ test "button label uses ink height and excludes line_gap" {
     var ctx = Context.init(std.testing.allocator, GapLike.font);
     defer ctx.deinit();
     const id: Id = 0xD1672;
-    // Default button_padding comes from style. content = ink=18, box = pad_v + 18
-    const pad = ctx.style.button_padding; // [top, right, bottom, left]
+    // Default control padding comes from style. content = ink=18, box = pad_v + 18
+    const pad = ctx.style.spacing.control_padding; // [top, right, bottom, left]
     const ink: i32 = 18;
     const expected_h: i32 = pad[0] + ink + pad[2];
 

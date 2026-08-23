@@ -28,6 +28,28 @@ pub const AnimationStyle = struct {
     press_tau_s: f32 = 0.06,
 };
 
+pub const SpacingScale = struct {
+    xs: i32 = 2,
+    sm: i32 = 4,
+    md: i32 = 6,
+    lg: i32 = 8,
+};
+
+pub const SpacingTokens = struct {
+    scale: SpacingScale = .{},
+    /// Top, right, bottom, left.
+    control_padding: [4]i32 = .{ 4, 8, 4, 8 },
+    control_gap: i32 = 6,
+    popup_inset: i32 = 4,
+    popup_item_height: i32 = 20,
+    dialog_panel_inset: i32 = 20,
+    dialog_title_top: i32 = 16,
+    dialog_body_top: i32 = 48,
+    dialog_action_height: i32 = 32,
+    dialog_action_gap: i32 = 8,
+    dialog_action_label_inset: i32 = 8,
+};
+
 pub const SurfaceTokens = struct {
     canvas: Color,
     panel: Color,
@@ -89,6 +111,7 @@ pub const Style = struct {
     elevation: ElevationTokens,
     /// Time-based button and tab color transitions. Disabled by default.
     animation: AnimationStyle = .{},
+    spacing: SpacingTokens = .{},
     /// Normal fill for button etc.
     bg: Color,
     /// Fill while hovered (`state.hot_id == id`)
@@ -120,8 +143,6 @@ pub const Style = struct {
     swatch_size: i32 = 18,
     swatch_border: i32 = 1,
     swatch_border_selected: i32 = 2,
-    /// top, right, bottom, left
-    button_padding: [4]i32 = .{ 4, 8, 4, 8 },
     button_border: i32 = 1,
     button_border_selected: i32 = 2,
     /// Selected fill (lower priority than held/hover). Deep blue for high contrast vs normal,
@@ -143,15 +164,9 @@ pub const Style = struct {
     // Checkbox / Toggle(switch) / Radio. Dimensions only; reuse existing colors:
     // ON/accent = bg_active, box interior / track = slider_track_bg, knob = slider_knob_bg, border = border / border_hover.
     checkbox_size: i32 = 16,
-    /// Gap between glyph and label (shared by checkbox / toggle / radio)
-    checkbox_gap: i32 = 6,
     switch_w: i32 = 28,
     switch_h: i32 = 16,
     radio_size: i32 = 16,
-    // Popup / context menu. Reuse existing bg / bg_hover / border / text /
-    // text_subtle (no new color fields).
-    popup_item_h: i32 = 20,
-    popup_padding: i32 = 4,
     /// One tree-indent step for `beginListboxRow` guides. `0` emits no guide
     /// (even when `depth > 0`). Must be `>= 0`.
     indent_w: i32 = 14,
@@ -307,6 +322,27 @@ pub fn lightStyle() Style {
 // ============================================================
 
 const std = @import("std");
+
+test "default styles expose the canonical spacing tokens" {
+    const dark = defaultStyle();
+    const light = lightStyle();
+
+    try std.testing.expectEqual(@as(i32, 2), dark.spacing.scale.xs);
+    try std.testing.expectEqual(@as(i32, 4), dark.spacing.scale.sm);
+    try std.testing.expectEqual(@as(i32, 6), dark.spacing.scale.md);
+    try std.testing.expectEqual(@as(i32, 8), dark.spacing.scale.lg);
+    try std.testing.expectEqualSlices(i32, &.{ 4, 8, 4, 8 }, &dark.spacing.control_padding);
+    try std.testing.expectEqual(@as(i32, 6), dark.spacing.control_gap);
+    try std.testing.expectEqual(@as(i32, 4), dark.spacing.popup_inset);
+    try std.testing.expectEqual(@as(i32, 20), dark.spacing.popup_item_height);
+    try std.testing.expectEqual(@as(i32, 20), dark.spacing.dialog_panel_inset);
+    try std.testing.expectEqual(@as(i32, 16), dark.spacing.dialog_title_top);
+    try std.testing.expectEqual(@as(i32, 48), dark.spacing.dialog_body_top);
+    try std.testing.expectEqual(@as(i32, 32), dark.spacing.dialog_action_height);
+    try std.testing.expectEqual(@as(i32, 8), dark.spacing.dialog_action_gap);
+    try std.testing.expectEqual(@as(i32, 8), dark.spacing.dialog_action_label_inset);
+    try std.testing.expectEqualSlices(u8, std.mem.asBytes(&dark.spacing), std.mem.asBytes(&light.spacing));
+}
 
 test "defaultStyle: text is white (compatible with earlier label default)" {
     const s = defaultStyle();

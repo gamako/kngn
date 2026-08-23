@@ -466,13 +466,13 @@ fn updatePopupGeo(app: *App, items: []const gui.PopupItem) void {
     var max_w: i32 = 0;
     for (items) |it| max_w = @max(max_w, @as(i32, @intCast(ctx.font.measure(it.label))));
     const style = ctx.style;
-    const geo = gui.layoutPopup(state.pos, items.len, max_w, style.popup_item_h, style.popup_padding, ctx.screen_w, ctx.screen_h);
+    const geo = gui.layoutPopup(state.pos, items.len, max_w, style.spacing.popup_item_height, style.spacing.popup_inset, ctx.screen_w, ctx.screen_h);
     app.last_popup_x = geo.outer.x;
     app.last_popup_y = geo.outer.y;
     app.last_popup_w = @intCast(geo.outer.w);
     app.last_popup_h = @intCast(geo.outer.h);
-    const req_w = max_w + style.popup_padding * 2;
-    const req_h = @as(i32, @intCast(items.len)) * style.popup_item_h + style.popup_padding * 2;
+    const req_w = max_w + style.spacing.popup_inset * 2;
+    const req_h = @as(i32, @intCast(items.len)) * style.spacing.popup_item_height + style.spacing.popup_inset * 2;
     const clamped: u32 = if (geo.outer.x != state.pos.x or geo.outer.y != state.pos.y or
         @as(i32, @intCast(geo.outer.w)) < req_w or @as(i32, @intCast(geo.outer.h)) < req_h) 1 else 0;
     app.last_popup_clamped = clamped;

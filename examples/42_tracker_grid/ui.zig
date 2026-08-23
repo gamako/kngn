@@ -350,7 +350,7 @@ fn updatePopupGeo(app: *App) void {
     };
     const content_w = gui.popupContentWidth(ctx.font, &app.context_items);
     const style = ctx.style;
-    const geo = gui.layoutPopup(pos, app.context_items.len, content_w, style.popup_item_h, style.popup_padding, ctx.screen_w, ctx.screen_h);
+    const geo = gui.layoutPopup(pos, app.context_items.len, content_w, style.spacing.popup_item_height, style.spacing.popup_inset, ctx.screen_w, ctx.screen_h);
     app.context_outer = geo.outer;
     for (&app.context_item_rects, 0..) |*r, i| r.* = gui.itemRect(geo, i);
 }

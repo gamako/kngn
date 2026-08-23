@@ -693,6 +693,7 @@ pub const Context = struct {
                         self.tooltip_candidate_anchor,
                         self.screen_w,
                         self.screen_h,
+                        self.style.spacing.popup_inset,
                         self.font,
                         self.allocator(),
                     );
@@ -1089,7 +1090,7 @@ pub const Context = struct {
     /// root for the builder and restored on the way out. Builder imbalance is a
     /// lifecycle violation (a silent restore would hide an unclosed box).
     fn buildTooltipSubtree(self: *Context, build_fn: TooltipBuildFn, build_ctx: *anyopaque) *layout.Node {
-        const pad = self.style.popup_padding;
+        const pad = self.style.spacing.popup_inset;
         const root = self.allocator().create(layout.Node) catch @panic("tooltipBox: OOM");
         root.* = .{
             .cfg = .{

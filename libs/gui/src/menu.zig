@@ -394,7 +394,7 @@ test "menuBarPopup: disabled items do not return selected (popup enabled contrac
 
     const title_id = ctx.id_stack.make("File");
     const tr = ctx.getNodeRect(title_id).?;
-    const item1_y = tr.y + @as(i32, @intCast(tr.h)) + ctx.style.popup_padding + ctx.style.popup_item_h + 2;
+    const item1_y = tr.y + @as(i32, @intCast(tr.h)) + ctx.style.spacing.popup_inset + ctx.style.spacing.popup_item_height + 2;
 
     // frame 2: click the disabled second row (edge via pushEvent between beginFrame and endFrame)
     ctx.beginFrame(400, 300);

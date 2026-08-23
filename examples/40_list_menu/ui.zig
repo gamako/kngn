@@ -632,7 +632,7 @@ fn updatePopupGeo(
     // so a checked filter item does not throw this rect off from the real one.
     const content_w = gui.popupContentWidth(ctx.font, items);
     const style = ctx.style;
-    const geo = gui.layoutPopup(pos, items.len, content_w, style.popup_item_h, style.popup_padding, ctx.screen_w, ctx.screen_h);
+    const geo = gui.layoutPopup(pos, items.len, content_w, style.spacing.popup_item_height, style.spacing.popup_inset, ctx.screen_w, ctx.screen_h);
     outer.* = geo.outer;
     var i: usize = 0;
     while (i < item_rects.len and i < items.len) : (i += 1) {

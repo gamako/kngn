@@ -286,7 +286,7 @@ const LAYER_ROW_PART_SLIDER_WRAP: gui.Id = 6;
 /// Floor for the layer-name field's computed width (`buildLayerPanel`): always wide enough for
 /// the button's own padding plus a short ellipsized name, even when the row's other, fixed-width
 /// children (thumb/V-H/opacity slider) leave very little over at the panel's minimum extent.
-/// Sized generously above `button_padding` (16px) plus a 3-char ellipsis ("...") so
+/// Sized generously above the control's horizontal padding (16px) plus a 3-char ellipsis ("...") so
 /// `ellipsizeText`'s own "ellipsis alone does not fit `max_w`" fallback (which returns "..."
 /// unclipped) never triggers here.
 ///
@@ -6052,7 +6052,7 @@ fn buildLayerPanel(ctx: *gui.Context, app: *App) !void {
         // legible in a panel this narrow.
         const opacity_slot_w: i32 = @intCast(ctx.font.measure("O") + ctx.font.measure("255") + 2 * 6 + 16);
         const name_w: i32 = @max(LAYER_NAME_MIN_W, row_prev_w - thumb_w - vis_w - opacity_slot_w - row_gap * 3);
-        const name_hpad: i32 = ctx.style.button_padding[1] + ctx.style.button_padding[3];
+        const name_hpad: i32 = ctx.style.spacing.control_padding[1] + ctx.style.spacing.control_padding[3];
         const name_max_w: i32 = @max(0, name_w - name_hpad);
 
         // Layer-name display. While renaming, only the target row shows the pre-commit buffer + caret.

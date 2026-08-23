@@ -31,6 +31,7 @@ const id_mod = @import("id.zig");
 const font_mod = @import("font.zig");
 const layout = @import("layout.zig");
 const input_mod = @import("input.zig");
+const style_mod = @import("style.zig");
 
 pub const Context = context_mod.Context;
 pub const Rect = geom.Rect;
@@ -482,7 +483,7 @@ fn runPopup(ctx: *Context, items: []const PopupItem, pos: Vec2) PopupInteraction
     // outer.w = max_measure + check-mark reserve + pad*2; layoutPopup clips to screen when over the viewport.
     const content_w = popupContentWidth(ctx.font, items);
     const style = ctx.style;
-    const geo = layoutPopup(pos, items.len, content_w, style.popup_item_h, style.popup_padding, ctx.screen_w, ctx.screen_h);
+    const geo = layoutPopup(pos, items.len, content_w, style.spacing.popup_item_height, style.spacing.popup_inset, ctx.screen_w, ctx.screen_h);
 
     const in = &ctx.input;
 
@@ -511,9 +512,16 @@ const DialogGeometry = struct {
     actions: Rect,
 };
 
-const dialog_panel_padding: i32 = 20;
-
-fn dialogGeometry(pos: Vec2, options: DialogOptions, screen_w: u32, screen_h: u32) DialogGeometry {
+fn dialogGeometry(
+    pos: Vec2,
+    options: DialogOptions,
+    screen_w: u32,
+    screen_h: u32,
+    panel_inset: i32,
+    title_top: i32,
+    body_top: i32,
+    action_height: i32,
+) DialogGeometry {
     std.debug.assert(screen_w > 0 and screen_h > 0);
     const requested = dialogSize(options);
     const sw: i64 = screen_w;
@@ -527,20 +535,20 @@ fn dialogGeometry(pos: Vec2, options: DialogOptions, screen_w: u32, screen_h: u3
     if (x < 0) x = 0;
     if (y < 0) y = 0;
     const outer: Rect = .{ .x = @intCast(x), .y = @intCast(y), .w = @intCast(w), .h = @intCast(h) };
-    const content_w = if (outer.w > @as(u32, @intCast(dialog_panel_padding * 2)))
-        outer.w - @as(u32, @intCast(dialog_panel_padding * 2))
+    const content_w = if (outer.w > @as(u32, @intCast(panel_inset * 2)))
+        outer.w - @as(u32, @intCast(panel_inset * 2))
     else
         0;
-    const title_y = outer.y + @min(@as(i32, 16), @as(i32, @intCast(outer.h)));
-    const body_y = @min(outer.y + 48, outer.y + @as(i32, @intCast(outer.h)));
-    const actions_h = @min(@as(u32, 32), outer.h);
-    const actions_bottom = @min(dialog_panel_padding, @as(i32, @intCast(outer.h - actions_h)));
+    const title_y = outer.y + @min(title_top, @as(i32, @intCast(outer.h)));
+    const body_y = @min(outer.y + body_top, outer.y + @as(i32, @intCast(outer.h)));
+    const actions_h = @min(@as(u32, @intCast(action_height)), outer.h);
+    const actions_bottom = @min(panel_inset, @as(i32, @intCast(outer.h - actions_h)));
     const actions_y = outer.y + @as(i32, @intCast(outer.h - actions_h)) - actions_bottom;
     return .{
         .outer = outer,
-        .title = .{ .x = outer.x + @min(dialog_panel_padding, @as(i32, @intCast(outer.w))), .y = title_y, .w = content_w, .h = @min(@as(u32, 24), outer.h) },
-        .body = .{ .x = outer.x + @min(dialog_panel_padding, @as(i32, @intCast(outer.w))), .y = body_y, .w = content_w, .h = @min(@as(u32, 48), outer.h) },
-        .actions = .{ .x = outer.x + @min(dialog_panel_padding, @as(i32, @intCast(outer.w))), .y = actions_y, .w = content_w, .h = actions_h },
+        .title = .{ .x = outer.x + @min(panel_inset, @as(i32, @intCast(outer.w))), .y = title_y, .w = content_w, .h = @min(@as(u32, 24), outer.h) },
+        .body = .{ .x = outer.x + @min(panel_inset, @as(i32, @intCast(outer.w))), .y = body_y, .w = content_w, .h = @min(@as(u32, 48), outer.h) },
+        .actions = .{ .x = outer.x + @min(panel_inset, @as(i32, @intCast(outer.w))), .y = actions_y, .w = content_w, .h = actions_h },
     };
 }
 
@@ -562,9 +570,9 @@ fn moveDialogFocus(actions: []const DialogAction, current: ?usize, reverse: bool
     return null;
 }
 
-fn dialogActionRect(geo: DialogGeometry, index: usize, count: usize) Rect {
+fn dialogActionRect(geo: DialogGeometry, index: usize, count: usize, action_gap: i32) Rect {
     if (count == 0 or index >= count or geo.actions.w == 0 or geo.actions.h == 0) return .{ .x = 0, .y = 0, .w = 0, .h = 0 };
-    const gap: u32 = 8;
+    const gap: u32 = @intCast(action_gap);
     const total_gap = gap * @as(u32, @intCast(count - 1));
     const available = geo.actions.w -| total_gap;
     const base_w = available / @as(u32, @intCast(count));
@@ -586,7 +594,17 @@ fn dialogFocusId(id: Id, index: usize) Id {
 fn runDialog(ctx: *Context, state: *PopupState) DialogResult {
     const dialog_state = &(state.dialog orelse return .{});
     const options = dialog_state.options;
-    const geo = dialogGeometry(state.pos, options, ctx.screen_w, ctx.screen_h);
+    const style = ctx.style;
+    const geo = dialogGeometry(
+        state.pos,
+        options,
+        ctx.screen_w,
+        ctx.screen_h,
+        style.spacing.dialog_panel_inset,
+        style.spacing.dialog_title_top,
+        style.spacing.dialog_body_top,
+        style.spacing.dialog_action_height,
+    );
     if (dialog_state.focus_index == null) dialog_state.focus_index = firstEnabledAction(options.actions);
 
     const input = &ctx.input;
@@ -605,7 +623,7 @@ fn runDialog(ctx: *Context, state: *PopupState) DialogResult {
     var selected: ?usize = null;
     for (options.actions, 0..) |action, i| {
         if (!action.enabled) continue;
-        const action_rect = dialogActionRect(geo, i, options.actions.len);
+        const action_rect = dialogActionRect(geo, i, options.actions.len, style.spacing.dialog_action_gap);
         if (input.mouse_pressed.left and action_rect.contains(input.mouse_pressed_pos)) {
             dialog_state.focus_index = i;
             selected = i;
@@ -635,14 +653,14 @@ fn drawDialog(ctx: *Context, id: Id, geo: DialogGeometry, options: DialogOptions
     if (geo.body.w != 0 and geo.body.h != 0) dl.textEx(.{ .x = geo.body.x, .y = geo.body.y }, options.body, style.text_tokens.subtle, null) catch @panic("dialog body: OOM");
 
     for (options.actions, 0..) |action, i| {
-        const r = dialogActionRect(geo, i, options.actions.len);
+        const r = dialogActionRect(geo, i, options.actions.len, style.spacing.dialog_action_gap);
         if (r.isEmpty()) continue;
         const hovered = action.enabled and r.contains(ctx.input.mouse_pos);
         const fill = if (!action.enabled) style.surface.control else if (hovered) style.surface.control_hover else style.surface.control;
         dl.rectFilledEx(r, fill, .{ .radius = style.control_radius }) catch @panic("dialog action: OOM");
         dl.rectOutlineEx(r, if (action.enabled) style.border_tokens.hover else style.border_tokens.normal, 1, .{ .radius = style.control_radius }) catch @panic("dialog action: OOM");
         const text_y = font_mod.centeredTextY(r.y, @intCast(r.h), font_mod.fontInkHeight(ctx.font));
-        dl.textEx(.{ .x = r.x + 8, .y = text_y }, action.label, if (action.enabled) style.text_tokens.primary else style.text_tokens.subtle, null) catch @panic("dialog action label: OOM");
+        dl.textEx(.{ .x = r.x + style.spacing.dialog_action_label_inset, .y = text_y }, action.label, if (action.enabled) style.text_tokens.primary else style.text_tokens.subtle, null) catch @panic("dialog action label: OOM");
         if (focus_index != null and focus_index.? == i and action.enabled) {
             ctx.state.focused_id = dialogFocusId(id, i);
             ctx.state.focus_visible = true;
@@ -737,7 +755,7 @@ fn draw(ctx: *Context, geo: PopupGeometry, items: []const PopupItem, hovered_idx
     // Text height is logical ink (ascent+descent). item_h / hit-test / outer frame keep style.
     const text_h = font_mod.fontInkHeight(ctx.font);
     // Reserved once for the whole list (measurePopupContentWidth + checkMarkReserve sized outer
-    // the same way), not per item: an all-unchecked list keeps text_x == r.x + 4 exactly.
+    // the same way), not per item: an all-unchecked list keeps text_x == r.x + popup_inset exactly.
     const indent = checkMarkReserve(items);
     for (items, 0..) |it, i| {
         const r = itemRect(geo, i);
@@ -752,14 +770,14 @@ fn draw(ctx: *Context, geo: PopupGeometry, items: []const PopupItem, hovered_idx
         const text_y = font_mod.centeredTextY(r.y, geo.item_h, text_h);
         if (it.checked) {
             const mark_y = font_mod.centeredTextY(r.y, geo.item_h, check_mark_w);
-            dl.rectFilled(.{ .x = r.x + 4, .y = mark_y, .w = @intCast(check_mark_w), .h = @intCast(check_mark_w) }, text_col) catch
+            dl.rectFilled(.{ .x = r.x + style.spacing.popup_inset, .y = mark_y, .w = @intCast(check_mark_w), .h = @intCast(check_mark_w) }, text_col) catch
                 @panic("popupMenu: OOM");
         }
         // Same contract as ctx.labelEx (dupe onto the arena). popupMenu is called after endFrame, but
         // the arena stays valid until the next beginFrame (see Context.beginFrame reset timing),
         // so a caller temporary buffer is safe.
         const dup = ctx.allocator().dupe(u8, it.label) catch @panic("popupMenu: OOM");
-        dl.textEx(.{ .x = r.x + 4 + indent, .y = text_y }, dup, text_col, null) catch @panic("popupMenu: OOM");
+        dl.textEx(.{ .x = r.x + style.spacing.popup_inset + indent, .y = text_y }, dup, text_col, null) catch @panic("popupMenu: OOM");
     }
 }
 
@@ -767,20 +785,20 @@ fn draw(ctx: *Context, geo: PopupGeometry, items: []const PopupItem, hovered_idx
 /// Fits on screen with `layoutPopup` clamp rules and, like popupMenu, pushes
 /// rectFilled / rectOutline / textEx onto the DrawList. text must already be duped on the frame arena
 /// (Context.tooltip does the dupe). No-op when screen_w/h is 0 (avoids layoutPopup asserts).
-/// Position: 4px below the anchor bottom (overflow clamped by layoutPopup).
+/// Position: one popup inset below the anchor bottom (overflow clamped by layoutPopup).
 pub fn drawTooltipOverlay(ctx: *Context, text: []const u8, anchor: Rect) void {
     if (ctx.screen_w == 0 or ctx.screen_h == 0) return;
     const style = ctx.style;
-    const pad = style.popup_padding;
+    const pad = style.spacing.popup_inset;
     // Same item_h contract as popup + ink vertical centering.
-    const item_h = style.popup_item_h;
+    const item_h = style.spacing.popup_item_height;
     if (item_h <= 0) return;
     const text_h = font_mod.fontInkHeight(ctx.font);
     if (text_h <= 0) return;
     const content_w: i32 = @intCast(ctx.font.measure(text));
     const pos: Vec2 = .{
         .x = anchor.x,
-        .y = anchor.y + @as(i32, @intCast(anchor.h)) + 4,
+        .y = anchor.y + @as(i32, @intCast(anchor.h)) + pad,
     };
     const geo = layoutPopup(pos, 1, content_w, item_h, pad, ctx.screen_w, ctx.screen_h);
 
@@ -793,7 +811,7 @@ pub fn drawTooltipOverlay(ctx: *Context, text: []const u8, anchor: Rect) void {
     const r = itemRect(geo, 0);
     if (r.isEmpty()) return;
     const text_y = font_mod.centeredTextY(r.y, geo.item_h, text_h);
-    dl.textEx(.{ .x = r.x + 4, .y = text_y }, text, style.text_tokens.primary, null) catch @panic("tooltip: OOM");
+    dl.textEx(.{ .x = r.x + pad, .y = text_y }, text, style.text_tokens.primary, null) catch @panic("tooltip: OOM");
 }
 
 /// Add the same (dx, dy) to `node` and every descendant. Layout rects are absolute;
@@ -808,7 +826,7 @@ pub fn translateNodeTree(node: *layout.Node, dx: i32, dy: i32) void {
     while (it) |c| : (it = c.next_sibling) translateNodeTree(c, dx, dy);
 }
 
-/// Place a custom-tooltip subtree: natural size 4px below `anchor`, then push back
+/// Place a custom-tooltip subtree: natural size `inset` below `anchor`, then push back
 /// from the right and bottom edges (no flip). If the subtree is larger than the
 /// screen, the root rect is shrunk to the screen, the whole tree is translated
 /// by the same delta, and `clip_children` cuts overflow. Tooltips do not scroll.
@@ -820,6 +838,7 @@ pub fn placeTooltipSubtree(
     anchor: Rect,
     screen_w: u32,
     screen_h: u32,
+    inset: i32,
     font: font_mod.Font,
     allocator: Allocator,
 ) void {
@@ -828,7 +847,7 @@ pub fn placeTooltipSubtree(
     layout.measureWidths(root, font);
     const nat_w: i32 = @max(root.measured_w, 1);
     const desired_x = anchor.x;
-    const desired_y = anchor.y + @as(i32, @intCast(anchor.h)) + 4;
+    const desired_y = anchor.y + @as(i32, @intCast(anchor.h)) + inset;
     layout.placeWidths(root, .{
         .x = desired_x,
         .y = desired_y,
@@ -1291,8 +1310,17 @@ test "Dialog: scrim absorbs outside input and focus stays within enabled actions
     try std.testing.expectEqual(@as(?usize, 0), ctx.popup_state.?.dialog.?.focus_index);
 
     ctx.beginFrame(800, 600);
-    const geo = dialogGeometry(ctx.popup_state.?.pos, options, 800, 600);
-    const action = dialogActionRect(geo, 0, options.actions.len);
+    const geo = dialogGeometry(
+        ctx.popup_state.?.pos,
+        options,
+        800,
+        600,
+        ctx.style.spacing.dialog_panel_inset,
+        ctx.style.spacing.dialog_title_top,
+        ctx.style.spacing.dialog_body_top,
+        ctx.style.spacing.dialog_action_height,
+    );
+    const action = dialogActionRect(geo, 0, options.actions.len, ctx.style.spacing.dialog_action_gap);
     ctx.pushEvent(.{ .mouse_down = .{ .x = action.x + 4, .y = action.y + 4, .button = 0, .modifiers = 0 } });
     ctx.endFrame();
     const clicked = ctx.dialog(42);
@@ -1344,7 +1372,16 @@ test "Dialog: action row stays inside the panel padding" {
     ctx.openDialog(42, options);
     _ = ctx.dialog(42);
 
-    const geo = dialogGeometry(ctx.popup_state.?.pos, options, 800, 600);
+    const geo = dialogGeometry(
+        ctx.popup_state.?.pos,
+        options,
+        800,
+        600,
+        ctx.style.spacing.dialog_panel_inset,
+        ctx.style.spacing.dialog_title_top,
+        ctx.style.spacing.dialog_body_top,
+        ctx.style.spacing.dialog_action_height,
+    );
     var action_rects: [2]Rect = undefined;
     var action_count: usize = 0;
     for (ctx.draw_list.cmds.items) |command| switch (command) {
@@ -1357,14 +1394,14 @@ test "Dialog: action row stays inside the panel padding" {
 
     try std.testing.expectEqual(@as(usize, action_rects.len), action_count);
     for (action_rects, 0..) |rect, i| {
-        try std.testing.expectEqualDeep(dialogActionRect(geo, i, actions.len), rect);
+        try std.testing.expectEqualDeep(dialogActionRect(geo, i, actions.len, ctx.style.spacing.dialog_action_gap), rect);
         if (i == 0) try std.testing.expectEqual(geo.title.x, rect.x);
         if (i + 1 == action_rects.len) try std.testing.expectEqual(
             @as(i64, geo.title.x) + geo.title.w,
             @as(i64, rect.x) + rect.w,
         );
         try std.testing.expectEqual(
-            geo.outer.y + @as(i32, @intCast(geo.outer.h)) - dialog_panel_padding,
+            geo.outer.y + @as(i32, @intCast(geo.outer.h)) - ctx.style.spacing.dialog_panel_inset,
             rect.y + @as(i32, @intCast(rect.h)),
         );
     }
@@ -1385,7 +1422,7 @@ test "openPopup: clears active_id/hot_id just before opening" {
 
 // ── ink-based text y ────────────────────────────────
 
-/// line_height=24, ascent=14, descent=4 → ink=18. With popup_item_h=20, text_y = item_top + 1.
+/// line_height=24, ascent=14, descent=4 → ink=18. With a 20px item height, text_y = item_top + 1.
 const GapLike = struct {
     fn measure(_: *const anyopaque, text: []const u8) u32 {
         return 8 * @as(u32, @intCast(text.len));
@@ -1421,8 +1458,8 @@ test "popup text_y is ink-centered (item_h=20, ink=18 → +1)" {
     const result = ctx.popupMenu(1, &items);
     try std.testing.expect(result.open);
 
-    const pad = ctx.style.popup_padding; // 4
-    const item_h = ctx.style.popup_item_h; // 20
+    const pad = ctx.style.spacing.popup_inset; // 4
+    const item_h = ctx.style.spacing.popup_item_height; // 20
     const ink: i32 = 18;
     try std.testing.expectEqual(ink, font_mod.fontInkHeight(ctx.font));
 
@@ -1470,8 +1507,8 @@ test "tooltip text_y uses the same item_h/ink centering as popup" {
     const anchor = geom.Rect{ .x = 50, .y = 50, .w = 40, .h = 20 };
     drawTooltipOverlay(&ctx, "tip", anchor);
 
-    const pad = ctx.style.popup_padding;
-    const item_h = ctx.style.popup_item_h;
+    const pad = ctx.style.spacing.popup_inset;
+    const item_h = ctx.style.spacing.popup_item_height;
     // layout: pos = (50, 50+20+4=74), outer.h = item_h + 2*pad
     const expected_outer_h: u32 = @intCast(item_h + 2 * pad);
     var saw_text = false;
@@ -1663,12 +1700,13 @@ test "placeTooltipSubtree: sits 4px below the anchor at natural size" {
     layout.appendChild(&root, &leaf);
 
     const anchor = Rect{ .x = 20, .y = 10, .w = 30, .h = 12 };
-    placeTooltipSubtree(&root, anchor, 800, 600, font_mod.default_font, std.testing.allocator);
+    const inset = style_mod.defaultStyle().spacing.popup_inset;
+    placeTooltipSubtree(&root, anchor, 800, 600, inset, font_mod.default_font, std.testing.allocator);
 
     try std.testing.expectEqual(@as(i32, 20), root.rect.x);
-    try std.testing.expectEqual(@as(i32, 10 + 12 + 4), root.rect.y);
+    try std.testing.expectEqual(@as(i32, 10 + 12 + inset), root.rect.y);
     try std.testing.expectEqual(@as(i32, 24), leaf.rect.x); // + padding
-    try std.testing.expectEqual(@as(i32, 10 + 12 + 4 + 4), leaf.rect.y);
+    try std.testing.expectEqual(@as(i32, 10 + 12 + inset + 4), leaf.rect.y);
     try std.testing.expect(!root.cfg.clip_children);
 }
 
@@ -1688,7 +1726,8 @@ test "placeTooltipSubtree: right and bottom overflow is pushed back, not flipped
     layout.appendChild(&root, &leaf);
 
     const anchor = Rect{ .x = 180, .y = 60, .w = 16, .h = 12 };
-    placeTooltipSubtree(&root, anchor, 200, 80, font_mod.default_font, std.testing.allocator);
+    const inset = style_mod.defaultStyle().spacing.popup_inset;
+    placeTooltipSubtree(&root, anchor, 200, 80, inset, font_mod.default_font, std.testing.allocator);
 
     try std.testing.expect(root.rect.x >= 0);
     try std.testing.expect(root.rect.y >= 0);
@@ -1716,7 +1755,8 @@ test "placeTooltipSubtree: larger than the screen shrinks the root and clips" {
     layout.appendChild(&root, &leaf);
 
     const anchor = Rect{ .x = 10, .y = 10, .w = 8, .h = 8 };
-    placeTooltipSubtree(&root, anchor, 80, 50, font_mod.default_font, std.testing.allocator);
+    const inset = style_mod.defaultStyle().spacing.popup_inset;
+    placeTooltipSubtree(&root, anchor, 80, 50, inset, font_mod.default_font, std.testing.allocator);
 
     try std.testing.expectEqual(@as(u32, 80), root.rect.w);
     try std.testing.expectEqual(@as(u32, 50), root.rect.h);

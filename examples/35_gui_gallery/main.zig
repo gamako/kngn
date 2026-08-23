@@ -719,7 +719,7 @@ fn renderTable(ctx: *gui.Context, app: *App) void {
         .{ .width = .{ .grow = 1 }, .header = "Path" },
         .{ .width = .{ .fixed = 36 }, .header = "On" },
     };
-    ctx.beginBox(.{ .width = .{ .grow = 1 }, .height = .{ .grow = 1 }, .padding = .{ 0, 0, 0, ctx.style.button_padding[3] } });
+    ctx.beginBox(.{ .width = .{ .grow = 1 }, .height = .{ .grow = 1 }, .padding = .{ 0, 0, 0, ctx.style.spacing.control_padding[3] } });
     ctx.beginTable(Ids.table, &cols, .{
         .width = .{ .grow = 1 },
         .height = .{ .grow = 1 },

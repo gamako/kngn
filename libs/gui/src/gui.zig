@@ -121,6 +121,8 @@ pub const PerIdStateStore = @import("state.zig").PerIdStateStore;
 pub const TweenState = @import("animation.zig").TweenState;
 pub const AnimationState = @import("animation.zig").AnimationState;
 pub const AnimationStyle = @import("style.zig").AnimationStyle;
+pub const SpacingScale = @import("style.zig").SpacingScale;
+pub const SpacingTokens = @import("style.zig").SpacingTokens;
 
 // Single-line text_edit core.
 // TextLayout: mapping among codepoint index (0..count), UTF-8 byte offset, and cumulative logical width.
