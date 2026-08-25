@@ -177,7 +177,7 @@ kngn/
 │   └── text.zig       # BDF text (→ future, next to libs/gfx)
 ├── kit/               # the public umbrella module (ADR-007 R4). Applications and external consumers import only this
 │   └── kit.zig        # re-exports platform, control, types, audio, gui, png, font, dsp, synth, gamepad, recipe, gmath, gfx, appshell, sound, midi and more
-├── examples/          # samples 01..45, run from the root with run-example_NN, plus image/ (the shared usako.png asset)
+├── examples/          # samples 01..47, run from the root with run-example_NN, plus image/ (the shared usako.png asset)
 ├── libs/              # L2–L3, portable reusable libraries (platform-independent as a rule, unit testable headless)
 │   ├── png/           # a PNG codec (decode and encode)
 │   ├── pixelops/      # shared pixel primitives (premultiplied and straight blends, div255, clip hoisting, u32 fill)
@@ -675,7 +675,8 @@ zig build run-example_31        # 31_sprite_ex (a drawSpriteEx demo, using kit.g
 #   27_selectable_label / 28_text_input / 29_midi_monitor / 30_sound_demo / 31_sprite_ex /
 #   32_sprite_anim / 33_camera / 34_action_map / 35_gui_gallery / 36_tilemap / 37_gui_torture /
 #   38_minigame / 39_settings_shell / 40_list_menu / 41_panel_host / 42_tracker_grid /
-#   43_game_inventory / 44_fixed_framebuffer / 45_path_drawing
+#   43_game_inventory / 44_fixed_framebuffer / 45_path_drawing / 46_style_gallery /
+#   47_screen_layout
 # examples/image/ is a shared asset with no run step.
 ```
 

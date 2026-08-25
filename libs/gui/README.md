@@ -21,6 +21,7 @@ Immediate-mode GUI library for KNGN. Standalone and platform-independent;
 | `src/text_wrap.zig` | Paragraph split, wrap, declarative overflow, low-level `truncate` |
 | `src/style.zig` | Shared widget style (colours / sizes / padding / text tiers, …) |
 | `src/widgets.zig` | Basic widgets (Button / Label / ColorSwatch / Slider / HSV picker / ScrollArea / checkbox / toggle / radio / Tabs / Listbox / ellipsis / form row) |
+| `src/table.zig` | Column table: shared column widths, an optional sticky header |
 
 ## Frame flow
 
@@ -35,6 +36,11 @@ The size passed to `beginFrame` is the **logical** size. Under a physical frameb
 from `fb.width`/`fb.height`, and `gui.render`'s `scale` has to agree with it — see
 [app-authoring.md](../../docs/app-authoring.md) for how the two relate to `content_scale` and
 the framebuffer mode.
+
+**Assembling a whole screen** out of the pieces below — which call to reach for, how the box
+tree is arranged, and the boundary between the layout placing things and the caller placing
+them — is section 5 of [app-authoring.md](../../docs/app-authoring.md), whose runnable
+reference is `examples/47_screen_layout/`. This file is the per-widget contract behind it.
 
 ## Low-level rounded primitives
 
@@ -209,6 +215,55 @@ already followed.
 
 `gui.menuBar` / `gui.menuBarPopup` (a top menu row built from `Command` definitions) use the
 classic slot under the hood and are unaffected by any of the above.
+
+## Rows of data (`src/table.zig`, the virtual list in `src/widgets.zig`)
+
+Two widgets for repeated rows, split by row count rather than by appearance.
+
+**`beginTable` / `tableHeaderRow` / `beginTableRow` / `beginTableCell` / `endTable`** share
+one column spec across every row. `TableCol.width` is a `Sizing`, so a column is content-sized
+(`.fit`), fixed, grow or percent. Cell nodes are collected as the table builds and `endTable`
+writes the resolved widths back before layout runs, the same model as a slider group — so the
+columns settle in the frame they are built, with no previous-frame lag. The contracts:
+
+- **It does not virtualize.** Every row built is built, and a `.fit` column runs
+  `layout.measure` over every cell subtree each frame. Tens of rows, not thousands; a
+  virtualized table must use fixed / grow / percent columns, because a `.fit` max taken from
+  the visible window alone would change the column widths as the user scrolls.
+- `opts.scroll` (a caller-owned `*Vec2f`) turns the body into a `ScrollArea` with a sticky
+  header strip outside the viewport. Such a table rejects `.fit` on either axis: the body is
+  grow, and grow-in-fit measures as 0, so the viewport would have no size.
+- `h_scroll` requires `opts.scroll` and rejects grow / percent columns, whose meaning is
+  "fill what is left of the viewport" and so cannot exceed it.
+- A row is `height = .fit` and each cell keeps its intrinsic height; `TableCol.align_cross`
+  aligns a cell's own content inside its box. `opts.stretch_cells` is the opt-in that
+  equalises cell heights (legal only when the row height is `.fit` or `.fixed`).
+- Tables do not nest. An **interactive** row (`TableRowOpts.interactive`) takes an id from
+  the data's identity, never from a display name — two rows sharing a label would collide.
+  A display-only row needs no id of its own.
+
+**`beginVirtualList` / `endVirtualList`** wrap a `ScrollArea` whose content height is the
+whole list, and return the half-open `VirtualRange` the caller materializes:
+
+```zig
+const range = ctx.beginVirtualList(id, &scroll, .{ .row_height = 28, .row_count = 10_000 });
+var i = range.first;
+while (i < range.end) : (i += 1) { ... }  // build only this window
+ctx.endVirtualList();
+```
+
+- Rows are a **fixed** `row_height` (plus `gap`); that pitch is what makes the index
+  arithmetic possible. `overscan` adds rows on each side of the visible window.
+- A leading spacer box stands in for the rows above `range.first`, so scroll geometry matches
+  the full list.
+- `scroll` is caller-owned. `virtualScrollToRow` moves it and must be called **before**
+  `beginVirtualList` in the same frame — step (1) of the scroll settle order (caller → thumb
+  → wheel → clamp).
+- A column header belongs **outside** the list, as a sibling box; inside it, it scrolls away.
+- `beginListboxRow` inside the loop gives single selection with a roving Tab stop, so a
+  ten-thousand-row list costs Tab one stop.
+- The first frame has no previous-frame viewport rect, so a non-`.fixed` height falls back to
+  the logical screen height and over-builds that one frame.
 
 ## Layout engine limits
 

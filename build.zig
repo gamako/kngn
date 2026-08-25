@@ -451,6 +451,7 @@ const standalone_examples = [_][]const u8{
     "34_action_map",     "35_gui_gallery",      "36_tilemap",           "37_gui_torture",
     "38_minigame",       "39_settings_shell",   "40_list_menu",         "41_panel_host",
     "42_tracker_grid",   "43_game_inventory",   "44_fixed_framebuffer", "46_style_gallery",
+    "47_screen_layout",
 };
 
 fn addCheckedChildBuild(
@@ -847,6 +848,7 @@ pub fn build(b: *std.Build) void {
             .{ .name = "example_44", .path = "examples/44_fixed_framebuffer/main.zig", .needs_sprite = false, .needs_fps_counter = false, .needs_fixed_timestep = false, .needs_text = false, .needs_gui = false, .needs_png = false, .needs_font = false, .needs_audio = false, .needs_gamepad = false, .needs_gmath = false, .needs_sound = false, .platform_features = exe_features.mascot },
             .{ .name = "example_45", .path = "examples/45_path_drawing/main.zig", .needs_sprite = false, .needs_fps_counter = false, .needs_fixed_timestep = false, .needs_text = false, .needs_gui = true, .needs_png = false, .needs_font = false, .needs_audio = false, .needs_gamepad = false, .needs_gmath = false, .needs_sound = false },
             .{ .name = "example_46", .path = "examples/46_style_gallery/main.zig", .needs_sprite = false, .needs_fps_counter = false, .needs_fixed_timestep = false, .needs_text = false, .needs_gui = true, .needs_png = false, .needs_font = false, .needs_audio = false, .needs_gamepad = false, .needs_gmath = false, .needs_sound = false },
+            .{ .name = "example_47", .path = "examples/47_screen_layout/main.zig", .needs_sprite = false, .needs_fps_counter = false, .needs_fixed_timestep = false, .needs_text = false, .needs_gui = true, .needs_png = false, .needs_font = false, .needs_audio = false, .needs_gamepad = false, .needs_gmath = false, .needs_sound = false },
         }) |example| {
             const needs: ExampleNeeds = .{
                 .needs_sprite = example.needs_sprite,
@@ -864,7 +866,7 @@ pub fn build(b: *std.Build) void {
                 .needs_sound = example.needs_sound,
                 .needs_pixelops = std.mem.eql(u8, example.name, "example_23"),
                 .platform_features = if (@hasField(@TypeOf(example), "platform_features")) example.platform_features else exe_features.base,
-                .needs_kit = std.mem.eql(u8, example.name, "example_31") or std.mem.eql(u8, example.name, "example_32") or std.mem.eql(u8, example.name, "example_33") or std.mem.eql(u8, example.name, "example_34") or std.mem.eql(u8, example.name, "example_35") or std.mem.eql(u8, example.name, "example_36") or std.mem.eql(u8, example.name, "example_37") or std.mem.eql(u8, example.name, "example_38") or std.mem.eql(u8, example.name, "example_44") or std.mem.eql(u8, example.name, "example_46") or std.mem.startsWith(u8, example.name, "example_26"),
+                .needs_kit = std.mem.eql(u8, example.name, "example_31") or std.mem.eql(u8, example.name, "example_32") or std.mem.eql(u8, example.name, "example_33") or std.mem.eql(u8, example.name, "example_34") or std.mem.eql(u8, example.name, "example_35") or std.mem.eql(u8, example.name, "example_36") or std.mem.eql(u8, example.name, "example_37") or std.mem.eql(u8, example.name, "example_38") or std.mem.eql(u8, example.name, "example_44") or std.mem.eql(u8, example.name, "example_46") or std.mem.eql(u8, example.name, "example_47") or std.mem.startsWith(u8, example.name, "example_26"),
             };
             // audio examples: audio-capable OSes only (macOS/Linux/Windows). All other examples: every OS.
             if (!needs.needs_audio or audio_supported) {

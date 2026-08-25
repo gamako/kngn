@@ -1,0 +1,86 @@
+# Screen layout replay: the assembled screen, then proof that the list is virtualized.
+#
+# The layout counters and the framebuffer alone would stay green on an empty screen, so
+# every checkpoint below also pins what the frame actually built.
+
+step 2
+digest layout_sanity
+expect layout_sanity enabled=1
+expect layout_sanity scanned=1
+expect layout_sanity text_overflow=0
+expect layout_sanity sibling_overlap=0
+expect layout_sanity content_overflow=0
+
+# The screen holds all ten thousand entries but builds only the visible window plus
+# overscan. `built<64` fails the moment the rows stop being virtualized.
+digest screen
+expect screen entries=10000
+expect screen first=0
+expect screen built>8
+expect screen built<64
+expect screen cards=3
+expect screen table_rows=4
+expect screen selected=-1
+expect screen tab=all
+snapshot fb
+
+# The header is live: clicking the second tab moves the selection, which follows the focus.
+inject mouse_move 968 28
+step 1
+inject mouse_down left
+step 1
+inject mouse_up left
+step 2
+digest screen
+expect screen tab=recent
+
+# Selecting a sidebar collection changes what the cards and the summary table say.
+inject mouse_move 80 151
+step 1
+inject mouse_down left
+step 1
+inject mouse_up left
+step 2
+digest screen
+expect screen collection=1
+snapshot fb
+
+# Selecting an entry row: the third visible row.
+inject mouse_move 400 279
+step 1
+inject mouse_down left
+step 1
+inject mouse_up left
+step 2
+digest screen
+expect screen selected=2
+
+# Scrolling to the middle moves the window without changing how much is built.
+action reveal 5000
+step 3
+digest screen
+expect screen first>4900
+expect screen built<64
+expect screen cards=3
+expect screen table_rows=4
+digest layout_sanity
+expect layout_sanity total=0
+snapshot fb
+
+# The end of the list: the window stops at the last row.
+action reveal 9999
+step 3
+digest screen
+expect screen end=10000
+expect screen built<64
+digest layout_sanity
+expect layout_sanity total=0
+snapshot fb
+
+# Back to the top.
+action reveal 0
+step 3
+digest screen
+expect screen first=0
+
+quit

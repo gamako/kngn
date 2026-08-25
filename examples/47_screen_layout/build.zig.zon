@@ -1,0 +1,18 @@
+.{
+    .name = .example_47_screen_layout,
+    .version = "0.0.0",
+    .fingerprint = 0x87bc166ecdddc2e9,
+    .minimum_zig_version = "0.16.0",
+    .dependencies = .{
+        .kngn = .{
+            .path = "../..",
+        },
+    },
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "main.zig",
+        "e2e.txt",
+        "e2e.sh",
+    },
+}
