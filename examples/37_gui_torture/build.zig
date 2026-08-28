@@ -28,8 +28,7 @@ pub fn build(b: *std.Build) void {
             .optimize = optimize,
         }),
     });
-    exe.root_module.addImport("platform", dep.module("platform"));
-    exe.root_module.addImport("gui", dep.module("gui"));
+    exe.root_module.addImport("kit", dep.module("kit"));
 
     // Every sample may print the backend it was built for.
     const opts = b.addOptions();
