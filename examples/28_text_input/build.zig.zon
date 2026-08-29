@@ -1,0 +1,17 @@
+.{
+    .name = .example_28_text_input,
+    .version = "0.0.0",
+    .fingerprint = 0x5cb87f6da3709d95,
+    .minimum_zig_version = "0.16.0",
+    .dependencies = .{
+        .kngn = .{
+            .path = "../..",
+        },
+    },
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "main.zig",
+        "sample.zon",
+    },
+}

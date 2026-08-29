@@ -1,0 +1,17 @@
+.{
+    .name = .example_11_gui_widgets,
+    .version = "0.0.0",
+    .fingerprint = 0xbbb2edbee2b929e4,
+    .minimum_zig_version = "0.16.0",
+    .dependencies = .{
+        .kngn = .{
+            .path = "../..",
+        },
+    },
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "main.zig",
+        "sample.zon",
+    },
+}

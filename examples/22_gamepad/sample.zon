@@ -1,0 +1,4 @@
+.{
+    .modules = .{ "gamepad", "platform" },
+    .features = .{ .enable_gamepad = true },
+}

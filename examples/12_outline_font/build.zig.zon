@@ -1,0 +1,17 @@
+.{
+    .name = .example_12_outline_font,
+    .version = "0.0.0",
+    .fingerprint = 0x1db861b2f180780b,
+    .minimum_zig_version = "0.16.0",
+    .dependencies = .{
+        .kngn = .{
+            .path = "../..",
+        },
+    },
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "main.zig",
+        "sample.zon",
+    },
+}

@@ -1,0 +1,5 @@
+.{
+    .modules = .{ "audio", "platform" },
+    .features = .{ .enable_audio = true },
+    .console_subsystem = true,
+}

@@ -1,0 +1,4 @@
+.{
+    .modules = .{ "midi", "platform" },
+    .features = .{ .enable_midi = true },
+}

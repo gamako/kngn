@@ -6,6 +6,10 @@ const kngn_build = @import("kngn");
 const helpers = kngn_build.build_helpers.consumer;
 const macos = kngn_build.build_helpers.macos;
 
+/// What this sample is wired with. The build in the kngn repository reads the same file, so
+/// the wiring is stated once rather than once per build script.
+const decl: helpers.SampleDecl = @import("sample.zon");
+
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
@@ -18,7 +22,8 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
         .platform = backend,
-        .enable_gamepad = true,
+        .enable_gamepad = decl.effectiveFeatures().enable_gamepad,
+        .enable_menu = decl.effectiveFeatures().enable_menu,
     });
 
     const exe = b.addExecutable(.{
@@ -29,8 +34,7 @@ pub fn build(b: *std.Build) void {
             .optimize = optimize,
         }),
     });
-    exe.root_module.addImport("platform", dep.module("platform"));
-    exe.root_module.addImport("gamepad", dep.module("gamepad"));
+    inline for (decl.modules) |name| exe.root_module.addImport(name, dep.module(name));
 
     // Every sample may print the backend it was built for.
     const opts = b.addOptions();
@@ -41,7 +45,10 @@ pub fn build(b: *std.Build) void {
         macos.resolveMacOSSDKPaths(b, null, null)
     else
         null;
-    helpers.setupConsumerExe(b, exe, dep, backend, sdk_paths, .{ .enable_gamepad = true });
+    helpers.setupConsumerExe(b, exe, dep, backend, sdk_paths, decl.effectiveFeatures());
+    // A sample that prints instead of opening a window keeps the console subsystem, so that its
+    // output is visible. setupConsumerExe sets the windowed one for everybody, so this comes after.
+    if (target.result.os.tag == .windows and decl.console_subsystem) exe.subsystem = .Console;
 
     b.installArtifact(exe);
 

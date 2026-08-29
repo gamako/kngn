@@ -1,0 +1,4 @@
+.{
+    .modules = .{ "pixelops", "platform" },
+    .features = .{ .enable_fullscreen = true, .enable_text_input = false },
+}

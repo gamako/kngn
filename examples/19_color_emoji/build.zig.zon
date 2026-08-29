@@ -1,0 +1,17 @@
+.{
+    .name = .example_19_color_emoji,
+    .version = "0.0.0",
+    .fingerprint = 0x58cc0bf2f8d52e9d,
+    .minimum_zig_version = "0.16.0",
+    .dependencies = .{
+        .kngn = .{
+            .path = "../..",
+        },
+    },
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "main.zig",
+        "sample.zon",
+    },
+}

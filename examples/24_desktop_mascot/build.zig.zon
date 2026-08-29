@@ -1,0 +1,17 @@
+.{
+    .name = .example_24_desktop_mascot,
+    .version = "0.0.0",
+    .fingerprint = 0x219856e4f5238340,
+    .minimum_zig_version = "0.16.0",
+    .dependencies = .{
+        .kngn = .{
+            .path = "../..",
+        },
+    },
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "main.zig",
+        "sample.zon",
+    },
+}

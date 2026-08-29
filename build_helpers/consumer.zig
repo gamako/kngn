@@ -120,6 +120,65 @@ pub const PlatformFeatures = struct {
 /// A consumer build script assembles a native executable: it links a prebuilt archive and
 /// system libraries, neither of which exists for wasm. The wasm artefacts are built by the
 /// kngn package itself, which owns the reactor root, the memory layout and the web package.
+/// What a sample states about itself, once, for both builds that can produce it.
+///
+/// A sample that ships as its own package is built two ways: by the build in the repository it
+/// lives in, and as that standalone package. Both have to agree on how it is wired, and a fact written in
+/// two build scripts drifts — a sample whose source moved to `kit` while one script still passed
+/// the old modules fails only in the build nobody ran. So the sample states it in a `sample.zon`
+/// next to its source and both scripts read that file.
+///
+/// The standalone script reads it with `@import` and a type annotation:
+///
+///     const decl: helpers.SampleDecl = @import("sample.zon");
+///
+/// The repository's own build reads the same file as text, because a file may belong to only one
+/// module: when the sample builds standalone both build scripts are live, and importing the file
+/// from both fails with "file exists in modules 'root.@build' and 'root.@dependencies...'".
+///
+/// Only fields a build can act on belong here. An application outside this repository has no
+/// second script reading its wiring, so it writes its `addImport` calls and its
+/// `PlatformFeatures` directly instead — this type exists to keep two scripts in step, which is
+/// not a problem such an application has.
+pub const SampleDecl = struct {
+    /// The modules the sample imports by name. This list is what a standalone build wires with
+    /// `addImport`, so a name missing here is a module the sample cannot import. The build in the
+    /// kngn repository wires `platform` and `keyboard` for every sample regardless, so naming
+    /// those two changes nothing on that side while still being required on this one.
+    modules: []const []const u8,
+    /// The capabilities the executable takes. `enable_gamepad` and `enable_menu` also have to
+    /// reach `b.dependency` as package options, so a standalone script passes them from here as
+    /// well as to `setupConsumerExe`.
+    features: PlatformFeatures = .{},
+    /// Windows: keep the console subsystem rather than the windowed one that
+    /// `setupConsumerExe` sets. For a sample that writes to stdout instead of opening a window,
+    /// whose output is invisible under the windowed subsystem. Apply it after
+    /// `setupConsumerExe`, which sets the windowed one for everybody.
+    console_subsystem: bool = false,
+
+    /// The capabilities this executable actually takes: what `features` states, plus what naming
+    /// a module implies. Importing `audio`, `midi` or `gamepad` by name means the executable uses
+    /// that subsystem, and each of those needs something linked on the executable's side, so the
+    /// module list implies the flag.
+    ///
+    /// **Both builds resolve the declaration through this, so that neither can derive a different
+    /// answer from the same file.** Stating the module and leaving the flag off would otherwise
+    /// link the libraries in one build and not the other.
+    pub fn effectiveFeatures(self: SampleDecl) PlatformFeatures {
+        var resolved = self.features;
+        for (self.modules) |name| {
+            if (std.mem.eql(u8, name, "audio")) {
+                resolved.enable_audio = true;
+            } else if (std.mem.eql(u8, name, "midi")) {
+                resolved.enable_midi = true;
+            } else if (std.mem.eql(u8, name, "gamepad")) {
+                resolved.enable_gamepad = true;
+            }
+        }
+        return resolved;
+    }
+};
+
 pub fn assertStandaloneNativeBackend(backend: PlatformType) void {
     if (backend != .wasm) return;
     @panic("this build script targets a native backend; wasm artefacts come from the kngn package's own `zig build package-web`");

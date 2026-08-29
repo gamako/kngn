@@ -8,6 +8,7 @@ pub const build_helpers = struct {
 };
 
 const platform = @import("build_helpers/platform.zig");
+const example_modules = @import("build_helpers/example_modules.zig");
 const macos = @import("build_helpers/macos.zig");
 
 const APP_NAME = "kngn_demo";
@@ -441,16 +442,54 @@ fn assertVendoredHelpersIdentical(b: *std.Build) void {
 /// When the parent was invoked with an explicit `-Dplatform` / `-Doptimize` (or `--release`),
 /// those flags are forwarded; otherwise the child uses its own host defaults.
 /// Cross-compilation of a child is not a gate guarantee (no automatic target rewrite).
-/// Every sample that builds on its own as a package. The sweep gate walks this list, so a
+/// Every sample that can build on its own as a package. The sweep gate walks this list, so a
 /// new sample joins the gate by being added here.
 const standalone_examples = [_][]const u8{
-    "01_timed_window",   "02_keyboard_input",   "03_sprite_rendering",  "04_fixed_timestep",
-    "05_text_rendering", "06_sprite_benchmark", "07_mouse_input",       "15_audio_tone",
-    "21_char_input",     "22_gamepad",          "23_fullscreen",        "25_collision_demo",
-    "26_appshell_demo",  "30_sound_demo",       "32_sprite_anim",       "33_camera",
-    "34_action_map",     "35_gui_gallery",      "36_tilemap",           "37_gui_torture",
-    "38_minigame",       "39_settings_shell",   "40_list_menu",         "41_panel_host",
-    "42_tracker_grid",   "43_game_inventory",   "44_fixed_framebuffer", "46_style_gallery",
+    "01_timed_window",
+    "02_keyboard_input",
+    "03_sprite_rendering",
+    "04_fixed_timestep",
+    "05_text_rendering",
+    "06_sprite_benchmark",
+    "07_mouse_input",
+    "08_gui_primitives",
+    "09_gui_interaction",
+    "10_gui_layout",
+    "11_gui_widgets",
+    "12_outline_font",
+    "13_gui_slider",
+    "14_gui_color_picker",
+    "15_audio_tone",
+    "16_gui_scroll",
+    "17_gui_toggles",
+    "18_cursor",
+    "19_color_emoji",
+    "21_char_input",
+    "22_gamepad",
+    "23_fullscreen",
+    "24_desktop_mascot",
+    "25_collision_demo",
+    "26_appshell_demo",
+    "27_selectable_label",
+    "28_text_input",
+    "29_midi_monitor",
+    "30_sound_demo",
+    "31_sprite_ex",
+    "32_sprite_anim",
+    "33_camera",
+    "34_action_map",
+    "35_gui_gallery",
+    "36_tilemap",
+    "37_gui_torture",
+    "38_minigame",
+    "39_settings_shell",
+    "40_list_menu",
+    "41_panel_host",
+    "42_tracker_grid",
+    "43_game_inventory",
+    "44_fixed_framebuffer",
+    "45_path_drawing",
+    "46_style_gallery",
     "47_screen_layout",
 };
 
@@ -694,7 +733,7 @@ pub fn build(b: *std.Build) void {
     const shared_modules = SharedModules.init(b, false, wasm_harness, enable_gamepad_ext, enable_menu_ext, max_modules_option, max_modules_mod, target, platform_option);
 
     // Names a package consumer can ask for beyond the six `SharedModules.init` registers
-    // itself. Every sample in `examples/` builds on its own as a package (its own
+    // itself. Every standalone-capable sample in `examples/` builds as a package of its own (its own
     // `build.zig.zon` naming this one), and a sample's source imports the individual library
     // it demonstrates rather than the umbrella, so those import names have to resolve.
     //
@@ -712,6 +751,7 @@ pub fn build(b: *std.Build) void {
     publishModuleAlias(b, "fps_counter", shared_modules.fps_counter);
     publishModuleAlias(b, "text", shared_modules.text);
     publishModuleAlias(b, "audio", shared_modules.audio.mod);
+    publishModuleAlias(b, "midi", shared_modules.midi.mod);
     publishModuleAlias(b, "gamepad", shared_modules.gamepad.mod);
     publishModuleAlias(b, "pixelops", shared_modules.pixelops.mod);
     publishModuleAlias(b, "sound", shared_modules.sound.mod);
@@ -799,82 +839,74 @@ pub fn build(b: *std.Build) void {
         }
 
         // ----- Sample programs -----
-        // Declare the modules each example needs.
-        // Every entry supplies the required fields (name / path / the needs_* listed here); the
-        // optional ones are read with @hasField below, so an entry that does not use them omits them.
+        // Every sample states how it is wired in its own `sample.zon` (`SampleDecl`): the modules
+        // it imports, the capabilities it takes, and whether it keeps the console subsystem on
+        // Windows. Its standalone build.zig reads the same file, so neither build can drift from
+        // the other. A row here gives only where to find the sample and its declaration.
+        //
+        // examples/20_capture_demo is not in this table. It direct-imports the camera facade, the
+        // harness, the synthetic capture source and the visualisation modules (spectrogram, scope,
+        // synth), none of which the package publishes, so it cannot be a package of its own and is
+        // wired by hand above.
         inline for (.{
-            .{ .name = "example_01", .path = "examples/01_timed_window/main.zig", .needs_sprite = false, .needs_fps_counter = false, .needs_fixed_timestep = false, .needs_text = false, .needs_gui = false, .needs_png = false, .needs_font = false, .needs_audio = false, .needs_gamepad = false, .needs_gmath = false, .needs_sound = false },
-            .{ .name = "example_02", .path = "examples/02_keyboard_input/main.zig", .needs_sprite = false, .needs_fps_counter = false, .needs_fixed_timestep = false, .needs_text = false, .needs_gui = false, .needs_png = false, .needs_font = false, .needs_audio = false, .needs_gamepad = false, .needs_gmath = false, .needs_sound = false },
-            .{ .name = "example_03", .path = "examples/03_sprite_rendering/main.zig", .needs_sprite = true, .needs_fps_counter = false, .needs_fixed_timestep = false, .needs_text = false, .needs_gui = false, .needs_png = false, .needs_font = false, .needs_audio = false, .needs_gamepad = false, .needs_gmath = false, .needs_sound = false },
-            .{ .name = "example_04", .path = "examples/04_fixed_timestep/main.zig", .needs_sprite = false, .needs_fps_counter = true, .needs_fixed_timestep = true, .needs_text = false, .needs_gui = false, .needs_png = false, .needs_font = false, .needs_audio = false, .needs_gamepad = false, .needs_gmath = false, .needs_sound = false },
-            .{ .name = "example_05", .path = "examples/05_text_rendering/main.zig", .needs_sprite = false, .needs_fps_counter = true, .needs_fixed_timestep = false, .needs_text = true, .needs_gui = false, .needs_png = false, .needs_font = true, .needs_audio = false, .needs_gamepad = false, .needs_gmath = false, .needs_sound = false },
-            .{ .name = "example_06", .path = "examples/06_sprite_benchmark/main.zig", .needs_sprite = true, .needs_fps_counter = true, .needs_fixed_timestep = false, .needs_text = false, .needs_gui = false, .needs_png = false, .needs_font = false, .needs_audio = false, .needs_gamepad = false, .needs_gmath = false, .needs_sound = false },
-            .{ .name = "example_07", .path = "examples/07_mouse_input/main.zig", .needs_sprite = false, .needs_fps_counter = false, .needs_fixed_timestep = false, .needs_text = false, .needs_gui = false, .needs_png = false, .needs_font = false, .needs_audio = false, .needs_gamepad = false, .needs_gmath = false, .needs_sound = false },
-            .{ .name = "example_08", .path = "examples/08_gui_primitives/main.zig", .needs_sprite = false, .needs_fps_counter = false, .needs_fixed_timestep = false, .needs_text = false, .needs_gui = true, .needs_png = true, .needs_font = false, .needs_audio = false, .needs_gamepad = false, .needs_gmath = false, .needs_sound = false },
-            .{ .name = "example_09", .path = "examples/09_gui_interaction/main.zig", .needs_sprite = false, .needs_fps_counter = false, .needs_fixed_timestep = false, .needs_text = false, .needs_gui = true, .needs_png = false, .needs_font = false, .needs_audio = false, .needs_gamepad = false, .needs_gmath = false, .needs_sound = false },
-            .{ .name = "example_10", .path = "examples/10_gui_layout/main.zig", .needs_sprite = false, .needs_fps_counter = false, .needs_fixed_timestep = false, .needs_text = false, .needs_gui = true, .needs_png = false, .needs_font = false, .needs_audio = false, .needs_gamepad = false, .needs_gmath = false, .needs_sound = false },
-            .{ .name = "example_11", .path = "examples/11_gui_widgets/main.zig", .needs_sprite = false, .needs_fps_counter = false, .needs_fixed_timestep = false, .needs_text = false, .needs_gui = true, .needs_png = false, .needs_font = false, .needs_audio = false, .needs_gamepad = false, .needs_gmath = false, .needs_sound = false },
-            .{ .name = "example_12", .path = "examples/12_outline_font/main.zig", .needs_sprite = false, .needs_fps_counter = false, .needs_fixed_timestep = false, .needs_text = false, .needs_gui = false, .needs_png = false, .needs_font = true, .needs_audio = false, .needs_gamepad = false, .needs_gmath = false, .needs_sound = false },
-            .{ .name = "example_13", .path = "examples/13_gui_slider/main.zig", .needs_sprite = false, .needs_fps_counter = false, .needs_fixed_timestep = false, .needs_text = false, .needs_gui = true, .needs_png = false, .needs_font = false, .needs_audio = false, .needs_gamepad = false, .needs_gmath = false, .needs_sound = false },
-            .{ .name = "example_14", .path = "examples/14_gui_color_picker/main.zig", .needs_sprite = false, .needs_fps_counter = false, .needs_fixed_timestep = false, .needs_text = false, .needs_gui = true, .needs_png = false, .needs_font = false, .needs_audio = false, .needs_gamepad = false, .needs_gmath = false, .needs_sound = false },
-            .{ .name = "example_15", .path = "examples/15_audio_tone/main.zig", .needs_sprite = false, .needs_fps_counter = false, .needs_fixed_timestep = false, .needs_text = false, .needs_gui = false, .needs_png = false, .needs_font = false, .needs_audio = true, .needs_gamepad = false, .needs_gmath = false, .needs_sound = false },
-            .{ .name = "example_16", .path = "examples/16_gui_scroll/main.zig", .needs_sprite = false, .needs_fps_counter = false, .needs_fixed_timestep = false, .needs_text = false, .needs_gui = true, .needs_png = false, .needs_font = false, .needs_audio = false, .needs_gamepad = false, .needs_gmath = false, .needs_sound = false },
-            .{ .name = "example_17", .path = "examples/17_gui_toggles/main.zig", .needs_sprite = false, .needs_fps_counter = false, .needs_fixed_timestep = false, .needs_text = false, .needs_gui = true, .needs_png = false, .needs_font = false, .needs_audio = false, .needs_gamepad = false, .needs_gmath = false, .needs_sound = false },
-            .{ .name = "example_18", .path = "examples/18_cursor/main.zig", .needs_sprite = false, .needs_fps_counter = false, .needs_fixed_timestep = false, .needs_text = false, .needs_gui = false, .needs_png = false, .needs_font = false, .needs_audio = false, .needs_gamepad = false, .needs_gmath = false, .needs_sound = false, .platform_features = exe_features.cursor },
-            .{ .name = "example_19", .path = "examples/19_color_emoji/main.zig", .needs_sprite = false, .needs_fps_counter = false, .needs_fixed_timestep = false, .needs_text = false, .needs_gui = false, .needs_png = false, .needs_font = true, .needs_audio = false, .needs_gamepad = false, .needs_gmath = false, .needs_sound = false },
-            .{ .name = "example_21", .path = "examples/21_char_input/main.zig", .needs_sprite = false, .needs_fps_counter = false, .needs_fixed_timestep = false, .needs_text = false, .needs_gui = false, .needs_png = false, .needs_font = true, .needs_audio = false, .needs_gamepad = false, .needs_gmath = false, .needs_sound = false },
-            .{ .name = "example_22", .path = "examples/22_gamepad/main.zig", .needs_sprite = false, .needs_fps_counter = false, .needs_fixed_timestep = false, .needs_text = false, .needs_gui = false, .needs_png = false, .needs_font = false, .needs_audio = false, .needs_gamepad = true, .needs_gmath = false, .needs_sound = false },
-            .{ .name = "example_23", .path = "examples/23_fullscreen/main.zig", .needs_sprite = false, .needs_fps_counter = false, .needs_fixed_timestep = false, .needs_text = false, .needs_gui = false, .needs_png = false, .needs_font = false, .needs_audio = false, .needs_gamepad = false, .needs_gmath = false, .needs_sound = false, .platform_features = exe_features.fullscreen },
-            .{ .name = "example_24", .path = "examples/24_desktop_mascot/main.zig", .needs_sprite = false, .needs_fps_counter = false, .needs_fixed_timestep = false, .needs_text = false, .needs_gui = false, .needs_png = true, .needs_font = false, .needs_audio = false, .needs_gamepad = false, .needs_gmath = false, .needs_sound = false, .platform_features = exe_features.mascot },
-            .{ .name = "example_25", .path = "examples/25_collision_demo/main.zig", .needs_sprite = false, .needs_fps_counter = false, .needs_fixed_timestep = false, .needs_text = false, .needs_gui = false, .needs_png = false, .needs_font = false, .needs_audio = false, .needs_gamepad = false, .needs_gmath = true, .needs_sound = false },
-            .{ .name = "example_26", .path = "examples/26_appshell_demo/main.zig", .needs_sprite = false, .needs_fps_counter = false, .needs_fixed_timestep = false, .needs_text = false, .needs_gui = true, .needs_png = false, .needs_font = true, .needs_paint = true, .needs_audio = false, .needs_gamepad = false, .needs_gmath = false, .needs_sound = false },
-            .{ .name = "example_27", .path = "examples/27_selectable_label/main.zig", .needs_sprite = false, .needs_fps_counter = false, .needs_fixed_timestep = false, .needs_text = false, .needs_gui = true, .needs_png = false, .needs_font = true, .needs_audio = false, .needs_gamepad = false, .needs_gmath = false, .needs_sound = false },
-            .{ .name = "example_28", .path = "examples/28_text_input/main.zig", .needs_sprite = false, .needs_fps_counter = false, .needs_fixed_timestep = false, .needs_text = false, .needs_gui = true, .needs_png = false, .needs_font = true, .needs_audio = false, .needs_gamepad = false, .needs_gmath = false, .needs_sound = false },
-            .{ .name = "example_29", .path = "examples/29_midi_monitor/main.zig", .needs_sprite = false, .needs_fps_counter = false, .needs_fixed_timestep = false, .needs_text = false, .needs_gui = false, .needs_png = false, .needs_font = false, .needs_audio = false, .needs_gamepad = false, .needs_gmath = false, .needs_sound = false },
-            .{ .name = "example_30", .path = "examples/30_sound_demo/main.zig", .needs_sprite = false, .needs_fps_counter = false, .needs_fixed_timestep = false, .needs_text = false, .needs_gui = false, .needs_png = false, .needs_font = false, .needs_audio = true, .needs_gamepad = false, .needs_gmath = false, .needs_sound = true },
-            .{ .name = "example_31", .path = "examples/31_sprite_ex/main.zig", .needs_sprite = false, .needs_fps_counter = false, .needs_fixed_timestep = false, .needs_text = false, .needs_gui = false, .needs_png = false, .needs_font = false, .needs_audio = false, .needs_gamepad = false, .needs_gmath = false, .needs_sound = false },
-            .{ .name = "example_32", .path = "examples/32_sprite_anim/main.zig", .needs_sprite = false, .needs_fps_counter = false, .needs_fixed_timestep = false, .needs_text = false, .needs_gui = false, .needs_png = false, .needs_font = false, .needs_audio = false, .needs_gamepad = false, .needs_gmath = false, .needs_sound = false },
-            .{ .name = "example_33", .path = "examples/33_camera/main.zig", .needs_sprite = false, .needs_fps_counter = false, .needs_fixed_timestep = false, .needs_text = false, .needs_gui = false, .needs_png = false, .needs_font = false, .needs_audio = false, .needs_gamepad = false, .needs_gmath = false, .needs_sound = false },
-            .{ .name = "example_34", .path = "examples/34_action_map/main.zig", .needs_sprite = false, .needs_fps_counter = false, .needs_fixed_timestep = false, .needs_text = false, .needs_gui = false, .needs_png = false, .needs_font = false, .needs_audio = false, .needs_gamepad = true, .needs_gmath = false, .needs_sound = false },
-            .{ .name = "example_35", .path = "examples/35_gui_gallery/main.zig", .needs_sprite = false, .needs_fps_counter = false, .needs_fixed_timestep = false, .needs_text = false, .needs_gui = true, .needs_png = false, .needs_font = false, .needs_audio = false, .needs_gamepad = false, .needs_gmath = false, .needs_sound = false, .needs_kit = true },
-            .{ .name = "example_36", .path = "examples/36_tilemap/main.zig", .needs_sprite = false, .needs_fps_counter = false, .needs_fixed_timestep = false, .needs_text = false, .needs_gui = false, .needs_png = false, .needs_font = false, .needs_audio = false, .needs_gamepad = false, .needs_gmath = false, .needs_sound = false },
-            .{ .name = "example_37", .path = "examples/37_gui_torture/main.zig", .needs_sprite = false, .needs_fps_counter = false, .needs_fixed_timestep = false, .needs_text = false, .needs_gui = true, .needs_png = false, .needs_font = false, .needs_audio = false, .needs_gamepad = false, .needs_gmath = false, .needs_sound = false, .needs_kit = true },
-            .{ .name = "example_38", .path = "examples/38_minigame/main.zig", .needs_sprite = false, .needs_fps_counter = false, .needs_fixed_timestep = false, .needs_text = false, .needs_gui = false, .needs_png = false, .needs_font = false, .needs_audio = true, .needs_gamepad = false, .needs_gmath = false, .needs_sound = true },
-            .{ .name = "example_39", .path = "examples/39_settings_shell/main.zig", .needs_sprite = false, .needs_fps_counter = false, .needs_fixed_timestep = false, .needs_text = false, .needs_gui = true, .needs_png = false, .needs_font = false, .needs_audio = false, .needs_gamepad = false, .needs_gmath = false, .needs_sound = false },
-            .{ .name = "example_40", .path = "examples/40_list_menu/main.zig", .needs_sprite = false, .needs_fps_counter = false, .needs_fixed_timestep = false, .needs_text = false, .needs_gui = true, .needs_png = false, .needs_font = false, .needs_audio = false, .needs_gamepad = false, .needs_gmath = false, .needs_sound = false },
-            .{ .name = "example_41", .path = "examples/41_panel_host/main.zig", .needs_sprite = false, .needs_fps_counter = false, .needs_fixed_timestep = false, .needs_text = false, .needs_gui = true, .needs_png = false, .needs_font = false, .needs_audio = false, .needs_gamepad = false, .needs_gmath = false, .needs_sound = false },
-            .{ .name = "example_42", .path = "examples/42_tracker_grid/main.zig", .needs_sprite = false, .needs_fps_counter = false, .needs_fixed_timestep = false, .needs_text = false, .needs_gui = true, .needs_png = false, .needs_font = false, .needs_audio = false, .needs_gamepad = false, .needs_gmath = false, .needs_sound = false },
-            .{ .name = "example_43", .path = "examples/43_game_inventory/main.zig", .needs_sprite = false, .needs_fps_counter = false, .needs_fixed_timestep = false, .needs_text = false, .needs_gui = true, .needs_png = false, .needs_font = false, .needs_audio = false, .needs_gamepad = true, .needs_gmath = false, .needs_sound = false },
-            .{ .name = "example_44", .path = "examples/44_fixed_framebuffer/main.zig", .needs_sprite = false, .needs_fps_counter = false, .needs_fixed_timestep = false, .needs_text = false, .needs_gui = false, .needs_png = false, .needs_font = false, .needs_audio = false, .needs_gamepad = false, .needs_gmath = false, .needs_sound = false, .platform_features = exe_features.mascot },
-            .{ .name = "example_45", .path = "examples/45_path_drawing/main.zig", .needs_sprite = false, .needs_fps_counter = false, .needs_fixed_timestep = false, .needs_text = false, .needs_gui = true, .needs_png = false, .needs_font = false, .needs_audio = false, .needs_gamepad = false, .needs_gmath = false, .needs_sound = false },
-            .{ .name = "example_46", .path = "examples/46_style_gallery/main.zig", .needs_sprite = false, .needs_fps_counter = false, .needs_fixed_timestep = false, .needs_text = false, .needs_gui = true, .needs_png = false, .needs_font = false, .needs_audio = false, .needs_gamepad = false, .needs_gmath = false, .needs_sound = false },
-            .{ .name = "example_47", .path = "examples/47_screen_layout/main.zig", .needs_sprite = false, .needs_fps_counter = false, .needs_fixed_timestep = false, .needs_text = false, .needs_gui = true, .needs_png = false, .needs_font = false, .needs_audio = false, .needs_gamepad = false, .needs_gmath = false, .needs_sound = false },
+            .{ .name = "example_01", .path = "examples/01_timed_window/main.zig", .decl_zon = "examples/01_timed_window/sample.zon" },
+            .{ .name = "example_02", .path = "examples/02_keyboard_input/main.zig", .decl_zon = "examples/02_keyboard_input/sample.zon" },
+            .{ .name = "example_03", .path = "examples/03_sprite_rendering/main.zig", .decl_zon = "examples/03_sprite_rendering/sample.zon" },
+            .{ .name = "example_04", .path = "examples/04_fixed_timestep/main.zig", .decl_zon = "examples/04_fixed_timestep/sample.zon" },
+            .{ .name = "example_05", .path = "examples/05_text_rendering/main.zig", .decl_zon = "examples/05_text_rendering/sample.zon" },
+            .{ .name = "example_06", .path = "examples/06_sprite_benchmark/main.zig", .decl_zon = "examples/06_sprite_benchmark/sample.zon" },
+            .{ .name = "example_07", .path = "examples/07_mouse_input/main.zig", .decl_zon = "examples/07_mouse_input/sample.zon" },
+            .{ .name = "example_08", .path = "examples/08_gui_primitives/main.zig", .decl_zon = "examples/08_gui_primitives/sample.zon" },
+            .{ .name = "example_09", .path = "examples/09_gui_interaction/main.zig", .decl_zon = "examples/09_gui_interaction/sample.zon" },
+            .{ .name = "example_10", .path = "examples/10_gui_layout/main.zig", .decl_zon = "examples/10_gui_layout/sample.zon" },
+            .{ .name = "example_11", .path = "examples/11_gui_widgets/main.zig", .decl_zon = "examples/11_gui_widgets/sample.zon" },
+            .{ .name = "example_12", .path = "examples/12_outline_font/main.zig", .decl_zon = "examples/12_outline_font/sample.zon" },
+            .{ .name = "example_13", .path = "examples/13_gui_slider/main.zig", .decl_zon = "examples/13_gui_slider/sample.zon" },
+            .{ .name = "example_14", .path = "examples/14_gui_color_picker/main.zig", .decl_zon = "examples/14_gui_color_picker/sample.zon" },
+            .{ .name = "example_15", .path = "examples/15_audio_tone/main.zig", .decl_zon = "examples/15_audio_tone/sample.zon" },
+            .{ .name = "example_16", .path = "examples/16_gui_scroll/main.zig", .decl_zon = "examples/16_gui_scroll/sample.zon" },
+            .{ .name = "example_17", .path = "examples/17_gui_toggles/main.zig", .decl_zon = "examples/17_gui_toggles/sample.zon" },
+            .{ .name = "example_18", .path = "examples/18_cursor/main.zig", .decl_zon = "examples/18_cursor/sample.zon" },
+            .{ .name = "example_19", .path = "examples/19_color_emoji/main.zig", .decl_zon = "examples/19_color_emoji/sample.zon" },
+            .{ .name = "example_21", .path = "examples/21_char_input/main.zig", .decl_zon = "examples/21_char_input/sample.zon" },
+            .{ .name = "example_22", .path = "examples/22_gamepad/main.zig", .decl_zon = "examples/22_gamepad/sample.zon" },
+            .{ .name = "example_23", .path = "examples/23_fullscreen/main.zig", .decl_zon = "examples/23_fullscreen/sample.zon" },
+            .{ .name = "example_24", .path = "examples/24_desktop_mascot/main.zig", .decl_zon = "examples/24_desktop_mascot/sample.zon" },
+            .{ .name = "example_25", .path = "examples/25_collision_demo/main.zig", .decl_zon = "examples/25_collision_demo/sample.zon" },
+            .{ .name = "example_26", .path = "examples/26_appshell_demo/main.zig", .decl_zon = "examples/26_appshell_demo/sample.zon" },
+            .{ .name = "example_27", .path = "examples/27_selectable_label/main.zig", .decl_zon = "examples/27_selectable_label/sample.zon" },
+            .{ .name = "example_28", .path = "examples/28_text_input/main.zig", .decl_zon = "examples/28_text_input/sample.zon" },
+            .{ .name = "example_29", .path = "examples/29_midi_monitor/main.zig", .decl_zon = "examples/29_midi_monitor/sample.zon" },
+            .{ .name = "example_30", .path = "examples/30_sound_demo/main.zig", .decl_zon = "examples/30_sound_demo/sample.zon" },
+            .{ .name = "example_31", .path = "examples/31_sprite_ex/main.zig", .decl_zon = "examples/31_sprite_ex/sample.zon" },
+            .{ .name = "example_32", .path = "examples/32_sprite_anim/main.zig", .decl_zon = "examples/32_sprite_anim/sample.zon" },
+            .{ .name = "example_33", .path = "examples/33_camera/main.zig", .decl_zon = "examples/33_camera/sample.zon" },
+            .{ .name = "example_34", .path = "examples/34_action_map/main.zig", .decl_zon = "examples/34_action_map/sample.zon" },
+            .{ .name = "example_35", .path = "examples/35_gui_gallery/main.zig", .decl_zon = "examples/35_gui_gallery/sample.zon" },
+            .{ .name = "example_36", .path = "examples/36_tilemap/main.zig", .decl_zon = "examples/36_tilemap/sample.zon" },
+            .{ .name = "example_37", .path = "examples/37_gui_torture/main.zig", .decl_zon = "examples/37_gui_torture/sample.zon" },
+            .{ .name = "example_38", .path = "examples/38_minigame/main.zig", .decl_zon = "examples/38_minigame/sample.zon" },
+            .{ .name = "example_39", .path = "examples/39_settings_shell/main.zig", .decl_zon = "examples/39_settings_shell/sample.zon" },
+            .{ .name = "example_40", .path = "examples/40_list_menu/main.zig", .decl_zon = "examples/40_list_menu/sample.zon" },
+            .{ .name = "example_41", .path = "examples/41_panel_host/main.zig", .decl_zon = "examples/41_panel_host/sample.zon" },
+            .{ .name = "example_42", .path = "examples/42_tracker_grid/main.zig", .decl_zon = "examples/42_tracker_grid/sample.zon" },
+            .{ .name = "example_43", .path = "examples/43_game_inventory/main.zig", .decl_zon = "examples/43_game_inventory/sample.zon" },
+            .{ .name = "example_44", .path = "examples/44_fixed_framebuffer/main.zig", .decl_zon = "examples/44_fixed_framebuffer/sample.zon" },
+            .{ .name = "example_45", .path = "examples/45_path_drawing/main.zig", .decl_zon = "examples/45_path_drawing/sample.zon" },
+            .{ .name = "example_46", .path = "examples/46_style_gallery/main.zig", .decl_zon = "examples/46_style_gallery/sample.zon" },
+            .{ .name = "example_47", .path = "examples/47_screen_layout/main.zig", .decl_zon = "examples/47_screen_layout/sample.zon" },
         }) |example| {
-            const needs: ExampleNeeds = .{
-                .needs_sprite = example.needs_sprite,
-                .needs_fps_counter = example.needs_fps_counter,
-                .needs_fixed_timestep = example.needs_fixed_timestep,
-                .needs_text = example.needs_text,
-                .needs_gui = example.needs_gui,
-                .needs_png = example.needs_png,
-                .needs_font = example.needs_font,
-                .needs_paint = if (@hasField(@TypeOf(example), "needs_paint")) example.needs_paint else false,
-                .needs_audio = example.needs_audio,
-                .needs_gamepad = example.needs_gamepad,
-                .needs_midi = std.mem.eql(u8, example.name, "example_29"),
-                .needs_gmath = example.needs_gmath,
-                .needs_sound = example.needs_sound,
-                .needs_pixelops = std.mem.eql(u8, example.name, "example_23"),
-                .platform_features = if (@hasField(@TypeOf(example), "platform_features")) example.platform_features else exe_features.base,
-                .needs_kit = std.mem.eql(u8, example.name, "example_31") or std.mem.eql(u8, example.name, "example_32") or std.mem.eql(u8, example.name, "example_33") or std.mem.eql(u8, example.name, "example_34") or std.mem.eql(u8, example.name, "example_35") or std.mem.eql(u8, example.name, "example_36") or std.mem.eql(u8, example.name, "example_37") or std.mem.eql(u8, example.name, "example_38") or std.mem.eql(u8, example.name, "example_44") or std.mem.eql(u8, example.name, "example_46") or std.mem.eql(u8, example.name, "example_47") or std.mem.startsWith(u8, example.name, "example_26"),
-            };
+            // A sample with its own build.zig states everything in `sample.zon`, and both builds
+            // read that one file.
+            const resolved = exampleDeclFromFile(b, example.decl_zon);
+            const needs = resolved.needs;
             // audio examples: audio-capable OSes only (macOS/Linux/Windows). All other examples: every OS.
             if (!needs.needs_audio or audio_supported) {
                 const ex_exe = addExampleExe(b, target, optimize, platform_root, sdk_paths, be, artifactName(b, example.name, be, default_be), example.path, &shared_modules, &pm, needs);
-                // Tools with no window that write to stdout (example_06 bench / example_15 audio tone)
-                // keep the console subsystem on Windows too (override setupExecutableForPlatform GUI subsystem).
-                if (target_os == .windows and comptime (std.mem.eql(u8, example.name, "example_06") or
-                    std.mem.eql(u8, example.name, "example_15"))) ex_exe.subsystem = .Console;
+                // A sample that prints instead of opening a window keeps the console subsystem, so
+                // that its output is visible. It states that in its own declaration, which its
+                // standalone build reads too.
+                if (target_os == .windows and resolved.console_subsystem) ex_exe.subsystem = .Console;
                 // examples always install for every backend, independent of install-all
                 // (keeps the existing behaviour of catching platform-layer / example compile regressions on every `zig build`).
                 b.installArtifact(ex_exe);
@@ -1003,10 +1035,10 @@ pub fn build(b: *std.Build) void {
     );
     check_consumer_step.dependOn(check_vendor_step);
 
-    // Standalone gates. Every sample in `examples/` and the editor build on their own as
+    // Standalone gates. Every standalone-capable sample in `examples/` and the editor build as
     // packages depending on this one, which is the same path an application outside this
     // repository takes. Two levels: a few representative samples plus the editor run with
-    // `zig build test`, and the full sweep of every sample joins `-Dinstall-all=true`,
+    // `zig build test`, and the full sweep of those samples joins `-Dinstall-all=true`,
     // because a link step per sample is more than the aggregate test should carry.
     //
     // These run on every host. A sample reaches the build helpers through the package, so
@@ -1742,6 +1774,20 @@ pub fn build(b: *std.Build) void {
     const run_serde_test = b.addRunArtifact(serde_test);
     const test_serde_step = b.step("test-serde", "Run libs/serde versioned container tests");
     test_serde_step.dependOn(&run_serde_test.step);
+
+    // build_helpers/example_modules unit tests (parsing a sample's module list)
+    const example_modules_test_mod = b.createModule(.{
+        .root_source_file = b.path("build_helpers/example_modules.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    const example_modules_test = b.addTest(.{ .root_module = example_modules_test_mod });
+    const run_example_modules_test = b.addRunArtifact(example_modules_test);
+    const test_example_modules_step = b.step(
+        "test-example-modules",
+        "Run the parser for a sample's module list (accepts comments, rejects empty / nested / unknown)",
+    );
+    test_example_modules_step.dependOn(&run_example_modules_test.step);
 
     // libs/appshell unit tests (settings / window state / recent files)
     const appshell_test_mod = b.createModule(.{
@@ -2965,6 +3011,7 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(test_pixelops_step);
     test_step.dependOn(test_serde_step);
     test_step.dependOn(test_appshell_step);
+    test_step.dependOn(test_example_modules_step);
     test_step.dependOn(test_recipe_step);
     test_step.dependOn(test_gmath_step);
     test_step.dependOn(test_sound_step);
@@ -3411,16 +3458,22 @@ fn artifactName(b: *std.Build, base: []const u8, be: platform.PlatformType, defa
 /// modules carry the flags as `build_options`. Adding an executable with a set that is not
 /// here stops the build with a message from `PlatformModules.variant`, so the list can never
 /// silently fall behind.
+/// The feature sets a platform module variant is built for. `all` below is that list, and asking
+/// for a set that is not in it stops the build (see `PlatformModules.forFeatures`), so a sample
+/// declaring a new combination in its `sample.zon` needs an entry here first.
+///
+/// The entries name the shape of the set rather than the executables that take it: a sample states
+/// its own set in its `sample.zon`, so which sample uses which is not knowable from here.
 const exe_features = struct {
-    /// Nothing optional. Most examples, the main program, synth.
+    /// Nothing optional.
     const base: platform.PlatformFeatures = .{};
-    /// GameController input (examples 22 and 34).
+    /// GameController input: a framework link on the executable's side as well as the variant.
     const gamepad: platform.PlatformFeatures = .{ .enable_gamepad = true };
-    /// System cursor shapes (example 18).
+    /// System cursor shapes.
     const cursor: platform.PlatformFeatures = .{ .enable_cursor = true };
-    /// A fullscreen window and nothing else — example 23 reads keys, never characters.
+    /// A fullscreen window, for an executable that reads keys and never characters.
     const fullscreen: platform.PlatformFeatures = .{ .enable_fullscreen = true, .enable_text_input = false };
-    /// A transparent, borderless, click-through window — example 24 takes no text either.
+    /// A transparent, borderless, click-through window, for an executable that takes no text.
     const mascot: platform.PlatformFeatures = .{ .enable_mascot = true, .enable_text_input = false };
     /// The pixel editor: a native menu bar, file panels, a crosshair over the canvas, and
     /// fullscreen (it persists `windowedGeometry`).
@@ -4060,15 +4113,87 @@ const ExampleNeeds = struct {
     needs_font: bool,
     needs_paint: bool = false,
     needs_audio: bool,
-    needs_gamepad: bool, // examples/22_gamepad / 34_action_map
-    needs_midi: bool, // true only for examples/29_midi_monitor
-    needs_gmath: bool, // true only for examples/25_collision_demo
-    needs_sound: bool, // true only for examples/30_sound_demo
-    needs_pixelops: bool = false, // true only for examples/23_fullscreen
-    needs_kit: bool = false, // example_31/32/33/34/36/38 / example_26
+    needs_gamepad: bool, // the gamepad capability opt-in, not only the module
+    needs_midi: bool, // the MIDI frameworks as well as the module
+    needs_gmath: bool, // derived from a sample's module list
+    needs_sound: bool, // derived from a sample's module list
+    needs_pixelops: bool = false, // derived from a sample's module list
+    needs_kit: bool = false, // derived from a sample's module list
     /// The macOS backend feature set (`exe_features`). `needs_gamepad` folds into it in
     /// `exampleFeatures`, so an example states its gamepad need once.
     platform_features: platform.PlatformFeatures = exe_features.base,
+};
+
+/// Read a sample's declaration and turn it into the flags the wiring below switches on.
+///
+/// The declaration lives next to the sample and is read by `build_helpers/example_modules.zig`,
+/// which documents why this build reads the file rather than importing it. Module flags come from
+/// the list of names; everything a list of names cannot express — a system library to link, a
+/// capability to turn on, the Windows subsystem — comes from the same file's other fields, so the
+/// standalone build and this one cannot disagree about any of it.
+fn exampleDeclFromFile(b: *std.Build, zon_rel_path: []const u8) ExampleDecl {
+    const raw = std.Io.Dir.cwd().readFileAlloc(
+        b.graph.io,
+        b.pathFromRoot(zon_rel_path),
+        b.allocator,
+        .limited(64 * 1024),
+    ) catch |err|
+        std.debug.panic("{s}: unreadable: {s}", .{ zon_rel_path, @errorName(err) });
+    const source = b.allocator.dupeZ(u8, raw) catch @panic("OOM");
+
+    var diag: std.zon.parse.Diagnostics = .{};
+    const result = example_modules.parse(b.allocator, source, &diag) catch @panic("OOM");
+    const parsed = switch (result) {
+        .ok => |parsed| parsed,
+        .malformed => std.debug.panic(
+            "{s}: expected a sample declaration, as in `.{{ .modules = .{{\"kit\"}} }}`:\n{f}",
+            .{ zon_rel_path, &diag },
+        ),
+        .empty => std.debug.panic(
+            "{s}: names no module; a sample that imports nothing cannot build",
+            .{zon_rel_path},
+        ),
+        .unknown => |name| std.debug.panic(
+            "{s}: names a module this build does not wire: {s}",
+            .{ zon_rel_path, name },
+        ),
+    };
+    const set = parsed.modules;
+
+    // Both builds resolve the declaration the same way (`SampleDecl.effectiveFeatures`), so the
+    // module list and the feature flags cannot mean one thing here and another in the sample's own
+    // build.
+    const features = parsed.decl.effectiveFeatures();
+
+    return .{
+        .needs = .{
+            .needs_sprite = set.contains(.sprite),
+            .needs_fps_counter = set.contains(.fps_counter),
+            .needs_fixed_timestep = set.contains(.fixed_timestep),
+            .needs_text = set.contains(.text),
+            .needs_gui = set.contains(.gui),
+            .needs_png = set.contains(.png),
+            .needs_font = set.contains(.font),
+            .needs_paint = set.contains(.paint),
+            .needs_audio = features.enable_audio,
+            .needs_gamepad = features.enable_gamepad,
+            .needs_midi = features.enable_midi,
+            .needs_gmath = set.contains(.gmath),
+            .needs_sound = set.contains(.sound),
+            .needs_pixelops = set.contains(.pixelops),
+            .needs_kit = set.contains(.kit),
+            .platform_features = features,
+            // `platform` and `keyboard` are wired for every sample, so naming them sets nothing.
+        },
+        .console_subsystem = parsed.decl.console_subsystem,
+    };
+}
+
+/// What one row of the table below resolves to: the module and capability flags, plus the facts
+/// the wiring applies to the executable itself.
+const ExampleDecl = struct {
+    needs: ExampleNeeds,
+    console_subsystem: bool = false,
 };
 
 /// The one feature set an example's platform module, kit module and object file all use.
@@ -4105,7 +4230,7 @@ fn addExampleExe(
     });
     // Every example uses platform / keyboard
     // (examples are teaching material outside R5=kit-only; keep legacy per-module wiring)
-    // Gamepad opt-in: only needs_gamepad examples (22 / 34) use the
+    // Gamepad opt-in: only samples whose declaration resolves to `enable_gamepad` use the
     // opt-in-enabled platform module (GameController framework link + enable gamepad code in the Swift backend).
     // Other examples use the default opt-in-disabled side (existing exes unchanged).
     const variant = pm.variant(exampleFeatures(needs));
@@ -4142,10 +4267,6 @@ fn addExampleExe(
         // needs_gamepad kit examples use kit_gamepad wired to platform_gamepad.
         exe.root_module.addImport("kit", variant.kit.mod);
     }
-    if (std.mem.startsWith(u8, name, "example_26")) {
-        exe.root_module.addImport("appshell", common.appshell.mod);
-    }
-
     // build_options: for showing platform name / build mode in the startup banner.
     // Any example may read `@import("build_options").platform_name`.
     // (Separate module scope from build_options.platform_backend on the platform module)

@@ -1,0 +1,17 @@
+.{
+    .name = .example_27_selectable_label,
+    .version = "0.0.0",
+    .fingerprint = 0x4e3f8833741f57b0,
+    .minimum_zig_version = "0.16.0",
+    .dependencies = .{
+        .kngn = .{
+            .path = "../..",
+        },
+    },
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "main.zig",
+        "sample.zon",
+    },
+}

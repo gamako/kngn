@@ -1,0 +1,17 @@
+.{
+    .name = .example_31_sprite_ex,
+    .version = "0.0.0",
+    .fingerprint = 0x3fffc32d17c63414,
+    .minimum_zig_version = "0.16.0",
+    .dependencies = .{
+        .kngn = .{
+            .path = "../..",
+        },
+    },
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "main.zig",
+        "sample.zon",
+    },
+}

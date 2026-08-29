@@ -1,0 +1,3 @@
+.{
+    .modules = .{ "font", "fps_counter", "keyboard", "platform", "text" },
+}

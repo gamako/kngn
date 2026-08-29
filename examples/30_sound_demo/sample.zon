@@ -1,0 +1,4 @@
+.{
+    .modules = .{ "audio", "platform", "sound" },
+    .features = .{ .enable_audio = true },
+}

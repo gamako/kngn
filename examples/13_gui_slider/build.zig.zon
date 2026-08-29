@@ -1,0 +1,17 @@
+.{
+    .name = .example_13_gui_slider,
+    .version = "0.0.0",
+    .fingerprint = 0x10c55da8ba16cf0c,
+    .minimum_zig_version = "0.16.0",
+    .dependencies = .{
+        .kngn = .{
+            .path = "../..",
+        },
+    },
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "main.zig",
+        "sample.zon",
+    },
+}

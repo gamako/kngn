@@ -1,0 +1,17 @@
+.{
+    .name = .example_14_gui_color_picker,
+    .version = "0.0.0",
+    .fingerprint = 0x4597db5363230dc9,
+    .minimum_zig_version = "0.16.0",
+    .dependencies = .{
+        .kngn = .{
+            .path = "../..",
+        },
+    },
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "main.zig",
+        "sample.zon",
+    },
+}

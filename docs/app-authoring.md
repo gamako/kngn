@@ -1111,6 +1111,12 @@ copyable reference for an application's own layout checks.
 
 - `.path` (or fetch) dependency on kngn with matching `target` / `optimize` / `platform`
 - `exe.root_module.addImport("kit", dep.module("kit"))`
+  - The samples under `examples/` do the same thing one level of indirection away: each states
+    what it is wired with in its own `sample.zon` and reads that, because the build in this
+    repository reads the same file to wire its copy of the sample. Copying a sample therefore
+    means editing `sample.zon`, not the `addImport` call. An application outside this repository
+    has no second build reading its wiring, so the direct call above is the simpler form and the
+    one to write.
 - Vendor `build_helpers/{consumer,macos,swift}.zig` as **byte-identical** copies of
   `kngn/build_helpers/` (the parent gate fails configuration on drift)
 - `helpers.setupConsumerExe(...)` for macOS archives/frameworks, Wayland private `.c`,

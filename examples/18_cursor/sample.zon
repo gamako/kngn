@@ -1,0 +1,4 @@
+.{
+    .modules = .{"platform"},
+    .features = .{ .enable_cursor = true },
+}

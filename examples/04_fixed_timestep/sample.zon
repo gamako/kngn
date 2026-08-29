@@ -1,0 +1,3 @@
+.{
+    .modules = .{ "fixed_timestep", "fps_counter", "platform" },
+}

@@ -1,0 +1,4 @@
+.{
+    .modules = .{"kit"},
+    .features = .{ .enable_audio = true },
+}

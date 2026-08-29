@@ -1,0 +1,4 @@
+.{
+    .modules = .{"kit"},
+    .features = .{ .enable_mascot = true, .enable_text_input = false },
+}

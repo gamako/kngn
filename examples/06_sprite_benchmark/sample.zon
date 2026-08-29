@@ -1,0 +1,4 @@
+.{
+    .modules = .{ "fps_counter", "platform", "sprite" },
+    .console_subsystem = true,
+}
