@@ -101,6 +101,13 @@ pub const centeredTextY = @import("font.zig").centeredTextY;
 
 pub const render = @import("render.zig").render;
 
+/// Rendering with a per-command breakdown, for investigating where a frame's rasterization
+/// goes. `render` is the ordinary entry point and carries none of this.
+pub const renderProfiled = @import("render.zig").renderProfiled;
+pub const RenderProfile = @import("render.zig").RenderProfile;
+pub const RenderBucket = @import("render.zig").RenderBucket;
+pub const RenderClock = @import("render.zig").RenderClock;
+
 // Input management + ID stack + composition state + Context
 pub const InputEvent = @import("input.zig").InputEvent;
 pub const Input = @import("input.zig").Input;

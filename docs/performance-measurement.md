@@ -56,6 +56,75 @@ There is a worked example of drawing the wrong conclusion by not aligning these.
    (the same window measured ≈1020fps headless at 1x against ≈101fps on-screen at 2x).
    Never mix them in a comparison.
 
+## Where a frame's rasterization goes (`gui.renderProfiled`)
+
+`gui_render` is one section, so a frame that spends most of its time there says *that*
+rasterization is expensive without saying *what* is. `gui.renderProfiled` takes the ordinary
+arguments plus a clock and a `RenderProfile`, and charges every command to a source bucket.
+`gui.render` is unchanged and carries none of it.
+
+The clock is the caller's, and it must be a real monotonic one (`platform.getRealTime`): under
+a replay `platform.getTime` is the harness's virtual clock and every bucket reads zero.
+
+### The measurement that motivated it
+
+A 1440x900 dashboard built on `kit`, headless, ReleaseFast, averaged over 1200 frames after a
+200-frame warmup. Command counts suggested text was the cost — 125 text commands against 7
+shadows. They were not:
+
+| Bucket | ms/frame | Share | Commands/frame | Per command |
+|---|---:|---:|---:|---:|
+| shadow | 0.890 | **51.0%** | 7.00 | **≈128 µs** |
+| path_stroke | 0.240 | 13.6% | 22.00 | ≈11 µs |
+| path_fill | 0.200 | 11.4% | 1.00 | ≈200 µs |
+| text | 0.130 | 7.4% | 124.66 | ≈1.0 µs |
+| rounded_fill | 0.106 | 6.0% | 42.33 | ≈2.5 µs |
+| sharp_fill | 0.072 | 4.1% | 12.67 | ≈5.7 µs |
+| line | 0.053 | 3.0% | 18.67 | ≈2.8 µs |
+| image | 0.033 | 1.9% | 4.00 | ≈8.3 µs |
+| rounded_outline | 0.023 | 1.3% | 23.67 | ≈0.95 µs |
+| circle_filled | 0.006 | 0.3% | 41.66 | ≈0.13 µs |
+
+`sharp_outline` and `circle_outline` are absent from the table because this screen emitted
+none; the other ten buckets account for the whole total.
+
+**A shadow cost 128 times what a text command did.** Reading command counts as a proxy for
+cost would have pointed at the wrong half of the frame.
+
+### Why the numbers are believable, and where they are not
+
+The bucket total (1.739–1.769 ms over three runs) sits beside the application's own
+`gui_render` section (1.717–1.749 ms), measured on a different path. Two independent
+measurements agreeing to within about 1.5% is the check worth having. They are not the same
+statistic — the bucket total is a mean and the section is a p50 — so treat the agreement as a
+sanity check rather than an identity, and do not expect one to bound the other.
+
+Three qualifications belong with any number this produces:
+
+- **A bucket is a marginal quantity, not an intrinsic cost.** Shared glyph, corner and shadow
+  caches, write locality and branch prediction all make a command cheaper or dearer depending
+  on what surrounds it. Bucket times explain how a *scene* is composed.
+- **Cheap buckets are inflated.** The closing clock read is charged to the command, so a
+  command costing 0.13 µs carries a read of tens of nanoseconds. It does not move a bucket
+  costing 128 µs per command.
+- **Measure headless.** The same scene on screen measured 58% slower and far less repeatable:
+  2.48–3.04 ms across three runs, a range of 22% of the median, against 1.76–1.78 ms and 1.4%
+  headless. The cause is not more work. On screen the loop waits — metal's present takes the
+  fifo and inflight waits inside it when the caller is free-running — and a loop that spends
+  most of its period waiting runs at a lower clock, so the same rasterization measures slower.
+  That is the effect the section totals exist to expose; see the frame pacing section below,
+  which measures present at 12.8 ms on the same backend.
+
+### A cache can be hit every time and still be the cost
+
+The shadow mask cache missed **twice in 1200 frames** and evicted nothing, so on the usual
+reading it was working perfectly. It was, and shadow was still half the frame: the 9-slice
+blit moved **986,936 pixels per frame**, 76% of the window's area, on every one of those hits.
+
+`DrawList.shadowMaskDiagnostics()` and `cornerMaskDiagnostics()` report `blit_pixels` and
+`coverage_pixels` next to the hit and miss counts for this reason. **A miss count of zero
+answers "is the cache working", never "is this cheap".**
+
 ## Frame pacing: a low fps is not necessarily a drawing cost
 
 A fixed sleep (`platform.frameDelay(16ms)`) does not subtract the frame's work time, so

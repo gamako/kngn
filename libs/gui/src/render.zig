@@ -20,6 +20,154 @@ pub const DrawList = draw_mod.DrawList;
 pub const BitmapFont = font_mod.BitmapFont;
 pub const Font = font_mod.Font;
 
+/// The source bucket a `DrawCmd` is charged to when rendering is profiled.
+///
+/// **One command is charged to exactly one bucket.** These are the *source* kinds an
+/// application emits, not the stages the renderer runs: a sharp outline is drawn as several
+/// filled rectangles internally, a circle goes through the rounded implementation, and a
+/// stroked path flattens, expands and rasterizes. Those stages overlap across buckets, so
+/// bucket times explain how the *scene* is composed, not how the renderer spends its
+/// instructions. Do not add stage costs to bucket costs.
+pub const RenderBucket = enum {
+    sharp_fill,
+    rounded_fill,
+    sharp_outline,
+    rounded_outline,
+    circle_filled,
+    circle_outline,
+    line,
+    text,
+    image,
+    path_fill,
+    path_stroke,
+    shadow,
+
+    pub const count = @typeInfo(RenderBucket).@"enum".fields.len;
+};
+
+/// What `renderProfiled` accumulates. The caller owns it, resets it, and reads it; rendering
+/// never allocates, formats or logs.
+///
+/// **What the numbers are.** `seconds[b]` is the wall time spent dispatching the commands in
+/// bucket `b` *in this scene, in this order, with these caches warm*. It is a marginal
+/// quantity, not an intrinsic per-kind cost: shared glyph, corner and shadow caches, write
+/// locality and branch prediction all make a command cheaper or dearer depending on what
+/// surrounds it.
+///
+/// **What the profile does not cover.** Domain validation is outside every bucket: at a scale
+/// other than one it runs before the span starts, and at scale one it does not run as a
+/// separate pass at all. A bucket therefore measures drawing, not the checking that precedes
+/// it, and `total()` is correspondingly a little under the whole of a `gui_render` section.
+///
+/// **What the span covers.** Profiling reads the clock twice per command, but a bucket's
+/// elapsed time spans the command body and the closing read only: classification and the
+/// opening read happen before the span starts, and recording happens after it ends. The
+/// closing read is therefore charged to the command, which matters when reading a cheap
+/// bucket — a command costing a fraction of a microsecond carries a read of tens of
+/// nanoseconds. `counts` is there to size that per bucket.
+pub const RenderProfile = struct {
+    /// Commands charged to each bucket.
+    counts: [RenderBucket.count]u64 = @splat(0),
+    /// Seconds spent in each bucket. The closing clock read falls inside the interval; the
+    /// opening one does not.
+    seconds: [RenderBucket.count]f64 = @splat(0),
+    /// Commands dispatched, whether or not they drew anything.
+    commands: u64 = 0,
+    /// Commands the renderer skipped because their clip was empty. They are dispatched and
+    /// charged like any other, because the dispatch is real work even when the drawing is not.
+    ///
+    /// The clip is tested at the scale the renderer uses, not the logical one: at a scale below
+    /// one, a clip a pixel wide scales to nothing and the command is skipped even though its
+    /// logical clip is not empty.
+    empty_clip: u64 = 0,
+    /// Commands whose paint was a gradient rather than a solid colour.
+    gradient: u64 = 0,
+    /// Commands whose parameters select an anti-aliased route. A sharp rectangle carries an
+    /// `aa` flag the sharp path never consults and a zero-radius circle is not drawn at all,
+    /// so neither is counted; a path is, because it always goes through the coverage
+    /// rasterizer. It counts the route chosen, **not** pixels anti-aliased: a command clipped
+    /// to nothing, or a path with no area, is counted and shades nothing.
+    antialiased: u64 = 0,
+    /// Text commands carrying their own font rather than using the one passed to `render`.
+    font_override: u64 = 0,
+
+    pub fn total(self: *const RenderProfile) f64 {
+        var sum: f64 = 0;
+        for (self.seconds) |v| sum += v;
+        return sum;
+    }
+
+    fn add(self: *RenderProfile, bucket: RenderBucket, elapsed: f64) void {
+        const i = @intFromEnum(bucket);
+        self.counts[i] += 1;
+        self.seconds[i] += elapsed;
+    }
+};
+
+/// Whether the renderer will skip this command for want of a clip, at the scale it renders at.
+fn skipsOnClip(clip: Rect, scale: f32) bool {
+    return if (scale == 1.0) clip.isEmpty() else scaleRect(clip, scale).isEmpty();
+}
+
+/// The bucket a command is charged to. Attributes (gradient, anti-aliasing, a font override)
+/// are counted separately, because they cut across the buckets rather than partitioning them.
+fn classify(cmd: draw_mod.DrawCmd, scale: f32, profile: *RenderProfile) RenderBucket {
+    profile.commands += 1;
+    switch (cmd) {
+        .rect_filled => |c| {
+            if (c.paint != .solid) profile.gradient += 1;
+            if (c.radius != 0 and c.aa) profile.antialiased += 1;
+            if (skipsOnClip(c.clip, scale)) profile.empty_clip += 1;
+            return if (c.radius == 0) .sharp_fill else .rounded_fill;
+        },
+        .rect_outline => |c| {
+            if (c.radius != 0 and c.aa) profile.antialiased += 1;
+            if (skipsOnClip(c.clip, scale)) profile.empty_clip += 1;
+            return if (c.radius == 0) .sharp_outline else .rounded_outline;
+        },
+        .circle_filled => |c| {
+            if (c.aa and c.radius != 0) profile.antialiased += 1;
+            if (skipsOnClip(c.clip, scale)) profile.empty_clip += 1;
+            return .circle_filled;
+        },
+        .circle_outline => |c| {
+            if (c.aa and c.radius != 0) profile.antialiased += 1;
+            if (skipsOnClip(c.clip, scale)) profile.empty_clip += 1;
+            return .circle_outline;
+        },
+        .line => |c| {
+            if (skipsOnClip(c.clip, scale)) profile.empty_clip += 1;
+            return .line;
+        },
+        .text => |c| {
+            if (c.font != null) profile.font_override += 1;
+            if (skipsOnClip(c.clip, scale)) profile.empty_clip += 1;
+            return .text;
+        },
+        .image => |c| {
+            if (skipsOnClip(c.clip, scale)) profile.empty_clip += 1;
+            return .image;
+        },
+        .path => |c| {
+            if (c.aa) profile.antialiased += 1;
+            if (skipsOnClip(c.clip, scale)) profile.empty_clip += 1;
+            return if (c.stroke == null) .path_fill else .path_stroke;
+        },
+        .shadow => |c| {
+            if (skipsOnClip(c.clip, scale)) profile.empty_clip += 1;
+            return .shadow;
+        },
+    }
+}
+
+/// A clock for `renderProfiled`, injected by the caller.
+///
+/// It must be a **real** monotonic clock (`platform.getRealTime`, not `platform.getTime`):
+/// under a replay the latter is the harness's virtual clock and every bucket would read zero.
+/// The GUI does not reach for one itself, because that would make this layer depend on a
+/// platform backend — the same reason `core/control/frame_prof.zig` has its caller inject one.
+pub const RenderClock = *const fn () f64;
+
 /// Largest `scale` `render` accepts. A coordinate of 2^20 plus an extent of
 /// 2^20 is 2^21; times 256 is 2^29, which still fits in i32 after `drawLine`
 /// expands the AABB by thickness (`max - min` plus thickness).
@@ -131,7 +279,38 @@ fn pathInDomain(c: @FieldType(draw_mod.DrawCmd, "path")) bool {
 ///
 /// `.text` keeps logical coordinates when scale==1.0; when scale!=1.0 it
 /// physicalizes pos/clip and passes scale to Font.drawTo.
+/// Rasterize a `DrawList` onto `target`.
 pub fn render(target: RenderTarget, draw_list: *DrawList, font: Font, scale: f32) void {
+    var discard: RenderProfile = .{};
+    renderImpl(false, target, draw_list, font, scale, undefined, &discard);
+}
+
+/// Rasterize as `render` does, and charge each command to a `RenderBucket`.
+///
+/// The breakdown costs two clock reads per command, so this is a diagnostic entry point, not
+/// a drop-in replacement: an application calls it while investigating and calls `render` the
+/// rest of the time. `render` is compiled with the collection branch off, so the ordinary path
+/// carries no counter, no clock read and no runtime test.
+pub fn renderProfiled(
+    target: RenderTarget,
+    draw_list: *DrawList,
+    font: Font,
+    scale: f32,
+    clock: RenderClock,
+    profile: *RenderProfile,
+) void {
+    renderImpl(true, target, draw_list, font, scale, clock, profile);
+}
+
+fn renderImpl(
+    comptime collect: bool,
+    target: RenderTarget,
+    draw_list: *DrawList,
+    font: Font,
+    scale: f32,
+    clock: RenderClock,
+    profile: *RenderProfile,
+) void {
     std.debug.assert(target.pixels.len == @as(usize, target.width) * @as(usize, target.height));
     if (!scaleWithinDomain(scale)) {
         std.debug.panic("gui.render: scale {e} is outside the accepted range (0, {d}]", .{ scale, MAX_SCALE });
@@ -139,6 +318,10 @@ pub fn render(target: RenderTarget, draw_list: *DrawList, font: Font, scale: f32
 
     if (scale == 1.0) {
         for (draw_list.cmds.items) |cmd| {
+            const prof_start = if (collect) blk: {
+                const b = classify(cmd, scale, profile);
+                break :blk .{ b, clock() };
+            } else {};
             switch (cmd) {
                 .rect_filled => |c| if (!c.clip.isEmpty()) {
                     if (!paintInDomain(c.paint)) {
@@ -180,14 +363,22 @@ pub fn render(target: RenderTarget, draw_list: *DrawList, font: Font, scale: f32
                 .path => |c| if (!c.clip.isEmpty()) drawPath(target, draw_list, c, 1.0, true),
                 .shadow => |c| if (!c.clip.isEmpty()) drawShadow(target, draw_list, c.rect, c.color, c.options, c.clip, 1.0, true),
             }
+            if (collect) profile.add(prof_start[0], clock() - prof_start[1]);
         }
         return;
     }
 
     for (draw_list.cmds.items) |cmd| {
+        // The domain check comes first: classification scales the clip to decide whether the
+        // renderer will skip the command, and scaling a coordinate that is out of domain
+        // overflows before the panic that is supposed to report it.
         if (!cmdWithinDomain(cmd)) {
             std.debug.panic("gui.render: DrawCmd {s} is outside the accepted domain", .{@tagName(cmd)});
         }
+        const prof_start = if (collect) blk: {
+            const b = classify(cmd, scale, profile);
+            break :blk .{ b, clock() };
+        } else {};
         switch (cmd) {
             .rect_filled => |c| {
                 const phys_clip = scaleRect(c.clip, scale);
@@ -304,6 +495,7 @@ pub fn render(target: RenderTarget, draw_list: *DrawList, font: Font, scale: f32
                 drawShadow(target, draw_list, scaleRect(c.rect, scale), c.color, c.options, scaleRect(c.clip, scale), scale, true);
             },
         }
+        if (collect) profile.add(prof_start[0], clock() - prof_start[1]);
     }
 }
 
@@ -4249,4 +4441,298 @@ test "render: domain maxima at MAX_SCALE do not panic" {
     } });
 
     render(target, &dl, font_mod.default_font, MAX_SCALE);
+}
+
+// ============================================================================
+// renderProfiled tests
+//
+// A scripted clock is used rather than a real one, so these assert what the profiler
+// records rather than how fast the machine is. A wall clock would make them flaky and,
+// worse, would let a profiler that always reports zero pass on a fast machine.
+// ============================================================================
+
+var test_clock_now: f64 = 0;
+var test_clock_step: f64 = 0;
+
+fn testClock() f64 {
+    const now = test_clock_now;
+    test_clock_now += test_clock_step;
+    return now;
+}
+
+fn testTarget(pixels: []u32, w: u32, h: u32) RenderTarget {
+    return .{ .pixels = pixels, .width = w, .height = h };
+}
+
+/// One command of each source bucket, so a classification mistake shows up as a count in the
+/// wrong place rather than as a plausible-looking total.
+fn buildOneOfEach(dl: *DrawList, arena: std.mem.Allocator) !void {
+    const col = Color.rgba(0xFF, 0x20, 0x40, 0xFF);
+    const r: Rect = .{ .x = 2, .y = 2, .w = 20, .h = 12 };
+    try dl.rectFilled(r, col); // sharp_fill
+    try dl.rectFilledEx(r, col, .{ .radius = 4 }); // rounded_fill
+    try dl.rectOutline(r, col, 1); // sharp_outline
+    try dl.rectOutlineEx(r, col, 1, .{ .radius = 4 }); // rounded_outline
+    try dl.circleFilled(.{ .x = 30, .y = 30 }, 6, col, .{}); // circle_filled
+    try dl.circleOutline(.{ .x = 30, .y = 30 }, 6, col, 1, .{}); // circle_outline
+    try dl.line(.{ .x = 0, .y = 0 }, .{ .x = 10, .y = 10 }, col, 1); // line
+    try dl.text(.{ .x = 1, .y = 1 }, "hi", col); // text
+    // The DrawList holds a borrowed slice, so these pixels have to outlive this function.
+    const px = try arena.alloc(u32, 4);
+    @memset(px, 0xFF00FF00);
+    try dl.image(r, px, 2, 2); // image
+    {
+        var pb = dl.beginPath(arena);
+        try pb.moveTo(.{ .x = 4, .y = 4 });
+        try pb.lineTo(.{ .x = 16, .y = 4 });
+        try pb.lineTo(.{ .x = 16, .y = 16 });
+        try pb.finish(.{ .color = col }); // path_fill
+    }
+    {
+        var pb = dl.beginPath(arena);
+        try pb.moveTo(.{ .x = 4, .y = 20 });
+        try pb.lineTo(.{ .x = 16, .y = 20 });
+        try pb.stroke(.{ .color = col, .width = 2 }); // path_stroke
+    }
+    try dl.shadow(r, col, .{ .radius = 4, .blur = 3 }); // shadow
+}
+
+test "renderProfiled: every source bucket is charged exactly once" {
+    const gpa = std.testing.allocator;
+    var dl = DrawList.init(gpa);
+    defer dl.deinit();
+    dl.reset(64, 64);
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    try buildOneOfEach(&dl, arena_state.allocator());
+
+    var pixels = [_]u32{0} ** (64 * 64);
+    var profile: RenderProfile = .{};
+    test_clock_now = 0;
+    test_clock_step = 1;
+    renderProfiled(testTarget(&pixels, 64, 64), &dl, font_mod.default_font, 1.0, testClock, &profile);
+
+    inline for (@typeInfo(RenderBucket).@"enum".fields) |f| {
+        const bucket: RenderBucket = @enumFromInt(f.value);
+        try std.testing.expectEqual(@as(u64, 1), profile.counts[@intFromEnum(bucket)]);
+    }
+    try std.testing.expectEqual(@as(u64, RenderBucket.count), profile.commands);
+}
+
+test "renderProfiled: a clock that advances produces non-zero durations" {
+    const gpa = std.testing.allocator;
+    var dl = DrawList.init(gpa);
+    defer dl.deinit();
+    dl.reset(64, 64);
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    try buildOneOfEach(&dl, arena_state.allocator());
+
+    var pixels = [_]u32{0} ** (64 * 64);
+    var profile: RenderProfile = .{};
+    test_clock_now = 0;
+    test_clock_step = 1; // each read advances by 1, so each command spans exactly 1
+    renderProfiled(testTarget(&pixels, 64, 64), &dl, font_mod.default_font, 1.0, testClock, &profile);
+
+    // The instrument reporting zero everywhere is the failure this guards against: it looks
+    // exactly like a renderer that costs nothing.
+    for (profile.seconds) |v| try std.testing.expect(v > 0);
+    try std.testing.expectEqual(@as(f64, RenderBucket.count), profile.total());
+}
+
+test "renderProfiled: adding a command moves only its own bucket" {
+    const gpa = std.testing.allocator;
+    var dl = DrawList.init(gpa);
+    defer dl.deinit();
+    dl.reset(64, 64);
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    try buildOneOfEach(&dl, arena_state.allocator());
+
+    var pixels = [_]u32{0} ** (64 * 64);
+    var before: RenderProfile = .{};
+    test_clock_now = 0;
+    test_clock_step = 1;
+    renderProfiled(testTarget(&pixels, 64, 64), &dl, font_mod.default_font, 1.0, testClock, &before);
+
+    try dl.line(.{ .x = 1, .y = 1 }, .{ .x = 9, .y = 9 }, Color.rgba(0, 0xFF, 0, 0xFF), 1);
+    var after: RenderProfile = .{};
+    test_clock_now = 0;
+    renderProfiled(testTarget(&pixels, 64, 64), &dl, font_mod.default_font, 1.0, testClock, &after);
+
+    inline for (@typeInfo(RenderBucket).@"enum".fields) |f| {
+        const i = f.value;
+        const expected = before.counts[i] + @as(u64, if (@as(RenderBucket, @enumFromInt(i)) == .line) 1 else 0);
+        try std.testing.expectEqual(expected, after.counts[i]);
+    }
+}
+
+test "renderProfiled: an empty clip is still dispatched and charged" {
+    const gpa = std.testing.allocator;
+    var dl = DrawList.init(gpa);
+    defer dl.deinit();
+    dl.reset(64, 64);
+    try dl.pushClip(.{ .x = 0, .y = 0, .w = 0, .h = 0 });
+    try dl.rectFilled(.{ .x = 2, .y = 2, .w = 10, .h = 10 }, Color.rgba(0xFF, 0, 0, 0xFF));
+    dl.popClip();
+
+    var pixels = [_]u32{0} ** (64 * 64);
+    var profile: RenderProfile = .{};
+    test_clock_now = 0;
+    test_clock_step = 1;
+    renderProfiled(testTarget(&pixels, 64, 64), &dl, font_mod.default_font, 1.0, testClock, &profile);
+
+    try std.testing.expectEqual(@as(u64, 1), profile.commands);
+    try std.testing.expectEqual(@as(u64, 1), profile.empty_clip);
+    try std.testing.expectEqual(@as(u64, 1), profile.counts[@intFromEnum(RenderBucket.sharp_fill)]);
+}
+
+test "renderProfiled: attributes are counted across buckets, not as buckets" {
+    const gpa = std.testing.allocator;
+    var dl = DrawList.init(gpa);
+    defer dl.deinit();
+    dl.reset(64, 64);
+    const r: Rect = .{ .x = 2, .y = 2, .w = 20, .h = 12 };
+    const paint: Paint = .{ .linear = .{
+        .start = .{ .x = 2, .y = 2 },
+        .end = .{ .x = 22, .y = 2 },
+        .start_color = Color.rgba(0xFF, 0, 0, 0xFF),
+        .end_color = Color.rgba(0, 0, 0xFF, 0xFF),
+    } };
+    try dl.rectFilledPaint(r, paint);
+
+    var pixels = [_]u32{0} ** (64 * 64);
+    var profile: RenderProfile = .{};
+    test_clock_now = 0;
+    test_clock_step = 1;
+    renderProfiled(testTarget(&pixels, 64, 64), &dl, font_mod.default_font, 1.0, testClock, &profile);
+
+    try std.testing.expectEqual(@as(u64, 1), profile.gradient);
+    try std.testing.expectEqual(@as(u64, 1), profile.counts[@intFromEnum(RenderBucket.sharp_fill)]);
+}
+
+test "renderProfiled: the scaled path is instrumented too" {
+    const gpa = std.testing.allocator;
+    var dl = DrawList.init(gpa);
+    defer dl.deinit();
+    dl.reset(64, 64);
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    try buildOneOfEach(&dl, arena_state.allocator());
+
+    // `render` has a separate loop for scale 1.0, so a profiler wired into only that one
+    // passes every scale-1 test while measuring nothing at any other scale.
+    var pixels = [_]u32{0} ** (256 * 256);
+    for ([_]f32{ 0.5, 2.0 }) |scale| {
+        var profile: RenderProfile = .{};
+        test_clock_now = 0;
+        test_clock_step = 1;
+        renderProfiled(testTarget(&pixels, 256, 256), &dl, font_mod.default_font, scale, testClock, &profile);
+        try std.testing.expectEqual(@as(u64, RenderBucket.count), profile.commands);
+        inline for (@typeInfo(RenderBucket).@"enum".fields) |f| {
+            try std.testing.expectEqual(@as(u64, 1), profile.counts[f.value]);
+        }
+        for (profile.seconds) |v| try std.testing.expect(v > 0);
+    }
+}
+
+test "renderProfiled: attribute counters track the commands that carry them" {
+    const gpa = std.testing.allocator;
+    var dl = DrawList.init(gpa);
+    defer dl.deinit();
+    dl.reset(64, 64);
+    const col = Color.rgba(0xFF, 0, 0, 0xFF);
+    const r: Rect = .{ .x = 2, .y = 2, .w = 20, .h = 12 };
+    try dl.rectFilledEx(r, col, .{ .radius = 4, .aa = true });
+    try dl.rectFilledEx(r, col, .{ .radius = 4, .aa = false });
+    try dl.textEx(.{ .x = 1, .y = 1 }, "a", col, font_mod.default_font); // font override
+    try dl.text(.{ .x = 1, .y = 20 }, "b", col); // no override
+
+    var pixels = [_]u32{0} ** (64 * 64);
+    var profile: RenderProfile = .{};
+    test_clock_now = 0;
+    test_clock_step = 1;
+    renderProfiled(testTarget(&pixels, 64, 64), &dl, font_mod.default_font, 1.0, testClock, &profile);
+
+    try std.testing.expectEqual(@as(u64, 1), profile.antialiased);
+    try std.testing.expectEqual(@as(u64, 1), profile.font_override);
+    try std.testing.expectEqual(@as(u64, 2), profile.counts[@intFromEnum(RenderBucket.text)]);
+}
+
+test "renderProfiled: an empty clip is counted at the scale the renderer tests" {
+    const gpa = std.testing.allocator;
+    var dl = DrawList.init(gpa);
+    defer dl.deinit();
+    dl.reset(64, 64);
+    // One logical pixel wide: not empty as written, empty once scaled down.
+    try dl.pushClip(.{ .x = 0, .y = 0, .w = 1, .h = 1 });
+    try dl.rectFilled(.{ .x = 0, .y = 0, .w = 10, .h = 10 }, Color.rgba(0xFF, 0, 0, 0xFF));
+    dl.popClip();
+
+    var pixels = [_]u32{0} ** (64 * 64);
+
+    var at_one: RenderProfile = .{};
+    test_clock_now = 0;
+    test_clock_step = 1;
+    renderProfiled(testTarget(&pixels, 64, 64), &dl, font_mod.default_font, 1.0, testClock, &at_one);
+    try std.testing.expectEqual(@as(u64, 0), at_one.empty_clip);
+
+    var shrunk: RenderProfile = .{};
+    test_clock_now = 0;
+    renderProfiled(testTarget(&pixels, 64, 64), &dl, font_mod.default_font, 0.25, testClock, &shrunk);
+    try std.testing.expectEqual(@as(u64, 1), shrunk.empty_clip);
+}
+
+test "renderProfiled draws exactly what render draws" {
+    const gpa = std.testing.allocator;
+    var dl = DrawList.init(gpa);
+    defer dl.deinit();
+    dl.reset(64, 64);
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    try buildOneOfEach(&dl, arena_state.allocator());
+
+    // Measuring must not change the picture. Without this, an instrumented path could drift
+    // from the ordinary one and every timing above would describe a renderer nobody ships.
+    for ([_]f32{ 1.0, 0.5, 2.0 }) |scale| {
+        var plain = [_]u32{0} ** (256 * 256);
+        var profiled = [_]u32{0} ** (256 * 256);
+        render(testTarget(&plain, 256, 256), &dl, font_mod.default_font, scale);
+        var profile: RenderProfile = .{};
+        test_clock_now = 0;
+        test_clock_step = 1;
+        renderProfiled(testTarget(&profiled, 256, 256), &dl, font_mod.default_font, scale, testClock, &profile);
+        try std.testing.expectEqualSlices(u32, &plain, &profiled);
+    }
+}
+
+test "renderProfiled: a command counted as clipped away really does not draw" {
+    const gpa = std.testing.allocator;
+    var dl = DrawList.init(gpa);
+    defer dl.deinit();
+    dl.reset(64, 64);
+    try dl.pushClip(.{ .x = 0, .y = 0, .w = 1, .h = 1 });
+    try dl.rectFilled(.{ .x = 0, .y = 0, .w = 10, .h = 10 }, Color.rgba(0xFF, 0, 0, 0xFF));
+    dl.popClip();
+
+    // `empty_clip` is a claim about the renderer's behaviour, so check the framebuffer and not
+    // only the counter: agreeing with itself is not evidence.
+    var shrunk = [_]u32{0} ** (64 * 64);
+    var profile_shrunk: RenderProfile = .{};
+    test_clock_now = 0;
+    test_clock_step = 1;
+    renderProfiled(testTarget(&shrunk, 64, 64), &dl, font_mod.default_font, 0.25, testClock, &profile_shrunk);
+    try std.testing.expectEqual(@as(u64, 1), profile_shrunk.empty_clip);
+    for (shrunk) |px| try std.testing.expectEqual(@as(u32, 0), px);
+
+    var drawn = [_]u32{0} ** (64 * 64);
+    var profile_drawn: RenderProfile = .{};
+    test_clock_now = 0;
+    renderProfiled(testTarget(&drawn, 64, 64), &dl, font_mod.default_font, 1.0, testClock, &profile_drawn);
+    try std.testing.expectEqual(@as(u64, 0), profile_drawn.empty_clip);
+    var touched: usize = 0;
+    for (drawn) |px| {
+        if (px != 0) touched += 1;
+    }
+    try std.testing.expect(touched > 0);
 }
