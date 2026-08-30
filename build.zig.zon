@@ -99,6 +99,15 @@
         "kit",
         // Canonical external-app starting point (copy next to kngn and change .path once).
         "template",
+        // Documentation, as a directory rather than a list of files. `tests/kit_doc_coverage.zig`
+        // embeds two of these and checks that the paths the tour links to exist; the tour links
+        // to nine of them plus AGENT.md, and every other target it names (samples, libs, core,
+        // kit, template) is already covered above. Naming the files individually would mean a
+        // list that has to be updated whenever the tour cites another document, and nothing
+        // would catch the omission, because the check runs against a checkout where the file is
+        // present regardless. The cost is that any documentation edit changes the package hash.
+        "docs",
+        "AGENT.md",
         // Gates that build against the published surface the way an outside package does.
         // build() wires them as child builds, so a fetched package needs them present.
         "gates",

@@ -2522,6 +2522,25 @@ pub fn build(b: *std.Build) void {
     const test_gui_leak_step = b.step("test-gui-leak", "Run GUI PerIdStateStore leak measurement");
     test_gui_leak_step.dependOn(&run_gui_leak_test.step);
 
+    // test-kit-docs: the published surface of kit stays reachable from the author-facing docs.
+    // The documents are embedded rather than opened at run time, so the check cannot depend on
+    // where it was invoked from; the working directory below is only for the reference check,
+    // which has to resolve the tour's relative links against the tree.
+    const kit_doc_coverage_mod = b.createModule(.{
+        .root_source_file = b.path("tests/kit_doc_coverage.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    kit_doc_coverage_mod.addAnonymousImport("kit_source", .{ .root_source_file = b.path("kit/kit.zig") });
+    kit_doc_coverage_mod.addAnonymousImport("kit_tour", .{ .root_source_file = b.path("docs/kit-tour.md") });
+    kit_doc_coverage_mod.addAnonymousImport("app_authoring", .{ .root_source_file = b.path("docs/app-authoring.md") });
+    kit_doc_coverage_mod.addAnonymousImport("manifest", .{ .root_source_file = b.path("build.zig.zon") });
+    const kit_doc_coverage_test = b.addTest(.{ .root_module = kit_doc_coverage_mod });
+    const run_kit_doc_coverage_test = b.addRunArtifact(kit_doc_coverage_test);
+    run_kit_doc_coverage_test.setCwd(b.path("."));
+    const test_kit_docs_step = b.step("test-kit-docs", "Check the kit surface is indexed by the author documentation");
+    test_kit_docs_step.dependOn(&run_kit_doc_coverage_test.step);
+
     // check-gui-contract: the GUI lifecycle checks must survive optimisation.
     // Unit tests can only exercise the paths that keep the contract — breaking one ends the
     // process — so each case runs as its own child process and the gate asserts on how it died.
@@ -2976,6 +2995,7 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(test_vector_step);
     test_step.dependOn(test_gui_step);
     test_step.dependOn(test_gui_leak_step);
+    test_step.dependOn(test_kit_docs_step);
     test_step.dependOn(gui_contract_step);
     test_step.dependOn(test_synth_step);
     test_step.dependOn(test_modular_step);

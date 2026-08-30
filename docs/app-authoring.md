@@ -38,6 +38,11 @@ Do not import internal `platform.zig`, flux libraries (`paint`, `modular`, `viz`
 other non-kit modules from application sources. Build-time linking helpers under
 `build_helpers/` are the exception (see §7).
 
+**For what is inside `kit`, see [`docs/kit-tour.md`](kit-tour.md)** — an index of every name
+it publishes, the sample that is the worked example for each, and the places where reading
+the source leads to the wrong call. This document is the one to read through; that one is the
+one to look things up in.
+
 ## 3. The `Runtime(App)` shape
 
 Prefer `kit.app_runtime.Runtime(App)` over a hand-written event loop. The app provides:
@@ -114,7 +119,10 @@ There is no argv equivalent on wasm; each setting picks one of the three above i
 The framebuffer's pixel format is canonical BGRA: each `u32` in `fb.pixels` is `0xAARRGGBB`
 (little-endian memory order `[B,G,R,A]`), the same format on every backend including wasm.
 
-Full-pixel fills use `kit.pixelops.fill32` (never `@memset` on the framebuffer).
+Which call clears it fastest depends on the value, not on the area: `@memset` is already
+optimal for a compile-time constant whose four bytes are equal (`0`, `0xFFFFFFFF`), and
+`kit.pixelops.fill32` / `fillRect32` is for everything else, including any ordinary background
+colour. §3 of [`docs/kit-tour.md`](kit-tour.md) has the rule and the measurements behind it.
 
 ## 4. Runtime + GUI + event forwarding order
 
@@ -856,7 +864,8 @@ that.
 
 The drawing calls themselves — rounded rectangles, circles, gradients, shadows, paths — are
 §6. Use this section to decide *whether* to drop to the draw list, and §6 for what to say
-once you have.
+once you have. §2 of [`docs/kit-tour.md`](kit-tour.md) indexes the rest of what the draw list
+holds, including text with an explicit font, clipping and the two `beginPath` forms.
 
 ### 5.7 Widget ids
 
@@ -932,6 +941,11 @@ Subsequent builds reuse the global cache. `gui.default_bitmap_font` remains avai
 explicit fixed 8x16 bitmap option for callers that need pixel-stable ASCII rendering. See the
 font section of [`libs/gui/README.md`](../libs/gui/README.md) and the font behaviour in
 [`examples/46_style_gallery/main.zig`](../examples/46_style_gallery/main.zig).
+
+To take the default family at another size or weight, the entry point is
+`gui.defaultFontFamily().variant(size, weight)`. A similarly named `defaultFontVariant` is
+`pub` in the font source but is not re-exported, so it cannot be reached through `kit`; §2 of
+[`docs/kit-tour.md`](kit-tour.md) has the details.
 
 ### Rounded rectangles and circles
 
@@ -1124,9 +1138,9 @@ copyable reference for an application's own layout checks.
 - Pass the **same** backend to `b.dependency(... .platform = backend)` and
   `setupConsumerExe`
 - Capabilities beyond the platform layer are opt-in through the `PlatformFeatures` argument
-  of `setupConsumerExe`, and each one adds what that capability links. Using `kit.audio` or
-  `kit.midi` without asking for them leaves their system symbols undefined at link time —
-  `snd_pcm_*` on Linux, `AudioComponent*` / `MIDIClient*` on macOS:
+  of `setupConsumerExe`, and each one adds what that capability links. Ask for `kit.audio`
+  and `kit.midi` whenever the executable uses them. Where leaving the flag off actually
+  breaks the link, and where it happens not to, is §4 of [`docs/kit-tour.md`](kit-tour.md):
 
   ```zig
   helpers.setupConsumerExe(b, exe, dep, backend, sdk_paths, .{
@@ -1138,11 +1152,15 @@ copyable reference for an application's own layout checks.
   `kit.sound`, `kit.synth` and `kit.dsp` are pure DSP over buffers you already own, so they
   need neither flag.
 
+  How to call audio and MIDI, and which platforms have a real backend for each, is §4 of
+  [`docs/kit-tour.md`](kit-tour.md).
+
   Most other fields of `PlatformFeatures` — file panels, cursor shapes, mascot windows,
   fullscreen, text input — are **not** yours to choose. They decide what goes into the macOS
   backend object file, and you link a prebuilt archive with all of them already enabled, so
   passing `false` turns nothing off (see
-  [ADR-013](adr/013_per-executable-capability-linking.md)).
+  [ADR-013](adr/013_per-executable-capability-linking.md)). How to call them, and which
+  platforms implement each, is §1 of [`docs/kit-tour.md`](kit-tour.md).
 
   Two exceptions have to be asked for **on the dependency as well**, because the archive is
   built differently for them — the gamepad backend and the native menu's extra translation

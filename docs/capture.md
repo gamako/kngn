@@ -56,6 +56,20 @@ the function names matching.
 | open | `camera.open(allocator, cfg)` | `audio.openCapture(allocator, cfg)` |
 | device type | `VideoDevice` | `CaptureDevice` |
 | config types | `camera.Config` / `camera.EffectiveConfig` | `audio.CaptureConfig` / `audio.CaptureEffectiveConfig` |
+| **reachable from `kit`** | **no — in-tree only** | **yes: `kit.audio.openCapture`, `kit.audio.requestCapturePermission`** |
+
+**The one asymmetry that is not cosmetic is the last row.** Everything above it describes a
+unified control plane, and it is one — but the microphone half is published through `kit`
+and the camera half is not. An application outside this repository has no import path to
+`core/camera.zig`, so the camera column of this document describes a facade it cannot call.
+The reason is that headless verification of a camera runs through the synthetic source in
+`core/capture_synthetic.zig`, which is a harness-driven internal tool that does not go
+through the camera facade and is deliberately not published; publishing `camera` alone would
+add an API that an external author can call but cannot test. Publishing is one-way
+(ADR-020), so the boundary stays where it is until an in-tree application needs a camera —
+at which point the synthetic source is revisited together with it. This is a boundary, not a
+dead end: [`examples/20_capture_demo`](../examples/20_capture_demo) works because it is
+in-tree and wired to that internal path.
 
 There is no separate `configure()`. `open(config)` takes the requested values as hints
 and negotiates internally, and `device.config()` returns what the backend reports as

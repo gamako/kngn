@@ -1,8 +1,11 @@
 //! example_22: gamepad input demo (scaffold; ADR-009)
 //!
-//! **Real backends are not implemented on any OS yet.** On a normal launch the connection display stays "disconnected",
-//! but driving it with harness `inject gamepad_connect/disconnect/button/axis` shows connection, point motion and
-//! colour changes (headless replay can self-check; see AGENT.md "headless verification harness").
+//! **A real controller is read on macOS only, and only when the executable opts in**
+//! (`enable_gamepad`, required on both the dependency and `setupConsumerExe`). Elsewhere, and without the
+//! opt-in, `getGamepadState` returns null and the connection display stays "disconnected". The harness, by
+//! contrast, answers on every OS: driving it with `inject gamepad_connect/disconnect/button/axis` shows
+//! connection, point motion and colour changes (headless replay can self-check; see AGENT.md "headless
+//! verification harness"). **A green headless run therefore says nothing about a real controller.**
 //!
 //! The demo lives in `examples/22_gamepad`; run it from the repository root with
 //! `zig build run-example_22`.
