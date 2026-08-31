@@ -60,6 +60,16 @@ const Ids = struct {
     const left_b: gui.Id = 0x0A10_0302;
     const left_c: gui.Id = 0x0A10_0303;
 
+    const am_start: gui.Id = 0x0A10_0350;
+    const am_start_a: gui.Id = 0x0A10_0351;
+    const am_center: gui.Id = 0x0A10_0360;
+    const am_center_a: gui.Id = 0x0A10_0361;
+    const am_end: gui.Id = 0x0A10_0370;
+    const am_end_a: gui.Id = 0x0A10_0371;
+    const am_grow: gui.Id = 0x0A10_0380;
+    const am_grow_a: gui.Id = 0x0A10_0381;
+    const am_grow_g: gui.Id = 0x0A10_0382;
+
     const wrap_row: gui.Id = 0x0A10_0400;
     const wrap_a: gui.Id = 0x0A10_0401;
     const wrap_b: gui.Id = 0x0A10_0402;
@@ -374,8 +384,59 @@ fn itemLeftover(ctx: *gui.Context, width: i32) void {
     });
 }
 
+/// x of an explicit-id child relative to its row, so the readout does not move with the
+/// catalog's own position. -1 while either rect is still uncached (first frame).
+fn relX(ctx: *const gui.Context, row: gui.Id, child: gui.Id) i32 {
+    const rx = nodeX(ctx, row);
+    const cx = nodeX(ctx, child);
+    if (rx < 0 or cx < 0) return -1;
+    return cx - rx;
+}
+
+fn alignRow(ctx: *gui.Context, row_id: gui.Id, first_id: gui.Id, width: i32, alignment: gui.Align, label: []const u8) void {
+    ctx.beginBox(.{
+        .id = row_id,
+        .direction = .row,
+        .width = .{ .fixed = width },
+        .height = .{ .fixed = ROW_H },
+        .gap = GAP,
+        .align_main = alignment,
+        .bg = Col.row,
+    });
+    chip(ctx, first_id, label, .{ .fixed = 60 }, Col.fixed);
+    chip(ctx, 0, label, .{ .fixed = 60 }, Col.fit);
+    ctx.endBox();
+}
+
+fn itemAlignMain(ctx: *gui.Context, width: i32) void {
+    beginItem(ctx, "4. align_main", width);
+    alignRow(ctx, Ids.am_start, Ids.am_start_a, width, .start, "start");
+    alignRow(ctx, Ids.am_center, Ids.am_center_a, width, .center, "center");
+    alignRow(ctx, Ids.am_end, Ids.am_end_a, width, .end, "end");
+    // A grow child takes the space align_main would place, so `.end` here is a no-op.
+    ctx.beginBox(.{
+        .id = Ids.am_grow,
+        .direction = .row,
+        .width = .{ .fixed = width },
+        .height = .{ .fixed = ROW_H },
+        .gap = GAP,
+        .align_main = .end,
+        .bg = Col.row,
+    });
+    chip(ctx, Ids.am_grow_a, "end", .{ .fixed = 60 }, Col.fixed);
+    chip(ctx, Ids.am_grow_g, "grow", .{ .grow = 1 }, Col.grow);
+    ctx.endBox();
+    const ids = [_]gui.Id{ Ids.am_start_a, Ids.am_center_a, Ids.am_end_a, Ids.am_grow_a };
+    endItem(ctx, allCached(ctx, &ids), "start_x={d} center_x={d} end_x={d} grow_x={d}", .{
+        relX(ctx, Ids.am_start, Ids.am_start_a),
+        relX(ctx, Ids.am_center, Ids.am_center_a),
+        relX(ctx, Ids.am_end, Ids.am_end_a),
+        relX(ctx, Ids.am_grow, Ids.am_grow_a),
+    });
+}
+
 fn itemWrap(ctx: *gui.Context, width: i32) void {
-    beginItem(ctx, "4. wrap", width);
+    beginItem(ctx, "5. wrap", width);
     ctx.beginBox(.{
         .id = Ids.wrap_row,
         .direction = .row,
@@ -432,7 +493,7 @@ fn itemWrap(ctx: *gui.Context, width: i32) void {
 }
 
 fn itemCrossGrow(ctx: *gui.Context, width: i32) void {
-    beginItem(ctx, "5. wrap cross grow", width);
+    beginItem(ctx, "6. wrap cross grow", width);
     ctx.beginBox(.{
         .id = Ids.xgrow_row,
         .direction = .row,
@@ -507,7 +568,7 @@ fn wrapFour(ctx: *gui.Context, ids: [4]gui.Id) void {
 }
 
 fn itemAnchor(ctx: *gui.Context, width: i32) void {
-    beginItem(ctx, "6. anchor", width);
+    beginItem(ctx, "7. anchor", width);
 
     ctx.beginBox(.{ .direction = .row, .gap = 8 });
     ctx.beginBox(.{
@@ -596,7 +657,7 @@ fn itemAnchor(ctx: *gui.Context, width: i32) void {
 }
 
 fn itemExtent(ctx: *gui.Context, app: *App, width: i32) void {
-    beginItem(ctx, "7. content extent", width);
+    beginItem(ctx, "8. content extent", width);
     ctx.beginScrollArea(Ids.ext_vp, &app.extent_scroll, .{
         .width = .{ .fixed = width },
         .height = .{ .fixed = 48 },
@@ -653,7 +714,7 @@ const TABLE_ROWS = [_]TableRow{
 };
 
 fn itemTable(ctx: *gui.Context, width: i32) void {
-    beginItem(ctx, "8. table columns", width);
+    beginItem(ctx, "9. table columns", width);
     const cols = [_]gui.TableCol{
         .{ .width = .{ .fixed = 48 }, .header = "Kind" },
         .{ .width = .fit, .header = "Name" },
@@ -705,7 +766,7 @@ fn itemTable(ctx: *gui.Context, width: i32) void {
 }
 
 fn itemVirtual(ctx: *gui.Context, app: *App, width: i32) void {
-    beginItem(ctx, "9. virtual list", width);
+    beginItem(ctx, "10. virtual list", width);
     const opts = gui.VirtualListOpts{
         .row_height = VIRT_ROW_H,
         .row_count = VIRT_COUNT,
@@ -792,6 +853,7 @@ fn buildCatalog(ctx: *gui.Context, app: *App) void {
     itemMixed(ctx, width);
     itemClamp(ctx, width);
     itemLeftover(ctx, width);
+    itemAlignMain(ctx, width);
     itemWrap(ctx, width);
     itemCrossGrow(ctx, width);
     itemAnchor(ctx, width);
@@ -825,6 +887,14 @@ fn layoutDigest(ctx_ptr: *anyopaque, buf: []u8) []const u8 {
     appendFmt(buf, &off, " left_w={d} leftover={d}", .{
         nodeW(ctx, Ids.left_row),
         leftoverOf(ctx, Ids.left_row, &left_kids, 8),
+    });
+
+    appendFmt(buf, &off, " am_start_x={d} am_center_x={d} am_end_x={d} am_grow_x={d} am_grow_w={d}", .{
+        relX(ctx, Ids.am_start, Ids.am_start_a),
+        relX(ctx, Ids.am_center, Ids.am_center_a),
+        relX(ctx, Ids.am_end, Ids.am_end_a),
+        relX(ctx, Ids.am_grow, Ids.am_grow_a),
+        nodeW(ctx, Ids.am_grow_g),
     });
 
     var wcounts: [8]u8 = undefined;

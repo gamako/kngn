@@ -216,6 +216,8 @@ pub fn main(init: std.process.Init) !void {
     try runIndentScenario(io, &tracker, 1000, 0, "indent-d0-1000");
     try runIndentScenario(io, &tracker, 500, 3, "indent-d3-500");
     try runIndentScenario(io, &tracker, 1000, 3, "indent-d3-1000");
+    try runAlignScenario(io, &tracker, 1000, .start, "align-start-1000");
+    try runAlignScenario(io, &tracker, 1000, .end, "align-end-1000");
     std.debug.print("\n", .{});
 }
 
@@ -317,6 +319,36 @@ fn buildIndentRows(ctx: *gui.Context, rows: usize, depth: u8) void {
     ctx.endBox();
 }
 
+/// A column of rows that each leave main-axis space unclaimed, so `align_main` has
+/// something to place. The pair of scenarios below differs only in that field: the
+/// `.start` run is what every tree that never sets it pays.
+fn buildAlignRows(ctx: *gui.Context, rows: usize, alignment: gui.Align) void {
+    ctx.beginBox(.{
+        .direction = .column,
+        .width = .{ .grow = 1 },
+        .height = .{ .grow = 1 },
+        .gap = 1,
+    });
+    var i: usize = 0;
+    while (i < rows) : (i += 1) {
+        // 1000 − (3 × 40 + 2 × 8) = 864 px unclaimed per row.
+        ctx.beginBox(.{
+            .direction = .row,
+            .width = .{ .fixed = 1000 },
+            .height = .{ .fixed = 12 },
+            .gap = 8,
+            .align_main = alignment,
+        });
+        var c: usize = 0;
+        while (c < 3) : (c += 1) {
+            ctx.beginBox(.{ .width = .{ .fixed = 40 }, .height = .{ .fixed = 12 } });
+            ctx.endBox();
+        }
+        ctx.endBox();
+    }
+    ctx.endBox();
+}
+
 fn runCountedScenario(
     io: std.Io,
     tracker: *peak_allocator.PeakTrackingAllocator,
@@ -383,6 +415,19 @@ fn runAnchorScenario(io: std.Io, tracker: *peak_allocator.PeakTrackingAllocator,
         }
     };
     Gen.n_badges = n;
+    try runCountedScenario(io, tracker, name, Gen.build);
+}
+
+fn runAlignScenario(io: std.Io, tracker: *peak_allocator.PeakTrackingAllocator, rows: usize, alignment: gui.Align, name: []const u8) !void {
+    const Gen = struct {
+        var n_rows: usize = 0;
+        var a: gui.Align = .start;
+        fn build(ctx: *gui.Context) void {
+            buildAlignRows(ctx, n_rows, a);
+        }
+    };
+    Gen.n_rows = rows;
+    Gen.a = alignment;
     try runCountedScenario(io, tracker, name, Gen.build);
 }
 

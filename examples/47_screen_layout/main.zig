@@ -238,7 +238,8 @@ const App = struct {
         });
         ctx.labelStyled("Asset library", .heading);
 
-        // Main-axis alignment is start only, so a grow spacer is what pushes the rest right.
+        // A group at each end is CSS space-between, which `align_main` does not cover: it moves
+        // the whole line as one block. A grow spacer is what splits the row into two groups.
         ctx.beginBox(.{ .width = .{ .grow = 1 }, .height = .{ .fixed = 1 } });
         ctx.endBox();
 
@@ -513,13 +514,11 @@ fn meter(ctx: *gui.Context, fraction: f32) void {
     ctx.custom(.{ .x = 120, .y = 6 }, Meter.draw, state);
 }
 
-/// A fixed-width cell whose text is pushed to the right edge. Main-axis alignment is
-/// `.start` only, so the right-aligned column every number wants is a grow spacer in front
-/// of the label rather than an option on the cell.
+/// A fixed-width cell whose text is pushed to the right edge. `align_main = .end` places the
+/// width the label did not use; it works here because the cell holds no `.grow` child to take
+/// that width first.
 fn numCell(ctx: *gui.Context, str: []const u8, width: i32, tier: gui.TextTier) void {
-    ctx.beginBox(.{ .direction = .row, .width = .{ .fixed = width }, .clip_children = true });
-    ctx.beginBox(.{ .width = .{ .grow = 1 }, .height = .{ .fixed = 1 } });
-    ctx.endBox();
+    ctx.beginBox(.{ .direction = .row, .width = .{ .fixed = width }, .align_main = .end, .clip_children = true });
     ctx.labelStyled(str, tier);
     ctx.endBox();
 }

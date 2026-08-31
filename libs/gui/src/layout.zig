@@ -31,7 +31,14 @@
 //   still applies. They are not in the layout size; a parent with
 //   clip_children=false still folds their visible overflow into content extent.
 //   Draw order is tree order — later siblings paint on top.
-// - main-axis alignment (justify_content) is start only; right-align etc. by inserting a grow box
+// - main-axis alignment is `BoxConfig.align_main` (CSS justify_content), limited to
+//   start / center / end. It places the leftover main-axis space no child took, by shifting
+//   the whole line; the gap between children never changes. A weight>0 grow child normally
+//   absorbs that leftover, so align_main has no effect in a box that has one — except when
+//   every such child is frozen by its own min/max clamp and a remainder is still left. In a
+//   wrap box each line is aligned independently. Anchored children ignore it. Distributing
+//   the leftover between children (space-between and friends) is not supported; a two-group
+//   row still puts a grow box between the groups.
 // - grow / percent children inside a fit parent measure as 0 (the fit parent shrinks accordingly).
 //   This holds on both axes, including measureHeights.
 // - percent is relative to the parent content box (after padding, before gap). Floor truncation;
@@ -111,6 +118,21 @@ pub const BoxConfig = struct {
     /// When true, children wrap onto the next cross-axis line once the main axis
     /// is full. See the Limitations block for the wrap contracts.
     wrap: bool = false,
+    /// Where the flow children sit along the main axis (CSS `justify-content`). It places
+    /// the leftover main-axis space **no child took** — the space that otherwise stays as a
+    /// trailing gap — by shifting the whole line: `.start` keeps it at the end, `.center`
+    /// splits it, `.end` moves it in front. `gap` between children is never changed.
+    ///
+    /// A weight>0 `.grow` child normally absorbs that leftover, so **this has no effect in
+    /// a box that has one**. It does have an effect when every such child is frozen by its
+    /// own `min_*` / `max_*` clamp and a remainder is still left (min-side, max-side, or a
+    /// mix), because a frozen child stops taking the remainder. A weight-0 `.grow` child
+    /// never takes the remainder either. Children that overflow the parent leave no
+    /// leftover, and neither does a `.fit` main axis unless `min_*` widened it.
+    ///
+    /// In a `wrap` box each line is aligned independently. Anchored children are placed by
+    /// their own `Anchor` and ignore this.
+    align_main: Align = .start,
     align_cross: Align = .start,
     bg: ?Color = null,
     /// Border (null = none). Emitted bg → children → border
@@ -767,6 +789,7 @@ fn placeLinearOnAxis(node: *Node, axis: Axis) void {
             axis,
             acc,
             node.has_anchored_child,
+            cfg.align_main,
         );
         if (axis == .h) commitExtent(node, max_right, max_bottom);
     } else if (node.has_anchored_child) {
@@ -799,21 +822,40 @@ fn placeLinearOnAxis(node: *Node, axis: Axis) void {
     }
 }
 
+/// Start-of-line offset for `align_main`, given the main-axis space no child took.
+/// `.start` is the identity, and the callers pass a zero leftover for it rather
+/// than working one out.
+fn mainAlignOffset(align_main: Align, leftover: i32) i32 {
+    return switch (align_main) {
+        .start => 0,
+        .center => @divFloor(leftover, 2),
+        .end => leftover,
+    };
+}
+
 /// Distribute leftover main-axis space among grow children on one line, then place.
 ///
 /// Hot path: every frame on the GUI layout path. Line membership and placement
 /// are O(children). Freeze reallocation is worst-case O(grow_on_line^2);
 /// practical grow counts are small. Not a per-pixel loop; not RT.
 ///
+/// `content_main` is always the parent's real content size on this axis: the
+/// indefinite-main sentinel of `contentMainForPlace` reaches `placeWrapCross` only,
+/// never here, so a leftover can never be the sentinel.
+///
 /// Invariants:
 /// - weight 0 grow children take 0 of the remainder but still receive min/max
 ///   clamp (a grow=0, min=20 child is 20 and is frozen into used from the start).
 /// - if the sum of mins exceeds the remainder, each child still gets its min
 ///   and the parent overflows (same as the no-shrink contract).
-/// - leftover remainder stays as a trailing gap when no unfrozen weight>0 grow
-///   child remains (every such child max-frozen, or none existed).
+/// - leftover remainder stays where `align_main` puts it (by default a trailing
+///   gap) when no unfrozen weight>0 grow child remains — every such child frozen
+///   by its own min/max clamp, or none existed.
 /// - with no clamp violations the peel is bit-identical to the unconstrained
 ///   accumulate-peel (the no-clamp branch is that peel).
+/// - `align_main` shifts the whole line by whatever remainder is still unclaimed
+///   once every child has its size. `.start` leaves the line at `cursor0`; it adds
+///   one comparison and no extra walk, and skips the clamp branch's subtraction.
 fn placeLineMain(
     first: ?*Node,
     end: ?*Node,
@@ -824,6 +866,7 @@ fn placeLineMain(
     axis: Axis,
     extent: ?ExtentAcc,
     skip_anchored: bool,
+    align_main: Align,
 ) void {
     const start = first orelse return;
     if (!lineHasClamp(start, end, axis, skip_anchored)) {
@@ -842,7 +885,10 @@ fn placeLineMain(
         }
         var remaining: i64 = @max(0, content_main - used);
         var w_rest: i64 = grow_total;
-        var cursor: i32 = cursor0;
+        // A weight>0 grow child takes the remainder down to zero (the last one's share is
+        // the whole rest), so only a line without one leaves anything for align_main.
+        const leftover: i32 = if (align_main == .start or grow_total > 0) 0 else @intCast(remaining);
+        var cursor: i32 = cursor0 + mainAlignOffset(align_main, leftover);
         it = start;
         while (it) |c| {
             if (c == end) break;
@@ -888,6 +934,10 @@ fn placeLineMain(
         it = nextLinePeer(c, skip_anchored);
     }
 
+    // Whatever no child took, once every child has a size. Zero unless the loop below
+    // runs out of unfrozen weight>0 grow children: while one is left it takes the rest.
+    var leftover: i32 = 0;
+
     while (true) {
         var w_rest: i64 = 0;
         it = start;
@@ -896,7 +946,12 @@ fn placeLineMain(
             if (isUnfrozenGrow(c, axis)) w_rest += growWeightOf(c, axis);
             it = nextLinePeer(c, skip_anchored);
         }
-        if (w_rest == 0) break;
+        if (w_rest == 0) {
+            // Every child's size is in `used`: non-grow and weight-0 grow from the seed
+            // loop above, weight>0 grow from the freeze pass below (a child freezes once).
+            if (align_main != .start) leftover = @max(0, content_main - used);
+            break;
+        }
 
         const remaining: i64 = @max(0, content_main - used);
         var peel_rem = remaining;
@@ -939,7 +994,7 @@ fn placeLineMain(
         }
     }
 
-    var cursor: i32 = cursor0;
+    var cursor: i32 = cursor0 + mainAlignOffset(align_main, leftover);
     it = start;
     while (it) |c| {
         if (c == end) break;
@@ -979,7 +1034,7 @@ fn placeWrapMain(node: *Node) void {
     while (first) |f| {
         const end = nextLineStart(f, content_main, cfg.gap, main, skip);
         const count = countUntil(f, end, skip);
-        placeLineMain(f, end, count, origin - scroll, content_main, cfg.gap, main, null, skip);
+        placeLineMain(f, end, count, origin - scroll, content_main, cfg.gap, main, null, skip, cfg.align_main);
         first = end;
     }
 }
@@ -1438,6 +1493,330 @@ test "place: align_cross center aligns using the percent child's resolved size" 
     // Resolved h = 50 → y = (100−50)/2 = 25 (would be 50 if based on measured=0)
     try std.testing.expectEqual(@as(u32, 50), a.rect.h);
     try std.testing.expectEqual(@as(i32, 25), a.rect.y);
+}
+
+// ── align_main ──────────────────────────────────────────────────────────────
+// `align_main` places the main-axis space no child took. The pair of tests that
+// matters is "a grow child makes it inert" together with "a clamp-frozen grow
+// child does not": the loose rule alone is satisfied by an implementation that
+// gives up whenever any grow child is present.
+
+test "place: align_main start/center/end shifts the whole line (fixed children, gap)" {
+    inline for (.{
+        .{ .alignment = Align.start, .xs = [3]i32{ 0, 40, 90 } },
+        .{ .alignment = Align.center, .xs = [3]i32{ 30, 70, 120 } },
+        .{ .alignment = Align.end, .xs = [3]i32{ 60, 100, 150 } },
+    }) |case| {
+        var root: Node = .{ .cfg = .{ .direction = .row, .width = .{ .fixed = 200 }, .height = .{ .fixed = 20 }, .gap = 10, .align_main = case.alignment } };
+        var a: Node = .{ .cfg = .{ .width = .{ .fixed = 30 }, .height = .{ .fixed = 20 } } };
+        var b: Node = .{ .cfg = .{ .width = .{ .fixed = 40 }, .height = .{ .fixed = 20 } } };
+        var c: Node = .{ .cfg = .{ .width = .{ .fixed = 50 }, .height = .{ .fixed = 20 } } };
+        appendChild(&root, &a);
+        appendChild(&root, &b);
+        appendChild(&root, &c);
+        measure(&root, test_font);
+        place(&root, .{ .x = 0, .y = 0, .w = 200, .h = 20 });
+        // used = 30+40+50 + 2 gaps = 140, so 60 px is unclaimed.
+        try std.testing.expectEqual(case.xs[0], a.rect.x);
+        try std.testing.expectEqual(case.xs[1], b.rect.x);
+        try std.testing.expectEqual(case.xs[2], c.rect.x);
+        // The gap between children never changes, whatever the alignment.
+        try std.testing.expectEqual(@as(i32, 10), b.rect.x - (a.rect.x + @as(i32, @intCast(a.rect.w))));
+    }
+    // `.end` puts the last child's far edge exactly on the content edge (an
+    // off-by-one-gap offset would land on 190 or 210).
+    var root: Node = .{ .cfg = .{ .direction = .row, .width = .{ .fixed = 200 }, .height = .{ .fixed = 20 }, .gap = 10, .align_main = .end } };
+    var a: Node = .{ .cfg = .{ .width = .{ .fixed = 30 }, .height = .{ .fixed = 20 } } };
+    var b: Node = .{ .cfg = .{ .width = .{ .fixed = 40 }, .height = .{ .fixed = 20 } } };
+    var c: Node = .{ .cfg = .{ .width = .{ .fixed = 50 }, .height = .{ .fixed = 20 } } };
+    appendChild(&root, &a);
+    appendChild(&root, &b);
+    appendChild(&root, &c);
+    measure(&root, test_font);
+    place(&root, .{ .x = 0, .y = 0, .w = 200, .h = 20 });
+    try std.testing.expectEqual(@as(i32, 200), c.rect.x + @as(i32, @intCast(c.rect.w)));
+}
+
+test "place: align_main center floors an odd leftover" {
+    var root: Node = .{ .cfg = .{ .direction = .row, .width = .{ .fixed = 105 }, .height = .{ .fixed = 10 }, .align_main = .center } };
+    var a: Node = .{ .cfg = .{ .width = .{ .fixed = 100 }, .height = .{ .fixed = 10 } } };
+    appendChild(&root, &a);
+    measure(&root, test_font);
+    place(&root, .{ .x = 0, .y = 0, .w = 105, .h = 10 });
+    try std.testing.expectEqual(@as(i32, 2), a.rect.x); // floor(5/2)
+}
+
+test "place: align_main works on a column's main axis too" {
+    var root: Node = .{ .cfg = .{ .direction = .column, .width = .{ .fixed = 20 }, .height = .{ .fixed = 200 }, .gap = 10, .align_main = .end } };
+    var a: Node = .{ .cfg = .{ .width = .{ .fixed = 20 }, .height = .{ .fixed = 30 } } };
+    var b: Node = .{ .cfg = .{ .width = .{ .fixed = 20 }, .height = .{ .fixed = 40 } } };
+    var c: Node = .{ .cfg = .{ .width = .{ .fixed = 20 }, .height = .{ .fixed = 50 } } };
+    appendChild(&root, &a);
+    appendChild(&root, &b);
+    appendChild(&root, &c);
+    measure(&root, test_font);
+    place(&root, .{ .x = 0, .y = 0, .w = 20, .h = 200 });
+    try std.testing.expectEqual(@as(i32, 60), a.rect.y);
+    try std.testing.expectEqual(@as(i32, 100), b.rect.y);
+    try std.testing.expectEqual(@as(i32, 150), c.rect.y);
+}
+
+test "place: align_main is inert when a weight>0 grow child takes the remainder" {
+    var placed: [2][3]Rect = undefined;
+    inline for (.{ Align.start, Align.end }, 0..) |alignment, run| {
+        var root: Node = .{ .cfg = .{ .direction = .row, .width = .{ .fixed = 200 }, .height = .{ .fixed = 20 }, .gap = 10, .align_main = alignment } };
+        var a: Node = .{ .cfg = .{ .width = .{ .fixed = 30 }, .height = .{ .fixed = 20 } } };
+        var b: Node = .{ .cfg = .{ .width = .{ .fixed = 40 }, .height = .{ .fixed = 20 } } };
+        var g: Node = .{ .cfg = .{ .width = .{ .grow = 1 }, .height = .{ .fixed = 20 } } };
+        appendChild(&root, &a);
+        appendChild(&root, &b);
+        appendChild(&root, &g);
+        measure(&root, test_font);
+        place(&root, .{ .x = 0, .y = 0, .w = 200, .h = 20 });
+        placed[run] = .{ a.rect, b.rect, g.rect };
+    }
+    try std.testing.expectEqual(@as(u32, 110), placed[0][2].w); // the grow child took all 110
+    try std.testing.expectEqualSlices(Rect, &placed[0], &placed[1]);
+}
+
+test "place: align_main places the remainder left by max-frozen grow children" {
+    inline for (.{
+        .{ .alignment = Align.start, .xs = [2]i32{ 0, 50 } },
+        .{ .alignment = Align.end, .xs = [2]i32{ 100, 150 } },
+    }) |case| {
+        var root: Node = .{ .cfg = .{ .direction = .row, .width = .{ .fixed = 200 }, .height = .{ .fixed = 10 }, .align_main = case.alignment } };
+        var a: Node = .{ .cfg = .{ .width = .{ .grow = 1 }, .height = .{ .fixed = 10 }, .max_width = 50 } };
+        var b: Node = .{ .cfg = .{ .width = .{ .grow = 1 }, .height = .{ .fixed = 10 }, .max_width = 50 } };
+        appendChild(&root, &a);
+        appendChild(&root, &b);
+        measure(&root, test_font);
+        place(&root, .{ .x = 0, .y = 0, .w = 200, .h = 10 });
+        try std.testing.expectEqual(@as(u32, 50), a.rect.w);
+        try std.testing.expectEqual(@as(u32, 50), b.rect.w);
+        try std.testing.expectEqual(case.xs[0], a.rect.x);
+        try std.testing.expectEqual(case.xs[1], b.rect.x);
+    }
+}
+
+test "place: align_main places the remainder when min and max freezes are mixed" {
+    // a freezes at its min, b at its max: 60 + 10 = 70 of 100, so 30 is unclaimed.
+    // An implementation that treats only a max freeze as an exception reports 0 here.
+    var root: Node = .{ .cfg = .{ .direction = .row, .width = .{ .fixed = 100 }, .height = .{ .fixed = 10 }, .align_main = .end } };
+    var a: Node = .{ .cfg = .{ .width = .{ .grow = 1 }, .height = .{ .fixed = 10 }, .min_width = 60 } };
+    var b: Node = .{ .cfg = .{ .width = .{ .grow = 9 }, .height = .{ .fixed = 10 }, .max_width = 10 } };
+    appendChild(&root, &a);
+    appendChild(&root, &b);
+    measure(&root, test_font);
+    place(&root, .{ .x = 0, .y = 0, .w = 100, .h = 10 });
+    try std.testing.expectEqual(@as(u32, 60), a.rect.w);
+    try std.testing.expectEqual(@as(u32, 10), b.rect.w);
+    try std.testing.expectEqual(@as(i32, 30), a.rect.x);
+    try std.testing.expectEqual(@as(i32, 90), b.rect.x);
+    try std.testing.expectEqual(@as(i32, 100), b.rect.x + @as(i32, @intCast(b.rect.w)));
+}
+
+test "place: align_main places the remainder weight-0 grow children never take (clamped)" {
+    var root: Node = .{ .cfg = .{ .direction = .row, .width = .{ .fixed = 100 }, .height = .{ .fixed = 10 }, .align_main = .end } };
+    var a: Node = .{ .cfg = .{ .width = .{ .grow = 0 }, .height = .{ .fixed = 10 }, .min_width = 20 } };
+    var b: Node = .{ .cfg = .{ .width = .{ .grow = 0 }, .height = .{ .fixed = 10 }, .min_width = 20 } };
+    appendChild(&root, &a);
+    appendChild(&root, &b);
+    measure(&root, test_font);
+    place(&root, .{ .x = 0, .y = 0, .w = 100, .h = 10 });
+    try std.testing.expectEqual(@as(u32, 20), a.rect.w);
+    try std.testing.expectEqual(@as(i32, 60), a.rect.x);
+    try std.testing.expectEqual(@as(i32, 80), b.rect.x);
+    try std.testing.expectEqual(@as(i32, 100), b.rect.x + @as(i32, @intCast(b.rect.w)));
+}
+
+test "place: align_main places the remainder weight-0 grow children never take (unclamped)" {
+    // No min or max anywhere, so this goes through the no-clamp peel where
+    // grow_total is 0 — the branch the clamped case above never reaches.
+    var root: Node = .{ .cfg = .{ .direction = .row, .width = .{ .fixed = 100 }, .height = .{ .fixed = 10 }, .align_main = .end } };
+    var f: Node = .{ .cfg = .{ .width = .{ .fixed = 20 }, .height = .{ .fixed = 10 } } };
+    var g: Node = .{ .cfg = .{ .width = .{ .grow = 0 }, .height = .{ .fixed = 10 } } };
+    appendChild(&root, &f);
+    appendChild(&root, &g);
+    measure(&root, test_font);
+    place(&root, .{ .x = 0, .y = 0, .w = 100, .h = 10 });
+    try std.testing.expectEqual(@as(u32, 20), f.rect.w);
+    try std.testing.expectEqual(@as(i32, 80), f.rect.x);
+    try std.testing.expectEqual(@as(u32, 0), g.rect.w);
+    try std.testing.expectEqual(@as(i32, 100), g.rect.x);
+}
+
+test "place: align_main leaves overflowing children where they are" {
+    var root: Node = .{ .cfg = .{ .direction = .row, .width = .{ .fixed = 50 }, .height = .{ .fixed = 10 }, .align_main = .center } };
+    var a: Node = .{ .cfg = .{ .width = .{ .fixed = 40 }, .height = .{ .fixed = 10 } } };
+    var b: Node = .{ .cfg = .{ .width = .{ .fixed = 40 }, .height = .{ .fixed = 10 } } };
+    appendChild(&root, &a);
+    appendChild(&root, &b);
+    measure(&root, test_font);
+    place(&root, .{ .x = 0, .y = 0, .w = 50, .h = 10 });
+    try std.testing.expectEqual(@as(i32, 0), a.rect.x); // never a negative offset
+    try std.testing.expectEqual(@as(i32, 40), b.rect.x);
+}
+
+test "wrap: align_main aligns each line on its own leftover" {
+    var root: Node = .{ .cfg = .{ .direction = .row, .wrap = true, .width = .{ .fixed = 100 }, .height = .{ .fixed = 100 }, .cross_gap = 0, .align_main = .end } };
+    var a: Node = .{ .cfg = .{ .width = .{ .fixed = 60 }, .height = .{ .fixed = 10 } } };
+    var b: Node = .{ .cfg = .{ .width = .{ .fixed = 30 }, .height = .{ .fixed = 10 } } };
+    var c: Node = .{ .cfg = .{ .width = .{ .fixed = 40 }, .height = .{ .fixed = 10 } } };
+    appendChild(&root, &a);
+    appendChild(&root, &b);
+    appendChild(&root, &c);
+    measure(&root, test_font);
+    place(&root, .{ .x = 0, .y = 0, .w = 100, .h = 100 });
+    // Line 1 is 60+30 = 90 (leftover 10), line 2 is 40 (leftover 60). One offset
+    // for the whole container would give both lines the same shift.
+    try std.testing.expectEqual(@as(i32, 10), a.rect.x);
+    try std.testing.expectEqual(@as(i32, 70), b.rect.x);
+    try std.testing.expectEqual(@as(i32, 60), c.rect.x);
+    try std.testing.expectEqual(@as(i32, 0), a.rect.y);
+    try std.testing.expectEqual(@as(i32, 10), c.rect.y);
+}
+
+test "wrap: align_main uses the real main size on a column whose main axis is indefinite" {
+    // A column-wrap box splits lines against a huge sentinel while widths are being
+    // placed; heights then re-split against the real 80 px. A sentinel leaking into
+    // the leftover would put these children thousands of pixels down.
+    var root: Node = .{ .cfg = .{ .direction = .column, .wrap = true, .width = .{ .fixed = 100 }, .height = .{ .grow = 1 }, .cross_gap = 0, .align_main = .end } };
+    var a: Node = .{ .cfg = .{ .width = .{ .fixed = 40 }, .height = .{ .fixed = 30 } } };
+    var b: Node = .{ .cfg = .{ .width = .{ .fixed = 40 }, .height = .{ .fixed = 30 } } };
+    var c: Node = .{ .cfg = .{ .width = .{ .fixed = 40 }, .height = .{ .fixed = 30 } } };
+    appendChild(&root, &a);
+    appendChild(&root, &b);
+    appendChild(&root, &c);
+    measure(&root, test_font);
+    place(&root, .{ .x = 0, .y = 0, .w = 100, .h = 80 });
+    // Line 1 holds two children (60 of 80, leftover 20), line 2 one (leftover 50).
+    try std.testing.expectEqual(@as(i32, 20), a.rect.y);
+    try std.testing.expectEqual(@as(i32, 50), b.rect.y);
+    try std.testing.expectEqual(@as(i32, 50), c.rect.y);
+    try std.testing.expectEqual(@as(i32, 0), a.rect.x);
+    try std.testing.expectEqual(@as(i32, 40), c.rect.x);
+}
+
+test "place: align_main and align_cross are independent" {
+    inline for (.{ Align.start, Align.end }) |main_alignment| {
+        var root: Node = .{ .cfg = .{ .direction = .row, .width = .{ .fixed = 200 }, .height = .{ .fixed = 100 }, .align_main = main_alignment, .align_cross = .center } };
+        var a: Node = .{ .cfg = .{ .width = .{ .fixed = 20 }, .height = .{ .fixed = 20 } } };
+        appendChild(&root, &a);
+        measure(&root, test_font);
+        place(&root, .{ .x = 0, .y = 0, .w = 200, .h = 100 });
+        try std.testing.expectEqual(@as(i32, 40), a.rect.y); // (100−20)/2, whatever align_main is
+        try std.testing.expectEqual(@as(i32, if (main_alignment == .end) 180 else 0), a.rect.x);
+    }
+}
+
+test "place: align_main counts a percent child's resolved share" {
+    var root: Node = .{ .cfg = .{ .direction = .row, .width = .{ .fixed = 200 }, .height = .{ .fixed = 10 }, .align_main = .end } };
+    var f: Node = .{ .cfg = .{ .width = .{ .fixed = 20 }, .height = .{ .fixed = 10 } } };
+    var pc: Node = .{ .cfg = .{ .width = .{ .percent = 0.25 }, .height = .{ .fixed = 10 } } };
+    appendChild(&root, &f);
+    appendChild(&root, &pc);
+    measure(&root, test_font);
+    place(&root, .{ .x = 0, .y = 0, .w = 200, .h = 10 });
+    // 20 + floor(200 × 0.25) = 70 used, so 130 is left.
+    try std.testing.expectEqual(@as(u32, 50), pc.rect.w);
+    try std.testing.expectEqual(@as(i32, 130), f.rect.x);
+    try std.testing.expectEqual(@as(i32, 150), pc.rect.x);
+}
+
+test "place: align_main accounts for a negative gap" {
+    var root: Node = .{ .cfg = .{ .direction = .row, .width = .{ .fixed = 100 }, .height = .{ .fixed = 10 }, .gap = -10, .align_main = .end } };
+    var a: Node = .{ .cfg = .{ .width = .{ .fixed = 30 }, .height = .{ .fixed = 10 } } };
+    var b: Node = .{ .cfg = .{ .width = .{ .fixed = 30 }, .height = .{ .fixed = 10 } } };
+    appendChild(&root, &a);
+    appendChild(&root, &b);
+    measure(&root, test_font);
+    place(&root, .{ .x = 0, .y = 0, .w = 100, .h = 10 });
+    // 30 + 30 − 10 = 50 used, so 50 is left; b overlaps a by the negative gap.
+    try std.testing.expectEqual(@as(i32, 50), a.rect.x);
+    try std.testing.expectEqual(@as(i32, 70), b.rect.x);
+}
+
+test "place: align_main applies on top of scroll, not instead of it" {
+    var root: Node = .{ .cfg = .{ .direction = .row, .width = .{ .fixed = 100 }, .height = .{ .fixed = 10 }, .scroll_x = 15, .align_main = .end } };
+    var a: Node = .{ .cfg = .{ .width = .{ .fixed = 20 }, .height = .{ .fixed = 10 } } };
+    appendChild(&root, &a);
+    measure(&root, test_font);
+    place(&root, .{ .x = 0, .y = 0, .w = 100, .h = 10 });
+    // Aligned to 80, then shifted left by the scroll. Applying either twice moves it.
+    try std.testing.expectEqual(@as(i32, 65), a.rect.x);
+    // The extent is measured with the scroll added back, so it is the unscrolled value.
+    try std.testing.expectEqual(@as(i32, 100), root.content_w);
+}
+
+test "place: align_main center splits the remainder in the clamp branch too" {
+    var root: Node = .{ .cfg = .{ .direction = .row, .width = .{ .fixed = 100 }, .height = .{ .fixed = 10 }, .align_main = .center } };
+    var a: Node = .{ .cfg = .{ .width = .{ .grow = 1 }, .height = .{ .fixed = 10 }, .max_width = 20 } };
+    appendChild(&root, &a);
+    measure(&root, test_font);
+    place(&root, .{ .x = 0, .y = 0, .w = 100, .h = 10 });
+    try std.testing.expectEqual(@as(u32, 20), a.rect.w);
+    try std.testing.expectEqual(@as(i32, 40), a.rect.x);
+}
+
+test "place: align_main handles a weight-0 grow child beside a max-frozen one" {
+    var root: Node = .{ .cfg = .{ .direction = .row, .width = .{ .fixed = 100 }, .height = .{ .fixed = 10 }, .align_main = .end } };
+    var z: Node = .{ .cfg = .{ .width = .{ .grow = 0 }, .height = .{ .fixed = 10 }, .min_width = 10 } };
+    var g: Node = .{ .cfg = .{ .width = .{ .grow = 1 }, .height = .{ .fixed = 10 }, .max_width = 30 } };
+    appendChild(&root, &z);
+    appendChild(&root, &g);
+    measure(&root, test_font);
+    place(&root, .{ .x = 0, .y = 0, .w = 100, .h = 10 });
+    // 10 (weight-0 at its min) + 30 (max-frozen) = 40 used, so 60 is left.
+    try std.testing.expectEqual(@as(u32, 10), z.rect.w);
+    try std.testing.expectEqual(@as(u32, 30), g.rect.w);
+    try std.testing.expectEqual(@as(i32, 60), z.rect.x);
+    try std.testing.expectEqual(@as(i32, 70), g.rect.x);
+}
+
+test "wrap: align_main aligns each line when the grow children freeze" {
+    var root: Node = .{ .cfg = .{ .direction = .row, .wrap = true, .width = .{ .fixed = 100 }, .height = .{ .fixed = 100 }, .cross_gap = 0, .align_main = .end } };
+    // Each child enters the line split at its min (40), so two fit per line; each is
+    // then max-frozen at 40, leaving 20 on the full line and 60 on the last.
+    var a: Node = .{ .cfg = .{ .width = .{ .grow = 1 }, .height = .{ .fixed = 10 }, .min_width = 40, .max_width = 40 } };
+    var b: Node = .{ .cfg = .{ .width = .{ .grow = 1 }, .height = .{ .fixed = 10 }, .min_width = 40, .max_width = 40 } };
+    var c: Node = .{ .cfg = .{ .width = .{ .grow = 1 }, .height = .{ .fixed = 10 }, .min_width = 40, .max_width = 40 } };
+    appendChild(&root, &a);
+    appendChild(&root, &b);
+    appendChild(&root, &c);
+    measure(&root, test_font);
+    place(&root, .{ .x = 0, .y = 0, .w = 100, .h = 100 });
+    try std.testing.expectEqual(@as(i32, 20), a.rect.x);
+    try std.testing.expectEqual(@as(i32, 60), b.rect.x);
+    try std.testing.expectEqual(@as(i32, 60), c.rect.x);
+    try std.testing.expectEqual(@as(i32, 0), a.rect.y);
+    try std.testing.expectEqual(@as(i32, 10), c.rect.y);
+}
+
+test "place: content extent follows the children align_main moved" {
+    inline for (.{
+        .{ .alignment = Align.start, .x = 0, .content_w = 20 },
+        .{ .alignment = Align.center, .x = 40, .content_w = 60 },
+        .{ .alignment = Align.end, .x = 80, .content_w = 100 },
+    }) |case| {
+        var root: Node = .{ .cfg = .{ .direction = .row, .width = .{ .fixed = 100 }, .height = .{ .fixed = 20 }, .align_main = case.alignment } };
+        var a: Node = .{ .cfg = .{ .width = .{ .fixed = 20 }, .height = .{ .fixed = 20 } } };
+        appendChild(&root, &a);
+        measure(&root, test_font);
+        place(&root, .{ .x = 0, .y = 0, .w = 100, .h = 20 });
+        try std.testing.expectEqual(@as(i32, case.x), a.rect.x);
+        try std.testing.expectEqual(@as(i32, case.content_w), root.content_w);
+    }
+}
+
+test "place: content extent stays a border-box value with padding under align_main" {
+    var root: Node = .{ .cfg = .{ .direction = .row, .width = .{ .fixed = 100 }, .height = .{ .fixed = 20 }, .padding = .{ 0, 5, 0, 7 }, .align_main = .end } };
+    var a: Node = .{ .cfg = .{ .width = .{ .fixed = 20 }, .height = .{ .fixed = 20 } } };
+    appendChild(&root, &a);
+    measure(&root, test_font);
+    place(&root, .{ .x = 0, .y = 0, .w = 100, .h = 20 });
+    // content = 100 − 12 = 88, leftover 68, so x = 7 + 68 and the extent is 88 + 12.
+    try std.testing.expectEqual(@as(i32, 75), a.rect.x);
+    try std.testing.expectEqual(@as(i32, 100), root.content_w);
 }
 
 test "place: cross-axis grow fills parent content" {

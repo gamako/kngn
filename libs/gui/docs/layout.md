@@ -87,6 +87,42 @@ parent does not include it.
 
 An explicit `id` is cached and hit-tested like any other box.
 
+## Main-axis alignment
+
+`BoxConfig.align_main` (CSS `justify-content`, limited to `.start` / `.center` /
+`.end`) decides where the flow children sit along the main axis. It places the
+main-axis space **no child took** — the space that otherwise stays as a trailing
+gap — by shifting the whole line: `.start` leaves it at the end, `.center` splits
+it (floored), `.end` moves it in front. The `gap` between children never changes,
+so distributing the leftover *between* children (CSS `space-between` and friends)
+is not available; a row with a group at each end still puts a `.grow` box between
+the groups.
+
+The rule that matters in practice is when it does nothing:
+
+| Situation | Leftover | `align_main` |
+|---|---|---|
+| A weight>0 `.grow` child on the main axis | 0 — it takes the rest | no effect |
+| Every weight>0 `.grow` child frozen at its own `min_*` / `max_*`, remainder left | that remainder | applies |
+| Only weight-0 `.grow` children (they never take the remainder) | the remainder | applies |
+| Children overflow the parent | clamped to 0 | no effect |
+| A `.fit` main axis | 0, unless the box's own main-axis `min_*` widened it | usually no effect |
+
+The freeze exception covers a min-side freeze, a max-side freeze, and a mix of
+both: what matters is that no unfrozen weight>0 `.grow` child is left to absorb
+the rest. So "a `.grow` child makes `align_main` inert" is the practical rule, not
+the exact one.
+
+In a `wrap` box **each line is aligned on its own leftover**, which is what CSS
+`justify-content` does; the cross-axis stacking of the lines is not affected
+(there is no `align_content`). Anchored children are placed by their own `Anchor`
+and ignore `align_main` entirely.
+
+Content extent follows the children: a `.center` or `.end` box's `content_w` /
+`content_h` grows by the offset, because the extent is measured from the content
+origin. A `.fixed`-size box therefore reports an extent up to its own content
+size under `.end`.
+
 ## The pitfall: `.grow` on a `.fit` container's main axis is always exactly zero
 
 Follow what happens when a node `N` is sized `.fit` on its **main** axis and

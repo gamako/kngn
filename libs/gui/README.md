@@ -273,7 +273,14 @@ ctx.endVirtualList();
   measure, main-axis cursor, gap, grow share, wrap line split, or line cross size. Their own
   size is resolved against the parent content box (grow fills that box). Draw order is tree
   order — later siblings paint on top
-- Main-axis alignment (`justify_content`) is start only. Right-align with a grow spacer box
+- Main-axis alignment is `BoxConfig.align_main` (CSS `justify_content`), limited to
+  `.start` / `.center` / `.end`. It places the main-axis space no child took, shifting the
+  whole line; the gap between children never changes. **A weight>0 `.grow` child normally
+  absorbs that space, so `align_main` has no effect in a box that has one** — except when
+  every such child is frozen by its own min/max clamp and a remainder is still left. Each
+  `wrap` line is aligned on its own leftover; anchored children ignore it. Distributing the
+  leftover *between* children (`space-between` and friends) is not supported, so a row with
+  a group at each end still puts a `.grow` box between the groups
 - No shrink. When children exceed the parent, they overflow (visual clipping via `clip_children`)
 - grow / percent children inside a fit parent measure as 0 (the fit parent shrinks accordingly)
 - percent is relative to the parent's content box (padding deducted, gap not). Floor truncation;

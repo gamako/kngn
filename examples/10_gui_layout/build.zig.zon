@@ -13,5 +13,7 @@
         "build.zig.zon",
         "main.zig",
         "sample.zon",
+        "e2e.txt",
+        "e2e.sh",
     },
 }

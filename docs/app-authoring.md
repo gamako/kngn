@@ -260,6 +260,7 @@ what is inside it. The fields a screen normally needs:
 | `padding` | `.{ top, right, bottom, left }` |
 | `gap` | space between children on the main axis |
 | `align_cross` | `.start` / `.center` / `.end` — where children sit on the cross axis |
+| `align_main` | `.start` / `.center` / `.end` — where children sit on the **main** axis (CSS `justify-content`). A weight>0 `.grow` child normally takes the space `align_main` would place, so it has no effect next to one — unless every such child is frozen by its own min/max clamp ([layout.md](../libs/gui/docs/layout.md)) |
 | `bg`, `border`, `radius` | the box's own painting (`border` is `.{ .color, .thickness }`) |
 | `clip_children` | clip drawing and hit-testing to the content box |
 | `min_width` / `max_width` / `min_height` / `max_height` | a clamp applied on top of whatever `Sizing` says |
@@ -446,32 +447,18 @@ window resize adds or removes.
 
 Two conventions worth knowing early:
 
-- **Main-axis alignment is `.start` only.** To push something to the far end of a row, put
-  an empty `.{ .grow = 1 }` box in front of it. That is the whole of the header:
+- **Main-axis alignment is `BoxConfig.align_main`** (`.start` / `.center` / `.end`, CSS
+  `justify-content`). It places the main-axis space no child took, shifting the whole line —
+  which is how a right-aligned number column stops needing a spacer box.
 
-  ```zig
-  fn buildHeader(self: *App, ctx: *gui.Context) void {
-      ctx.beginBox(.{
-          .direction = .row,
-          .width = .{ .grow = 1 },
-          .height = .{ .fixed = 56 },
-          .padding = .{ 0, 16, 0, 16 },
-          .gap = 12,
-          .align_cross = .center,
-          .bg = ctx.style.surface.raised,
-      });
-      ctx.labelStyled("Asset library", .heading);
-
-      // The spacer: everything after it is pushed to the right edge.
-      ctx.beginBox(.{ .width = .{ .grow = 1 }, .height = .{ .fixed = 1 } });
-      ctx.endBox();
-
-      if (ctx.tabId(tab_all_id, "All", self.tab == .all, .{}).focused) self.tab = .all;
-      if (ctx.tabId(tab_recent_id, "Recent", self.tab == .recent, .{}).focused) self.tab = .recent;
-      if (ctx.buttonId(rescan_id, "Rescan", .{}).clicked) self.selected_entry = null;
-      ctx.endBox();
-  }
-  ```
+  **It normally has no effect in a box that holds a weight>0 `.grow` child**, because that
+  child takes the space `align_main` would have placed. (The exception is a `.grow` child
+  frozen by its own `min_*` / `max_*`, which stops taking the rest — the full rule is in
+  [libs/gui/docs/layout.md](../libs/gui/docs/layout.md).) The usual case is worth knowing
+  before you meet it: the header of `examples/47_screen_layout` is `.grow`-driven, and its
+  title-left / tabs-right split is *two* groups, which is CSS `space-between` — not one of the
+  three values. **A two-group row still puts an empty `.{ .grow = 1 }` box between the
+  groups**, and that sample shows both shapes side by side.
 
   The sidebar is the same shape — a `.{ .fixed = 240 }` column of `beginListboxRow` entries
   and a `beginCollapsible` holding the filter controls, each of which is one line from the
@@ -752,10 +739,10 @@ fn sizeOf(i: usize) usize {
 }
 ```
 
-**A column of numbers wants its digits aligned, and the alignment is yours to build.**
-Main-axis alignment is `.start` only (§5.1), so `numCell` is the general shape for any
-right-aligned column: a `.grow` spacer inside the fixed-width cell, in front of the label.
-The same spacer is what pushed the header's tabs to the window's right edge.
+**A column of numbers wants its digits aligned.** `numCell` is the general shape for any
+right-aligned column: a fixed-width cell with `.align_main = .end` (§5.1), holding the label
+alone. It works there precisely because the cell holds no `.grow` child — the header's
+two-group split still needs a spacer, and the sample keeps one for that reason.
 
 **Give the rows something to be read along.** A list whose names are shorter than the column
 they sit in leaves a wide gap before the columns pinned to the right, and the eye loses the

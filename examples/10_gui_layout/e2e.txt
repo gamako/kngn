@@ -1,0 +1,37 @@
+# Layout catalog replay. The catalog is a set of resolved-size readouts, so the
+# checks below assert the numbers, not just that a frame was produced.
+#
+# The rect cache settles one frame after a size change, so every digest is taken
+# after `step 2`.
+
+step 2
+digest layout
+expect layout width=640
+
+# Main-axis alignment. Each row is 640 px holding two 60 px chips with a 4 px gap,
+# so 516 px is left for align_main to place.
+expect layout am_start_x=0
+expect layout am_center_x=258
+expect layout am_end_x=516
+
+# The fourth row is the same `.end` row plus a grow child. The grow child takes
+# the 576 px that align_main would otherwise have placed, so the first chip stays
+# at the start: this line fails if align_main ever moves a line whose space is
+# already claimed.
+expect layout am_grow_x=0
+expect layout am_grow_w=576
+
+snapshot fb
+
+# Narrowing the catalog changes the leftover, so the offsets have to follow it.
+# 400 − 124 = 276.
+action layout_width 400
+step 2
+digest layout
+expect layout width=400
+expect layout am_start_x=0
+expect layout am_center_x=138
+expect layout am_end_x=276
+snapshot fb
+
+quit
