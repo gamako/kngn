@@ -33,7 +33,9 @@ splits the two axes. Each frame runs five tree walks, in this order:
    paragraph width (`text_wrap.measureIntrinsicWidth`; layout never calls
    `font.measure` on a leaf string). Custom leaves take their caller-supplied
    width. Boxes resolve `.fixed` / `.fit` on the width axis; **`.grow` and
-   `.percent` are 0**.
+   `.percent` contribute 0** before their own clamp — `computeMeasured` clamps its
+   raw result, so a positive `min_width` still makes the measured value that
+   minimum.
 2. **`placeWidths`** — pre-order. Resolves `rect.x` / `rect.w` the way the
    historical `place` pass resolved both axes: `.percent` of the parent's
    content width, `.grow` leftover by weight (or fill, on the cross axis).
@@ -42,8 +44,9 @@ splits the two axes. Each frame runs five tree walks, in this order:
    inside a paragraph. The leaf's `measured_h` is then the line count
    (one line uses ink height so a single-line leaf matches the historical size).
 4. **`measureHeights`** — post-order. Re-aggregates `.fit` heights from the
-   (now wrap-aware) children. **`.grow` and `.percent` are 0** here too —
-   the same rule as width measure, including inside a `.fit` parent.
+   (now wrap-aware) children. **`.grow` and `.percent` contribute 0** here too,
+   before their own clamp — the same rule as width measure, including inside a
+   `.fit` parent.
 5. **`placeHeights`** — pre-order. Resolves `rect.y` / `rect.h`.
 
 A leaf still ignores its own `Sizing` at measure time (intrinsic contribution
@@ -123,16 +126,20 @@ Content extent follows the children: a `.center` or `.end` box's `content_w` /
 origin. A `.fixed`-size box therefore reports an extent up to its own content
 size under `.end`.
 
-## The pitfall: `.grow` on a `.fit` container's main axis is always exactly zero
+## The pitfall: `.grow` on a `.fit` container's main axis collapses to zero
 
 Follow what happens when a node `N` is sized `.fit` on its **main** axis and
-has a direct **box** child `C` sized `.grow` on that same axis (a leaf child
-is a separate case — see the leaf exception above; a leaf's own measured
-contribution is always its intrinsic size, `Sizing` notwithstanding):
+has a direct **box** child `C` sized `.grow` on that same axis, `C` carrying no
+`min_*` of its own (a leaf child is a separate case — see the leaf exception
+above; a leaf's own measured contribution is always its intrinsic size, `Sizing`
+notwithstanding. `C`'s own `min_*` is the other way out, and the last bullet
+below is where it comes in):
 
 - During `measure`, `C`'s own measured size on that axis is `0` — and so is
   any `.percent` sibling's; the same `.grow, .percent => 0` rule applies to
-  both alike at measure time. So when `N` sums its children on that axis to
+  both alike at measure time. `computeMeasured` computes that raw `0` and then
+  clamps it, so the `0` holds only while `C`'s `min_*` on the axis is `0`. So
+  when `N` sums its children on that axis to
   resolve its own `.fit` size, neither contributes anything: `N`'s measured
   size on that axis is exactly the sum of its fixed and fit children's
   measured sizes, plus padding and inter-child gap (`.grow`/`.percent`
@@ -150,11 +157,14 @@ contribution is always its intrinsic size, `Sizing` notwithstanding):
   `.percent` siblings (or with a `.percent` sibling that resolves to a `0`
   share — `.percent(0)`, or a nonzero `f` against a `0` content size), and
   it goes *negative* (clamped to `0`) the moment any `.percent` sibling
-  resolves to a positive share. `C` resolves to `0` — **unconditionally**,
-  regardless of what siblings `C` has: `N`'s content size can never exceed
-  what its fixed/fit children alone needed, so there is never a positive
-  amount left for `.grow`, and any `.percent` sibling can only make the
-  shortfall larger, never smaller.
+  resolves to a positive share. `C` resolves to `0` **whatever siblings `C`
+  has**: `N`'s content size can never exceed what its fixed/fit children alone
+  needed, so there is never a positive amount left for `.grow`, and any
+  `.percent` sibling can only make the shortfall larger, never smaller.
+- What does take `C` out of it is **`C`'s own `min_*`**. The clamp applies to
+  every `Sizing`, so `C` measures at its minimum, `N`'s `.fit` sum carries that
+  minimum, and `C` is placed at it. The collapse is a property of a `.grow` box
+  with no minimum, not of `.grow` as such.
 
 This follows directly from a bottom-up pass (`measure`) being asked to size
 something that is only known top-down (`grow`): a `.fit` container has no way
@@ -165,8 +175,8 @@ to reserve room for a child whose size it cannot see yet.
 It is tempting to assume `.percent` collapses the same way `.grow` does under
 a `.fit` main-axis parent, but it does not, because of how `place` resolves
 each one. A `.grow` child's size comes from *leftover* space (`content size
-− everything else`), which is always exactly zero under a `.fit` main axis as
-shown above. A `.percent` child's size, in contrast, is `floor(content size *
+− everything else`), which is zero under a `.fit` main axis as shown above
+(the child's own `min_*` being the way out). A `.percent` child's size, in contrast, is `floor(content size *
 f)` — a **direct** fraction of the container's actual content size, not a
 leftover. If that content size is nonzero (because some *other* sibling is
 `.fixed` or `.fit` and contributes a nonzero amount), the `.percent` child
@@ -184,7 +194,9 @@ directly (weight is ignored), not a leftover — see "Related pitfalls" below.
 So `.percent` under a `.fit` main axis, and `.grow`/`.percent` under a `.fit`
 cross axis, only degrade to zero in the narrower case where **nothing at all**
 establishes a nonzero content size on that axis: no *box* sibling is sized
-`.fixed`/`.fit` with a nonzero result, **and** no leaf sibling has a nonzero
+`.fixed`/`.fit` with a nonzero result, no *box* sibling carries a positive
+`min_*` on that axis (the clamp inside `computeMeasured` makes such a sibling
+measure at its minimum), **and** no leaf sibling has a nonzero
 intrinsic content size on that axis either — a leaf always contributes its
 own intrinsic size to this sum/max regardless of its own declared `Sizing`
 (the leaf exception above), so a leaf sibling with nonzero intrinsic content

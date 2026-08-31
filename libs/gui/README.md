@@ -183,6 +183,15 @@ Two smaller helpers round out a settings-style form:
   description below, wrapping the control(s) the caller builds in between (same begin/end
   shape as `beginCollapsible`); replaces hand-stacking `ctx.label` / `ctx.labelEx` next to a
   control with no declared relationship between them.
+- `ctx.separator(opts)` / `gui.separator(ctx, opts)` — a one-line rule, `opts.thickness` (default
+  1, must be positive) on the parent's main axis and `.grow` on its cross axis. So a `.column`
+  parent gets a horizontal rule and a `.row` parent a vertical one, read from the innermost open
+  box. `opts.color` defaults to `style.border_tokens.normal`, resolved per call so a theme swap
+  follows. **The cross axis fills a size the rule does not establish**: the parent's resolved
+  content size, or — in a `wrap` box — the cross size of its own line, computed from that line's
+  children alone (so a `.fixed`-width wrap parent does not give a lone rule any length). Where
+  nothing establishes that size the rule is zero length and silently invisible.
+  `docs/adr/034` records why `BoxConfig.border` stays four-sided.
 
 **Disabling a widget:** `ctx.beginDisabled()` / `ctx.endDisabled()` open a nestable scope
 (not a per-call option, since checkbox/toggle/radio/`textInputId` take no options struct
@@ -282,7 +291,9 @@ ctx.endVirtualList();
   leftover *between* children (`space-between` and friends) is not supported, so a row with
   a group at each end still puts a `.grow` box between the groups
 - No shrink. When children exceed the parent, they overflow (visual clipping via `clip_children`)
-- grow / percent children inside a fit parent measure as 0 (the fit parent shrinks accordingly)
+- A grow / percent child **box** inside a fit parent measures as 0 before its own clamp, so the
+  fit parent shrinks accordingly — but a positive `min_*` on that child still contributes. A
+  **leaf** contributes its intrinsic measure whatever `Sizing` it declares
 - percent is relative to the parent's content box (padding deducted, gap not). Floor truncation;
   leftover pixels are absorbed by grow children
 - `clip_children` clips drawing (and hit-test) to the content box (rect minus padding)

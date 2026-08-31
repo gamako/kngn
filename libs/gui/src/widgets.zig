@@ -2785,6 +2785,59 @@ pub fn endFormRow(ctx: *Context) void {
 }
 
 // ============================================================
+// Separator
+// ============================================================
+// A rule on one edge — under a header, between two panes, above a footer. `BoxConfig.border`
+// is uniform on all four sides and is painted inside the rect without affecting layout, so a
+// single edge is a sibling box that occupies space in the flow instead. `docs/adr/034` records
+// why the border is not extended per side.
+
+pub const SeparatorOpts = struct {
+    /// null resolves to `style.border_tokens.normal` at call time, so a theme swap follows.
+    color: ?Color = null,
+    /// Main-axis thickness in px. Must be positive.
+    thickness: i32 = 1,
+};
+
+/// A one-line rule sized from the box it is called inside: `thickness` on that box's main
+/// axis, `.grow` on its cross axis. So a `.column` parent gets a horizontal rule and a
+/// `.row` parent a vertical one, read from the innermost box open at the moment of the call
+/// (the frame root, a `.column`, when none is open).
+///
+/// Being `.grow` on the cross axis, the rule fills a size it does not itself establish, and
+/// **who establishes that size differs between a wrap box and an ordinary one**:
+///
+/// - **not wrapping**: the parent's resolved content size on the cross axis — the parent's own
+///   `.fixed` / `.grow` / `.percent` / `min_*`, or, for a `.fit` parent, the max `computeMeasured`
+///   takes over its other children. What each of those contributes there: a **leaf** its
+///   intrinsic measure whatever `Sizing` it declares (so a wrapping `ctx.text`, created `.grow`
+///   on the width axis, does give a rule in a `.fit` column its length); a **box** sized
+///   `.fixed` / `.fit` its resolved size; a **box** sized `.grow` / `.percent` its `min_*` —
+///   zero by default but not always zero, since `min_width = 20` gives the rule 20; an
+///   **anchored** child nothing at all.
+/// - **`wrap = true`**: the cross size of the line this rule lands on, which `lineCrossSize`
+///   takes over that line's children **by declared `Sizing` alone — there is no leaf exception
+///   on this path**. A `.grow`-declared leaf on the line therefore contributes its `min_*`
+///   rather than its intrinsic size, and the parent's own cross sizing does not reach the line
+///   at all: a rule alone on a line inside a `.fixed`-width wrap box is zero.
+///
+/// Where nothing contributes, the rule is zero length and **silently invisible** — the general
+/// grow-inside-fit behaviour, whose symptom §5.2 of `docs/app-authoring.md` describes.
+///
+/// Hot path: every frame on the GUI widget-build path — one box, no layout branch. Not a
+/// per-pixel loop; not RT.
+pub fn separator(ctx: *Context, opts: SeparatorOpts) void {
+    std.debug.assert(opts.thickness > 0);
+    const color = opts.color orelse ctx.style.border_tokens.normal;
+    const cfg: layout.BoxConfig = switch (ctx.openBox().cfg.direction) {
+        .column => .{ .width = .{ .grow = 1 }, .height = .{ .fixed = opts.thickness }, .bg = color },
+        .row => .{ .width = .{ .fixed = opts.thickness }, .height = .{ .grow = 1 }, .bg = color },
+    };
+    ctx.beginBox(cfg);
+    ctx.endBox();
+}
+
+// ============================================================
 // Tests
 // ============================================================
 
@@ -2821,6 +2874,364 @@ fn center(rect: Rect) struct { x: i32, y: i32 } {
         .x = rect.x + @as(i32, @intCast(rect.w / 2)),
         .y = rect.y + @as(i32, @intCast(rect.h / 2)),
     };
+}
+
+// ── separator ───────────────────────────────────────────────────────────────
+
+/// Every solid-filled rectangle in the frame. `emitNode` emits bg → children → border, so a
+/// fixed command index moves as soon as a box in the fixture gains a background; asserting on
+/// the set instead also catches an implementation that paints one rectangle too many.
+fn solidFills(ctx: *const Context, out: *std.ArrayList(Rect), colors: *std.ArrayList(Color)) !void {
+    for (ctx.draw_list.cmds.items) |cmd| {
+        switch (cmd) {
+            .rect_filled => |r| switch (r.paint) {
+                .solid => |c| {
+                    try out.append(std.testing.allocator, r.rect);
+                    try colors.append(std.testing.allocator, c);
+                },
+                else => {},
+            },
+            else => {},
+        }
+    }
+}
+
+const SepFill = struct { rect: Rect, color: Color };
+
+/// Build one frame and return its single solid fill, failing if the fixture produced any
+/// other number.
+fn onlySolidFill(ctx: *Context) !SepFill {
+    var rects: std.ArrayList(Rect) = .empty;
+    defer rects.deinit(std.testing.allocator);
+    var colors: std.ArrayList(Color) = .empty;
+    defer colors.deinit(std.testing.allocator);
+    try solidFills(ctx, &rects, &colors);
+    try std.testing.expectEqual(@as(usize, 1), rects.items.len);
+    return .{ .rect = rects.items[0], .color = colors.items[0] };
+}
+
+fn separatorInParent(ctx: *Context, direction: layout.Direction, w: layout.Sizing, h: layout.Sizing, opts: SeparatorOpts) !SepFill {
+    ctx.beginFrame(400, 300);
+    ctx.beginBox(.{ .direction = direction, .width = w, .height = h });
+    separator(ctx, opts);
+    ctx.endBox();
+    ctx.endFrame();
+    return onlySolidFill(ctx);
+}
+
+test "separator: a column parent gets a horizontal rule in the border token" {
+    var ctx = testCtx();
+    defer ctx.deinit();
+    const fill = try separatorInParent(&ctx, .column, .{ .fixed = 200 }, .{ .fixed = 100 }, .{});
+    try std.testing.expectEqual(@as(u32, 200), fill.rect.w);
+    try std.testing.expectEqual(@as(u32, 1), fill.rect.h);
+    try std.testing.expectEqual(ctx.style.border_tokens.normal, fill.color);
+}
+
+test "separator: a row parent gets a vertical rule" {
+    var ctx = testCtx();
+    defer ctx.deinit();
+    const fill = try separatorInParent(&ctx, .row, .{ .fixed = 200 }, .{ .fixed = 100 }, .{});
+    try std.testing.expectEqual(@as(u32, 1), fill.rect.w);
+    try std.testing.expectEqual(@as(u32, 100), fill.rect.h);
+}
+
+test "separator: thickness lands on the parent's main axis in both directions" {
+    var ctx = testCtx();
+    defer ctx.deinit();
+    const col = try separatorInParent(&ctx, .column, .{ .fixed = 200 }, .{ .fixed = 100 }, .{ .thickness = 3 });
+    try std.testing.expectEqual(@as(u32, 200), col.rect.w);
+    try std.testing.expectEqual(@as(u32, 3), col.rect.h);
+    const row = try separatorInParent(&ctx, .row, .{ .fixed = 200 }, .{ .fixed = 100 }, .{ .thickness = 3 });
+    try std.testing.expectEqual(@as(u32, 3), row.rect.w);
+    try std.testing.expectEqual(@as(u32, 100), row.rect.h);
+}
+
+test "separator: with no box open it reads the frame root, a column" {
+    var ctx = testCtx();
+    defer ctx.deinit();
+    ctx.beginFrame(400, 300);
+    separator(&ctx, .{});
+    ctx.endFrame();
+    const fill = try onlySolidFill(&ctx);
+    try std.testing.expectEqual(@as(u32, 400), fill.rect.w);
+    try std.testing.expectEqual(@as(u32, 1), fill.rect.h);
+}
+
+test "separator: an explicit color wins over the token" {
+    var ctx = testCtx();
+    defer ctx.deinit();
+    const want = Color.rgba(0x11, 0x22, 0x33, 0xFF);
+    const fill = try separatorInParent(&ctx, .column, .{ .fixed = 200 }, .{ .fixed = 100 }, .{ .color = want });
+    try std.testing.expectEqual(want, fill.color);
+}
+
+test "separator: the default color follows a theme swap on the same context" {
+    var ctx = testCtx();
+    defer ctx.deinit();
+    const dark = style_mod.defaultStyle();
+    const light = style_mod.lightStyle();
+    // Without this the test below passes for a reason that has nothing to do with the code.
+    try std.testing.expect(@as(u32, @bitCast(dark.border_tokens.normal)) != @as(u32, @bitCast(light.border_tokens.normal)));
+
+    ctx.style = dark;
+    const first = try separatorInParent(&ctx, .column, .{ .fixed = 200 }, .{ .fixed = 100 }, .{});
+    try std.testing.expectEqual(dark.border_tokens.normal, first.color);
+
+    // A second frame on the same context: an implementation that resolved the colour once
+    // would keep the dark token here.
+    ctx.style = light;
+    const second = try separatorInParent(&ctx, .column, .{ .fixed = 200 }, .{ .fixed = 100 }, .{});
+    try std.testing.expectEqual(light.border_tokens.normal, second.color);
+}
+
+test "separator: the default color is the border token, not the legacy flat mirror" {
+    var ctx = testCtx();
+    defer ctx.deinit();
+    // `Style.border` mirrors `border_tokens.normal`, so an implementation reading the flat
+    // field passes every ordinary theme test. Splitting them apart is what separates the two.
+    ctx.style.border = Color.rgba(0xAB, 0xCD, 0xEF, 0xFF);
+    const fill = try separatorInParent(&ctx, .column, .{ .fixed = 200 }, .{ .fixed = 100 }, .{});
+    try std.testing.expectEqual(ctx.style.border_tokens.normal, fill.color);
+    try std.testing.expect(@as(u32, @bitCast(ctx.style.border)) != @as(u32, @bitCast(fill.color)));
+}
+
+test "separator: alone in a fit cross axis it has no length" {
+    var ctx = testCtx();
+    defer ctx.deinit();
+    // A rule contributes nothing to the size that would give it its length.
+    const col = try separatorInParent(&ctx, .column, .fit, .{ .fixed = 100 }, .{});
+    try std.testing.expectEqual(@as(u32, 0), col.rect.w);
+    const row = try separatorInParent(&ctx, .row, .{ .fixed = 200 }, .fit, .{});
+    try std.testing.expectEqual(@as(u32, 0), row.rect.h);
+}
+
+test "separator: a sibling establishes the fit cross axis and the rule fills it" {
+    var ctx = testCtx();
+    defer ctx.deinit();
+    // The counterpart to the test above: "a fit cross axis means zero" is false in general,
+    // and an implementation built on that reading would fail here.
+    inline for (.{ layout.Direction.column, layout.Direction.row }) |direction| {
+        ctx.beginFrame(400, 300);
+        ctx.beginBox(.{ .direction = direction, .width = .fit, .height = .fit });
+        ctx.beginBox(.{ .width = .{ .fixed = 80 }, .height = .{ .fixed = 40 } });
+        ctx.endBox();
+        separator(&ctx, .{});
+        ctx.endBox();
+        ctx.endFrame();
+        const fill = try onlySolidFill(&ctx);
+        if (direction == .column) {
+            try std.testing.expectEqual(@as(u32, 80), fill.rect.w);
+            try std.testing.expectEqual(@as(u32, 1), fill.rect.h);
+        } else {
+            try std.testing.expectEqual(@as(u32, 1), fill.rect.w);
+            try std.testing.expectEqual(@as(u32, 40), fill.rect.h);
+        }
+    }
+}
+
+test "separator: alone on a wrap line it has no length" {
+    var ctx = testCtx();
+    defer ctx.deinit();
+    // A wrap line takes its cross size from the line's own children, and a grow child
+    // enters that at its min — so a line holding only a rule is zero across.
+    ctx.beginFrame(400, 300);
+    ctx.beginBox(.{ .direction = .column, .wrap = true, .width = .{ .fixed = 200 }, .height = .{ .fixed = 100 } });
+    separator(&ctx, .{});
+    ctx.endBox();
+    ctx.endFrame();
+    const fill = try onlySolidFill(&ctx);
+    try std.testing.expectEqual(@as(u32, 0), fill.rect.w);
+}
+
+test "separator: a fixed child on the same wrap line gives the rule its length" {
+    var ctx = testCtx();
+    defer ctx.deinit();
+    // Both fit on one line (40 + 1 of 100 on the main axis), and the fixed child is what
+    // sets that line's cross size.
+    ctx.beginFrame(400, 300);
+    ctx.beginBox(.{ .direction = .column, .wrap = true, .width = .{ .fixed = 200 }, .height = .{ .fixed = 100 } });
+    ctx.beginBox(.{ .width = .{ .fixed = 80 }, .height = .{ .fixed = 40 } });
+    ctx.endBox();
+    separator(&ctx, .{});
+    ctx.endBox();
+    ctx.endFrame();
+    const fill = try onlySolidFill(&ctx);
+    try std.testing.expectEqual(@as(u32, 80), fill.rect.w);
+    try std.testing.expectEqual(@as(u32, 1), fill.rect.h);
+}
+
+test "separator: it occupies space in the flow" {
+    var ctx = testCtx();
+    defer ctx.deinit();
+    // The claim that makes this a box and not a border option: the rule takes main-axis
+    // space, so what follows it moves by `thickness`. Measured as the gap between two
+    // siblings placed around it.
+    inline for (.{ @as(i32, 1), @as(i32, 5) }) |thickness| {
+        ctx.beginFrame(400, 300);
+        ctx.beginBox(.{ .id = 0x5E_0001, .direction = .column, .width = .{ .fixed = 200 }, .height = .{ .fixed = 100 } });
+        ctx.beginBox(.{ .id = 0x5E_0002, .width = .{ .fixed = 30 }, .height = .{ .fixed = 10 } });
+        ctx.endBox();
+        separator(&ctx, .{ .thickness = thickness });
+        ctx.beginBox(.{ .id = 0x5E_0003, .width = .{ .fixed = 30 }, .height = .{ .fixed = 10 } });
+        ctx.endBox();
+        ctx.endBox();
+        ctx.endFrame();
+        const above = ctx.getNodeRect(0x5E_0002).?;
+        const below = ctx.getNodeRect(0x5E_0003).?;
+        const gap = below.y - (above.y + @as(i32, @intCast(above.h)));
+        try std.testing.expectEqual(thickness, gap);
+    }
+}
+
+test "separator: the cross axis is the parent's content size, padding excluded" {
+    var ctx = testCtx();
+    defer ctx.deinit();
+    ctx.beginFrame(400, 300);
+    ctx.beginBox(.{ .direction = .column, .width = .{ .fixed = 200 }, .height = .{ .fixed = 100 }, .padding = .{ 4, 6, 4, 10 } });
+    separator(&ctx, .{});
+    ctx.endBox();
+    ctx.endFrame();
+    const fill = try onlySolidFill(&ctx);
+    try std.testing.expectEqual(@as(u32, 200 - 6 - 10), fill.rect.w);
+    try std.testing.expectEqual(@as(i32, 10), fill.rect.x);
+}
+
+test "separator: a row-direction wrap line behaves the same as a column one" {
+    var ctx = testCtx();
+    defer ctx.deinit();
+    // Alone on the line: zero. With a fixed child on the same line: that line's cross size.
+    ctx.beginFrame(400, 300);
+    ctx.beginBox(.{ .direction = .row, .wrap = true, .width = .{ .fixed = 200 }, .height = .{ .fixed = 100 } });
+    separator(&ctx, .{});
+    ctx.endBox();
+    ctx.endFrame();
+    const alone = try onlySolidFill(&ctx);
+    try std.testing.expectEqual(@as(u32, 0), alone.rect.h);
+
+    ctx.beginFrame(400, 300);
+    ctx.beginBox(.{ .direction = .row, .wrap = true, .width = .{ .fixed = 200 }, .height = .{ .fixed = 100 } });
+    ctx.beginBox(.{ .width = .{ .fixed = 30 }, .height = .{ .fixed = 40 } });
+    ctx.endBox();
+    separator(&ctx, .{});
+    ctx.endBox();
+    ctx.endFrame();
+    const paired = try onlySolidFill(&ctx);
+    try std.testing.expectEqual(@as(u32, 1), paired.rect.w);
+    try std.testing.expectEqual(@as(u32, 40), paired.rect.h);
+}
+
+test "separator: an anchored sibling does not establish a fit cross axis" {
+    var ctx = testCtx();
+    defer ctx.deinit();
+    // An overlay takes no part in the parent's fit measure, so it cannot give the rule a
+    // length however large it is.
+    ctx.beginFrame(400, 300);
+    ctx.beginBox(.{ .direction = .column, .width = .fit, .height = .{ .fixed = 100 } });
+    ctx.beginBox(.{ .anchor = .{ .at = .top_left }, .width = .{ .fixed = 120 }, .height = .{ .fixed = 40 } });
+    ctx.endBox();
+    separator(&ctx, .{});
+    ctx.endBox();
+    ctx.endFrame();
+    var rects: std.ArrayList(Rect) = .empty;
+    defer rects.deinit(std.testing.allocator);
+    var colors: std.ArrayList(Color) = .empty;
+    defer colors.deinit(std.testing.allocator);
+    try solidFills(&ctx, &rects, &colors);
+    // The overlay has no bg, so the rule is still the only fill.
+    try std.testing.expectEqual(@as(usize, 1), rects.items.len);
+    try std.testing.expectEqual(@as(u32, 0), rects.items[0].w);
+}
+
+test "separator: a grow sibling on the cross axis does not establish a fit cross axis" {
+    var ctx = testCtx();
+    defer ctx.deinit();
+    // A `.grow` cross-axis child contributes its min (0) to a fit measure, exactly like the
+    // rule itself, so neither one gives the other a size.
+    ctx.beginFrame(400, 300);
+    ctx.beginBox(.{ .direction = .column, .width = .fit, .height = .{ .fixed = 100 } });
+    ctx.beginBox(.{ .width = .{ .grow = 1 }, .height = .{ .fixed = 40 } });
+    ctx.endBox();
+    separator(&ctx, .{});
+    ctx.endBox();
+    ctx.endFrame();
+    const fill = try onlySolidFill(&ctx);
+    try std.testing.expectEqual(@as(u32, 0), fill.rect.w);
+}
+
+test "separator: an indefinite sibling's min on the cross axis does establish it" {
+    var ctx = testCtx();
+    defer ctx.deinit();
+    // The counterpart to the test above: an indefinite `Sizing` contributes its min, not
+    // nothing, so the rule is 20 wide. "Only `.fixed` / `.fit` siblings count" is the wrong
+    // reading, and it is wrong for `.percent` the same way it is wrong for `.grow`.
+    inline for (.{ layout.Sizing{ .grow = 1 }, layout.Sizing{ .percent = 0.5 } }) |sizing| {
+        ctx.beginFrame(400, 300);
+        ctx.beginBox(.{ .direction = .column, .width = .fit, .height = .{ .fixed = 100 } });
+        ctx.beginBox(.{ .width = sizing, .height = .{ .fixed = 40 }, .min_width = 20 });
+        ctx.endBox();
+        separator(&ctx, .{});
+        ctx.endBox();
+        ctx.endFrame();
+        const fill = try onlySolidFill(&ctx);
+        try std.testing.expectEqual(@as(u32, 20), fill.rect.w);
+    }
+}
+
+test "separator: a text leaf's intrinsic width establishes a fit cross axis" {
+    var ctx = testCtx();
+    defer ctx.deinit();
+    // A leaf contributes its intrinsic measure whatever `Sizing` it declares, so a wrapping
+    // text leaf — which is created `.grow` on the width axis — still gives the rule a length.
+    ctx.beginFrame(400, 300);
+    ctx.beginBox(.{ .direction = .column, .width = .fit, .height = .{ .fixed = 100 } });
+    ctx.text("abcd", .{ .wrap = true });
+    separator(&ctx, .{});
+    ctx.endBox();
+    ctx.endFrame();
+    var rects: std.ArrayList(Rect) = .empty;
+    defer rects.deinit(std.testing.allocator);
+    var colors: std.ArrayList(Color) = .empty;
+    defer colors.deinit(std.testing.allocator);
+    try solidFills(&ctx, &rects, &colors);
+    try std.testing.expectEqual(@as(usize, 1), rects.items.len);
+    // The test font is 8 px per ASCII character.
+    try std.testing.expectEqual(@as(u32, 32), rects.items[0].w);
+}
+
+test "separator: a wrap line takes no leaf exception, so a wrapping text gives no length" {
+    var ctx = testCtx();
+    defer ctx.deinit();
+    // The same text that establishes a `.fit` column's width contributes nothing to a wrap
+    // line: `lineCrossSize` reads the declared `Sizing`, and a wrapping text leaf declares
+    // `.grow` on the width axis. The leaf exception belongs to the fit measure, not here.
+    ctx.beginFrame(400, 300);
+    ctx.beginBox(.{ .direction = .column, .wrap = true, .width = .{ .fixed = 200 }, .height = .{ .fixed = 100 } });
+    ctx.text("abcd", .{ .wrap = true });
+    separator(&ctx, .{});
+    ctx.endBox();
+    ctx.endFrame();
+    var rects: std.ArrayList(Rect) = .empty;
+    defer rects.deinit(std.testing.allocator);
+    var colors: std.ArrayList(Color) = .empty;
+    defer colors.deinit(std.testing.allocator);
+    try solidFills(&ctx, &rects, &colors);
+    try std.testing.expectEqual(@as(usize, 1), rects.items.len);
+    try std.testing.expectEqual(@as(u32, 0), rects.items[0].w);
+}
+
+test "separator: the parent's own min on the cross axis establishes it" {
+    var ctx = testCtx();
+    defer ctx.deinit();
+    // No sibling at all, but the parent cannot be narrower than 150, and a `.grow` child
+    // fills what the clamp produced.
+    ctx.beginFrame(400, 300);
+    ctx.beginBox(.{ .direction = .column, .width = .fit, .height = .{ .fixed = 100 }, .min_width = 150 });
+    separator(&ctx, .{});
+    ctx.endBox();
+    ctx.endFrame();
+    const fill = try onlySolidFill(&ctx);
+    try std.testing.expectEqual(@as(u32, 150), fill.rect.w);
 }
 
 fn expectButtonDrawColors(ctx: *Context, background: Color, border: Color, text: Color) !void {

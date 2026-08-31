@@ -242,6 +242,9 @@ pub const labelEllipsis = @import("widgets.zig").labelEllipsis;
 pub const FormRowOpts = @import("widgets.zig").FormRowOpts;
 pub const beginFormRow = @import("widgets.zig").beginFormRow;
 pub const endFormRow = @import("widgets.zig").endFormRow;
+// Separator — a rule on one edge (see docs/adr/034 for why border stays four-sided)
+pub const SeparatorOpts = @import("widgets.zig").SeparatorOpts;
+pub const separator = @import("widgets.zig").separator;
 // Slider group — label / track / value columns shared by the slider rows inside
 pub const SliderGroupOpts = @import("widgets.zig").SliderGroupOpts;
 pub const beginSliderGroup = @import("widgets.zig").beginSliderGroup;

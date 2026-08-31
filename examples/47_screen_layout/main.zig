@@ -209,7 +209,7 @@ const App = struct {
             .bg = ctx.style.surface.canvas,
         });
         self.buildHeader(ctx);
-        rule(ctx);
+        ctx.separator(.{});
 
         ctx.beginBox(.{
             .direction = .row,
@@ -468,17 +468,6 @@ const App = struct {
 const col_kind_w: i32 = 96;
 const col_size_w: i32 = 72;
 const col_date_w: i32 = 104;
-
-/// A one-pixel horizontal rule. `Border` is uniform on all four sides, so a single edge is
-/// a box of its own rather than an option on the box above it.
-fn rule(ctx: *gui.Context) void {
-    ctx.beginBox(.{
-        .width = .{ .grow = 1 },
-        .height = .{ .fixed = 1 },
-        .bg = ctx.style.border_tokens.normal,
-    });
-    ctx.endBox();
-}
 
 /// A custom-drawn leaf. No widget draws a progress bar, and the bar still belongs inside
 /// the card's layout, so it enters the tree through `ctx.custom` and is handed its final

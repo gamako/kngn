@@ -39,8 +39,11 @@
 //   wrap box each line is aligned independently. Anchored children ignore it. Distributing
 //   the leftover between children (space-between and friends) is not supported; a two-group
 //   row still puts a grow box between the groups.
-// - grow / percent children inside a fit parent measure as 0 (the fit parent shrinks accordingly).
-//   This holds on both axes, including measureHeights.
+// - a grow / percent child box inside a fit parent measures as 0 before its own clamp, so the
+//   fit parent shrinks accordingly; a positive min_* on that child still contributes, since the
+//   clamp applies to computeMeasured. A leaf is the other exception: it contributes its
+//   intrinsic measure whatever Sizing it declares. This holds on both axes, including
+//   measureHeights.
 // - percent is relative to the parent content box (after padding, before gap). Floor truncation;
 //   no sum correction among percent children. Leftover px from truncation is absorbed by grow children
 
@@ -439,7 +442,8 @@ pub fn measureWidths(node: *Node, default_font: Font) void {
 
 /// Height measure (post-order). Text-leaf `measured_h` is already set by wrapText
 /// (or by `seedTextHeightsUnwrapped` when tests call `measure` without wrap).
-/// grow / percent children inside a fit parent measure as 0 on this axis too.
+/// grow / percent children inside a fit parent measure as 0 on this axis too, before their
+/// own clamp: computeMeasured clamps its raw result, so a positive min_height still contributes.
 ///
 /// Hot path: every frame on the GUI layout path; not a per-pixel loop; not RT.
 pub fn measureHeights(node: *Node, default_font: Font) void {
@@ -627,6 +631,8 @@ fn lineHasClamp(first: *Node, end: ?*Node, axis: Axis, skip_anchored: bool) bool
 /// Line cross size: max of (non-grow/percent children's clamped resolved size,
 /// grow/percent children's min). A line of only grow/percent children with
 /// min 0 has cross 0 (same idea as grow/percent measuring 0 inside a fit parent).
+/// This reads the declared Sizing and takes no leaf exception, unlike computeMeasured:
+/// a leaf declaring grow / percent contributes its min here, not its intrinsic size.
 fn lineCrossSize(first: *Node, end: ?*Node, cross: Axis, skip_anchored: bool) i32 {
     var line_cross: i32 = 0;
     var it: ?*Node = first;

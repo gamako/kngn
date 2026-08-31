@@ -346,7 +346,7 @@ fn buildScreen(self: *App, ctx: *gui.Context) void {
         .bg = ctx.style.surface.canvas,
     });
     self.buildHeader(ctx);
-    rule(ctx);   // see below: a single edge is a box, not a border option
+    ctx.separator(.{});   // see below: one edge is a rule, not a border option
 
     ctx.beginBox(.{
         .direction = .row,
@@ -387,23 +387,17 @@ fn card(ctx: *gui.Context, title: []const u8, value: []const u8, fraction: ?f32)
 }
 ```
 
-**`border` is uniform on all four sides, so one edge is a box of its own.** A rule under the
-header, a divider between two panes, a hairline over a footer — each is a `.{ .grow = 1 }`
-box one pixel tall with a background:
+**`border` is uniform on all four sides, so a rule on one edge is `ctx.separator(.{})`.** It
+emits a box `thickness` px on the parent's main axis and `.grow` on its cross axis, so the
+orientation follows the parent's `direction` and the colour follows the theme. It is worth
+naming because two adjacent surface tokens differ by little: without an edge, a header band
+and the page under it read as one soft gradient rather than two regions.
 
-```zig
-fn rule(ctx: *gui.Context) void {
-    ctx.beginBox(.{
-        .width = .{ .grow = 1 },
-        .height = .{ .fixed = 1 },
-        .bg = ctx.style.border_tokens.normal,
-    });
-    ctx.endBox();
-}
-```
-
-It is worth the three lines: two adjacent surface tokens differ by little, so without an edge
-a header band and the page under it read as one soft gradient rather than two regions.
+**The rule fills a size it does not itself establish**, so it is zero length and simply does
+not appear when nothing else establishes one: an unconstrained `.fit` cross axis with no other
+sized child, or — because a `wrap` line takes its cross size from that line's children alone —
+a lone rule on a wrap line, even inside a `.fixed` parent. §5.2 is the general form of the trap. [`docs/adr/034`](adr/034_separator-instead-of-per-side-border.md)
+records why the border is not extended per side.
 
 The content column stacks the cards, the table and the list, and the card row splits itself
 between three `.grow` children. (In the sample `card` also takes the `*App`, so it can count
@@ -515,6 +509,7 @@ tabs and list rows take the current state as a plain argument rather than storin
 | `beginCollapsible` / `endCollapsible` | `if (ctx.beginCollapsible(id, "Filters", &self.filters_open)) { ...; ctx.endCollapsible(); }` | `bool`: whether the body is open. **Close it only when this was true** |
 | `beginScrollArea` / `endScrollArea` | a scroll viewport around content you build | nothing; you own the `gui.Vec2f` offset |
 | `beginFormRow` / `endFormRow` | an optional label and description above the control(s) built between them | nothing |
+| `separator` | `ctx.separator(.{});` — a one-line rule; `thickness` sits on the parent's main axis, the cross axis grows | nothing |
 | `beginSliderGroup` / `endSliderGroup` | shared label / track / value columns for the sliders inside | nothing |
 | `beginTable` … `endTable` | a column table (§5.4) | `endTableRow` returns `TableRowResult{ activated }` |
 | `beginVirtualList` / `endVirtualList` | a fixed-row list that builds only what is visible (§5.4) | `VirtualRange{ first, end }` — the half-open window to build |

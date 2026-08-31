@@ -427,6 +427,8 @@ pub const Context = struct {
     // Form row
     pub const beginFormRow = widgets.beginFormRow;
     pub const endFormRow = widgets.endFormRow;
+    // Separator
+    pub const separator = widgets.separator;
     // Slider group (label / track / value columns shared by the rows inside)
     pub const beginSliderGroup = widgets.beginSliderGroup;
     pub const endSliderGroup = widgets.endSliderGroup;
