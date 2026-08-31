@@ -626,7 +626,7 @@ fn renderText(ctx: *gui.Context, app: *App) void {
     ctx.label(app.long_emoji);
     ctx.label(app.long_newline);
     ctx.label(app.utf8_boundary_text);
-    ctx.labelStyled("heading-tier", .heading);
+    ctx.labelStyled("title-tier", .title);
     ctx.labelStyled("muted-tier", .muted);
     _ = ctx.selectableLabelId(Ids.text_selectable, app.utf8_boundary_text, .{});
     _ = ctx.textInputId(Ids.text_input, app.text_buf, .{ .width = .{ .fixed = 480 }, .placeholder = "empty" });

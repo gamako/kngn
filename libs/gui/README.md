@@ -169,11 +169,17 @@ Two smaller helpers round out a settings-style form:
   `max_lines = 0` is one line plus a marker). Use this when the leaf should simply fit
   its box. `label` / `labelEx` stay the terse path: no auto-wrap, but explicit paragraph
   breaks still become multiple lines.
-- `ctx.labelStyled(str, tier)` — `heading` / `body` / `caption` / `muted`. Delegates to
-  `text` with that tier's `Style` colour and resolved font. With `gui.default_font`, a null
-  tier font resolves through the shared Noto Sans JP family using the tier's size and weight:
-  heading 20/700, body 16/400, caption 13/400, muted 12/400. An explicit font wins. A
-  bitmap or family-less custom font uses the context font and ignores tier size and weight.
+- `ctx.labelStyled(str, tier)` — seven role-named tiers, largest to smallest: `headline` 24/700
+  (screen title), `title` 20/700 (card or window title), `subtitle` 18/600 (section heading),
+  `body` 16/400 (prose and values), `label` 14/600 (column header, field name — a short name the
+  eye scans), `caption` 13/400 (an aside meant to be read), `muted` 12/400 (droppable hint).
+  Delegates to `text` with that tier's `Style` colour and resolved font. With `gui.default_font`,
+  a null tier font resolves through the shared Noto Sans JP family using the tier's size and
+  weight. An explicit font wins. A bitmap or family-less custom font uses the context font and
+  ignores tier size and weight. **`docs/adr/035_text-tier-vocabulary.md` maps HTML, Material 3, Apple HIG and Tailwind
+  onto these seven**, and holds the rule for choosing between `label` / `caption` / `muted`.
+  `Style` keeps one `TextStyle` per tier in `text_styles`, indexed by the enum; read it through
+  `style.textStyle(tier)`.
 - `ctx.labelEllipsis(text, max_w, color) EllipsisResult` / `gui.ellipsizeText(ctx, text, max_w)`
   — draw (or just compute) `text` truncated to a trailing `"..."` once it would exceed `max_w`
   px, codepoint-aware. `result.truncated` is available **in the same frame**, which is why

@@ -48,14 +48,9 @@ its matching scalar tail. Clip intersection, destination stride, and source colo
 computed outside the per-pixel work. The coverage loop is frame-time, full-pixel work;
 allocation and outline rasterisation remain cache-miss-only operations.
 
-The default tiers are:
-
-| Tier | Size | Weight |
-| --- | ---: | ---: |
-| heading | 20 px | 700 |
-| body | 16 px | 400 |
-| caption | 13 px | 400 |
-| muted | 12 px | 400 |
+One variant is created per tier `(size, weight)` pair, and the pairs are listed in
+[035](035_text-tier-vocabulary.md), which owns the tier vocabulary. What matters here is
+the count: each distinct pair is one `OutlineFont` sharing this coverage cache.
 
 ## Alternatives rejected
 

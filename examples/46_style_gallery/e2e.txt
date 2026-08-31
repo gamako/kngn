@@ -279,4 +279,27 @@ snapshot drawlist
 digest frameprof
 expect frameprof body_ms<16.7
 
+# shadow masks -> text tiers. Appended after the sections above so their expectations and
+# draw-list hashes are untouched; a hash here that moves is a defect, not an update.
+inject key_down PAGE_DOWN
+step 1
+inject key_up PAGE_DOWN
+step 1
+digest showcase
+digest layout_sanity
+expect layout_sanity total=0
+expect showcase section=text
+expect showcase index=6
+# Reported from the enum, so adding a tier fails this line until the specimen list and this
+# number are both looked at.
+expect showcase text_tiers=7
+snapshot fb
+digest drawlist
+# 7 tiers x (name + size/weight readout + specimen line) = 21, plus this section's own intro
+# label and the two in the header = 24. Dropping a tier from the specimen loop moves it.
+expect drawlist text=24
+# One separator per tier, plus the canvas, header and panel backgrounds.
+expect drawlist rect_filled=10
+expect drawlist path=0
+
 quit

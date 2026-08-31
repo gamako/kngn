@@ -19,8 +19,37 @@ pub const TextStyle = struct {
     weight: u16 = 400,
 };
 
-/// Named text tier for `Context.labelStyled`.
-pub const TextTier = enum { heading, body, caption, muted };
+/// Named text tier for `Context.labelStyled`. Seven role-oriented levels, chosen so that a
+/// design written in an external vocabulary can be transcribed without inventing a mapping;
+/// `docs/adr/035_text-tier-vocabulary.md` holds the mapping tables and why the count is seven. The declaration order
+/// is largest to smallest and is what indexes `Style.text_styles`.
+pub const TextTier = enum {
+    /// Screen title, the topmost visual heading. 24px / 700.
+    headline,
+    /// Card or window title, a title inside a major section. 20px / 700.
+    title,
+    /// Section heading in a sidebar or inspector. 18px / 600.
+    subtitle,
+    /// Ordinary prose, descriptions, a list's values. 16px / 400.
+    body,
+    /// Column header, form field name, short UI label — a name the eye scans rather than
+    /// reads. 14px / 600.
+    label,
+    /// A note or aside the reader is still meant to read. 13px / 400, subtle colour.
+    caption,
+    /// The lowest-priority hint or optional metadata: droppable without losing the point.
+    /// 12px / 400.
+    muted,
+};
+
+/// One `TextStyle` per `TextTier`, indexed by the enum's declaration order. Adding a tier to
+/// the enum makes this array wider, which is what keeps the two from drifting apart.
+pub const TextStyles = [@typeInfo(TextTier).@"enum".fields.len]TextStyle;
+
+/// Index of `tier` into a `TextStyles`.
+pub fn tierIndex(tier: TextTier) usize {
+    return @intFromEnum(tier);
+}
 
 pub const AnimationStyle = struct {
     enabled: bool = false,
@@ -170,14 +199,14 @@ pub const Style = struct {
     /// One tree-indent step for `beginListboxRow` guides. `0` emits no guide
     /// (even when `depth > 0`). Must be `>= 0`.
     indent_w: i32 = 14,
-    /// Heading tier. Default 20px / weight 700.
-    heading: TextStyle = .{ .color = Color.rgba(0xFF, 0xFF, 0xFF, 0xFF), .size = 20, .weight = 700 },
-    /// Body tier. Default 16px / weight 400.
-    body: TextStyle = .{ .color = Color.rgba(0xFF, 0xFF, 0xFF, 0xFF), .size = 16, .weight = 400 },
-    /// Caption tier. Default 13px / weight 400.
-    caption: TextStyle = .{ .color = Color.rgba(0x90, 0x98, 0xA0, 0xFF), .size = 13, .weight = 400 },
-    /// Muted tier. Default 12px / weight 400.
-    muted: TextStyle = .{ .color = Color.rgba(0x64, 0x68, 0x70, 0xFF), .size = 12, .weight = 400 },
+    /// One entry per `TextTier`, in the enum's declaration order. Read it through
+    /// `textStyle(tier)` rather than by index. The sizes and weights are the same in both
+    /// themes; only the colours differ.
+    text_styles: TextStyles = defaultTextStyles(
+        Color.rgba(0xFF, 0xFF, 0xFF, 0xFF),
+        Color.rgba(0x90, 0x98, 0xA0, 0xFF),
+        Color.rgba(0x64, 0x68, 0x70, 0xFF),
+    ),
 
     /// The color a disabled widget draws `base` as: grayscale (so an accent color loses its hue,
     /// not just its brightness), then blended halfway toward `bg` (so a disabled widget dims
@@ -206,14 +235,25 @@ pub const Style = struct {
     }
 
     pub fn textStyle(self: Style, tier: TextTier) TextStyle {
-        return switch (tier) {
-            .heading => self.heading,
-            .body => self.body,
-            .caption => self.caption,
-            .muted => self.muted,
-        };
+        return self.text_styles[tierIndex(tier)];
     }
 };
+
+/// The one place the size and weight of every tier is written. `primary` colours the tiers
+/// that carry structure, `subtle` the caption, `muted` the lowest tier — the caller derives
+/// `muted` from a built `Style` (see `styleForTokens`), so it is passed in rather than
+/// computed here.
+fn defaultTextStyles(primary: Color, subtle: Color, muted: Color) TextStyles {
+    var out: TextStyles = undefined;
+    out[tierIndex(.headline)] = .{ .color = primary, .size = 24, .weight = 700 };
+    out[tierIndex(.title)] = .{ .color = primary, .size = 20, .weight = 700 };
+    out[tierIndex(.subtitle)] = .{ .color = primary, .size = 18, .weight = 600 };
+    out[tierIndex(.body)] = .{ .color = primary, .size = 16, .weight = 400 };
+    out[tierIndex(.label)] = .{ .color = primary, .size = 14, .weight = 600 };
+    out[tierIndex(.caption)] = .{ .color = subtle, .size = 13, .weight = 400 };
+    out[tierIndex(.muted)] = .{ .color = muted, .size = 12, .weight = 400 };
+    return out;
+}
 
 fn styleForTokens(
     surface: SurfaceTokens,
@@ -245,11 +285,11 @@ fn styleForTokens(
         .slider_knob_active_bg = accent.primary,
         .picker_marker_light = text_tokens.primary,
         .picker_marker_dark = Color.rgba(0x00, 0x00, 0x00, 0xFF),
-        .heading = .{ .color = text_tokens.primary, .size = 20, .weight = 700 },
-        .body = .{ .color = text_tokens.primary, .size = 16, .weight = 400 },
-        .caption = .{ .color = text_tokens.subtle, .size = 13, .weight = 400 },
+        // `mutedFromSubtle` needs a built Style, so the muted colour is seeded with `subtle`
+        // here and rewritten once `s` exists.
+        .text_styles = defaultTextStyles(text_tokens.primary, text_tokens.subtle, text_tokens.subtle),
     };
-    s.muted = .{ .color = s.mutedFromSubtle(), .size = 12, .weight = 400 };
+    s.text_styles[tierIndex(.muted)].color = s.mutedFromSubtle();
     return s;
 }
 
@@ -385,33 +425,99 @@ test "disabledColor: idempotent-ish -- disabling an already-bg-colored value ret
     try std.testing.expect(@as(i32, @intCast(s.bg.r)) - @as(i32, @intCast(bg_disabled.r)) <= 8);
 }
 
-test "defaultStyle: text tiers map heading/body to text, caption to text_subtle, muted toward bg" {
+/// The tier table as prose, so the test below fails when a size or weight in `style.zig`
+/// changes without this list changing with it. `docs/adr/035_text-tier-vocabulary.md` is where
+/// the numbers come from.
+const expected_tiers = [_]struct { tier: TextTier, size: f32, weight: u16 }{
+    .{ .tier = .headline, .size = 24, .weight = 700 },
+    .{ .tier = .title, .size = 20, .weight = 700 },
+    .{ .tier = .subtitle, .size = 18, .weight = 600 },
+    .{ .tier = .body, .size = 16, .weight = 400 },
+    .{ .tier = .label, .size = 14, .weight = 600 },
+    .{ .tier = .caption, .size = 13, .weight = 400 },
+    .{ .tier = .muted, .size = 12, .weight = 400 },
+};
+
+test "TextTier: the enum and the expected table hold the same tiers" {
+    // Adding a tier without extending the table (or the gallery) leaves it unmeasured.
+    try std.testing.expectEqual(expected_tiers.len, @typeInfo(TextTier).@"enum".fields.len);
+    inline for (@typeInfo(TextTier).@"enum".fields, 0..) |field, i| {
+        try std.testing.expectEqual(i, tierIndex(@field(TextTier, field.name)));
+        try std.testing.expectEqualStrings(field.name, @tagName(expected_tiers[i].tier));
+    }
+}
+
+test "defaultStyle: every tier has the designed size and weight, in both themes" {
+    inline for (.{ defaultStyle(), lightStyle() }) |s| {
+        for (expected_tiers) |want| {
+            const got = s.textStyle(want.tier);
+            try std.testing.expectEqual(want.size, got.size);
+            try std.testing.expectEqual(want.weight, got.weight);
+            // A null font is what lets Context resolve the size/weight through the family.
+            try std.testing.expect(got.font == null);
+        }
+    }
+}
+
+test "defaultStyle: tier colors follow the tokens, and sizes descend strictly" {
     const s = defaultStyle();
-    try std.testing.expectEqual(s.text, s.heading.color);
-    try std.testing.expectEqual(s.text, s.body.color);
-    try std.testing.expectEqual(s.text_subtle, s.caption.color);
-    try std.testing.expectEqual(s.mutedFromSubtle(), s.muted.color);
-    try std.testing.expect(s.heading.font == null);
-    try std.testing.expect(s.body.font == null);
-    try std.testing.expect(s.caption.font == null);
-    try std.testing.expect(s.muted.font == null);
-    try std.testing.expectEqual(@as(f32, 20), s.heading.size);
-    try std.testing.expectEqual(@as(u16, 700), s.heading.weight);
-    try std.testing.expectEqual(@as(f32, 16), s.body.size);
-    try std.testing.expectEqual(@as(u16, 400), s.body.weight);
-    try std.testing.expectEqual(@as(f32, 13), s.caption.size);
-    try std.testing.expectEqual(@as(u16, 400), s.caption.weight);
-    try std.testing.expectEqual(@as(f32, 12), s.muted.size);
-    try std.testing.expectEqual(@as(u16, 400), s.muted.weight);
+    // Structure-carrying tiers take the primary text colour; caption the subtle one; muted is
+    // derived from subtle so it stays the weakest.
+    for ([_]TextTier{ .headline, .title, .subtitle, .body, .label }) |tier| {
+        try std.testing.expectEqual(s.text, s.textStyle(tier).color);
+    }
+    try std.testing.expectEqual(s.text_subtle, s.textStyle(.caption).color);
+    try std.testing.expectEqual(s.mutedFromSubtle(), s.textStyle(.muted).color);
+    // Declaration order is largest to smallest, and no two tiers share a size: a duplicate
+    // would make two tiers indistinguishable and share one font variant.
+    inline for (@typeInfo(TextTier).@"enum".fields, 0..) |_, i| {
+        if (i == 0) continue;
+        const prev = s.text_styles[i - 1];
+        const cur = s.text_styles[i];
+        try std.testing.expect(cur.size < prev.size);
+    }
     try std.testing.expectEqual(@as(i32, 14), s.indent_w);
 }
 
-test "textStyle: tier selects the matching TextStyle field" {
+test "defaultStyle: muted is derived from subtle in both themes and in the field default" {
+    // `styleForTokens` seeds muted with `subtle` and rewrites it once the Style exists, so the
+    // two-step is worth asserting on the value it produces, per theme.
+    inline for (.{ defaultStyle(), lightStyle() }) |s| {
+        try std.testing.expectEqual(s.mutedFromSubtle(), s.textStyle(.muted).color);
+        // Weaker than caption is the point of the tier; if the seed leaked through they match.
+        try std.testing.expect(@as(u32, @bitCast(s.textStyle(.muted).color)) != @as(u32, @bitCast(s.textStyle(.caption).color)));
+    }
+    try std.testing.expectEqual(Color.rgba(0x64, 0x68, 0x70, 0xFF), defaultStyle().textStyle(.muted).color);
+    // The `Style.text_styles` field default is a separate table from `styleForTokens`; a
+    // caller building a Style by hand gets these.
+    const bare: Style = .{
+        .surface = defaultStyle().surface,
+        .accent = defaultStyle().accent,
+        .border_tokens = defaultStyle().border_tokens,
+        .text_tokens = defaultStyle().text_tokens,
+        .elevation = defaultStyle().elevation,
+        .bg = defaultStyle().bg,
+        .bg_hover = defaultStyle().bg_hover,
+        .bg_active = defaultStyle().bg_active,
+        .border = defaultStyle().border,
+        .border_hover = defaultStyle().border_hover,
+        .text = defaultStyle().text,
+        .text_subtle = defaultStyle().text_subtle,
+    };
+    for (expected_tiers) |want| {
+        try std.testing.expectEqual(want.size, bare.textStyle(want.tier).size);
+        try std.testing.expectEqual(want.weight, bare.textStyle(want.tier).weight);
+    }
+    try std.testing.expectEqual(Color.rgba(0x64, 0x68, 0x70, 0xFF), bare.textStyle(.muted).color);
+}
+
+test "textStyle: tier selects the matching array element" {
     const s = defaultStyle();
-    try std.testing.expectEqual(s.heading.color, s.textStyle(.heading).color);
-    try std.testing.expectEqual(s.body.color, s.textStyle(.body).color);
-    try std.testing.expectEqual(s.caption.color, s.textStyle(.caption).color);
-    try std.testing.expectEqual(s.muted.color, s.textStyle(.muted).color);
+    inline for (@typeInfo(TextTier).@"enum".fields, 0..) |field, i| {
+        const tier = @field(TextTier, field.name);
+        try std.testing.expectEqual(s.text_styles[i].color, s.textStyle(tier).color);
+        try std.testing.expectEqual(s.text_styles[i].size, s.textStyle(tier).size);
+    }
 }
 
 test "mutedFromSubtle: halfway from text_subtle toward bg" {
@@ -490,8 +596,8 @@ test "lightStyle: values and derived colors are theme-local" {
     try std.testing.expectEqual(Color.rgba(0x00, 0x00, 0x00, 0x38), s.elevation.shadow);
     try std.testing.expectEqual(Color.rgba(0xEA, 0xEC, 0xEF, 0xFF), s.disabledColor(s.surface.control));
     try std.testing.expectEqual(Color.rgba(0x9D, 0xA7, 0xB4, 0xFF), s.mutedFromSubtle());
-    try std.testing.expectEqual(s.text_tokens.primary, s.heading.color);
-    try std.testing.expectEqual(s.text_tokens.subtle, s.caption.color);
+    try std.testing.expectEqual(s.text_tokens.primary, s.textStyle(.title).color);
+    try std.testing.expectEqual(s.text_tokens.subtle, s.textStyle(.caption).color);
 }
 
 test "WidgetStyle: every override is optional" {

@@ -491,7 +491,7 @@ fn renderText(ctx: *gui.Context, app: *App) void {
     ctx.endBox();
     ctx.endBox();
     ctx.labelEx("labelStyled tiers (size and weight are resolved by the default family)", ctx.style.text_tokens.subtle);
-    ctx.labelStyled("Heading", .heading);
+    ctx.labelStyled("Title", .title);
     ctx.labelStyled("日本語ラベル", .body);
     ctx.labelStyled("Body text", .body);
     ctx.labelStyled("Caption", .caption);
@@ -531,7 +531,7 @@ fn itemTooltip(ptr: *anyopaque, ctx: *gui.Context) void {
     ctx.beginBox(.{ .direction = .row, .gap = 8, .align_cross = .center });
     ctx.imageBox(0x35B0, &image_pixels, 8, 8, .{ .border = ctx.style.border_tokens.normal });
     ctx.beginBox(.{ .direction = .column, .gap = 2 });
-    ctx.labelStyled("Item", .heading);
+    ctx.labelStyled("Item", .title);
     ctx.label("A custom tooltip");
     ctx.endBox();
     ctx.endBox();

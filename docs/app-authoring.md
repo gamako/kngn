@@ -380,8 +380,8 @@ fn card(ctx: *gui.Context, title: []const u8, value: []const u8, fraction: ?f32)
         .radius = 8,
         .border = .{ .color = ctx.style.border_tokens.normal, .thickness = 1 },
     });
-    ctx.labelStyled(title, .caption);
-    ctx.labelStyled(value, .heading);
+    ctx.labelStyled(title, .label);
+    ctx.labelStyled(value, .title);
     if (fraction) |f| meter(ctx, f);   // §5.5 — no widget draws a bar
     ctx.endBox();
 }
@@ -495,7 +495,7 @@ tabs and list rows take the current state as a plain argument rather than storin
 | Call | Minimal use | Returns |
 |---|---|---|
 | `label` / `labelEx` | `ctx.label("Collections");` — one line, no wrapping | nothing |
-| `labelStyled` | `ctx.labelStyled("Asset library", .heading);` — `.heading` / `.body` / `.caption` / `.muted` | nothing |
+| `labelStyled` | `ctx.labelStyled("Asset library", .headline);` — `.headline` / `.title` / `.subtitle` / `.body` / `.label` / `.caption` / `.muted` (§6) | nothing |
 | `text` | `ctx.text(name, .{ .overflow = .ellipsis });` — declarative: `wrap`, `max_lines`, `.visible`/`.clip`/`.ellipsis` | nothing |
 | `button` / `buttonId` | `if (ctx.buttonId(id, "Rescan", .{}).clicked) { ... }` | `ButtonResult{ clicked, hovered, held }`; `ctx.button("Rescan")` is the `clicked` bool alone |
 | `checkbox` / `checkboxId` | `_ = ctx.checkboxId(id, "Tagged only", &self.only_tagged);` | `bool`: true on the frame the value changed. The new value is written through the pointer |
@@ -600,7 +600,7 @@ fn buildInspector(self: *App, ctx: *gui.Context) void {
         .radius = 8,
         .border = .{ .color = ctx.style.border_tokens.normal, .thickness = 1 },
     });
-    ctx.labelStyled("Details", .caption);
+    ctx.labelStyled("Details", .subtitle);
     self.buildSummaryTable(ctx);
     ctx.endBox();
 }
@@ -745,7 +745,8 @@ row across it. `ListboxRowOpts.idle_bg` on alternating rows is the cheapest fix,
 it is the *idle* fill it costs nothing to selection and hover.
 
 The list's header row is a sibling box built above the list from the same `cell` calls with
-`.caption` instead of `.body`, so the two columns line up by construction.
+`.label` instead of `.body`, so the two columns line up by construction — and the header reads
+as a header, since `.label` is the tier for a name the eye scans (§6).
 
 A string built for a row lives on the frame arena (`ctx.allocator()`), which is reset at the
 *next* `beginFrame` — after `gui.render` has read it. That is why `allocPrint` above needs no
@@ -897,17 +898,30 @@ covers Japanese text without application-side font setup. `Context.init` recogni
 
 ```zig
 var ctx = gui.Context.init(gpa, gui.default_font);
-ctx.labelStyled("GUI Style Showcase", .heading);
+ctx.labelStyled("Asset library", .headline);
 ```
 
-The default text tiers are:
+The tiers are named for the role they play, largest to smallest:
 
-| Tier | Size | Weight |
-|---|---:|---:|
-| `heading` | 20 px | 700 |
-| `body` | 16 px | 400 |
-| `caption` | 13 px | 400 |
-| `muted` | 12 px | 400 |
+| Tier | Size | Weight | What it is for |
+|---|---:|---:|---|
+| `headline` | 24 px | 700 | screen title, the topmost visual heading |
+| `title` | 20 px | 700 | card or window title; a title inside a major section |
+| `subtitle` | 18 px | 600 | section heading in a sidebar or inspector |
+| `body` | 16 px | 400 | ordinary prose, descriptions, a list's values |
+| `label` | 14 px | 600 | column header, form field name, short UI label |
+| `caption` | 13 px | 400 | a note or aside the reader is still meant to read |
+| `muted` | 12 px | 400 | lowest-priority hint or optional metadata |
+
+**Choosing between the bottom three is a question of role, not size** — they sit within two
+pixels of each other. `label` is a short *name* the eye scans to find structure; `caption` is a
+*sentence* that supplements the content; `muted` is something *droppable*.
+
+**Porting a design written in another vocabulary?**
+[`docs/adr/035`](adr/035_text-tier-vocabulary.md) maps HTML's `h1`–`h6` / `p` / `small`,
+Material 3, Apple HIG and Tailwind onto these seven, and says what is deliberately not carried
+over (exact pixel sizes, per-step line heights, Tailwind's independent weight modifier).
+`examples/46_style_gallery`'s text section shows all seven side by side.
 
 The font is a URL package with a pinned content hash, fetched at build time. The first build
 therefore needs network access unless the package is already in Zig's global cache. To prefetch the

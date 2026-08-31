@@ -235,7 +235,7 @@ fn emitReadout(ctx: *gui.Context, ready: bool, comptime fmt: []const u8, args: a
 
 fn beginItem(ctx: *gui.Context, title: []const u8, width: i32) void {
     ctx.beginBox(.{ .direction = .column, .width = .{ .fixed = width }, .gap = 3 });
-    ctx.labelStyled(title, .heading);
+    ctx.labelStyled(title, .title);
 }
 
 fn endItem(ctx: *gui.Context, ready: bool, comptime fmt: []const u8, args: anytype) void {
@@ -824,7 +824,7 @@ fn buildCatalog(ctx: *gui.Context, app: *App) void {
         .gap = 8,
         .align_cross = .center,
     });
-    ctx.labelStyled("layout catalog", .heading);
+    ctx.labelStyled("layout catalog", .title);
     _ = ctx.sliderI32Id(Ids.width_slider, "width", &app.catalog_width, .{
         .min = WIDTH_MIN,
         .max = WIDTH_MAX,

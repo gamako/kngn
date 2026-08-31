@@ -3538,75 +3538,85 @@ test "text: non-wrap explicit newline + max_lines ellipsis targets the last visi
     try std.testing.expect(std.mem.endsWith(u8, last, "..."));
 }
 
-test "labelStyled: each tier uses the matching style color and context font" {
-    var ctx = testCtx();
-    defer ctx.deinit();
-    ctx.beginFrame(400, 200);
+const tier_fields = @typeInfo(style_mod.TextTier).@"enum".fields;
+const tier_count = tier_fields.len;
+
+/// Draw one label per tier and collect the resulting text commands, in tier order. Walking the
+/// enum rather than a hand-written list is what makes a new tier join these tests by itself.
+fn labelEveryTier(ctx: *Context, out_color: *[tier_count]Color, out_font: *[tier_count]?Font) !void {
+    ctx.beginFrame(800, 400);
     ctx.beginBox(.{ .direction = .column });
-    ctx.labelStyled("H", .heading);
-    ctx.labelStyled("B", .body);
-    ctx.labelStyled("C", .caption);
-    ctx.labelStyled("M", .muted);
+    inline for (tier_fields) |field| {
+        ctx.labelStyled(field.name, @field(style_mod.TextTier, field.name));
+    }
     ctx.endBox();
     ctx.endFrame();
-    var colors: [4]Color = undefined;
-    var fonts: [4]?Font = undefined;
     var n: usize = 0;
     for (ctx.draw_list.cmds.items) |cmd| {
         if (cmd != .text) continue;
-        colors[n] = cmd.text.color;
-        fonts[n] = cmd.text.font;
+        if (n == tier_count) return error.TestUnexpectedResult;
+        out_color[n] = cmd.text.color;
+        out_font[n] = cmd.text.font;
         n += 1;
     }
-    try std.testing.expectEqual(@as(usize, 4), n);
-    try std.testing.expectEqual(ctx.style.heading.color, colors[0]);
-    try std.testing.expectEqual(ctx.style.body.color, colors[1]);
-    try std.testing.expectEqual(ctx.style.caption.color, colors[2]);
-    try std.testing.expectEqual(ctx.style.muted.color, colors[3]);
-    try std.testing.expectEqual(ctx.font.ptr, fonts[0].?.ptr);
-    try std.testing.expectEqual(ctx.font.ptr, fonts[1].?.ptr);
-    try std.testing.expectEqual(ctx.font.ptr, fonts[2].?.ptr);
-    try std.testing.expectEqual(ctx.font.ptr, fonts[3].?.ptr);
+    try std.testing.expectEqual(tier_count, n);
+}
+
+test "labelStyled: each tier uses the matching style color and context font" {
+    var ctx = testCtx();
+    defer ctx.deinit();
+    var colors: [tier_count]Color = undefined;
+    var fonts: [tier_count]?Font = undefined;
+    try labelEveryTier(&ctx, &colors, &fonts);
+    inline for (tier_fields, 0..) |field, i| {
+        const tier = @field(style_mod.TextTier, field.name);
+        try std.testing.expectEqual(ctx.style.textStyle(tier).color, colors[i]);
+        // A bitmap context font ignores the tier's size and weight, so every tier draws with it.
+        try std.testing.expectEqual(ctx.font.ptr, fonts[i].?.ptr);
+    }
 }
 
 test "labelStyled: a non-null tier font is carried onto the draw command" {
     var ctx = testCtx();
     defer ctx.deinit();
-    ctx.style.heading.font = font_mod.defaultOutlineFont();
+    ctx.style.text_styles[style_mod.tierIndex(.title)].font = font_mod.defaultOutlineFont();
     ctx.beginFrame(400, 80);
-    ctx.labelStyled("Title", .heading);
+    ctx.labelStyled("Title", .title);
     ctx.endFrame();
     const cmd = firstText(&ctx).?.text;
     try std.testing.expect(cmd.font != null);
-    try std.testing.expectEqual(ctx.style.heading.font.?.ptr, cmd.font.?.ptr);
+    try std.testing.expectEqual(ctx.style.textStyle(.title).font.?.ptr, cmd.font.?.ptr);
 }
 
-test "labelStyled: outline default resolves distinct size and weight variants" {
+test "labelStyled: the outline default resolves a distinct variant for every tier" {
     var ctx = Context.init(std.testing.allocator, font_mod.default_outline_font);
     defer ctx.deinit();
-    ctx.beginFrame(800, 200);
-    ctx.beginBox(.{ .direction = .column });
-    ctx.labelStyled("Heading", .heading);
-    ctx.labelStyled("Body", .body);
-    ctx.labelStyled("Caption", .caption);
-    ctx.labelStyled("Muted", .muted);
-    ctx.endBox();
-    ctx.endFrame();
+    var colors: [tier_count]Color = undefined;
+    var fonts: [tier_count]?Font = undefined;
+    try labelEveryTier(&ctx, &colors, &fonts);
 
-    var fonts: [4]Font = undefined;
-    var n: usize = 0;
-    for (ctx.draw_list.cmds.items) |cmd| {
-        if (cmd != .text) continue;
-        fonts[n] = cmd.text.font orelse return error.TestUnexpectedResult;
-        n += 1;
+    // The face each tier drew with has to be the one its own size and weight resolve to.
+    // Distinct pointers and a descending line height do not say that: every tier resolving at
+    // weight 400, or at `size + 1`, satisfies both. Resolving the variant here from the tier's
+    // own `TextStyle` and comparing identity is what pins the pair that was actually passed.
+    inline for (tier_fields, 0..) |field, i| {
+        const ts = ctx.style.textStyle(@field(style_mod.TextTier, field.name));
+        const want = try font_mod.defaultFontFamily().variant(ts.size, ts.weight);
+        try std.testing.expectEqual(want.ptr, fonts[i].?.ptr);
     }
-    try std.testing.expectEqual(@as(usize, 4), n);
-    try std.testing.expect(fonts[0].ptr != fonts[1].ptr);
-    try std.testing.expect(fonts[1].ptr != fonts[2].ptr);
-    try std.testing.expect(fonts[2].ptr != fonts[3].ptr);
-    try std.testing.expect(fonts[0].metrics().line_height >= fonts[1].metrics().line_height);
-    try std.testing.expect(fonts[1].metrics().line_height >= fonts[2].metrics().line_height);
-    try std.testing.expect(fonts[2].metrics().line_height >= fonts[3].metrics().line_height);
+    // `variantOutline` keys its cache on `quantizePx(size)` plus weight, so two tiers sharing a
+    // quantized (size, weight) would share one variant pointer. Distinct pointers across every
+    // pair is the executable form of "no two tiers resolve to the same face".
+    for (fonts, 0..) |a, i| {
+        for (fonts[i + 1 ..]) |b| {
+            try std.testing.expect(a.?.ptr != b.?.ptr);
+        }
+    }
+    // Declaration order is largest to smallest, so the resolved faces descend with it.
+    inline for (tier_fields, 0..) |_, i| {
+        if (i == 0) continue;
+        try std.testing.expect(fonts[i].?.metrics().line_height <= fonts[i - 1].?.metrics().line_height);
+    }
 }
 
 test "labelStyled: uses the text path for paragraphs and overflow" {

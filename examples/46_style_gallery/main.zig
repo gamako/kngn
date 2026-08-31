@@ -21,6 +21,9 @@ const Section = enum(u8) {
     rounded,
     gradients,
     shadow,
+    /// Appended rather than inserted: `changeSection` takes the field count modulo, so a new
+    /// last section leaves every existing section's index — and its draw list — unchanged.
+    text,
 };
 
 const FrameSection = enum {
@@ -178,7 +181,7 @@ const App = struct {
 
 fn showcaseDigest(ctx_ptr: *anyopaque, buf: []u8) []const u8 {
     const app: *App = @ptrCast(@alignCast(ctx_ptr));
-    return std.fmt.bufPrint(buf, "section={s} index={d} theme={s} hot={s} active={s} focused={s} selected={s} disabled={d} fill={d} stroke={d} aa_on={d} aa_off={d} shadow={d}", .{
+    return std.fmt.bufPrint(buf, "section={s} index={d} theme={s} hot={s} active={s} focused={s} selected={s} disabled={d} fill={d} stroke={d} aa_on={d} aa_off={d} shadow={d} text_tiers={d}", .{
         app.sectionName(),
         app.sectionIndex(),
         app.themeName(),
@@ -192,7 +195,37 @@ fn showcaseDigest(ctx_ptr: *anyopaque, buf: []u8) []const u8 {
         app.aa_on_count,
         app.aa_off_count,
         app.shadow_count,
+        // Taken from the enum, not written as a literal: a hand-written count would keep
+        // reporting the old number after a tier was added.
+        @as(u32, @intCast(@typeInfo(gui.TextTier).@"enum".fields.len)),
     }) catch buf[0..0];
+}
+
+/// One specimen per `TextTier`, walked off the enum so a tier added to `libs/gui` appears here
+/// without anyone remembering to add it. Each row names the tier, states the size and weight
+/// resolved for it, and then shows a line of prose at that tier.
+fn renderTextTiers(ctx: *gui.Context) void {
+    ctx.beginBox(.{ .direction = .column, .gap = 10, .padding = .{ 12, 16, 12, 16 } });
+    ctx.labelEx("labelStyled tiers: name, resolved size / weight, and a specimen line", ctx.style.text_tokens.subtle);
+    inline for (@typeInfo(gui.TextTier).@"enum".fields) |field| {
+        const tier = @field(gui.TextTier, field.name);
+        const ts = ctx.style.textStyle(tier);
+        ctx.beginBox(.{ .direction = .row, .gap = 12, .align_cross = .center });
+        ctx.beginBox(.{ .width = .{ .fixed = 88 } });
+        ctx.labelStyled(field.name, .label);
+        ctx.endBox();
+        ctx.beginBox(.{ .width = .{ .fixed = 84 } });
+        var buf: [24]u8 = undefined;
+        ctx.labelEx(
+            std.fmt.bufPrint(&buf, "{d:.0}px / {d}", .{ ts.size, ts.weight }) catch "?",
+            ctx.style.text_tokens.subtle,
+        );
+        ctx.endBox();
+        ctx.labelStyled("The quick brown fox", tier);
+        ctx.endBox();
+        ctx.separator(.{});
+    }
+    ctx.endBox();
 }
 
 fn renderHeader(ctx: *gui.Context, app: *const App) void {
@@ -202,7 +235,7 @@ fn renderHeader(ctx: *gui.Context, app: *const App) void {
         .padding = .{ 8, 12, 8, 12 },
         .bg = ctx.style.surface.raised,
     });
-    ctx.labelStyled("GUI Style Showcase", .heading);
+    ctx.labelStyled("GUI Style Showcase", .title);
     var line: [128]u8 = undefined;
     ctx.labelEx(std.fmt.bufPrint(&line, "section={s}  |  PAGE_DOWN/PAGE_UP or N/P", .{app.sectionName()}) catch "section=?", ctx.style.text_tokens.subtle);
     if (app.theme == .light) ctx.labelEx("theme=light", ctx.style.accent.primary);
@@ -211,7 +244,7 @@ fn renderHeader(ctx: *gui.Context, app: *const App) void {
 
 fn renderOverview(ctx: *gui.Context) void {
     ctx.beginBox(.{ .direction = .column, .gap = 10, .padding = .{ 16, 16, 16, 16 } });
-    ctx.labelStyled("A compact visual contract for GUI states and path rendering.", .heading);
+    ctx.labelStyled("A compact visual contract for GUI states and path rendering.", .title);
     ctx.label("The states section keeps normal and selected controls visible together.");
     ctx.label("Move the pointer for hover, hold the left button for press, and use Tab for focus.");
     ctx.label("The paths section compares fills, holes, caps, joins, hairlines, and antialiasing.");
@@ -297,6 +330,7 @@ fn renderFrame(ctx: *gui.Context, app: *App) void {
             ctx.labelEx("nine-slice shadow masks: radius / blur / offset / slice boundaries", ctx.style.text_tokens.subtle);
             ctx.endBox();
         },
+        .text => renderTextTiers(ctx),
     }
     ctx.endBox();
     ctx.endBox();

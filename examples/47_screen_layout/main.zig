@@ -236,7 +236,7 @@ const App = struct {
             .align_cross = .center,
             .bg = ctx.style.surface.raised,
         });
-        ctx.labelStyled("Asset library", .heading);
+        ctx.labelStyled("Asset library", .headline);
 
         // A group at each end is CSS space-between, which `align_main` does not cover: it moves
         // the whole line as one block. A grow spacer is what splits the row into two groups.
@@ -261,7 +261,7 @@ const App = struct {
             .radius = 8,
             .border = .{ .color = ctx.style.border_tokens.normal, .thickness = 1 },
         });
-        ctx.labelStyled("Collections", .caption);
+        ctx.labelStyled("Collections", .subtitle);
 
         for (collections, 0..) |c, i| {
             const row = ctx.beginListboxRow(Ids.collection + @as(gui.Id, @intCast(i)), self.collection == i, .{
@@ -327,7 +327,7 @@ const App = struct {
             .radius = 8,
             .border = .{ .color = ctx.style.border_tokens.normal, .thickness = 1 },
         });
-        ctx.labelStyled("Details", .caption);
+        ctx.labelStyled("Details", .subtitle);
         self.buildSummaryTable(ctx);
         ctx.endBox();
     }
@@ -363,8 +363,8 @@ const App = struct {
             .radius = 8,
             .border = .{ .color = ctx.style.border_tokens.normal, .thickness = 1 },
         });
-        ctx.labelStyled(title, .caption);
-        ctx.labelStyled(value, .heading);
+        ctx.labelStyled(title, .label);
+        ctx.labelStyled(value, .title);
         if (fraction) |f| meter(ctx, f);
         ctx.endBox();
         // Counted where the card is actually built, so deleting a call moves the number.
@@ -421,11 +421,11 @@ const App = struct {
             .bg = ctx.style.surface.control,
         });
         ctx.beginBox(.{ .width = .{ .grow = 1 } });
-        ctx.labelStyled("Name", .caption);
+        ctx.labelStyled("Name", .label);
         ctx.endBox();
-        cell(ctx, "Kind", col_kind_w, .caption);
-        numCell(ctx, "KiB", col_size_w, .caption);
-        cell(ctx, "Updated", col_date_w, .caption);
+        cell(ctx, "Kind", col_kind_w, .label);
+        numCell(ctx, "KiB", col_size_w, .label);
+        cell(ctx, "Updated", col_date_w, .label);
         ctx.endBox();
     }
 
