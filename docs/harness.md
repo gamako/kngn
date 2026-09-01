@@ -37,11 +37,16 @@ Phases, all implemented:
 
 ## The command language (identical for file replay and live)
 
-One command per line, separated by a newline **or `;`**. A line **beginning** with `#` is
-a comment; splitting happens first, so a `#` comments out only as far as the next `;`, and
-a `#` anywhere else is ordinary text. The notes to the right of the listing below are
+One command per line, separated by a newline **or `;`**. A line whose first non-blank
+character is `#` is a comment, consumed to its own newline (or to end of input) — a `;`
+inside it is ordinary text, not a separator. A `#` anywhere else — mid-line, or right after
+a `;` — is ordinary text that reaches command parsing like any other character: as the tail
+of a command that takes the rest of the line (e.g. `inject commit`, `inject composition
+update`, `inject file_drop`), or, on its own, as an unmatched command name. The notes to the
+right of the listing below are
 therefore for the reader, not part of the syntax — pasted verbatim they would be read as a
-modifier, or injected as text. The syntax is **the same in file replay and live**:
+modifier, or injected as text. The syntax
+is **the same in file replay and live**:
 
 ```text
 inject key_down A          # key_down/key_up <KEY> [modifiers...] (a KeyCode name, case-insensitive: A / SPACE / ESCAPE / LEFT / 0)

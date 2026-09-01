@@ -914,7 +914,7 @@ pub fn pollGateWithPump(native_continue: bool, pump: ?NativePump) bool {
         // Drop only a trailing CR (keeping record and replay symmetrical: the whitespace around a commit's text is not lost).
         var line = std.mem.trimStart(u8, raw, " \t");
         if (line.len > 0 and line[line.len - 1] == '\r') line = line[0 .. line.len - 1];
-        if (line.len == 0 or line[0] == '#') continue;
+        if (line.len == 0) continue; // a blank line; nextLine() has already consumed any full-line comment
         var it = std.mem.tokenizeAny(u8, line, " \t");
         const cmd = it.next() orelse continue;
         if (std.mem.eql(u8, cmd, "step")) {
@@ -1012,7 +1012,7 @@ fn runFreeRunCommands() bool {
         const raw = nextLine() orelse continue;
         var line = std.mem.trimStart(u8, raw, " \t");
         if (line.len > 0 and line[line.len - 1] == '\r') line = line[0 .. line.len - 1];
-        if (line.len == 0 or line[0] == '#') continue;
+        if (line.len == 0) continue; // a blank line; nextLine() has already consumed any full-line comment
         var it = std.mem.tokenizeAny(u8, line, " \t");
         const cmd = it.next() orelse continue;
         if (std.mem.eql(u8, cmd, "step")) {
@@ -3631,15 +3631,46 @@ fn applyMidiState(ev: MidiEvent) void {
     }
 }
 
-/// Returns the next single command. The separators are a newline and `;` (so that `'inject A; step 3; digest fb'` can be written as one argument).
+/// True exactly when `cursor` sits at the start of a physical line: at the very start of the
+/// buffer, or immediately after a newline. A `;` separator leaves it false, which is what
+/// distinguishes a genuine comment line from a fragment that merely begins with `#`. Derived
+/// from `cursor` and `cmd_buf` alone, so nothing keeps it in step by hand: every caller that
+/// resets `cursor` to 0 (always alongside a fresh `cmd_buf`) or advances it past a `\n` gets
+/// the right answer for free.
+fn atLineStart() bool {
+    return cursor == 0 or cmd_buf[cursor - 1] == '\n';
+}
+
+/// Returns the next single command, or null at end of input. The separators are a newline and `;`
+/// (so that `'inject A; step 3; digest fb'` can be written as one argument). A physical line whose first
+/// non-blank character is `#` is a comment: it is consumed whole, to its own `\n` or to end of input,
+/// regardless of any `;` inside it, and is never returned (the caller never sees it, so it does not need
+/// its own comment check). Comment recognition applies only at the true start of a physical line: a `#`
+/// anywhere else — mid-line, or immediately after a `;` — reaches the caller as ordinary text, the same as
+/// any other character (this is what keeps `inject commit ok  # not a comment` taking the `#` literally,
+/// and what makes a bare `# ...` fragment after a `;` an unmatched command rather than a silently
+/// swallowed comment).
 fn nextLine() ?[]const u8 {
-    if (cursor >= cmd_buf.len) return null;
-    const start = cursor;
-    var end = cursor;
-    while (end < cmd_buf.len and cmd_buf[end] != '\n' and cmd_buf[end] != ';') end += 1;
-    cursor = if (end < cmd_buf.len) end + 1 else end;
-    line_no += 1;
-    return cmd_buf[start..end];
+    while (cursor < cmd_buf.len) {
+        const start = cursor;
+        if (atLineStart()) {
+            var probe = cursor;
+            while (probe < cmd_buf.len and (cmd_buf[probe] == ' ' or cmd_buf[probe] == '\t')) probe += 1;
+            if (probe < cmd_buf.len and cmd_buf[probe] == '#') {
+                var end = probe;
+                while (end < cmd_buf.len and cmd_buf[end] != '\n') end += 1;
+                cursor = if (end < cmd_buf.len) end + 1 else end;
+                line_no += 1;
+                continue; // a whole comment line: skip it and fetch the next fragment
+            }
+        }
+        var end = cursor;
+        while (end < cmd_buf.len and cmd_buf[end] != '\n' and cmd_buf[end] != ';') end += 1;
+        cursor = if (end < cmd_buf.len) end + 1 else end;
+        line_no += 1;
+        return cmd_buf[start..end];
+    }
+    return null;
 }
 
 fn setButton(b: *MouseButtons, btn: MouseButton, down: bool) void {
@@ -4168,6 +4199,30 @@ test "the execution model: native_continue=false stops it" {
     resetForTest();
     cmd_buf = "step 5\n";
     try testing.expect(!pollGate(false));
+}
+
+test "a `#` comment reaches its own newline, so a `;` inside it is not a command separator" {
+    resetForTest();
+    // A comment line is consumed whole, so `step 100` inside it is text, not a command: it never
+    // sets steps_remaining, and the next real command is `quit` on the following line.
+    cmd_buf = "# comment; step 100\nquit\n";
+    try testing.expect(!pollGate(true)); // the whole first line is a comment, so `quit` runs next
+    try testing.expectEqual(@as(usize, 0), steps_remaining);
+}
+
+test "a `#` right after a `;` is ordinary text, an unmatched command, not a comment" {
+    resetForTest();
+    mode = .live; // so an unmatched command's warning lands on resp_buf, where the test can see it
+    resp_buf.clearRetainingCapacity();
+    defer resp_buf.clearRetainingCapacity();
+    // Comment recognition applies only at the true start of a physical line. "#5" starts a new
+    // command (after the `;`) rather than a physical line, so it reaches command dispatch, where it
+    // matches nothing — a silent comment-swallow and an unmatched-command report are otherwise
+    // indistinguishable from the return value alone, so the assertion below checks the report text.
+    cmd_buf = "step 1; #5\nquit\n";
+    try testing.expect(pollGate(true)); // step 1
+    try testing.expect(!pollGate(true)); // "#5" is reported unmatched, then quit ends the request
+    try testing.expect(std.mem.indexOf(u8, resp_buf.items, "unknown command") != null);
 }
 
 /// A `FramebufferSnapshot` for a test that only cares about pixels/crc: logical and framebuffer
