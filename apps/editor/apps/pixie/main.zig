@@ -7693,7 +7693,7 @@ fn appFrameInner(self: *App, win: *platform.Window) !void {
                     self.doc.pushPaintOp(self.gpa, pd.layer_idx, pd.diffs) catch {}; // This branch is unreachable while a text layer is selected
                 }
             } else if (self.eye_in.picking or self.active_kind == .eyedropper or
-                (pressed_left_gated and in.modifiers.alt))
+                (pressed_left_gated and in.mouse_pressed_modifiers.alt))
             {
                 // Eyedropper (separate path). While the dedicated tool is selected, or finish an in-progress pick,
                 // or temporary Alt+click eyedrop (bezier/select already branched above, so

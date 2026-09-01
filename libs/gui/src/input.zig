@@ -223,7 +223,6 @@ pub const Input = struct {
     mouse_pressed_modifiers: ModifierFlags = .{},
     mouse_released_pos: Vec2 = .{ .x = 0, .y = 0 }, // coordinates of the most recent left release edge
     scroll_delta: Vec2f = .{},
-    modifiers: ModifierFlags = .{},
 
     keys_pressed: std.ArrayList(u32) = .empty, // codes pressed this frame (edge)
     keys_released: std.ArrayList(u32) = .empty, // codes released this frame (edge)
@@ -259,29 +258,24 @@ pub const Input = struct {
         switch (ev) {
             .mouse_move => |m| {
                 self.setMousePos(m.x, m.y);
-                self.modifiers = @bitCast(m.modifiers);
             },
             .mouse_down => |m| {
                 self.setMousePos(m.x, m.y);
-                self.modifiers = @bitCast(m.modifiers);
                 self.mouse_pressed_pos = .{ .x = m.x, .y = m.y };
                 self.mouse_pressed_modifiers = @bitCast(m.modifiers);
                 self.applyButton(m.button, true);
             },
             .mouse_up => |m| {
                 self.setMousePos(m.x, m.y);
-                self.modifiers = @bitCast(m.modifiers);
                 if (m.button == 0) self.mouse_released_pos = .{ .x = m.x, .y = m.y };
                 self.applyButton(m.button, false);
             },
             .mouse_scroll => |m| {
                 self.setMousePos(m.x, m.y);
-                self.modifiers = @bitCast(m.modifiers);
                 self.scroll_delta.x += m.dx;
                 self.scroll_delta.y += m.dy;
             },
             .key_down => |k| {
-                self.modifiers = @bitCast(k.modifiers);
                 self.ordered_text_events.append(self.alloc, .{ .key_down = .{
                     .code = k.code,
                     .modifiers = k.modifiers,
@@ -293,12 +287,10 @@ pub const Input = struct {
                 appendUnique(&self.keys_down, self.alloc, k.code);
             },
             .key_up => |k| {
-                self.modifiers = @bitCast(k.modifiers);
                 appendUnique(&self.keys_released, self.alloc, k.code);
                 removeFirst(&self.keys_down, k.code);
             },
             .char_input => |ch| {
-                self.modifiers = @bitCast(ch.modifiers);
                 self.ordered_text_events.append(self.alloc, .{ .char_input = .{
                     .codepoint = ch.codepoint,
                     .modifiers = ch.modifiers,
@@ -339,10 +331,10 @@ pub const Input = struct {
     /// Whether this frame carries a fresh press of `code` holding exactly the modifiers asked for:
     /// every bit of `required` set, and no bit of `forbidden`. Auto-repeat does not count.
     ///
-    /// Modifiers come from the key_down event itself rather than from `Input.modifiers`, which only
-    /// holds the last event of the frame — with several events in one frame it reports the wrong
-    /// combination for all but the last. Every keyboard interaction in this library goes through
-    /// here so that the repeat and modifier rules stay identical across widgets.
+    /// The modifiers are read from the `key_down` event itself, so a frame carrying several events
+    /// judges each one against the combination that was actually held when it arrived. Every
+    /// keyboard interaction in this library goes through here so that the repeat and modifier
+    /// rules stay identical across widgets.
     pub fn pressedPlain(self: *const Input, code: u32, required: u32, forbidden: u32) bool {
         for (self.ordered_text_events.items) |event| switch (event) {
             .key_down => |k| {
@@ -588,14 +580,14 @@ test "Input: scroll_delta accumulates and resets each frame" {
     try std.testing.expectEqual(@as(f32, 0), in.scroll_delta.y);
 }
 
-test "Input: modifiers are converted from raw bits" {
+test "Input: mouse_pressed_modifiers are converted from raw bits" {
     var in = Input.init(std.testing.allocator);
     defer in.deinit();
 
     in.beginFrame();
     in.pushEvent(.{ .mouse_down = .{ .x = 0, .y = 0, .button = 0, .modifiers = 0x01 } }); // shift
-    try std.testing.expect(in.modifiers.shift);
-    try std.testing.expect(!in.modifiers.ctrl);
+    try std.testing.expect(in.mouse_pressed_modifiers.shift);
+    try std.testing.expect(!in.mouse_pressed_modifiers.ctrl);
 }
 
 test "Input: preserves char_input and key_down order, and resets each frame" {
