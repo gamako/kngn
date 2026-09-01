@@ -37,8 +37,11 @@ Phases, all implemented:
 
 ## The command language (identical for file replay and live)
 
-One command per line, separated by a newline **or `;`**; `#` starts a comment. The
-syntax is **the same in file replay and live**:
+One command per line, separated by a newline **or `;`**. A line **beginning** with `#` is
+a comment; splitting happens first, so a `#` comments out only as far as the next `;`, and
+a `#` anywhere else is ordinary text. The notes to the right of the listing below are
+therefore for the reader, not part of the syntax — pasted verbatim they would be read as a
+modifier, or injected as text. The syntax is **the same in file replay and live**:
 
 ```text
 inject key_down A          # key_down/key_up <KEY> [modifiers...] (a KeyCode name, case-insensitive: A / SPACE / ESCAPE / LEFT / 0)
@@ -46,6 +49,10 @@ inject key_down S cmd shift # zero or more of shift/ctrl/alt/cmd at the end (any
 inject mouse_move 100 120  # mouse_move <x> <y> [modifiers...]
 inject mouse_down left alt # mouse_down/up <left|right|middle> [modifiers...]
 inject scroll 0 -3 ctrl    # scroll <dx> <dy> [modifiers...]
+inject char A              # char <char|0x<hex>|U+<hex>> [modifiers...] one settled character (`5` is '5'; decimal is not accepted)
+inject commit hello world  # commit [text] the rest of the line, one char_input per codepoint (an IME's insertText)
+inject composition update 0 ab # composition update <cursor_bytes> [text] text being composed (the first one is phase=start)
+inject composition cancel  # composition cancel  abandon the composition in progress
 step 5                     # manual/replay: drive 5 frames / free-run: a frame barrier of 5 presents
 await fb crc=8702DD71 60   # await <probe> <key><op><value> [timeout]  (timeout is a frame budget; 0 = compare once)
 await audio silent=0       # free-run holds the connection and waits for the app; manual drives frames and waits
@@ -365,13 +372,76 @@ a file, and live returns that path.
 ### Modifier tokens on inject
 
 Adding zero or more of `shift`, `ctrl`, `alt`, `cmd` after the required arguments of
-`inject` sets them in that `KeyEvent` or `MouseEvent`'s `modifiers` (any order,
-case-insensitive). It
-works on every path: key_down/up, mouse_move/down/up and scroll. For example
+`inject` sets them in that event's `modifiers` (any order, case-insensitive). It works on
+key_down/up, mouse_move/down/up, scroll and char; the events produced by `inject commit`
+and `inject composition` always carry an empty modifier set. For example
 `inject key_down S cmd` (Cmd+S), `inject key_down Z cmd` (undo),
 `inject mouse_down left alt`. **A single unknown token produces a warning and the
 event is not injected at all** (fail-fast, so a typo in a modifier name is never
 swallowed). With no modifiers, the set is empty as before.
+
+### Text input and IME
+
+Four forms cover text entry. They differ in **what a real backend would have produced**,
+not in convenience:
+
+| Form | Emits | Stands for |
+|---|---|---|
+| `inject char <char\|0x<hex>\|U+<hex>> [modifiers...]` | one `char_input` | a single settled character |
+| `inject commit [text]` | one `char_input` per codepoint | a settled string (an IME's `insertText`) |
+| `inject composition update <cursor_bytes> [text]` | `composition_changed`, `phase=start` the first time and `update` after | text being composed, not yet settled |
+| `inject composition cancel` | `composition_changed`, `phase=cancel`, and only while one is in progress (otherwise a warning and nothing else) | abandoning a composition |
+
+**`inject commit` with no text settles the composition but delivers no text.** It emits
+`composition_changed` with `phase=commit` and empties the snapshot — and that is all. A
+real IME hands the converted string over at that moment; this does not, so the settled
+characters have to be injected explicitly as `inject commit <text>`. With no composition in
+progress it warns and does nothing.
+
+**What `inject commit <text>` emits depends on whether a composition is in progress.** With
+one in progress it emits `composition_changed` with `phase=commit` *first*, then the
+`char_input` sequence. With none it emits the `char_input`s and no `composition_changed` at
+all.
+
+**A `composition_changed` event carries no text.** It carries `revision`, `phase` and
+`cursor`; the string being composed is read separately through
+`window.getCompositionSnapshot(buf)`, which is latest-wins. After a commit or a cancel the
+snapshot still reports the newest revision but its text is **empty**, so an application
+mirroring it decides from the phase, not from the text being non-empty. Latest-wins also
+means a script that composes and then settles has to `step` in between, or the application
+never observes the in-progress text at all.
+
+**The accepted codepoints** are the same for `char` and for every codepoint of a `commit`:
+`0x20 <= cp <= 0x10FFFF`, `cp != 0x7F`, and not a surrogate (`0xD800..0xDFFF`) — the same
+predicate the single-line text widget filters incoming codepoints with. It is wider than
+"printable": a C1 control (`0x80..0x9F`) and a Unicode noncharacter both pass. Anything
+outside it is refused with a warning and nothing is injected. A `char` argument is either
+a literal of exactly one codepoint (`A`, `é`) or hex of any length (`0x00E9`, `U+E9`; `0X`
+and `u+` are accepted too) — **never decimal**, so `5` is the character `'5'` (U+0035).
+
+**`commit` and `composition update` take the rest of the line.** Exactly one separator after
+the last required argument is dropped — after `commit` itself, and after `composition
+update`'s `<cursor_bytes>` — and the remainder is the text, spaces at both ends included
+(so record and replay stay symmetrical); quotes get no special treatment. `;` and a newline
+are the command separators, so neither can appear in the text. A composition is capped at
+1024 bytes, and its `<cursor_bytes>` is a **decimal byte offset** — not a codepoint index,
+and not hex like `char`'s argument — rounded **down** to a UTF-8 boundary.
+
+**A very long `commit` can be cut short.** UTF-8 and codepoint validation covers the whole
+string before anything is queued, so a bad byte injects nothing rather than half the
+text — but the injection queue holds 256 events and `commit` spends one per codepoint.
+Past that the rest is dropped with a warning.
+
+`examples/28_text_input` is the worked example: a single-line field driven through all four
+forms, with `e2e_mac_keys.txt` beside it as a runnable script.
+
+**What this cannot reproduce.** An injected event enters the queue directly, so it never
+passes through the native `keyDown` or the input context. Within the queue's capacity the
+*settled* path is complete — `inject char` and `inject commit` deliver the same
+`char_input` events a backend would — but the IME's own presentation is not modelled at
+all: the candidate window, where it lands (so whether `setCompositionRect` had any
+effect), and how the platform behaves mid conversion. Those need a real session and a pair
+of eyes.
 
 ### Tab takes an extra step to observe
 

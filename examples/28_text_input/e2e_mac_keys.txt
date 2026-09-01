@@ -126,4 +126,49 @@ inject composition cancel
 step 1
 assert input preedit_active=0
 
+# --- settled characters: the three `inject char` argument forms ---
+# The whole buffer is still selected, so the first character replaces it.
+inject char X
+step 1
+assert input len=1
+assert input caret=1
+
+# 0x59 is 'Y'. Hex, never decimal
+inject char 0x59
+step 1
+assert input len=2
+assert input caret=2
+
+# U+00E9 is two bytes in UTF-8 -- len counts bytes, caret counts codepoints
+inject char U+00E9
+step 1
+assert input len=4
+assert input caret=3
+
+# --- settling a composition: the text has to be given to `commit` ---
+inject composition update 0 ab
+step 1
+assert input preedit_active=1
+assert input preedit_len=2
+
+inject commit ab
+step 1
+assert input preedit_active=0
+assert input preedit_len=0
+assert input len=6
+assert input caret=5
+
+# --- a bare `commit` settles the composition and delivers no text ---
+inject composition update 0 cd
+step 1
+assert input preedit_active=1
+assert input preedit_len=2
+
+inject commit
+step 1
+assert input preedit_active=0
+assert input preedit_len=0
+assert input len=6
+assert input caret=5
+
 quit
