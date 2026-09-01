@@ -109,7 +109,7 @@ The rule that matters in practice is when it does nothing:
 | Every weight>0 `.grow` child frozen at its own `min_*` / `max_*`, remainder left | that remainder | applies |
 | Only weight-0 `.grow` children (they never take the remainder) | the remainder | applies |
 | Children overflow the parent | clamped to 0 | no effect |
-| A `.fit` main axis | 0, unless the box's own main-axis `min_*` widened it | usually no effect |
+| A `.fit` main axis | 0, unless something made the placed size exceed what the children take: the box's own main-axis `min_*`, a negative `gap` or `padding` that clamped the raw sum up to `0`, or a leaf placed smaller than it measured | usually no effect |
 
 The freeze exception covers a min-side freeze, a max-side freeze, and a mix of
 both: what matters is that no unfrozen weight>0 `.grow` child is left to absorb
@@ -128,47 +128,98 @@ size under `.end`.
 
 ## The pitfall: `.grow` on a `.fit` container's main axis collapses to zero
 
-Follow what happens when a node `N` is sized `.fit` on its **main** axis and
-has a direct **box** child `C` sized `.grow` on that same axis, `C` carrying no
-`min_*` of its own (a leaf child is a separate case — see the leaf exception
-above; a leaf's own measured contribution is always its intrinsic size, `Sizing`
-notwithstanding. `C`'s own `min_*` is the other way out, and the last bullet
-below is where it comes in):
+Follow what happens when a node `N` is sized `.fit` on its **main** axis and has
+a direct child `C` sized `.grow` on that same axis. The collapse is stated for
+this shape:
 
-- During `measure`, `C`'s own measured size on that axis is `0` — and so is
-  any `.percent` sibling's; the same `.grow, .percent => 0` rule applies to
-  both alike at measure time. `computeMeasured` computes that raw `0` and then
-  clamps it, so the `0` holds only while `C`'s `min_*` on the axis is `0`. So
-  when `N` sums its children on that axis to
-  resolve its own `.fit` size, neither contributes anything: `N`'s measured
-  size on that axis is exactly the sum of its fixed and fit children's
-  measured sizes, plus padding and inter-child gap (`.grow`/`.percent`
-  siblings add nothing to that sum).
+- `C` is an **unanchored box**. A leaf child takes the leaf exception above (its
+  measured contribution is always its intrinsic size, `Sizing` notwithstanding),
+  and an anchored child is not in the flow measure at all — it resolves `.grow`
+  against `N`'s content box directly, so it fills whatever that is.
+- `C` carries **no `min_*`** of its own on the axis. That clamp is the way out,
+  and the last step of the walk-through is where it comes in.
+- `N` carries **no `min_*` / `max_*`** of its own on the axis. `computeMeasured`
+  clamps `N`'s own fit sum too, so `N`'s minimum becomes content `C` can take:
+  a `.fit` box with `min_width = 100` and one `.grow` child places that child at
+  100.
+- `N` is **placed by its parent at its measured size**, which is what `.fit`
+  means. A root handed a rectangle directly (`place` / `layoutTree` set the root's
+  rect from their argument) is sized by that argument instead, and a `.grow` child
+  takes the room it brings.
+- `N`'s `padding` is **non-negative** and its `gap` is **not negative enough to
+  drive the fit sum below zero**, and `C`'s siblings are boxes rather than leaves.
+  These are covered under "Where the sum and the placement disagree" below,
+  because they break the argument in the same way.
+
+With those held, the walk-through:
+
+- During `measure`, the raw size of a `.grow` or `.percent` child on that axis
+  is `0` — the same `.grow, .percent => 0` rule applies to both alike. But
+  `computeMeasured` clamps that raw value before returning it
+  (`return clampAxis(node, axis, raw)`), so what such a child actually
+  contributes is **its own `min_*` on that axis**, and `0` only when that
+  minimum is `0`. `C` here carries none, so `C` contributes `0`. `N`'s measured
+  size is therefore the sum of every flow child's *clamped* measured size —
+  fixed and fit children at what they measured, `.grow` and `.percent` children
+  at their own minimum — plus padding and inter-child gap. A `.grow` sibling
+  with `min_width = 20` does widen `N`; it is not invisible to the sum.
 - `N`'s parent then places `N` using exactly that measured value: a `.fit`
   node's placed size on an axis *is* its measured size on that axis, by
   construction. So `N`'s content size (that placed size minus padding), once
   `place` recurses into it, is exactly what was just summed, minus padding.
 - When `place` computes the leftover for `.grow` children
-  (`content size − everything else`), "everything else" now also includes
-  any `.percent` sibling's *actual, resolved* share of that content size
-  (`floor(content size * f)` — see below) — a share that was invisible to
-  the fixed-and-fit-only sum that established `N`'s content size in the
-  first place. So the leftover is never positive: it is exactly `0` with no
-  `.percent` siblings (or with a `.percent` sibling that resolves to a `0`
-  share — `.percent(0)`, or a nonzero `f` against a `0` content size), and
-  it goes *negative* (clamped to `0`) the moment any `.percent` sibling
-  resolves to a positive share. `C` resolves to `0` **whatever siblings `C`
-  has**: `N`'s content size can never exceed what its fixed/fit children alone
-  needed, so there is never a positive amount left for `.grow`, and any
-  `.percent` sibling can only make the shortfall larger, never smaller.
+  (`content size − everything else`), every **box** sibling takes **at least what
+  it contributed** to the sum that established that content size, and some take
+  more:
+
+  | The box sibling | Contributed at measure | Takes at place |
+  |---|---|---|
+  | `.fixed` / `.fit` | its clamped measured size | the same |
+  | `.grow` with a positive `min_*` | that minimum | it freezes at the minimum, or takes more |
+  | `.percent` | its `min_*` (`0` without one) | `clamp(floor(content size * f))`, a direct share of the whole content size that was invisible to the measure sum |
+
+  So the leftover is never positive. It is exactly `0` when every sibling takes
+  precisely what it contributed, and it goes *negative* (clamped to `0`) as soon
+  as one takes more — which any `.percent` sibling resolving above its minimum
+  does. `C` resolves to `0` **whatever box siblings `C` has**: the content size
+  `N` was placed at is the sum of the siblings' contributions, and no box sibling
+  gives part of its contribution back, so nothing is left for a `.grow` child
+  that contributed nothing itself.
 - What does take `C` out of it is **`C`'s own `min_*`**. The clamp applies to
   every `Sizing`, so `C` measures at its minimum, `N`'s `.fit` sum carries that
   minimum, and `C` is placed at it. The collapse is a property of a `.grow` box
   with no minimum, not of `.grow` as such.
 
 This follows directly from a bottom-up pass (`measure`) being asked to size
-something that is only known top-down (`grow`): a `.fit` container has no way
-to reserve room for a child whose size it cannot see yet.
+something that is only known top-down (`grow`): a `.fit` container has no way to
+reserve room for a child whose size it cannot see yet. A `min_*` is precisely the
+part of that size it *can* see, which is why both `C`'s own minimum and `N`'s are
+ways out of it.
+
+### Where the sum and the placement disagree
+
+The argument above rests on `N`'s content size being the sum of what its children
+contributed, and on no child handing part of that contribution back at `place`.
+Three things break that, and each hands `C` a real size:
+
+- **A leaf sibling.** A leaf contributes its intrinsic size at measure whatever
+  `Sizing` it declares, but at `place` it is treated like a box and resolved from
+  that declared `Sizing`. A leaf declaring `.grow` — which is what a wrapping
+  `ctx.text` is — therefore contributes its intrinsic width to `N`'s sum and then
+  shares the leftover with `C` instead of keeping it. A leaf declaring a `.fixed`
+  smaller than its intrinsic size gives back the difference the same way.
+- **A `gap` negative enough to drive the sum below zero.** `gapTotal` is
+  `gap × (n − 1)`, and it enters both the measure sum and `place`'s `used`
+  identically, so a mildly negative gap changes nothing. What breaks the argument
+  is the raw sum going *negative*: `computeMeasured` clamps it to `0` (the default
+  minimum) while `place` still subtracts the same negative total from `used`, and
+  the difference is a positive remainder for `C`. With one `.fixed(100)` sibling,
+  `gap = -10` leaves `C` at zero; `gap = -300` gives it 200.
+- **Negative `padding`, again only where it drives the raw sum below zero.** Not
+  rejected by `assertBoxConfigValid`, and it fails exactly like a negative gap:
+  the raw fit sum clamps up to `0` while `place` still adds the negative padding
+  back when it derives the content size from the rect. A negative padding that
+  leaves the sum positive changes nothing, the same way `gap = -10` does not.
 
 ### `.percent`, and `.grow` on the cross axis, are different: conditional, not unconditional
 
@@ -178,13 +229,17 @@ each one. A `.grow` child's size comes from *leftover* space (`content size
 − everything else`), which is zero under a `.fit` main axis as shown above
 (the child's own `min_*` being the way out). A `.percent` child's size, in contrast, is `floor(content size *
 f)` — a **direct** fraction of the container's actual content size, not a
-leftover. If that content size is nonzero (because some *other* sibling is
-`.fixed` or `.fit` and contributes a nonzero amount), the `.percent` child
-gets a real, nonzero size too, even though it also measured as `0`.
+leftover. If some *other* sibling contributed enough that
+`clamp(floor(content size * f))` comes out positive — a `.fixed` or `.fit` sibling
+at its measured size, or a `.grow` / `.percent` sibling at a positive `min_*` —
+the `.percent` child gets a real, nonzero size too — even where it measured as `0`, which is the case
+for a **box** `.percent` child carrying no `min_*` of its own (a leaf measures at
+its intrinsic size whatever it declares).
 
 For example: a `.fit`-main-axis container with a `.fixed(100)` sibling and a
-`.percent(0.5)` child has content size `100` (the `.fixed` sibling's
-contribution; the `.percent` child still contributed `0` at measure time).
+`.percent(0.5)` child, neither carrying a `min_*`, has content size `100` (the
+`.fixed` sibling's contribution; the `.percent` child, having no minimum to
+clamp its raw `0` up to, contributed nothing at measure time).
 At `place`, the `.percent` child resolves to `floor(100 * 0.5) = 50` — not
 zero. A `.grow` child in the same position would still resolve to `0`.
 
@@ -193,7 +248,13 @@ The same distinction holds for `.grow` on the **cross** axis: a cross-axis
 directly (weight is ignored), not a leftover — see "Related pitfalls" below.
 So `.percent` under a `.fit` main axis, and `.grow`/`.percent` under a `.fit`
 cross axis, only degrade to zero in the narrower case where **nothing at all**
-establishes a nonzero content size on that axis: no *box* sibling is sized
+establishes a content size big enough for the child's own resolution to come out
+positive — for `.percent`, `floor(content size * f)` still truncates a small
+content size to `0` (`floor(1 * 0.5)`). **Outside a `wrap` box** — the wrap path is
+the paragraph after this one — that includes the container itself: its own `min_*`
+sets a floor on the `.fit` result, and on an axis where it is not `.fit` at all its
+own `.fixed` / `.grow` / `.percent` resolution *is* the content size, children
+notwithstanding. Otherwise: no *box* sibling is sized
 `.fixed`/`.fit` with a nonzero result, no *box* sibling carries a positive
 `min_*` on that axis (the clamp inside `computeMeasured` makes such a sibling
 measure at its minimum), **and** no leaf sibling has a nonzero
@@ -202,7 +263,19 @@ own intrinsic size to this sum/max regardless of its own declared `Sizing`
 (the leaf exception above), so a leaf sibling with nonzero intrinsic content
 on that axis (a non-empty label, for instance; an empty string or a
 zero-sized custom leaf contributes nothing and does not break the collapse)
-breaks the collapse on its own.
+breaks the collapse on its own. And, as on the main axis, a **negative axis
+`padding`** that drives the raw `.fit` result below zero breaks it too: the clamp
+raises the measured value to `0` while `place` still derives the content size as
+`rect − padding`, which is then positive.
+
+**That leaf exception is the non-wrapping path only.** Inside a `wrap` box the
+cross size of a line comes from `lineCrossSize`, which reads each child's declared
+`Sizing` and takes no leaf exception, so a leaf declaring `.grow` / `.percent`
+contributes its `min_*` there rather than its intrinsic size — and the container's
+own cross sizing does not reach the line at all. A `.grow`-cross child alone on a
+line with such a leaf collapses even inside a `.fixed` parent. `separator`'s doc
+comment in `src/widgets.zig` states both paths side by side, and
+`docs/adr/034` records why.
 
 ### Worked example
 
@@ -213,7 +286,8 @@ var highlight: Node = .{ .cfg = .{ .width = .{ .grow = 1 }, .height = .{ .fixed 
 appendChild(&container, &highlight);
 
 measure(&container, font);
-// container.measured_w == 0: `.fit` summed its one child's measured_w, which is 0 (`.grow`).
+// container.measured_w == 0: `.fit` summed its one child's measured_w, which is 0
+// (`.grow`, and no `min_width` for the clamp in `computeMeasured` to raise it to).
 
 // container's own parent would place it at exactly that measured width (0) — reproduced
 // directly here for a minimal example, rather than adding a further ancestor node:
@@ -241,21 +315,25 @@ either case above, depending on `opts.direction` (the content box's own
 direction, which decides whether width is its main or cross axis):
 
 - With `.direction = .row`, width is the content box's **main** axis, so a
-  `.grow`-width row is the unconditional case: it resolves to zero width no
-  matter what its siblings are.
+  `.grow`-width row is the unconditional case: it resolves to zero width whatever
+  its *box* siblings are. (`ScrollAreaOpts`'s `padding` and `gap` reach the content
+  box unchecked, so the negative-value escapes above are reachable here too — as
+  an accident rather than a technique.)
 - With the default `.direction = .column` (rows stacked vertically), width is
   the content box's **cross** axis, so a `.grow`-width row only resolves to
-  zero *when* no sibling row establishes a nonzero width either (per the
-  conditional rule above — a `.fixed`/`.fit` box sibling, or a leaf sibling
-  with nonzero intrinsic width, would break the collapse). That condition
-  does hold for a common and easy pattern to reach: a list where every row is
-  a plain background/highlight box using `width = .{ .grow = 1 }` — none of
-  them is `.fixed` or `.fit`, and none is a leaf with its own nonzero width,
-  so nothing establishes a nonzero width and the whole list's rows collapse
-  together. It does *not* hold the moment some other row (or a non-empty
-  label leaf directly inside the content box) is sized `.fixed`/`.fit`, or is
-  a leaf with nonzero intrinsic width, instead — then that sibling's nonzero
-  width carries through to every `.grow`-width row.
+  zero *when* nothing else establishes a nonzero width (per the conditional
+  rule above — a `.fixed`/`.fit` box sibling, a box sibling with a positive
+  `min_width`, a leaf sibling with nonzero intrinsic width, or a `min_width` on
+  the content box itself would each break the collapse). That condition does
+  hold for a common and easy pattern to reach: a list where every row is a plain
+  background/highlight box using `width = .{ .grow = 1 }` — none of them is
+  `.fixed` or `.fit`, none carries a `min_width`, and none is a leaf with its own
+  nonzero width, so nothing establishes a nonzero width and the whole list's rows
+  collapse together — barring a negative horizontal `padding` on the content box,
+  which reaches it unchecked from `ScrollAreaOpts` and clamps the raw `.fit` result
+  up to `0` while `place` still derives a positive content width. It stops holding the moment some other row (or a non-empty
+  label leaf directly inside the content box) contributes a width instead — then
+  that nonzero width carries through to every `.grow`-width row.
 
 When the condition does hold, the visible effect is the same regardless of
 direction: a selection highlight (or whichever row relies on `.grow` to reach
@@ -284,8 +362,15 @@ a `bar_thickness`-px strip of height for the viewport.
   `.fit` resolves the cross axis as a **max** over children, not a sum, and a
   cross-axis `.grow` child's size is taken directly from the container's
   content size (see "`.percent`, and `.grow` on the cross axis" above) —
-  it is not a leftover distribution. So it only collapses to zero when no
-  sibling establishes a nonzero max on that axis, not unconditionally.
+  it is not a leftover distribution. So it only collapses to zero when neither a
+  sibling nor the container itself establishes a nonzero size on that axis (the
+  container's own `min_*`, or its own `.fixed` / `.grow` / `.percent` resolution
+  where it is not `.fit` there, is enough on its own), not unconditionally.
+  A negative axis `padding` that clamps the raw `.fit` result up to `0` is an
+  escape here as well, for the same reason it is on the main axis.
+  **In a `wrap` box the container's own sizing is not one of those escapes**: the
+  line's cross size comes from `lineCrossSize` over that line's children by
+  declared `Sizing` alone, so only a sibling on the same line can establish it.
 - **Percent truncation leftover needs a `.grow` sibling (with a positive
   weight) to land somewhere.** `.percent` uses `floor` with no correction
   across siblings, so a set of `.percent` children rarely sums to exactly

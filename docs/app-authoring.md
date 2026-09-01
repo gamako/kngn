@@ -324,24 +324,30 @@ Two conventions worth knowing early:
 ### 5.2 The one pitfall to know before you meet it
 
 **A box child sized `.grow` on its parent's main axis, where that parent is `.fit` on the
-same axis, resolves to zero.** `.fit` is measured bottom-up from the children, and a `.grow`
-child has no size to contribute at measure time, so the parent ends up exactly as large as
-its fixed and fit children — leaving nothing for the grow child to take. Unlike the cases
-below this holds whatever the siblings are. Two things take a child out of it: a `min_width`
-/ `min_height` on the child, since the clamp applies to every `Sizing` and so it still gets
-its minimum; and `anchor`, which removes the child from the flow measure altogether — though
-an anchored `.grow` child then fills the parent's *content box*, which a `.fit` parent with
-nothing else in it may still leave at zero.
+same axis, resolves to zero.** `.fit` is measured bottom-up from the children, and at measure
+time a `.grow` child contributes only its own `min_*` — nothing, by default. Every box sibling
+then takes back at least what it contributed to that sum, so there is no leftover for the grow
+child. Unlike the cases below this holds whatever the *box* siblings are. Two things take a
+child out of it: a `min_width` / `min_height` on the child, since the clamp applies to every
+`Sizing` and so it still gets its minimum; and `anchor`, which removes the child from the flow
+measure altogether — though an anchored `.grow` child then fills the parent's *content box*,
+which a `.fit` parent with nothing else in it may still leave at zero. A `min_*` on the
+**parent** does it too, since the same clamp widens the parent's own measured size; and a leaf
+sibling that declares `.grow` (which a wrapping `ctx.text` is) shares the leftover with the
+child rather than keeping it, because a leaf is measured at its intrinsic size but placed by
+what it declared.
 
 The symptom is a highlight, separator, or row background that the code plainly draws and
 that is nowhere on screen. The fix is always to give that axis a definite size somewhere up
 the chain, rather than asking a `.fit` parent to make room.
 
 Leaves (text, custom-drawn widgets) and the **cross** axis follow narrower, conditional
-rules — a leaf always contributes its intrinsic size whatever `Sizing` it declares, and a
-cross-axis `.grow` child collapses only when no sibling establishes a size on that axis at
-all. The full model — the five layout stages, the interaction with `.percent`,
-and the worked cases — is
+rules — a leaf contributes its intrinsic size whatever `Sizing` it declares, except on a
+`wrap` line, whose cross size is taken from the declared `Sizing` alone; and a cross-axis
+`.grow` child collapses only when nothing establishes a size on that axis — a sibling, or the
+parent itself, except on a `wrap` line, which the parent's own sizing does not reach. The full model — the five layout stages, the interaction with `.percent`, the
+remaining conditions on the collapse (a parent placed at something other than its measured
+size, a negative `gap` or `padding`), and the worked cases — is
 [`libs/gui/docs/layout.md`](../libs/gui/docs/layout.md). Read it once before doing
 anything unusual with `.fit`.
 
