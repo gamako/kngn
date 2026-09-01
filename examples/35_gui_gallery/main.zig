@@ -865,6 +865,6 @@ pub fn main(init: std.process.Init) !void {
 
         // Follow this frame's settled focus onto the IME path (forward keyDown to IME only while a text field
         // has focus). Takes effect for the next frame's keyDown decision.
-        window.setTextInputActive(ctx.wantsKeyboard());
+        window.setTextInputActive(ctx.wantsTextInput());
     }
 }

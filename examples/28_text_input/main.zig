@@ -321,11 +321,11 @@ pub fn main(init: std.process.Init) !void {
         window.present();
 
         // Forward keyDown to IME only while a text field has focus. Clicking empty space to clear focus
-        // (wantsKeyboard()==false) lets keys reach shortcuts even while IME is enabled.
+        // lets keys reach shortcuts even while IME is enabled.
         // Switch document access on the same schedule (must complete before the next pollEvents).
         // Re-registering every frame is intentional: PerIdStateStore rehash can invalidate *PerIdState, so
         // optimizing to focus-change-only would leave selection/caret pointers dangling.
-        const wants = ctx.wantsKeyboard();
+        const wants = ctx.wantsTextInput();
         window.setTextInputActive(wants);
         if (wants) {
             switch (focused_id) {

@@ -656,7 +656,7 @@ pub fn main(init: std.process.Init) !void {
         const target: gui.RenderTarget = .{ .pixels = fb.pixels, .width = fb.width, .height = fb.height };
         gui.render(target, &ctx.draw_list, ctx.font, 1.0);
         Prof.mark(.gui_render);
-        window.setTextInputActive(ctx.state.focused_id == Ids.text_input);
+        window.setTextInputActive(ctx.wantsTextInput());
         window.present();
         Prof.end(.present);
     }

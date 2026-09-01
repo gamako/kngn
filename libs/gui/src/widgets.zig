@@ -561,6 +561,10 @@ pub fn textInputId(
         // A text field is a control, so Tab reaches it alongside the buttons and checkboxes. It keeps
         // its own handling of the keys it cares about; Tab is not one of them.
         ctx.registerFocusable(id);
+        // And it is a text field, which `focus_order` alone cannot say. `wantsTextInput` reads this
+        // back once the focus has settled, so that an application can switch a native IME on for a
+        // text field and for nothing else.
+        ctx.registerTextInput(id);
     }
 
     var text_layout = text_edit.buildTextLayout(ctx.allocator(), ctx.font, buffer.slice()) catch
@@ -7333,4 +7337,161 @@ test "Context.beginDisabled/endDisabled: nests, and isDisabled reflects the curr
     ctx.endDisabled();
     try std.testing.expect(!ctx.isDisabled());
     ctx.endFrame();
+}
+
+// ── wantsTextInput: the predicate a native IME is switched with ───────────────
+
+test "wantsTextInput: false with no text field, and false when a button holds the focus" {
+    var ctx = testCtx();
+    defer ctx.deinit();
+    const button_id: Id = 0xA1;
+
+    // A frame with nothing in it at all.
+    ctx.beginFrameAt(240, 120, 0);
+    ctx.endFrame();
+    try std.testing.expect(!ctx.wantsTextInput());
+
+    ctx.beginFrameAt(240, 120, 0.1);
+    _ = ctx.buttonId(button_id, "press", .{});
+    ctx.endFrame();
+    const rect = ctx.getNodeRect(button_id).?;
+
+    ctx.beginFrameAt(240, 120, 0.2);
+    const c = center(rect);
+    clickAt(&ctx, c.x, c.y);
+    _ = ctx.buttonId(button_id, "press", .{});
+    ctx.endFrame();
+
+    // The button took the focus, so `wantsKeyboard` is true — and that is exactly the value an
+    // IME must not be driven from.
+    try std.testing.expect(ctx.wantsKeyboard());
+    try std.testing.expect(!ctx.wantsTextInput());
+}
+
+test "wantsTextInput: true once a text field holds the focus, and false again after an outside click" {
+    var ctx = testCtx();
+    defer ctx.deinit();
+    var buffer = try TextBuffer.init(std.testing.allocator, "ab");
+    defer buffer.deinit();
+    const id: Id = 0xB1;
+
+    ctx.beginFrameAt(240, 120, 0);
+    _ = ctx.textInputId(id, &buffer, .{ .width = .{ .fixed = 80 } });
+    ctx.endFrame();
+    try std.testing.expect(!ctx.wantsTextInput());
+    const rect = ctx.getNodeRect(id).?;
+
+    ctx.beginFrameAt(240, 120, 0.1);
+    clickAt(&ctx, rect.x + 8, rect.y + 8);
+    _ = ctx.textInputId(id, &buffer, .{ .width = .{ .fixed = 80 } });
+    ctx.endFrame();
+    try std.testing.expect(ctx.wantsTextInput());
+
+    // Clicking away drops the focus, and the answer has to follow it down.
+    ctx.beginFrameAt(240, 120, 0.2);
+    clickAt(&ctx, rect.x + @as(i32, @intCast(rect.w)) + 40, rect.y + @as(i32, @intCast(rect.h)) + 40);
+    _ = ctx.textInputId(id, &buffer, .{ .width = .{ .fixed = 80 } });
+    ctx.endFrame();
+    try std.testing.expect(!ctx.wantsTextInput());
+}
+
+test "wantsTextInput: stays true across two fields, and names neither" {
+    var ctx = testCtx();
+    defer ctx.deinit();
+    var first = try TextBuffer.init(std.testing.allocator, "one");
+    defer first.deinit();
+    var second = try TextBuffer.init(std.testing.allocator, "two");
+    defer second.deinit();
+    const id_a: Id = 0xC1;
+    const id_b: Id = 0xC2;
+
+    ctx.beginFrameAt(240, 160, 0);
+    _ = ctx.textInputId(id_a, &first, .{ .width = .{ .fixed = 80 } });
+    _ = ctx.textInputId(id_b, &second, .{ .width = .{ .fixed = 80 } });
+    ctx.endFrame();
+    const rect_a = ctx.getNodeRect(id_a).?;
+    const rect_b = ctx.getNodeRect(id_b).?;
+
+    ctx.beginFrameAt(240, 160, 0.1);
+    clickAt(&ctx, rect_a.x + 8, rect_a.y + 8);
+    _ = ctx.textInputId(id_a, &first, .{ .width = .{ .fixed = 80 } });
+    _ = ctx.textInputId(id_b, &second, .{ .width = .{ .fixed = 80 } });
+    ctx.endFrame();
+    try std.testing.expect(ctx.wantsTextInput());
+    try std.testing.expectEqual(id_a, ctx.focusedId());
+
+    ctx.beginFrameAt(240, 160, 0.2);
+    clickAt(&ctx, rect_b.x + 8, rect_b.y + 8);
+    _ = ctx.textInputId(id_a, &first, .{ .width = .{ .fixed = 80 } });
+    _ = ctx.textInputId(id_b, &second, .{ .width = .{ .fixed = 80 } });
+    ctx.endFrame();
+    // The answer is the same for either field: it is a yes-or-no, and `focusedId` is what tells
+    // the two apart.
+    try std.testing.expect(ctx.wantsTextInput());
+    try std.testing.expectEqual(id_b, ctx.focusedId());
+}
+
+test "wantsTextInput: Tab from a button onto a text field flips it within the same endFrame" {
+    var ctx = testCtx();
+    defer ctx.deinit();
+    var buffer = try TextBuffer.init(std.testing.allocator, "ab");
+    defer buffer.deinit();
+    const button_id: Id = 0xD1;
+    const text_id: Id = 0xD2;
+
+    ctx.beginFrameAt(240, 160, 0);
+    _ = ctx.buttonId(button_id, "press", .{});
+    _ = ctx.textInputId(text_id, &buffer, .{ .width = .{ .fixed = 80 } });
+    ctx.endFrame();
+    const rect = ctx.getNodeRect(button_id).?;
+
+    ctx.beginFrameAt(240, 160, 0.1);
+    const c = center(rect);
+    clickAt(&ctx, c.x, c.y);
+    _ = ctx.buttonId(button_id, "press", .{});
+    _ = ctx.textInputId(text_id, &buffer, .{ .width = .{ .fixed = 80 } });
+    ctx.endFrame();
+    try std.testing.expect(!ctx.wantsTextInput());
+
+    // Tab is resolved inside endFrame, so the answer is current on the very frame that received it
+    // — an application reading it after endFrame does not lag a frame behind the focus.
+    ctx.beginFrameAt(240, 160, 0.2);
+    ctx.pushEvent(.{ .key_down = .{ .code = input_mod.key.tab, .modifiers = 0, .repeat = false } });
+    _ = ctx.buttonId(button_id, "press", .{});
+    _ = ctx.textInputId(text_id, &buffer, .{ .width = .{ .fixed = 80 } });
+    ctx.endFrame();
+    try std.testing.expectEqual(text_id, ctx.focusedId());
+    try std.testing.expect(ctx.wantsTextInput());
+}
+
+test "wantsTextInput: a field that goes disabled, or is not submitted at all, takes it back down" {
+    var ctx = testCtx();
+    defer ctx.deinit();
+    var buffer = try TextBuffer.init(std.testing.allocator, "ab");
+    defer buffer.deinit();
+    const id: Id = 0xE1;
+
+    ctx.beginFrameAt(240, 120, 0);
+    _ = ctx.textInputId(id, &buffer, .{ .width = .{ .fixed = 80 } });
+    ctx.endFrame();
+    const rect = ctx.getNodeRect(id).?;
+
+    ctx.beginFrameAt(240, 120, 0.1);
+    clickAt(&ctx, rect.x + 8, rect.y + 8);
+    _ = ctx.textInputId(id, &buffer, .{ .width = .{ .fixed = 80 } });
+    ctx.endFrame();
+    try std.testing.expect(ctx.wantsTextInput());
+
+    // Disabled: not a focus target, and not an IME target either.
+    ctx.beginFrameAt(240, 120, 0.2);
+    ctx.beginDisabled();
+    _ = ctx.textInputId(id, &buffer, .{ .width = .{ .fixed = 80 } });
+    ctx.endDisabled();
+    ctx.endFrame();
+    try std.testing.expect(!ctx.wantsTextInput());
+
+    // And a frame that does not build the field at all cannot leave a stale yes behind.
+    ctx.beginFrameAt(240, 120, 0.3);
+    ctx.endFrame();
+    try std.testing.expect(!ctx.wantsTextInput());
 }

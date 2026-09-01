@@ -289,6 +289,18 @@ pub const Context = struct {
     focus_order: std.ArrayList(Id) = .empty,
     /// A Tab press waiting to be resolved at the end of the frame, once `focus_order` is complete.
     focus_move: enum { none, next, prev } = .none,
+    /// The text fields submitted this frame, enabled ones only. `focus_order` records every
+    /// focusable as one flat list, so the focus it resolves cannot say *what kind* of widget it
+    /// landed on; this is the one distinction the framework has to draw, because a native IME is
+    /// switched on for a text field and for nothing else.
+    ///
+    /// Recorded where the structure is built rather than searched for where it is read: a tree
+    /// with no text field clears an empty list and compares one id against zero, and allocates
+    /// and walks nothing. Cleared every frame with the capacity kept, like `focus_order`.
+    text_input_ids: std.ArrayList(Id) = .empty,
+    /// The text field that held the focus when the last frame finished, or 0. Written once per
+    /// frame in `endFrame`, after the focus has settled. See `wantsTextInput`.
+    focused_text_input_id: Id = 0,
     /// Scroll-area begin→end state stack (supports nesting). Not on the arena (push/pop within the frame).
     scroll_stack: std.ArrayList(ScrollState) = .empty,
     /// Unconsumed wheel delta for the frame (seeded from input.scroll_delta at the first wheel apply).
@@ -504,6 +516,7 @@ pub const Context = struct {
         self.rect_cache.deinit(self.gpa);
         self.per_id_state.deinit(self.gpa);
         self.focus_order.deinit(self.gpa);
+        self.text_input_ids.deinit(self.gpa);
         self.scroll_stack.deinit(self.gpa);
         self.scroll_areas_prev.deinit(self.gpa);
         self.scroll_areas_cur.deinit(self.gpa);
@@ -570,6 +583,7 @@ pub const Context = struct {
         self.animation_seen_press = 0;
         self.composition = .{};
         self.focus_order.clearRetainingCapacity();
+        self.text_input_ids.clearRetainingCapacity();
         self.focus_move = .none;
         self.wheel_remaining = .{};
         self.wheel_remaining_seeded = false;
@@ -744,6 +758,15 @@ pub const Context = struct {
         // Tab traversal, after the draw commands are out (so the move shows next frame) and before
         // the trim below (so the widget just focused is protected from it).
         self.resolveFocusMove();
+        // The focus is settled now — an outside click has cleared it and Tab has moved it — so this
+        // is the first point at which "is the focus on a text field?" has a final answer.
+        self.focused_text_input_id = 0;
+        for (self.text_input_ids.items) |id| {
+            if (id == self.state.focused_id) {
+                self.focused_text_input_id = id;
+                break;
+            }
+        }
         // A wake ID is only retained while its widget is submitted in the current tree.
         if (self.animation_wake_hover != 0 and self.animation_seen_hover != self.animation_wake_hover) {
             self.animation_wake_hover = 0;
@@ -800,6 +823,21 @@ pub const Context = struct {
 
     pub fn wantsKeyboard(self: *const Context) bool {
         return self.state.focused_id != 0;
+    }
+
+    /// Whether the keyboard focus is on a text field, which is the value a native IME is switched
+    /// on and off with (`Window.setTextInputActive`).
+    ///
+    /// **This is not `wantsKeyboard`.** That one is true for any focusable — a button, a checkbox,
+    /// a slider — because keyboard focus is not specific to text. Driving an IME from it turns
+    /// the input method on while the user is tabbing through buttons.
+    ///
+    /// Read it **after `endFrame` and before the next `pollEvents`**: the focus settles inside
+    /// `endFrame`, so during a frame this still reports what the previous one finished with. It
+    /// answers yes or no and does not name the field — `focusedId()` is what tells several fields
+    /// apart.
+    pub fn wantsTextInput(self: *const Context) bool {
+        return self.focused_text_input_id != 0;
     }
 
     /// Enter a disabled scope: every ordinary widget built before the matching `endDisabled`
@@ -895,6 +933,18 @@ pub const Context = struct {
         self.requireInteractiveAllowed("registerFocusable");
         if (id == 0 or self.popup_state != null or self.popup_stack.len != 0) return;
         self.focus_order.append(self.gpa, id) catch @panic("Context.registerFocusable: OOM");
+    }
+
+    /// Record that `id`, already registered as focusable, is a text field. Called by `textInputId`
+    /// for an enabled field only; a disabled one is not a target for the focus or for an IME.
+    ///
+    /// Runs once per text field per frame, on the frame-build path. It appends and does not search,
+    /// so the cost belongs to the trees that have a text field.
+    pub fn registerTextInput(self: *Context, id: Id) void {
+        self.requireFrame("registerTextInput");
+        self.requireInteractiveAllowed("registerTextInput");
+        if (id == 0 or self.popup_state != null or self.popup_stack.len != 0) return;
+        self.text_input_ids.append(self.gpa, id) catch @panic("Context.registerTextInput: OOM");
     }
 
     /// Whether the pointer is taking part in this frame — pressed now, or still held from an

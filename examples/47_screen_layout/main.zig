@@ -187,7 +187,7 @@ const App = struct {
         kit.pixelops.fill32(fb.pixels, @bitCast(ctx.style.surface.canvas));
         const target: gui.RenderTarget = .{ .pixels = fb.pixels, .width = fb.width, .height = fb.height };
         gui.render(target, &ctx.draw_list, ctx.font, 1.0);
-        win.setTextInputActive(ctx.state.focused_id == Ids.search);
+        win.setTextInputActive(ctx.wantsTextInput());
         win.present();
         return running;
     }
