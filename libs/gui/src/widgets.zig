@@ -72,6 +72,8 @@ pub const SelectableLabelResult = struct {
 };
 
 pub const TextInputOpts = struct {
+    /// `.fixed`/`.fit` are the field's own natural width. `.grow`/`.percent` resolve against the
+    /// parent's content box, the same as `scrollArea`/`table` (not against the screen).
     width: layout.Sizing = .{ .fixed = 320 },
     /// top, right, bottom, left
     padding: [4]i32 = .{ 4, 8, 4, 8 },
@@ -748,7 +750,7 @@ pub fn textInputId(
     const follow_x: i32 = @intCast(committed_prefix_w + preedit_cursor_w);
     const content_span: i32 = @intCast(text_layout.prefix_widths[text_layout.count()] + preedit_w);
 
-    const width = resolveTextInputWidth(ctx, buffer.slice(), opts);
+    const width = resolveTextInputWidth(ctx, id, buffer.slice(), opts);
     const metrics = ctx.font.metrics();
     // Content height uses ascent+descent, not `line_height` (which includes line_gap).
     const ink_height: i32 = font_mod.inkHeight(metrics);
@@ -789,9 +791,17 @@ pub fn textInputId(
         .ink_height = ink_height,
         .vertical_offset = vertical_offset,
     };
+    // `.fixed`/`.fit` are already parent-independent pixel values (see `resolveTextInputWidth`),
+    // so the box's own Sizing can just restate that value. `.grow`/`.percent` are passed through
+    // unchanged so the deferred layout pass below resolves them against the real parent, the same
+    // way `beginScrollArea` passes its own `width` option straight through.
+    const box_width: layout.Sizing = switch (opts.width) {
+        .fixed, .fit => .{ .fixed = width },
+        .grow, .percent => opts.width,
+    };
     ctx.beginBox(.{
         .id = id,
-        .width = .{ .fixed = width },
+        .width = box_width,
         .height = .{ .fixed = height },
         .clip_children = true,
         .border = .{
@@ -818,7 +828,19 @@ fn clampTextInputState(per_id: *state_mod.PerIdState, count: usize) void {
     per_id.caret = per_id.selection.extent;
 }
 
-fn resolveTextInputWidth(ctx: *Context, text: []const u8, opts: TextInputOpts) i32 {
+/// Pixel width used for this frame's scroll-clamp math and the custom leaf's draw size.
+/// `.fixed`/`.fit` are parent-independent and settle here for good. `.grow`/`.percent` are
+/// handed to `beginBox` as-is (by the caller) so the deferred layout pass resolves them against
+/// the real parent, and what this function returns for them is only a same-frame approximation:
+/// this id's own rect as the previous frame's layout pass settled it, one frame behind the parent
+/// (the same bootstrap `beginScrollArea` uses for its viewport width). Before any frame has run
+/// for this id (so no rect is cached yet), `.grow` falls back to the screen width and `.percent`
+/// to that fraction of it.
+fn resolveTextInputWidth(ctx: *Context, id: Id, text: []const u8, opts: TextInputOpts) i32 {
+    switch (opts.width) {
+        .grow, .percent => if (ctx.getNodeRect(id)) |r| return @intCast(r.w),
+        else => {},
+    }
     return switch (opts.width) {
         .fixed => |w| @max(w, opts.padding[3] + opts.padding[1]),
         .fit => @intCast(ctx.font.measure(if (text.len == 0) opts.placeholder else text) +
@@ -5551,6 +5573,55 @@ test "TextInput: horizontal scroll keeps the caret in the viewport" {
     _ = ctx.textInputId(id, &buffer, .{ .width = .{ .fixed = 40 } });
     try std.testing.expect(ctx.perIdState(id).scroll_x > 0);
     ctx.endFrame();
+}
+
+test "TextInput: grow width resolves against the parent box, not the screen" {
+    // The screen (800px) is far wider than either parent panel (100px / 137px), so a width
+    // that tracked `screen_w` instead of the parent would pass at only one of these sizes
+    // (or neither) — this is the general "grow fills the parent's content box" claim, not
+    // one convenient parent width.
+    for ([_]i32{ 100, 137 }) |parent_w| {
+        var ctx = testCtx();
+        defer ctx.deinit();
+        var buffer = try TextBuffer.init(std.testing.allocator, "hello");
+        defer buffer.deinit();
+        const id: Id = 0xD1140;
+
+        ctx.beginFrame(800, 200);
+        ctx.beginBox(.{ .width = .{ .fixed = parent_w }, .height = .{ .fixed = 60 } });
+        _ = ctx.textInputId(id, &buffer, .{ .width = .{ .grow = 1 } });
+        ctx.endBox();
+        ctx.endFrame();
+
+        const rect = ctx.getNodeRect(id).?;
+        try std.testing.expectEqual(@as(u32, @intCast(parent_w)), rect.w);
+    }
+}
+
+test "TextInput: percent width resolves against the parent box, not the screen" {
+    // Same reasoning as the grow case above: a fraction of `screen_w` (800px) would land on
+    // a different pixel width than a fraction of either 100px or 140px parent, so both cases
+    // passing pins the parent-relative contract rather than one lucky fraction/parent pair.
+    const cases = [_]struct { parent_w: i32, percent: f32, expected_w: u32 }{
+        .{ .parent_w = 100, .percent = 0.5, .expected_w = 50 },
+        .{ .parent_w = 140, .percent = 0.25, .expected_w = 35 },
+    };
+    for (cases) |case| {
+        var ctx = testCtx();
+        defer ctx.deinit();
+        var buffer = try TextBuffer.init(std.testing.allocator, "hello");
+        defer buffer.deinit();
+        const id: Id = 0xD1141;
+
+        ctx.beginFrame(800, 200);
+        ctx.beginBox(.{ .width = .{ .fixed = case.parent_w }, .height = .{ .fixed = 60 } });
+        _ = ctx.textInputId(id, &buffer, .{ .width = .{ .percent = case.percent } });
+        ctx.endBox();
+        ctx.endFrame();
+
+        const rect = ctx.getNodeRect(id).?;
+        try std.testing.expectEqual(case.expected_w, rect.w);
+    }
 }
 
 test "TextInput: caret blink is decided from virtual time alone" {
