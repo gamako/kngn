@@ -164,7 +164,8 @@ to the interface: `quit`, the gamepad connection events, `menu_command`, `file_d
 `gui.InputEvent`.** The platform event still arrives, and it is the signal to read the text being
 composed with `window.getCompositionSnapshot` and hand it to the context with
 `ctx.setComposition`. §4 of [`docs/app-authoring.md`](app-authoring.md) has the
-forwarding order.
+forwarding order, and [`docs/text-input.md`](text-input.md) has the whole text-input seam:
+switching the input method on, placing the candidate window, and the clipboard.
 
 ## 3. Two dimensions and images
 

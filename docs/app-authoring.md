@@ -147,7 +147,7 @@ App.frame(win, now):
   )
     while (win.nextEvent()) |ev| {
       ...                                    -- the app's own switch on ev, if it wants one
-      ctx.pushEvent(toGuiEvent(ev))          -- and/or ctx.setComposition(ime_state)
+      ctx.pushEvent(toGuiEvent(ev))          -- plus ctx.setComposition(...) for a text field (§text-input)
     }
     ctx.<widget calls>                       -- the frame's tree of boxes and widgets (§5)
   ctx.endFrame()                             -- closes the window; layout and draw cmds are final
@@ -156,6 +156,10 @@ App.frame(win, now):
   win.present()
   fb.unlock()                                -- via defer, right after lockFramebuffer
 ```
+
+`setComposition` is the one that needs explaining, and it is explained where the rest of the
+text-input seams are: [docs/text-input.md](text-input.md) covers switching the platform input
+method on, placing the candidate window, and the three clipboard connections.
 
 **Where input may be handed over**: anywhere in the loop. `pushEvent` and `setComposition`
 called inside a frame apply to that frame; called outside one they are staged and applied by
@@ -502,7 +506,7 @@ tabs and list rows take the current state as a plain argument rather than storin
 | `toggle` / `toggleId` | `_ = ctx.toggleId(id, "Previews", &self.preview);` | the same, drawn as a switch |
 | `radio` / `radioId` | `if (ctx.radioId(id, "Sort by name", !self.sort_by_size)) self.sort_by_size = false;` | `bool`: true when clicked. `selected` is display-only — the group lives in your state |
 | `sliderI32` / `sliderF32` | `_ = ctx.sliderI32Id(id, "Min KiB", &self.min_size_kib, .{ .min = 0, .max = 4096, .step = 64 });` | `bool`: true on the frame the value changed; the value is written through the pointer |
-| `textInputId` | `const r = ctx.textInputId(id, &self.search, .{ .width = .{ .fixed = 160 }, .placeholder = "name" });` | `TextInputResult{ changed, focused, selection, copy_request, caret_rect }`. The text lives in a `gui.TextBuffer` you own |
+| `textInputId` | `const r = ctx.textInputId(id, &self.search, .{ .width = .{ .fixed = 160 }, .placeholder = "name" });` | `TextInputResult{ changed, focused, selection, copy_request, caret_rect }`. The text lives in a `gui.TextBuffer` you own. Single-line only, and the IME and clipboard seams around it are [docs/text-input.md](text-input.md) |
 | `selectableLabel` / `selectableLabelId` | `_ = ctx.selectableLabelId(id, "Read-only text", .{ .focusable = true });` | `SelectableLabelResult{ selection, copy_request }` — text the user drags across and copies. Out of the Tab order unless `.focusable` |
 | `tabId` | `if (ctx.tabId(id, "All", self.tab == .all, .{}).focused) self.tab = .all;` | `TabResult{ activated, focused }` — see the note below on which to use |
 | `beginListboxRow` / `endListboxRow` | one row of a single-select list; wrap any content between them (§5.4) | `ListboxRowResult{ activated }` — a click, or Space/Enter on the focused row |

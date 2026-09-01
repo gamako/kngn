@@ -413,6 +413,14 @@ Two things are worth knowing when driving this from a test or a replay script:
 usually text to select rather than a control, and lists are built out of it. `TextInput` and
 the button-like widgets join it automatically.
 
+**`wantsKeyboard` and `wantsTextInput` answer different questions.** The first is true whenever
+anything holds the focus; the second only when a text field does, which is what a platform input
+method is switched with. They are read after `endFrame`, once the focus has settled. A text field
+is **single-line only** — no newlines, no wrapping, no vertical caret movement
+([ADR-024](../../docs/adr/024_gui-scope-boundary-large-widget-subsystems.md)) — and the seams
+around it, the input method, the candidate window and the clipboard, are
+[docs/text-input.md](../../docs/text-input.md).
+
 `beginListboxRow` carries this further: it registers as a Tab stop only for the row the
 caller marks `selected` (a roving tab stop), so a hundreds-of-rows list still costs Tab
 exactly one stop. Because which row a filtered/hidden list should move to next is data only
