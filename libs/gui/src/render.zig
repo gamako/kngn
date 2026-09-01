@@ -862,6 +862,34 @@ fn blitShadowRegion(
     }
 }
 
+/// The nine-slice layout of one shadow, derived from its outer rectangle in
+/// device pixels: `outer` inset by `slice` on all four sides is `center`, and the
+/// corner and edge slices cover the ring between them. Deriving both in one place
+/// keeps every reader agreeing on where the slices fall.
+const ShadowGeometry = struct {
+    /// Corner and edge slice size. Zero means the shadow is too small to blit.
+    slice: u32,
+    /// The uniform interior. Empty when the outer rectangle is at most two slices
+    /// wide or tall.
+    center: Rect,
+
+    fn init(outer: Rect, extent: u32) ShadowGeometry {
+        const slice = @min(extent, @min(outer.w / 2, outer.h / 2));
+        return .{
+            .slice = slice,
+            .center = .{
+                .x = outer.x + @as(i32, @intCast(slice)),
+                .y = outer.y + @as(i32, @intCast(slice)),
+                .w = outer.w - slice * 2,
+                .h = outer.h - slice * 2,
+            },
+        };
+    }
+};
+
+/// `rect` and `clip` arrive in device pixels: like the other rectangle commands,
+/// the caller physicalizes them. `radius`, `blur` and `offset` live in the options
+/// rather than in the command's geometry, so they are physicalized here.
 fn drawShadow(
     target: RenderTarget,
     draw_list: *DrawList,
@@ -875,17 +903,13 @@ fn drawShadow(
     if (rect.isEmpty() or clip.isEmpty() or color.a == 0) return;
     const radius = if (options.radius == 0) 0 else scaleRadiusUnclamped(options.radius, scale);
     const blur = scaleBlurUnclamped(options.blur, scale);
-    const base = if (scale == 1.0 and options.offset.x == 0 and options.offset.y == 0)
-        rect
-    else
-        scaleRect(rect, scale);
     const offset = scalePoint(options.offset, scale);
     const blur_i: i32 = @intCast(blur);
     const outer = Rect{
-        .x = base.x + offset.x - blur_i,
-        .y = base.y + offset.y - blur_i,
-        .w = base.w + blur * 2,
-        .h = base.h + blur * 2,
+        .x = rect.x + offset.x - blur_i,
+        .y = rect.y + offset.y - blur_i,
+        .w = rect.w + blur * 2,
+        .h = rect.h + blur * 2,
     };
     const visible = clipRect(outer, clip, target);
     if (visible.isEmpty()) return;
@@ -895,12 +919,11 @@ fn drawShadow(
         error.KeyTooLarge => @panic("gui shadow mask key exceeds bounded cache"),
         error.OutOfMemory => @panic("gui shadow mask cache: OOM"),
     };
-    const half_w = outer.w / 2;
-    const half_h = outer.h / 2;
-    const slice = @min(mask.extent, @min(half_w, half_h));
+    const geo = ShadowGeometry.init(outer, mask.extent);
+    const slice = geo.slice;
     if (slice == 0) return;
-    const center_w = outer.w - slice * 2;
-    const center_h = outer.h - slice * 2;
+    const center_w = geo.center.w;
+    const center_h = geo.center.h;
     const far_x = mask.extent - slice;
     const far_y = mask.extent - slice;
     const horizontal_a = center_w / 2;
@@ -930,7 +953,7 @@ fn drawShadow(
         blitShadowRegion(target, draw_list, .{ .x = outer.x + @as(i32, @intCast(outer.w - slice)), .y = outer.y + @as(i32, @intCast(slice + vertical_a)), .w = slice, .h = vertical_b }, clip, mask, color, .vertical_edge, far_x, 0, true, false, use_simd);
     }
     if (center_w != 0 and center_h != 0) {
-        blitShadowRegion(target, draw_list, .{ .x = outer.x + @as(i32, @intCast(slice)), .y = outer.y + @as(i32, @intCast(slice)), .w = center_w, .h = center_h }, clip, mask, color, .center, 0, 0, false, false, use_simd);
+        blitShadowRegion(target, draw_list, geo.center, clip, mask, color, .center, 0, 0, false, false, use_simd);
     }
 }
 
@@ -3973,6 +3996,121 @@ test "shadow render: fractional scale and clip boundaries use the retained key" 
     try std.testing.expectEqual(first.evaluations, second.evaluations);
     try std.testing.expectEqual(first.allocations, second.allocations);
     try std.testing.expect(second.hits > first.hits);
+}
+
+/// Read one pixel of a test target by signed coordinates, so a fixture can assert
+/// on both sides of an edge without casting at every call site.
+fn pixelAt(pixels: []const u32, width: usize, x: i32, y: i32) u32 {
+    return pixels[@as(usize, @intCast(y)) * width + @as(usize, @intCast(x))];
+}
+
+test "shadow render: the shadow lands on the rectangle the caller physicalized" {
+    // A zero radius and a zero blur make the mask a single fully opaque sample, so
+    // the shadow covers exactly the rectangle it was given. Its edges are then an
+    // exact oracle for where the shadow landed and how large it is.
+    const background: u32 = 0xFF202020;
+    const color = Color.rgba(0, 0, 0, 0xFF);
+    const ink: u32 = @bitCast(color);
+    // The rectangle is (9, 7, 20, 14): at 1.5 every edge lands on a half pixel, so
+    // the expected values below hold only under the floor rule and a round or ceil
+    // would miss them.
+    const cases = [_]struct { scale: f32, x0: i32, y0: i32, x1: i32, y1: i32 }{
+        .{ .scale = 1.0, .x0 = 9, .y0 = 7, .x1 = 29, .y1 = 21 },
+        .{ .scale = 1.5, .x0 = 13, .y0 = 10, .x1 = 43, .y1 = 31 },
+        .{ .scale = 2.0, .x0 = 18, .y0 = 14, .x1 = 58, .y1 = 42 },
+    };
+    for (cases) |c| {
+        var pixels = [_]u32{background} ** (128 * 96);
+        var dl = DrawList.init(std.testing.allocator);
+        defer dl.deinit();
+        dl.reset(64, 48);
+        try dl.shadow(.{ .x = 9, .y = 7, .w = 20, .h = 14 }, color, .{});
+        const target = RenderTarget{ .pixels = &pixels, .width = 128, .height = 96 };
+        render(target, &dl, font_mod.default_font, c.scale);
+
+        try std.testing.expectEqual(ink, pixelAt(&pixels, 128, c.x0, c.y0));
+        try std.testing.expectEqual(ink, pixelAt(&pixels, 128, c.x1 - 1, c.y0));
+        try std.testing.expectEqual(ink, pixelAt(&pixels, 128, c.x0, c.y1 - 1));
+        try std.testing.expectEqual(ink, pixelAt(&pixels, 128, c.x1 - 1, c.y1 - 1));
+        try std.testing.expectEqual(ink, pixelAt(&pixels, 128, @divTrunc(c.x0 + c.x1, 2), @divTrunc(c.y0 + c.y1, 2)));
+
+        try std.testing.expectEqual(background, pixelAt(&pixels, 128, c.x0 - 1, c.y0));
+        try std.testing.expectEqual(background, pixelAt(&pixels, 128, c.x0, c.y0 - 1));
+        try std.testing.expectEqual(background, pixelAt(&pixels, 128, c.x1, c.y1 - 1));
+        try std.testing.expectEqual(background, pixelAt(&pixels, 128, c.x1 - 1, c.y1));
+    }
+}
+
+test "shadow render: the offset is physicalized once" {
+    const background: u32 = 0xFF202020;
+    const color = Color.rgba(0, 0, 0, 0xFF);
+    const ink: u32 = @bitCast(color);
+    var pixels = [_]u32{background} ** (128 * 96);
+    var dl = DrawList.init(std.testing.allocator);
+    defer dl.deinit();
+    dl.reset(64, 48);
+    try dl.shadow(.{ .x = 10, .y = 8, .w = 20, .h = 12 }, color, .{ .offset = .{ .x = 4, .y = -2 } });
+    const target = RenderTarget{ .pixels = &pixels, .width = 128, .height = 96 };
+    render(target, &dl, font_mod.default_font, 2.0);
+
+    // The rectangle physicalizes to (20, 16, 40, 24) and the offset to (8, -4),
+    // which puts the shadow at (28, 12) through (68, 36) exclusive.
+    try std.testing.expectEqual(ink, pixelAt(&pixels, 128, 28, 12));
+    try std.testing.expectEqual(ink, pixelAt(&pixels, 128, 67, 35));
+    try std.testing.expectEqual(background, pixelAt(&pixels, 128, 27, 12));
+    try std.testing.expectEqual(background, pixelAt(&pixels, 128, 28, 11));
+    try std.testing.expectEqual(background, pixelAt(&pixels, 128, 68, 35));
+    try std.testing.expectEqual(background, pixelAt(&pixels, 128, 67, 36));
+}
+
+test "shadow render: the radius, blur, offset and clip are each physicalized once" {
+    // A soft shadow has no crisp silhouette to compare against, but the region it
+    // is allowed to touch is exact: the physical rectangle displaced by the offset,
+    // grown by the blur, and intersected with the physical clip. Converting any of
+    // those a second time moves or widens that region, so asserting that nothing
+    // outside it changed catches a repeated conversion without depending on the
+    // mask's coverage profile.
+    const background: u32 = 0xFF202020;
+    const scale: f32 = 1.5;
+    const logical_rect = Rect{ .x = 9, .y = 7, .w = 20, .h = 14 };
+    const logical_clip = Rect{ .x = 6, .y = 5, .w = 30, .h = 24 };
+    const options: draw_mod.ShadowOptions = .{ .radius = 6, .blur = 4, .offset = .{ .x = -3, .y = 5 } };
+
+    var pixels = [_]u32{background} ** (128 * 96);
+    var dl = DrawList.init(std.testing.allocator);
+    defer dl.deinit();
+    dl.reset(64, 48);
+    try dl.pushClip(logical_clip);
+    try dl.shadow(logical_rect, Color.rgba(0, 0, 0, 0xC0), options);
+    dl.popClip();
+    const target = RenderTarget{ .pixels = &pixels, .width = 128, .height = 96 };
+    render(target, &dl, font_mod.default_font, scale);
+
+    const base = scaleRect(logical_rect, scale);
+    const blur = scaleBlurUnclamped(options.blur, scale);
+    const offset = scalePoint(options.offset, scale);
+    const outer = Rect{
+        .x = base.x + offset.x - @as(i32, @intCast(blur)),
+        .y = base.y + offset.y - @as(i32, @intCast(blur)),
+        .w = base.w + blur * 2,
+        .h = base.h + blur * 2,
+    };
+    const allowed = clipRect(outer, scaleRect(logical_clip, scale), target);
+    try std.testing.expect(!allowed.isEmpty());
+
+    var touched: usize = 0;
+    for (0..96) |y| {
+        for (0..128) |x| {
+            if (pixels[y * 128 + x] == background) continue;
+            touched += 1;
+            const px: i32 = @intCast(x);
+            const py: i32 = @intCast(y);
+            try std.testing.expect(px >= allowed.x and px < allowed.x + @as(i32, @intCast(allowed.w)));
+            try std.testing.expect(py >= allowed.y and py < allowed.y + @as(i32, @intCast(allowed.h)));
+        }
+    }
+    // The bound is not satisfied by painting nothing at all.
+    try std.testing.expect(touched > 0);
 }
 
 test "shadow render: zero radius and zero blur use the non-analytic cached route" {
