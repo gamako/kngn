@@ -58,6 +58,13 @@ inject char A              # char <char|0x<hex>|U+<hex>> [modifiers...] one sett
 inject commit hello world  # commit [text] the rest of the line, one char_input per codepoint (an IME's insertText)
 inject composition update 0 ab # composition update <cursor_bytes> [text] text being composed (the first one is phase=start)
 inject composition cancel  # composition cancel  abandon the composition in progress
+inject midi note_on 60 100 # midi note_on|note_off <note 0..127> <velocity 0..127>, decimal (a note_on with velocity 0 behaves as a note_off)
+inject midi cc 1 64        # midi cc <controller 0..127> <value 0..127>, decimal (unlike char's hex argument)
+inject file_drop /tmp/a.png # file_drop <path> the rest of the line, spaces kept, no quoting (`;` and a newline are the separators, so a path cannot contain either)
+inject gamepad_connect 0 Pad Name # gamepad_connect <index 0..3> [name] resets that pad to its neutral state (every button off, sticks and triggers at 0)
+inject gamepad_disconnect 0 # gamepad_disconnect <index 0..3>
+inject gamepad_button 0 a 1 # gamepad_button <index> <button> <0|1> rewrites the polled state directly; no event, and a no-op with a warning if not connected
+inject gamepad_axis 0 left_x 0.5 # gamepad_axis <index> <axis> <value> likewise: polled state only, no event, and requires a prior gamepad_connect
 step 5                     # manual/replay: drive 5 frames / free-run: a frame barrier of 5 presents
 await fb crc=8702DD71 60   # await <probe> <key><op><value> [timeout]  (timeout is a frame budget; 0 = compare once)
 await audio silent=0       # free-run holds the connection and waits for the app; manual drives frames and waits
@@ -68,6 +75,8 @@ digest fb                  # fb <w>x<h> crc=<hex> top=[#RRGGBB:NN%,...]
 digest window              # window logical_w=<n> logical_h=<n> fb_w=<n> fb_h=<n> scale=<f> epoch=<n>
 digest audio               # audio rms=<f> peak=<f> f0=<Hz> silent=<0|1> frames=<n> band_low/mid/high=<0..1> centroid=<Hz> onsets=<n> lufs=<f>
 digest stats               # {"frame":..,"virtual_fps":60.0,"mouse_move_merge_count":..,"mouse_scroll_merge_count":..,"event_drop_count":..,"modal_blocked_injections":..} (one line of JSON)
+digest midi                # midi device=0 note_count=<n> notes=<32 hex digits, a 128-bit pressed set, note N is bit N> cc_count=<n> cc=<128 slots, each a hex byte or `--` if never set>
+digest gamepad              # gamepad connected=<bitmask over 4 pads> then, per connected pad i: p<i>_buttons=<hex bitmask> p<i>_lx=.. p<i>_ly=.. p<i>_rx=.. p<i>_ry=.. p<i>_lt=.. p<i>_rt=..
 digest capabilities        # {"backend":"metal","headless_active":false,"probes":[{"name":..,"ext":..,"snapshot":bool,"digest":bool,"desc":..(,"args":[...])},...],"actions":[{"name":..,"desc":..(,"args":[...])},...]}
 snapshot capabilities /tmp/c.json # save capabilities as JSON (default capabilities_<n>.json)
 action <name> [args...]    # run a high-level operation the app registered (the write counterpart to a probe's read)
@@ -447,6 +456,73 @@ passes through the native `keyDown` or the input context. Within the queue's cap
 all: the candidate window, where it lands (so whether `setCompositionRect` had any
 effect), and how the platform behaves mid conversion. Those need a real session and a pair
 of eyes.
+
+### File drop
+
+`inject file_drop <path>` queues one `file_drop` event carrying the path as UTF-8. Like
+`commit` and `composition update`, it takes the rest of the line: exactly one separator
+after the token is dropped, and everything after that is the path as it stands — spaces
+kept, no quoting. `;` and a newline are the command separators, so a path containing either
+cannot be expressed this way. An empty path, a path holding a NUL byte, invalid UTF-8, or a
+path over 1024 bytes (`FILE_DROP_PATH_BYTES`, macOS `PATH_MAX`) is rejected with a warning
+and nothing is queued. Only one path per event — a real multi-file drop is not modelled.
+
+### MIDI input
+
+`inject midi note_on|note_off <note> <velocity>` and `inject midi cc <controller> <value>`
+feed the same facade a real MIDI device does (`core/midi.zig`, ADR-010); `device_id` is
+always `0`. **Every numeric argument is decimal** (`60` means note 60, not `0x60`) — the
+opposite of `inject char`'s hex, so a value copied between the two forms reads differently.
+Values outside `0..127` are rejected with a warning; extra arguments are also rejected
+rather than silently ignored. **A `note_on` with velocity `0` is delivered as a `note_off`**,
+the standard MIDI convention (a device that only ever sends `note_on` still turns notes
+off). MIDI runs through its own FIFO, separate from the inject queue that `key_down`,
+`mouse_move` and the other event-producing `inject` kinds feed, so it overflows (and is
+dropped) independently of an injection burst on that queue.
+
+`digest midi` reads the state MIDI has produced so far (not an event log): a 128-bit
+pressed-note bitset and the last-seen value of every controller (`--` for one never set).
+`examples/29_midi_monitor` is the worked example.
+
+### Gamepad input
+
+Four `inject` kinds drive the gamepad facade, but they do not all behave the same way:
+
+| Form | What it does |
+|---|---|
+| `inject gamepad_connect <index> [name]` | queues `gamepad_connected` **and** resets that pad's state to neutral (every button off, both sticks at 0, both triggers at 0) |
+| `inject gamepad_disconnect <index>` | queues `gamepad_disconnected` and nulls that pad's state |
+| `inject gamepad_button <index> <button> <0\|1>` | **no event** — writes the button bit directly |
+| `inject gamepad_axis <index> <axis> <value>` | **no event** — writes the axis value directly |
+
+`index` is `0..3` (`MAX_GAMEPADS = 4`). `button` is one of the 15 case-insensitive names in
+`GamepadButton` (`a`, `b`, `x`, `y`, `left_shoulder`, `right_shoulder`, `back`, `start`,
+`left_stick`, `right_stick`, `dpad_up`, `dpad_down`, `dpad_left`, `dpad_right`, `guide`).
+`axis` is one of `left_x`/`left_y`/`right_x`/`right_y` (sticks, range `-1..1`) or
+`left_trigger`/`right_trigger` (range `0..1`); a value outside its range, or a non-finite one
+(`NaN`/`inf`), is rejected rather than clamped. An unrecognised button or axis name is
+rejected the same way.
+
+**`gamepad_button` and `gamepad_axis` change only the state an application polls through
+`window.getGamepadState(index)` — they queue no event at all** (ADR-009's polling model: a
+real backend only ever updates this same state, at its own hardware's rate, and an
+application reads it once per frame rather than reacting to per-axis events). A script
+that injects a button press and then asserts on an event queue will see nothing; `step`
+once and read `digest gamepad` (or the application's own state) instead.
+
+**Both require the pad to already be connected.** `inject gamepad_button` or
+`inject gamepad_axis` against an index that `gamepad_connect` has not been run for yet warns
+`the pad is not connected` and leaves the state untouched — connecting is not implied.
+
+`digest gamepad` reports a bitmask of which of the 4 pads are connected, then, for each
+connected pad, its button bitmask and the six analog values.
+
+**Headless green here is not the same evidence it is for keyboard and mouse.** The harness
+runs identically on every OS, but the gamepad facade's real (non-injected) backend exists
+only on macOS (`GameController`) — Linux and Windows have no real gamepad backend yet. A
+headless replay exercising `inject gamepad_*` verifies the harness and the application's own
+polling logic, not whether reading an actual controller works on any platform.
+`examples/22_gamepad` is the worked example.
 
 ### Tab takes an extra step to observe
 
