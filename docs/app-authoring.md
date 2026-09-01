@@ -199,63 +199,59 @@ replacing the widget path would change every existing UI frame.
 
 ## 5. Building a screen: boxes, widgets, a table and a virtual list
 
-§4 gave the order a frame runs in and left `ctx.<widget calls>` as a placeholder. This
-section is what goes there: how a screen is assembled, which call to reach for, and where
-the boundary is between the library placing things and you placing them.
+§4 gave the order a frame runs in and left `ctx.<widget calls>` as a placeholder. This section
+is the index of what goes there: which call to reach for, what it contracts to, and where the
+boundary is between the library placing things and you placing them.
 
-**The runnable reference is [`examples/47_screen_layout/`](../examples/47_screen_layout/).**
-The code blocks in §5.1 to §5.5 are that sample's `main.zig`, in the order it builds them, so
-reading straight through assembles one screen: a header, a sidebar, a row of cards, a small
-table, and a list of ten thousand entries. Each block is one of the screen's own functions,
-and the state they read is declared in the skeleton below, so what is missing between two
-blocks is only the other blocks. The sample imports `kit` only and compiles as a standalone
-package in the same gate as every other one, which is why the code here is the code that
-runs — open it when you want the file rather than the walk-through.
+**The runnable reference is [`examples/47_screen_layout/`](../examples/47_screen_layout/)** — a
+header, a sidebar, a row of cards, a small table and a list of ten thousand entries. It imports
+`kit` only and is compiled on its own by `check-examples-standalone`, so it is the code that
+runs. Read its `main.zig` for an assembled screen; read this section for the names, the
+contracts and the traps.
 
-**`Context` is not the only entry point to drawing, but it is the default one.** A screen
-is described as a tree of boxes and widgets; the layout engine resolves it to rectangles at
-`endFrame`. Reaching past that to `ctx.draw_list` and passing coordinates by hand is
-available (§5.6) and occasionally right, but it is the exit, not the entrance: hand-computed
-positions accumulate error as a screen grows, while a declared size is either correct or
-wrong on its own.
+**`Context` is not the only entry point to drawing, but it is the default one.** A screen is a
+tree of boxes and widgets that the layout engine resolves to rectangles at `endFrame`. Reaching
+past that to `ctx.draw_list` and passing coordinates by hand is available (§5.6) and
+occasionally right, but it is the exit, not the entrance: hand-computed positions accumulate
+error as a screen grows, while a declared size is either correct or wrong on its own.
 
 ### 5.0 Which call to reach for
 
-Three groups, separated by **when in the frame they are called** — a distinction that
-decides more than it looks like it does, because the first group must be called inside a
-frame and the third must be called outside one, and getting either wrong panics rather
-than misbehaving quietly.
+Sorted by **when in the frame they are called**. Everything above the last row must be called
+inside a frame and the last row must be called outside one, and getting either wrong panics
+rather than misbehaving quietly.
 
 | When | Calls | In the layout tree | Hit-tested | Who decides the position |
 |---|---|---|---|---|
-| Inside the frame (required) | `beginBox`/`endBox`, the widgets, `ctx.custom` | yes | yes | the layout engine |
+| Inside the frame (required) | the widgets (§5.3) | yes | yes | the layout engine |
+| Inside the frame (required) | `beginBox` / `endBox` | yes | not itself; the widgets inside it are | the layout engine |
+| Inside the frame (required) | `ctx.custom` | yes | no — no id, no hit-test, no focus | the layout engine |
 | Inside the frame | `ctx.draw_list.*` directly | no | no | you |
 | After `endFrame` (required) | `popupMenu*`, `dialog*`, `menuBarPopup` | a separate layer | yes | the library |
 
-Only the *drawing* half of a popup or dialog is in that third group. Opening one
-(`openPopup`, `openDialog`) and building a menu bar's button row (`menuBar`) are ordinary
-in-frame calls that set state; the matching `popupMenu` / `dialog` / `menuBarPopup` paints
-it after the frame is closed.
+Only the *drawing* half of a popup or dialog is in that last group, and only that half is what
+the frame boundary constrains. Opening one (`openPopup`, `openDialog`) sets state and needs no
+frame of its own, and building a menu bar's button row (`menuBar`) is an ordinary in-frame call;
+the matching `popupMenu` / `dialog` / `menuBarPopup` paints it after the frame is closed.
 
-Draw order follows the same three steps: whatever you pushed onto `draw_list` during the
-frame is already in the list when `endFrame` appends the interface's own commands, so
-widgets paint **over** a hand-drawn background; the post-`endFrame` layers paint over
-everything.
+Draw order follows the same order: whatever you pushed onto `draw_list` during the frame
+is already in the list when `endFrame` appends the interface's own commands, so widgets paint
+**over** a hand-drawn background; the post-`endFrame` layers paint over everything.
 
-Choose by what the thing is:
+Which one a thing is:
 
-- **A control** (something with a state the user changes) — a widget from §5.3.
-- **An arrangement** (a panel, a row, a column, a card, a gap) — a box, §5.1.
-- **A drawing that belongs to the layout** (a meter, a waveform, a thumbnail) —
-  `ctx.custom`, §5.5. It takes a rectangle from the layout and draws inside it.
-- **A drawing that belongs to no box** (a full-window background, a debug overlay) — the
-  draw list, §5.6.
+| What you are placing | Call | Where |
+|---|---|---|
+| A control — something with a state the user changes | a widget | §5.3 |
+| An arrangement — a panel, a row, a column, a card, a gap | a box | §5.1 |
+| A drawing that belongs to the layout — a meter, a waveform, a thumbnail | `ctx.custom` | §5.5 |
+| A drawing that belongs to no box — a full-window background, a debug overlay | `ctx.draw_list` | §5.6 |
 
 ### 5.1 The box tree
 
-`beginBox` opens a box, `endBox` closes it, and what you build in between are its children.
-A box carries no position — only a `BoxConfig` saying how it is sized and how it arranges
-what is inside it. The fields a screen normally needs:
+`ctx.beginBox(cfg: gui.BoxConfig)` opens a box, `ctx.endBox()` closes it, and what you build
+in between are its children. A box carries no position — only the `BoxConfig` saying how it is
+sized and how it arranges what is inside it. The fields a screen normally needs:
 
 | Field | What it does |
 |---|---|
@@ -265,10 +261,10 @@ what is inside it. The fields a screen normally needs:
 | `gap` | space between children on the main axis |
 | `align_cross` | `.start` / `.center` / `.end` — where children sit on the cross axis |
 | `align_main` | `.start` / `.center` / `.end` — where children sit on the **main** axis (CSS `justify-content`). A weight>0 `.grow` child normally takes the space `align_main` would place, so it has no effect next to one — unless every such child is frozen by its own min/max clamp ([layout.md](../libs/gui/docs/layout.md)) |
-| `bg`, `border`, `radius` | the box's own painting (`border` is `.{ .color, .thickness }`) |
+| `bg`, `border`, `radius` | the box's own painting. `bg` is a `?gui.Color`, `border` a `?.{ .color, .thickness }`, `radius` a uniform logical radius. Take the colours from the active theme rather than writing literals: `ctx.style.surface.canvas` / `.panel` / `.raised` / `.control` / `.control_subtle`, `ctx.style.accent.primary`, `ctx.style.border_tokens.normal` (§6) |
 | `clip_children` | clip drawing and hit-testing to the content box |
 | `min_width` / `max_width` / `min_height` / `max_height` | a clamp applied on top of whatever `Sizing` says |
-| `id` | an explicit id, needed only when you want to look the box's rectangle up later |
+| `id` | an explicit id. Needed to read the box's settled rectangle back (`ctx.getNodeRect`), which is also what a custom interactive widget runs its behavior against |
 
 `BoxConfig` carries four more that this section does not use: `wrap` and `cross_gap` (flex
 wrapping), `anchor` (turn the child into an overlay that takes no part in its parent's
@@ -285,111 +281,18 @@ documented with the rest of the engine in
 | `.{ .grow = w }` | share of the space left after the fixed / fit / percent siblings, split between grow siblings by weight `w`. On the **cross** axis a grow child simply fills the parent, weight ignored |
 | `.{ .percent = f }` | `floor(parent_content * f)` |
 
-That is the whole vocabulary. Before the boxes, the state they read — the GUI stores none of
-it, so every value a widget shows or writes lives in your own struct:
+That is the whole vocabulary, and it is enough for a screen with no arithmetic in it: give the
+side columns of a row `.{ .fixed = n }` and the middle `.{ .grow = 1 }`, and the middle takes
+whatever is left at every window size. Siblings that are all `.{ .grow = 1 }` divide their row
+evenly. In a column where only the last child is `.grow` on the main axis, the others keep
+their fixed or measured sizes and it absorbs every pixel a resize adds or removes.
+[`examples/47_screen_layout/main.zig`](../examples/47_screen_layout/main.zig) is that screen
+assembled: `buildScreen` is the outer frame, `card` the repeated panel, and `buildContent` the
+column holding the cards, the header and the list.
 
-```zig
-const std = @import("std");
-const kit = @import("kit");
-const gui = kit.gui;
-const platform = kit.platform;
-
-/// Ids for the widgets this screen builds. Any non-zero `u64` will do; they only have to be
-/// unique within one frame (§5.7).
-const tab_all_id: gui.Id = 0x4701;
-const tab_recent_id: gui.Id = 0x4702;
-const rescan_id: gui.Id = 0x4703;
-const summary_table_id: gui.Id = 0x470C;
-const entry_list_id: gui.Id = 0x470B;
-/// Ten thousand row ids, reserved as a range clear of every other id above.
-const entry_id_base: gui.Id = 0x1000_0000;
-
-/// How many entries the list holds. Large enough that building every row each frame would
-/// be the wrong shape — see §5.4.
-const entry_count: usize = 10_000;
-
-const Collection = struct { name: []const u8, kind: []const u8 };
-const collections = [_]Collection{
-    .{ .name = "All assets", .kind = "mixed" },
-    .{ .name = "Textures", .kind = "image" },
-    // ...
-};
-
-const App = struct {
-    ctx: gui.Context,
-    /// The text field's contents.
-    search: gui.TextBuffer,
-    /// The entry list's scroll offset. The GUI never keeps one of its own.
-    list_scroll: gui.Vec2f = .{ .x = 0, .y = 0 },
-
-    tab: enum { all, recent } = .all,
-    collection: usize = 0,
-    selected_entry: ?usize = null,
-    filters_open: bool = true,
-    only_tagged: bool = false,
-    preview: bool = true,
-    sort_by_size: bool = false,
-    min_size_kib: i32 = 0,
-
-    /// How far into the list the selection sits, or null when nothing is selected.
-    fn selectedFraction(self: *const App) ?f32 {
-        const i = self.selected_entry orelse return null;
-        return @as(f32, @floatFromInt(i + 1)) / @as(f32, @floatFromInt(entry_count));
-    }
-};
-```
-
-A two-column screen under a header is then four boxes:
-
-```zig
-fn buildScreen(self: *App, ctx: *gui.Context) void {
-    ctx.beginBox(.{
-        .direction = .column,
-        .width = .{ .grow = 1 },
-        .height = .{ .grow = 1 },
-        .bg = ctx.style.surface.canvas,
-    });
-    self.buildHeader(ctx);
-    ctx.separator(.{});   // see below: one edge is a rule, not a border option
-
-    ctx.beginBox(.{
-        .direction = .row,
-        .width = .{ .grow = 1 },
-        .height = .{ .grow = 1 },
-        .gap = 12,
-        .padding = .{ 12, 12, 12, 12 },
-    });
-    self.buildSidebar(ctx);     // width = .{ .fixed = 240 }, height = .{ .grow = 1 }
-    self.buildContent(ctx);     // width = .{ .grow = 1 },    height = .{ .grow = 1 }
-    self.buildInspector(ctx);   // width = .{ .fixed = 280 }, height = .{ .grow = 1 }
-    ctx.endBox();
-
-    ctx.endBox();
-}
-```
-
-The two side columns keep their widths and the middle takes whatever is left, at every window
-size, with no arithmetic anywhere. Cards work the same way — three siblings each `.{ .grow = 1 }`
-divide their row evenly, and none of them knows its own width:
-
-```zig
-fn card(ctx: *gui.Context, title: []const u8, value: []const u8, fraction: ?f32) void {
-    ctx.beginBox(.{
-        .direction = .column,
-        .width = .{ .grow = 1 },
-        .height = .{ .grow = 1 },
-        .padding = .{ 12, 16, 12, 16 },
-        .gap = 6,
-        .bg = ctx.style.surface.raised,
-        .radius = 8,
-        .border = .{ .color = ctx.style.border_tokens.normal, .thickness = 1 },
-    });
-    ctx.labelStyled(title, .label);
-    ctx.labelStyled(value, .title);
-    if (fraction) |f| meter(ctx, f);   // §5.5 — no widget draws a bar
-    ctx.endBox();
-}
-```
+**The GUI stores no application state.** Every value a widget shows or writes — a selection, a
+text buffer, a scroll offset, an open/closed flag — lives in your own struct, which is why the
+calls in §5.3 take pointers and current values rather than remembering anything.
 
 **`border` is uniform on all four sides, so a rule on one edge is `ctx.separator(.{})`.** It
 emits a box `thickness` px on the parent's main axis and `.grow` on its cross axis, so the
@@ -403,46 +306,6 @@ sized child, or — because a `wrap` line takes its cross size from that line's 
 a lone rule on a wrap line, even inside a `.fixed` parent. §5.2 is the general form of the trap. [`docs/adr/034`](adr/034_separator-instead-of-per-side-border.md)
 records why the border is not extended per side.
 
-The content column stacks the cards, the table and the list, and the card row splits itself
-between three `.grow` children. (In the sample `card` also takes the `*App`, so it can count
-what it built for the harness probe of §5.8; nothing about the layout needs it.)
-
-```zig
-fn buildContent(self: *App, ctx: *gui.Context) void {
-    ctx.beginBox(.{
-        .direction = .column,
-        .width = .{ .grow = 1 },
-        .height = .{ .grow = 1 },
-        .gap = 12,
-    });
-    self.buildCards(ctx);      // a fixed-height row of three cards
-    buildListHeader(ctx);      // a sibling above the list, sharing its column widths
-    self.buildEntryList(ctx);  // §5.4 — takes the leftover height
-    ctx.endBox();
-}
-
-fn buildCards(self: *App, ctx: *gui.Context) void {
-    ctx.beginBox(.{
-        .direction = .row,
-        .width = .{ .grow = 1 },
-        .height = .{ .fixed = 92 },
-        .gap = 12,
-    });
-    const selected_label = if (self.selected_entry) |i|
-        std.fmt.allocPrint(ctx.allocator(), "#{d}", .{i}) catch "-"
-    else
-        "none";
-    card(ctx, "Entries", std.fmt.allocPrint(ctx.allocator(), "{d}", .{entry_count}) catch "?", null);
-    card(ctx, "Collection", collections[self.collection].name, null);
-    card(ctx, "Selected", selected_label, self.selectedFraction());
-    ctx.endBox();
-}
-```
-
-Only the last child is `.grow` on the column's main axis, so the cards keep their 92 px, the
-header keeps what it measures to, and the list absorbs the rest — including every pixel a
-window resize adds or removes.
-
 Two conventions worth knowing early:
 
 - **Main-axis alignment is `BoxConfig.align_main`** (`.start` / `.center` / `.end`, CSS
@@ -452,15 +315,9 @@ Two conventions worth knowing early:
   **It normally has no effect in a box that holds a weight>0 `.grow` child**, because that
   child takes the space `align_main` would have placed. (The exception is a `.grow` child
   frozen by its own `min_*` / `max_*`, which stops taking the rest — the full rule is in
-  [libs/gui/docs/layout.md](../libs/gui/docs/layout.md).) The usual case is worth knowing
-  before you meet it: the header of `examples/47_screen_layout` is `.grow`-driven, and its
-  title-left / tabs-right split is *two* groups, which is CSS `space-between` — not one of the
-  three values. **A two-group row still puts an empty `.{ .grow = 1 }` box between the
-  groups**, and that sample shows both shapes side by side.
-
-  The sidebar is the same shape — a `.{ .fixed = 240 }` column of `beginListboxRow` entries
-  and a `beginCollapsible` holding the filter controls, each of which is one line from the
-  widget table in §5.3.
+  [libs/gui/docs/layout.md](../libs/gui/docs/layout.md).) Nor does it express a row split into
+  *two* groups — a title on the left, tabs on the right, CSS `space-between` — which is not one
+  of the three values: **that row still puts an empty `.{ .grow = 1 }` box between the groups**.
 - **There is no shrink.** Children that together exceed their parent overflow rather than
   being squeezed; `clip_children` hides the overflow but does not change the numbers.
 
@@ -491,10 +348,10 @@ anything unusual with `.fit`.
 ### 5.3 The widgets
 
 Called between `beginFrame` and `endFrame`, as `ctx.<name>(...)` unless the table says
-otherwise (a few are free functions taking the context as their first argument). `self.*`
-below refers to the skeleton in §5.1; any other name is called out where it appears. Each
-returns what happened this frame; **the selection or value is yours to own**, which is why radio buttons,
-tabs and list rows take the current state as a plain argument rather than storing it.
+otherwise (a few are free functions taking the context as their first argument). `self.*` in
+the minimal uses below is the application's own state struct. Each call returns what happened
+this frame; **the selection or value is yours to own**, which is why radio buttons, tabs and
+list rows take the current state as a plain argument rather than storing it.
 
 | Call | Minimal use | Returns |
 |---|---|---|
@@ -509,7 +366,7 @@ tabs and list rows take the current state as a plain argument rather than storin
 | `textInputId` | `const r = ctx.textInputId(id, &self.search, .{ .width = .{ .fixed = 160 }, .placeholder = "name" });` | `TextInputResult{ changed, focused, selection, copy_request, caret_rect }`. The text lives in a `gui.TextBuffer` you own. Single-line only, and the IME and clipboard seams around it are [docs/text-input.md](text-input.md) |
 | `selectableLabel` / `selectableLabelId` | `_ = ctx.selectableLabelId(id, "Read-only text", .{ .focusable = true });` | `SelectableLabelResult{ selection, copy_request }` — text the user drags across and copies. Out of the Tab order unless `.focusable` |
 | `tabId` | `if (ctx.tabId(id, "All", self.tab == .all, .{}).focused) self.tab = .all;` | `TabResult{ activated, focused }` — see the note below on which to use |
-| `beginListboxRow` / `endListboxRow` | one row of a single-select list; wrap any content between them (§5.4) | `ListboxRowResult{ activated }` — a click, or Space/Enter on the focused row |
+| `beginListboxRow` / `endListboxRow` | `const row = ctx.beginListboxRow(id, self.selected == i, .{ .height = .{ .fixed = 28 } });` — one row of a single-select list; wrap any content between the two, and take `ListboxRowOpts` for its height, padding, gap, `align_cross` and `idle_bg` (§5.4) | `ListboxRowResult{ activated }` — a click, or Space/Enter on the focused row |
 | `beginCollapsible` / `endCollapsible` | `if (ctx.beginCollapsible(id, "Filters", &self.filters_open)) { ...; ctx.endCollapsible(); }` | `bool`: whether the body is open. **Close it only when this was true** |
 | `beginScrollArea` / `endScrollArea` | a scroll viewport around content you build | nothing; you own the `gui.Vec2f` offset |
 | `beginFormRow` / `endFormRow` | an optional label and description above the control(s) built between them | nothing |
@@ -522,22 +379,23 @@ tabs and list rows take the current state as a plain argument rather than storin
 | `iconButton` | a button drawn from a 16×16 bitmap instead of a label | the same as `button` |
 | `tooltip` / `tooltipBox` | attach a tooltip to the widget just built | nothing |
 | `beginDisabled` / `endDisabled` | a nestable scope: everything inside rejects input and leaves the Tab order | nothing |
-| `openPopup` / `openDialog` / `closePopup` | **opening** a popup or dialog is an ordinary in-frame call — it only sets state | nothing |
+| `openPopup` / `openDialog` / `closePopup` | **opening or closing** a popup or dialog only sets state, so it needs no frame; the ordinary place for it is inside one, next to the control that triggers it | nothing |
 | `gui.menuBar` | `gui.menuBar(ctx, commands, &menu_state);` (`menu_state` is a `gui.MenuBarState` you own) — the top row of buttons built from `Command` definitions. A free function, not a `Context` method | nothing; the chosen `CommandId` comes from `menuBarPopup` below |
 
 **`tabId` returns two different things and they answer different questions.** `focused` is
 true while the tab holds the keyboard focus, so following it makes the selection move with
-both a click and a Tab — the convention the library is built around, and what the sample
-does. `activated` is true only on a click or Space/Enter, so following it keeps the selection
-put while Tab walks past. Pick one deliberately; `selected` itself is always display-only.
+both a click and a Tab — the convention the library is built around, and what
+`examples/47_screen_layout` follows. `activated` is true only on a click or Space/Enter, so
+following it keeps the selection put while Tab walks past. Pick one deliberately; `selected` itself is always display-only.
 
 Only the **drawing** half of a popup, dialog or menu happens after `endFrame`, because it
-paints over the finished frame. The opening calls above stay inside it:
+paints over the finished frame. The opening calls above are state updates, ordinarily made
+inside the frame next to the control that triggers them:
 
 | Call | Minimal use |
 |---|---|
-| `popupMenu` / `popupMenuEx` / `popupMenuStacked` | `ctx.openPopup(id, pos)` inside the frame; `ctx.popupMenu(id, items)` after `endFrame` |
-| `dialog` / `dialogStacked` | `ctx.openDialog(id, .{ ... })` inside the frame; `const r = ctx.dialog(id)` after `endFrame` (§6 has the worked example) |
+| `popupMenu` / `popupMenuEx` / `popupMenuStacked` | `ctx.openPopup(id, pos)` as a state update; `ctx.popupMenu(id, items)` after `endFrame` |
+| `dialog` / `dialogStacked` | `ctx.openDialog(id, .{ ... })` as a state update; `const r = ctx.dialog(id)` after `endFrame` (§6 has the options and the result) |
 | `gui.menuBarPopup` | the dropdown half of the menu bar whose button row `gui.menuBar` built inside the frame. Its `MenuBarResult.selected` is the chosen `CommandId` |
 
 Four rules that apply across both tables:
@@ -575,70 +433,38 @@ Two different widgets, and the row count decides which:
 | Tens of rows, and the columns must line up across them (content-sized `.fit` columns, a sticky header, horizontal scrolling) | `beginTable` |
 | Thousands of rows | `beginVirtualList`, with a header row of your own outside it |
 
-The table itself lives in the third column, which is an ordinary box:
+A table is built one call per level, and the order is the contract:
 
-```zig
-fn buildInspector(self: *App, ctx: *gui.Context) void {
-    ctx.beginBox(.{
-        .direction = .column,
-        .width = .{ .fixed = 280 },
-        .height = .{ .grow = 1 },
-        .padding = .{ 12, 12, 12, 12 },
-        .gap = 8,
-        .bg = ctx.style.surface.panel,
-        .radius = 8,
-        .border = .{ .color = ctx.style.border_tokens.normal, .thickness = 1 },
-    });
-    ctx.labelStyled("Details", .subtitle);
-    self.buildSummaryTable(ctx);
-    ctx.endBox();
-}
-```
+| Order | Call | What it is |
+|---|---|---|
+| 1 | `ctx.beginTable(id, cols, opts)` | `cols` is a `[]const gui.TableCol`: `.{ .width: Sizing, .header: ?[]const u8, .align_cross }`, where `align_cross` aligns the cell's own content inside the cell box |
+| 2 | `ctx.tableHeaderRow()` | optional, **at most once, before any body row**; draws the `header` strings of `cols` |
+| 3 | `ctx.beginTableRow(opts)` | once per row. `TableRowOpts` is `.{ .interactive: ?TableRowInteractive, .idle_bg, .height }`; a row that responds to a click needs `interactive` with a non-zero id taken from the data's identity, never from a display name |
+| 4 | `ctx.beginTableCell()` … build the cell … `ctx.endTableCell()` | **exactly once per column**, in column order |
+| 5 | `_ = ctx.endTableRow()` | after the last cell is closed; returns `TableRowResult{ activated }`, which the caller applies to its own selection |
+| 6 | `ctx.endTable()` | |
+
+`TableOpts` is `width` / `height` (`Sizing`, both `.{ .grow = 1 }`), `column_gap`, `row_gap`,
+`scroll`, `h_scroll`, `stretch_cells`, `header_bg`, `bg`, `border`, `wheel_px` and
+`bar_thickness`. `stretch_cells` makes `endTableRow` write a shared cell height so cell
+backgrounds line up, at the cost of measuring every cell subtree per row; with it on, a row's
+`height` must be `.fit` or `.fixed`, and `.grow` / `.percent` is a contract violation that
+fails the frame.
 
 **`beginTable` shares one column spec across its rows.** Cells are collected as the table
-builds and the widths are written back before layout runs, so the columns settle in the
-same frame — there is no one-frame lag on column width:
+builds and the widths are written back before layout runs, so the columns settle in the same
+frame — there is no one-frame lag on column width.
 
-```zig
-const cols = [_]gui.TableCol{
-    .{ .width = .{ .fixed = 104 }, .header = "Property" },
-    .{ .width = .{ .grow = 1 },    .header = "Value" },
-};
-const rows = [_][2][]const u8{
-    .{ "Kind", collections[self.collection].kind },
-    .{ "Sort", if (self.sort_by_size) "size" else "name" },
-    .{ "Tagged only", if (self.only_tagged) "yes" else "no" },
-};
-
-ctx.beginTable(summary_table_id, &cols, .{
-    .width = .{ .grow = 1 },
-    .height = .fit,
-    .column_gap = 12,
-    .header_bg = ctx.style.surface.control,
-});
-ctx.tableHeaderRow();
-for (rows) |cells| {
-    ctx.beginTableRow(.{});
-    for (cells) |text| {
-        ctx.beginTableCell();
-        ctx.label(text);
-        ctx.endTableCell();
-    }
-    _ = ctx.endTableRow();
-}
-ctx.endTable();
-```
-
-**A `.grow` column is only as sensible as the container that bounds it.** In the sample this
-table lives in a 280 px inspector column, so the value column growing means "fill the
-inspector", which is what you want. Put the same table across the whole pane and that column
-stretches to the far edge instead, stranding every column after it and leaving a canyon down
-the middle of each row. If a table really must span the pane, size the data columns and give
-the slack a **trailing `.grow` column of its own** — header-less, content-less, one empty
-cell per row — rather than letting a column that holds data absorb it.
+**A `.grow` column is only as sensible as the container that bounds it.** In a narrow
+container — an inspector column, a card — a growing value column means "fill the container",
+which is what you want. Put the same table across a whole pane and that column stretches to the
+far edge instead, stranding every column after it and leaving a canyon down the middle of each
+row. If a table really must span the pane, size the data columns and give the slack a
+**trailing `.grow` column of its own** — header-less, content-less, one empty cell per row —
+rather than letting a column that holds data absorb it.
 
 Its constraints: passing `opts.scroll` (a `*gui.Vec2f` you own) turns the body into a scroll
-region with a sticky header, and such a table cannot be `.fit` on either axis; `h_scroll`
+region, with a sticky header when a header row was built, and such a table cannot be `.fit` on either axis; `h_scroll`
 requires that `scroll` and rejects `.grow` / `.percent` columns, which by definition cannot
 exceed the viewport. **`beginTable` does not virtualize**: every row you build is built, and
 a `.fit` column measures every cell in the table each frame. That is fine for tens of rows
@@ -647,169 +473,83 @@ and wrong for thousands.
 **`beginVirtualList` is the answer for a long list.** It opens a scroll area whose content
 height is the full list, and returns the half-open index window you should actually build:
 
-```zig
-const row_height: i32 = 28;
-const list_opts: gui.VirtualListOpts = .{
-    .row_height = row_height,  // fixed, and every row must honour it
-    .row_count = entry_count,
-    .overscan = 2,             // extra rows built on each side of the visible window
-    // Frames the whole scroll region. Worth setting: the viewport cuts its last row in
-    // half, and with no edge to cut against that reads as a drawing error.
-    .border = .{ .color = ctx.style.border_tokens.normal, .thickness = 1 },
-};
+| Call | What it is |
+|---|---|
+| `ctx.beginVirtualList(id, scroll: *gui.Vec2f, opts) VirtualRange` | build **only** `range.first .. range.end` (half-open); the scroll offset is yours |
+| `ctx.endVirtualList()` | closes it |
+| `ctx.virtualScrollToRow(id, scroll, opts, index)` | moves the offset to a row; must be called **before** `beginVirtualList` in the same frame, and **with the same `opts` value** — it computes the same geometry, so declare the options once and pass that one value to both |
 
-const range = ctx.beginVirtualList(entry_list_id, &self.list_scroll, list_opts);
-var i = range.first;
-while (i < range.end) : (i += 1) {
-    const row = ctx.beginListboxRow(
-        entry_id_base + @as(gui.Id, @intCast(i)),
-        self.selected_entry == i,
-        .{
-            .height = .{ .fixed = row_height },
-            .padding = .{ 0, 12, 0, 12 },
-            .gap = 12,
-            .align_cross = .center,
-            // `idle_bg` is the unselected, unhovered fill, so banding the rows here still
-            // leaves selection and hover their own colours.
-            .idle_bg = if (i % 2 == 1) ctx.style.surface.control_subtle else null,
-        },
-    );
-    // The name column takes the leftover width and ellipsizes inside it.
-    ctx.beginBox(.{ .width = .{ .grow = 1 }, .clip_children = true });
-    ctx.text(
-        std.fmt.allocPrint(ctx.allocator(), "asset_{d:0>5}", .{i}) catch "?",
-        .{ .overflow = .ellipsis },
-    );
-    ctx.endBox();
-    cell(ctx, kindOf(i), 96, .body);
-    numCell(ctx, std.fmt.allocPrint(ctx.allocator(), "{d}", .{sizeOf(i)}) catch "?", 72, .body);
-    ctx.endListboxRow();
-    if (row.activated) self.selected_entry = i;
-}
-ctx.endVirtualList();
-```
+`VirtualListOpts`:
 
-`cell` is the fixed-width column the rows and the header both use — naming the widths once
-in a helper is what keeps the two aligned without either knowing an x coordinate:
+| Field | Meaning |
+|---|---|
+| `row_height` | required, `> 0` (asserted). Fixed, and every row must be built at exactly this height — that is what makes the index arithmetic possible. A list of variably tall rows is not this widget |
+| `row_count` | required. The full list length; the scroll range is computed from it, not measured |
+| `overscan` | extra rows built on each side of the visible window (default 2) |
+| `width` / `height` | `Sizing`, both `.{ .grow = 1 }` by default |
+| `padding` | `.{ top, right, bottom, left }` — **top and bottom must be `0`** (debug-asserted). The content height is declared rather than measured, so a vertical pad would shift the first row and under-size the scroll range; put that space on an outer box |
+| `gap` | between rows, `>= 0`. It is part of the arithmetic, not decoration: the row pitch is `row_height + gap`, and both the scroll range and the returned window are computed from it |
+| `align_cross`, `bg`, `border`, `wheel_px`, `bar_thickness` | appearance and the wheel step. Setting `border` is worth it: the viewport cuts its last row in half, and with no edge to cut against that reads as a drawing error |
 
-```zig
-fn cell(ctx: *gui.Context, str: []const u8, width: i32, tier: gui.TextTier) void {
-    ctx.beginBox(.{ .width = .{ .fixed = width }, .clip_children = true });
-    ctx.labelStyled(str, tier);
-    ctx.endBox();
-}
+Rows are usually `beginListboxRow` / `endListboxRow`, one per index in the range, with the row's
+own cells between them. What that buys, and what it asks for:
 
-/// The same cell with its text against the right edge, for a column of numbers.
-fn numCell(ctx: *gui.Context, str: []const u8, width: i32, tier: gui.TextTier) void {
-    ctx.beginBox(.{ .direction = .row, .width = .{ .fixed = width }, .clip_children = true });
-    ctx.beginBox(.{ .width = .{ .grow = 1 }, .height = .{ .fixed = 1 } });
-    ctx.endBox();
-    ctx.labelStyled(str, tier);
-    ctx.endBox();
-}
-
-/// Stand-ins for whatever the application's own data says about a row.
-fn kindOf(i: usize) []const u8 {
-    return switch (i % 4) {
-        0 => "image",
-        1 => "audio",
-        2 => "font",
-        else => "archive",
-    };
-}
-
-fn sizeOf(i: usize) usize {
-    return 12 + (i * 37) % 4096;
-}
-```
-
-**A column of numbers wants its digits aligned.** `numCell` is the general shape for any
-right-aligned column: a fixed-width cell with `.align_main = .end` (§5.1), holding the label
-alone. It works there precisely because the cell holds no `.grow` child — the header's
-two-group split still needs a spacer, and the sample keeps one for that reason.
-
-**Give the rows something to be read along.** A list whose names are shorter than the column
-they sit in leaves a wide gap before the columns pinned to the right, and the eye loses the
-row across it. `ListboxRowOpts.idle_bg` on alternating rows is the cheapest fix, and because
-it is the *idle* fill it costs nothing to selection and hover.
-
-The list's header row is a sibling box built above the list from the same `cell` calls with
-`.label` instead of `.body`, so the two columns line up by construction — and the header reads
-as a header, since `.label` is the tier for a name the eye scans (§6).
-
-A string built for a row lives on the frame arena (`ctx.allocator()`), which is reset at the
-*next* `beginFrame` — after `gui.render` has read it. That is why `allocPrint` above needs no
-cleanup, and why a buffer on the stack would not do.
-
-What that buys, and what it asks for:
-
-- The per-frame cost follows the **viewport**, not `row_count`. In the sample, ten thousand
-  entries build about seventeen rows a frame at its default window size.
-- `self.list_scroll` is a `gui.Vec2f` the application owns; the library keeps no scroll
-  state of its own. `ctx.virtualScrollToRow(id, &scroll, opts, index)` moves it, and must be
-  called **before** `beginVirtualList` in the same frame.
-- Rows are a **fixed height** — that is what makes the index arithmetic possible. A list of
-  variably tall rows is not this widget.
+- The per-frame cost follows the **viewport**, not `row_count`. Ten thousand entries build
+  about seventeen rows a frame at a default window size. The viewport comes from the previous
+  frame's rectangle, so on the *first* frame a list whose `height` is not `.fixed` falls back to
+  the logical screen height and over-builds; that is accepted, not a bug to work around.
+- Rows are `ctx.beginListboxRow(id, selected, opts)` … `ctx.endListboxRow()`. The `id` must be
+  non-zero and come from the data's identity (a reserved base plus the index, §5.7), `selected`
+  is your state passed in, and the returned `activated` is what you apply back to it.
+- `beginListboxRow` registers as a Tab stop only for the row marked `selected`, so a long list
+  costs Tab one stop rather than ten thousand. **The row is the only supported focus target**:
+  a focusable widget inside a virtual row is not supported, because rows that were never built
+  would silently change the Tab order.
 - **Put the column header outside the list**, as a sibling box above it, or it scrolls away
-  with the rows. Naming the column widths once and using them in both places is what keeps
-  the two aligned; neither knows an x coordinate.
-- `beginListboxRow` registers as a Tab stop only for the row marked `selected`, so a long
-  list costs Tab one stop rather than ten thousand. **The row is the only supported focus
-  target**: a focusable widget inside a virtual row is not supported, because rows that were
-  never built would silently change the Tab order.
-- **Vertical padding on the list must be zero** (horizontal is fine). The content height is
-  declared rather than measured, so a vertical pad would shift the first row and under-size
-  the scroll range; put that space on an outer box instead.
+  with the rows. Naming the column widths once — a `cell` helper both the header and the rows
+  call — is what keeps the two aligned; neither knows an x coordinate.
+- **A column of numbers wants its digits aligned.** The general shape is a fixed-width cell
+  with `.direction = .row` and `.align_main = .end`, holding the label alone. Both halves
+  matter: `direction` defaults to `.column`, on which `align_main` is the *vertical* axis; and
+  it works only because the cell holds no `.grow` child to take that space first (§5.1).
+- **Give the rows something to be read along.** A list whose names are shorter than the column
+  they sit in leaves a wide gap before the columns pinned to the right, and the eye loses the
+  row across it. `ListboxRowOpts.idle_bg` on alternating rows is the cheapest fix, and because
+  it is the *idle* fill it costs nothing to selection and hover.
+- A name column that must ellipsize is a `.{ .grow = 1 }` box with `clip_children`, holding
+  `ctx.text(name, .{ .overflow = .ellipsis })`.
+- A string built for a row lives on the frame arena (`ctx.allocator()`), which is reset at the
+  *next* `beginFrame` — after `gui.render` has read it. That is why an `allocPrint` for a cell
+  needs no cleanup, and why a buffer on the stack would not do.
+
+`buildSummaryTable` and `buildEntryList` in
+[`examples/47_screen_layout/main.zig`](../examples/47_screen_layout/main.zig) build the two
+shapes out.
 
 ### 5.5 Custom drawing inside the layout: `ctx.custom`
 
 When no widget fits but the thing still belongs in the tree — a level meter, a sparkline, a
-preview — `ctx.custom` puts a leaf in the layout that draws itself:
+preview — `ctx.custom(size: gui.Vec2, draw_fn, user_data: *anyopaque)` puts a leaf in the
+layout that draws itself. `draw_fn` is a
+`*const fn (*anyopaque, *gui.DrawList, gui.Rect) void`; `Meter` in
+[`examples/47_screen_layout/main.zig`](../examples/47_screen_layout/main.zig) is the worked one.
 
-```zig
-const Meter = struct {
-    fraction: f32,
-    track: gui.Color,
-    fill: gui.Color,
-
-    fn draw(ptr: *anyopaque, dl: *gui.DrawList, rect: gui.Rect) void {
-        const self: *Meter = @ptrCast(@alignCast(ptr));
-        dl.rectFilledEx(rect, self.track, .{ .radius = 3 }) catch @panic("meter: OOM");
-        const filled: u32 = @intFromFloat(@as(f32, @floatFromInt(rect.w)) * self.fraction);
-        if (filled == 0) return;
-        dl.rectFilledEx(
-            .{ .x = rect.x, .y = rect.y, .w = filled, .h = rect.h },
-            self.fill,
-            .{ .radius = 3 },
-        ) catch @panic("meter: OOM");
-    }
-};
-
-fn meter(ctx: *gui.Context, fraction: f32) void {
-    const state = ctx.allocator().create(Meter) catch @panic("meter: OOM");
-    state.* = .{
-        .fraction = std.math.clamp(fraction, 0, 1),
-        .track = ctx.style.surface.control,
-        .fill = ctx.style.accent.primary,
-    };
-    ctx.custom(.{ .x = 120, .y = 6 }, Meter.draw, state);
-}
-```
-
-Four things to get right:
+Five things to get right:
 
 - The `Vec2` is the leaf's **measured** size, not the size it is drawn at. The parent's
   sizing can change the final rectangle, which is why the callback is handed a `rect`.
 - The callback runs **during `endFrame`**, after layout has settled.
-- The context pointer is neither copied nor owned by the library; it only has to stay valid
+- The user-data pointer is neither copied nor owned by the library; it only has to stay valid
   until the callback has run. The frame arena (`ctx.allocator()`) is the natural home, since
   it is reset at the *next* `beginFrame`. What does not work is keeping an arena pointer
   across frames.
 - `DrawList` methods return errors and the callback returns `void`, so allocation failure is
   handled inside it — the library's own leaves use `catch @panic(...)`.
+- `ctx.custom` draws and nothing else — no id, no hit-test, no focus. A plain wrapping box
+  adds none either: interaction means an **explicit-id** box whose previous-frame rectangle you
+  run a behavior against (`libs/gui/README.md` has the two worked custom widgets).
 
-`ctx.custom` draws and nothing else — no id, no hit-test, no focus. Interaction comes from
-the box around it. The full contract, and two worked custom-drawn widgets to copy, are in
+The full contract, and two worked custom-drawn widgets to copy, are in
 [`libs/gui/README.md`](../libs/gui/README.md).
 
 ### 5.6 Drawing outside the layout: `ctx.draw_list`
@@ -818,15 +558,8 @@ the box around it. The full contract, and two worked custom-drawn widgets to cop
 is everything the tree provides: you supply absolute coordinates, nothing is hit-tested, and
 nothing follows a resize unless you make it. What you get is a drawing that answers to no
 box — a background behind the whole interface, a decoration spanning several panels, a debug
-overlay:
-
-```zig
-/// A backdrop under the whole interface. Called inside the frame, before the boxes.
-fn drawBackdrop(ctx: *gui.Context, rect: gui.Rect) void {
-    ctx.draw_list.rectFilledEx(rect, ctx.style.surface.panel, .{ .radius = 8 }) catch
-        @panic("backdrop: OOM");
-}
-```
+overlay. Its methods return errors, so a caller inside a frame handles them there
+(`catch @panic(...)` is what the library's own leaves do).
 
 Commands pushed during the frame sit **under** everything `endFrame` emits, so an interface
 built from boxes lands on top of a hand-drawn background without any ordering work. Anything
@@ -835,8 +568,8 @@ call time, so it has to stay alive until `gui.render` has run; the frame arena s
 that.
 
 The drawing calls themselves — rounded rectangles, circles, gradients, shadows, paths — are
-§6. Use this section to decide *whether* to drop to the draw list, and §6 for what to say
-once you have. §2 of [`docs/kit-tour.md`](kit-tour.md) indexes the rest of what the draw list
+documented in §6. Use this section to decide *whether* to drop to the draw list, and §6 for
+the calls themselves. §2 of [`docs/kit-tour.md`](kit-tour.md) indexes the rest of what the draw list
 holds, including text with an explicit font, clipping and the two `beginPath` forms.
 
 ### 5.7 Widget ids
@@ -852,8 +585,8 @@ Three ways out, in order of preference:
   derived from the data's own identity, not from its display name. `textInputId` has no
   auto-id form at all, for this reason.
 - Push a scope: `ctx.id_stack.push(i)` … `ctx.id_stack.pop()` around a repeated block.
-- Reserve a range for a collection, as the sample does: `Ids.entry + index`, kept clear of
-  every other id. Ids only have to be unique within one frame, but a range that grows with
+- Reserve a range for a collection: a base id plus the index (`Ids.entry + index` in
+  `examples/47_screen_layout`), kept clear of every other id. Ids only have to be unique within one frame, but a range that grows with
   the data has to be reserved deliberately.
 
 An id is any non-zero `u64`. Colliding within a frame is a contract violation and is caught
@@ -944,40 +677,26 @@ try draw_list.circleFilled(.{ .x = 80, .y = 64 }, 16, color, .{});
 try draw_list.circleOutline(.{ .x = 128, .y = 64 }, 16, color, 3, .{});
 ```
 
-`radius = 0` uses the same sharp drawing route as the existing filled and outline rectangle
-calls. Anti-aliasing is enabled by default; pass `.aa = false` in `RoundedRectOptions` or
-`CircleOptions` when a thresholded edge is wanted. The rounded masks are retained by the
-`DrawList` across `reset`. The rounded section of [`examples/46_style_gallery/main.zig`](../examples/46_style_gallery/main.zig)
-shows zero-radius, rounded, outlined, and circular variants together.
+`radius = 0` takes the sharp path. Anti-aliasing is on by default; pass `.aa = false` in
+`RoundedRectOptions` or `CircleOptions` for a thresholded edge. The rounded masks are retained
+by the `DrawList` across `reset`, so a repeated radius is not remasked each frame. The rounded
+section of [`examples/46_style_gallery/main.zig`](../examples/46_style_gallery/main.zig) shows
+the zero-radius, rounded, outlined and circular variants together.
 
 ### Gradients
 
-`Paint` is a tagged union with `solid`, `linear`, and `radial` cases. `rectFilledPaint` accepts a
-paint, and `rectFilledPaintEx` combines a paint with rounded-rectangle options:
+`Paint` is a tagged union, and `rectFilledPaint(rect, paint)` / `rectFilledPaintEx(rect, paint,
+rounded_opts)` take one:
 
-```zig
-const solid: gui.Paint = .{ .solid = color };
-const linear: gui.Paint = .{ .linear = .{
-    .start = .{ .x = 0, .y = 0 },
-    .end = .{ .x = 160, .y = 0 },
-    .start_color = blue,
-    .end_color = cyan,
-} };
-const radial: gui.Paint = .{ .radial = .{
-    .center = .{ .x = 80, .y = 40 },
-    .radius = 80,
-    .inner_color = white,
-    .outer_color = blue,
-} };
-try draw_list.rectFilledPaint(rect, solid);
-try draw_list.rectFilledPaint(rect, linear);
-try draw_list.rectFilledPaintEx(rect, radial, .{ .radius = 24 });
-```
+| Case | Fields |
+|---|---|
+| `.solid` | a `Color` |
+| `.linear` | `start`, `end` (points), `start_color`, `end_color` |
+| `.radial` | `center`, `radius`, `inner_color`, `outer_color` |
 
-The ordinary `rectFilled` and `rectFilledEx` calls are solid-paint wrappers, so solid paint is
-the default and existing solid drawing does not change. The gradient section of
-[`examples/46_style_gallery/main.zig`](../examples/46_style_gallery/main.zig) is a complete
-linear/radial paint arrangement.
+The colour-taking calls `rectFilled` and `rectFilledEx` are wrappers over `.solid`. The gradient
+section of [`examples/46_style_gallery/main.zig`](../examples/46_style_gallery/main.zig) is a
+complete linear/radial paint arrangement.
 
 ### Raised panels and shadows
 
@@ -1011,37 +730,32 @@ combinations.
 
 ### Modal dialogs
 
-Dialogs use the same popup mechanism as existing popups: opening a dialog takes the modal slot,
-absorbs background interaction, and drawing/hit-testing happens through the post-`endFrame`
-overlay call. `DialogOptions` carries the title, body, actions, width, and Escape policy:
+A dialog uses the same popup mechanism as a popup menu, and the drawing and hit-testing happen
+through the post-`endFrame` overlay call. `openDialog` takes the single classic modal slot and
+absorbs background interaction; `openDialogStacked` / `openDialogStackedAt` put the dialog on
+the independent popup stack instead, which holds more than one. The order is the contract:
 
-```zig
-const DIALOG_ACTIONS = [_]gui.DialogAction{
-    .{ .label = "Cancel" },
-    .{ .label = "Continue" },
-};
+| When | Call |
+|---|---|
+| Any time state can be set | `ctx.openDialog(id, opts)`, which centres it, or `ctx.openDialogAt(id, pos, opts)`. These only set state, so a frame is not required; the natural place is inside one, next to the control that opens the dialog |
+| After `endFrame` (required) | `const r = ctx.dialog(id)`, which draws it, hit-tests it and reports what happened |
 
-ctx.openDialog(0xD1, .{
-    .title = "Confirm",
-    .body = "Continue with this operation?",
-    .actions = &DIALOG_ACTIONS,
-});
+`DialogOptions` carries `title`, `body`, `actions` (a `[]const gui.DialogAction`, each
+`.{ .label, .enabled }`), `width` (360 by default) and `dismiss_on_escape` (`true` by default).
+`DialogResult` reports `open`, `selected: ?usize` (the action index) and `dismissed`. While the
+dialog is open, Tab and Shift+Tab cycle the enabled actions and Enter or Space activates the
+focused one.
 
-ctx.endFrame();
-const result = ctx.dialog(0xD1);
-if (result.selected) |index| {
-    _ = index;
-}
-if (result.dismissed) {
-    // Escape, when enabled, reports a dismissal and closes the dialog.
-}
-```
+**The options are borrowed, not copied.** `openDialog` stores the `DialogOptions` value, and
+`title`, `body`, the `actions` slice **and each action's `label`** still point at your memory —
+which the dialog reads on every frame it stays open, not just the frame that opened it. A local
+array or a frame-arena string is therefore not enough: all of them have to live as long as the
+dialog does.
 
-Call `openDialogAt` when the position should be supplied explicitly; `openDialog` centres the
-dialog. `dismiss_on_escape` defaults to `true`. While the dialog is open, Tab and Shift+Tab
-cycle through enabled actions, and Enter or Space activates the focused action. The returned
-`DialogResult` reports `open`, the selected action index, or `dismissed`. The popup/dialog API is
-also re-exported as `openDialogStacked` and `dialogStacked` for the stacked popup channel.
+`openDialogStacked` / `openDialogStackedAt` / `dialogStacked` are the same calls on that
+stacked channel.
+[`examples/35_gui_gallery/main.zig`](../examples/35_gui_gallery/main.zig) is the worked
+dialog.
 
 ### Animation (opt-in)
 
@@ -1241,13 +955,12 @@ Three consequences worth designing for:
 macOS has one backend and it is first-class, so an application there gets the guarantees
 above without choosing anything ([adr/031](adr/031_metal-only-macos-backend.md)).
 
-## 10. HiDPI: five concepts, one relationship
+## 10. HiDPI: five quantities, one relationship
 
-Five quantities interact once a window's content scale is not 1, each documented in full on its
-own elsewhere: the coordinate model and the framebuffer modes are
+The coordinate model and the framebuffer modes are
 [ADR-011](adr/011_high-dpi-coordinates-and-fb-modes.md); the web's DPR and clamping contract is
-in [`docs/wasm-deploy.md`](wasm-deploy.md). This section only states how the five relate, so an
-app author does not have to reconstruct that relationship from two other documents.
+in [`docs/wasm-deploy.md`](wasm-deploy.md). This section states which call returns which
+quantity, and how they relate.
 
 | Quantity | What it is | Where it comes from |
 |---|---|---|
@@ -1259,47 +972,38 @@ app author does not have to reconstruct that relationship from two other documen
 
 **The rule**: `ctx.beginFrame` always takes the **logical** size — `fb.logical_size.width` /
 `.height`, not `fb.width` / `fb.height` — so application and GUI code stay in logical
-coordinates throughout, under either mode. `content_scale` reports the real device pixel ratio
-under **both** modes (a retina display still reports `2.0` while `fb_mode` is `.logical`); only
-the framebuffer's *own size* — and what `gui.render`'s `scale` argument must be — depends on the
-mode. Under `.physical`, `fb.width`/`.height` is `round(logical size × content_scale)` and `render`'s
-`scale` must be that same frame's `fb.content_scale`; passing a mismatched value still produces
-an internally consistent draw list, just baked at the wrong physical size, so it under- or
-over-fills the framebuffer it was just handed. Under `.logical`, `fb.width`/`.height` **is** the
-logical size regardless of `content_scale`, and `render`'s `scale` is the constant `1.0` — the
-renderer draws once at logical resolution and leaves the upscale to the OS or browser, which is
-also why a `.logical`-only app never needs to look at `content_scale` at all.
+coordinates under either mode. `content_scale` reports the real device pixel ratio under
+**both** modes (a retina display still reports `2.0` while `fb_mode` is `.logical`); only the
+framebuffer's *own size*, and what `gui.render`'s `scale` must be, depend on the mode. A
+mismatched `scale` still produces an internally consistent draw list, just baked at the wrong
+physical size, so it under- or over-fills the framebuffer it was just handed.
 
-If manual drawing writes into `fb.pixels` directly instead of going through `gui.render` (games,
-`33_camera`), the same physical-pixel framebuffer is what is written; `libs/gfx`'s
-`ScreenTransform` (ADR-011 R6) is the shared helper for that logical-to-physical conversion, kept
-separate from `gfx.Camera` so a scale change never alters how much of the world is visible.
+If manual drawing writes into `fb.pixels` directly instead of going through `gui.render`
+(games, `33_camera`), the same physical-pixel framebuffer is what is written;
+`libs/gfx`'s `ScreenTransform` (ADR-011 R6) is the shared helper for that logical-to-physical
+conversion, kept separate from `gfx.Camera` so a scale change never alters how much of the
+world is visible.
 
 ### `.fixed`: one resolution, whatever the window does
 
-`.fb_mode = .{ .fixed = .{ .width = 640, .height = 400 } }` asks for a framebuffer of exactly that
-size. The window can be any size and any aspect ratio; present magnifies the framebuffer to fit,
-preserving the aspect ratio, and paints the remainder as a letterbox — black in an opaque window,
-fully transparent in a `transparent` one. `44_fixed_framebuffer` is the worked example, and the
-contract is [ADR-030](adr/030_fixed-framebuffer-and-letterboxed-present.md).
+`.fb_mode = .{ .fixed = .{ .width = 640, .height = 400 } }` asks for a framebuffer of exactly
+that size. Present magnifies it to fit the window, preserving the aspect ratio, and paints the
+remainder as a letterbox — black in an opaque window, fully transparent in a `transparent` one.
+`44_fixed_framebuffer` is the worked example, and the contract is
+[ADR-030](adr/030_fixed-framebuffer-and-letterboxed-present.md).
 
-What it changes for the app is that the three quantities above stop moving:
-
-- `fb.width` / `fb.height` and `fb.logical_size` are all **the fixed size**, and stay there across
-  every resize and every move between displays. `scale_epoch` does not advance either, because the
-  framebuffer did not change.
-- `content_scale` is **1.0**, and so is `gui.render`'s `scale`. There is one coordinate space and
-  the app draws in it, which is why nothing has to be recomputed when the window changes.
-- Pointer positions arrive in that same space. A position **over a letterbox bar** comes through
-  negative, or past the last row or column, rather than being clamped inside the content — an app
-  that treats a press outside the framebuffer as "not on anything" needs no other handling.
-
-The cost is that the result is not sharp: rendering happens at the fixed size and is magnified,
-which is the intended look for pixel art and the wrong choice for a text-heavy interface. An app
-that wants the display's resolution wants `.physical`.
-
-A zero side is `error.Unsupported`, and a backend that cannot magnify while presenting refuses the
-window rather than quietly handing back a framebuffer of another size.
+- `fb.width` / `fb.height` and `fb.logical_size` are all **the fixed size**, and stay there
+  across every resize and every move between displays. `scale_epoch` does not advance either,
+  because the framebuffer did not change.
+- `content_scale` is **1.0**, and so is `gui.render`'s `scale`.
+- Pointer positions arrive in that same space. A position **over a letterbox bar** comes
+  through negative, or past the last row or column, rather than being clamped inside the
+  content — an app that treats a press outside the framebuffer as "not on anything" needs no
+  other handling.
+- The result is magnified rather than rendered at the display's resolution. An app that wants
+  the display's own resolution wants `.physical`.
+- A zero side is `error.Unsupported`, and a backend that cannot magnify while presenting
+  refuses the window rather than quietly handing back a framebuffer of another size.
 
 ## 11. Wasm and web packaging
 
