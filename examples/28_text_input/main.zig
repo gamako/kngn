@@ -7,44 +7,14 @@
 //! Composition text borrows a fixed buffer (no heap alloc).
 
 const std = @import("std");
-const platform = @import("platform");
-const gui = @import("gui");
-const fontmod = @import("font");
+const kit = @import("kit");
+const platform = kit.platform;
+const gui = kit.gui;
+const fontmod = kit.font;
 
 const COMPOSITION_BYTES = 1024;
 
 const CompositionCaretRect = struct { x: i32, y: i32, w: i32, h: i32 };
-
-fn buttonToU8(b: platform.MouseButton) u8 {
-    return switch (b) {
-        .left => 0,
-        .right => 1,
-        .middle => 2,
-        else => 0xFF,
-    };
-}
-
-fn toGuiEvent(ev: platform.Event) ?gui.InputEvent {
-    return switch (ev) {
-        .quit, .gamepad_connected, .gamepad_disconnected, .composition_changed, .menu_command => null,
-        .file_drop => null,
-        .mouse_move => |m| .{ .mouse_move = .{ .x = m.x, .y = m.y, .modifiers = m.modifiers.toC() } },
-        .mouse_down => |m| .{ .mouse_down = .{ .x = m.x, .y = m.y, .button = buttonToU8(m.button), .modifiers = m.modifiers.toC() } },
-        .mouse_up => |m| .{ .mouse_up = .{ .x = m.x, .y = m.y, .button = buttonToU8(m.button), .modifiers = m.modifiers.toC() } },
-        .mouse_scroll => |s| .{ .mouse_scroll = .{ .x = s.x, .y = s.y, .dx = s.dx, .dy = s.dy, .modifiers = s.modifiers.toC() } },
-        .char_input => |ch| .{ .char_input = .{ .codepoint = ch.codepoint, .modifiers = ch.modifiers.toC() } },
-        .key_down => |k| blk: {
-            const code = @intFromEnum(k.key);
-            if (code < 0) break :blk null;
-            break :blk .{ .key_down = .{ .code = @intCast(code), .modifiers = k.modifiers.toC(), .repeat = k.is_repeat } };
-        },
-        .key_up => |k| blk: {
-            const code = @intFromEnum(k.key);
-            if (code < 0) break :blk null;
-            break :blk .{ .key_up = .{ .code = @intCast(code), .modifiers = k.modifiers.toC() } };
-        },
-    };
-}
 
 const InputProbe = struct {
     focus: u32 = 0,
@@ -265,7 +235,7 @@ pub fn main(init: std.process.Init) !void {
                     paste_text = platform.getClipboardText(paste_buf[0..]);
                 }
             }
-            if (toGuiEvent(ev)) |ge| ctx.pushEvent(ge);
+            if (kit.toGuiEvent(ev)) |ge| ctx.pushEvent(ge);
         }
 
         ime.syncFromWindow(window);

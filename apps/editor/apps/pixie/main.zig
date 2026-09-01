@@ -427,49 +427,18 @@ fn drawInlineComposition(ctx_ptr: *anyopaque, dl: *gui.DrawList, rect: gui.Rect)
     }, d.preedit_color, 1) catch @panic("composition caret: OOM");
 }
 
-/// platform.MouseButton → InputEvent button index (0=left/1=right/2=middle).
-fn buttonToU8(b: platform.MouseButton) u8 {
-    return switch (b) {
-        .left => 0,
-        .right => 1,
-        .middle => 2,
-        else => 0xFF,
-    };
-}
-
-/// platform.Event → gui.InputEvent. quit (GUI-irrelevant) becomes null.
-/// Drop negative key codes (platform KeyCode.UNKNOWN = -1); libs/gui assumes u32 codes.
-/// `pass_char_input`: true only while size_dialog is open (normally char_input is not forwarded to GUI).
+/// platform.Event → gui.InputEvent through the published adapter.
+///
+/// `pass_char_input`: true only while the size dialog is open. Elsewhere a typed character is
+/// consumed by this application's own handlers — renaming a layer, editing a text layer — so it is
+/// withheld from the interface rather than reaching a widget.
 fn toGuiEvent(ev: platform.Event) ?gui.InputEvent {
     return toGuiEventEx(ev, false);
 }
 
 fn toGuiEventEx(ev: platform.Event, pass_char_input: bool) ?gui.InputEvent {
-    return switch (ev) {
-        .quit => null,
-        .char_input => |ch| if (pass_char_input)
-            .{ .char_input = .{ .codepoint = ch.codepoint, .modifiers = ch.modifiers.toC() } }
-        else
-            null,
-        .gamepad_connected, .gamepad_disconnected => null, // pixie does not consume this (cross-cutting Event; other features untouched)
-        .composition_changed => null, // composition not consumed here (inline preedit is separate)
-        .menu_command => null, // Consumed by App.dispatchCommand (not forwarded to gui)
-        .file_drop => null, // Do not forward to GUI
-        .mouse_move => |m| .{ .mouse_move = .{ .x = m.x, .y = m.y, .modifiers = m.modifiers.toC() } },
-        .mouse_down => |m| .{ .mouse_down = .{ .x = m.x, .y = m.y, .button = buttonToU8(m.button), .modifiers = m.modifiers.toC() } },
-        .mouse_up => |m| .{ .mouse_up = .{ .x = m.x, .y = m.y, .button = buttonToU8(m.button), .modifiers = m.modifiers.toC() } },
-        .mouse_scroll => |s| .{ .mouse_scroll = .{ .x = s.x, .y = s.y, .dx = s.dx, .dy = s.dy, .modifiers = s.modifiers.toC() } },
-        .key_down => |k| blk: {
-            const code = @intFromEnum(k.key);
-            if (code < 0) break :blk null;
-            break :blk .{ .key_down = .{ .code = @intCast(code), .modifiers = k.modifiers.toC(), .repeat = k.is_repeat } };
-        },
-        .key_up => |k| blk: {
-            const code = @intFromEnum(k.key);
-            if (code < 0) break :blk null;
-            break :blk .{ .key_up = .{ .code = @intCast(code), .modifiers = k.modifiers.toC() } };
-        },
-    };
+    if (ev == .char_input and !pass_char_input) return null;
+    return kit.toGuiEvent(ev);
 }
 
 /// App state (touched from both event handling and UI build)

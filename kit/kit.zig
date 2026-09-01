@@ -61,14 +61,16 @@ fn buttonToU8(b: platform.MouseButton) u8 {
     };
 }
 
-/// Canonical `platform.Event` → `gui.InputEvent` adapter (pixie's current semantics).
+/// The canonical `platform.Event` → `gui.InputEvent` adapter: everything the interface reacts to,
+/// which is the pointer, the keys and the characters the user typed.
 ///
-/// GUI-unrelated events return `null`:
+/// Events the interface has no part in return `null`:
 /// - `quit`
-/// - `char_input` (IME-committed char; whether to forward to GUI is app-owned. examples/27 and 28 pass it themselves)
 /// - `gamepad_connected` / `gamepad_disconnected`
-/// - `composition_changed`
-/// - `menu_command` / `file_drop` (menu: App.dispatchCommand; drop: app-owned)
+/// - `composition_changed` (text still being composed has no `gui.InputEvent` form; the platform
+///   event is the signal to read `window.getCompositionSnapshot` and hand the text to
+///   `ctx.setComposition`)
+/// - `menu_command` / `file_drop` (both belong to the application, not to a widget)
 ///
 /// Negative key values (`KeyCode.UNKNOWN = -1`, …) are discarded (libs/gui assumes u32 codes).
 ///
@@ -81,7 +83,7 @@ fn buttonToU8(b: platform.MouseButton) u8 {
 pub fn toGuiEvent(ev: platform.Event) ?gui.InputEvent {
     return switch (ev) {
         .quit => null,
-        .char_input => null,
+        .char_input => |ch| .{ .char_input = .{ .codepoint = ch.codepoint, .modifiers = ch.modifiers.toC() } },
         .gamepad_connected, .gamepad_disconnected => null,
         .composition_changed => null,
         .menu_command => null,
@@ -234,9 +236,22 @@ test "toGuiEvent: key down/up and repeat; discard UNKNOWN" {
     } }) == null);
 }
 
-test "toGuiEvent: events ignored by pixie return null" {
+test "toGuiEvent: char_input is forwarded with its codepoint and modifiers" {
+    const alt = platform.ModifierFlags{ .alt = true };
+    const ascii = toGuiEvent(.{ .char_input = .{ .codepoint = 'a', .modifiers = .{} } }).?;
+    try testing.expect(ascii == .char_input);
+    try testing.expectEqual(@as(u32, 'a'), ascii.char_input.codepoint);
+    try testing.expectEqual((platform.ModifierFlags{}).toC(), ascii.char_input.modifiers);
+
+    // A settled character is what an IME delivers, so a multibyte scalar has to survive intact.
+    const multibyte = toGuiEvent(.{ .char_input = .{ .codepoint = 'あ', .modifiers = alt } }).?;
+    try testing.expect(multibyte == .char_input);
+    try testing.expectEqual(@as(u32, 'あ'), multibyte.char_input.codepoint);
+    try testing.expectEqual(alt.toC(), multibyte.char_input.modifiers);
+}
+
+test "toGuiEvent: events the interface has no part in return null" {
     try testing.expect(toGuiEvent(.quit) == null);
-    try testing.expect(toGuiEvent(.{ .char_input = .{ .codepoint = 'a', .modifiers = .{} } }) == null);
     try testing.expect(toGuiEvent(.{ .gamepad_connected = .{ .index = 0 } }) == null);
     try testing.expect(toGuiEvent(.{ .gamepad_disconnected = .{ .index = 0 } }) == null);
     try testing.expect(toGuiEvent(.{ .composition_changed = .{

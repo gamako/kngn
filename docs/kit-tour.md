@@ -157,9 +157,14 @@ falls back the same way, so a missing font shows up as plain text rather than a 
 Converts a `platform.Event` into a `gui.InputEvent`, so the event loop can feed the
 interface. Source [`kit/kit.zig`](../kit/kit.zig).
 
-**It drops `char_input`.** Typed characters are not forwarded, which is invisible until a
-text field silently refuses to accept text. §4 of [`docs/app-authoring.md`](app-authoring.md)
-has the forwarding order and what to do about it.
+It forwards everything a widget reacts to, typed characters included, so a `textInputId`
+works with no glue. What it returns `null` for is what belongs to the application rather than
+to the interface: `quit`, the gamepad connection events, `menu_command`, `file_drop`, and
+`composition_changed`. That last one is the one to know about: **it has no counterpart in
+`gui.InputEvent`.** The platform event still arrives, and it is the signal to read the text being
+composed with `window.getCompositionSnapshot` and hand it to the context with
+`ctx.setComposition`. §4 of [`docs/app-authoring.md`](app-authoring.md) has the
+forwarding order.
 
 ## 3. Two dimensions and images
 

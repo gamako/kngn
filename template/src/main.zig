@@ -70,7 +70,7 @@ const App = struct {
                 },
                 else => {},
             }
-            if (toGuiEvent(ev)) |ge| self.ctx.pushEvent(ge);
+            if (kit.toGuiEvent(ev)) |ge| self.ctx.pushEvent(ge);
         }
 
         if (self.ctx.button("Toggle color")) {
@@ -87,39 +87,6 @@ const App = struct {
         return running;
     }
 };
-
-/// platform.MouseButton → InputEvent button index (0=left/1=right/2=middle).
-fn buttonToU8(b: platform.MouseButton) u8 {
-    return switch (b) {
-        .left => 0,
-        .right => 1,
-        .middle => 2,
-        else => 0xFF,
-    };
-}
-
-/// platform.Event → gui.InputEvent, the caller-owned conversion every GUI app needs
-/// (mirrors apps/synth/main.zig and examples/09_gui_interaction). Events the GUI has
-/// no use for become null and are simply not forwarded.
-fn toGuiEvent(ev: platform.Event) ?gui.InputEvent {
-    return switch (ev) {
-        .mouse_move => |m| .{ .mouse_move = .{ .x = m.x, .y = m.y, .modifiers = m.modifiers.toC() } },
-        .mouse_down => |m| .{ .mouse_down = .{ .x = m.x, .y = m.y, .button = buttonToU8(m.button), .modifiers = m.modifiers.toC() } },
-        .mouse_up => |m| .{ .mouse_up = .{ .x = m.x, .y = m.y, .button = buttonToU8(m.button), .modifiers = m.modifiers.toC() } },
-        .mouse_scroll => |s| .{ .mouse_scroll = .{ .x = s.x, .y = s.y, .dx = s.dx, .dy = s.dy, .modifiers = s.modifiers.toC() } },
-        .key_down => |k| blk: {
-            const code = @intFromEnum(k.key);
-            if (code < 0) break :blk null;
-            break :blk .{ .key_down = .{ .code = @intCast(code), .modifiers = k.modifiers.toC(), .repeat = k.is_repeat } };
-        },
-        .key_up => |k| blk: {
-            const code = @intFromEnum(k.key);
-            if (code < 0) break :blk null;
-            break :blk .{ .key_up = .{ .code = @intCast(code), .modifiers = k.modifiers.toC() } };
-        },
-        else => null,
-    };
-}
 
 fn registerHarness(app: *App) void {
     platform.registerProbe(.{

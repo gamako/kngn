@@ -8,42 +8,9 @@
 // Reflow on resize uses the fb size every frame. The track is fixed-width so width changes do not break it.
 
 const std = @import("std");
-const platform = @import("platform");
-const gui = @import("gui");
-
-fn buttonToU8(b: platform.MouseButton) u8 {
-    return switch (b) {
-        .left => 0,
-        .right => 1,
-        .middle => 2,
-        else => 0xFF,
-    };
-}
-
-fn toGuiEvent(ev: platform.Event) ?gui.InputEvent {
-    return switch (ev) {
-        .quit => null,
-        .char_input => null,
-        .gamepad_connected, .gamepad_disconnected => null, // Unused by GUI (cross-cutting Event)
-        .composition_changed => null, // composition unused (inline preedit lives elsewhere)
-        .menu_command => null, // Consumed at the app's common dispatch entry
-        .file_drop => null, // Not forwarded to GUI
-        .mouse_move => |m| .{ .mouse_move = .{ .x = m.x, .y = m.y, .modifiers = m.modifiers.toC() } },
-        .mouse_down => |m| .{ .mouse_down = .{ .x = m.x, .y = m.y, .button = buttonToU8(m.button), .modifiers = m.modifiers.toC() } },
-        .mouse_up => |m| .{ .mouse_up = .{ .x = m.x, .y = m.y, .button = buttonToU8(m.button), .modifiers = m.modifiers.toC() } },
-        .mouse_scroll => |s| .{ .mouse_scroll = .{ .x = s.x, .y = s.y, .dx = s.dx, .dy = s.dy, .modifiers = s.modifiers.toC() } },
-        .key_down => |k| blk: {
-            const code = @intFromEnum(k.key);
-            if (code < 0) break :blk null;
-            break :blk .{ .key_down = .{ .code = @intCast(code), .modifiers = k.modifiers.toC(), .repeat = k.is_repeat } };
-        },
-        .key_up => |k| blk: {
-            const code = @intFromEnum(k.key);
-            if (code < 0) break :blk null;
-            break :blk .{ .key_up = .{ .code = @intCast(code), .modifiers = k.modifiers.toC() } };
-        },
-    };
-}
+const kit = @import("kit");
+const platform = kit.platform;
+const gui = kit.gui;
 
 const INIT_SIZE: i32 = 8;
 const INIT_OPACITY: i32 = 200;
@@ -82,7 +49,7 @@ pub fn main(init: std.process.Init) !void {
                 },
                 else => {},
             }
-            if (toGuiEvent(ev)) |ge| ctx.pushEvent(ge);
+            if (kit.toGuiEvent(ev)) |ge| ctx.pushEvent(ge);
         }
 
         @memset(fb.pixels, 0xFF_18_18_1C);

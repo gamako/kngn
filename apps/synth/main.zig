@@ -217,20 +217,11 @@ fn waveOf(idx: usize) dsp.Waveform {
     };
 }
 
-fn buttonToU8(b: platform.MouseButton) u8 {
-    return switch (b) {
-        .left => 0,
-        .right => 1,
-        .middle => 2,
-        else => 0xFF,
-    };
-}
-
+/// The PC keyboard plays the notes here, so this application owns `key_down` and `key_up` and the
+/// interface is handed the pointer alone. Everything it does pass is the published adapter's.
 fn toGuiEvent(ev: platform.Event) ?gui.InputEvent {
     return switch (ev) {
-        .mouse_move => |m| .{ .mouse_move = .{ .x = m.x, .y = m.y, .modifiers = m.modifiers.toC() } },
-        .mouse_down => |m| .{ .mouse_down = .{ .x = m.x, .y = m.y, .button = buttonToU8(m.button), .modifiers = m.modifiers.toC() } },
-        .mouse_up => |m| .{ .mouse_up = .{ .x = m.x, .y = m.y, .button = buttonToU8(m.button), .modifiers = m.modifiers.toC() } },
+        .mouse_move, .mouse_down, .mouse_up => kit.toGuiEvent(ev),
         else => null,
     };
 }

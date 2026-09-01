@@ -5,39 +5,9 @@
 //! emit path commands and does not inspect the DrawCmd union.
 
 const std = @import("std");
-const platform = @import("platform");
-const gui = @import("gui");
-
-fn buttonToU8(b: platform.MouseButton) u8 {
-    return switch (b) {
-        .left => 0,
-        .right => 1,
-        .middle => 2,
-        else => 0xFF,
-    };
-}
-
-fn toGuiEvent(ev: platform.Event) ?gui.InputEvent {
-    return switch (ev) {
-        .quit, .gamepad_connected, .gamepad_disconnected, .composition_changed, .menu_command => null,
-        .file_drop => null,
-        .mouse_move => |m| .{ .mouse_move = .{ .x = m.x, .y = m.y, .modifiers = m.modifiers.toC() } },
-        .mouse_down => |m| .{ .mouse_down = .{ .x = m.x, .y = m.y, .button = buttonToU8(m.button), .modifiers = m.modifiers.toC() } },
-        .mouse_up => |m| .{ .mouse_up = .{ .x = m.x, .y = m.y, .button = buttonToU8(m.button), .modifiers = m.modifiers.toC() } },
-        .mouse_scroll => |s| .{ .mouse_scroll = .{ .x = s.x, .y = s.y, .dx = s.dx, .dy = s.dy, .modifiers = s.modifiers.toC() } },
-        .char_input => |ch| .{ .char_input = .{ .codepoint = ch.codepoint, .modifiers = ch.modifiers.toC() } },
-        .key_down => |k| blk: {
-            const code = @intFromEnum(k.key);
-            if (code < 0) break :blk null;
-            break :blk .{ .key_down = .{ .code = @intCast(code), .modifiers = k.modifiers.toC(), .repeat = k.is_repeat } };
-        },
-        .key_up => |k| blk: {
-            const code = @intFromEnum(k.key);
-            if (code < 0) break :blk null;
-            break :blk .{ .key_up = .{ .code = @intCast(code), .modifiers = k.modifiers.toC() } };
-        },
-    };
-}
+const kit = @import("kit");
+const platform = kit.platform;
+const gui = kit.gui;
 
 const CopyProbe = struct {
     count: u32 = 0,
@@ -78,7 +48,7 @@ pub fn main(init: std.process.Init) !void {
         ctx.beginFrameAt(fb.width, fb.height, platform.getTime());
         while (window.nextEvent()) |ev| {
             if (ev == .quit) running = false;
-            if (toGuiEvent(ev)) |ge| ctx.pushEvent(ge);
+            if (kit.toGuiEvent(ev)) |ge| ctx.pushEvent(ge);
         }
 
         @memset(fb.pixels, 0xFF_18181C);

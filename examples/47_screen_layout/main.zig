@@ -172,7 +172,7 @@ const App = struct {
                 },
                 else => {},
             }
-            pushGuiEvent(ctx, ev);
+            if (kit.toGuiEvent(ev)) |ge| ctx.pushEvent(ge);
         }
 
         // Step (1) of the scroll order: a caller write, before the list is opened.
@@ -518,22 +518,6 @@ fn cell(ctx: *gui.Context, str: []const u8, width: i32, tier: gui.TextTier) void
     ctx.beginBox(.{ .width = .{ .fixed = width }, .clip_children = true });
     ctx.labelStyled(str, tier);
     ctx.endBox();
-}
-
-/// `kit.toGuiEvent` covers pointer and key events but deliberately drops `char_input`, so an
-/// application with a text field forwards that one itself.
-fn pushGuiEvent(ctx: *gui.Context, ev: platform.Event) void {
-    if (kit.toGuiEvent(ev)) |ge| {
-        ctx.pushEvent(ge);
-        return;
-    }
-    switch (ev) {
-        .char_input => |c| ctx.pushEvent(.{ .char_input = .{
-            .codepoint = c.codepoint,
-            .modifiers = c.modifiers.toC(),
-        } }),
-        else => {},
-    }
 }
 
 // ── Harness wiring ────────────────────────────────────────────────────────────

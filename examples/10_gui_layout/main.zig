@@ -19,8 +19,9 @@
 // writes are event-only. Does not touch the real-time audio path.
 
 const std = @import("std");
-const platform = @import("platform");
-const gui = @import("gui");
+const kit = @import("kit");
+const platform = kit.platform;
+const gui = kit.gui;
 
 const WINDOW_W: u32 = 1024;
 const WINDOW_H: u32 = 768;
@@ -148,42 +149,6 @@ const App = struct {
     virt_scroll: gui.Vec2f = .{},
     virt_range: gui.VirtualRange = .{},
 };
-
-fn buttonToU8(b: platform.MouseButton) u8 {
-    return switch (b) {
-        .left => 0,
-        .right => 1,
-        .middle => 2,
-        else => 0xFF,
-    };
-}
-
-/// platform.Event → gui.InputEvent. quit (irrelevant to GUI) becomes null.
-/// Discard negative key codes (platform KeyCode.UNKNOWN = -1); libs/gui expects u32 codes.
-fn toGuiEvent(ev: platform.Event) ?gui.InputEvent {
-    return switch (ev) {
-        .quit => null,
-        .char_input => null,
-        .gamepad_connected, .gamepad_disconnected => null,
-        .composition_changed => null,
-        .menu_command => null,
-        .file_drop => null,
-        .mouse_move => |m| .{ .mouse_move = .{ .x = m.x, .y = m.y, .modifiers = m.modifiers.toC() } },
-        .mouse_down => |m| .{ .mouse_down = .{ .x = m.x, .y = m.y, .button = buttonToU8(m.button), .modifiers = m.modifiers.toC() } },
-        .mouse_up => |m| .{ .mouse_up = .{ .x = m.x, .y = m.y, .button = buttonToU8(m.button), .modifiers = m.modifiers.toC() } },
-        .mouse_scroll => |s| .{ .mouse_scroll = .{ .x = s.x, .y = s.y, .dx = s.dx, .dy = s.dy, .modifiers = s.modifiers.toC() } },
-        .key_down => |k| blk: {
-            const code = @intFromEnum(k.key);
-            if (code < 0) break :blk null;
-            break :blk .{ .key_down = .{ .code = @intCast(code), .modifiers = k.modifiers.toC(), .repeat = k.is_repeat } };
-        },
-        .key_up => |k| blk: {
-            const code = @intFromEnum(k.key);
-            if (code < 0) break :blk null;
-            break :blk .{ .key_up = .{ .code = @intCast(code), .modifiers = k.modifiers.toC() } };
-        },
-    };
-}
 
 fn nodeW(ctx: *const gui.Context, id: gui.Id) i32 {
     const r = ctx.getNodeRect(id) orelse return -1;
@@ -1044,7 +1009,7 @@ pub fn main(init: std.process.Init) !void {
                 },
                 else => {},
             }
-            if (toGuiEvent(ev)) |ge| ctx.pushEvent(ge);
+            if (kit.toGuiEvent(ev)) |ge| ctx.pushEvent(ge);
         }
 
         @memset(fb.pixels, 0xFF_18_18_1C);

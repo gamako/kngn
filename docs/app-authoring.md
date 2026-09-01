@@ -554,25 +554,10 @@ Four rules that apply across both tables:
   keyboard focus. An application writes no glue for any of it
   ([ADR-021](adr/021_gui-keyboard-focus-traversal.md)).
 
-**A text field needs one extra line of event forwarding.** `kit.toGuiEvent` converts pointer
-and key events but deliberately returns `null` for `char_input`, so the characters the user
-types never reach a `textInputId` unless the application forwards them itself:
-
-```zig
-fn pushGuiEvent(ctx: *gui.Context, ev: platform.Event) void {
-    if (kit.toGuiEvent(ev)) |ge| {
-        ctx.pushEvent(ge);
-        return;
-    }
-    switch (ev) {
-        .char_input => |c| ctx.pushEvent(.{ .char_input = .{
-            .codepoint = c.codepoint,
-            .modifiers = c.modifiers.toC(),
-        } }),
-        else => {},
-    }
-}
-```
+**A text field needs no extra forwarding.** `kit.toGuiEvent` passes typed characters through
+along with the pointer and the keys, so `if (kit.toGuiEvent(ev)) |ge| ctx.pushEvent(ge);` is the
+whole event loop. Text still being composed is the exception: `composition_changed` arrives as a
+platform event but has no `gui.InputEvent` form, so it is handed over separately — see §4.
 
 The full contract for each widget — the option structs, the results, the interaction
 priorities — is [`libs/gui/README.md`](../libs/gui/README.md).
