@@ -97,6 +97,11 @@ pub const TableOpts = struct {
     height: layout.Sizing = .{ .grow = 1 },
     column_gap: i32 = 8,
     row_gap: i32 = 0,
+    /// top, right, bottom, left. Insets the table's whole content — the header row
+    /// (sticky or not) and every body row alike, since they are all direct or indirect
+    /// children of this one outer box — from the outer border set by `border`. Applies
+    /// once around the whole table, not per row (`row_gap` is the space between rows).
+    padding: [4]i32 = .{ 0, 0, 0, 0 },
     /// Caller-owned scroll. null = a small non-scrolling table (no sticky header,
     /// no body ScrollArea). Non-null opens a body ScrollArea and, when a header
     /// row is built, a sticky header strip outside that viewport. Requires a
@@ -365,6 +370,7 @@ pub fn beginTable(ctx: *Context, id: Id, cols: []const TableCol, opts: TableOpts
         .direction = .column,
         .width = opts.width,
         .height = opts.height,
+        .padding = opts.padding,
         .gap = if (opts.scroll == null) opts.row_gap else 0,
         .bg = opts.bg,
         .border = opts.border,
@@ -1838,6 +1844,195 @@ test "table sticky header: header clip excludes the vertical scrollbar gutter" {
     try std.testing.expectEqual(vp_r, header_clip_r);
     try std.testing.expectEqual(vp_r, body_clip_r);
     try std.testing.expect(header_r.rect.x + @as(i32, @intCast(header_r.rect.w)) > header_clip_r);
+}
+
+fn buildPaddedFitTable(ctx: *Context, table_id: Id, padding: [4]i32) void {
+    const cols = [_]TableCol{.{ .width = .{ .fixed = 40 }, .header = "A" }};
+    ctx.beginTable(table_id, &cols, .{
+        .width = .fit,
+        .height = .fit,
+        .column_gap = 0,
+        .row_gap = 0,
+        .padding = padding,
+    });
+    ctx.tableHeaderRow();
+    ctx.beginTableRow(.{});
+    ctx.beginTableCell();
+    ctx.label("x");
+    ctx.endTableCell();
+    _ = ctx.endTableRow();
+    ctx.endTable();
+}
+
+test "table padding: insets header and body alike, and the fit outer box grows to hold it" {
+    var base = testCtx();
+    defer base.deinit();
+    const TID: Id = 0xA090;
+    base.beginFrame(400, 200);
+    buildPaddedFitTable(&base, TID, .{ 0, 0, 0, 0 });
+    base.endFrame();
+    const base_table = base.getNodeRect(TID).?;
+    const base_header = base.getNodeRect(headerCellId(&base, TID, 0)).?;
+    const base_body = base.getNodeRect(cellId(&base, TID, @as(u64, 0), 0)).?;
+
+    var padded = testCtx();
+    defer padded.deinit();
+    const pad: [4]i32 = .{ 5, 7, 9, 11 };
+    padded.beginFrame(400, 200);
+    buildPaddedFitTable(&padded, TID, pad);
+    padded.endFrame();
+    const padded_table = padded.getNodeRect(TID).?;
+    const padded_header = padded.getNodeRect(headerCellId(&padded, TID, 0)).?;
+    const padded_body = padded.getNodeRect(cellId(&padded, TID, @as(u64, 0), 0)).?;
+
+    // Left padding shifts both rows' first (and only) column by the same amount:
+    // header and body receive the same inset, not just one of the two.
+    try std.testing.expectEqual(base_header.x + pad[3], padded_header.x);
+    try std.testing.expectEqual(base_body.x + pad[3], padded_body.x);
+    try std.testing.expectEqual(base_header.y + pad[0], padded_header.y);
+
+    // A `.fit` table's own outer box grows to hold the padding (real box padding,
+    // not a fake extra column that would leave the outer box's own size unchanged).
+    try std.testing.expectEqual(base_table.w + @as(u32, @intCast(pad[1] + pad[3])), padded_table.w);
+    try std.testing.expectEqual(base_table.h + @as(u32, @intCast(pad[0] + pad[2])), padded_table.h);
+}
+
+test "table padding: scrollbar and content-extent invariants still hold with padding set" {
+    var ctx = testCtx();
+    defer ctx.deinit();
+    const TID: Id = 0xA091;
+    var scroll: Vec2f = .{};
+    const cols = [_]TableCol{
+        .{ .width = .{ .fixed = 80 }, .header = "LeftCol" },
+        .{ .width = .{ .fixed = 80 }, .header = "RightCol" },
+    };
+    const pad: [4]i32 = .{ 4, 6, 4, 10 };
+    const table_w: i32 = 100;
+    const bar_thickness: i32 = 8;
+
+    var frame: usize = 0;
+    while (frame < 3) : (frame += 1) {
+        ctx.beginFrame(300, 300);
+        ctx.beginTable(TID, &cols, .{
+            .width = .{ .fixed = table_w },
+            .height = .{ .fixed = 80 },
+            .column_gap = 0,
+            .scroll = &scroll,
+            .bar_thickness = bar_thickness,
+            .padding = pad,
+        });
+        ctx.tableHeaderRow();
+        var i: usize = 0;
+        while (i < 20) : (i += 1) {
+            ctx.beginTableRow(.{});
+            ctx.beginTableCell();
+            ctx.label("leftcell");
+            ctx.endTableCell();
+            ctx.beginTableCell();
+            ctx.label("rightcel");
+            ctx.endTableCell();
+            _ = ctx.endTableRow();
+        }
+        ctx.endTable();
+        ctx.endFrame();
+    }
+
+    const vthumb = id_mod.hashInt(id_mod.hashInt(TID, body_vp_salt), 2);
+    try std.testing.expect(ctx.getNodeRect(vthumb) != null);
+
+    // With table-level padding set, the header and body clips still stop exactly at
+    // the viewport's right edge (the scrollbar gutter draws that line, not the
+    // padding), and the viewport itself is narrower by the left/right padding plus
+    // the scrollbar's own gutter.
+    const header_r = ctx.getNodeCachedRect(headerCellId(&ctx, TID, 1)).?;
+    const body_r = ctx.getNodeCachedRect(cellId(&ctx, TID, @as(u64, 0), 1)).?;
+    const vp = ctx.getNodeRect(id_mod.hashInt(TID, body_vp_salt)).?;
+    const header_clip_r = header_r.clip.x + @as(i32, @intCast(header_r.clip.w));
+    const body_clip_r = body_r.clip.x + @as(i32, @intCast(body_r.clip.w));
+    const vp_r = vp.x + @as(i32, @intCast(vp.w));
+    try std.testing.expectEqual(vp_r, header_clip_r);
+    try std.testing.expectEqual(vp_r, body_clip_r);
+
+    const expected_vp_w: u32 = @intCast(table_w - pad[3] - pad[1] - bar_thickness);
+    try std.testing.expectEqual(expected_vp_w, vp.w);
+
+    // Left padding insets the first column for both header and body, same as the
+    // fit-table case above.
+    const table_r = ctx.getNodeRect(TID).?;
+    const header_col0 = ctx.getNodeRect(headerCellId(&ctx, TID, 0)).?;
+    const body_col0 = ctx.getNodeRect(cellId(&ctx, TID, @as(u64, 0), 0)).?;
+    try std.testing.expectEqual(table_r.x + pad[3], header_col0.x);
+    try std.testing.expectEqual(header_col0.x, body_col0.x);
+}
+
+test "table padding: h_scroll's row keeps its column-sum fit width; only the viewport narrows" {
+    var ctx = testCtx();
+    defer ctx.deinit();
+    const TID: Id = 0xA092;
+    var scroll: Vec2f = .{};
+    const cols = [_]TableCol{
+        .{ .width = .{ .fixed = 120 }, .header = "LeftCol" },
+        .{ .width = .{ .fixed = 120 }, .header = "RightCol" },
+    };
+    const pad: [4]i32 = .{ 2, 6, 2, 10 };
+    const table_w: i32 = 100;
+
+    const build = struct {
+        fn f(c: *Context, id: Id, s: *Vec2f) void {
+            c.beginTable(id, &cols, .{
+                .width = .{ .fixed = table_w },
+                .height = .{ .fixed = 80 },
+                .column_gap = 0,
+                .scroll = s,
+                .h_scroll = true,
+                .wheel_px = 16,
+                .padding = pad,
+            });
+            c.tableHeaderRow();
+            var i: usize = 0;
+            while (i < 3) : (i += 1) {
+                c.beginTableRow(.{});
+                c.beginTableCell();
+                c.label("leftcell");
+                c.endTableCell();
+                c.beginTableCell();
+                c.label("rightcel");
+                c.endTableCell();
+                _ = c.endTableRow();
+            }
+            c.endTable();
+        }
+    }.f;
+
+    var warm: usize = 0;
+    while (warm < 2) : (warm += 1) {
+        ctx.beginFrame(300, 300);
+        build(&ctx, TID, &scroll);
+        ctx.endFrame();
+    }
+
+    // The row's `.fit` content width is the two columns' sum (240px, column_gap=0):
+    // padding narrows the viewport it scrolls inside, not this row width itself
+    // (the invariant this file's header comment states for the h_scroll path).
+    const vp = ctx.getNodeRect(id_mod.hashInt(TID, body_vp_salt)).?;
+    const expected_vp_w: u32 = @intCast(table_w - pad[3] - pad[1]);
+    try std.testing.expectEqual(expected_vp_w, vp.w);
+
+    const hc = center(vp);
+    ctx.beginFrame(300, 300);
+    wheelAt(&ctx, hc.x, hc.y, -40, 0);
+    build(&ctx, TID, &scroll);
+    ctx.endFrame();
+
+    try std.testing.expect(scroll.x > 0);
+    const content_w: i32 = 240;
+    const expected_max_x: f32 = @floatFromInt(content_w - @as(i32, @intCast(expected_vp_w)));
+    try std.testing.expectEqual(expected_max_x, scroll.x);
+    // Header and body settle on the same scrolled x, same as the unpadded case.
+    try std.testing.expectEqual(
+        ctx.getNodeRect(headerCellId(&ctx, TID, 0)).?.x,
+        ctx.getNodeRect(cellId(&ctx, TID, @as(u64, 0), 0)).?.x,
+    );
 }
 
 test "table fixed columns: no fit or stretch bookkeeping on the frame arena" {
