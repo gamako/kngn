@@ -96,7 +96,11 @@ pub const Anchor = struct {
 
 /// Box border. Emit order is bg → children → border (border draws on top of children).
 /// The border is drawn inside the rect and does not affect layout math.
-pub const Border = struct { color: Color, thickness: u32 };
+///
+/// The same type a `DrawList` box takes, so a layout box and a directly painted one
+/// describe a border once. `DrawList.box` paints its border straight after the
+/// background because it has no children to come between them.
+pub const Border = draw_mod.Border;
 
 pub const BoxConfig = struct {
     /// 0 = engine auto-assigns (not externally referenceable; not registered in the rect cache).

@@ -104,7 +104,7 @@ screen and for the visual calls. What that document does not enumerate is **the 
 - rectangles: `rectFilled`, `rectOutline`, and the `…Ex` forms taking a corner radius
 - paint (gradients): `rectFilledPaint`, `rectFilledPaintEx`
 - circles and lines: `circleFilled`, `circleOutline`, `line`
-- shadow: `shadow`
+- shadow: `shadow` for a standalone one, `box` when a background sits on top of it
 - text: `text`, and `textEx` when you want a font other than the context's
 - images: `image`
 - paths: `beginPath`

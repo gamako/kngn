@@ -361,7 +361,7 @@ fn renderImpl(
                 .text => |c| if (!c.clip.isEmpty()) (c.font orelse font).drawTo(target, c.pos, c.text, c.color, c.clip, 1.0),
                 .image => |c| if (!c.clip.isEmpty()) drawImage(target, c.rect, c.pixels, c.src_w, c.src_h, c.clip),
                 .path => |c| if (!c.clip.isEmpty()) drawPath(target, draw_list, c, 1.0, true),
-                .shadow => |c| if (!c.clip.isEmpty()) drawShadow(target, draw_list, c.rect, c.color, c.options, c.clip, 1.0, true),
+                .shadow => |c| if (!c.clip.isEmpty()) drawShadow(target, draw_list, c.rect, c.color, c.options, c.clip, c.opaque_cover_radius, 1.0, true),
             }
             if (collect) profile.add(prof_start[0], clock() - prof_start[1]);
         }
@@ -492,7 +492,7 @@ fn renderImpl(
                 }
             },
             .shadow => |c| {
-                drawShadow(target, draw_list, scaleRect(c.rect, scale), c.color, c.options, scaleRect(c.clip, scale), scale, true);
+                drawShadow(target, draw_list, scaleRect(c.rect, scale), c.color, c.options, scaleRect(c.clip, scale), c.opaque_cover_radius, scale, true);
             },
         }
         if (collect) profile.add(prof_start[0], clock() - prof_start[1]);
@@ -862,6 +862,52 @@ fn blitShadowRegion(
     }
 }
 
+/// Whether `inner` lies entirely within `outer`. An empty `inner` is contained by
+/// definition. Compared in i64 so a right or bottom edge cannot overflow.
+fn containsRect(outer: Rect, inner: Rect) bool {
+    if (inner.isEmpty()) return true;
+    if (outer.isEmpty()) return false;
+    const outer_right = @as(i64, outer.x) + outer.w;
+    const outer_bottom = @as(i64, outer.y) + outer.h;
+    const inner_right = @as(i64, inner.x) + inner.w;
+    const inner_bottom = @as(i64, inner.y) + inner.h;
+    return inner.x >= outer.x and inner.y >= outer.y and
+        inner_right <= outer_right and inner_bottom <= outer_bottom;
+}
+
+/// Whether the background that `DrawList.box` queued right after this shadow will
+/// overwrite every pixel of the shadow's center slice, which makes painting that
+/// slice invisible work. `cover_radius` is the background's logical corner radius,
+/// or `no_opaque_cover` when no opaque background follows.
+///
+/// The background is known to be opaque and to share this shadow's rectangle and
+/// clip, because `DrawList.box` is the only writer of `cover_radius` and appends
+/// the pair together. What remains is geometry, and only one shape of it counts:
+/// the two strips that cross at the middle of a rounded fill, which
+/// `drawRoundedFilledDevice` paints with a plain fill and no coverage mask. A
+/// pixel inside a corner mask may happen to be fully opaque; this answers "not
+/// covered" for it rather than reason about coverage. Answering false costs one
+/// redundant blit, while answering true where it does not hold would leave the
+/// shadow visible through the background.
+fn centerIsCovered(
+    center: Rect,
+    box: Rect,
+    clip: Rect,
+    cover_radius: u32,
+    scale: f32,
+    target: RenderTarget,
+) bool {
+    if (cover_radius == draw_mod.no_opaque_cover) return false;
+    const visible = clipRect(center, clip, target);
+    if (visible.isEmpty()) return false;
+    const radius = clampedDeviceRadius(box, cover_radius, scale);
+    const inset: i32 = @intCast(radius);
+    const vertical = Rect{ .x = box.x + inset, .y = box.y, .w = box.w - radius * 2, .h = box.h };
+    const horizontal = Rect{ .x = box.x, .y = box.y + inset, .w = box.w, .h = box.h - radius * 2 };
+    return containsRect(clipRect(vertical, clip, target), visible) or
+        containsRect(clipRect(horizontal, clip, target), visible);
+}
+
 /// The nine-slice layout of one shadow, derived from its outer rectangle in
 /// device pixels: `outer` inset by `slice` on all four sides is `center`, and the
 /// corner and edge slices cover the ring between them. Deriving both in one place
@@ -897,6 +943,7 @@ fn drawShadow(
     color: Color,
     options: draw_mod.ShadowOptions,
     clip: Rect,
+    cover_radius: u32,
     scale: f32,
     comptime use_simd: bool,
 ) void {
@@ -952,7 +999,9 @@ fn drawShadow(
         blitShadowRegion(target, draw_list, .{ .x = outer.x, .y = outer.y + @as(i32, @intCast(slice + vertical_a)), .w = slice, .h = vertical_b }, clip, mask, color, .vertical_edge, 0, 0, false, false, use_simd);
         blitShadowRegion(target, draw_list, .{ .x = outer.x + @as(i32, @intCast(outer.w - slice)), .y = outer.y + @as(i32, @intCast(slice + vertical_a)), .w = slice, .h = vertical_b }, clip, mask, color, .vertical_edge, far_x, 0, true, false, use_simd);
     }
-    if (center_w != 0 and center_h != 0) {
+    if (center_w != 0 and center_h != 0 and
+        !centerIsCovered(geo.center, rect, clip, cover_radius, scale, target))
+    {
         blitShadowRegion(target, draw_list, geo.center, clip, mask, color, .center, 0, 0, false, false, use_simd);
     }
 }
@@ -3962,14 +4011,14 @@ test "shadow render: SIMD and scalar nine-slice coverage are framebuffer-identic
     const color = Color.rgba(0x00, 0x00, 0x00, 0xA0);
     const simd_target = RenderTarget{ .pixels = &simd_pixels, .width = 96, .height = 64 };
     const scalar_target = RenderTarget{ .pixels = &scalar_pixels, .width = 96, .height = 64 };
-    drawShadow(simd_target, &simd, rect, color, options, clip, 1.0, true);
+    drawShadow(simd_target, &simd, rect, color, options, clip, draw_mod.no_opaque_cover, 1.0, true);
     const first_pixels = simd_pixels;
     try std.testing.expect(first_pixels[32 * 96 + 40] != 0xFF17202A);
-    drawShadow(scalar_target, &scalar, rect, color, options, clip, 1.0, false);
+    drawShadow(scalar_target, &scalar, rect, color, options, clip, draw_mod.no_opaque_cover, 1.0, false);
     try std.testing.expectEqualSlices(u32, &first_pixels, &scalar_pixels);
 
     const cold = simd.shadowMaskDiagnostics();
-    drawShadow(simd_target, &simd, rect, color, options, clip, 1.0, true);
+    drawShadow(simd_target, &simd, rect, color, options, clip, draw_mod.no_opaque_cover, 1.0, true);
     const warm = simd.shadowMaskDiagnostics();
     try std.testing.expectEqual(cold.evaluations, warm.evaluations);
     try std.testing.expectEqual(cold.allocations, warm.allocations);
@@ -4151,10 +4200,10 @@ test "shadow render: DrawList reset retains masks until the explicit cache reset
     const target = RenderTarget{ .pixels = &pixels, .width = 48, .height = 32 };
 
     dl.reset(48, 32);
-    drawShadow(target, &dl, rect, color, .{ .radius = 6, .blur = 4 }, clip, 1.0, true);
+    drawShadow(target, &dl, rect, color, .{ .radius = 6, .blur = 4 }, clip, draw_mod.no_opaque_cover, 1.0, true);
     const cold = dl.shadowMaskDiagnostics();
     dl.reset(48, 32);
-    drawShadow(target, &dl, rect, color, .{ .radius = 6, .blur = 4 }, clip, 1.0, true);
+    drawShadow(target, &dl, rect, color, .{ .radius = 6, .blur = 4 }, clip, draw_mod.no_opaque_cover, 1.0, true);
     const warm = dl.shadowMaskDiagnostics();
     try std.testing.expectEqual(@as(u64, 1), cold.evaluations);
     try std.testing.expectEqual(cold.evaluations, warm.evaluations);
@@ -4873,4 +4922,367 @@ test "renderProfiled: a command counted as clipped away really does not draw" {
         if (px != 0) touched += 1;
     }
     try std.testing.expect(touched > 0);
+}
+
+/// A destination that varies per pixel, so a fixture cannot pass by accident when
+/// a routine reads what was already there. A flat background hides exactly the
+/// mistake these tests are looking for.
+fn fillTestNoise(pixels: []u32, seed: u64) void {
+    var prng = std.Random.DefaultPrng.init(seed);
+    var random = prng.random();
+    for (pixels) |*px| px.* = 0xFF000000 | (random.int(u32) & 0x00FFFFFF);
+}
+
+const BoxCoverCase = struct {
+    name: []const u8,
+    rect: Rect,
+    options: draw_mod.BoxOptions,
+    clip: ?Rect = null,
+    scale: f32 = 1.0,
+    /// Whether the renderer is expected to drop the shadow's center slice.
+    dropped: bool,
+};
+
+/// Paint one case twice — once as `DrawList.box` builds it, once with the cover
+/// hint erased so the center is painted and then overwritten — and require the two
+/// framebuffers to be identical. The hint is erased after the fact rather than the
+/// commands rebuilt by hand, so the two routes cannot drift apart in anything but
+/// the hint itself.
+fn expectBoxCover(case: BoxCoverCase) !void {
+    const w = 160;
+    const h = 120;
+    var covered_pixels: [w * h]u32 = undefined;
+    var reference_pixels: [w * h]u32 = undefined;
+    fillTestNoise(&covered_pixels, 0x5A17C0DE);
+    fillTestNoise(&reference_pixels, 0x5A17C0DE);
+
+    var covered = DrawList.init(std.testing.allocator);
+    defer covered.deinit();
+    var reference = DrawList.init(std.testing.allocator);
+    defer reference.deinit();
+
+    for ([_]*DrawList{ &covered, &reference }, 0..) |dl, index| {
+        dl.reset(80, 60);
+        if (case.clip) |c| try dl.pushClip(c);
+        try dl.box(case.rect, case.options);
+        if (case.clip != null) dl.popClip();
+        if (index == 1) {
+            for (dl.cmds.items) |*cmd| switch (cmd.*) {
+                .shadow => |*sh| sh.opaque_cover_radius = draw_mod.no_opaque_cover,
+                else => {},
+            };
+        }
+    }
+
+    const covered_target = RenderTarget{ .pixels = &covered_pixels, .width = w, .height = h };
+    const reference_target = RenderTarget{ .pixels = &reference_pixels, .width = w, .height = h };
+    render(covered_target, &covered, font_mod.default_font, case.scale);
+    render(reference_target, &reference, font_mod.default_font, case.scale);
+
+    std.testing.expectEqualSlices(u32, &reference_pixels, &covered_pixels) catch |err| {
+        std.debug.print("\ncase '{s}': framebuffers differ\n", .{case.name});
+        return err;
+    };
+
+    const covered_blit = covered.shadowMaskDiagnostics().blit_pixels;
+    const reference_blit = reference.shadowMaskDiagnostics().blit_pixels;
+    if (case.dropped) {
+        std.testing.expect(covered_blit < reference_blit) catch |err| {
+            std.debug.print(
+                "\ncase '{s}': expected the center to be dropped, blit {d} vs {d}\n",
+                .{ case.name, covered_blit, reference_blit },
+            );
+            return err;
+        };
+    } else {
+        std.testing.expectEqual(reference_blit, covered_blit) catch |err| {
+            std.debug.print(
+                "\ncase '{s}': expected the center to be painted, blit {d} vs {d}\n",
+                .{ case.name, covered_blit, reference_blit },
+            );
+            return err;
+        };
+    }
+}
+
+test "box: lowering paints what the three commands painted by hand" {
+    // The test above holds the commands fixed and varies only the cover hint, so it
+    // cannot see a part routed to the wrong place — a blur handed to the background,
+    // a border thickness lost. This one builds the same picture the long way and
+    // compares pixels, which is the only check that reads every field.
+    const w = 160;
+    const h = 120;
+    var box_pixels: [w * h]u32 = undefined;
+    var manual_pixels: [w * h]u32 = undefined;
+    fillTestNoise(&box_pixels, 0x1BADB002);
+    fillTestNoise(&manual_pixels, 0x1BADB002);
+
+    const rect = Rect{ .x = 14, .y = 12, .w = 44, .h = 30 };
+    const background = draw_mod.Paint{ .solid = Color.rgba(0x30, 0x40, 0x50, 0xFE) };
+    const border_color = Color.rgba(0x90, 0xA0, 0xB0, 0xC0);
+    const shadow_color = Color.rgba(0, 0, 0, 0xA0);
+    const shadow_options = draw_mod.ShadowOptions{ .radius = 12, .blur = 6, .offset = .{ .x = -3, .y = 5 } };
+    const radius = 9;
+    const thickness = 3;
+    const aa = false;
+
+    var boxed = DrawList.init(std.testing.allocator);
+    defer boxed.deinit();
+    boxed.reset(80, 60);
+    try boxed.box(rect, .{
+        .background = background,
+        .border = .{ .color = border_color, .thickness = thickness },
+        .radius = radius,
+        .shadow = .{
+            .color = shadow_color,
+            .offset = shadow_options.offset,
+            .blur = shadow_options.blur,
+            .radius_override = shadow_options.radius,
+        },
+        .aa = aa,
+    });
+
+    var manual = DrawList.init(std.testing.allocator);
+    defer manual.deinit();
+    manual.reset(80, 60);
+    try manual.shadow(rect, shadow_color, shadow_options);
+    try manual.rectFilledPaintEx(rect, background, .{ .radius = radius, .aa = aa });
+    try manual.rectOutlineEx(rect, border_color, thickness, .{ .radius = radius, .aa = aa });
+
+    // A translucent background, so neither route drops the center and the comparison
+    // is about the parameters rather than about the elision.
+    render(.{ .pixels = &box_pixels, .width = w, .height = h }, &boxed, font_mod.default_font, 1.0);
+    render(.{ .pixels = &manual_pixels, .width = w, .height = h }, &manual, font_mod.default_font, 1.0);
+    try std.testing.expectEqualSlices(u32, &manual_pixels, &box_pixels);
+}
+
+test "box: a shadow command assembled by hand paints its center" {
+    // The cover hint defaults to the safe answer, so code that builds a DrawCmd
+    // directly — which the public surface allows — cannot lose its shadow's center by
+    // omission. Only a deliberate write to the internal field can claim a cover.
+    var dl = DrawList.init(std.testing.allocator);
+    defer dl.deinit();
+    dl.reset(80, 60);
+    try dl.cmds.append(dl.alloc, .{ .shadow = .{
+        .rect = .{ .x = 14, .y = 12, .w = 44, .h = 30 },
+        .color = Color.rgba(0, 0, 0, 0xA0),
+        .options = .{ .radius = 8, .blur = 6 },
+        .clip = .{ .x = 0, .y = 0, .w = 80, .h = 60 },
+    } });
+    try std.testing.expectEqual(draw_mod.no_opaque_cover, dl.cmds.items[0].shadow.opaque_cover_radius);
+
+    var pixels: [160 * 120]u32 = undefined;
+    fillTestNoise(&pixels, 0x0C0FFEE0);
+    const before = dl.shadowMaskDiagnostics().blit_pixels;
+    render(.{ .pixels = &pixels, .width = 160, .height = 120 }, &dl, font_mod.default_font, 1.0);
+    const painted = dl.shadowMaskDiagnostics().blit_pixels - before;
+
+    // The nine slices together cover the shadow's whole outer rectangle, so anything
+    // less than that area means a slice went missing.
+    const outer_area: u64 = (44 + 6 * 2) * (30 + 6 * 2);
+    try std.testing.expectEqual(outer_area, painted);
+}
+
+test "box: dropping a covered shadow center leaves the framebuffer identical" {
+    const shadow_color = Color.rgba(0, 0, 0, 0xA0);
+    const opaque_solid = draw_mod.Paint{ .solid = Color.rgba(0x30, 0x40, 0x50, 0xFF) };
+    const rect = Rect{ .x = 14, .y = 12, .w = 44, .h = 30 };
+    const soft = draw_mod.BoxShadow{ .color = shadow_color, .blur = 8, .offset = .{ .x = 0, .y = 3 } };
+
+    const cases = [_]BoxCoverCase{
+        // A sharp-cornered shadow keeps its center exactly where an offset puts it,
+        // so with no offset the background covers it and with one it does not — the
+        // band that leaves the box is the visible part of the drop shadow.
+        .{
+            .name = "sharp corners, no offset",
+            .rect = rect,
+            .options = .{
+                .background = opaque_solid,
+                .shadow = .{ .color = shadow_color, .blur = 8 },
+            },
+            .dropped = true,
+        },
+        .{
+            .name = "sharp corners, offset downward",
+            .rect = rect,
+            .options = .{ .background = opaque_solid, .shadow = soft },
+            .dropped = false,
+        },
+        .{
+            .name = "opaque solid background, rounded corners",
+            .rect = rect,
+            .options = .{ .background = opaque_solid, .radius = 10, .shadow = soft },
+            .dropped = true,
+        },
+        .{
+            .name = "opaque background under an opaque border",
+            .rect = rect,
+            .options = .{
+                .background = opaque_solid,
+                .border = .{ .color = Color.rgba(0x90, 0x90, 0x90, 0xFF), .thickness = 1 },
+                .radius = 10,
+                .shadow = soft,
+            },
+            .dropped = true,
+        },
+        .{
+            .name = "opaque background under a translucent border",
+            .rect = rect,
+            .options = .{
+                .background = opaque_solid,
+                .border = .{ .color = Color.rgba(0x90, 0x90, 0x90, 0x40), .thickness = 3 },
+                .radius = 10,
+                .shadow = soft,
+            },
+            .dropped = true,
+        },
+        .{
+            .name = "opaque linear gradient background",
+            .rect = rect,
+            .options = .{
+                .background = .{ .linear = .{
+                    .start = .{ .x = 14, .y = 12 },
+                    .end = .{ .x = 58, .y = 42 },
+                    .start_color = Color.rgba(0x20, 0x30, 0x40, 0xFF),
+                    .end_color = Color.rgba(0x60, 0x70, 0x80, 0xFF),
+                } },
+                .radius = 6,
+                .shadow = soft,
+            },
+            .dropped = true,
+        },
+        .{
+            .name = "opaque radial gradient background",
+            .rect = rect,
+            .options = .{
+                .background = .{ .radial = .{
+                    .center = .{ .x = 36, .y = 27 },
+                    .radius = 24,
+                    .inner_color = Color.rgba(0x70, 0x60, 0x50, 0xFF),
+                    .outer_color = Color.rgba(0x10, 0x20, 0x30, 0xFF),
+                } },
+                .radius = 6,
+                .shadow = soft,
+            },
+            .dropped = true,
+        },
+        .{
+            .name = "solid background one step short of opaque",
+            .rect = rect,
+            .options = .{
+                .background = .{ .solid = Color.rgba(0x30, 0x40, 0x50, 0xFE) },
+                .radius = 10,
+                .shadow = soft,
+            },
+            .dropped = false,
+        },
+        .{
+            .name = "linear gradient with one translucent end",
+            .rect = rect,
+            .options = .{
+                .background = .{ .linear = .{
+                    .start = .{ .x = 14, .y = 12 },
+                    .end = .{ .x = 58, .y = 42 },
+                    .start_color = Color.rgba(0x20, 0x30, 0x40, 0xFF),
+                    .end_color = Color.rgba(0x60, 0x70, 0x80, 0xFE),
+                } },
+                .radius = 6,
+                .shadow = soft,
+            },
+            .dropped = false,
+        },
+        .{
+            .name = "no background at all",
+            .rect = rect,
+            .options = .{ .shadow = soft },
+            .dropped = false,
+        },
+        .{
+            .name = "border but no background",
+            .rect = rect,
+            .options = .{
+                .border = .{ .color = Color.rgba(0x90, 0x90, 0x90, 0xFF), .thickness = 4 },
+                .radius = 10,
+                .shadow = soft,
+            },
+            .dropped = false,
+        },
+        .{
+            .name = "zero blur and zero radius",
+            .rect = rect,
+            .options = .{
+                .background = opaque_solid,
+                .shadow = .{ .color = shadow_color },
+            },
+            .dropped = true,
+        },
+        .{
+            .name = "shadow radius override, larger than the box radius",
+            .rect = rect,
+            .options = .{
+                .background = opaque_solid,
+                .radius = 8,
+                .shadow = .{ .color = shadow_color, .blur = 8, .offset = .{ .x = 0, .y = 3 }, .radius_override = 14 },
+            },
+            .dropped = true,
+        },
+        .{
+            .name = "offset larger than the blur moves the center off the background",
+            .rect = rect,
+            .options = .{
+                .background = opaque_solid,
+                .radius = 4,
+                .shadow = .{ .color = shadow_color, .blur = 4, .offset = .{ .x = 20, .y = 0 } },
+            },
+            .dropped = false,
+        },
+        .{
+            .name = "a clip that cuts the box in half",
+            .rect = rect,
+            .options = .{ .background = opaque_solid, .radius = 8, .shadow = soft },
+            .clip = .{ .x = 0, .y = 0, .w = 36, .h = 60 },
+            .dropped = true,
+        },
+        .{
+            .name = "a large radius leaves only the crossing strips opaque",
+            .rect = .{ .x = 14, .y = 12, .w = 40, .h = 40 },
+            .options = .{ .background = opaque_solid, .radius = 16, .shadow = soft },
+            .dropped = true,
+        },
+        .{
+            .name = "antialiasing off",
+            .rect = rect,
+            .options = .{ .background = opaque_solid, .radius = 10, .aa = false, .shadow = soft },
+            .dropped = true,
+        },
+    };
+
+    for (cases) |case| try expectBoxCover(case);
+
+    // The shadow's corners are tighter than the box's, so the opaque strips of the
+    // background never reach the center. Both radii have to be physicalized for
+    // that to be visible: comparing a scaled shadow radius against an unscaled fill
+    // radius would call this covered and paint the shadow through the panel.
+    try expectBoxCover(.{
+        .name = "a shadow rounder than the box, at twice the scale",
+        .rect = rect,
+        .options = .{
+            .background = opaque_solid,
+            .radius = 6,
+            .shadow = .{ .color = shadow_color, .blur = 8, .radius_override = 4 },
+        },
+        .scale = 2.0,
+        .dropped = false,
+    });
+
+    const scales = [_]f32{ 0.5, 1.0, 1.5, 2.0 };
+    for (scales) |scale| {
+        try expectBoxCover(.{
+            .name = "opaque background across scales",
+            .rect = rect,
+            .options = .{ .background = opaque_solid, .radius = 10, .shadow = soft },
+            .scale = scale,
+            .dropped = true,
+        });
+    }
 }

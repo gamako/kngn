@@ -468,14 +468,17 @@ fn appendShadows(app: *App) !void {
         .{ .rect = .{ .x = 248, .y = 360, .w = 300, .h = 128 }, .radius = 6, .blur = 24, .offset = .{ .x = 4, .y = 4 }, .color = gui.Color.rgba(0x40, 0xD8, 0xC0, 0xFF) },
     };
     for (panels) |panel| {
-        try draw_list.shadow(panel.rect, app.ctx.style.elevation.shadow, .{
+        try draw_list.box(panel.rect, .{
+            .background = .{ .solid = panel.color },
+            .border = .{ .color = gui.Color.rgba(0xFF, 0xFF, 0xFF, 0x60), .thickness = 1 },
             .radius = panel.radius,
-            .blur = panel.blur,
-            .offset = panel.offset,
+            .shadow = .{
+                .color = app.ctx.style.elevation.shadow,
+                .offset = panel.offset,
+                .blur = panel.blur,
+            },
         });
         app.shadow_count += 1;
-        try draw_list.rectFilledEx(panel.rect, panel.color, .{ .radius = panel.radius });
-        try draw_list.rectOutlineEx(panel.rect, gui.Color.rgba(0xFF, 0xFF, 0xFF, 0x60), 1, .{ .radius = panel.radius });
         app.fill_count += 1;
         app.stroke_count += 1;
     }

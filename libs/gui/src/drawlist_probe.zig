@@ -19,7 +19,13 @@
 //!   `cmd=text x=.. y=.. color=.. font=default|custom clip_.. offclip=.. text="<escaped content>"`
 //!   `cmd=image x=.. y=.. w=.. h=.. src_w=.. src_h=.. pixfnv=#XXXXXXXX clip_.. offclip=..`
 //!   `cmd=path color=.. aa=0|1 winding=nonzero style=fill|stroke width=.. join=miter|bevel cap=butt|square|round miter_limit=.. verbs="MLQCZ" pts="<f32-hex pairs>" clip_.. offclip=..`
-//!   `cmd=shadow x=.. y=.. w=.. h=.. color=.. radius=.. blur=.. dx=.. dy=.. clip_.. offclip=..`
+//!   `cmd=shadow x=.. y=.. w=.. h=.. color=.. radius=.. blur=.. dx=.. dy=.. cover_radius=.. clip_.. offclip=..`
+//! `cover_radius=N` appears only on a shadow that `DrawList.box` queued under an opaque
+//! background, and is the corner radius of that background: it says the renderer is
+//! allowed to skip the shadow's center where the background will overwrite it. Its
+//! absence means the center is painted. Like `offclip`, it is an observation — the
+//! parser reads it back as absent, so an injected list cannot claim a cover.
+//!
 //! `offclip=1` means the command's own extent is not fully contained by the clip rect baked
 //! into it (for `line`/`text`, "extent" is the endpoints/the draw position — the same signal
 //! a truncated shape or a mis-placed label would produce). A scene with nothing accidentally

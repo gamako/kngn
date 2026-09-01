@@ -74,8 +74,11 @@ pub const FieldRole = enum {
     color,
     font,
     text,
-    /// Written by the serializer; accepted and ignored by the parser (a derived
-    /// value such as `offclip` or `pixfnv`, not a `DrawCmd` field).
+    /// Written by the serializer; accepted and ignored by the parser. The value is an
+    /// observation about a command rather than input to it: either computed from the
+    /// command (`offclip`, `pixfnv`) or, for `cover_radius`, a field that only
+    /// `DrawList.box` sets on the production path. Either way the text form never
+    /// feeds one back in, so a parsed list cannot assert one.
     derived,
     /// Path winding name (`nonzero`).
     winding,
@@ -278,6 +281,7 @@ pub const verbs = [_]VerbSpec{
             .{ .name = "blur", .role = .u32, .required = false },
             .{ .name = "dx", .role = .i32, .required = false },
             .{ .name = "dy", .role = .i32, .required = false },
+            .{ .name = "cover_radius", .role = .derived, .required = false },
             .{ .name = "clip_x", .role = .i32, .required = false },
             .{ .name = "clip_y", .role = .i32, .required = false },
             .{ .name = "clip_w", .role = .u32, .required = false },
@@ -794,6 +798,8 @@ pub fn appendCmd(list: *std.ArrayList(u8), allocator: Allocator, cmd: DrawCmd) !
                     try appendFmt(list, allocator, "{s}={d}", .{ field.name, offclipOf(cmd) });
                 } else if (std.mem.eql(u8, field.name, "pixfnv")) {
                     try appendFmt(list, allocator, "{s}=#{X:0>8}", .{ field.name, pixfnvOf(cmd) });
+                } else if (std.mem.eql(u8, field.name, "cover_radius")) {
+                    try appendFmt(list, allocator, "{s}={d}", .{ field.name, cmd.shadow.opaque_cover_radius });
                 } else {
                     try appendFmt(list, allocator, "{s}=0", .{field.name});
                 }
@@ -855,6 +861,9 @@ fn shouldEmitField(cmd: DrawCmd, field: FieldSpec) bool {
     }
     if (std.mem.eql(u8, field.name, "dy")) {
         return cmd.shadow.options.offset.y != 0;
+    }
+    if (std.mem.eql(u8, field.name, "cover_radius")) {
+        return cmd.shadow.opaque_cover_radius != draw_mod.no_opaque_cover;
     }
     if (std.mem.eql(u8, field.name, "aa")) {
         return switch (cmd) {
@@ -1709,6 +1718,42 @@ test "draw_cmd_text: shadow canonical fields round trip without changing existin
     defer second.deinit(testing.allocator);
     try appendCmd(&second, testing.allocator, parsed);
     try testing.expectEqualSlices(u8, first.items, second.items);
+}
+
+test "draw_cmd_text: a box reports its cover radius, and the parser does not take it back" {
+    // The dump carries the cover radius so a probe can see that a box lowered the way
+    // it meant to. The parser does not read it back: text is the one input the
+    // renderer cannot vouch for, so a parsed list cannot claim a covering background
+    // that was never queued. A parsed shadow therefore always paints its center,
+    // which costs a blit and can never show the shadow through a panel.
+    var dl = DrawList.init(testing.allocator);
+    defer dl.deinit();
+    dl.reset(64, 64);
+    try dl.box(.{ .x = 6, .y = 8, .w = 32, .h = 24 }, .{
+        .background = .{ .solid = Color.rgba(0x20, 0x30, 0x40, 0xFF) },
+        .radius = 10,
+        .shadow = .{ .color = Color.rgba(0, 0, 0, 0xA0), .blur = 6 },
+    });
+    var dumped: std.ArrayList(u8) = .empty;
+    defer dumped.deinit(testing.allocator);
+    try appendCmd(&dumped, testing.allocator, dl.cmds.items[0]);
+    try testing.expect(std.mem.indexOf(u8, dumped.items, "cover_radius=10") != null);
+
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const parsed = try parseCmdLine(std.mem.trimEnd(u8, dumped.items, "\n"), arena.allocator());
+    try testing.expectEqual(draw_mod.no_opaque_cover, parsed.shadow.opaque_cover_radius);
+
+    // A shadow with nothing over it says so by omitting the key entirely.
+    dl.reset(64, 64);
+    try dl.box(.{ .x = 6, .y = 8, .w = 32, .h = 24 }, .{
+        .radius = 10,
+        .shadow = .{ .color = Color.rgba(0, 0, 0, 0xA0), .blur = 6 },
+    });
+    var bare: std.ArrayList(u8) = .empty;
+    defer bare.deinit(testing.allocator);
+    try appendCmd(&bare, testing.allocator, dl.cmds.items[0]);
+    try testing.expect(std.mem.indexOf(u8, bare.items, "cover_radius") == null);
 }
 
 test "draw_cmd_text: gradient dumps use canonical IEEE bit fields and round trip" {

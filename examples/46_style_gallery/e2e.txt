@@ -269,7 +269,10 @@ expect showcase fill=5
 expect showcase stroke=5
 snapshot fb
 digest drawlist
-expect drawlist hash=CB7D4F68
+# The hash covers the dump text, which reports a shadow's cover_radius when a box
+# queues an opaque background over it. Two of the five panels here are covered, so
+# this value moves if the box lowering changes even when the pixels do not.
+expect drawlist hash=F2D79EE1
 expect drawlist rect_filled=8
 expect drawlist rect_outline=5
 expect drawlist path=0

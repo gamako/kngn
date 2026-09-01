@@ -18,7 +18,25 @@ const Shape = enum {
     circle_fill,
     circle_outline,
     shadow,
+    /// A box with no shadow: the scenario that must not get slower because the
+    /// shadow path grew a way to skip its center.
+    box_no_shadow,
+    /// A box whose opaque background covers the shadow's center, so the renderer
+    /// drops it.
+    box_shadow_opaque,
+    /// The same box one alpha step short of opaque: the center has to be painted.
+    box_shadow_translucent,
+    /// The same box displaced further than its corner radius, which also puts the
+    /// center outside the background.
+    box_shadow_offset,
 };
+
+fn hasShadow(shape: Shape) bool {
+    return switch (shape) {
+        .shadow, .box_shadow_opaque, .box_shadow_translucent, .box_shadow_offset => true,
+        else => false,
+    };
+}
 
 const Panel = enum { small, large };
 
@@ -61,6 +79,30 @@ fn buildScene(dl: *gui.DrawList, shape: Shape, panel: Panel, radius: u32) !void 
         .circle_fill => try dl.circleFilled(.{ .x = 160, .y = 160 }, radius, color, .{}),
         .circle_outline => try dl.circleOutline(.{ .x = 160, .y = 160 }, radius, color, 5, .{}),
         .shadow => try dl.shadow(rect, gui.Color.rgba(0, 0, 0, 0xA0), .{ .radius = radius, .blur = 16, .offset = .{ .x = 6, .y = 8 } }),
+        .box_no_shadow => try dl.box(rect, .{
+            .background = .{ .solid = color },
+            .border = .{ .color = gui.Color.rgba(0xFF, 0xFF, 0xFF, 0x60), .thickness = 1 },
+            .radius = radius,
+        }),
+        // A displacement within the corner radius, the shape a raised panel takes.
+        .box_shadow_opaque => try dl.box(rect, .{
+            .background = .{ .solid = color },
+            .border = .{ .color = gui.Color.rgba(0xFF, 0xFF, 0xFF, 0x60), .thickness = 1 },
+            .radius = radius,
+            .shadow = .{ .color = gui.Color.rgba(0, 0, 0, 0xA0), .offset = .{ .x = 0, .y = 2 }, .blur = 16 },
+        }),
+        .box_shadow_translucent => try dl.box(rect, .{
+            .background = .{ .solid = gui.Color.rgba(0x48, 0xA8, 0xF0, 0xF0) },
+            .border = .{ .color = gui.Color.rgba(0xFF, 0xFF, 0xFF, 0x60), .thickness = 1 },
+            .radius = radius,
+            .shadow = .{ .color = gui.Color.rgba(0, 0, 0, 0xA0), .offset = .{ .x = 0, .y = 2 }, .blur = 16 },
+        }),
+        .box_shadow_offset => try dl.box(rect, .{
+            .background = .{ .solid = color },
+            .border = .{ .color = gui.Color.rgba(0xFF, 0xFF, 0xFF, 0x60), .thickness = 1 },
+            .radius = radius,
+            .shadow = .{ .color = gui.Color.rgba(0, 0, 0, 0xA0), .offset = .{ .x = 6, .y = 8 }, .blur = 16 },
+        }),
     }
 }
 
@@ -160,7 +202,7 @@ fn printResult(result: Result) void {
 
 fn requireWarmCache(result: Result) !void {
     if (result.shape == .sharp_fill) return;
-    if (result.shape == .shadow) {
+    if (hasShadow(result.shape)) {
         if (result.shadow_hits == 0 or result.shadow_misses != 0) return error.WarmShadowCacheGuardFailed;
         if (result.warm_allocs != 0) return error.WarmAllocationGuardFailed;
         return;
@@ -213,6 +255,34 @@ pub fn main(init: std.process.Init) !void {
         const result = try runCase(io, &tracker, .shadow, .large, radius);
         printResult(result);
         try requireWarmCache(result);
+    }
+
+    // A box's shadow, with and without a background that covers its center. The two
+    // differ only in the background's alpha, so the gap between their blit counts is
+    // the center slice and nothing else.
+    for ([_]u32{ 8, 32 }) |radius| {
+        const no_shadow = try runCase(io, &tracker, .box_no_shadow, .large, radius);
+        const opaque_cover = try runCase(io, &tracker, .box_shadow_opaque, .large, radius);
+        const translucent = try runCase(io, &tracker, .box_shadow_translucent, .large, radius);
+        const offset = try runCase(io, &tracker, .box_shadow_offset, .large, radius);
+        printResult(no_shadow);
+        printResult(opaque_cover);
+        printResult(translucent);
+        printResult(offset);
+        try requireWarmCache(no_shadow);
+        try requireWarmCache(opaque_cover);
+        try requireWarmCache(translucent);
+        try requireWarmCache(offset);
+        // Without these the timings above could be measuring nothing: a workload that
+        // never drops a center, or one that drops every center, reports a difference
+        // that has no cause.
+        if (no_shadow.shadow_pixels != 0) return error.BoxWithoutShadowBlitGuardFailed;
+        if (opaque_cover.shadow_pixels >= translucent.shadow_pixels) return error.CoveredCenterNotDroppedGuardFailed;
+        if (offset.shadow_pixels <= opaque_cover.shadow_pixels) return error.OffsetCenterWronglyDroppedGuardFailed;
+        std.debug.print(
+            "box_center_drop radius={d} opaque={d} translucent={d} offset={d} dropped={d}\n",
+            .{ radius, opaque_cover.shadow_pixels, translucent.shadow_pixels, offset.shadow_pixels, translucent.shadow_pixels - opaque_cover.shadow_pixels },
+        );
     }
     std.debug.print("guards=ok corner_work=panel_invariant warm_allocs=0 checksums=different\n\n", .{});
 }

@@ -254,6 +254,49 @@ pub const ShadowOptions = struct {
     offset: Vec2 = .{ .x = 0, .y = 0 },
 };
 
+/// A shadow's `opaque_cover_radius` when no background is guaranteed to cover it.
+pub const no_opaque_cover: u32 = std.math.maxInt(u32);
+
+/// Uniform four-sided outline painted inside the box rect. `null` on `BoxOptions`
+/// means no border; a thickness of zero is one physical pixel, not "none".
+pub const Border = struct { color: Color, thickness: u32 };
+
+/// A box's outer shadow. The radius follows `BoxOptions.radius`, which is what a
+/// caller wants unless the shadow's silhouette is deliberately a different shape
+/// from the box that casts it.
+pub const BoxShadow = struct {
+    color: Color,
+    offset: Vec2 = .{ .x = 0, .y = 0 },
+    blur: u32 = 0,
+    radius_override: ?u32 = null,
+};
+
+/// What a box is made of. Every part is optional, and each one that is present
+/// costs exactly the command it would have cost on its own.
+pub const BoxOptions = struct {
+    background: ?Paint = null,
+    border: ?Border = null,
+    /// The corner radius of the background, the border, and — unless
+    /// `BoxShadow.radius_override` says otherwise — the shadow.
+    radius: u32 = 0,
+    shadow: ?BoxShadow = null,
+    /// Antialiasing for the background and the border. A shadow's coverage comes
+    /// from its mask and does not read this.
+    aa: bool = true,
+};
+
+/// Whether a paint covers every pixel of its shape without reading what is
+/// underneath. The switch is exhaustive, so a paint variant added later does not
+/// compile until someone decides what it answers here — a new paint cannot slip
+/// through as opaque, and cannot slip through as transparent either.
+pub fn paintIsOpaque(paint: Paint) bool {
+    return switch (paint) {
+        .solid => |c| c.a == 255,
+        .linear => |g| g.start_color.a == 255 and g.end_color.a == 255,
+        .radial => |g| g.inner_color.a == 255 and g.outer_color.a == 255,
+    };
+}
+
 /// One shape's coverage scratch is this many bytes or less. A larger bbox is
 /// split into horizontal bands so the peak stays at this cap.
 pub const path_scratch_limit_bytes: usize = 4 * 1024 * 1024;
@@ -301,6 +344,15 @@ pub const DrawCmd = union(enum) {
         color: Color,
         options: ShadowOptions,
         clip: Rect,
+        /// Internal. The corner radius of an opaque background that `DrawList.box`
+        /// has already queued over this exact rect and clip, or `no_opaque_cover`
+        /// when there is none. The renderer uses it to drop the nine-slice center,
+        /// which that background would overwrite pixel for pixel.
+        ///
+        /// `DrawList.box` is the only writer. The default is the safe answer, so a
+        /// command assembled by hand draws its center; setting it by hand claims a
+        /// covering background that may not exist.
+        opaque_cover_radius: u32 = no_opaque_cover,
     },
 };
 
@@ -576,6 +628,61 @@ pub const DrawList = struct {
             .aa = options.aa,
             .clip = self.currentClip(),
         } });
+    }
+
+    /// Paint one box: an outer shadow, a background, and a uniform border, in that
+    /// order, over the same rectangle. Any part may be absent.
+    ///
+    /// This is where a shadow and the surface that covers it become one statement.
+    /// Because the pair arrives together, the renderer can drop the part of the
+    /// shadow that the background overwrites — roughly three quarters of its area
+    /// for a typical panel — without a caller flag or a guess about what the next
+    /// command will be.
+    ///
+    /// The three commands share one clip and are appended together or not at all:
+    /// running out of memory leaves the list exactly as it was.
+    pub fn box(self: *DrawList, rect: Rect, options: BoxOptions) Allocator.Error!void {
+        var needed: usize = 0;
+        if (options.shadow != null) needed += 1;
+        if (options.background != null) needed += 1;
+        if (options.border != null) needed += 1;
+        if (needed == 0) return;
+
+        try self.cmds.ensureUnusedCapacity(self.alloc, needed);
+        const clip = self.currentClip();
+        if (options.shadow) |s| {
+            const covers = if (options.background) |paint| paintIsOpaque(paint) else false;
+            self.cmds.appendAssumeCapacity(.{ .shadow = .{
+                .rect = rect,
+                .color = s.color,
+                .options = .{
+                    .radius = s.radius_override orelse options.radius,
+                    .blur = s.blur,
+                    .offset = s.offset,
+                },
+                .clip = clip,
+                .opaque_cover_radius = if (covers) options.radius else no_opaque_cover,
+            } });
+        }
+        if (options.background) |paint| {
+            self.cmds.appendAssumeCapacity(.{ .rect_filled = .{
+                .rect = rect,
+                .paint = paint,
+                .radius = options.radius,
+                .aa = options.aa,
+                .clip = clip,
+            } });
+        }
+        if (options.border) |b| {
+            self.cmds.appendAssumeCapacity(.{ .rect_outline = .{
+                .rect = rect,
+                .color = b.color,
+                .thickness = b.thickness,
+                .radius = options.radius,
+                .aa = options.aa,
+                .clip = clip,
+            } });
+        }
     }
 
     /// Append an independent box-shadow command. The shadow is composited before
@@ -1037,4 +1144,159 @@ test "PathBuilder: stroke appends params; non-finite or non-positive width is In
         .miter_limit = 0.5,
     }));
     try std.testing.expectEqual(@as(usize, 1), dl.cmds.items.len);
+}
+
+test "box: no part means no command" {
+    var dl = DrawList.init(std.testing.allocator);
+    defer dl.deinit();
+    dl.reset(64, 48);
+    try dl.box(.{ .x = 2, .y = 2, .w = 20, .h = 10 }, .{});
+    try std.testing.expectEqual(@as(usize, 0), dl.cmds.items.len);
+}
+
+test "box: each part appends its own command, shadow then background then border" {
+    var dl = DrawList.init(std.testing.allocator);
+    defer dl.deinit();
+    dl.reset(64, 48);
+    const rect = Rect{ .x = 4, .y = 6, .w = 30, .h = 18 };
+    try dl.box(rect, .{
+        .background = .{ .solid = Color.rgba(1, 2, 3, 0xFF) },
+        .border = .{ .color = Color.rgba(4, 5, 6, 0xFF), .thickness = 2 },
+        .radius = 7,
+        .shadow = .{ .color = Color.rgba(0, 0, 0, 0x80), .blur = 5 },
+    });
+    try std.testing.expectEqual(@as(usize, 3), dl.cmds.items.len);
+    try std.testing.expect(dl.cmds.items[0] == .shadow);
+    try std.testing.expect(dl.cmds.items[1] == .rect_filled);
+    try std.testing.expect(dl.cmds.items[2] == .rect_outline);
+
+    // One rectangle, one clip, one radius across all three.
+    const clip = dl.cmds.items[0].shadow.clip;
+    for (dl.cmds.items) |cmd| {
+        const cmd_rect = switch (cmd) {
+            .shadow => |c| c.rect,
+            .rect_filled => |c| c.rect,
+            .rect_outline => |c| c.rect,
+            else => unreachable,
+        };
+        const cmd_clip = switch (cmd) {
+            .shadow => |c| c.clip,
+            .rect_filled => |c| c.clip,
+            .rect_outline => |c| c.clip,
+            else => unreachable,
+        };
+        try std.testing.expectEqual(rect, cmd_rect);
+        try std.testing.expectEqual(clip, cmd_clip);
+    }
+    try std.testing.expectEqual(@as(u32, 7), dl.cmds.items[0].shadow.options.radius);
+    try std.testing.expectEqual(@as(u32, 7), dl.cmds.items[1].rect_filled.radius);
+    try std.testing.expectEqual(@as(u32, 7), dl.cmds.items[2].rect_outline.radius);
+    try std.testing.expectEqual(@as(u32, 2), dl.cmds.items[2].rect_outline.thickness);
+
+    dl.reset(64, 48);
+    try dl.box(rect, .{ .background = .{ .solid = Color.rgba(1, 2, 3, 0xFF) } });
+    try std.testing.expectEqual(@as(usize, 1), dl.cmds.items.len);
+    try std.testing.expect(dl.cmds.items[0] == .rect_filled);
+
+    dl.reset(64, 48);
+    try dl.box(rect, .{ .border = .{ .color = Color.rgba(4, 5, 6, 0xFF), .thickness = 1 } });
+    try std.testing.expectEqual(@as(usize, 1), dl.cmds.items.len);
+    try std.testing.expect(dl.cmds.items[0] == .rect_outline);
+}
+
+test "box: the shadow follows the box radius until an override says otherwise" {
+    var dl = DrawList.init(std.testing.allocator);
+    defer dl.deinit();
+    dl.reset(64, 48);
+    const rect = Rect{ .x = 4, .y = 6, .w = 30, .h = 18 };
+    try dl.box(rect, .{ .radius = 9, .shadow = .{ .color = Color.rgba(0, 0, 0, 0x80) } });
+    try std.testing.expectEqual(@as(u32, 9), dl.cmds.items[0].shadow.options.radius);
+
+    dl.reset(64, 48);
+    try dl.box(rect, .{
+        .background = .{ .solid = Color.rgba(1, 2, 3, 0xFF) },
+        .radius = 9,
+        .shadow = .{ .color = Color.rgba(0, 0, 0, 0x80), .radius_override = 3 },
+    });
+    try std.testing.expectEqual(@as(u32, 3), dl.cmds.items[0].shadow.options.radius);
+    // The override moves the shadow's silhouette, never the background's.
+    try std.testing.expectEqual(@as(u32, 9), dl.cmds.items[1].rect_filled.radius);
+    try std.testing.expectEqual(@as(u32, 9), dl.cmds.items[0].shadow.opaque_cover_radius);
+}
+
+test "box: only an opaque background claims to cover the shadow" {
+    const rect = Rect{ .x = 4, .y = 6, .w = 30, .h = 18 };
+    const cases = [_]struct { paint: ?Paint, covers: bool }{
+        .{ .paint = .{ .solid = Color.rgba(1, 2, 3, 0xFF) }, .covers = true },
+        .{ .paint = .{ .solid = Color.rgba(1, 2, 3, 0xFE) }, .covers = false },
+        .{ .paint = .{ .linear = .{
+            .start = .{ .x = 0, .y = 0 },
+            .end = .{ .x = 1, .y = 1 },
+            .start_color = Color.rgba(1, 2, 3, 0xFF),
+            .end_color = Color.rgba(4, 5, 6, 0xFF),
+        } }, .covers = true },
+        .{ .paint = .{ .linear = .{
+            .start = .{ .x = 0, .y = 0 },
+            .end = .{ .x = 1, .y = 1 },
+            .start_color = Color.rgba(1, 2, 3, 0xFF),
+            .end_color = Color.rgba(4, 5, 6, 0xFE),
+        } }, .covers = false },
+        .{ .paint = .{ .radial = .{
+            .center = .{ .x = 1, .y = 1 },
+            .radius = 4,
+            .inner_color = Color.rgba(1, 2, 3, 0xFF),
+            .outer_color = Color.rgba(4, 5, 6, 0xFF),
+        } }, .covers = true },
+        .{ .paint = .{ .radial = .{
+            .center = .{ .x = 1, .y = 1 },
+            .radius = 4,
+            .inner_color = Color.rgba(1, 2, 3, 0x00),
+            .outer_color = Color.rgba(4, 5, 6, 0xFF),
+        } }, .covers = false },
+        .{ .paint = null, .covers = false },
+    };
+    for (cases) |case| {
+        var dl = DrawList.init(std.testing.allocator);
+        defer dl.deinit();
+        dl.reset(64, 48);
+        try dl.box(rect, .{
+            .background = case.paint,
+            .radius = 5,
+            .shadow = .{ .color = Color.rgba(0, 0, 0, 0x80) },
+        });
+        const expected: u32 = if (case.covers) 5 else no_opaque_cover;
+        try std.testing.expectEqual(expected, dl.cmds.items[0].shadow.opaque_cover_radius);
+    }
+}
+
+test "box: running out of memory leaves the command list as it was" {
+    // `reset` takes the first allocation for the clip stack; the box's reservation is
+    // the next one, and that is the one to fail.
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 1 });
+    var dl = DrawList.init(failing.allocator());
+    defer dl.deinit();
+    dl.reset(64, 48);
+
+    const err = dl.box(.{ .x = 4, .y = 6, .w = 30, .h = 18 }, .{
+        .background = .{ .solid = Color.rgba(1, 2, 3, 0xFF) },
+        .border = .{ .color = Color.rgba(4, 5, 6, 0xFF), .thickness = 1 },
+        .shadow = .{ .color = Color.rgba(0, 0, 0, 0x80) },
+    });
+    try std.testing.expectError(error.OutOfMemory, err);
+    try std.testing.expectEqual(@as(usize, 0), dl.cmds.items.len);
+}
+
+test "box: the cover hint does not widen DrawCmd" {
+    // A union is as wide as its widest payload, so the internal cover radius is free
+    // only while some other command stays the widest. Asserting that says what the
+    // design needs, where a byte count would churn on unrelated changes.
+    const shadow_bytes = @sizeOf(@FieldType(DrawCmd, "shadow"));
+    const widest_other = @max(
+        @sizeOf(@FieldType(DrawCmd, "rect_filled")),
+        @sizeOf(@FieldType(DrawCmd, "path")),
+    );
+    std.testing.expect(shadow_bytes <= widest_other) catch |err| {
+        std.debug.print("\nshadow payload {d} bytes, widest other {d}\n", .{ shadow_bytes, widest_other });
+        return err;
+    };
 }

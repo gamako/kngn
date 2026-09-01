@@ -646,9 +646,18 @@ fn drawDialog(ctx: *Context, id: Id, geo: DialogGeometry, options: DialogOptions
     const dl = &ctx.draw_list;
     const style = ctx.style;
     dl.rectFilled(.{ .x = 0, .y = 0, .w = ctx.screen_w, .h = ctx.screen_h }, Color.rgba(0, 0, 0, 0x88)) catch @panic("dialog: OOM");
-    dl.shadow(geo.outer, style.elevation.shadow, .{ .radius = 10, .blur = 16, .offset = .{ .x = 0, .y = 6 } }) catch @panic("dialog shadow: OOM");
-    dl.rectFilledEx(geo.outer, style.surface.control, .{ .radius = 8 }) catch @panic("dialog: OOM");
-    dl.rectOutlineEx(geo.outer, style.border_tokens.normal, 1, .{ .radius = 8 }) catch @panic("dialog: OOM");
+    dl.box(geo.outer, .{
+        .background = .{ .solid = style.surface.control },
+        .border = .{ .color = style.border_tokens.normal, .thickness = 1 },
+        .radius = 8,
+        // The shadow's silhouette is deliberately rounder than the dialog it lifts.
+        .shadow = .{
+            .color = style.elevation.shadow,
+            .offset = .{ .x = 0, .y = 6 },
+            .blur = 16,
+            .radius_override = 10,
+        },
+    }) catch @panic("dialog: OOM");
     if (geo.title.w != 0 and geo.title.h != 0) dl.textEx(.{ .x = geo.title.x, .y = geo.title.y }, options.title, style.text_tokens.primary, null) catch @panic("dialog title: OOM");
     if (geo.body.w != 0 and geo.body.h != 0) dl.textEx(.{ .x = geo.body.x, .y = geo.body.y }, options.body, style.text_tokens.subtle, null) catch @panic("dialog body: OOM");
 

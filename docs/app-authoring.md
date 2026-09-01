@@ -979,22 +979,35 @@ the default and existing solid drawing does not change. The gradient section of
 [`examples/46_style_gallery/main.zig`](../examples/46_style_gallery/main.zig) is a complete
 linear/radial paint arrangement.
 
-### Shadows
+### Raised panels and shadows
 
-Add a shadow as an independent `DrawList` command before drawing the panel over it:
+A raised card is one call. `box` paints an outer shadow, a background and a uniform border over
+the same rectangle, in that order, and every part is optional:
 
 ```zig
-try draw_list.shadow(panel_rect, gui.Color.rgba(0, 0, 0, 0xB0), .{
-    .radius = 12,
-    .blur = 8,
-    .offset = .{ .x = 4, .y = 6 },
+try draw_list.box(panel_rect, .{
+    .background = .{ .solid = theme.surface },
+    .border = .{ .color = theme.border, .thickness = 1 },
+    .radius = 10,
+    .shadow = .{ .color = gui.Color.rgba(0, 0, 0, 0xB0), .offset = .{ .x = 0, .y = 6 }, .blur = 8 },
 });
 ```
 
-`ShadowOptions.radius` and `.blur` are logical pixels; `.offset` is applied after physicalisation.
-Shadow masks are cached by `DrawList`, so a warm frame does not rerun the blur calculation every
-frame. The shadow section of [`examples/46_style_gallery/main.zig`](../examples/46_style_gallery/main.zig)
-shows the option combinations.
+`radius` applies to all three parts, the way `border-radius` does. `BoxShadow.radius_override`
+is there for a shadow whose silhouette is deliberately a different shape from the box casting it.
+A `thickness` of zero is one physical pixel, so "no border" is `null`, not `0`.
+
+**Prefer `box` over the three calls written out.** When the background is opaque it hides the
+middle of the shadow, and `box` is what lets the renderer skip painting it — on a dashboard of
+seven panels that was 41% of the frame's rasterisation, with a byte-identical result.
+[`docs/adr/036`](adr/036_box-painting-is-one-drawlist-operation.md) has the rule and the
+measurements; nothing about the drawing changes, only what is not drawn.
+
+`draw_list.shadow` remains for a shadow with nothing over it. `ShadowOptions.radius` and `.blur`
+are logical pixels; `.offset` is applied after physicalisation. Shadow masks are cached by
+`DrawList`, so a warm frame does not rerun the blur calculation every frame. The shadow section of
+[`examples/46_style_gallery/main.zig`](../examples/46_style_gallery/main.zig) shows the option
+combinations.
 
 ### Modal dialogs
 
