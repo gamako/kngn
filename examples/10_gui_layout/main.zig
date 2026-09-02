@@ -90,19 +90,19 @@ const Ids = struct {
     const xgrow_b: gui.Id = 0x0A10_0503;
     const xgrow_g1: gui.Id = 0x0A10_0504;
 
-    const an_plain: gui.Id = 0x0A10_0600;
-    const an_ovl: gui.Id = 0x0A10_0601;
-    const an_badge: gui.Id = 0x0A10_0602;
-    const an_wplain: gui.Id = 0x0A10_0610;
-    const an_wplain_0: gui.Id = 0x0A10_0611;
-    const an_wplain_1: gui.Id = 0x0A10_0612;
-    const an_wplain_2: gui.Id = 0x0A10_0613;
-    const an_wplain_3: gui.Id = 0x0A10_0614;
-    const an_wovl: gui.Id = 0x0A10_0620;
-    const an_wovl_0: gui.Id = 0x0A10_0621;
-    const an_wovl_1: gui.Id = 0x0A10_0622;
-    const an_wovl_2: gui.Id = 0x0A10_0623;
-    const an_wovl_3: gui.Id = 0x0A10_0624;
+    const pos_plain: gui.Id = 0x0A10_0600;
+    const pos_ovl: gui.Id = 0x0A10_0601;
+    const pos_badge: gui.Id = 0x0A10_0602;
+    const pos_wplain: gui.Id = 0x0A10_0610;
+    const pos_wplain_0: gui.Id = 0x0A10_0611;
+    const pos_wplain_1: gui.Id = 0x0A10_0612;
+    const pos_wplain_2: gui.Id = 0x0A10_0613;
+    const pos_wplain_3: gui.Id = 0x0A10_0614;
+    const pos_wovl: gui.Id = 0x0A10_0620;
+    const pos_wovl_0: gui.Id = 0x0A10_0621;
+    const pos_wovl_1: gui.Id = 0x0A10_0622;
+    const pos_wovl_2: gui.Id = 0x0A10_0623;
+    const pos_wovl_3: gui.Id = 0x0A10_0624;
 
     const ext_vp: gui.Id = 0x0A10_0700;
     const ext_inner: gui.Id = 0x0A10_0701;
@@ -221,7 +221,7 @@ fn chipEx(
     min_width: i32,
     max_width: i32,
     bg: gui.Color,
-    anchor: ?gui.Anchor,
+    position: ?gui.Position,
 ) void {
     ctx.beginBox(.{
         .id = id,
@@ -229,7 +229,7 @@ fn chipEx(
         .height = height,
         .min_width = min_width,
         .max_width = max_width,
-        .anchor = anchor,
+        .position = position,
         .padding = .{ 2, 4, 2, 4 },
         .bg = bg,
     });
@@ -532,12 +532,12 @@ fn wrapFour(ctx: *gui.Context, ids: [4]gui.Id) void {
     }
 }
 
-fn itemAnchor(ctx: *gui.Context, width: i32) void {
-    beginItem(ctx, "7. anchor", width);
+fn itemPosition(ctx: *gui.Context, width: i32) void {
+    beginItem(ctx, "7. position", width);
 
     ctx.beginBox(.{ .direction = .row, .gap = 8 });
     ctx.beginBox(.{
-        .id = Ids.an_plain,
+        .id = Ids.pos_plain,
         .direction = .column,
         .width = .fit,
         .padding = .{ 4, 8, 4, 8 },
@@ -547,7 +547,7 @@ fn itemAnchor(ctx: *gui.Context, width: i32) void {
     flowBody(ctx);
     ctx.endBox();
     ctx.beginBox(.{
-        .id = Ids.an_ovl,
+        .id = Ids.pos_ovl,
         .direction = .column,
         .width = .fit,
         .padding = .{ 4, 8, 4, 8 },
@@ -556,8 +556,8 @@ fn itemAnchor(ctx: *gui.Context, width: i32) void {
     });
     flowBody(ctx);
     ctx.beginBox(.{
-        .id = Ids.an_badge,
-        .anchor = .{ .at = .top_right, .offset = .{ .x = 12, .y = -8 } },
+        .id = Ids.pos_badge,
+        .position = .{ .top = .{ .length = .{ .px = -8 } }, .right = .{ .length = .{ .px = -12 } } },
         .width = .{ .fixed = 10 },
         .height = .{ .fixed = 10 },
         .bg = Col.badge,
@@ -567,7 +567,7 @@ fn itemAnchor(ctx: *gui.Context, width: i32) void {
     ctx.endBox();
 
     ctx.beginBox(.{
-        .id = Ids.an_wplain,
+        .id = Ids.pos_wplain,
         .direction = .row,
         .wrap = true,
         .width = .{ .fixed = width },
@@ -575,11 +575,11 @@ fn itemAnchor(ctx: *gui.Context, width: i32) void {
         .gap = GAP,
         .bg = Col.row,
     });
-    wrapFour(ctx, .{ Ids.an_wplain_0, Ids.an_wplain_1, Ids.an_wplain_2, Ids.an_wplain_3 });
+    wrapFour(ctx, .{ Ids.pos_wplain_0, Ids.pos_wplain_1, Ids.pos_wplain_2, Ids.pos_wplain_3 });
     ctx.endBox();
 
     ctx.beginBox(.{
-        .id = Ids.an_wovl,
+        .id = Ids.pos_wovl,
         .direction = .row,
         .wrap = true,
         .width = .{ .fixed = width },
@@ -587,9 +587,9 @@ fn itemAnchor(ctx: *gui.Context, width: i32) void {
         .gap = GAP,
         .bg = Col.row,
     });
-    wrapFour(ctx, .{ Ids.an_wovl_0, Ids.an_wovl_1, Ids.an_wovl_2, Ids.an_wovl_3 });
+    wrapFour(ctx, .{ Ids.pos_wovl_0, Ids.pos_wovl_1, Ids.pos_wovl_2, Ids.pos_wovl_3 });
     ctx.beginBox(.{
-        .anchor = .{ .at = .top_right },
+        .position = .{ .top = .{ .length = .{} }, .right = .{ .length = .{} } },
         .width = .{ .fixed = 10 },
         .height = .{ .fixed = 10 },
         .bg = Col.badge,
@@ -601,17 +601,17 @@ fn itemAnchor(ctx: *gui.Context, width: i32) void {
     var ocounts: [8]u8 = undefined;
     var pys: [8]i32 = undefined;
     var oys: [8]i32 = undefined;
-    const pids = [_]gui.Id{ Ids.an_wplain_0, Ids.an_wplain_1, Ids.an_wplain_2, Ids.an_wplain_3 };
-    const oids = [_]gui.Id{ Ids.an_wovl_0, Ids.an_wovl_1, Ids.an_wovl_2, Ids.an_wovl_3 };
+    const pids = [_]gui.Id{ Ids.pos_wplain_0, Ids.pos_wplain_1, Ids.pos_wplain_2, Ids.pos_wplain_3 };
+    const oids = [_]gui.Id{ Ids.pos_wovl_0, Ids.pos_wovl_1, Ids.pos_wovl_2, Ids.pos_wovl_3 };
     const plines = wrapLines(ctx, &pids, &pcounts, &pys);
     const olines = wrapLines(ctx, &oids, &ocounts, &oys);
-    const size_ids = [_]gui.Id{ Ids.an_plain, Ids.an_ovl, Ids.an_badge };
+    const size_ids = [_]gui.Id{ Ids.pos_plain, Ids.pos_ovl, Ids.pos_badge };
     endItem(ctx, allCached(ctx, &size_ids) and allCached(ctx, &pids) and allCached(ctx, &oids), "plain={d}x{d} overlay={d}x{d} dh={d}  wrap_plain={d}[{d},{d}] wrap_ovl={d}[{d},{d}]", .{
-        nodeW(ctx, Ids.an_plain),
-        nodeH(ctx, Ids.an_plain),
-        nodeW(ctx, Ids.an_ovl),
-        nodeH(ctx, Ids.an_ovl),
-        nodeH(ctx, Ids.an_ovl) - nodeH(ctx, Ids.an_plain),
+        nodeW(ctx, Ids.pos_plain),
+        nodeH(ctx, Ids.pos_plain),
+        nodeW(ctx, Ids.pos_ovl),
+        nodeH(ctx, Ids.pos_ovl),
+        nodeH(ctx, Ids.pos_ovl) - nodeH(ctx, Ids.pos_plain),
         plines,
         pcounts[0],
         pcounts[1],
@@ -821,7 +821,7 @@ fn buildCatalog(ctx: *gui.Context, app: *App) void {
     itemAlignMain(ctx, width);
     itemWrap(ctx, width);
     itemCrossGrow(ctx, width);
-    itemAnchor(ctx, width);
+    itemPosition(ctx, width);
     itemExtent(ctx, app, width);
     itemTable(ctx, width);
     itemVirtual(ctx, app, width);
@@ -900,27 +900,27 @@ fn layoutDigest(ctx_ptr: *anyopaque, buf: []u8) []const u8 {
     var ocounts: [8]u8 = undefined;
     var pys: [8]i32 = undefined;
     var oys: [8]i32 = undefined;
-    const pids = [_]gui.Id{ Ids.an_wplain_0, Ids.an_wplain_1, Ids.an_wplain_2, Ids.an_wplain_3 };
-    const oids = [_]gui.Id{ Ids.an_wovl_0, Ids.an_wovl_1, Ids.an_wovl_2, Ids.an_wovl_3 };
+    const pids = [_]gui.Id{ Ids.pos_wplain_0, Ids.pos_wplain_1, Ids.pos_wplain_2, Ids.pos_wplain_3 };
+    const oids = [_]gui.Id{ Ids.pos_wovl_0, Ids.pos_wovl_1, Ids.pos_wovl_2, Ids.pos_wovl_3 };
     const plines = wrapLines(ctx, &pids, &pcounts, &pys);
     const olines = wrapLines(ctx, &oids, &ocounts, &oys);
-    const plain_h = nodeH(ctx, Ids.an_plain);
-    const ovl_h = nodeH(ctx, Ids.an_ovl);
-    const an_dh: i32 = if (plain_h >= 0 and ovl_h >= 0) ovl_h - plain_h else -1;
-    appendFmt(buf, &off, " an_plain={d} an_plain_h={d} an_ovl={d} an_ovl_h={d} an_dh={d}", .{
-        nodeW(ctx, Ids.an_plain),
+    const plain_h = nodeH(ctx, Ids.pos_plain);
+    const ovl_h = nodeH(ctx, Ids.pos_ovl);
+    const pos_dh: i32 = if (plain_h >= 0 and ovl_h >= 0) ovl_h - plain_h else -1;
+    appendFmt(buf, &off, " pos_plain={d} pos_plain_h={d} pos_ovl={d} pos_ovl_h={d} pos_dh={d}", .{
+        nodeW(ctx, Ids.pos_plain),
         plain_h,
-        nodeW(ctx, Ids.an_ovl),
+        nodeW(ctx, Ids.pos_ovl),
         ovl_h,
-        an_dh,
+        pos_dh,
     });
-    appendFmt(buf, &off, " an_badge_x={d} an_badge_y={d} an_ovl_x={d} an_ovl_y={d}", .{
-        nodeX(ctx, Ids.an_badge),
-        nodeY(ctx, Ids.an_badge),
-        nodeX(ctx, Ids.an_ovl),
-        nodeY(ctx, Ids.an_ovl),
+    appendFmt(buf, &off, " pos_badge_x={d} pos_badge_y={d} pos_ovl_x={d} pos_ovl_y={d}", .{
+        nodeX(ctx, Ids.pos_badge),
+        nodeY(ctx, Ids.pos_badge),
+        nodeX(ctx, Ids.pos_ovl),
+        nodeY(ctx, Ids.pos_ovl),
     });
-    appendFmt(buf, &off, " an_wplain={d} an_wovl={d}", .{
+    appendFmt(buf, &off, " pos_wplain={d} pos_wovl={d}", .{
         plines,
         olines,
     });

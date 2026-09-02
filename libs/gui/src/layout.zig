@@ -24,19 +24,23 @@
 //   trailing gap when no unfrozen weight>0 grow child remains (every such child
 //   max-frozen, or none existed). Freeze iteration is bit-identical to the
 //   unconstrained peel when no clamp fires.
-// - anchored children (`BoxConfig.anchor != null`) are overlays: they take no
-//   part in the parent's fit measure, main-axis cursor, gap, grow share, wrap
-//   line split, or line cross size. Their own size is resolved against the
-//   parent content box (grow fills that box, ignoring weight). min/max clamp
-//   still applies. They are not in the layout size; a parent with
-//   clip_children=false still folds their visible overflow into content extent.
-//   Draw order is tree order — later siblings paint on top.
+// - positioned children (`BoxConfig.position != null`) are out of flow: they take
+//   no part in the parent's fit measure, main-axis cursor, gap, grow share, wrap
+//   line split, or line cross size. Their containing block is always the direct
+//   parent. An axis pinned by both insets takes its size from the distance
+//   between them (and rejects a `.fixed` / `.percent` Sizing, which would state
+//   the size a second time); otherwise the size comes from the child's own
+//   Sizing, resolved against the parent content box (grow fills that box,
+//   ignoring weight). min/max clamp still applies, last. They are not in the
+//   layout size; a parent with clip_children=false still folds their visible
+//   overflow into content extent. Draw order is tree order — later siblings
+//   paint on top.
 // - main-axis alignment is `BoxConfig.align_main` (CSS justify_content), limited to
 //   start / center / end. It places the leftover main-axis space no child took, by shifting
 //   the whole line; the gap between children never changes. A weight>0 grow child normally
 //   absorbs that leftover, so align_main has no effect in a box that has one — except when
 //   every such child is frozen by its own min/max clamp and a remainder is still left. In a
-//   wrap box each line is aligned independently. Anchored children ignore it. Distributing
+//   wrap box each line is aligned independently. Positioned children ignore it. Distributing
 //   the leftover between children (space-between and friends) is not supported; a two-group
 //   row still puts a grow box between the groups.
 // - a grow / percent child box inside a fit parent measures as 0 before its own clamp, so the
@@ -58,6 +62,7 @@ const text_wrap = @import("text_wrap.zig");
 
 pub const Rect = geom.Rect;
 pub const Vec2 = geom.Vec2;
+pub const Vec2f = geom.Vec2f;
 pub const Color = color_mod.Color;
 pub const DrawList = draw_mod.DrawList;
 pub const BitmapFont = font_mod.BitmapFont;
@@ -75,23 +80,37 @@ pub const Sizing = union(enum) {
 
 pub const Align = enum { start, center, end };
 
-/// Nine-way attachment point of an anchored child inside the parent content box.
-pub const AnchorAt = enum {
-    top_left,
-    top_center,
-    top_right,
-    center_left,
-    center,
-    center_right,
-    bottom_left,
-    bottom_center,
-    bottom_right,
+/// One edge of a positioned box, measured inward from that edge of the parent content box.
+///
+/// `px` and `percent` add, so one edge expresses CSS `calc(<percentage> + <length>)`;
+/// `percent` is a fraction, 1.0 meaning 100% of the parent content box on that axis.
+/// Either part may be negative, which moves the box outward, past that edge.
+pub const Inset = union(enum) {
+    auto,
+    length: struct { px: i32 = 0, percent: f32 = 0 },
 };
 
-/// Overlay placement. `offset` is added after aligning `at` to the parent content box.
-pub const Anchor = struct {
-    at: AnchorAt,
-    offset: Vec2 = .{ .x = 0, .y = 0 },
+/// Out-of-flow placement inside the parent content box (CSS `position: absolute`).
+///
+/// The containing block is always the direct parent: there is no search for a positioned
+/// ancestor, and no way to escape the parent's box from here. Placing a subtree against
+/// something further up is a different mechanism, not a wider version of this one.
+///
+/// Which insets are set decides the shape of the placement on each axis independently:
+/// neither pins the box at the content origin, one pins it to that edge, and both pin both
+/// edges and take the size from the distance between them (`Sizing` on that axis must then
+/// be `.fit` or `.grow`; a `.fixed` or `.percent` size would contradict the two insets).
+pub const Position = struct {
+    left: Inset = .auto,
+    top: Inset = .auto,
+    right: Inset = .auto,
+    bottom: Inset = .auto,
+    /// Fraction of the box's own size subtracted after the insets resolve, the way CSS
+    /// pairs `left: 50%` with `translate: -50%`: 0 puts the box's leading edge on the
+    /// resolved point, 0.5 its centre, 1.0 its trailing edge. Any finite value is legal,
+    /// including outside [0, 1], which overshoots on purpose. Ignored on an axis where
+    /// both insets are set, because the size came from the parent rather than the box.
+    pivot: Vec2f = .{},
 };
 
 /// Box border. Emit order is bg → children → border (border draws on top of children).
@@ -137,8 +156,8 @@ pub const BoxConfig = struct {
     /// never takes the remainder either. Children that overflow the parent leave no
     /// leftover, and neither does a `.fit` main axis unless `min_*` widened it.
     ///
-    /// In a `wrap` box each line is aligned independently. Anchored children are placed by
-    /// their own `Anchor` and ignore this.
+    /// In a `wrap` box each line is aligned independently. Positioned children are placed by
+    /// their own `Position` and ignore this.
     align_main: Align = .start,
     align_cross: Align = .start,
     bg: ?Color = null,
@@ -155,15 +174,15 @@ pub const BoxConfig = struct {
     /// [0, content_natural - viewport] before passing.
     scroll_x: i32 = 0,
     scroll_y: i32 = 0,
-    /// When set, this box is an overlay on its parent: it does not take part in
-    /// the parent's fit measure, main-axis cursor, gap, grow share, wrap line
-    /// split, or line cross size. Its own size is resolved against the parent
-    /// content box (fixed = value, fit = measured, percent = fraction of parent
-    /// content, grow = fill parent content on that axis, ignoring weight).
-    /// min/max clamp still applies. Draw order is tree order — later siblings
-    /// paint on top. An explicit `id` is cached and hit-tested like any other box.
-    /// Several siblings may be anchored.
-    anchor: ?Anchor = null,
+    /// When set, this box is out of its parent's flow: it does not take part in the
+    /// parent's fit measure, main-axis cursor, gap, grow share, wrap line split, or line
+    /// cross size. Its own size is resolved against the parent content box (fixed = value,
+    /// fit = measured, percent = fraction of parent content, grow = fill parent content on
+    /// that axis ignoring weight), except on an axis pinned by both insets, where the two
+    /// insets give the size. min/max clamp still applies. Draw order is tree order — later
+    /// siblings paint on top. An explicit `id` is cached and hit-tested like any other box.
+    /// Several siblings may be positioned.
+    position: ?Position = null,
 };
 
 /// Draw callback for a custom leaf. Called with the final rect after endFrame finalizes layout.
@@ -202,9 +221,9 @@ pub const Node = struct {
     /// Non-overlay children. `child_count - flow_child_count` is the overlay count.
     /// Written in `appendChild` so measure/place never recounts.
     flow_child_count: u32 = 0,
-    /// True when at least one direct child has `cfg.anchor != null`.
-    /// A false box takes the pre-overlay walk (no extra sibling scan).
-    has_anchored_child: bool = false,
+    /// True when at least one direct child has `cfg.position != null`.
+    /// A false box takes the in-flow walk (no extra sibling scan).
+    has_positioned_child: bool = false,
     measured_w: i32 = 0,
     measured_h: i32 = 0,
     /// Content extent after place, in border-box units (max child edge + both paddings).
@@ -236,20 +255,26 @@ pub fn appendChild(parent: *Node, child: *Node) void {
     }
     parent.last_child = child;
     parent.child_count += 1;
-    if (child.cfg.anchor != null) {
-        parent.has_anchored_child = true;
+    if (child.cfg.position != null) {
+        parent.has_positioned_child = true;
     } else {
         parent.flow_child_count += 1;
     }
 }
 
 /// Detect invalid Sizing values in debug builds (called from beginBox).
+/// Whether a `Sizing` value is legal. A percent must be a finite, non-negative fraction:
+/// an infinity would otherwise pass a bare `>= 0` and reach the resolve as a size.
+pub fn sizingValid(s: Sizing) bool {
+    return switch (s) {
+        .fixed => |n| n >= 0,
+        .percent => |f| std.math.isFinite(f) and f >= 0,
+        else => true,
+    };
+}
+
 pub fn assertSizingValid(s: Sizing) void {
-    switch (s) {
-        .fixed => |n| std.debug.assert(n >= 0),
-        .percent => |f| std.debug.assert(f >= 0),
-        else => {},
-    }
+    std.debug.assert(sizingValid(s));
 }
 
 /// Whether `cfg.wrap` is legal with the main/cross Sizing pair.
@@ -299,6 +324,42 @@ pub fn assertBoxConfigValid(cfg: BoxConfig) void {
     std.debug.assert(cfg.max_width >= cfg.min_width);
     std.debug.assert(cfg.max_height >= cfg.min_height);
     std.debug.assert(wrapConfigValid(cfg));
+    std.debug.assert(positionConfigValid(cfg));
+}
+
+fn insetValid(inset: Inset) bool {
+    return switch (inset) {
+        .auto => true,
+        .length => |l| std.math.isFinite(l.percent),
+    };
+}
+
+/// Whether `cfg.position` is legal with the Sizing pair.
+///
+/// Pinning both edges of an axis states the size twice over if that axis also carries a
+/// `.fixed` or `.percent` size — the insets say one thing and the size says another. Rather
+/// than pick a winner silently (CSS drops one inset and moves on), that pair is rejected:
+/// `.fit` and `.grow` are the sizes that mean "whatever is available", which is exactly what
+/// two insets supply.
+pub fn positionConfigValid(cfg: BoxConfig) bool {
+    const pos = cfg.position orelse return true;
+    if (!std.math.isFinite(pos.pivot.x) or !std.math.isFinite(pos.pivot.y)) return false;
+    inline for (.{ pos.left, pos.top, pos.right, pos.bottom }) |inset| {
+        if (!insetValid(inset)) return false;
+    }
+    if (pos.left != .auto and pos.right != .auto) {
+        switch (cfg.width) {
+            .fixed, .percent => return false,
+            else => {},
+        }
+    }
+    if (pos.top != .auto and pos.bottom != .auto) {
+        switch (cfg.height) {
+            .fixed, .percent => return false,
+            else => {},
+        }
+    }
+    return true;
 }
 
 /// Declared fixed size after min/max clamp, or -1 when the axis is not `.fixed`.
@@ -373,34 +434,34 @@ fn effectiveCrossGap(cfg: BoxConfig) i32 {
     return cfg.cross_gap orelse cfg.gap;
 }
 
-fn isAnchored(node: *const Node) bool {
-    return node.cfg.anchor != null;
+fn isPositioned(node: *const Node) bool {
+    return node.cfg.position != null;
 }
 
 fn firstFlowChild(node: *const Node) ?*Node {
     var it = node.first_child;
     while (it) |c| {
-        if (!isAnchored(c)) return c;
+        if (!isPositioned(c)) return c;
         it = c.next_sibling;
     }
     return null;
 }
 
 fn firstOnLine(node: *const Node) ?*Node {
-    return if (node.has_anchored_child) firstFlowChild(node) else node.first_child;
+    return if (node.has_positioned_child) firstFlowChild(node) else node.first_child;
 }
 
 fn nextFlowSibling(node: *const Node) ?*Node {
     var it = node.next_sibling;
     while (it) |c| {
-        if (!isAnchored(c)) return c;
+        if (!isPositioned(c)) return c;
         it = c.next_sibling;
     }
     return null;
 }
 
-fn nextLinePeer(node: *const Node, skip_anchored: bool) ?*Node {
-    return if (skip_anchored) nextFlowSibling(node) else node.next_sibling;
+fn nextLinePeer(node: *const Node, skip_positioned: bool) ?*Node {
+    return if (skip_positioned) nextFlowSibling(node) else node.next_sibling;
 }
 
 fn crossAxis(cfg: BoxConfig) Axis {
@@ -415,10 +476,24 @@ fn gapTotal(gap: i32, child_count: u32) i32 {
     return if (child_count > 1) gap * (@as(i32, @intCast(child_count)) - 1) else 0;
 }
 
-/// Percent resolve: floor(content × f) with no sum correction (leftover px absorbed by grow).
+/// floor(content x f) in f64, as an i64 so the caller decides what range the result must fit.
+/// Returns null when the product leaves the i64 range, which a finite f32 can still do.
+fn percentFloor(content: i32, f: f32) ?i64 {
+    const product = @floor(@as(f64, @floatFromInt(content)) * @as(f64, f));
+    if (!(product >= min_i64_f64 and product <= max_i64_f64)) return null;
+    return @intFromFloat(product);
+}
+
+const min_i64_f64: f64 = -9223372036854775808.0;
+const max_i64_f64: f64 = 9223372036854775808.0;
+
+/// Percent resolve for `Sizing.percent`: floor(content × f) with no sum correction (leftover
+/// px absorbed by grow). The fraction is non-negative and finite (`sizingValid`), and the
+/// content it scales is a placed size, so the product is in range by construction.
 fn percentOf(content: i32, f: f32) i32 {
-    std.debug.assert(f >= 0);
-    return @intFromFloat(@floor(@as(f64, @floatFromInt(content)) * @as(f64, f)));
+    std.debug.assert(sizingValid(.{ .percent = f }));
+    const v = percentFloor(content, f).?;
+    return @intCast(v);
 }
 
 /// Width measure (post-order). Text leaves use `measureIntrinsicWidth` only —
@@ -502,9 +577,9 @@ fn computeMeasured(node: *const Node, axis: Axis) i32 {
             if (mainAxis(node.cfg) == axis) {
                 var sum: i32 = 0;
                 var it = node.first_child;
-                if (node.has_anchored_child) {
+                if (node.has_positioned_child) {
                     while (it) |c| : (it = c.next_sibling) {
-                        if (isAnchored(c)) continue;
+                        if (isPositioned(c)) continue;
                         sum += measuredOf(c, axis);
                     }
                 } else {
@@ -514,9 +589,9 @@ fn computeMeasured(node: *const Node, axis: Axis) i32 {
             } else {
                 var max_child: i32 = 0;
                 var it = node.first_child;
-                if (node.has_anchored_child) {
+                if (node.has_positioned_child) {
                     while (it) |c| : (it = c.next_sibling) {
-                        if (isAnchored(c)) continue;
+                        if (isPositioned(c)) continue;
                         max_child = @max(max_child, measuredOf(c, axis));
                     }
                 } else {
@@ -599,35 +674,35 @@ fn wrapEntrySize(child: *const Node, main: Axis, content_main: i32) i32 {
     };
 }
 
-fn nextLineStart(first: *Node, content_main: i32, gap: i32, main: Axis, skip_anchored: bool) ?*Node {
+fn nextLineStart(first: *Node, content_main: i32, gap: i32, main: Axis, skip_positioned: bool) ?*Node {
     var used = wrapEntrySize(first, main, content_main);
-    var it = nextLinePeer(first, skip_anchored);
+    var it = nextLinePeer(first, skip_positioned);
     while (it) |c| {
         const entry = wrapEntrySize(c, main, content_main);
         if (used + gap + entry > content_main) return c;
         used += gap + entry;
-        it = nextLinePeer(c, skip_anchored);
+        it = nextLinePeer(c, skip_positioned);
     }
     return null;
 }
 
-fn countUntil(first: *Node, end: ?*Node, skip_anchored: bool) u32 {
+fn countUntil(first: *Node, end: ?*Node, skip_positioned: bool) u32 {
     var n: u32 = 0;
     var it: ?*Node = first;
     while (it) |c| {
         if (c == end) break;
         n += 1;
-        it = nextLinePeer(c, skip_anchored);
+        it = nextLinePeer(c, skip_positioned);
     }
     return n;
 }
 
-fn lineHasClamp(first: *Node, end: ?*Node, axis: Axis, skip_anchored: bool) bool {
+fn lineHasClamp(first: *Node, end: ?*Node, axis: Axis, skip_positioned: bool) bool {
     var it: ?*Node = first;
     while (it) |c| {
         if (c == end) break;
         if (hasAxisClamp(c, axis)) return true;
-        it = nextLinePeer(c, skip_anchored);
+        it = nextLinePeer(c, skip_positioned);
     }
     return false;
 }
@@ -637,7 +712,7 @@ fn lineHasClamp(first: *Node, end: ?*Node, axis: Axis, skip_anchored: bool) bool
 /// min 0 has cross 0 (same idea as grow/percent measuring 0 inside a fit parent).
 /// This reads the declared Sizing and takes no leaf exception, unlike computeMeasured:
 /// a leaf declaring grow / percent contributes its min here, not its intrinsic size.
-fn lineCrossSize(first: *Node, end: ?*Node, cross: Axis, skip_anchored: bool) i32 {
+fn lineCrossSize(first: *Node, end: ?*Node, cross: Axis, skip_positioned: bool) i32 {
     var line_cross: i32 = 0;
     var it: ?*Node = first;
     while (it) |c| {
@@ -648,7 +723,7 @@ fn lineCrossSize(first: *Node, end: ?*Node, cross: Axis, skip_anchored: bool) i3
             .fit => clampAxis(c, cross, measuredOf(c, cross)),
         };
         line_cross = @max(line_cross, contrib);
-        it = nextLinePeer(c, skip_anchored);
+        it = nextLinePeer(c, skip_positioned);
     }
     return line_cross;
 }
@@ -668,7 +743,7 @@ fn measureWrapCross(node: *const Node, cross: Axis) i32 {
     const gap = node.cfg.gap;
     const cgap = effectiveCrossGap(node.cfg);
     const pad = axisPadding(node.cfg, cross);
-    const skip = node.has_anchored_child;
+    const skip = node.has_positioned_child;
     var first = firstOnLine(node);
     if (first == null) return pad;
     var total: i32 = 0;
@@ -768,7 +843,7 @@ fn placeChildrenOnAxis(node: *Node, axis: Axis) void {
     } else {
         placeLinearOnAxis(node, axis);
     }
-    if (node.has_anchored_child) placeAnchoredOnAxis(node, axis);
+    if (node.has_positioned_child) placePositionedOnAxis(node, axis);
 }
 
 fn placeLinearOnAxis(node: *Node, axis: Axis) void {
@@ -798,14 +873,14 @@ fn placeLinearOnAxis(node: *Node, axis: Axis) void {
             cfg.gap,
             axis,
             acc,
-            node.has_anchored_child,
+            node.has_positioned_child,
             cfg.align_main,
         );
         if (axis == .h) commitExtent(node, max_right, max_bottom);
-    } else if (node.has_anchored_child) {
+    } else if (node.has_positioned_child) {
         var it = node.first_child;
         while (it) |c| : (it = c.next_sibling) {
-            if (isAnchored(c)) continue;
+            if (isPositioned(c)) continue;
             const size: i32 = resolveSize(c, axis, content_size, null);
             const cross_off: i32 = switch (cfg.align_cross) {
                 .start => 0,
@@ -875,11 +950,11 @@ fn placeLineMain(
     gap: i32,
     axis: Axis,
     extent: ?ExtentAcc,
-    skip_anchored: bool,
+    skip_positioned: bool,
     align_main: Align,
 ) void {
     const start = first orelse return;
-    if (!lineHasClamp(start, end, axis, skip_anchored)) {
+    if (!lineHasClamp(start, end, axis, skip_positioned)) {
         var used: i32 = gapTotal(gap, count);
         var grow_total: i64 = 0;
         var it: ?*Node = start;
@@ -891,7 +966,7 @@ fn placeLineMain(
                 .percent => |f| used += percentOf(content_main, f),
                 .grow => |w| grow_total += w,
             }
-            it = nextLinePeer(c, skip_anchored);
+            it = nextLinePeer(c, skip_positioned);
         }
         var remaining: i64 = @max(0, content_main - used);
         var w_rest: i64 = grow_total;
@@ -916,7 +991,7 @@ fn placeLineMain(
             descendPlace(c, axis, cursor, size);
             if (extent) |acc| accumulateExtent(acc.parent, c, acc.max_right, acc.max_bottom);
             cursor += size + gap;
-            it = nextLinePeer(c, skip_anchored);
+            it = nextLinePeer(c, skip_positioned);
         }
         return;
     }
@@ -941,7 +1016,7 @@ fn placeLineMain(
                 used += sz;
             },
         }
-        it = nextLinePeer(c, skip_anchored);
+        it = nextLinePeer(c, skip_positioned);
     }
 
     // Whatever no child took, once every child has a size. Zero unless the loop below
@@ -954,7 +1029,7 @@ fn placeLineMain(
         while (it) |c| {
             if (c == end) break;
             if (isUnfrozenGrow(c, axis)) w_rest += growWeightOf(c, axis);
-            it = nextLinePeer(c, skip_anchored);
+            it = nextLinePeer(c, skip_positioned);
         }
         if (w_rest == 0) {
             // Every child's size is in `used`: non-grow and weight-0 grow from the seed
@@ -983,7 +1058,7 @@ fn placeLineMain(
                     any_freeze = true;
                 }
             }
-            it = nextLinePeer(c, skip_anchored);
+            it = nextLinePeer(c, skip_positioned);
         }
         if (!any_freeze) {
             peel_rem = remaining;
@@ -998,7 +1073,7 @@ fn placeLineMain(
                     wr -= w;
                     setRectSizeI(c, axis, @intCast(take));
                 }
-                it = nextLinePeer(c, skip_anchored);
+                it = nextLinePeer(c, skip_positioned);
             }
             break;
         }
@@ -1012,7 +1087,7 @@ fn placeLineMain(
         descendPlace(c, axis, cursor, size);
         if (extent) |acc| accumulateExtent(acc.parent, c, acc.max_right, acc.max_bottom);
         cursor += size + gap;
-        it = nextLinePeer(c, skip_anchored);
+        it = nextLinePeer(c, skip_positioned);
     }
 }
 
@@ -1039,7 +1114,7 @@ fn placeWrapMain(node: *Node) void {
     else
         node.rect.y + cfg.padding[0];
     const scroll: i32 = if (main == .w) cfg.scroll_x else cfg.scroll_y;
-    const skip = node.has_anchored_child;
+    const skip = node.has_positioned_child;
     var first = firstOnLine(node);
     while (first) |f| {
         const end = nextLineStart(f, content_main, cfg.gap, main, skip);
@@ -1063,7 +1138,7 @@ fn placeWrapCross(node: *Node, record_extent: bool, main_known: bool) void {
     var max_right: i32 = 0;
     var max_bottom: i32 = 0;
     var cross_cursor = origin_cross - scroll_cross;
-    const skip = node.has_anchored_child;
+    const skip = node.has_positioned_child;
     var first = firstOnLine(node);
     while (first) |f| {
         const end = nextLineStart(f, content_main, cfg.gap, main, skip);
@@ -1096,36 +1171,154 @@ fn descendPlace(child: *Node, axis: Axis, pos: i32, size: i32) void {
     }
 }
 
-fn anchoredAlign(at: AnchorAt, axis: Axis) Align {
+/// The two insets of a `Position` on one axis, leading first.
+fn axisInsets(pos: Position, axis: Axis) struct { leading: Inset, trailing: Inset } {
     return switch (axis) {
-        .w => switch (at) {
-            .top_left, .center_left, .bottom_left => .start,
-            .top_center, .center, .bottom_center => .center,
-            .top_right, .center_right, .bottom_right => .end,
-        },
-        .h => switch (at) {
-            .top_left, .top_center, .top_right => .start,
-            .center_left, .center, .center_right => .center,
-            .bottom_left, .bottom_center, .bottom_right => .end,
+        .w => .{ .leading = pos.left, .trailing = pos.right },
+        .h => .{ .leading = pos.top, .trailing = pos.bottom },
+    };
+}
+
+fn axisPivot(pos: Position, axis: Axis) f32 {
+    return switch (axis) {
+        .w => pos.pivot.x,
+        .h => pos.pivot.y,
+    };
+}
+
+/// Resolve one inset against the parent content size. A null result means `.auto` — the edge
+/// is not pinned — which is a placement, not a failure; a value that leaves the range is the
+/// failure. Keeping the two apart matters: folding an overflow into `.auto` would silently
+/// place the box at the content origin instead of reporting that it cannot be placed.
+fn resolveInset(inset: Inset, content: i32) PositionResolveError!?i64 {
+    return switch (inset) {
+        .auto => null,
+        .length => |l| blk: {
+            const pct = percentFloor(content, l.percent) orelse return error.OutOfDomain;
+            break :blk addChecked(pct, l.px) orelse return error.OutOfDomain;
         },
     };
 }
 
-fn anchoredPos(anchor: Anchor, axis: Axis, origin: i32, content: i32, size: i32) i32 {
-    const off: i32 = if (axis == .w) anchor.offset.x else anchor.offset.y;
-    const base: i32 = switch (anchoredAlign(anchor.at, axis)) {
-        .start => origin,
-        .center => origin + @divFloor(content - size, 2),
-        .end => origin + content - size,
-    };
-    return base + off;
+fn addChecked(a: i64, b: i64) ?i64 {
+    const r = @addWithOverflow(a, b);
+    return if (r[1] != 0) null else r[0];
 }
 
-/// Place overlay children after flow children on this axis.
+fn subChecked(a: i64, b: i64) ?i64 {
+    const r = @subWithOverflow(a, b);
+    return if (r[1] != 0) null else r[0];
+}
+
+/// Coordinates layout produces must land inside the domain `render` accepts, so that a tree
+/// which lays out cannot fail to draw. `geom` owns those bounds; they are narrower than i32.
+fn coordInDomain(v: i64) bool {
+    return v >= geom.MIN_COORD and v <= geom.MAX_COORD;
+}
+
+fn extentInDomain(v: i64) bool {
+    return v >= 0 and v <= geom.MAX_EXTENT;
+}
+
+/// floor(size × pivot). `null` when the product leaves the i64 range.
+fn pivotOffset(size: i32, pivot: f32) ?i64 {
+    return percentFloor(size, pivot);
+}
+
+pub const PositionResolveError = error{OutOfDomain};
+
+/// Where a positioned child sits on one axis, before the parent's scroll is applied.
+pub const PositionedAxis = struct { pos: i32, size: i32 };
+
+/// Resolve a positioned child on one axis. Pure and checked: every intermediate is computed
+/// in i64 and the result is required to land in the coordinate domain, so an input that
+/// cannot be placed is reported rather than wrapped or truncated.
+///
+/// The four inset combinations are four different placements, not one with special cases:
+///
+/// | leading | trailing | size                          | position                                       |
+/// |---------|----------|-------------------------------|------------------------------------------------|
+/// | auto    | auto     | the box's own `Sizing`        | content origin, less the pivot                  |
+/// | set     | auto     | the box's own `Sizing`        | origin + leading, less the pivot                |
+/// | auto    | set      | the box's own `Sizing`        | the trailing edge, less size and the pivot      |
+/// | set     | set      | the gap between the two edges | origin + leading; the pivot does not apply      |
+///
+/// Both-set is the only case where the parent decides the size, which is why the pivot —
+/// a fraction of the box's own size — has nothing to shift there.
+///
+/// Hot path: every frame on the GUI layout path, once per positioned child per axis.
+/// Not a per-pixel loop; not RT.
+fn resolvePositionedChecked(
+    child: *const Node,
+    axis: Axis,
+    origin: i32,
+    content: i32,
+) PositionResolveError!PositionedAxis {
+    const pos_cfg = child.cfg.position.?;
+    const insets = axisInsets(pos_cfg, axis);
+    const leading = try resolveInset(insets.leading, content);
+    const trailing = try resolveInset(insets.trailing, content);
+
+    if (leading != null and trailing != null) {
+        // Both edges pinned: the distance between them is the size, and the pivot has
+        // nothing to shift because the size no longer comes from the box.
+        const available = subChecked(subChecked(content, leading.?) orelse
+            return error.OutOfDomain, trailing.?) orelse return error.OutOfDomain;
+        const clamped = clampAxisI64(child, axis, available);
+        if (!extentInDomain(clamped)) return error.OutOfDomain;
+        const p = addChecked(origin, leading.?) orelse return error.OutOfDomain;
+        if (!coordInDomain(p)) return error.OutOfDomain;
+        if (!coordInDomain(addChecked(p, clamped) orelse return error.OutOfDomain))
+            return error.OutOfDomain;
+        return .{ .pos = @intCast(p), .size = @intCast(clamped) };
+    }
+
+    const size = resolveSize(child, axis, content, null);
+    if (!extentInDomain(size)) return error.OutOfDomain;
+    const pivot_off = pivotOffset(size, axisPivot(pos_cfg, axis)) orelse
+        return error.OutOfDomain;
+
+    const base: i64 = if (leading) |l|
+        addChecked(origin, l) orelse return error.OutOfDomain
+    else if (trailing) |t| blk: {
+        // Measured inward from the trailing edge, so the box's own size comes off too.
+        const edge = addChecked(origin, content) orelse return error.OutOfDomain;
+        const inner = subChecked(edge, t) orelse return error.OutOfDomain;
+        break :blk subChecked(inner, size) orelse return error.OutOfDomain;
+    } else origin;
+
+    const p = subChecked(base, pivot_off) orelse return error.OutOfDomain;
+    if (!coordInDomain(p)) return error.OutOfDomain;
+    if (!coordInDomain(addChecked(p, size) orelse return error.OutOfDomain))
+        return error.OutOfDomain;
+    return .{ .pos = @intCast(p), .size = @intCast(size) };
+}
+
+/// `resolvePositionedChecked` for a config that `assertBoxConfigValid` has already accepted
+/// and a parent whose own rect is in the coordinate domain. A failure here is a bug, not a
+/// caller error, so it trips an assertion instead of propagating.
+fn resolvePositioned(
+    child: *const Node,
+    axis: Axis,
+    origin: i32,
+    content: i32,
+) PositionedAxis {
+    return resolvePositionedChecked(child, axis, origin, content) catch
+        @panic("layout: positioned child resolves outside the coordinate domain");
+}
+
+/// `clampAxis` in i64, for a size that has not been proven to fit i32 yet.
+fn clampAxisI64(node: *const Node, axis: Axis, raw: i64) i64 {
+    const lo: i64 = minOf(node, axis);
+    const hi: i64 = maxOf(node, axis);
+    return @min(@max(raw, lo), hi);
+}
+
+/// Place positioned children after the in-flow ones on this axis.
 ///
 /// Hot path: every frame on the GUI layout path. O(children) per box.
 /// Not a per-pixel loop; not RT.
-fn placeAnchoredOnAxis(node: *Node, axis: Axis) void {
+fn placePositionedOnAxis(node: *Node, axis: Axis) void {
     const cfg = node.cfg;
     const content_origin: i32 = if (axis == .w)
         node.rect.x + cfg.padding[3]
@@ -1135,15 +1328,14 @@ fn placeAnchoredOnAxis(node: *Node, axis: Axis) void {
     const scroll: i32 = if (axis == .w) cfg.scroll_x else cfg.scroll_y;
     var it = node.first_child;
     while (it) |c| : (it = c.next_sibling) {
-        const anchor = c.cfg.anchor orelse continue;
-        const size = resolveSize(c, axis, content_size, null);
-        const pos = anchoredPos(anchor, axis, content_origin, content_size, size) - scroll;
-        descendPlace(c, axis, pos, size);
+        if (c.cfg.position == null) continue;
+        const r = resolvePositioned(c, axis, content_origin, content_size);
+        descendPlace(c, axis, r.pos - scroll, r.size);
     }
-    if (axis == .h) foldAnchoredExtent(node);
+    if (axis == .h) foldPositionedExtent(node);
 }
 
-fn foldAnchoredExtent(node: *Node) void {
+fn foldPositionedExtent(node: *Node) void {
     if (node.cfg.clip_children) return;
     var max_right: i32 = if (node.content_w >= 0)
         node.content_w - node.cfg.padding[3] - node.cfg.padding[1]
@@ -1156,7 +1348,7 @@ fn foldAnchoredExtent(node: *Node) void {
     var any = false;
     var it = node.first_child;
     while (it) |c| : (it = c.next_sibling) {
-        if (!isAnchored(c)) continue;
+        if (!isPositioned(c)) continue;
         accumulateExtent(node, c, &max_right, &max_bottom);
         any = true;
     }
@@ -2750,34 +2942,74 @@ test "extent: a leaf does not record content extent (stays -1)" {
     try std.testing.expectEqual(@as(i32, -1), t.content_h);
 }
 
-fn anchored(at: AnchorAt, w: i32, h: i32) Node {
+fn positioned(pos: Position, w: i32, h: i32) Node {
     return .{ .cfg = .{
-        .anchor = .{ .at = at },
+        .position = pos,
         .width = .{ .fixed = w },
         .height = .{ .fixed = h },
     } };
 }
 
-test "appendChild: overlay membership is recorded at insert" {
+/// A box out of flow whose placement the test does not care about: both insets auto on
+/// both axes, which pins it at the parent's content origin.
+fn atOrigin(w: i32, h: i32) Node {
+    return positioned(.{}, w, h);
+}
+
+const LegacyAt = enum { start, center, end };
+
+/// The nine attachment points this engine used to offer, written as insets. Kept as a
+/// test fixture because it is the translation a reader migrating old code needs, and
+/// because two of the three cases per axis are easy to get subtly wrong:
+///
+/// - `.end` is the only one whose offset changes sign. An inset is measured *inward* from
+///   its edge, so "8px further right" is `right = -8`, not `right = 8`.
+/// - `.center` is `50%` paired with a half-size pivot, the CSS idiom. It is **not** an exact
+///   translation: the old rule was `floor((content - size) / 2)` and this one is
+///   `floor(content x 0.5) - floor(size x 0.5)`, which differ by 1px when content and size
+///   have different parity (content 100, size 11: 44 against 45). The four corners are the
+///   only cases that translate exactly.
+fn legacyPosition(h: LegacyAt, v: LegacyAt, dx: i32, dy: i32) Position {
+    var p: Position = .{};
+    switch (h) {
+        .start => p.left = .{ .length = .{ .px = dx } },
+        .center => {
+            p.left = .{ .length = .{ .px = dx, .percent = 0.5 } };
+            p.pivot.x = 0.5;
+        },
+        .end => p.right = .{ .length = .{ .px = -dx } },
+    }
+    switch (v) {
+        .start => p.top = .{ .length = .{ .px = dy } },
+        .center => {
+            p.top = .{ .length = .{ .px = dy, .percent = 0.5 } };
+            p.pivot.y = 0.5;
+        },
+        .end => p.bottom = .{ .length = .{ .px = -dy } },
+    }
+    return p;
+}
+
+test "appendChild: out-of-flow membership is recorded at insert" {
     var parent: Node = .{};
     var a: Node = boxWH(10, 10);
-    var badge: Node = anchored(.center, 8, 8);
+    var badge: Node = atOrigin(8, 8);
     var c: Node = boxWH(10, 10);
     appendChild(&parent, &a);
-    try std.testing.expect(!parent.has_anchored_child);
+    try std.testing.expect(!parent.has_positioned_child);
     try std.testing.expectEqual(@as(u32, 1), parent.flow_child_count);
     try std.testing.expectEqual(@as(u32, 1), parent.child_count);
     appendChild(&parent, &badge);
-    try std.testing.expect(parent.has_anchored_child);
+    try std.testing.expect(parent.has_positioned_child);
     try std.testing.expectEqual(@as(u32, 1), parent.flow_child_count);
     try std.testing.expectEqual(@as(u32, 2), parent.child_count);
     appendChild(&parent, &c);
-    try std.testing.expect(parent.has_anchored_child);
+    try std.testing.expect(parent.has_positioned_child);
     try std.testing.expectEqual(@as(u32, 2), parent.flow_child_count);
     try std.testing.expectEqual(@as(u32, 3), parent.child_count);
 }
 
-test "anchor: a tree with no overlay keeps the pre-overlay rect contract" {
+test "position: a tree with none keeps the in-flow rect contract" {
     var root: Node = .{ .cfg = .{ .direction = .row, .width = .{ .fixed = 200 }, .height = .{ .fixed = 50 } } };
     var f: Node = .{ .cfg = .{ .width = .{ .fixed = 50 }, .height = .{ .fixed = 10 } } };
     var p: Node = .{ .cfg = .{ .width = .{ .percent = 0.25 }, .height = .{ .fixed = 10 } } };
@@ -2787,7 +3019,7 @@ test "anchor: a tree with no overlay keeps the pre-overlay rect contract" {
     appendChild(&root, &p);
     appendChild(&root, &g1);
     appendChild(&root, &g2);
-    try std.testing.expect(!root.has_anchored_child);
+    try std.testing.expect(!root.has_positioned_child);
     try std.testing.expectEqual(root.child_count, root.flow_child_count);
     measure(&root, test_font);
     place(&root, .{ .x = 0, .y = 0, .w = 200, .h = 50 });
@@ -2810,7 +3042,7 @@ test "anchor: a tree with no overlay keeps the pre-overlay rect contract" {
     var b: Node = boxWH(40, 10);
     appendChild(&wrap_root, &a);
     appendChild(&wrap_root, &b);
-    try std.testing.expect(!wrap_root.has_anchored_child);
+    try std.testing.expect(!wrap_root.has_positioned_child);
     try std.testing.expectEqual(wrap_root.child_count, wrap_root.flow_child_count);
     layoutOnce(&wrap_root, 50, 50);
     try std.testing.expectEqual(@as(i32, 0), a.rect.x);
@@ -2821,10 +3053,10 @@ test "anchor: a tree with no overlay keeps the pre-overlay rect contract" {
     try std.testing.expectEqual(@as(u32, 10), a.rect.h);
 }
 
-test "anchor: a fit parent does not grow for an anchored child" {
+test "position: a fit parent does not grow for a positioned child" {
     var root: Node = .{ .cfg = .{ .direction = .row } };
     var flow: Node = boxWH(10, 10);
-    var badge: Node = anchored(.top_right, 80, 80);
+    var badge: Node = positioned(legacyPosition(.end, .start, 0, 0), 80, 80);
     appendChild(&root, &flow);
     appendChild(&root, &badge);
     measure(&root, test_font);
@@ -2832,7 +3064,7 @@ test "anchor: a fit parent does not grow for an anchored child" {
     try std.testing.expectEqual(@as(i32, 10), root.measured_h);
 }
 
-test "anchor: wrap line split and line cross ignore the overlay" {
+test "position: wrap line split and line cross ignore the positioned child" {
     var with: Node = .{ .cfg = .{
         .direction = .row,
         .wrap = true,
@@ -2840,7 +3072,7 @@ test "anchor: wrap line split and line cross ignore the overlay" {
         .height = .fit,
     } };
     var a: Node = boxWH(40, 10);
-    var badge: Node = anchored(.center, 40, 40);
+    var badge: Node = atOrigin(40, 40);
     var b: Node = boxWH(40, 10);
     appendChild(&with, &a);
     appendChild(&with, &badge);
@@ -2867,7 +3099,7 @@ test "anchor: wrap line split and line cross ignore the overlay" {
     try std.testing.expectEqual(@as(i32, 20), with.measured_h);
 }
 
-test "anchor: gap and grow share ignore the overlay" {
+test "position: gap and grow share ignore the positioned child" {
     var root: Node = .{ .cfg = .{
         .direction = .row,
         .width = .{ .fixed = 100 },
@@ -2875,7 +3107,7 @@ test "anchor: gap and grow share ignore the overlay" {
         .gap = 10,
     } };
     var g1: Node = .{ .cfg = .{ .width = .{ .grow = 1 }, .height = .{ .fixed = 10 } } };
-    var badge: Node = anchored(.center, 8, 8);
+    var badge: Node = atOrigin(8, 8);
     var g2: Node = .{ .cfg = .{ .width = .{ .grow = 1 }, .height = .{ .fixed = 10 } } };
     appendChild(&root, &g1);
     appendChild(&root, &badge);
@@ -2887,26 +3119,22 @@ test "anchor: gap and grow share ignore the overlay" {
     try std.testing.expectEqual(@as(i32, 55), g2.rect.x);
 }
 
-test "anchor: nine-way placement plus offset" {
+test "position: the nine legacy attachment points as insets" {
     var root: Node = .{ .cfg = .{
         .direction = .column,
         .width = .{ .fixed = 100 },
         .height = .{ .fixed = 80 },
         .padding = .{ 4, 4, 4, 4 },
     } };
-    var tl: Node = .{ .cfg = .{
-        .anchor = .{ .at = .top_left, .offset = .{ .x = 2, .y = 3 } },
-        .width = .{ .fixed = 10 },
-        .height = .{ .fixed = 8 },
-    } };
-    var tc: Node = anchored(.top_center, 10, 8);
-    var tr: Node = anchored(.top_right, 10, 8);
-    var cl: Node = anchored(.center_left, 10, 8);
-    var c: Node = anchored(.center, 10, 8);
-    var cr: Node = anchored(.center_right, 10, 8);
-    var bl: Node = anchored(.bottom_left, 10, 8);
-    var bc: Node = anchored(.bottom_center, 10, 8);
-    var br: Node = anchored(.bottom_right, 10, 8);
+    var tl: Node = positioned(legacyPosition(.start, .start, 2, 3), 10, 8);
+    var tc: Node = positioned(legacyPosition(.center, .start, 0, 0), 10, 8);
+    var tr: Node = positioned(legacyPosition(.end, .start, 0, 0), 10, 8);
+    var cl: Node = positioned(legacyPosition(.start, .center, 0, 0), 10, 8);
+    var c: Node = positioned(legacyPosition(.center, .center, 0, 0), 10, 8);
+    var cr: Node = positioned(legacyPosition(.end, .center, 0, 0), 10, 8);
+    var bl: Node = positioned(legacyPosition(.start, .end, 0, 0), 10, 8);
+    var bc: Node = positioned(legacyPosition(.center, .end, 0, 0), 10, 8);
+    var br: Node = positioned(legacyPosition(.end, .end, 0, 0), 10, 8);
     appendChild(&root, &tl);
     appendChild(&root, &tc);
     appendChild(&root, &tr);
@@ -2917,8 +3145,12 @@ test "anchor: nine-way placement plus offset" {
     appendChild(&root, &bc);
     appendChild(&root, &br);
     layoutOnce(&root, 100, 80);
-    const mid_x: i32 = 4 + @divFloor(92 - 10, 2);
-    const mid_y: i32 = 4 + @divFloor(72 - 8, 2);
+    // Content box is 92 x 72 at (4, 4). The centre values are the new rule computed by hand:
+    // 4 + floor(92 x 0.5) - floor(10 x 0.5) = 45, and 4 + floor(72 x 0.5) - floor(8 x 0.5) = 36.
+    // Both axes happen to agree with the old rule here because the sizes share parity with
+    // the content box; the test below pins a case where they do not.
+    const mid_x: i32 = 45;
+    const mid_y: i32 = 36;
     try std.testing.expectEqual(@as(i32, 4 + 2), tl.rect.x);
     try std.testing.expectEqual(@as(i32, 4 + 3), tl.rect.y);
     try std.testing.expectEqual(mid_x, tc.rect.x);
@@ -2939,7 +3171,174 @@ test "anchor: nine-way placement plus offset" {
     try std.testing.expectEqual(@as(i32, 80 - 4 - 8), br.rect.y);
 }
 
-test "anchor: grow fills the parent content box on both axes" {
+test "position: centring is 50% plus a half pivot, floored on each term" {
+    // Content 100, size 11. The old nine-way rule gave floor((100 - 11) / 2) = 44; this rule
+    // gives floor(100 x 0.5) - floor(11 x 0.5) = 50 - 5 = 45. Pinning 45 is what makes the
+    // two-term form the contract, rather than an accident nobody would notice.
+    var root: Node = .{ .cfg = .{
+        .direction = .column,
+        .width = .{ .fixed = 100 },
+        .height = .{ .fixed = 100 },
+    } };
+    var c: Node = positioned(.{
+        .left = .{ .length = .{ .percent = 0.5 } },
+        .top = .{ .length = .{ .percent = 0.5 } },
+        .pivot = .{ .x = 0.5, .y = 0.5 },
+    }, 11, 11);
+    appendChild(&root, &c);
+    layoutOnce(&root, 100, 100);
+    try std.testing.expectEqual(@as(i32, 45), c.rect.x);
+    try std.testing.expectEqual(@as(i32, 45), c.rect.y);
+}
+
+test "position: px and percent on one edge add, as CSS calc does" {
+    var root: Node = .{ .cfg = .{
+        .direction = .column,
+        .width = .{ .fixed = 200 },
+        .height = .{ .fixed = 200 },
+    } };
+    var a: Node = positioned(.{
+        .left = .{ .length = .{ .px = 10, .percent = 0.5 } },
+        .top = .{ .length = .{ .px = -10, .percent = 0.5 } },
+    }, 20, 20);
+    appendChild(&root, &a);
+    layoutOnce(&root, 200, 200);
+    try std.testing.expectEqual(@as(i32, 110), a.rect.x); // 100 + 10
+    try std.testing.expectEqual(@as(i32, 90), a.rect.y); // 100 - 10
+}
+
+test "position: percent floors, and floors toward negative infinity when the fraction is negative" {
+    var root: Node = .{ .cfg = .{
+        .direction = .column,
+        .width = .{ .fixed = 101 },
+        .height = .{ .fixed = 101 },
+    } };
+    var a: Node = positioned(.{
+        .left = .{ .length = .{ .percent = 0.5 } },
+        .top = .{ .length = .{ .percent = -0.5 } },
+    }, 10, 10);
+    appendChild(&root, &a);
+    layoutOnce(&root, 101, 101);
+    try std.testing.expectEqual(@as(i32, 50), a.rect.x); // floor(101 * 0.5)
+    try std.testing.expectEqual(@as(i32, -51), a.rect.y); // floor(101 * -0.5)
+}
+
+test "position: one inset per axis pins that edge, from either side" {
+    var root: Node = .{ .cfg = .{
+        .direction = .column,
+        .width = .{ .fixed = 100 },
+        .height = .{ .fixed = 100 },
+        .padding = .{ 5, 5, 5, 5 },
+    } };
+    var from_start: Node = positioned(.{
+        .left = .{ .length = .{ .px = 7 } },
+        .top = .{ .length = .{ .px = 3 } },
+    }, 10, 10);
+    var from_end: Node = positioned(.{
+        .right = .{ .length = .{ .px = 7 } },
+        .bottom = .{ .length = .{ .px = 3 } },
+    }, 10, 10);
+    appendChild(&root, &from_start);
+    appendChild(&root, &from_end);
+    layoutOnce(&root, 100, 100);
+    try std.testing.expectEqual(@as(i32, 12), from_start.rect.x); // 5 + 7
+    try std.testing.expectEqual(@as(i32, 8), from_start.rect.y); // 5 + 3
+    try std.testing.expectEqual(@as(i32, 78), from_end.rect.x); // 5 + 90 - 7 - 10
+    try std.testing.expectEqual(@as(i32, 82), from_end.rect.y); // 5 + 90 - 3 - 10
+}
+
+test "position: pinning both edges takes the size from the gap between them" {
+    var root: Node = .{ .cfg = .{
+        .direction = .column,
+        .width = .{ .fixed = 200 },
+        .height = .{ .fixed = 100 },
+    } };
+    var bar: Node = .{ .cfg = .{
+        .position = .{
+            .left = .{ .length = .{ .px = 12 } },
+            .right = .{ .length = .{ .px = 12 } },
+            .top = .{ .length = .{ .px = 0 } },
+            // A pivot that would shift the box if the axis were not pinned on both sides.
+            .pivot = .{ .x = 0.5, .y = 0 },
+        },
+        .width = .fit,
+        .height = .{ .fixed = 20 },
+    } };
+    appendChild(&root, &bar);
+    layoutOnce(&root, 200, 100);
+    try std.testing.expectEqual(@as(i32, 12), bar.rect.x);
+    try std.testing.expectEqual(@as(u32, 176), bar.rect.w); // 200 - 12 - 12
+    try std.testing.expectEqual(@as(i32, 0), bar.rect.y);
+}
+
+test "position: both edges pinned, then clamped, keeps the leading edge and gives up the trailing one" {
+    var root: Node = .{ .cfg = .{
+        .direction = .column,
+        .width = .{ .fixed = 200 },
+        .height = .{ .fixed = 100 },
+    } };
+    var narrow: Node = .{ .cfg = .{
+        .position = .{
+            .left = .{ .length = .{ .px = 10 } },
+            .right = .{ .length = .{ .px = 10 } },
+        },
+        .width = .{ .grow = 1 },
+        .height = .{ .fixed = 10 },
+        .max_width = 50,
+    } };
+    var wide: Node = .{ .cfg = .{
+        .position = .{
+            .left = .{ .length = .{ .px = 10 } },
+            .right = .{ .length = .{ .px = 170 } },
+        },
+        .width = .{ .grow = 1 },
+        .height = .{ .fixed = 10 },
+        .min_width = 60,
+    } };
+    appendChild(&root, &narrow);
+    appendChild(&root, &wide);
+    layoutOnce(&root, 200, 100);
+    try std.testing.expectEqual(@as(i32, 10), narrow.rect.x);
+    try std.testing.expectEqual(@as(u32, 50), narrow.rect.w);
+    // min wins over the available 20, and the overflow goes past the trailing edge.
+    try std.testing.expectEqual(@as(i32, 10), wide.rect.x);
+    try std.testing.expectEqual(@as(u32, 60), wide.rect.w);
+}
+
+test "position: a negative inset puts the box outside the parent" {
+    var root: Node = .{ .cfg = .{
+        .direction = .column,
+        .width = .{ .fixed = 100 },
+        .height = .{ .fixed = 100 },
+    } };
+    var out: Node = positioned(.{
+        .left = .{ .length = .{ .px = -5 } },
+        .top = .{ .length = .{ .px = -6 } },
+    }, 10, 10);
+    appendChild(&root, &out);
+    layoutOnce(&root, 100, 100);
+    try std.testing.expectEqual(@as(i32, -5), out.rect.x);
+    try std.testing.expectEqual(@as(i32, -6), out.rect.y);
+}
+
+test "position: a pivot outside [0, 1] overshoots, and is not clamped" {
+    var root: Node = .{ .cfg = .{
+        .direction = .column,
+        .width = .{ .fixed = 100 },
+        .height = .{ .fixed = 100 },
+    } };
+    var past: Node = positioned(.{
+        .left = .{ .length = .{ .px = 50 } },
+        .top = .{ .length = .{ .px = 50 } },
+        .pivot = .{ .x = 2.0, .y = -1.0 },
+    }, 10, 10);
+    appendChild(&root, &past);
+    layoutOnce(&root, 100, 100);
+    try std.testing.expectEqual(@as(i32, 30), past.rect.x); // 50 - floor(10 * 2)
+    try std.testing.expectEqual(@as(i32, 60), past.rect.y); // 50 - floor(10 * -1)
+}
+
+test "position: grow fills the parent content box on both axes" {
     var root: Node = .{ .cfg = .{
         .direction = .column,
         .width = .{ .fixed = 80 },
@@ -2947,7 +3346,7 @@ test "anchor: grow fills the parent content box on both axes" {
         .padding = .{ 2, 6, 4, 8 },
     } };
     var cover: Node = .{ .cfg = .{
-        .anchor = .{ .at = .top_left },
+        .position = .{},
         .width = .{ .grow = 3 },
         .height = .{ .grow = 9 },
     } };
@@ -2959,7 +3358,7 @@ test "anchor: grow fills the parent content box on both axes" {
     try std.testing.expectEqual(@as(i32, 2), cover.rect.y);
 }
 
-test "anchor: percent resolves against the parent content box" {
+test "position: percent size resolves against the parent content box" {
     var root: Node = .{ .cfg = .{
         .direction = .column,
         .width = .{ .fixed = 100 },
@@ -2967,7 +3366,7 @@ test "anchor: percent resolves against the parent content box" {
         .padding = .{ 0, 10, 0, 10 },
     } };
     var p: Node = .{ .cfg = .{
-        .anchor = .{ .at = .top_left },
+        .position = .{},
         .width = .{ .percent = 0.5 },
         .height = .{ .percent = 0.25 },
     } };
@@ -2977,21 +3376,21 @@ test "anchor: percent resolves against the parent content box" {
     try std.testing.expectEqual(@as(u32, 20), p.rect.h); // floor(80 * 0.25)
 }
 
-test "anchor: min/max clamp applies to the resolved size" {
+test "position: min/max clamp applies to the resolved size" {
     var root: Node = .{ .cfg = .{
         .direction = .column,
         .width = .{ .fixed = 100 },
         .height = .{ .fixed = 80 },
     } };
     var lo: Node = .{ .cfg = .{
-        .anchor = .{ .at = .top_left },
+        .position = .{},
         .width = .{ .fixed = 10 },
         .height = .{ .fixed = 10 },
         .min_width = 30,
         .min_height = 20,
     } };
     var hi: Node = .{ .cfg = .{
-        .anchor = .{ .at = .top_right },
+        .position = legacyPosition(.end, .start, 0, 0),
         .width = .{ .grow = 1 },
         .height = .{ .percent = 1.0 },
         .max_width = 40,
@@ -3006,12 +3405,12 @@ test "anchor: min/max clamp applies to the resolved size" {
     try std.testing.expectEqual(@as(u32, 25), hi.rect.h);
 }
 
-test "anchor: wrapText still folds the overlay subtree; parent fit height ignores it" {
+test "position: a positioned child is still measured, and its subtree still wraps" {
     var arena_inst = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_inst.deinit();
     var root: Node = .{ .cfg = .{ .direction = .column, .width = .{ .fixed = 40 }, .height = .fit } };
     var badge: Node = .{ .cfg = .{
-        .anchor = .{ .at = .top_left },
+        .position = .{},
         .width = .{ .grow = 1 },
         .height = .fit,
         .direction = .column,
@@ -3026,7 +3425,25 @@ test "anchor: wrapText still folds the overlay subtree; parent fit height ignore
     try std.testing.expectEqual(@as(i32, 0), root.measured_h);
 }
 
-test "anchor: clip_children=false folds overflow into extent; clip excludes it" {
+test "position: the parent's scroll shifts a positioned child too" {
+    var root: Node = .{ .cfg = .{
+        .direction = .column,
+        .width = .{ .fixed = 100 },
+        .height = .{ .fixed = 100 },
+        .scroll_x = 7,
+        .scroll_y = 9,
+    } };
+    var a: Node = positioned(.{
+        .left = .{ .length = .{ .px = 20 } },
+        .top = .{ .length = .{ .px = 30 } },
+    }, 10, 10);
+    appendChild(&root, &a);
+    layoutOnce(&root, 100, 100);
+    try std.testing.expectEqual(@as(i32, 13), a.rect.x); // 20 - 7
+    try std.testing.expectEqual(@as(i32, 21), a.rect.y); // 30 - 9
+}
+
+test "position: clip_children=false folds overflow into extent; clip excludes it" {
     {
         var root: Node = .{ .cfg = .{
             .direction = .column,
@@ -3035,11 +3452,7 @@ test "anchor: clip_children=false folds overflow into extent; clip excludes it" 
             .clip_children = false,
         } };
         var flow: Node = boxWH(10, 10);
-        var badge: Node = .{ .cfg = .{
-            .anchor = .{ .at = .top_right, .offset = .{ .x = 20, .y = 0 } },
-            .width = .{ .fixed = 20 },
-            .height = .{ .fixed = 10 },
-        } };
+        var badge: Node = positioned(legacyPosition(.end, .start, 20, 0), 20, 10);
         appendChild(&root, &flow);
         appendChild(&root, &badge);
         layoutOnce(&root, 40, 40);
@@ -3054,17 +3467,186 @@ test "anchor: clip_children=false folds overflow into extent; clip excludes it" 
             .clip_children = true,
         } };
         var flow: Node = boxWH(10, 10);
-        var badge: Node = .{ .cfg = .{
-            .anchor = .{ .at = .top_right, .offset = .{ .x = 20, .y = 0 } },
-            .width = .{ .fixed = 20 },
-            .height = .{ .fixed = 10 },
-        } };
+        var badge: Node = positioned(legacyPosition(.end, .start, 20, 0), 20, 10);
         appendChild(&root, &flow);
         appendChild(&root, &badge);
         layoutOnce(&root, 40, 40);
         try std.testing.expectEqual(@as(i32, 10), root.content_w);
         try std.testing.expectEqual(@as(i32, 10), root.content_h);
     }
+}
+
+test "positionConfigValid: pinning both edges of an axis rejects a size that states it again" {
+    const both_x: Position = .{
+        .left = .{ .length = .{ .px = 1 } },
+        .right = .{ .length = .{ .px = 1 } },
+    };
+    const both_y: Position = .{
+        .top = .{ .length = .{ .px = 1 } },
+        .bottom = .{ .length = .{ .px = 1 } },
+    };
+    // The two sizes that mean "whatever is available" are the ones two insets can supply.
+    try std.testing.expect(positionConfigValid(.{ .position = both_x, .width = .fit }));
+    try std.testing.expect(positionConfigValid(.{ .position = both_x, .width = .{ .grow = 1 } }));
+    try std.testing.expect(positionConfigValid(.{ .position = both_y, .height = .fit }));
+    try std.testing.expect(positionConfigValid(.{ .position = both_y, .height = .{ .grow = 1 } }));
+    // The two that state a size of their own contradict the insets.
+    try std.testing.expect(!positionConfigValid(.{ .position = both_x, .width = .{ .fixed = 10 } }));
+    try std.testing.expect(!positionConfigValid(.{ .position = both_x, .width = .{ .percent = 0.5 } }));
+    try std.testing.expect(!positionConfigValid(.{ .position = both_y, .height = .{ .fixed = 10 } }));
+    try std.testing.expect(!positionConfigValid(.{ .position = both_y, .height = .{ .percent = 0.5 } }));
+    // Pinning one axis says nothing about the other.
+    try std.testing.expect(positionConfigValid(.{ .position = both_x, .height = .{ .fixed = 10 } }));
+    try std.testing.expect(positionConfigValid(.{ .position = both_y, .width = .{ .fixed = 10 } }));
+    // A box with no position is unaffected.
+    try std.testing.expect(positionConfigValid(.{ .width = .{ .fixed = 10 } }));
+}
+
+test "positionConfigValid: a non-finite percent or pivot is rejected on every edge" {
+    const nan = std.math.nan(f32);
+    const inf = std.math.inf(f32);
+    for ([_]f32{ nan, inf, -inf }) |bad| {
+        try std.testing.expect(!positionConfigValid(.{ .position = .{ .left = .{ .length = .{ .percent = bad } } } }));
+        try std.testing.expect(!positionConfigValid(.{ .position = .{ .top = .{ .length = .{ .percent = bad } } } }));
+        try std.testing.expect(!positionConfigValid(.{ .position = .{ .right = .{ .length = .{ .percent = bad } } } }));
+        try std.testing.expect(!positionConfigValid(.{ .position = .{ .bottom = .{ .length = .{ .percent = bad } } } }));
+        try std.testing.expect(!positionConfigValid(.{ .position = .{ .pivot = .{ .x = bad } } }));
+        try std.testing.expect(!positionConfigValid(.{ .position = .{ .pivot = .{ .y = bad } } }));
+    }
+    // A finite percent outside [0, 1] and a finite pivot outside [0, 1] are both legal.
+    try std.testing.expect(positionConfigValid(.{ .position = .{
+        .left = .{ .length = .{ .percent = -2.5 } },
+        .pivot = .{ .x = 3.0, .y = -1.0 },
+    } }));
+}
+
+test "sizingValid: a percent size must be finite and non-negative" {
+    try std.testing.expect(sizingValid(.{ .percent = 0 }));
+    try std.testing.expect(sizingValid(.{ .percent = 2.5 }));
+    try std.testing.expect(!sizingValid(.{ .percent = -0.5 }));
+    try std.testing.expect(!sizingValid(.{ .percent = std.math.nan(f32) }));
+    // The bare `>= 0` this replaced let an infinity through and on into the resolve.
+    try std.testing.expect(!sizingValid(.{ .percent = std.math.inf(f32) }));
+    try std.testing.expect(sizingValid(.{ .fixed = 0 }));
+    try std.testing.expect(!sizingValid(.{ .fixed = -1 }));
+    try std.testing.expect(sizingValid(.fit));
+    try std.testing.expect(sizingValid(.{ .grow = 0 }));
+}
+
+/// Independent of `resolvePositionedChecked`: the four placements written out again, in the
+/// plainest form, so that a test comparing against them is comparing against the contract
+/// rather than against a second copy of the implementation's own arithmetic.
+fn oraclePos(
+    leading: ?i64,
+    trailing: ?i64,
+    origin: i64,
+    content: i64,
+    size: i64,
+    pivot: f32,
+) i64 {
+    const shift: i64 = @intFromFloat(@floor(@as(f64, @floatFromInt(size)) * @as(f64, pivot)));
+    if (leading != null and trailing != null) return origin + leading.?;
+    if (leading) |l| return origin + l - shift;
+    if (trailing) |t| return origin + content - t - size - shift;
+    return origin - shift;
+}
+
+test "position: the four placements match an independent oracle over a swept input space" {
+    // A deterministic sweep rather than one example per branch: a case built from the one
+    // input the author had in mind passes while the general claim is false.
+    const contents = [_]i32{ 0, 1, 101, 200 };
+    const origins = [_]i32{ 0, 37, -19 };
+    const px_values = [_]i32{ 0, 7, -7 };
+    const pcts = [_]f32{ 0, 0.5, -0.25 };
+    const pivots = [_]f32{ 0, 0.5, 1.0, -0.5 };
+    const size: i32 = 11;
+
+    for (contents) |content| {
+        for (origins) |origin| {
+            for (px_values) |px| {
+                for (pcts) |pct| {
+                    for (pivots) |pivot| {
+                        const len: Inset = .{ .length = .{ .px = px, .percent = pct } };
+                        const combos = [_]Position{
+                            .{ .pivot = .{ .x = pivot } },
+                            .{ .left = len, .pivot = .{ .x = pivot } },
+                            .{ .right = len, .pivot = .{ .x = pivot } },
+                            .{ .left = len, .right = len, .pivot = .{ .x = pivot } },
+                        };
+                        for (combos, 0..) |pos, i| {
+                            const both = i == 3;
+                            var child: Node = .{ .cfg = .{
+                                .position = pos,
+                                .width = if (both) .fit else .{ .fixed = size },
+                                .height = .{ .fixed = size },
+                            } };
+                            child.measured_w = size;
+                            const r = try resolvePositionedChecked(&child, .w, origin, content);
+
+                            const inset: i64 = @as(i64, px) +
+                                @as(i64, @intFromFloat(@floor(@as(f64, @floatFromInt(content)) * @as(f64, pct))));
+                            const leading: ?i64 = if (i == 1 or both) inset else null;
+                            const trailing: ?i64 = if (i == 2 or both) inset else null;
+                            const expect_size: i64 = if (both)
+                                @max(0, @as(i64, content) - inset - inset)
+                            else
+                                size;
+                            const expect_pos = oraclePos(leading, trailing, origin, content, expect_size, pivot);
+
+                            try std.testing.expectEqual(@as(i32, @intCast(expect_size)), r.size);
+                            try std.testing.expectEqual(@as(i32, @intCast(expect_pos)), r.pos);
+
+                            // Where both edges are pinned inward and the gap is real, the box
+                            // stays inside it. Outside that region the claim is simply false —
+                            // a negative inset is a request to overflow — so it is not asserted.
+                            if (both and inset >= 0 and @as(i64, content) - inset - inset >= 0) {
+                                try std.testing.expectEqual(@as(i32, @intCast(origin + inset)), r.pos);
+                                try std.testing.expect(r.pos + r.size <= origin + content);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+test "position: a placement that leaves the coordinate domain is reported, not wrapped" {
+    const huge_px: i32 = std.math.maxInt(i32);
+    const cases = [_]Position{
+        // A percentage large enough to throw the box out of the drawable domain.
+        .{ .left = .{ .length = .{ .percent = 1e30 } } },
+        // The same through the pixel term.
+        .{ .left = .{ .length = .{ .px = huge_px } } },
+        // And through the pivot, which scales the box's own size.
+        .{ .left = .{ .length = .{} }, .pivot = .{ .x = -1e30 } },
+        // Pinned on both sides, far enough apart that the size leaves the extent domain.
+        .{ .left = .{ .length = .{ .px = -huge_px } }, .right = .{ .length = .{ .px = -huge_px } } },
+    };
+    for (cases, 0..) |pos, i| {
+        const both = i == 3;
+        var child: Node = .{ .cfg = .{
+            .position = pos,
+            .width = if (both) .fit else .{ .fixed = 10 },
+            .height = .{ .fixed = 10 },
+        } };
+        child.measured_w = 10;
+        try std.testing.expectError(
+            error.OutOfDomain,
+            resolvePositionedChecked(&child, .w, 0, 100),
+        );
+    }
+}
+
+test "position: a placement at the edge of the coordinate domain still resolves" {
+    var child: Node = .{ .cfg = .{
+        .position = .{ .left = .{ .length = .{ .px = geom.MAX_COORD - 10 } } },
+        .width = .{ .fixed = 10 },
+        .height = .{ .fixed = 10 },
+    } };
+    const r = try resolvePositionedChecked(&child, .w, 0, 100);
+    try std.testing.expectEqual(@as(i32, geom.MAX_COORD - 10), r.pos);
+    try std.testing.expectEqual(@as(i32, 10), r.size);
 }
 
 test "BoxConfig: radius defaults to zero" {

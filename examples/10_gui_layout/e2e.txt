@@ -21,6 +21,20 @@ expect layout am_end_x=516
 expect layout am_grow_x=0
 expect layout am_grow_w=576
 
+# A positioned child places itself by insets from the parent content box and takes no
+# part in the parent's size: the plain panel and the one carrying the badge measure the
+# same, so pos_dh is 0.
+expect layout pos_plain_h=42
+expect layout pos_ovl_h=42
+expect layout pos_dh=0
+
+# The badge sits at top=-8, right=-12 of a 40 px content box starting at x=80, y=697:
+# 80 + 40 - (-12) - 10 = 122 and 697 + (-8) = 689. An inset is measured inward, so both
+# values are negative here; getting either sign backwards moves the badge by twice the
+# offset and fails this pair.
+expect layout pos_badge_x=122
+expect layout pos_badge_y=689
+
 snapshot fb
 
 # Narrowing the catalog changes the leftover, so the offsets have to follow it.

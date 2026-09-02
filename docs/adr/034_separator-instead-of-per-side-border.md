@@ -112,7 +112,7 @@ the same in a wrap box as in an ordinary one**:
   `ctx.text`, created `.grow` on the width axis, does give the rule its length), a
   **box** sized `.fixed` or `.fit` contributes its resolved size, a **box** sized
   `.grow` or `.percent` contributes its `min_*` — zero by default but not always
-  zero, since a `min_width = 20` sibling gives the rule 20 — and an **anchored**
+  zero, since a `min_width = 20` sibling gives the rule 20 — and a **positioned**
   child contributes nothing.
 - `wrap = true`: the cross size of the line the rule lands on, which
   `lineCrossSize` takes over **that line's children only**, and **by declared

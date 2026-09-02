@@ -192,6 +192,10 @@ pub fn main(init: std.process.Init) !void {
 
     std.debug.print("\n=== GUI full Context frame benchmark (ReleaseFast, animation=off, logical {d}x{d}) ===\n", .{ W, H });
     std.debug.print("measure: beginFrame + widget build + endFrame + gui.render (scale matrix)\n", .{});
+    // Per-box config and node footprint: every box copies a BoxConfig into an arena Node each
+    // frame, so a field added to BoxConfig is paid by every tree, including trees that never
+    // use that field.
+    std.debug.print("sizeof: BoxConfig={d}\n", .{@sizeOf(gui.BoxConfig)});
     // scale 1x / 1.5x / 2x x rows 500/1000
     // peak_bytes: peak allocation of one scenario, measured after reset() inside runScenario
     for ([_]f32{ 1.0, 1.5, 2.0 }) |s| {
@@ -212,6 +216,7 @@ pub fn main(init: std.process.Init) !void {
     std.debug.print("\n=== GUI overlay / indent-guide scenarios (scale 1.0) ===\n", .{});
     try runAnchorScenario(io, &tracker, 0, "anchor-0");
     try runAnchorScenario(io, &tracker, 100, "anchor-100");
+    try runFlowScenario(io, &tracker, 100, "flow-100");
     try runIndentScenario(io, &tracker, 500, 0, "indent-d0-500");
     try runIndentScenario(io, &tracker, 1000, 0, "indent-d0-1000");
     try runIndentScenario(io, &tracker, 500, 3, "indent-d3-500");
@@ -292,7 +297,34 @@ fn buildAnchors(ctx: *gui.Context, n: u32) void {
     var i: u32 = 0;
     while (i < n) : (i += 1) {
         ctx.beginBox(.{
-            .anchor = .{ .at = .top_right, .offset = .{ .x = @intCast(@mod(i, 40)), .y = @intCast(@mod(i, 20)) } },
+            .position = .{
+                .right = .{ .length = .{ .px = -@as(i32, @intCast(@mod(i, 40))) } },
+                .top = .{ .length = .{ .px = @intCast(@mod(i, 20)) } },
+            },
+            .width = .{ .fixed = 12 },
+            .height = .{ .fixed = 12 },
+            .bg = gui.Color.rgba(0xC0, 0x30, 0x30, 0xFF),
+        });
+        ctx.endBox();
+    }
+    ctx.endBox();
+}
+
+/// The control for `buildAnchors`: the same host, the same child count and the same child size,
+/// with every child in normal flow. It exists so that the cost of an out-of-flow feature is read
+/// against a tree of equal shape that does not use it, rather than against an empty tree.
+fn buildFlowBoxes(ctx: *gui.Context, n: u32) void {
+    ctx.beginBox(.{
+        .direction = .column,
+        .width = .{ .grow = 1 },
+        .height = .{ .grow = 1 },
+        .padding = .{ 8, 8, 8, 8 },
+        .bg = gui.Color.rgba(0x18, 0x1C, 0x24, 0xFF),
+    });
+    ctx.label("host");
+    var i: u32 = 0;
+    while (i < n) : (i += 1) {
+        ctx.beginBox(.{
             .width = .{ .fixed = 12 },
             .height = .{ .fixed = 12 },
             .bg = gui.Color.rgba(0xC0, 0x30, 0x30, 0xFF),
@@ -415,6 +447,17 @@ fn runAnchorScenario(io: std.Io, tracker: *peak_allocator.PeakTrackingAllocator,
         }
     };
     Gen.n_badges = n;
+    try runCountedScenario(io, tracker, name, Gen.build);
+}
+
+fn runFlowScenario(io: std.Io, tracker: *peak_allocator.PeakTrackingAllocator, n: u32, name: []const u8) !void {
+    const Gen = struct {
+        var n_boxes: u32 = 0;
+        fn build(ctx: *gui.Context) void {
+            buildFlowBoxes(ctx, n_boxes);
+        }
+    };
+    Gen.n_boxes = n;
     try runCountedScenario(io, tracker, name, Gen.build);
 }
 

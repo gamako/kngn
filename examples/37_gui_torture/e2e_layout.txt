@@ -14,6 +14,12 @@ expect layout zero_w=0
 expect layout zero_h=0
 expect layout splitter0_size=200
 expect layout pane0_w=200
+
+# The positioned badge sits at top=-6, right=-6 of a host with no padding, so it hangs 6 px
+# past the host on both sides. An inset is measured inward: flipping either sign would tuck
+# the badge inside instead, reporting -6 here.
+expect layout pos_badge_dx=6
+expect layout pos_badge_dy=6
 digest scroll
 expect scroll outer_scroll_y=0
 expect scroll inner_scroll_y=0

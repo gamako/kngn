@@ -532,7 +532,7 @@ here?" by walking the children every frame is a perfectly correct implementation
 taxes every caller that does not use the feature.
 
 **Record the answer where the structure is built, not where it is consumed.** A flag set
-when a child is inserted turns a per-frame search into a branch. `has_anchored_child` in
+when a child is inserted turns a per-frame search into a branch. `has_positioned_child` in
 `libs/gui/src/layout.zig` is the worked example: without it, a tree holding no overlay
 still paid two extra walks per box per frame.
 

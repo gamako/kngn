@@ -2840,7 +2840,7 @@ pub const SeparatorOpts = struct {
 ///   on the width axis, does give a rule in a `.fit` column its length); a **box** sized
 ///   `.fixed` / `.fit` its resolved size; a **box** sized `.grow` / `.percent` its `min_*` —
 ///   zero by default but not always zero, since `min_width = 20` gives the rule 20; an
-///   **anchored** child nothing at all.
+///   **positioned** child nothing at all.
 /// - **`wrap = true`**: the cross size of the line this rule lands on, which `lineCrossSize`
 ///   takes over that line's children **by declared `Sizing` alone — there is no leaf exception
 ///   on this path**. A `.grow`-declared leaf on the line therefore contributes its `min_*`
@@ -3147,14 +3147,14 @@ test "separator: a row-direction wrap line behaves the same as a column one" {
     try std.testing.expectEqual(@as(u32, 40), paired.rect.h);
 }
 
-test "separator: an anchored sibling does not establish a fit cross axis" {
+test "separator: a positioned sibling does not establish a fit cross axis" {
     var ctx = testCtx();
     defer ctx.deinit();
     // An overlay takes no part in the parent's fit measure, so it cannot give the rule a
     // length however large it is.
     ctx.beginFrame(400, 300);
     ctx.beginBox(.{ .direction = .column, .width = .fit, .height = .{ .fixed = 100 } });
-    ctx.beginBox(.{ .anchor = .{ .at = .top_left }, .width = .{ .fixed = 120 }, .height = .{ .fixed = 40 } });
+    ctx.beginBox(.{ .position = .{ .left = .{ .length = .{} }, .top = .{ .length = .{} } }, .width = .{ .fixed = 120 }, .height = .{ .fixed = 40 } });
     ctx.endBox();
     separator(&ctx, .{});
     ctx.endBox();

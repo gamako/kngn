@@ -284,7 +284,7 @@ ctx.endVirtualList();
 
 - Flex wrap is supported (`BoxConfig.wrap`). Illegal when the main axis is `.fit`, or when a
   grow/percent main axis is paired with a `.fit` cross axis
-- Anchored children (`BoxConfig.anchor`) are overlays: they take no part in the parent's fit
+- Positioned children (`BoxConfig.position`) are out of flow: they take no part in the parent's fit
   measure, main-axis cursor, gap, grow share, wrap line split, or line cross size. Their own
   size is resolved against the parent content box (grow fills that box). Draw order is tree
   order — later siblings paint on top
@@ -293,7 +293,7 @@ ctx.endVirtualList();
   whole line; the gap between children never changes. **A weight>0 `.grow` child normally
   absorbs that space, so `align_main` has no effect in a box that has one** — except when
   every such child is frozen by its own min/max clamp and a remainder is still left. Each
-  `wrap` line is aligned on its own leftover; anchored children ignore it. Distributing the
+  `wrap` line is aligned on its own leftover; positioned children ignore it. Distributing the
   leftover *between* children (`space-between` and friends) is not supported, so a row with
   a group at each end still puts a `.grow` box between the groups
 - No shrink. When children exceed the parent, they overflow (visual clipping via `clip_children`)

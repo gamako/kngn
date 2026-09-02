@@ -2374,7 +2374,7 @@ test "anchor: clip_children clips an overflowing overlay's draw commands" {
     });
     ctx.beginBox(.{
         .id = badge,
-        .anchor = .{ .at = .top_right, .offset = .{ .x = 16, .y = -8 } },
+        .position = .{ .top = .{ .length = .{ .px = -8 } }, .right = .{ .length = .{ .px = -16 } } },
         .width = .{ .fixed = 20 },
         .height = .{ .fixed = 20 },
         .bg = Color.rgba(0xC0, 0x30, 0x30, 0xFF),
@@ -2414,7 +2414,7 @@ test "anchor: an explicit id is cached and hit-tested" {
     ctx.label("host");
     ctx.beginBox(.{
         .id = badge,
-        .anchor = .{ .at = .top_right, .offset = .{ .x = 4, .y = -4 } },
+        .position = .{ .top = .{ .length = .{ .px = -4 } }, .right = .{ .length = .{ .px = -4 } } },
         .width = .{ .fixed = 16 },
         .height = .{ .fixed = 16 },
         .bg = Color.rgba(0xC0, 0x30, 0x30, 0xFF),
@@ -2467,7 +2467,7 @@ test "anchor: a tree with no overlay keeps the pre-overlay rect and DrawCmd cont
     ctx.endBox();
     ctx.endFrame();
 
-    try std.testing.expect(!ctx.layout_root.?.has_anchored_child);
+    try std.testing.expect(!ctx.layout_root.?.has_positioned_child);
     try std.testing.expectEqual(ctx.layout_root.?.child_count, ctx.layout_root.?.flow_child_count);
 
     const row_r = ctx.getNodeRect(row).?;

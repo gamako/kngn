@@ -267,8 +267,7 @@ sized and how it arranges what is inside it. The fields a screen normally needs:
 | `id` | an explicit id. Needed to read the box's settled rectangle back (`ctx.getNodeRect`), which is also what a custom interactive widget runs its behavior against |
 
 `BoxConfig` carries four more that this section does not use: `wrap` and `cross_gap` (flex
-wrapping), `anchor` (turn the child into an overlay that takes no part in its parent's
-layout), and `scroll_x` / `scroll_y` (the offset `beginScrollArea` drives). They are
+wrapping), `position` (place the child by insets from the parent's content box, out of the flow), and `scroll_x` / `scroll_y` (the offset `beginScrollArea` drives). They are
 documented with the rest of the engine in
 [`libs/gui/docs/layout.md`](../libs/gui/docs/layout.md).
 
@@ -329,8 +328,8 @@ time a `.grow` child contributes only its own `min_*` — nothing, by default. E
 then takes back at least what it contributed to that sum, so there is no leftover for the grow
 child. Unlike the cases below this holds whatever the *box* siblings are. Two things take a
 child out of it: a `min_width` / `min_height` on the child, since the clamp applies to every
-`Sizing` and so it still gets its minimum; and `anchor`, which removes the child from the flow
-measure altogether — though an anchored `.grow` child then fills the parent's *content box*,
+`Sizing` and so it still gets its minimum; and `position`, which removes the child from the flow
+measure altogether — though a positioned `.grow` child then fills the parent's *content box*,
 which a `.fit` parent with nothing else in it may still leave at zero. A `min_*` on the
 **parent** does it too, since the same clamp widens the parent's own measured size; and a leaf
 sibling that declares `.grow` (which a wrapping `ctx.text` is) shares the leftover with the
@@ -830,7 +829,7 @@ enabled=1 scanned=1 text_overflow=0 sibling_overlap=0 content_overflow=0 total=0
 `text_overflow` counts visible text whose logical advance or ink height leaves its leaf rectangle;
 `sibling_overlap` counts positive-area overlap between direct flow siblings; and
 `content_overflow` counts ordinary flow content plus padding exceeding its parent rectangle.
-Ellipsis, clipping, scrolling, anchored overlays, and explicit min/max constraints are treated as
+Ellipsis, clipping, scrolling, positioned children, and explicit min/max constraints are treated as
 intentional boundaries. `total` is the sum of the three counters, so `total=0` is the normal
 healthy layout result. Popups, dialogs, and tooltips are outside this probe's normal-layout root.
 

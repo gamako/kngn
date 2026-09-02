@@ -43,7 +43,7 @@ const SECTIONS = [_]SectionMeta{
     .{ .name = "text", .detail = "selectableLabel / textInputId / wrap / overflow / labelStyled", .widgets = 3, .missing = 0 },
     .{ .name = "values", .detail = "slider / checkbox / toggle / radio", .widgets = 4, .missing = 0 },
     .{ .name = "color", .detail = "colorSwatch / SV+hue / imageBox", .widgets = 3, .missing = 0 },
-    .{ .name = "layout", .detail = "splitter / scrollArea / iconButton / tooltip / collapsible / anchor / indent", .widgets = 5, .missing = 0 },
+    .{ .name = "layout", .detail = "splitter / scrollArea / iconButton / tooltip / collapsible / position / indent", .widgets = 5, .missing = 0 },
     .{ .name = "menus", .detail = "popup/contextMenu / menuBar", .widgets = 2, .missing = 0 },
     .{ .name = "stepgrid", .detail = "stepgrid.widgetRow", .widgets = 1, .missing = 0 },
     .{ .name = "table", .detail = "column header / sticky scroll / selected row / ellipsis", .widgets = 1, .missing = 0 },
@@ -92,7 +92,7 @@ const LAYOUT_MATRIX = [_]MatrixRow{
     .{ .name = "iconButton", .cells = .{ "ok", "demo", "demo", "N/A", "N/A", "N/A", "N/A", "N/A", "ok" } },
     .{ .name = "tooltip", .cells = .{ "ok", "demo", "N/A", "N/A", "N/A", "N/A", "N/A", "N/A", "ok" } },
     .{ .name = "collapsible", .cells = .{ "ok", "demo", "demo", "N/A", "N/A", "N/A", "N/A", "N/A", "ok" } },
-    .{ .name = "anchor", .cells = .{ "ok", "demo", "N/A", "N/A", "N/A", "ok", "N/A", "N/A", "N/A" } },
+    .{ .name = "position", .cells = .{ "ok", "demo", "N/A", "N/A", "N/A", "ok", "N/A", "N/A", "N/A" } },
     .{ .name = "indent", .cells = .{ "ok", "demo", "demo", "N/A", "N/A", "ok", "N/A", "N/A", "N/A" } },
 };
 const MENUS_MATRIX = [_]MatrixRow{
@@ -303,7 +303,7 @@ const App = struct {
             Ids.collapsible_child => "button",
             Ids.popup_trigger, Ids.popup => "popup",
             Ids.table => "table",
-            Ids.badge_host, Ids.badge => "anchor",
+            Ids.badge_host, Ids.badge => "position",
             else => if (id >= Ids.table_row0 and id < Ids.table_row0 + 16)
                 "tableRow"
             else if (id >= Ids.tree_row0 and id < Ids.tree_row0 + 16)
@@ -327,7 +327,19 @@ fn galleryDigest(ctx_ptr: *anyopaque, buf: []u8) []const u8 {
             if (dialog_state_data.focus_index) |index| dialog_focus = @intCast(index + 1);
         };
     }
-    return std.fmt.bufPrint(buf, "section={s} index={d} widgets={d} missing={d} schema={s} hot={s} active={s} focused={s} disabled={d} dialog={s} dialog_last={s} dialog_result={s} dialog_focus={d} dialog_shadow={d}", .{
+    // The badge's rect relative to its host: a positioned child is placed by insets from the
+    // parent content box, and an inset that lost its sign moves the badge by twice the offset.
+    // Reporting the offset rather than the absolute rect keeps the check independent of where
+    // the layout section happens to sit on screen.
+    var badge_dx: i32 = -1;
+    var badge_dy: i32 = -1;
+    if (app.ctx.getNodeRect(Ids.badge_host)) |host| {
+        if (app.ctx.getNodeRect(Ids.badge)) |badge| {
+            badge_dx = (host.x + @as(i32, @intCast(host.w))) - (badge.x + @as(i32, @intCast(badge.w)));
+            badge_dy = badge.y - host.y;
+        }
+    }
+    return std.fmt.bufPrint(buf, "section={s} index={d} widgets={d} missing={d} schema={s} hot={s} active={s} focused={s} disabled={d} dialog={s} dialog_last={s} dialog_result={s} dialog_focus={d} dialog_shadow={d} badge_dx={d} badge_dy={d}", .{
         meta.name,
         app.section,
         meta.widgets,
@@ -342,6 +354,8 @@ fn galleryDigest(ctx_ptr: *anyopaque, buf: []u8) []const u8 {
         app.dialog_result,
         dialog_focus,
         dialog_shadow,
+        badge_dx,
+        badge_dy,
     }) catch buf[0..0];
 }
 
@@ -579,7 +593,7 @@ fn renderLayout(ctx: *gui.Context, app: *App) void {
     }
     ctx.endBox();
 
-    ctx.labelEx("anchored overlay (later sibling paints on top)", ctx.style.text_tokens.subtle);
+    ctx.labelEx("positioned overlay (later sibling paints on top)", ctx.style.text_tokens.subtle);
     ctx.beginBox(.{
         .id = Ids.badge_host,
         .width = .{ .fixed = 120 },
@@ -590,7 +604,7 @@ fn renderLayout(ctx: *gui.Context, app: *App) void {
     ctx.label("host");
     ctx.beginBox(.{
         .id = Ids.badge,
-        .anchor = .{ .at = .top_right, .offset = .{ .x = 6, .y = -6 } },
+        .position = .{ .top = .{ .length = .{ .px = -6 } }, .right = .{ .length = .{ .px = -6 } } },
         .width = .{ .fixed = 16 },
         .height = .{ .fixed = 16 },
         .bg = ctx.style.accent.danger,

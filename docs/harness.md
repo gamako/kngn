@@ -208,10 +208,10 @@ The counters have these meanings:
   so correctly wrapped text is not an overflow. Only visible text is counted;
   ellipsis, an ancestor `clip_children`, and a scroll viewport are excluded.
 - `sibling_overlap` counts positive-area intersections between direct flow children of
-  one parent. The children are ordered by x coordinate and checked with a sweep; an
-  anchored child is not a flow sibling for this purpose.
+  one parent. The children are ordered by x coordinate and checked with a sweep; a
+  positioned child is not a flow sibling for this purpose.
 - `content_overflow` counts a non-leaf whose flow content extent plus padding exceeds
-  its rectangle. Anchored children do not contribute to that extent. A clipping box,
+  its rectangle. Positioned children do not contribute to that extent. A clipping box,
   a scrolled viewport, and an explicit min/max constraint are intentional boundaries
   and are excluded.
 

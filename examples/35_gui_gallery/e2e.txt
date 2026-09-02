@@ -101,6 +101,12 @@ digest layout_sanity
 expect layout_sanity total=0
 expect gallery section=layout
 expect gallery widgets=5
+# The badge is a positioned child at top=-6, right=-6. Insets are measured inward from the
+# host's *content* box, and the host pads by 8 on the right and 6 on top, so the badge's
+# right edge lands 8 - 6 = 2 px inside the host's border box and its top exactly on it.
+# Flipping either sign moves the badge by twice the inset (dx 2 -> 14, dy 0 -> 12).
+expect gallery badge_dx=2
+expect gallery badge_dy=0
 snapshot fb
 # layout: iconButton hover 500ms → tooltip (beginFrame is frame_index/60 → step 32 ≈ 0.53s)
 # pen center ≈ (144,124): outer pad16 + header64 + gap16 + content pad16 + icon pad4

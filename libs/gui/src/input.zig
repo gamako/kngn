@@ -12,10 +12,7 @@ const geom = @import("geom.zig");
 pub const Vec2 = geom.Vec2;
 
 /// Scroll amount is f32 (keeps trackpad precision without rounding).
-pub const Vec2f = struct {
-    x: f32 = 0,
-    y: f32 = 0,
-};
+pub const Vec2f = geom.Vec2f;
 
 /// Currently held button set (LSB-first; same layout as platform.MouseButtons).
 pub const MouseButtons = packed struct(u8) {

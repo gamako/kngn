@@ -744,6 +744,35 @@ the sign of the drop as “no regression”, not as a speedup claim.
 | 500 | 2.0 | 2048×1536 | 630633 | 563070 | −10.7% |
 | 1000 | 2.0 | 2048×1536 | 850457 | 813212 | −4.4% |
 
+### Out-of-flow placement, and what a field on `BoxConfig` costs
+
+`BoxConfig` is copied into an arena `Node` for **every** box, every frame, so widening it
+is paid by trees that never touch the new field. Replacing the nine-way overlay attachment
+with per-edge insets took it from **128 to 168 bytes**. The question that decides whether
+that is acceptable is not how the feature performs, but whether the trees that do not use
+it got slower.
+
+`anchor-0` (a host with no positioned child at all) and `flow-100` (the same host, the same
+hundred children at the same size, all in normal flow) are the controls; `anchor-100` is the
+same shape with every child positioned. `flow-100` exists because `anchor-0` alone is not a
+control: it holds no children, so it would report the cost of a wider `BoxConfig` on a tree
+of one box.
+
+| scenario | before (ns) | after (ns) | Δ |
+|---|---:|---:|---:|
+| `anchor-0` (no positioned child) | 50734 / 50895 | 50617 / 50551 / 50651 | −0.3% |
+| `flow-100` (100 in-flow children) | 54299 | 51925 / 51693 / 51289 | −4.9% |
+| `anchor-100` (100 positioned children) | 58822 / 58586 | 59308 / 59465 / 59486 | +1.2% |
+
+Neither control regressed. The `flow-100` drop is not claimed as a speedup — nothing in the
+change makes in-flow placement do less work, and run-to-run spread on this bench is already
+several percent — it is reported as measured. `flow-100` has one before sample against three
+after; `anchor-0` has two against three.
+
+The +1.2% on `anchor-100` is the feature's own path doing more: four insets to resolve
+instead of one enum plus an offset, with every intermediate computed in i64 and checked
+against the coordinate domain.
+
 ### `bench-path` (one run, ns and scratch peak)
 
 Scratch is area(f32)+cover(f32)+8bpp = 9 bytes/px, capped at 4 MiB

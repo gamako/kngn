@@ -50,6 +50,8 @@ const Ids = struct {
     const outer_scroll: gui.Id = 0x3720;
     const inner_scroll: gui.Id = 0x3721;
     const zero_box: gui.Id = 0x3730;
+    const pos_host: gui.Id = 0x3738;
+    const pos_badge: gui.Id = 0x3739;
     const zero_btn: gui.Id = 0x3731;
     const zero_input: gui.Id = 0x3732;
     // text
@@ -327,6 +329,18 @@ fn layoutDigest(ctx_ptr: *anyopaque, buf: []u8) []const u8 {
                 appendFmt(buf, &off, " zero_w=-1 zero_h=-1", .{});
             }
             rectField(app, Ids.zero_btn, "zero_btn", buf, &off);
+            // The positioned badge, as an offset from its host's border box. The host has no
+            // padding here, so both numbers are the inset itself: an inset is measured inward,
+            // so -6 puts the badge 6 px outside on that side. A sign that flipped would report
+            // +6 instead, which is the failure this pair exists to catch.
+            if (app.ctx.getNodeRect(Ids.pos_host)) |host| {
+                if (app.ctx.getNodeRect(Ids.pos_badge)) |badge| {
+                    appendFmt(buf, &off, " pos_badge_dx={d} pos_badge_dy={d}", .{
+                        (badge.x + @as(i32, @intCast(badge.w))) - (host.x + @as(i32, @intCast(host.w))),
+                        host.y - badge.y,
+                    });
+                } else appendFmt(buf, &off, " pos_badge_dx=-1 pos_badge_dy=-1", .{});
+            } else appendFmt(buf, &off, " pos_badge_dx=-1 pos_badge_dy=-1", .{});
         },
         .input_state => {
             rectField(app, Ids.slider, "slider", buf, &off);
@@ -550,13 +564,15 @@ fn renderLayout(ctx: *gui.Context, app: *App) void {
     app.overflow = if (app.screen_w < 2000 or app.screen_h < 500) 1 else 0;
 
     ctx.beginBox(.{
+        .id = Ids.pos_host,
         .width = .{ .fixed = 80 },
         .height = .{ .fixed = 28 },
         .bg = ctx.style.surface.elevated,
     });
-    ctx.label("anchor-host");
+    ctx.label("position-host");
     ctx.beginBox(.{
-        .anchor = .{ .at = .top_right, .offset = .{ .x = 6, .y = -6 } },
+        .id = Ids.pos_badge,
+        .position = .{ .top = .{ .length = .{ .px = -6 } }, .right = .{ .length = .{ .px = -6 } } },
         .width = .{ .fixed = 12 },
         .height = .{ .fixed = 12 },
         .bg = ctx.style.accent.danger,

@@ -45,7 +45,7 @@ fn childFlowExtent(node: *const layout.Node) Extent {
     var max_bottom: i64 = 0;
     var child = node.first_child;
     while (child) |c| : (child = c.next_sibling) {
-        if (c.cfg.anchor != null) continue;
+        if (c.cfg.position != null) continue;
         const child_right = @as(i64, c.rect.x) + @as(i64, c.rect.w) - origin_x + @as(i64, node.cfg.scroll_x);
         const child_bottom = @as(i64, c.rect.y) + @as(i64, c.rect.h) - origin_y + @as(i64, node.cfg.scroll_y);
         max_right = @max(max_right, @max(child_right, 0));
@@ -72,7 +72,7 @@ fn contentOverflowExcluded(node: *const layout.Node) bool {
     if (hasExplicitClamp(node)) return true;
     var child = node.first_child;
     while (child) |c| : (child = c.next_sibling) {
-        if (c.cfg.anchor == null and hasExplicitClamp(c)) return true;
+        if (c.cfg.position == null and hasExplicitClamp(c)) return true;
     }
     return false;
 }
@@ -107,7 +107,7 @@ fn siblingOverlapCount(parent: *const layout.Node, allocator: Allocator) u32 {
     var count: usize = 0;
     var child = parent.first_child;
     while (child) |c| : (child = c.next_sibling) {
-        if (c.cfg.anchor == null) {
+        if (c.cfg.position == null) {
             items[count] = .{ .node = c };
             count += 1;
         }
@@ -234,7 +234,7 @@ test "fixture: content plus padding reports a fixed box overflow" {
     try testing.expectEqual(@as(u32, 1), result.content_overflow);
 }
 
-test "fixture exclusions: clip, scroll, ellipsis, wrap, anchor, detached popup, and min-max" {
+test "fixture exclusions: clip, scroll, ellipsis, wrap, positioned, detached popup, and min-max" {
     {
         var root: layout.Node = .{ .cfg = .{ .width = .{ .fixed = 100 }, .height = .{ .fixed = 100 } } };
         var clip: layout.Node = .{ .cfg = .{ .width = .{ .fixed = 20 }, .height = .{ .fixed = 20 }, .clip_children = true } };
@@ -273,13 +273,17 @@ test "fixture exclusions: clip, scroll, ellipsis, wrap, anchor, detached popup, 
     {
         var root: layout.Node = .{ .cfg = .{ .direction = .row, .width = .{ .fixed = 40 }, .height = .{ .fixed = 20 } } };
         var flow: layout.Node = .{ .cfg = .{ .width = .{ .fixed = 20 }, .height = .{ .fixed = 20 } } };
-        var anchor: layout.Node = .{ .cfg = .{
+        var positioned: layout.Node = .{ .cfg = .{
             .width = .{ .fixed = 40 },
             .height = .{ .fixed = 20 },
-            .anchor = .{ .at = .center },
+            .position = .{
+                .left = .{ .length = .{ .percent = 0.5 } },
+                .top = .{ .length = .{ .percent = 0.5 } },
+                .pivot = .{ .x = 0.5, .y = 0.5 },
+            },
         } };
         layout.appendChild(&root, &flow);
-        layout.appendChild(&root, &anchor);
+        layout.appendChild(&root, &positioned);
         try testing.expectEqual(@as(u32, 0), scanTestTree(&root).total());
     }
     {

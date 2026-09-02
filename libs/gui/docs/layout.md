@@ -58,15 +58,50 @@ grows to max-content, so the leaf does not fold.
 `measure` + `place` remain as a convenience for callers that do not wrap
 (they seed text height from the paragraph count instead of running `wrapText`).
 
-## Anchored children
+## Positioned children
 
-A child with `BoxConfig.anchor != null` is an overlay on its parent. It takes
+A child with `BoxConfig.position != null` is out of its parent's flow. It takes
 no part in the parent's fit measure, main-axis cursor, gap, grow share, wrap
-line split, or line cross size. Several siblings may be anchored. Draw order
+line split, or line cross size. Several siblings may be positioned. Draw order
 is tree order — a later sibling paints on top.
 
-The child's own size is resolved against the parent content box (border-box
-minus padding):
+The containing block is always the **direct parent**: there is no search for a
+positioned ancestor, and no way to reach past the parent's box from here.
+Placing a subtree against something further up the tree is a different
+mechanism, not a wider version of this one.
+
+`Position` carries one `Inset` per edge plus a `pivot`. An inset is measured
+**inward** from its edge of the parent content box, and holds a pixel offset
+and a percentage that add, so one edge expresses CSS
+`calc(<percentage> + <length>)`. Either part may be negative, which moves the
+box outward past that edge.
+
+Which insets are set decides the shape of the placement on each axis
+independently:
+
+| leading | trailing | Size | Position of the leading edge |
+|---|---|---|---|
+| `auto` | `auto` | the box's own `Sizing` | content origin, less the pivot |
+| set | `auto` | the box's own `Sizing` | origin + leading, less the pivot |
+| `auto` | set | the box's own `Sizing` | the trailing edge, less size and the pivot |
+| set | set | `content - leading - trailing` | origin + leading; the pivot does not apply |
+
+The `pivot` is the fraction of the box's **own** size subtracted after the
+insets resolve, the way CSS pairs `left: 50%` with `translate: -50%`: `0` puts
+the leading edge on the resolved point, `0.5` the centre, `1.0` the trailing
+edge. Any finite value is legal, including outside `[0, 1]`, which overshoots
+on purpose. Both terms floor independently, so centring is
+`floor(content * 0.5) - floor(size * 0.5)`.
+
+Pinning both edges is the only case where the parent decides the size, which is
+why the pivot has nothing to shift there. It also means the axis must not carry
+a `Sizing` that states a size of its own: `.fixed` and `.percent` are rejected
+there, because the insets and the size would be saying different things.
+`.fit` and `.grow` — the two that mean "whatever is available" — are what two
+insets supply.
+
+Where the box's own `Sizing` does decide the size, it resolves against the
+parent content box (border-box minus padding):
 
 | Mode | Result |
 |---|---|
@@ -76,16 +111,16 @@ minus padding):
 | `.grow` | fill the parent content on that axis (weight is ignored) |
 
 `min_*` / `max_*` clamp still applies — the same uniform rule as every other
-`Sizing`. After flow children are placed on an axis, each anchored child is
-aligned to one of nine points (`top_left` … `bottom_right`) and then shifted
-by `offset`. `placeWidths` resolves widths after the flow pass; `wrapText`
-still visits the anchored subtree; `measureHeights` measures that subtree
-without folding it into the parent's fit height; `placeHeights` applies the
-nine-way placement.
+`Sizing`, applied last. When both edges are pinned and the clamp disagrees with
+the distance between them, the leading edge wins and the difference is given up
+at the trailing end.
 
-Content extent: the overlay is not part of the layout size. A parent with
-`clip_children = false` still folds whatever of the overlay is actually
-visible (the usual extent rule) so a ScrollArea can reach it. A clipping
+`placeWidths` resolves widths after the flow pass; `wrapText` still visits the
+positioned subtree; `measureHeights` measures that subtree without folding it
+into the parent's fit height; `placeHeights` applies the placement.
+
+Content extent: a positioned child is not part of the layout size. A parent
+with `clip_children = false` still folds whatever of it is actually visible (the usual extent rule) so a ScrollArea can reach it. A clipping
 parent does not include it.
 
 An explicit `id` is cached and hit-tested like any other box.
@@ -132,9 +167,9 @@ Follow what happens when a node `N` is sized `.fit` on its **main** axis and has
 a direct child `C` sized `.grow` on that same axis. The collapse is stated for
 this shape:
 
-- `C` is an **unanchored box**. A leaf child takes the leaf exception above (its
+- `C` is an **in-flow box**. A leaf child takes the leaf exception above (its
   measured contribution is always its intrinsic size, `Sizing` notwithstanding),
-  and an anchored child is not in the flow measure at all — it resolves `.grow`
+  and a positioned child is not in the flow measure at all — it resolves `.grow`
   against `N`'s content box directly, so it fills whatever that is.
 - `C` carries **no `min_*`** of its own on the axis. That clamp is the way out,
   and the last step of the walk-through is where it comes in.
@@ -392,9 +427,9 @@ a `bar_thickness`-px strip of height for the viewport.
 (or harness `action layout_width <px>`) re-solves every item on the same
 screen. Each item prints the resolved numbers (child widths, wrap line
 membership, leftover, visible range). `digest layout` exposes the same
-figures for harness `expect`, including `an_plain_h` / `an_ovl_h` / `an_dh`
-(anchor does not change parent size), `an_badge_x` / `an_badge_y` (overlay
-placement), and `wrap_gap_y0` / `wrap_gap_y1` / `wrap_gap_dy` (measured
+figures for harness `expect`, including `pos_plain_h` / `pos_ovl_h` / `pos_dh`
+(a positioned child does not change parent size), `pos_badge_x` /
+`pos_badge_y` (placement), and `wrap_gap_y0` / `wrap_gap_y1` / `wrap_gap_dy` (measured
 cross-axis spacing).
 
 | Contract | Catalog item |
@@ -404,7 +439,7 @@ cross-axis spacing).
 | leftover remainder is a trailing gap when every grow child is max-frozen | 3. Leftover |
 | wrap line split: percent enters at its resolved size, grow enters at its min; `cross_gap` is independent of `gap` | 4. Wrap |
 | wrap cross-axis grow fills its own line, not the container | 5. Wrap cross grow |
-| an anchored child is an overlay: it takes no part in fit, cursor, gap, grow share, or wrap line split | 6. Anchor |
+| a positioned child is out of flow: it takes no part in fit, cursor, gap, grow share, or wrap line split | 6. Position |
 | ScrollArea scroll range is declared fixed → recorded content extent → measured | 7. Content extent |
 | table columns: fit is content-sized, fixed holds, grow absorbs the remainder | 8. Table columns |
 | virtual list visible window (`first..end`) follows height and scroll, not width | 9. Virtual list |

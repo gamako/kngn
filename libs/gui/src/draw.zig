@@ -12,7 +12,7 @@ pub const Color = color_mod.Color;
 pub const Font = font_mod.Font;
 
 /// Logical / device-space point used by path verbs. Distinct from integer `Vec2`.
-pub const Vec2f = struct { x: f32, y: f32 };
+pub const Vec2f = geom.Vec2f;
 
 pub const LinearGradient = struct {
     start: Vec2f,
