@@ -59,10 +59,12 @@ const draw_mod = @import("draw.zig");
 const font_mod = @import("font.zig");
 const id_mod = @import("id.zig");
 const text_wrap = @import("text_wrap.zig");
+const layer_types = @import("layer_types.zig");
 
 pub const Rect = geom.Rect;
 pub const Vec2 = geom.Vec2;
 pub const Vec2f = geom.Vec2f;
+pub const LayerSpec = layer_types.LayerSpec;
 pub const Color = color_mod.Color;
 pub const DrawList = draw_mod.DrawList;
 pub const BitmapFont = font_mod.BitmapFont;
@@ -183,6 +185,14 @@ pub const BoxConfig = struct {
     /// siblings paint on top. An explicit `id` is cached and hit-tested like any other box.
     /// Several siblings may be positioned.
     position: ?Position = null,
+    /// When set, this box is not a child of the box it is written inside: it is a layer of
+    /// its own, laid out as a root and placed against `LayerSpec.placement`.
+    ///
+    /// `position` takes a box out of its parent's flow but leaves it inside the parent's box,
+    /// clip and scroll. This takes it out of the parent altogether — which is what a dropdown,
+    /// a context menu or a tooltip needs, and why the two are separate fields rather than one
+    /// with a mode. A box may not carry both.
+    layer: ?LayerSpec = null,
 };
 
 /// Draw callback for a custom leaf. Called with the final rect after endFrame finalizes layout.
@@ -243,6 +253,17 @@ pub const Node = struct {
     /// leaf string or an allocator-owned normalised / ellipsis buffer.
     lines: []const text_wrap.Line = &.{},
 };
+
+/// Give `child` a parent for the purpose of closing scopes, without joining the sibling
+/// chain. A layer marker takes this instead of `appendChild`: never being in the chain is
+/// what keeps it out of the parent's fit measure, cursor, gap, grow share, wrap split and
+/// content extent — not a later pass that removes it again. The caller clears `parent` when
+/// the marker's scope closes, so no layout walk can reach upward from a layer root.
+pub fn attachDetached(parent: *Node, child: *Node) void {
+    std.debug.assert(child.parent == null);
+    std.debug.assert(child.cfg.layer != null);
+    child.parent = parent;
+}
 
 /// Append at the end (O(1) via last_child).
 pub fn appendChild(parent: *Node, child: *Node) void {
@@ -342,6 +363,10 @@ fn insetValid(inset: Inset) bool {
 /// `.fit` and `.grow` are the sizes that mean "whatever is available", which is exactly what
 /// two insets supply.
 pub fn positionConfigValid(cfg: BoxConfig) bool {
+    // A layer is placed against an anchor and a boundary; `position` is measured from a parent
+    // content box. A box that carried both would be asking two different frames of reference
+    // to decide where it goes.
+    if (cfg.layer != null and cfg.position != null) return false;
     const pos = cfg.position orelse return true;
     if (!std.math.isFinite(pos.pivot.x) or !std.math.isFinite(pos.pivot.y)) return false;
     inline for (.{ pos.left, pos.top, pos.right, pos.bottom }) |inset| {

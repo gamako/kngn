@@ -72,6 +72,56 @@ const table_mod = @import("table.zig");
 pub const Rect = geom.Rect;
 pub const Vec2 = geom.Vec2;
 pub const Vec2f = input_mod.Vec2f;
+const layer_types = @import("layer_types.zig");
+pub const LayerKey = layer_types.LayerKey;
+pub const LayerSpec = layer_types.LayerSpec;
+pub const LayerPlacement = layer_types.LayerPlacement;
+pub const AnchorSource = layer_types.AnchorSource;
+
+/// The most layers that may be open, or registered in one frame. Small and fixed: a screen
+/// showing more than a handful of menus, dialogs and tooltips at once has a different problem
+/// than a capacity limit. Overflow is a contract failure, not a silent drop — a menu that just
+/// does not appear is far harder to diagnose than one that says why.
+pub const max_layers: usize = 32;
+
+/// The state of one layer in the current frame.
+pub const LayerStatus = enum {
+    /// Its anchor has not been resolved yet this frame.
+    waiting,
+    /// Placed; its rect cache entries are written and it will be emitted.
+    placed,
+    /// Its anchor is not in this frame, or the layer it anchors to is itself missing. Not
+    /// emitted and not cached: drawing it would mean drawing at a coordinate from a frame
+    /// that no longer describes the screen.
+    missing,
+};
+
+/// One layer in the current frame. Lives as long as the frame.
+pub const LayerRecord = struct {
+    key: LayerKey,
+    z: i32,
+    /// Registration order, which breaks ties between equal `z` the way sibling order already
+    /// breaks ties between boxes.
+    serial: u32,
+    root: *layout.Node,
+    placement: LayerPlacement,
+    status: LayerStatus,
+    /// Whether this layer's boxes join the rect cache — and so the one explicit-id namespace,
+    /// and so what an `.id` anchor can point at.
+    cache: bool,
+    /// Index in `layers` of the layer this one anchors into, when its anchor id belongs to
+    /// one. Null for a `.point` anchor or an anchor in the main tree.
+    depends_on: ?usize,
+};
+
+/// What survives between frames for one layer. A `LayerRecord` describes a frame; this
+/// describes the slot, and is what makes "was this layer on screen last frame" answerable —
+/// the question first-visible suppression and outside-press dismissal are both built on.
+pub const LayerSlot = struct {
+    key: LayerKey,
+    prev_root_rect: Rect = .{ .x = 0, .y = 0, .w = 0, .h = 0 },
+    was_placed: bool = false,
+};
 pub const Color = color_mod.Color;
 pub const Id = id_mod.Id;
 pub const IdStack = id_mod.IdStack;
@@ -275,6 +325,13 @@ pub const Context = struct {
     now_s: f64 = 0,
     /// Implicit root of the layout tree (allocated on the arena in beginFrame)
     layout_root: ?*layout.Node = null,
+    /// Layers registered this frame, and the slots that outlive the frame. Fixed arrays
+    /// rather than lists on the frame arena: a list whose storage the arena reset frees but
+    /// whose capacity survives is a dangling pointer waiting for the next append.
+    layers: [max_layers]LayerRecord = undefined,
+    layers_len: usize = 0,
+    layer_slots: [max_layers]LayerSlot = undefined,
+    layer_slots_len: usize = 0,
     /// beginBox / endBox cursor (current parent)
     layout_current: ?*layout.Node = null,
     /// Layout sanity is opt-in; the result is copied out of the frame arena after the tree scan.
@@ -575,6 +632,9 @@ pub const Context = struct {
         self.screen_h = screen_h;
         self.now_s = now_s;
         _ = self.arena.reset(.retain_capacity); // Release the previous frame's payload and layout tree here
+        // The layer records point into the arena that was just released. The slots do not:
+        // they are what carries a layer's geometry across the reset.
+        self.layers_len = 0;
         self.input.beginFrame();
         self.id_stack.clear();
         self.state.beginFrame();
@@ -683,12 +743,26 @@ pub const Context = struct {
         requireContract(self.layout_current == root, "endFrame with a box still open");
         // Frames that never use the layout API (empty root) skip layout / emit / cache update
         // entirely: compatible with manual DrawList use (examples 08/09). rect_cache keeps the previous values.
-        if (root.first_child != null) {
-            const screen_rect = Rect{ .x = 0, .y = 0, .w = self.screen_w, .h = self.screen_h };
-            layout.layoutTree(root, screen_rect, self.font, self.allocator());
+        const screen_rect = Rect{ .x = 0, .y = 0, .w = self.screen_w, .h = self.screen_h };
+        // The tooltip is a layer like any other; registering it here rather than at the
+        // `tooltip` / `tooltipBox` call is what keeps a candidate that was replaced during the
+        // frame from leaving a record behind.
+        self.registerTooltipLayer();
+        const has_main = root.first_child != null;
+        // Frames that never use the layout API (empty root, no layer) skip layout / emit /
+        // cache update entirely: compatible with manual DrawList use (examples 08/09).
+        // rect_cache keeps the previous values.
+        if (has_main or self.layers_len > 0) {
+            if (has_main) layout.layoutTree(root, screen_rect, self.font, self.allocator());
             self.rect_cache.clearRetainingCapacity();
-            self.updateRectCache(root, screen_rect);
-            self.emitNode(root);
+            // From here until the layers are placed, the cache holds this frame's main rects.
+            // That is what an `.id` anchor reads, and it is why no second table of current
+            // geometry is needed. `endFrame` is synchronous, so nothing outside observes the
+            // half-updated state in between.
+            if (has_main) self.updateRectCache(root, screen_rect);
+            self.placeLayers(screen_rect);
+            if (has_main) self.emitNode(root);
+            self.emitLayers();
         }
         if (self.layout_sanity_enabled) {
             self.layout_sanity_result = layout_sanity_probe.scan(root, self.font, self.allocator());
@@ -697,28 +771,6 @@ pub const Context = struct {
         // previous-frame geometry (same 1-frame lag as hit-test).
         for (self.scroll_areas_cur.items) |*rec| {
             if (self.rect_cache.get(rec.id)) |c| rec.rect = c.rect;
-        }
-        // tooltip overlay: after layout UI, before frame_active=false (below popupMenu; popup runs after endFrame).
-        if (self.tooltip_candidate) |cand| {
-            switch (cand) {
-                .text => |tip| popup_mod.drawTooltipOverlay(self, tip, self.tooltip_candidate_anchor),
-                .custom => |tip_root| {
-                    self.tooltip_layout_calls += 1;
-                    popup_mod.placeTooltipSubtree(
-                        tip_root,
-                        self.tooltip_candidate_anchor,
-                        self.screen_w,
-                        self.screen_h,
-                        self.style.spacing.popup_inset,
-                        self.font,
-                        self.allocator(),
-                    );
-                    const style = self.style;
-                    self.draw_list.rectFilled(tip_root.rect, style.surface.control) catch @panic("tooltip: OOM");
-                    self.draw_list.rectOutline(tip_root.rect, style.border_tokens.normal, 1) catch @panic("tooltip: OOM");
-                    self.emitNode(tip_root);
-                },
-            }
         }
         // If the target was not refreshed this frame, clear the timer (suppress stale overlays for hidden widgets)
         if (self.tooltip_hover_id != 0 and !self.tooltip_hover_refreshed) {
@@ -1316,8 +1368,253 @@ pub const Context = struct {
             .id = if (cfg.id != 0) cfg.id else id_mod.hashInt(parent.id, parent.child_count),
             .cfg = cfg,
         };
-        layout.appendChild(parent, node);
+        if (cfg.layer) |spec| {
+            self.registerLayer(spec, node, parent);
+            layout.attachDetached(parent, node);
+        } else {
+            layout.appendChild(parent, node);
+        }
         self.layout_current = node;
+    }
+
+    /// Record a layer for this frame. Called from `beginBox` when the box carries a marker.
+    ///
+    /// Hot path: every frame, once per layer. O(1), and a frame with no layer never reaches
+    /// it — a tree that uses no layer pays one null check per box for the whole feature.
+    fn registerLayer(self: *Context, spec: LayerSpec, root: *layout.Node, logical_parent: *layout.Node) void {
+        var i: usize = 0;
+        while (i < self.layers_len) : (i += 1) {
+            requireContract(
+                !self.layers[i].key.eql(spec.key),
+                "two layers with the same key in one frame",
+            );
+        }
+        if (self.layers_len >= max_layers) {
+            // The count, the cap and where it happened, because a caller who hits this needs
+            // to find which registration was the extra one.
+            std.debug.print(
+                "gui: layer registration overflow: layer {d} of a maximum {d}, key {d}, inside box id {d}\n",
+                .{ self.layers_len + 1, max_layers, spec.key.value, logical_parent.id },
+            );
+            requireContract(false, "more layers in one frame than the maximum");
+        }
+        self.layers[self.layers_len] = .{
+            .key = spec.key,
+            .z = spec.z,
+            .serial = @intCast(self.layers_len),
+            .root = root,
+            .placement = spec.placement,
+            .status = .waiting,
+            .cache = spec.cache,
+            .depends_on = null,
+        };
+        self.layers_len += 1;
+    }
+
+    /// The slot for `key`, created on first use. Slots outlive frames, so this is where a
+    /// layer's previous geometry comes from.
+    fn layerSlot(self: *Context, layer_key: LayerKey) *LayerSlot {
+        var i: usize = 0;
+        while (i < self.layer_slots_len) : (i += 1) {
+            if (self.layer_slots[i].key.eql(layer_key)) return &self.layer_slots[i];
+        }
+        requireContract(self.layer_slots_len < max_layers, "more layer slots than the maximum");
+        self.layer_slots[self.layer_slots_len] = .{ .key = layer_key };
+        self.layer_slots_len += 1;
+        return &self.layer_slots[self.layer_slots_len - 1];
+    }
+
+    /// Where this layer was placed on the previous frame, or null if it was not on screen.
+    /// The input arbitration built on top of layers reads this; nothing in placement does.
+    pub fn layerPrevRect(self: *const Context, layer_key: LayerKey) ?Rect {
+        var i: usize = 0;
+        while (i < self.layer_slots_len) : (i += 1) {
+            const slot = self.layer_slots[i];
+            if (slot.key.eql(layer_key)) return if (slot.was_placed) slot.prev_root_rect else null;
+        }
+        return null;
+    }
+
+    /// The key the tooltip layer occupies. Reserved rather than derived, because there is
+    /// exactly one tooltip at a time and its slot has to be the same one across frames.
+    const tooltip_layer_key: LayerKey = .{ .value = 0x0071717 };
+
+    /// Turn this frame's tooltip candidate, if there is one, into a layer.
+    ///
+    /// Registering here rather than at the `tooltip` / `tooltipBox` call is deliberate: the
+    /// last writer of a frame wins, and a candidate that was replaced must not leave a layer
+    /// behind. Both kinds become a node tree, so the background and the border are emitted by
+    /// the layer in z order rather than drawn beside it.
+    fn registerTooltipLayer(self: *Context) void {
+        const cand = self.tooltip_candidate orelse return;
+        if (self.screen_w == 0 or self.screen_h == 0) return;
+        const style = self.style;
+        const pad = style.spacing.popup_inset;
+        const root: *layout.Node = switch (cand) {
+            .custom => |tip_root| blk: {
+                self.tooltip_layout_calls += 1;
+                break :blk tip_root;
+            },
+            .text => |tip| blk: {
+                const r = self.allocator().create(layout.Node) catch @panic("tooltip: OOM");
+                r.* = .{ .cfg = .{
+                    .direction = .column,
+                    .width = .fit,
+                    .height = .fit,
+                    .padding = .{ pad, pad, pad, pad },
+                } };
+                const leaf = self.allocator().create(layout.Node) catch @panic("tooltip: OOM");
+                leaf.* = .{ .cfg = .{}, .leaf = .{ .text = .{
+                    .str = self.allocator().dupe(u8, tip) catch @panic("tooltip: OOM"),
+                    .color = style.text_tokens.primary,
+                    .font = null,
+                } } };
+                layout.appendChild(r, leaf);
+                break :blk r;
+            },
+        };
+        root.cfg.bg = style.surface.control;
+        root.cfg.border = .{ .color = style.border_tokens.normal, .thickness = 1 };
+        self.registerLayer(.{
+            .key = tooltip_layer_key,
+            // Above ordinary layers: a tooltip explains what is already on screen, so nothing
+            // an application places should cover it.
+            .z = 1000,
+            .placement = .{
+                .source = .{ .point = .{
+                    .x = self.tooltip_candidate_anchor.x,
+                    .y = self.tooltip_candidate_anchor.y + @as(i32, @intCast(self.tooltip_candidate_anchor.h)) + pad,
+                } },
+                // A tooltip does not flip: its contract is that overflow is cut, not moved.
+                .flip = .none,
+                .shift = .both_axes,
+            },
+            // A tooltip is only ever looked at. Keeping it out of the cache keeps its ids out
+            // of the one explicit-id namespace, which is the contract `tooltipBox` already has.
+            .cache = false,
+        }, root, self.layout_root.?);
+    }
+
+    /// Resolve every layer's anchor and lay its root out, in dependency order.
+    ///
+    /// A layer may anchor into another layer — a submenu against its parent's item — so the
+    /// order is the order of the dependency, not of registration. A layer whose anchor is not
+    /// in this frame is not placed at all: it would otherwise be drawn at a coordinate from a
+    /// frame that no longer describes the screen, which is worse than not drawing it.
+    ///
+    /// Hot path: every frame, once per layer, and not reached at all on a frame with none.
+    fn placeLayers(self: *Context, boundary: Rect) void {
+        if (self.layers_len == 0) return;
+        // Each pass places at least one layer, or every remaining layer is blocked and the
+        // block is a cycle. Bounding the passes by the count is what turns a cycle into a
+        // contract failure rather than a hang.
+        var remaining = self.layers_len;
+        var pass: usize = 0;
+        while (remaining > 0) : (pass += 1) {
+            requireContract(pass <= self.layers_len, "a cycle among layer anchors");
+            var progressed = false;
+            var i: usize = 0;
+            while (i < self.layers_len) : (i += 1) {
+                const rec = &self.layers[i];
+                if (rec.status != .waiting) continue;
+                switch (self.resolveAnchor(rec)) {
+                    .blocked => continue,
+                    .missing => {
+                        rec.status = .missing;
+                        remaining -= 1;
+                        progressed = true;
+                    },
+                    .ready => |anchor_rect| {
+                        popup_mod.layoutLayerRoot(rec.root, boundary, self.font, self.allocator());
+                        popup_mod.placeLayerRoot(rec.root, anchor_rect, rec.placement, boundary);
+                        if (rec.cache) self.updateRectCache(rec.root, boundary);
+                        rec.status = .placed;
+                        remaining -= 1;
+                        progressed = true;
+                    },
+                }
+            }
+            if (!progressed) requireContract(false, "a cycle among layer anchors");
+        }
+        self.sealLayerSlots();
+    }
+
+    const AnchorResolve = union(enum) {
+        /// The layer it anchors into has not been placed yet.
+        blocked,
+        /// The anchor is not in this frame.
+        missing,
+        ready: Rect,
+    };
+
+    fn resolveAnchor(self: *Context, rec: *LayerRecord) AnchorResolve {
+        switch (rec.placement.source) {
+            .point => |p| return .{ .ready = .{ .x = p.x, .y = p.y, .w = 0, .h = 0 } },
+            .id => |anchor_id| {
+                if (self.ownerLayerOf(anchor_id)) |owner| {
+                    switch (self.layers[owner].status) {
+                        .waiting => return .blocked,
+                        .missing => return .missing,
+                        .placed => {},
+                    }
+                }
+                const entry = self.rect_cache.get(anchor_id) orelse return .missing;
+                return .{ .ready = entry.rect };
+            },
+        }
+    }
+
+    /// Which layer, if any, owns the box with this explicit id. Only layers that join the
+    /// cache can own one, because only their ids are in the namespace at all.
+    fn ownerLayerOf(self: *Context, anchor_id: Id) ?usize {
+        var i: usize = 0;
+        while (i < self.layers_len) : (i += 1) {
+            if (!self.layers[i].cache) continue;
+            if (subtreeHasId(self.layers[i].root, anchor_id)) return i;
+        }
+        return null;
+    }
+
+    /// Emit the layers over the main tree, nearest the viewer last.
+    fn emitLayers(self: *Context) void {
+        if (self.layers_len == 0) return;
+        // Insertion sort of indices: the count is small and fixed, and keeping it stable is
+        // what makes equal `z` fall back to registration order.
+        var order: [max_layers]usize = undefined;
+        var n: usize = 0;
+        for (self.layers[0..self.layers_len], 0..) |rec, i| {
+            if (rec.status != .placed) continue;
+            var j = n;
+            while (j > 0 and layerBefore(self.layers[i], self.layers[order[j - 1]])) : (j -= 1) {
+                order[j] = order[j - 1];
+            }
+            order[j] = i;
+            n += 1;
+        }
+        for (order[0..n]) |i| self.emitNode(self.layers[i].root);
+    }
+
+    /// Carry this frame's result into the slots, so the next frame can ask where a layer was
+    /// and whether it was on screen at all.
+    fn sealLayerSlots(self: *Context) void {
+        var i: usize = 0;
+        while (i < self.layers_len) : (i += 1) {
+            const rec = self.layers[i];
+            const slot = self.layerSlot(rec.key);
+            slot.was_placed = rec.status == .placed;
+            if (slot.was_placed) slot.prev_root_rect = rec.root.rect;
+        }
+    }
+
+    /// Release a layer's slot. The public open/close API calls this.
+    pub fn releaseLayerSlot(self: *Context, layer_key: LayerKey) void {
+        var i: usize = 0;
+        while (i < self.layer_slots_len) : (i += 1) {
+            if (!self.layer_slots[i].key.eql(layer_key)) continue;
+            self.layer_slots[i] = self.layer_slots[self.layer_slots_len - 1];
+            self.layer_slots_len -= 1;
+            return;
+        }
     }
 
     /// The layout node of the innermost box still open (the last `beginBox` whose `endBox` has not
@@ -1338,6 +1635,10 @@ pub const Context = struct {
         const cur = self.layout_current.?;
         requireContract(cur.parent != null, "endBox without a matching beginBox");
         self.layout_current = cur.parent;
+        // A marker borrowed its parent link only to close this scope. Clearing it now means
+        // no walk from a layer root can reach the tree it was written in, so a later pass
+        // cannot pick up the parent's clip, scroll or extent by accident.
+        if (cur.cfg.layer != null) cur.parent = null;
     }
 
     /// text leaf (default color = style.text). str is duped onto the arena, so it does not
@@ -1628,6 +1929,20 @@ pub const ButtonResult = struct {
 /// - Partial clips (ScrollArea etc.) are true only inside the viewport clip
 ///
 /// Single source of truth shared by buttonBehavior, TextInput, and SelectableLabel.
+fn layerBefore(a: LayerRecord, b: LayerRecord) bool {
+    if (a.z != b.z) return a.z < b.z;
+    return a.serial < b.serial;
+}
+
+fn subtreeHasId(node: *const layout.Node, wanted: Id) bool {
+    if (node.cfg.id == wanted) return true;
+    var it = node.first_child;
+    while (it) |c| : (it = c.next_sibling) {
+        if (subtreeHasId(c, wanted)) return true;
+    }
+    return false;
+}
+
 pub fn pointHitsVisible(rect: Rect, clip: Rect, p: Vec2) bool {
     return rect.contains(p) and clip.contains(p);
 }
@@ -2609,17 +2924,23 @@ fn tooltipHasText(ctx: *const Context, expected: []const u8) bool {
     return false;
 }
 
+/// The background the tooltip's text sits on, found by walking back from the text to the
+/// nearest filled rect. The tooltip is emitted as a layer — a box with a background, its
+/// children, then its border — so the background is the last fill before the text rather
+/// than a fixed number of commands away.
 fn tooltipOverlayBgRect(ctx: *const Context, tip: []const u8) ?Rect {
-    // After endFrame: … layout cmds … then tooltip: rect_filled, rect_outline, text
     var i: usize = 0;
     while (i < ctx.draw_list.cmds.items.len) : (i += 1) {
         const cmd = ctx.draw_list.cmds.items[i];
-        if (cmd == .text and std.mem.eql(u8, cmd.text.text, tip)) {
-            if (i >= 2 and ctx.draw_list.cmds.items[i - 2] == .rect_filled) {
-                return ctx.draw_list.cmds.items[i - 2].rect_filled.rect;
+        if (cmd != .text or !std.mem.eql(u8, cmd.text.text, tip)) continue;
+        var j = i;
+        while (j > 0) {
+            j -= 1;
+            if (ctx.draw_list.cmds.items[j] == .rect_filled) {
+                return ctx.draw_list.cmds.items[j].rect_filled.rect;
             }
-            return null;
         }
+        return null;
     }
     return null;
 }
@@ -2665,7 +2986,7 @@ test "tooltip: 500ms boundary at 0.0→0.4→0.5 (hidden below; shown at/after)"
     try std.testing.expect(tooltipHasText(&ctx, "tip"));
 }
 
-test "tooltip: overlay appends text at the end of the draw list" {
+test "tooltip: the overlay is emitted after the ordinary UI, so it draws on top" {
     var ctx = testCtx();
     defer ctx.deinit();
 
@@ -2679,8 +3000,20 @@ test "tooltip: overlay appends text at the end of the draw list" {
     hoverButtonWithTip(&ctx, 1, "Btn", "tail tip", 0.5);
     const cmds = ctx.draw_list.cmds.items;
     try std.testing.expect(cmds.len > before_tip_len);
-    try std.testing.expect(cmds[cmds.len - 1] == .text);
-    try std.testing.expectEqualStrings("tail tip", cmds[cmds.len - 1].text.text);
+    // The tooltip is a layer, so it emits a background, its content and a border. What the
+    // ordering has to guarantee is that all of it lands after the frame's ordinary UI —
+    // asserted as "no text is emitted after the tooltip's", which holds whichever of the
+    // three commands happens to be last.
+    var tip_index: ?usize = null;
+    for (cmds, 0..) |cmd, i| {
+        if (cmd != .text) continue;
+        if (std.mem.eql(u8, cmd.text.text, "tail tip")) {
+            tip_index = i;
+        } else {
+            try std.testing.expect(tip_index == null);
+        }
+    }
+    try std.testing.expect(tip_index != null);
 }
 
 test "tooltip: overlay clears on the next frame after leave" {

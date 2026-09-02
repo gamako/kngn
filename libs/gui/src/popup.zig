@@ -32,6 +32,7 @@ const font_mod = @import("font.zig");
 const layout = @import("layout.zig");
 const input_mod = @import("input.zig");
 const style_mod = @import("style.zig");
+const layer_types = @import("layer_types.zig");
 
 pub const Context = context_mod.Context;
 pub const Rect = geom.Rect;
@@ -842,59 +843,176 @@ pub fn translateNodeTree(node: *layout.Node, dx: i32, dy: i32) void {
 ///
 /// Hot path: once per showing custom-tooltip frame. Five-stage layout plus a
 /// tree walk. Not a per-pixel loop; not RT.
-pub fn placeTooltipSubtree(
+/// Lay out a layer's root at a size of its own choosing, then place it against an anchor.
+///
+/// A root has no parent, so the sizes that mean "ask the parent" have to mean something else
+/// here: `.fit` is the content's natural size, `.fixed` and `.percent` resolve against the
+/// boundary, and `.grow` has nothing to fill and is rejected. The order matters when the
+/// content wraps — the width has to be settled *before* the text folds, or the box wraps at
+/// its natural width and is then squeezed, leaving lines shorter than the box that holds them.
+///
+/// Hot path: every frame, once per visible layer. Not a per-pixel loop; not RT.
+pub fn layoutLayerRoot(
     root: *layout.Node,
-    anchor: Rect,
-    screen_w: u32,
-    screen_h: u32,
-    inset: i32,
+    boundary: Rect,
     font: font_mod.Font,
     allocator: Allocator,
 ) void {
-    if (screen_w == 0 or screen_h == 0) return;
+    std.debug.assert(root.parent == null);
+    // `.grow` on a root would be a request to fill a parent that does not exist.
+    std.debug.assert(rootSizingLegal(root.cfg.width));
+    std.debug.assert(rootSizingLegal(root.cfg.height));
+
+    const max_w: i32 = @intCast(boundary.w);
+    const max_h: i32 = @intCast(boundary.h);
 
     layout.measureWidths(root, font);
-    const nat_w: i32 = @max(root.measured_w, 1);
-    const desired_x = anchor.x;
-    const desired_y = anchor.y + @as(i32, @intCast(anchor.h)) + inset;
-    layout.placeWidths(root, .{
-        .x = desired_x,
-        .y = desired_y,
-        .w = @intCast(nat_w),
-        .h = 0,
-    });
+    const want_w = rootAxisSize(root, .w, max_w);
+    const w = @min(want_w, max_w);
+    layout.placeWidths(root, .{ .x = boundary.x, .y = boundary.y, .w = @intCast(@max(w, 0)), .h = 0 });
     layout.wrapText(root, font, allocator);
     layout.measureHeights(root, font);
-    const nat_h: i32 = @max(root.measured_h, 1);
+    const want_h = rootAxisSize(root, .h, max_h);
+    const h = @min(want_h, max_h);
     layout.placeHeights(root, .{
-        .x = desired_x,
-        .y = desired_y,
-        .w = @intCast(nat_w),
-        .h = @intCast(nat_h),
+        .x = boundary.x,
+        .y = boundary.y,
+        .w = @intCast(@max(w, 0)),
+        .h = @intCast(@max(h, 0)),
     });
+    // A layer that wants more room than the screen has cannot be given it, and cannot be
+    // shifted into view either. Clipping the root is what keeps the overflow from painting
+    // over everything else; the part that does not fit is cut, not scaled.
+    if (want_w > max_w or want_h > max_h) root.cfg.clip_children = true;
+}
 
-    const sw: i32 = @intCast(screen_w);
-    const sh: i32 = @intCast(screen_h);
-    var oversized = false;
-    if (@as(i32, @intCast(root.rect.w)) > sw) {
-        root.rect.w = @intCast(sw);
-        oversized = true;
-    }
-    if (@as(i32, @intCast(root.rect.h)) > sh) {
-        root.rect.h = @intCast(sh);
-        oversized = true;
-    }
-    if (oversized) root.cfg.clip_children = true;
+fn rootSizingLegal(s: layout.Sizing) bool {
+    return switch (s) {
+        .grow => false,
+        else => true,
+    };
+}
 
+/// The size a root asks for on one axis, before the boundary caps it.
+fn rootAxisSize(root: *const layout.Node, comptime axis: enum { w, h }, boundary: i32) i32 {
+    const sizing = if (axis == .w) root.cfg.width else root.cfg.height;
+    const measured = if (axis == .w) root.measured_w else root.measured_h;
+    const raw: i32 = switch (sizing) {
+        .fixed => |n| n,
+        .fit => @max(measured, 1),
+        .percent => |f| @intFromFloat(@floor(@as(f64, @floatFromInt(boundary)) * @as(f64, f))),
+        .grow => unreachable,
+    };
+    const lo = if (axis == .w) root.cfg.min_width else root.cfg.min_height;
+    const hi = if (axis == .w) root.cfg.max_width else root.cfg.max_height;
+    return @min(@max(raw, lo), hi);
+}
+
+/// Move an already-sized root to where its placement asks for, then keep it on screen.
+///
+/// Two rules do that, and neither can be written as an inset: **flip** moves the layer to the
+/// other side of its anchor when the preferred side has no room and the other does, and
+/// **shift** slides it back inside the boundary when it hangs over an edge. A box positioned
+/// by insets says where it goes; it has nowhere to say what to do when that place does not
+/// exist. Every toolkit that places menus carries both rules, which is why placing a layer is
+/// a different problem from positioning a box rather than a larger version of it.
+///
+/// Hot path: every frame, once per visible layer. Not a per-pixel loop; not RT.
+pub fn placeLayerRoot(root: *layout.Node, anchor: Rect, placement: layer_types.LayerPlacement, boundary: Rect) void {
     const rw: i32 = @intCast(root.rect.w);
     const rh: i32 = @intCast(root.rect.h);
-    var dx: i32 = 0;
-    var dy: i32 = 0;
-    if (root.rect.x + rw > sw) dx = sw - (root.rect.x + rw);
-    if (root.rect.y + rh > sh) dy = sh - (root.rect.y + rh);
-    if (root.rect.x + dx < 0) dx = -root.rect.x;
-    if (root.rect.y + dy < 0) dy = -root.rect.y;
-    if (dx != 0 or dy != 0) translateNodeTree(root, dx, dy);
+
+    var side = placement.side;
+    if (placement.flip == .main_axis) side = flippedSide(side, anchor, boundary, rw, rh);
+
+    var pos = sidePos(side, anchor, rw, rh);
+    pos.x += crossOffset(side, .w, anchor, rw, placement.cross);
+    pos.y += crossOffset(side, .h, anchor, rh, placement.cross);
+    pos.x += placement.offset.x;
+    pos.y += placement.offset.y;
+
+    if (placement.shift == .both_axes) {
+        pos.x = shiftInto(pos.x, rw, boundary.x, @intCast(boundary.w));
+        pos.y = shiftInto(pos.y, rh, boundary.y, @intCast(boundary.h));
+    }
+
+    translateNodeTree(root, pos.x - root.rect.x, pos.y - root.rect.y);
+}
+
+fn mainAxisIsVertical(side: layer_types.Side) bool {
+    return side == .below or side == .above;
+}
+
+/// The room on each side of the anchor along the placement's main axis.
+fn sideRoom(side: layer_types.Side, anchor: Rect, boundary: Rect) struct { preferred: i32, opposite: i32 } {
+    const b_right = boundary.x + @as(i32, @intCast(boundary.w));
+    const b_bottom = boundary.y + @as(i32, @intCast(boundary.h));
+    const a_right = anchor.x + @as(i32, @intCast(anchor.w));
+    const a_bottom = anchor.y + @as(i32, @intCast(anchor.h));
+    return switch (side) {
+        .below => .{ .preferred = b_bottom - a_bottom, .opposite = anchor.y - boundary.y },
+        .above => .{ .preferred = anchor.y - boundary.y, .opposite = b_bottom - a_bottom },
+        .right_of => .{ .preferred = b_right - a_right, .opposite = anchor.x - boundary.x },
+        .left_of => .{ .preferred = anchor.x - boundary.x, .opposite = b_right - a_right },
+    };
+}
+
+fn oppositeSide(side: layer_types.Side) layer_types.Side {
+    return switch (side) {
+        .below => .above,
+        .above => .below,
+        .right_of => .left_of,
+        .left_of => .right_of,
+    };
+}
+
+/// Flip only when the preferred side cannot hold the layer and the other side can hold more
+/// of it. A layer that fits nowhere stays on the side it asked for, so that it fails in the
+/// place the caller expects rather than jumping.
+fn flippedSide(side: layer_types.Side, anchor: Rect, boundary: Rect, rw: i32, rh: i32) layer_types.Side {
+    const need: i32 = if (mainAxisIsVertical(side)) rh else rw;
+    const room = sideRoom(side, anchor, boundary);
+    if (room.preferred >= need) return side;
+    if (room.opposite <= room.preferred) return side;
+    return oppositeSide(side);
+}
+
+fn sidePos(side: layer_types.Side, anchor: Rect, rw: i32, rh: i32) Vec2 {
+    const a_right = anchor.x + @as(i32, @intCast(anchor.w));
+    const a_bottom = anchor.y + @as(i32, @intCast(anchor.h));
+    return switch (side) {
+        .below => .{ .x = anchor.x, .y = a_bottom },
+        .above => .{ .x = anchor.x, .y = anchor.y - rh },
+        .right_of => .{ .x = a_right, .y = anchor.y },
+        .left_of => .{ .x = anchor.x - rw, .y = anchor.y },
+    };
+}
+
+/// The cross-axis adjustment. Only the axis that is not the placement's main axis moves.
+fn crossOffset(
+    side: layer_types.Side,
+    comptime axis: enum { w, h },
+    anchor: Rect,
+    size: i32,
+    cross: layer_types.CrossAlign,
+) i32 {
+    const vertical_main = mainAxisIsVertical(side);
+    const is_cross = if (axis == .w) vertical_main else !vertical_main;
+    if (!is_cross) return 0;
+    const span: i32 = @intCast(if (axis == .w) anchor.w else anchor.h);
+    return switch (cross) {
+        .start => 0,
+        .center => @divFloor(span - size, 2),
+        .end => span - size,
+    };
+}
+
+fn shiftInto(pos: i32, size: i32, lo: i32, span: i32) i32 {
+    var p = pos;
+    const hi = lo + span;
+    if (p + size > hi) p = hi - size;
+    if (p < lo) p = lo;
+    return p;
 }
 
 // ============================================================
@@ -1693,86 +1811,76 @@ test "popupPos: reads position from either backend, null when not open" {
     try std.testing.expectEqual(Vec2{ .x = 7, .y = 8 }, ctx.popupPos(2).?);
 }
 
-test "placeTooltipSubtree: sits 4px below the anchor at natural size" {
-    const color = color_mod.Color.rgba(0xFF, 0xFF, 0xFF, 0xFF);
-    var root = layout.Node{ .cfg = .{
-        .direction = .column,
-        .width = .fit,
-        .height = .fit,
-        .padding = .{ 4, 4, 4, 4 },
-    } };
-    var leaf = layout.Node{ .leaf = .{ .text = .{
-        .str = "hi",
-        .color = color,
-        .font = null,
-    } } };
+test "layer placement: below the anchor at natural size" {
+    var root: layout.Node = .{ .cfg = .{ .direction = .column, .width = .fit, .height = .fit } };
+    var leaf: layout.Node = .{ .cfg = .{ .width = .{ .fixed = 40 }, .height = .{ .fixed = 12 } } };
     layout.appendChild(&root, &leaf);
-
-    const anchor = Rect{ .x = 20, .y = 10, .w = 30, .h = 12 };
-    const inset = style_mod.defaultStyle().spacing.popup_inset;
-    placeTooltipSubtree(&root, anchor, 800, 600, inset, font_mod.default_font, std.testing.allocator);
-
+    const anchor: Rect = .{ .x = 20, .y = 30, .w = 50, .h = 16 };
+    const boundary: Rect = .{ .x = 0, .y = 0, .w = 800, .h = 600 };
+    layoutLayerRoot(&root, boundary, font_mod.default_font, std.testing.allocator);
+    placeLayerRoot(&root, anchor, .{ .source = .{ .point = .{ .x = 0, .y = 0 } }, .flip = .none }, boundary);
     try std.testing.expectEqual(@as(i32, 20), root.rect.x);
-    try std.testing.expectEqual(@as(i32, 10 + 12 + inset), root.rect.y);
-    try std.testing.expectEqual(@as(i32, 24), leaf.rect.x); // + padding
-    try std.testing.expectEqual(@as(i32, 10 + 12 + inset + 4), leaf.rect.y);
-    try std.testing.expect(!root.cfg.clip_children);
+    try std.testing.expectEqual(@as(i32, 46), root.rect.y); // anchor bottom
+    try std.testing.expectEqual(@as(u32, 40), root.rect.w);
 }
 
-test "placeTooltipSubtree: right and bottom overflow is pushed back, not flipped" {
-    const color = color_mod.Color.rgba(0xFF, 0xFF, 0xFF, 0xFF);
-    var root = layout.Node{ .cfg = .{
-        .direction = .column,
-        .width = .fit,
-        .height = .fit,
-        .padding = .{ 4, 4, 4, 4 },
-    } };
-    var leaf = layout.Node{ .leaf = .{ .text = .{
-        .str = "XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX",
-        .color = color,
-        .font = null,
-    } } };
+test "layer placement: overflow on the right and bottom is pushed back, not flipped" {
+    var root: layout.Node = .{ .cfg = .{ .direction = .column, .width = .fit, .height = .fit } };
+    var leaf: layout.Node = .{ .cfg = .{ .width = .{ .fixed = 60 }, .height = .{ .fixed = 20 } } };
     layout.appendChild(&root, &leaf);
-
-    const anchor = Rect{ .x = 180, .y = 60, .w = 16, .h = 12 };
-    const inset = style_mod.defaultStyle().spacing.popup_inset;
-    placeTooltipSubtree(&root, anchor, 200, 80, inset, font_mod.default_font, std.testing.allocator);
-
-    try std.testing.expect(root.rect.x >= 0);
-    try std.testing.expect(root.rect.y >= 0);
-    try std.testing.expect(@as(i64, root.rect.x) + root.rect.w <= 200);
-    try std.testing.expect(@as(i64, root.rect.y) + root.rect.h <= 80);
-    // Child moved by the same delta as the root (not left at the pre-clamp position).
-    try std.testing.expectEqual(root.rect.x + 4, leaf.rect.x);
-    try std.testing.expectEqual(root.rect.y + 4, leaf.rect.y);
+    const anchor: Rect = .{ .x = 170, .y = 60, .w = 20, .h = 10 };
+    const boundary: Rect = .{ .x = 0, .y = 0, .w = 200, .h = 80 };
+    layoutLayerRoot(&root, boundary, font_mod.default_font, std.testing.allocator);
+    placeLayerRoot(&root, anchor, .{ .source = .{ .point = .{ .x = 0, .y = 0 } }, .flip = .none }, boundary);
+    try std.testing.expectEqual(@as(i32, 140), root.rect.x); // 200 - 60
+    try std.testing.expectEqual(@as(i32, 60), root.rect.y); // 80 - 20
 }
 
-test "placeTooltipSubtree: larger than the screen shrinks the root and clips" {
-    var root = layout.Node{ .cfg = .{
-        .direction = .column,
-        .width = .fit,
-        .height = .fit,
-        .padding = .{ 2, 2, 2, 2 },
-    } };
-    var leaf = layout.Node{ .leaf = .{ .custom = .{
-        .measured = .{ .x = 400, .y = 300 },
-        .draw_fn = struct {
-            fn f(_: *anyopaque, _: *layout.DrawList, _: Rect) void {}
-        }.f,
-        .ctx = undefined,
-    } } };
+test "layer placement: a root larger than the boundary is clamped and clipped" {
+    var root: layout.Node = .{ .cfg = .{ .direction = .column, .width = .fit, .height = .fit } };
+    var leaf: layout.Node = .{ .cfg = .{ .width = .{ .fixed = 200 }, .height = .{ .fixed = 200 } } };
     layout.appendChild(&root, &leaf);
-
-    const anchor = Rect{ .x = 10, .y = 10, .w = 8, .h = 8 };
-    const inset = style_mod.defaultStyle().spacing.popup_inset;
-    placeTooltipSubtree(&root, anchor, 80, 50, inset, font_mod.default_font, std.testing.allocator);
-
+    const anchor: Rect = .{ .x = 10, .y = 10, .w = 4, .h = 4 };
+    const boundary: Rect = .{ .x = 0, .y = 0, .w = 80, .h = 50 };
+    layoutLayerRoot(&root, boundary, font_mod.default_font, std.testing.allocator);
+    placeLayerRoot(&root, anchor, .{ .source = .{ .point = .{ .x = 0, .y = 0 } }, .flip = .none }, boundary);
     try std.testing.expectEqual(@as(u32, 80), root.rect.w);
     try std.testing.expectEqual(@as(u32, 50), root.rect.h);
     try std.testing.expect(root.cfg.clip_children);
-    try std.testing.expectEqual(@as(i32, 0), root.rect.x);
-    try std.testing.expectEqual(@as(i32, 0), root.rect.y);
-    // Children keep natural size; clip on the root cuts the overflow.
-    try std.testing.expectEqual(@as(u32, 400), leaf.rect.w);
-    try std.testing.expectEqual(@as(u32, 300), leaf.rect.h);
+}
+
+test "layer placement: flip moves to the other side only when the preferred one cannot hold it" {
+    var root: layout.Node = .{ .cfg = .{ .direction = .column, .width = .fit, .height = .fit } };
+    var leaf: layout.Node = .{ .cfg = .{ .width = .{ .fixed = 30 }, .height = .{ .fixed = 40 } } };
+    layout.appendChild(&root, &leaf);
+    const boundary: Rect = .{ .x = 0, .y = 0, .w = 200, .h = 100 };
+
+    // Room below: the layer stays where it asked to be.
+    layoutLayerRoot(&root, boundary, font_mod.default_font, std.testing.allocator);
+    placeLayerRoot(&root, .{ .x = 10, .y = 10, .w = 20, .h = 10 }, .{ .source = .{ .point = .{ .x = 0, .y = 0 } } }, boundary);
+    try std.testing.expectEqual(@as(i32, 20), root.rect.y);
+
+    // No room below, room above: it flips.
+    layoutLayerRoot(&root, boundary, font_mod.default_font, std.testing.allocator);
+    placeLayerRoot(&root, .{ .x = 10, .y = 80, .w = 20, .h = 10 }, .{ .source = .{ .point = .{ .x = 0, .y = 0 } } }, boundary);
+    try std.testing.expectEqual(@as(i32, 40), root.rect.y); // 80 - 40
+
+    // Room on neither side: it stays on the side it asked for, and shift keeps it on screen,
+    // so that a layer that cannot fit fails where the caller expects rather than jumping.
+    const tight: Rect = .{ .x = 0, .y = 0, .w = 200, .h = 60 };
+    layoutLayerRoot(&root, tight, font_mod.default_font, std.testing.allocator);
+    placeLayerRoot(&root, .{ .x = 10, .y = 25, .w = 20, .h = 10 }, .{ .source = .{ .point = .{ .x = 0, .y = 0 } } }, tight);
+    try std.testing.expectEqual(@as(i32, 20), root.rect.y); // shifted up from 35 to fit 40 in 60
+}
+
+test "layer placement: cross alignment moves only the cross axis" {
+    var root: layout.Node = .{ .cfg = .{ .direction = .column, .width = .fit, .height = .fit } };
+    var leaf: layout.Node = .{ .cfg = .{ .width = .{ .fixed = 20 }, .height = .{ .fixed = 10 } } };
+    layout.appendChild(&root, &leaf);
+    const boundary: Rect = .{ .x = 0, .y = 0, .w = 400, .h = 400 };
+    const anchor: Rect = .{ .x = 100, .y = 100, .w = 60, .h = 20 };
+    layoutLayerRoot(&root, boundary, font_mod.default_font, std.testing.allocator);
+    placeLayerRoot(&root, anchor, .{ .source = .{ .point = .{ .x = 0, .y = 0 } }, .cross = .center, .flip = .none }, boundary);
+    try std.testing.expectEqual(@as(i32, 120), root.rect.x); // 100 + (60 - 20) / 2
+    try std.testing.expectEqual(@as(i32, 120), root.rect.y); // still directly below
 }

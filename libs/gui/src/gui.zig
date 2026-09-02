@@ -164,6 +164,15 @@ pub const Direction = @import("layout.zig").Direction;
 pub const Sizing = @import("layout.zig").Sizing;
 pub const Align = @import("layout.zig").Align;
 pub const Inset = @import("layout.zig").Inset;
+// Layer placement. The marker (`BoxConfig.layer`) is not published yet: a marker subtree's raw
+// `draw_list` calls would escape the layer's z order while `draw_list` is a public field.
+pub const LayerKey = @import("layer_types.zig").LayerKey;
+pub const LayerPlacement = @import("layer_types.zig").LayerPlacement;
+pub const AnchorSource = @import("layer_types.zig").AnchorSource;
+pub const Side = @import("layer_types.zig").Side;
+pub const CrossAlign = @import("layer_types.zig").CrossAlign;
+pub const FlipPolicy = @import("layer_types.zig").FlipPolicy;
+pub const ShiftPolicy = @import("layer_types.zig").ShiftPolicy;
 pub const Position = @import("layout.zig").Position;
 pub const Overflow = @import("layout.zig").Overflow;
 pub const BoxConfig = @import("layout.zig").BoxConfig;
