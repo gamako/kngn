@@ -12,7 +12,7 @@ machine-checkable in the existing harness without adding rendering behavior to t
 framework.
 
 The probe must describe layout ownership rather than every pixel that happens to be
-visible. In particular, intentional clipping, scrolling, anchored placement, and
+visible. In particular, intentional clipping, scrolling, out-of-flow placement, and
 detached overlays are part of the GUI contract and must not be reported as ordinary
 flow-layout failures.
 
@@ -46,9 +46,9 @@ string is long.
 
 ### Flow sibling overlap
 
-Only direct, non-anchored flow children of the same parent participate. A pair counts
+Only direct, in-flow children of the same parent participate. A pair counts
 when the intersection has positive width and positive height. Touching edges are not
-overlap, and anchored children are excluded both from the pair check and from their
+overlap, and positioned children are excluded both from the pair check and from their
 parent's flow extent.
 
 Children are sorted by their x coordinate. Each item is compared only with later
@@ -62,7 +62,7 @@ is enabled.
 
 For each non-leaf flow box, the probe computes the furthest direct flow-child edge,
 including an un-clipped child's measured content extent, then adds the box padding.
-The box is reported when that extent exceeds its width or height. Anchored children
+The box is reported when that extent exceeds its width or height. Positioned children
 do not contribute. A box with `clip_children`, a non-zero scroll offset, or an
 explicit min/max constraint is an intentional boundary and is excluded; a direct
 flow child with an explicit min/max constraint likewise marks the parent's constrained

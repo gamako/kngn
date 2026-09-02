@@ -214,8 +214,8 @@ pub fn main(init: std.process.Init) !void {
     try runWrapScenario(io, &tracker, .cjk, 20, 0, "cjk-many");
     try runWrapScenario(io, &tracker, .mixed, 20, 0, "mixed-many");
     std.debug.print("\n=== GUI overlay / indent-guide scenarios (scale 1.0) ===\n", .{});
-    try runAnchorScenario(io, &tracker, 0, "anchor-0");
-    try runAnchorScenario(io, &tracker, 100, "anchor-100");
+    try runPositionScenario(io, &tracker, 0, "position-0");
+    try runPositionScenario(io, &tracker, 100, "position-100");
     try runFlowScenario(io, &tracker, 100, "flow-100");
     try runIndentScenario(io, &tracker, 500, 0, "indent-d0-500");
     try runIndentScenario(io, &tracker, 1000, 0, "indent-d0-1000");
@@ -285,7 +285,7 @@ fn runWrapScenario(io: std.Io, tracker: *peak_allocator.PeakTrackingAllocator, k
     });
 }
 
-fn buildAnchors(ctx: *gui.Context, n: u32) void {
+fn buildPositioned(ctx: *gui.Context, n: u32) void {
     ctx.beginBox(.{
         .direction = .column,
         .width = .{ .grow = 1 },
@@ -310,7 +310,7 @@ fn buildAnchors(ctx: *gui.Context, n: u32) void {
     ctx.endBox();
 }
 
-/// The control for `buildAnchors`: the same host, the same child count and the same child size,
+/// The control for `buildPositioned`: the same host, the same child count and the same child size,
 /// with every child in normal flow. It exists so that the cost of an out-of-flow feature is read
 /// against a tree of equal shape that does not use it, rather than against an empty tree.
 fn buildFlowBoxes(ctx: *gui.Context, n: u32) void {
@@ -439,11 +439,11 @@ fn runCountedScenario(
     });
 }
 
-fn runAnchorScenario(io: std.Io, tracker: *peak_allocator.PeakTrackingAllocator, n: u32, name: []const u8) !void {
+fn runPositionScenario(io: std.Io, tracker: *peak_allocator.PeakTrackingAllocator, n: u32, name: []const u8) !void {
     const Gen = struct {
         var n_badges: u32 = 0;
         fn build(ctx: *gui.Context) void {
-            buildAnchors(ctx, n_badges);
+            buildPositioned(ctx, n_badges);
         }
     };
     Gen.n_badges = n;

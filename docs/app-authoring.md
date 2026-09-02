@@ -250,8 +250,9 @@ Which one a thing is:
 ### 5.1 The box tree
 
 `ctx.beginBox(cfg: gui.BoxConfig)` opens a box, `ctx.endBox()` closes it, and what you build
-in between are its children. A box carries no position — only the `BoxConfig` saying how it is
-sized and how it arranges what is inside it. The fields a screen normally needs:
+in between are its children. A box carries no coordinates of its own — only the `BoxConfig` saying how it is
+sized and how it arranges what is inside it. (`BoxConfig.position`, below, is the one way to
+opt out of that and place a box by coordinates instead.) The fields a screen normally needs:
 
 | Field | What it does |
 |---|---|

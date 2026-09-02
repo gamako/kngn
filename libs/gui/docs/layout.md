@@ -153,7 +153,7 @@ the exact one.
 
 In a `wrap` box **each line is aligned on its own leftover**, which is what CSS
 `justify-content` does; the cross-axis stacking of the lines is not affected
-(there is no `align_content`). Anchored children are placed by their own `Anchor`
+(there is no `align_content`). Positioned children are placed by their own `Position`
 and ignore `align_main` entirely.
 
 Content extent follows the children: a `.center` or `.end` box's `content_w` /

@@ -480,10 +480,12 @@ fn gapTotal(gap: i32, child_count: u32) i32 {
 /// Returns null when the product leaves the i64 range, which a finite f32 can still do.
 fn percentFloor(content: i32, f: f32) ?i64 {
     const product = @floor(@as(f64, @floatFromInt(content)) * @as(f64, f));
-    if (!(product >= min_i64_f64 and product <= max_i64_f64)) return null;
+    if (!(product >= min_i64_f64 and product < max_i64_f64)) return null;
     return @intFromFloat(product);
 }
 
+/// i64's range as f64 bounds. The maximum is exclusive: 2^63 is exactly representable as an
+/// f64 while `maxInt(i64)` is not, so a `<=` here would admit a product one past the range.
 const min_i64_f64: f64 = -9223372036854775808.0;
 const max_i64_f64: f64 = 9223372036854775808.0;
 
@@ -1227,6 +1229,20 @@ fn pivotOffset(size: i32, pivot: f32) ?i64 {
 
 pub const PositionResolveError = error{OutOfDomain};
 
+/// `resolveSize` for the positioned path, where a size that cannot be represented has to be
+/// reported rather than trap. `Sizing.percent` is the only mode that can leave the range from
+/// a legal config — `sizingValid` admits any finite non-negative fraction, and a large one
+/// against a large parent exceeds i32 — so it is the only mode that needs the checked form.
+fn resolveSizeChecked(child: *const Node, axis: Axis, content: i32) PositionResolveError!i64 {
+    const raw: i64 = switch (sizingOf(child, axis)) {
+        .percent => |f| percentFloor(content, f) orelse return error.OutOfDomain,
+        else => resolveSize(child, axis, content, null),
+    };
+    const clamped = clampAxisI64(child, axis, raw);
+    if (!extentInDomain(clamped)) return error.OutOfDomain;
+    return clamped;
+}
+
 /// Where a positioned child sits on one axis, before the parent's scroll is applied.
 pub const PositionedAxis = struct { pos: i32, size: i32 };
 
@@ -1251,13 +1267,17 @@ pub const PositionedAxis = struct { pos: i32, size: i32 };
 fn resolvePositionedChecked(
     child: *const Node,
     axis: Axis,
-    origin: i32,
-    content: i32,
+    origin: i64,
+    content: i64,
+    scroll: i64,
 ) PositionResolveError!PositionedAxis {
     const pos_cfg = child.cfg.position.?;
+    if (!extentInDomain(content)) return error.OutOfDomain;
+    if (!coordInDomain(origin)) return error.OutOfDomain;
+    const content32: i32 = @intCast(content);
     const insets = axisInsets(pos_cfg, axis);
-    const leading = try resolveInset(insets.leading, content);
-    const trailing = try resolveInset(insets.trailing, content);
+    const leading = try resolveInset(insets.leading, content32);
+    const trailing = try resolveInset(insets.trailing, content32);
 
     if (leading != null and trailing != null) {
         // Both edges pinned: the distance between them is the size, and the pivot has
@@ -1266,16 +1286,16 @@ fn resolvePositionedChecked(
             return error.OutOfDomain, trailing.?) orelse return error.OutOfDomain;
         const clamped = clampAxisI64(child, axis, available);
         if (!extentInDomain(clamped)) return error.OutOfDomain;
-        const p = addChecked(origin, leading.?) orelse return error.OutOfDomain;
+        const unscrolled = addChecked(origin, leading.?) orelse return error.OutOfDomain;
+        const p = subChecked(unscrolled, scroll) orelse return error.OutOfDomain;
         if (!coordInDomain(p)) return error.OutOfDomain;
         if (!coordInDomain(addChecked(p, clamped) orelse return error.OutOfDomain))
             return error.OutOfDomain;
         return .{ .pos = @intCast(p), .size = @intCast(clamped) };
     }
 
-    const size = resolveSize(child, axis, content, null);
-    if (!extentInDomain(size)) return error.OutOfDomain;
-    const pivot_off = pivotOffset(size, axisPivot(pos_cfg, axis)) orelse
+    const size = try resolveSizeChecked(child, axis, content32);
+    const pivot_off = pivotOffset(@intCast(size), axisPivot(pos_cfg, axis)) orelse
         return error.OutOfDomain;
 
     const base: i64 = if (leading) |l|
@@ -1287,7 +1307,8 @@ fn resolvePositionedChecked(
         break :blk subChecked(inner, size) orelse return error.OutOfDomain;
     } else origin;
 
-    const p = subChecked(base, pivot_off) orelse return error.OutOfDomain;
+    const unscrolled = subChecked(base, pivot_off) orelse return error.OutOfDomain;
+    const p = subChecked(unscrolled, scroll) orelse return error.OutOfDomain;
     if (!coordInDomain(p)) return error.OutOfDomain;
     if (!coordInDomain(addChecked(p, size) orelse return error.OutOfDomain))
         return error.OutOfDomain;
@@ -1297,13 +1318,24 @@ fn resolvePositionedChecked(
 /// `resolvePositionedChecked` for a config that `assertBoxConfigValid` has already accepted
 /// and a parent whose own rect is in the coordinate domain. A failure here is a bug, not a
 /// caller error, so it trips an assertion instead of propagating.
+///
+/// What the checked form covers is exactly this: the child's own rect, on one axis, from the
+/// parent's content origin through the insets, the size, the pivot and the scroll. It does
+/// **not** extend to `accumulateExtent` / `commitExtent`, which fold that rect into the
+/// parent's content extent in i32 and are shared with in-flow placement. A parent origin at
+/// one end of the coordinate domain and a child edge at the other give a relative extent
+/// wider than `geom.MAX_EXTENT`, and `scroll_x` / `scroll_y` are unvalidated i32 that the fold
+/// adds directly — both of which predate positioned boxes and apply to in-flow children the
+/// same way. Widening that fold would put checked arithmetic on the path every flow child
+/// takes, to fix something this feature did not introduce.
 fn resolvePositioned(
     child: *const Node,
     axis: Axis,
-    origin: i32,
-    content: i32,
+    origin: i64,
+    content: i64,
+    scroll: i64,
 ) PositionedAxis {
-    return resolvePositionedChecked(child, axis, origin, content) catch
+    return resolvePositionedChecked(child, axis, origin, content, scroll) catch
         @panic("layout: positioned child resolves outside the coordinate domain");
 }
 
@@ -1320,17 +1352,25 @@ fn clampAxisI64(node: *const Node, axis: Axis, raw: i64) i64 {
 /// Not a per-pixel loop; not RT.
 fn placePositionedOnAxis(node: *Node, axis: Axis) void {
     const cfg = node.cfg;
-    const content_origin: i32 = if (axis == .w)
-        node.rect.x + cfg.padding[3]
+    // Widened here rather than inside the resolver: the origin is the parent's own placed
+    // edge plus a padding the caller supplies, and the pair can leave the domain before a
+    // positioned child is even looked at.
+    const content_origin: i64 = if (axis == .w)
+        @as(i64, node.rect.x) + cfg.padding[3]
     else
-        node.rect.y + cfg.padding[0];
-    const content_size: i32 = @max(0, @as(i32, @intCast(if (axis == .w) node.rect.w else node.rect.h)) - axisPadding(cfg, axis));
-    const scroll: i32 = if (axis == .w) cfg.scroll_x else cfg.scroll_y;
+        @as(i64, node.rect.y) + cfg.padding[0];
+    // The padding pair is summed in i64 too: `axisPadding` adds two caller-supplied i32s.
+    const pad: i64 = switch (axis) {
+        .w => @as(i64, cfg.padding[3]) + cfg.padding[1],
+        .h => @as(i64, cfg.padding[0]) + cfg.padding[2],
+    };
+    const content_size: i64 = @max(0, @as(i64, if (axis == .w) node.rect.w else node.rect.h) - pad);
+    const scroll: i64 = if (axis == .w) cfg.scroll_x else cfg.scroll_y;
     var it = node.first_child;
     while (it) |c| : (it = c.next_sibling) {
         if (c.cfg.position == null) continue;
-        const r = resolvePositioned(c, axis, content_origin, content_size);
-        descendPlace(c, axis, r.pos - scroll, r.size);
+        const r = resolvePositioned(c, axis, content_origin, content_size, scroll);
+        descendPlace(c, axis, r.pos, r.size);
     }
     if (axis == .h) foldPositionedExtent(node);
 }
@@ -2958,17 +2998,19 @@ fn atOrigin(w: i32, h: i32) Node {
 
 const LegacyAt = enum { start, center, end };
 
-/// The nine attachment points this engine used to offer, written as insets. Kept as a
-/// test fixture because it is the translation a reader migrating old code needs, and
-/// because two of the three cases per axis are easy to get subtly wrong:
+/// The nine attachment points a box can want against its parent — each corner, each edge
+/// midpoint, and the centre — written as insets. Nine placements built one way and asserted
+/// against hand-computed coordinates, which is what makes the table a check on the resolver
+/// rather than nine restatements of it.
 ///
-/// - `.end` is the only one whose offset changes sign. An inset is measured *inward* from
-///   its edge, so "8px further right" is `right = -8`, not `right = 8`.
-/// - `.center` is `50%` paired with a half-size pivot, the CSS idiom. It is **not** an exact
-///   translation: the old rule was `floor((content - size) / 2)` and this one is
-///   `floor(content x 0.5) - floor(size x 0.5)`, which differ by 1px when content and size
-///   have different parity (content 100, size 11: 44 against 45). The four corners are the
-///   only cases that translate exactly.
+/// Two of the three cases per axis are easy to get subtly wrong:
+///
+/// - `.end` is the only one whose offset changes sign. An inset is measured *inward* from its
+///   edge, so "8px further right" is `right = -8`, not `right = 8`.
+/// - `.center` is `50%` paired with a half-size pivot, the CSS idiom. Both terms floor
+///   independently, so it is `floor(content x 0.5) - floor(size x 0.5)` and not
+///   `floor((content - size) / 2)`; the two differ by 1px whenever content and size have
+///   different parity (content 100, size 11: 45 against 44).
 fn legacyPosition(h: LegacyAt, v: LegacyAt, dx: i32, dy: i32) Position {
     var p: Position = .{};
     switch (h) {
@@ -3128,13 +3170,15 @@ test "position: the nine legacy attachment points as insets" {
     } };
     var tl: Node = positioned(legacyPosition(.start, .start, 2, 3), 10, 8);
     var tc: Node = positioned(legacyPosition(.center, .start, 0, 0), 10, 8);
-    var tr: Node = positioned(legacyPosition(.end, .start, 0, 0), 10, 8);
+    // The `.end` rows carry a non-zero offset on purpose: with zero there, an inset whose
+    // sign was inverted would land on the same coordinate and this table would pass.
+    var tr: Node = positioned(legacyPosition(.end, .start, 5, 0), 10, 8);
     var cl: Node = positioned(legacyPosition(.start, .center, 0, 0), 10, 8);
     var c: Node = positioned(legacyPosition(.center, .center, 0, 0), 10, 8);
-    var cr: Node = positioned(legacyPosition(.end, .center, 0, 0), 10, 8);
-    var bl: Node = positioned(legacyPosition(.start, .end, 0, 0), 10, 8);
-    var bc: Node = positioned(legacyPosition(.center, .end, 0, 0), 10, 8);
-    var br: Node = positioned(legacyPosition(.end, .end, 0, 0), 10, 8);
+    var cr: Node = positioned(legacyPosition(.end, .center, 5, 0), 10, 8);
+    var bl: Node = positioned(legacyPosition(.start, .end, 0, 7), 10, 8);
+    var bc: Node = positioned(legacyPosition(.center, .end, 0, 7), 10, 8);
+    var br: Node = positioned(legacyPosition(.end, .end, 5, 7), 10, 8);
     appendChild(&root, &tl);
     appendChild(&root, &tc);
     appendChild(&root, &tr);
@@ -3155,20 +3199,20 @@ test "position: the nine legacy attachment points as insets" {
     try std.testing.expectEqual(@as(i32, 4 + 3), tl.rect.y);
     try std.testing.expectEqual(mid_x, tc.rect.x);
     try std.testing.expectEqual(@as(i32, 4), tc.rect.y);
-    try std.testing.expectEqual(@as(i32, 100 - 4 - 10), tr.rect.x);
+    try std.testing.expectEqual(@as(i32, 100 - 4 - 10 + 5), tr.rect.x);
     try std.testing.expectEqual(@as(i32, 4), tr.rect.y);
     try std.testing.expectEqual(@as(i32, 4), cl.rect.x);
     try std.testing.expectEqual(mid_y, cl.rect.y);
     try std.testing.expectEqual(mid_x, c.rect.x);
     try std.testing.expectEqual(mid_y, c.rect.y);
-    try std.testing.expectEqual(@as(i32, 100 - 4 - 10), cr.rect.x);
+    try std.testing.expectEqual(@as(i32, 100 - 4 - 10 + 5), cr.rect.x);
     try std.testing.expectEqual(mid_y, cr.rect.y);
     try std.testing.expectEqual(@as(i32, 4), bl.rect.x);
-    try std.testing.expectEqual(@as(i32, 80 - 4 - 8), bl.rect.y);
+    try std.testing.expectEqual(@as(i32, 80 - 4 - 8 + 7), bl.rect.y);
     try std.testing.expectEqual(mid_x, bc.rect.x);
-    try std.testing.expectEqual(@as(i32, 80 - 4 - 8), bc.rect.y);
-    try std.testing.expectEqual(@as(i32, 100 - 4 - 10), br.rect.x);
-    try std.testing.expectEqual(@as(i32, 80 - 4 - 8), br.rect.y);
+    try std.testing.expectEqual(@as(i32, 80 - 4 - 8 + 7), bc.rect.y);
+    try std.testing.expectEqual(@as(i32, 100 - 4 - 10 + 5), br.rect.x);
+    try std.testing.expectEqual(@as(i32, 80 - 4 - 8 + 7), br.rect.y);
 }
 
 test "position: centring is 50% plus a half pivot, floored on each term" {
@@ -3559,19 +3603,26 @@ test "position: the four placements match an independent oracle over a swept inp
     const px_values = [_]i32{ 0, 7, -7 };
     const pcts = [_]f32{ 0, 0.5, -0.25 };
     const pivots = [_]f32{ 0, 0.5, 1.0, -0.5 };
+    // Chosen so the pairs land on each side of the raw size (11) and on it exactly.
+    const clamps = [_][2]i32{ .{ 0, std.math.maxInt(i32) }, .{ 20, 200 }, .{ 0, 5 }, .{ 11, 11 } };
     const size: i32 = 11;
 
     for (contents) |content| {
         for (origins) |origin| {
             for (px_values) |px| {
                 for (pcts) |pct| {
-                    for (pivots) |pivot| {
+                    for (pivots) |pivot| for (clamps) |clamp| {
+                        const min_w = clamp[0];
+                        const max_w = clamp[1];
                         const len: Inset = .{ .length = .{ .px = px, .percent = pct } };
+                        // The trailing edge gets a different value from the leading one, so
+                        // that a resolver reading the wrong one still lands somewhere else.
+                        const len_t: Inset = .{ .length = .{ .px = px + 3, .percent = pct } };
                         const combos = [_]Position{
                             .{ .pivot = .{ .x = pivot } },
                             .{ .left = len, .pivot = .{ .x = pivot } },
                             .{ .right = len, .pivot = .{ .x = pivot } },
-                            .{ .left = len, .right = len, .pivot = .{ .x = pivot } },
+                            .{ .left = len, .right = len_t, .pivot = .{ .x = pivot } },
                         };
                         for (combos, 0..) |pos, i| {
                             const both = i == 3;
@@ -3579,32 +3630,40 @@ test "position: the four placements match an independent oracle over a swept inp
                                 .position = pos,
                                 .width = if (both) .fit else .{ .fixed = size },
                                 .height = .{ .fixed = size },
+                                .min_width = min_w,
+                                .max_width = max_w,
                             } };
                             child.measured_w = size;
-                            const r = try resolvePositionedChecked(&child, .w, origin, content);
+                            const r = try resolvePositionedChecked(&child, .w, origin, content, 0);
 
-                            const inset: i64 = @as(i64, px) +
-                                @as(i64, @intFromFloat(@floor(@as(f64, @floatFromInt(content)) * @as(f64, pct))));
+                            const pct_part: i64 =
+                                @intFromFloat(@floor(@as(f64, @floatFromInt(content)) * @as(f64, pct)));
+                            const inset: i64 = @as(i64, px) + pct_part;
+                            const inset_t: i64 = @as(i64, px) + 3 + pct_part;
                             const leading: ?i64 = if (i == 1 or both) inset else null;
-                            const trailing: ?i64 = if (i == 2 or both) inset else null;
-                            const expect_size: i64 = if (both)
-                                @max(0, @as(i64, content) - inset - inset)
+                            const trailing: ?i64 = if (i == 2) inset else if (both) inset_t else null;
+                            const raw_size: i64 = if (both)
+                                @as(i64, content) - inset - inset_t
                             else
                                 size;
+                            const expect_size = @min(@max(raw_size, min_w), max_w);
                             const expect_pos = oraclePos(leading, trailing, origin, content, expect_size, pivot);
 
                             try std.testing.expectEqual(@as(i32, @intCast(expect_size)), r.size);
                             try std.testing.expectEqual(@as(i32, @intCast(expect_pos)), r.pos);
 
-                            // Where both edges are pinned inward and the gap is real, the box
-                            // stays inside it. Outside that region the claim is simply false —
-                            // a negative inset is a request to overflow — so it is not asserted.
-                            if (both and inset >= 0 and @as(i64, content) - inset - inset >= 0) {
+                            // Where both edges are pinned inward, the gap is real, and the
+                            // clamp does not widen it, the box stays inside that gap. Outside
+                            // that region the claim is simply false — a negative inset is a
+                            // request to overflow, and a min wider than the gap is a request
+                            // to exceed it — so it is not asserted there.
+                            const gap = @as(i64, content) - inset - inset_t;
+                            if (both and inset >= 0 and inset_t >= 0 and gap >= 0 and min_w <= gap) {
                                 try std.testing.expectEqual(@as(i32, @intCast(origin + inset)), r.pos);
                                 try std.testing.expect(r.pos + r.size <= origin + content);
                             }
                         }
-                    }
+                    };
                 }
             }
         }
@@ -3633,9 +3692,47 @@ test "position: a placement that leaves the coordinate domain is reported, not w
         child.measured_w = 10;
         try std.testing.expectError(
             error.OutOfDomain,
-            resolvePositionedChecked(&child, .w, 0, 100),
+            resolvePositionedChecked(&child, .w, 0, 100, 0),
         );
     }
+
+    // The size itself, not the insets. `sizingValid` admits any finite non-negative fraction,
+    // so a large one against a large parent leaves i32 while still being a legal config.
+    for ([_]f32{ 1e7, 1e30 }) |pct| {
+        var big: Node = .{ .cfg = .{
+            .position = .{ .left = .{ .length = .{} } },
+            .width = .{ .percent = pct },
+            .height = .{ .fixed = 10 },
+        } };
+        try std.testing.expectError(
+            error.OutOfDomain,
+            resolvePositionedChecked(&big, .w, 0, 1000, 0),
+        );
+    }
+
+    // A pivot at the far edge of what f64 can multiply out. 2^63 is exactly representable
+    // as an f64 while maxInt(i64) is not, so an inclusive bound here would let it through.
+    var pivot_edge: Node = .{ .cfg = .{
+        .position = .{ .left = .{ .length = .{} }, .pivot = .{ .x = 9223372036854775808.0 } },
+        .width = .{ .fixed = 1 },
+        .height = .{ .fixed = 1 },
+    } };
+    try std.testing.expectError(
+        error.OutOfDomain,
+        resolvePositionedChecked(&pivot_edge, .w, 0, 100, 0),
+    );
+
+    // Scroll is applied inside the checked path, so a scroll that throws the box out of the
+    // domain is reported rather than wrapping around.
+    var scrolled: Node = .{ .cfg = .{
+        .position = .{ .left = .{ .length = .{} } },
+        .width = .{ .fixed = 10 },
+        .height = .{ .fixed = 10 },
+    } };
+    try std.testing.expectError(
+        error.OutOfDomain,
+        resolvePositionedChecked(&scrolled, .w, 0, 100, std.math.maxInt(i32)),
+    );
 }
 
 test "position: a placement at the edge of the coordinate domain still resolves" {
@@ -3644,7 +3741,7 @@ test "position: a placement at the edge of the coordinate domain still resolves"
         .width = .{ .fixed = 10 },
         .height = .{ .fixed = 10 },
     } };
-    const r = try resolvePositionedChecked(&child, .w, 0, 100);
+    const r = try resolvePositionedChecked(&child, .w, 0, 100, 0);
     try std.testing.expectEqual(@as(i32, geom.MAX_COORD - 10), r.pos);
     try std.testing.expectEqual(@as(i32, 10), r.size);
 }

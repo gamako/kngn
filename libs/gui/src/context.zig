@@ -2359,7 +2359,7 @@ test "layout: clip_children bakes the parent rect into children's draw cmds" {
     try std.testing.expectEqual(@as(u32, 40), text_clip.h);
 }
 
-test "anchor: clip_children clips an overflowing overlay's draw commands" {
+test "position: clip_children clips an overflowing positioned child's draw commands" {
     var ctx = testCtx();
     defer ctx.deinit();
     const host: Id = 0xA101;
@@ -2398,7 +2398,7 @@ test "anchor: clip_children clips an overflowing overlay's draw commands" {
     try std.testing.expect(found);
 }
 
-test "anchor: an explicit id is cached and hit-tested" {
+test "position: an explicit id is cached and hit-tested" {
     var ctx = testCtx();
     defer ctx.deinit();
     const host: Id = 0xA201;
@@ -2439,7 +2439,7 @@ test "anchor: an explicit id is cached and hit-tested" {
     try std.testing.expect(res.clicked);
 }
 
-test "anchor: a tree with no overlay keeps the pre-overlay rect and DrawCmd contract" {
+test "position: a tree with none keeps the in-flow rect and DrawCmd contract" {
     var ctx = testCtx();
     defer ctx.deinit();
     const row: Id = 0xA301;

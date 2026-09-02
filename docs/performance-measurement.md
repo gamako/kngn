@@ -752,26 +752,28 @@ with per-edge insets took it from **128 to 168 bytes**. The question that decide
 that is acceptable is not how the feature performs, but whether the trees that do not use
 it got slower.
 
-`anchor-0` (a host with no positioned child at all) and `flow-100` (the same host, the same
-hundred children at the same size, all in normal flow) are the controls; `anchor-100` is the
-same shape with every child positioned. `flow-100` exists because `anchor-0` alone is not a
-control: it holds no children, so it would report the cost of a wider `BoxConfig` on a tree
-of one box.
+`position-0` (a host with no positioned child at all) and `flow-100` (the same host, the
+same hundred children at the same size, all in normal flow) are the controls; `position-100`
+is the same shape with every child positioned. `flow-100` exists because `position-0` alone
+is not a control: it holds no children, so it would report the cost of a wider `BoxConfig`
+on a tree of one box.
 
-| scenario | before (ns) | after (ns) | Δ |
+| scenario | before (ns) | after (ns) | Δ of medians |
 |---|---:|---:|---:|
-| `anchor-0` (no positioned child) | 50734 / 50895 | 50617 / 50551 / 50651 | −0.3% |
-| `flow-100` (100 in-flow children) | 54299 | 51925 / 51693 / 51289 | −4.9% |
-| `anchor-100` (100 positioned children) | 58822 / 58586 | 59308 / 59465 / 59486 | +1.2% |
+| `position-0` (no positioned child) | 50734, 50895 | median 50637 of 5 | −0.4% |
+| `flow-100` (100 in-flow children) | 54299 | median 53562 of 5 | −1.4% |
+| `position-100` (100 positioned children) | 58822, 58586 | median 59734 of 5 | +1.8% |
 
-Neither control regressed. The `flow-100` drop is not claimed as a speedup — nothing in the
-change makes in-flow placement do less work, and run-to-run spread on this bench is already
-several percent — it is reported as measured. `flow-100` has one before sample against three
-after; `anchor-0` has two against three.
+**Read these as "no regression detected", not as signed percentages.** The five after-samples
+of `flow-100` span 52612–56613, a 7.6% spread, which is wider than every difference in the
+table; the before column is two samples, and one for `flow-100`. What the numbers support is
+that neither control moved outside its own run-to-run spread. Sampling more would narrow the
+interval, not change that conclusion, and a frame-time assertion in a build gate would be
+measuring the spread rather than the change.
 
-The +1.2% on `anchor-100` is the feature's own path doing more: four insets to resolve
-instead of one enum plus an offset, with every intermediate computed in i64 and checked
-against the coordinate domain.
+The direction on `position-100` is what the feature's own path would predict: four insets to
+resolve instead of one enum plus an offset, with every intermediate computed in i64 and
+checked against the coordinate domain.
 
 ### `bench-path` (one run, ns and scratch peak)
 
