@@ -943,18 +943,29 @@ fn mainAxisIsVertical(side: layer_types.Side) bool {
     return side == .below or side == .above;
 }
 
-/// The room on each side of the anchor along the placement's main axis.
-fn sideRoom(side: layer_types.Side, anchor: Rect, boundary: Rect) struct { preferred: i32, opposite: i32 } {
+/// The room between the anchor and the boundary on one side, along that side's axis.
+fn roomOn(side: layer_types.Side, anchor: Rect, boundary: Rect) i32 {
     const b_right = boundary.x + @as(i32, @intCast(boundary.w));
     const b_bottom = boundary.y + @as(i32, @intCast(boundary.h));
     const a_right = anchor.x + @as(i32, @intCast(anchor.w));
     const a_bottom = anchor.y + @as(i32, @intCast(anchor.h));
     return switch (side) {
-        .below => .{ .preferred = b_bottom - a_bottom, .opposite = anchor.y - boundary.y },
-        .above => .{ .preferred = anchor.y - boundary.y, .opposite = b_bottom - a_bottom },
-        .right_of => .{ .preferred = b_right - a_right, .opposite = anchor.x - boundary.x },
-        .left_of => .{ .preferred = anchor.x - boundary.x, .opposite = b_right - a_right },
+        .below => b_bottom - a_bottom,
+        .above => anchor.y - boundary.y,
+        .right_of => b_right - a_right,
+        .left_of => anchor.x - boundary.x,
     };
+}
+
+/// How much room a side needs. The offset is part of where the layer lands, so it is part of
+/// what it needs: pushed further from the anchor it needs more, pulled back toward it, less.
+fn needOn(side: layer_types.Side, rw: i32, rh: i32, offset: Vec2) i32 {
+    const along: i32 = if (mainAxisIsVertical(side)) offset.y else offset.x;
+    const size: i32 = if (mainAxisIsVertical(side)) rh else rw;
+    // `below` and `right_of` grow away from the anchor as the offset grows; the other two
+    // grow toward it, so the same positive offset gives them room back.
+    const away = side == .below or side == .right_of;
+    return size + if (away) along else -along;
 }
 
 fn oppositeSide(side: layer_types.Side) layer_types.Side {
@@ -966,9 +977,12 @@ fn oppositeSide(side: layer_types.Side) layer_types.Side {
     };
 }
 
-/// Flip only when the preferred side cannot hold the layer and the other side can hold more
-/// of it. A layer that fits nowhere stays on the side it asked for, so that it fails in the
-/// place the caller expects rather than jumping.
+/// Flip only when the preferred side cannot hold the layer and the other side can.
+///
+/// A layer that fits on neither side stays where it asked to be. Moving it would put it
+/// somewhere it also does not fit, which is the same failure in a place the caller did not
+/// choose — and `shift` will bring it back on screen either way. Comparing which side has
+/// *more* room is not the same test and gets this case wrong.
 fn flippedSide(
     side: layer_types.Side,
     anchor: Rect,
@@ -977,15 +991,10 @@ fn flippedSide(
     rh: i32,
     offset: Vec2,
 ) layer_types.Side {
-    // The offset is part of where the layer ends up, so it is part of whether it fits. A
-    // layer nudged down by its offset needs that much more room below than its height alone.
-    const along: i32 = if (mainAxisIsVertical(side)) offset.y else offset.x;
-    const toward_end = side == .below or side == .right_of;
-    const need: i32 = (if (mainAxisIsVertical(side)) rh else rw) + if (toward_end) along else -along;
-    const room = sideRoom(side, anchor, boundary);
-    if (room.preferred >= need) return side;
-    if (room.opposite <= room.preferred) return side;
-    return oppositeSide(side);
+    if (needOn(side, rw, rh, offset) <= roomOn(side, anchor, boundary)) return side;
+    const opp = oppositeSide(side);
+    if (needOn(opp, rw, rh, offset) <= roomOn(opp, anchor, boundary)) return opp;
+    return side;
 }
 
 fn sidePos(side: layer_types.Side, anchor: Rect, rw: i32, rh: i32) Vec2 {
@@ -1882,6 +1891,64 @@ test "layer placement: flip moves to the other side only when the preferred one 
     layoutLayerRoot(&root, tight, font_mod.default_font, std.testing.allocator);
     placeLayerRoot(&root, .{ .x = 10, .y = 25, .w = 20, .h = 10 }, .{ .source = .{ .point = .{ .x = 0, .y = 0 } } }, tight);
     try std.testing.expectEqual(@as(i32, 20), root.rect.y); // shifted up from 35 to fit 40 in 60
+}
+
+fn flipCase(side: layer_types.Side, anchor: Rect, boundary: Rect, w: i32, h: i32, offset: Vec2) layer_types.Side {
+    return flippedSide(side, anchor, boundary, w, h, offset);
+}
+
+test "layer placement: flip needs the other side to fit, not merely to be roomier" {
+    const boundary: Rect = .{ .x = 0, .y = 0, .w = 200, .h = 100 };
+    const no_offset: Vec2 = .{ .x = 0, .y = 0 };
+
+    // Room below, so it stays.
+    try std.testing.expectEqual(
+        layer_types.Side.below,
+        flipCase(.below, .{ .x = 10, .y = 10, .w = 20, .h = 10 }, boundary, 30, 40, no_offset),
+    );
+    // No room below, room above: it flips.
+    try std.testing.expectEqual(
+        layer_types.Side.above,
+        flipCase(.below, .{ .x = 10, .y = 80, .w = 20, .h = 10 }, boundary, 30, 40, no_offset),
+    );
+    // Neither side can hold a 90px layer: 10 below, 80 above. The old rule compared which
+    // side had *more* room and flipped to a side that also does not fit, putting the layer at
+    // a negative y. It stays where it asked to be, and shift brings it on screen.
+    try std.testing.expectEqual(
+        layer_types.Side.below,
+        flipCase(.below, .{ .x = 10, .y = 80, .w = 20, .h = 10 }, boundary, 30, 90, no_offset),
+    );
+    // The same on the horizontal axis, in both directions.
+    try std.testing.expectEqual(
+        layer_types.Side.left_of,
+        flipCase(.right_of, .{ .x = 150, .y = 10, .w = 20, .h = 10 }, boundary, 60, 10, no_offset),
+    );
+    try std.testing.expectEqual(
+        layer_types.Side.right_of,
+        flipCase(.left_of, .{ .x = 10, .y = 10, .w = 20, .h = 10 }, boundary, 60, 10, no_offset),
+    );
+    // Asking for above with only 10px above it and 80 below: it flips down, the mirror of
+    // the second case.
+    try std.testing.expectEqual(
+        layer_types.Side.below,
+        flipCase(.above, .{ .x = 10, .y = 10, .w = 20, .h = 10 }, boundary, 30, 40, no_offset),
+    );
+}
+
+test "layer placement: the offset counts toward whether a side fits, on both sides" {
+    const boundary: Rect = .{ .x = 0, .y = 0, .w = 200, .h = 100 };
+    // 50 below the anchor, 40 above it. A 45-tall layer fits below on its own, but an offset
+    // pushing it 10 further down needs 55 and does not. Above it is pulled 10 back toward the
+    // anchor, so it needs 35 and fits — which comparing raw room (40 against 50) would miss.
+    const anchor: Rect = .{ .x = 10, .y = 40, .w = 20, .h = 10 };
+    try std.testing.expectEqual(
+        layer_types.Side.below,
+        flipCase(.below, anchor, boundary, 30, 45, .{ .x = 0, .y = 0 }),
+    );
+    try std.testing.expectEqual(
+        layer_types.Side.above,
+        flipCase(.below, anchor, boundary, 30, 45, .{ .x = 0, .y = 10 }),
+    );
 }
 
 test "layer placement: cross alignment moves only the cross axis" {

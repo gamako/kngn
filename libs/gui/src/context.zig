@@ -1677,7 +1677,7 @@ pub const Context = struct {
         // A marker borrowed its parent link only to close this scope. Clearing it now means
         // no walk from a layer root can reach the tree it was written in, so a later pass
         // cannot pick up the parent's clip, scroll or extent by accident.
-        if (cur.cfg.layer != null) {
+        if (cur.is_layer_root) {
             cur.parent = null;
             self.display_only_depth -= 1;
         }
@@ -1765,6 +1765,9 @@ pub const Context = struct {
     /// yet, so it is not a wheel target this frame. It becomes one on the next
     /// frame, once `endFrame` has recorded its rect.
     pub fn ensureWheelChain(self: *Context) void {
+        // Sealing the chain picks which scroll area the wheel belongs to for the rest of the
+        // frame, which is input routing state — not something a display-only subtree may set.
+        self.requireInteractiveAllowed("ensureWheelChain");
         if (self.wheel_chain_ready) return;
         self.wheel_chain_ready = true;
         self.wheel_chain_mouse = self.input.mouse_pos;
@@ -3219,6 +3222,25 @@ test "layer: the slot remembers where a layer was, and that it has gone" {
     try std.testing.expect(ctx.layerPrevRect(.{ .value = 7 }) != null); // the frame did not touch it
     ctx.releaseLayerSlot(.{ .value = 7 });
     try std.testing.expect(ctx.layerPrevRect(.{ .value = 7 }) == null);
+}
+
+test "layer: layerWasPlaced follows whether the layer reached the screen" {
+    var ctx = testCtx();
+    defer ctx.deinit();
+    const slot_key: LayerKey = .{ .value = 77 };
+    try std.testing.expect(!ctx.layerWasPlaced(slot_key)); // never seen
+
+    ctx.beginFrameAt(400, 300, 0.0);
+    (LayerFixture{ .key = 77, .box_id = 7700, .point = .{ .x = 3, .y = 4 } }).build(&ctx);
+    ctx.endFrame();
+    try std.testing.expect(ctx.layerWasPlaced(slot_key));
+
+    // Built again, but anchored to a box that is not in the frame: it does not reach the
+    // screen, and the slot has to say so rather than keep reporting the last time it did.
+    ctx.beginFrameAt(400, 300, 0.1);
+    (LayerFixture{ .key = 77, .anchor_id = 9999, .box_id = 7700 }).build(&ctx);
+    ctx.endFrame();
+    try std.testing.expect(!ctx.layerWasPlaced(slot_key));
 }
 
 test "layer: a tooltip stays out of the rect cache and the id namespace" {

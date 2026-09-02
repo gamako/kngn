@@ -126,7 +126,7 @@ pub const Border = draw_mod.Border;
 pub const BoxConfig = struct {
     /// 0 = engine auto-assigns (not externally referenceable; not registered in the rect cache).
     /// Non-zero = explicit ID (caller builds via IdStack etc.). Subject to getNodeRect / hit-test
-    /// caching. Must not collide within the same frame (asserted in debug).
+    /// caching. Must not collide within the same frame, in any build mode.
     id: Id = 0,
     direction: Direction = .column,
     width: Sizing = .fit,
@@ -228,9 +228,15 @@ pub const Node = struct {
     last_child: ?*Node = null,
     next_sibling: ?*Node = null,
     child_count: u32 = 0,
-    /// In-flow children. `child_count - flow_child_count` is the positioned count.
-    /// Written in `appendChild` so measure/place never recounts.
+    /// In-flow children. `child_count` counts everything written inside the parent, including
+    /// a layer marker that never joined the chain, so the difference is the count of children
+    /// that are out of flow *and still in the tree* — positioned boxes. Written in
+    /// `appendChild` so measure/place never recounts.
     flow_child_count: u32 = 0,
+    /// True when this node is a layer's root. Recorded once, when the marker is registered,
+    /// rather than read back from `cfg` — a caller holding the node through `openBox` can
+    /// change `cfg`, and a scope that opened as a layer has to close as one.
+    is_layer_root: bool = false,
     /// True when at least one direct child has `cfg.position != null`.
     /// A false box takes the in-flow walk (no extra sibling scan).
     has_positioned_child: bool = false,
@@ -263,6 +269,7 @@ pub fn attachDetached(parent: *Node, child: *Node) void {
     std.debug.assert(child.parent == null);
     std.debug.assert(child.cfg.layer != null);
     child.parent = parent;
+    child.is_layer_root = true;
     // The ordinal advances even though the chain does not. It is what auto-generated ids are
     // built from, so leaving it still would give the box written after a marker the same id
     // as the box written before it.
