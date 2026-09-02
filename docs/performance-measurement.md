@@ -747,7 +747,7 @@ the sign of the drop as “no regression”, not as a speedup claim.
 ### Out-of-flow placement, and what a field on `BoxConfig` costs
 
 `BoxConfig` is copied into an arena `Node` for **every** box, every frame, so widening it
-is paid by trees that never touch the new field. Replacing the nine-way overlay attachment
+is paid by trees that never touch the new field. Replacing the nine-way out-of-flow attachment
 with per-edge insets took it from **128 to 168 bytes**. The question that decides whether
 that is acceptable is not how the feature performs, but whether the trees that do not use
 it got slower.
@@ -758,22 +758,22 @@ is the same shape with every child positioned. `flow-100` exists because `positi
 is not a control: it holds no children, so it would report the cost of a wider `BoxConfig`
 on a tree of one box.
 
-| scenario | before (ns) | after (ns) | Δ of medians |
-|---|---:|---:|---:|
-| `position-0` (no positioned child) | 50734, 50895 | median 50637 of 5 | −0.4% |
-| `flow-100` (100 in-flow children) | 54299 | median 53562 of 5 | −1.4% |
-| `position-100` (100 positioned children) | 58822, 58586 | median 59734 of 5 | +1.8% |
+| scenario | before (ns) | after (ns, median of 5) |
+|---|---:|---:|
+| `position-0` (no positioned child) | 50734, 50895 | 50637 |
+| `flow-100` (100 in-flow children) | 54299 | 53562 |
+| `position-100` (100 positioned children) | 58822, 58586 | 59734 |
 
-**Read these as "no regression detected", not as signed percentages.** The five after-samples
-of `flow-100` span 52612–56613, a 7.6% spread, which is wider than every difference in the
-table; the before column is two samples, and one for `flow-100`. What the numbers support is
-that neither control moved outside its own run-to-run spread. Sampling more would narrow the
-interval, not change that conclusion, and a frame-time assertion in a build gate would be
-measuring the spread rather than the change.
+**No column of differences is given, because the spread is wider than any of them.** The five
+after-samples of `flow-100` span 52612–56613, 7.6% apart; the before column is two samples,
+and one for `flow-100`. What the measurement supports is that neither control moved outside
+its own run-to-run spread — "no regression detected", not a signed percentage. Sampling more
+would narrow the interval rather than change that, and a frame-time assertion in a build gate
+would be measuring the spread instead of the change.
 
-The direction on `position-100` is what the feature's own path would predict: four insets to
-resolve instead of one enum plus an offset, with every intermediate computed in i64 and
-checked against the coordinate domain.
+`position-100` is the feature's own path: four insets to resolve instead of one enum plus an
+offset, with the position resolver's arithmetic carried in i64 and checked against the
+coordinate domain.
 
 ### `bench-path` (one run, ns and scratch peak)
 

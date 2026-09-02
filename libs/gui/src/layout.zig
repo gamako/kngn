@@ -218,7 +218,7 @@ pub const Node = struct {
     last_child: ?*Node = null,
     next_sibling: ?*Node = null,
     child_count: u32 = 0,
-    /// Non-overlay children. `child_count - flow_child_count` is the overlay count.
+    /// In-flow children. `child_count - flow_child_count` is the positioned count.
     /// Written in `appendChild` so measure/place never recounts.
     flow_child_count: u32 = 0,
     /// True when at least one direct child has `cfg.position != null`.
@@ -1243,7 +1243,7 @@ fn resolveSizeChecked(child: *const Node, axis: Axis, content: i32) PositionReso
     return clamped;
 }
 
-/// Where a positioned child sits on one axis, before the parent's scroll is applied.
+/// Where a positioned child sits on one axis, after the parent's scroll is applied.
 pub const PositionedAxis = struct { pos: i32, size: i32 };
 
 /// Resolve a positioned child on one axis. Pure and checked: every intermediate is computed
@@ -1319,15 +1319,14 @@ fn resolvePositionedChecked(
 /// and a parent whose own rect is in the coordinate domain. A failure here is a bug, not a
 /// caller error, so it trips an assertion instead of propagating.
 ///
-/// What the checked form covers is exactly this: the child's own rect, on one axis, from the
-/// parent's content origin through the insets, the size, the pivot and the scroll. It does
-/// **not** extend to `accumulateExtent` / `commitExtent`, which fold that rect into the
-/// parent's content extent in i32 and are shared with in-flow placement. A parent origin at
-/// one end of the coordinate domain and a child edge at the other give a relative extent
-/// wider than `geom.MAX_EXTENT`, and `scroll_x` / `scroll_y` are unvalidated i32 that the fold
-/// adds directly — both of which predate positioned boxes and apply to in-flow children the
-/// same way. Widening that fold would put checked arithmetic on the path every flow child
-/// takes, to fix something this feature did not introduce.
+/// The checked form covers the child's own rect, on one axis, from the parent's content
+/// origin through the insets, the size, the pivot and the scroll. It does **not** cover
+/// `accumulateExtent` / `commitExtent`, which fold that rect into the parent's content extent
+/// in i32 on the path every in-flow child takes as well: a parent origin at one end of the
+/// coordinate domain with a child edge at the other gives a relative extent wider than
+/// `geom.MAX_EXTENT`, and `scroll_x` / `scroll_y` are unvalidated i32 the fold adds directly.
+/// A rect in the coordinate domain is therefore what this guarantees, and a content extent in
+/// range is not.
 fn resolvePositioned(
     child: *const Node,
     axis: Axis,
@@ -3007,10 +3006,10 @@ const LegacyAt = enum { start, center, end };
 ///
 /// - `.end` is the only one whose offset changes sign. An inset is measured *inward* from its
 ///   edge, so "8px further right" is `right = -8`, not `right = 8`.
-/// - `.center` is `50%` paired with a half-size pivot, the CSS idiom. Both terms floor
-///   independently, so it is `floor(content x 0.5) - floor(size x 0.5)` and not
-///   `floor((content - size) / 2)`; the two differ by 1px whenever content and size have
-///   different parity (content 100, size 11: 45 against 44).
+/// - `.center` is `50%` paired with a half-size pivot, the CSS idiom. The two terms floor
+///   independently — `floor(content x 0.5) - floor(size x 0.5)` — which is not the same as
+///   flooring once at the end. With content 100 and size 11 it is 45, where a single
+///   `floor((content - size) / 2)` would give 44.
 fn legacyPosition(h: LegacyAt, v: LegacyAt, dx: i32, dy: i32) Position {
     var p: Position = .{};
     switch (h) {
@@ -3189,10 +3188,10 @@ test "position: the nine legacy attachment points as insets" {
     appendChild(&root, &bc);
     appendChild(&root, &br);
     layoutOnce(&root, 100, 80);
-    // Content box is 92 x 72 at (4, 4). The centre values are the new rule computed by hand:
-    // 4 + floor(92 x 0.5) - floor(10 x 0.5) = 45, and 4 + floor(72 x 0.5) - floor(8 x 0.5) = 36.
-    // Both axes happen to agree with the old rule here because the sizes share parity with
-    // the content box; the test below pins a case where they do not.
+    // Content box is 92 x 72 at (4, 4), so the centres are 4 + floor(92 x 0.5) - floor(10 x 0.5)
+    // = 45 and 4 + floor(72 x 0.5) - floor(8 x 0.5) = 36, computed by hand. Both sizes share
+    // parity with the content box here, which is the case where flooring twice and flooring
+    // once agree; the test below pins one where they do not.
     const mid_x: i32 = 45;
     const mid_y: i32 = 36;
     try std.testing.expectEqual(@as(i32, 4 + 2), tl.rect.x);
@@ -3216,9 +3215,9 @@ test "position: the nine legacy attachment points as insets" {
 }
 
 test "position: centring is 50% plus a half pivot, floored on each term" {
-    // Content 100, size 11. The old nine-way rule gave floor((100 - 11) / 2) = 44; this rule
-    // gives floor(100 x 0.5) - floor(11 x 0.5) = 50 - 5 = 45. Pinning 45 is what makes the
-    // two-term form the contract, rather than an accident nobody would notice.
+    // Content 100, size 11: floor(100 x 0.5) - floor(11 x 0.5) = 50 - 5 = 45. Flooring once
+    // at the end instead would give 44, so pinning 45 is what makes the two-term form the
+    // contract rather than an accident nobody would notice.
     var root: Node = .{ .cfg = .{
         .direction = .column,
         .width = .{ .fixed = 100 },

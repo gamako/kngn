@@ -213,7 +213,7 @@ pub fn main(init: std.process.Init) !void {
     try runWrapScenario(io, &tracker, .long_word, 1, 10000, "longword-10000");
     try runWrapScenario(io, &tracker, .cjk, 20, 0, "cjk-many");
     try runWrapScenario(io, &tracker, .mixed, 20, 0, "mixed-many");
-    std.debug.print("\n=== GUI overlay / indent-guide scenarios (scale 1.0) ===\n", .{});
+    std.debug.print("\n=== GUI out-of-flow / indent-guide scenarios (scale 1.0) ===\n", .{});
     try runPositionScenario(io, &tracker, 0, "position-0");
     try runPositionScenario(io, &tracker, 100, "position-100");
     try runFlowScenario(io, &tracker, 100, "flow-100");
@@ -427,7 +427,7 @@ fn runCountedScenario(
     std.mem.sort(u64, samples[0..], {}, std.sort.asc(u64));
     var sum: u64 = 0;
     for (samples) |s| sum += s;
-    std.debug.print("gui.overlay {s:<16} arena_cap={d:<10} alloc_calls={d:<8} cmds={d:<6} avg={d:>9} ns  min={d:>9} ns  p95={d:>9} ns  peak_bytes={d}\n", .{
+    std.debug.print("gui.outflow {s:<16} arena_cap={d:<10} alloc_calls={d:<8} cmds={d:<6} avg={d:>9} ns  min={d:>9} ns  p95={d:>9} ns  peak_bytes={d}\n", .{
         name,
         arena_peak,
         tracker.alloc_calls / ITERS,
