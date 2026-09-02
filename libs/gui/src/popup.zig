@@ -923,7 +923,7 @@ pub fn placeLayerRoot(root: *layout.Node, anchor: Rect, placement: layer_types.L
     const rh: i32 = @intCast(root.rect.h);
 
     var side = placement.side;
-    if (placement.flip == .main_axis) side = flippedSide(side, anchor, boundary, rw, rh);
+    if (placement.flip == .main_axis) side = flippedSide(side, anchor, boundary, rw, rh, placement.offset);
 
     var pos = sidePos(side, anchor, rw, rh);
     pos.x += crossOffset(side, .w, anchor, rw, placement.cross);
@@ -969,8 +969,19 @@ fn oppositeSide(side: layer_types.Side) layer_types.Side {
 /// Flip only when the preferred side cannot hold the layer and the other side can hold more
 /// of it. A layer that fits nowhere stays on the side it asked for, so that it fails in the
 /// place the caller expects rather than jumping.
-fn flippedSide(side: layer_types.Side, anchor: Rect, boundary: Rect, rw: i32, rh: i32) layer_types.Side {
-    const need: i32 = if (mainAxisIsVertical(side)) rh else rw;
+fn flippedSide(
+    side: layer_types.Side,
+    anchor: Rect,
+    boundary: Rect,
+    rw: i32,
+    rh: i32,
+    offset: Vec2,
+) layer_types.Side {
+    // The offset is part of where the layer ends up, so it is part of whether it fits. A
+    // layer nudged down by its offset needs that much more room below than its height alone.
+    const along: i32 = if (mainAxisIsVertical(side)) offset.y else offset.x;
+    const toward_end = side == .below or side == .right_of;
+    const need: i32 = (if (mainAxisIsVertical(side)) rh else rw) + if (toward_end) along else -along;
     const room = sideRoom(side, anchor, boundary);
     if (room.preferred >= need) return side;
     if (room.opposite <= room.preferred) return side;

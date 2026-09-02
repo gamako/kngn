@@ -766,6 +766,17 @@ pub const Context = struct {
         }
         if (self.layout_sanity_enabled) {
             self.layout_sanity_result = layout_sanity_probe.scan(root, self.font, self.allocator());
+            // Each placed layer is a root of its own, scanned separately and summed in. A
+            // marker is not in the main tree by the time the probe runs, so nothing is
+            // counted twice; a layer that was not placed is not on screen to be counted.
+            var i: usize = 0;
+            while (i < self.layers_len) : (i += 1) {
+                if (self.layers[i].status != .placed) continue;
+                const r = layout_sanity_probe.scan(self.layers[i].root, self.font, self.allocator());
+                self.layout_sanity_result.text_overflow += r.text_overflow;
+                self.layout_sanity_result.sibling_overlap += r.sibling_overlap;
+                self.layout_sanity_result.content_overflow += r.content_overflow;
+            }
         }
         // Seal this frame's viewport rects so the next frame's wheel chain reads
         // previous-frame geometry (same 1-frame lag as hit-test).
@@ -1371,6 +1382,11 @@ pub const Context = struct {
         if (cfg.layer) |spec| {
             self.registerLayer(spec, node, parent);
             layout.attachDetached(parent, node);
+            // Layers do not take input yet: nothing arbitrates between a layer and what is
+            // under it, so a button inside one would be a button the box beneath it also
+            // gets. The existing display-only guard is what says so, and it is lifted when
+            // that arbitration arrives.
+            self.display_only_depth += 1;
         } else {
             layout.appendChild(parent, node);
         }
@@ -1463,13 +1479,25 @@ pub const Context = struct {
                     .height = .fit,
                     .padding = .{ pad, pad, pad, pad },
                 } };
+                // A row of the popup item height with the text centred in it, which is the
+                // shape a one-line tooltip has always had: the height comes from the style's
+                // item height, not from the font, so a tooltip is the same height as a menu
+                // item whatever font it is drawn in.
+                const row = self.allocator().create(layout.Node) catch @panic("tooltip: OOM");
+                row.* = .{ .cfg = .{
+                    .direction = .row,
+                    .width = .fit,
+                    .height = .{ .fixed = style.spacing.popup_item_height },
+                    .align_cross = .center,
+                } };
                 const leaf = self.allocator().create(layout.Node) catch @panic("tooltip: OOM");
                 leaf.* = .{ .cfg = .{}, .leaf = .{ .text = .{
                     .str = self.allocator().dupe(u8, tip) catch @panic("tooltip: OOM"),
                     .color = style.text_tokens.primary,
                     .font = null,
                 } } };
-                layout.appendChild(r, leaf);
+                layout.appendChild(row, leaf);
+                layout.appendChild(r, row);
                 break :blk r;
             },
         };
@@ -1556,6 +1584,7 @@ pub const Context = struct {
                 // its ids into the cache, so the lookup below fails and this layer is missing
                 // too — the propagation falls out of the cache rather than being restated.
                 if (self.ownerLayerOf(anchor_id)) |owner| {
+                    rec.depends_on = owner;
                     if (self.layers[owner].status == .waiting) return .blocked;
                 }
                 const entry = self.rect_cache.get(anchor_id) orelse return .missing;
@@ -1606,6 +1635,16 @@ pub const Context = struct {
         }
     }
 
+    /// Whether this layer was on screen on the previous frame. Distinct from `layerPrevRect`
+    /// returning null only in that it does not need the rectangle to answer.
+    pub fn layerWasPlaced(self: *const Context, layer_key: LayerKey) bool {
+        var i: usize = 0;
+        while (i < self.layer_slots_len) : (i += 1) {
+            if (self.layer_slots[i].key.eql(layer_key)) return self.layer_slots[i].was_placed;
+        }
+        return false;
+    }
+
     /// Release a layer's slot. The public open/close API calls this.
     pub fn releaseLayerSlot(self: *Context, layer_key: LayerKey) void {
         var i: usize = 0;
@@ -1638,7 +1677,10 @@ pub const Context = struct {
         // A marker borrowed its parent link only to close this scope. Clearing it now means
         // no walk from a layer root can reach the tree it was written in, so a later pass
         // cannot pick up the parent's clip, scroll or extent by accident.
-        if (cur.cfg.layer != null) cur.parent = null;
+        if (cur.cfg.layer != null) {
+            cur.parent = null;
+            self.display_only_depth -= 1;
+        }
     }
 
     /// text leaf (default color = style.text). str is duped onto the arena, so it does not
@@ -1772,14 +1814,16 @@ pub const Context = struct {
     /// content extent (-1 if unrecorded). declared_w/h are the clamped `.fixed`
     /// size (-1 if the axis is not `.fixed`). ScrollArea reads them in that
     /// declared → extent → measured order.
-    /// Duplicate explicit IDs in the same frame are a contract violation (Debug assert; Release last-wins overwrite,
-    /// but callers must not use duplicate IDs).
+    /// Duplicate explicit IDs in the same frame are a contract violation in every build mode.
     fn updateRectCache(self: *Context, node: *const layout.Node, clip: Rect) void {
         if (node.cfg.id != 0) {
             const gop = self.rect_cache.getOrPut(self.gpa, node.cfg.id) catch
                 @panic("Context.endFrame: OOM");
-            // Duplicate explicit IDs in the same frame are a contract violation (last-wins overwrite breaks hit-test)
-            std.debug.assert(!gop.found_existing);
+            // One namespace covers the main tree and every caching layer, so a duplicate is a
+            // contract violation in every build mode rather than a debug-only check: under
+            // last-wins, the loser's rect silently becomes the winner's, and hit-testing and
+            // anchoring both follow it to the wrong box.
+            requireContract(!gop.found_existing, "two boxes with the same explicit id in one frame");
             gop.value_ptr.* = .{
                 .rect = node.rect,
                 .clip = clip,
@@ -3013,6 +3057,35 @@ const LayerFixture = struct {
     }
 };
 
+test "tooltip: a one-line tooltip keeps the popup item height and centres its text" {
+    var ctx = testCtx();
+    defer ctx.deinit();
+    ctx.beginFrameAt(800, 600, 0.0);
+    _ = ctx.buttonId(1, "Btn", .{});
+    ctx.endFrame();
+    hoverButtonWithTip(&ctx, 1, "Btn", "tip", 0.0);
+    hoverButtonWithTip(&ctx, 1, "Btn", "tip", 0.5);
+
+    const bg = tooltipOverlayBgRect(&ctx, "tip").?;
+    const pad = ctx.style.spacing.popup_inset;
+    const item_h = ctx.style.spacing.popup_item_height;
+    // The height a tooltip has always had: one item row plus the inset above and below. It
+    // comes from the style rather than the font, so a tooltip matches a menu item's height
+    // whatever it is drawn in.
+    try std.testing.expectEqual(@as(u32, @intCast(item_h + 2 * pad)), bg.h);
+
+    // And the text sits centred in that row rather than at its top.
+    var text_y: ?i32 = null;
+    for (ctx.draw_list.cmds.items) |cmd| {
+        if (cmd == .text and std.mem.eql(u8, cmd.text.text, "tip")) text_y = cmd.text.pos.y;
+    }
+    const row_y = bg.y + pad;
+    const ink = font_mod.fontInkHeight(ctx.font);
+    _ = ink;
+    try std.testing.expect(text_y.? > row_y);
+    try std.testing.expect(text_y.? < row_y + item_h);
+}
+
 test "layer: a marker takes no part in its parent's size or cursor" {
     var ctx = testCtx();
     defer ctx.deinit();
@@ -3158,6 +3231,102 @@ test "layer: a tooltip stays out of the rect cache and the id namespace" {
     ctx.endBox();
     ctx.endFrame();
     try std.testing.expect(ctx.getNodeRect(800) != null);
+}
+
+test "layer: a marker and the box written after it do not share an auto id" {
+    var ctx = testCtx();
+    defer ctx.deinit();
+    ctx.beginFrameAt(400, 300, 0.0);
+    ctx.beginBox(.{ .id = 1000, .direction = .column });
+    // The marker is written first, so it takes the ordinal a first child would have. If it
+    // did not advance the ordinal, the next box would take the same one — two boxes with one
+    // auto id, and one per-id state between them.
+    ctx.beginBox(.{
+        .layer = .{ .key = .{ .value = 1 }, .placement = .{ .source = .{ .point = .{ .x = 0, .y = 0 } } } },
+        .width = .{ .fixed = 10 },
+        .height = .{ .fixed = 10 },
+    });
+    ctx.endBox();
+    const marker_id = ctx.layers[0].root.id;
+    ctx.beginBox(.{ .width = .{ .fixed = 10 }, .height = .{ .fixed = 10 } });
+    ctx.endBox();
+    const sibling_id = ctx.layout_root.?.first_child.?.first_child.?.id;
+    ctx.endBox();
+    ctx.endFrame();
+    try std.testing.expect(marker_id != sibling_id);
+}
+
+test "layer: emission puts every layer after the main tree, in z order" {
+    var ctx = testCtx();
+    defer ctx.deinit();
+    const bg_main = Color.rgba(0x11, 0x11, 0x11, 0xFF);
+    const bg_low = Color.rgba(0x22, 0x22, 0x22, 0xFF);
+    const bg_high = Color.rgba(0x33, 0x33, 0x33, 0xFF);
+    ctx.beginFrameAt(400, 300, 0.0);
+    ctx.beginBox(.{ .id = 1100, .width = .{ .fixed = 40 }, .height = .{ .fixed = 20 }, .bg = bg_main });
+    ctx.endBox();
+    // Registered high-z first, so registration order alone would emit it first.
+    ctx.beginBox(.{
+        .layer = .{ .key = .{ .value = 1 }, .z = 10, .placement = .{ .source = .{ .point = .{ .x = 0, .y = 0 } } } },
+        .width = .{ .fixed = 10 },
+        .height = .{ .fixed = 10 },
+        .bg = bg_high,
+    });
+    ctx.endBox();
+    ctx.beginBox(.{
+        .layer = .{ .key = .{ .value = 2 }, .z = 1, .placement = .{ .source = .{ .point = .{ .x = 0, .y = 0 } } } },
+        .width = .{ .fixed = 10 },
+        .height = .{ .fixed = 10 },
+        .bg = bg_low,
+    });
+    ctx.endBox();
+    ctx.endFrame();
+
+    var order: [3]u8 = .{ 0, 0, 0 };
+    var n: usize = 0;
+    for (ctx.draw_list.cmds.items) |cmd| {
+        if (cmd != .rect_filled) continue;
+        if (cmd.rect_filled.paint != .solid) continue;
+        const c = cmd.rect_filled.paint.solid;
+        const tag: u8 = if (c.r == 0x11) 1 else if (c.r == 0x22) 2 else if (c.r == 0x33) 3 else 0;
+        if (tag == 0 or n == order.len) continue;
+        order[n] = tag;
+        n += 1;
+    }
+    // main, then z = 1, then z = 10: the draw list itself, not just the comparator.
+    try std.testing.expectEqual([3]u8{ 1, 2, 3 }, order);
+}
+
+test "layer: a root sizes against the boundary, not against a parent it does not have" {
+    var ctx = testCtx();
+    defer ctx.deinit();
+    ctx.beginFrameAt(400, 300, 0.0);
+    ctx.beginBox(.{
+        .layer = .{ .key = .{ .value = 1 }, .placement = .{ .source = .{ .point = .{ .x = 0, .y = 0 } }, .flip = .none } },
+        .id = 1200,
+        .width = .{ .percent = 0.25 },
+        .height = .{ .fixed = 30 },
+    });
+    ctx.endBox();
+    ctx.endFrame();
+    const r = ctx.getNodeRect(1200).?;
+    try std.testing.expectEqual(@as(u32, 100), r.w); // a quarter of the 400-wide boundary
+    try std.testing.expectEqual(@as(u32, 30), r.h);
+}
+
+test "layer: a marker subtree may not take input" {
+    // Layers do not arbitrate against what is under them yet, so a widget inside one would be
+    // a widget the box beneath it also receives. The existing display-only guard says so.
+    var ctx = testCtx();
+    defer ctx.deinit();
+    ctx.beginFrameAt(400, 300, 0.0);
+    ctx.beginBox(.{
+        .layer = .{ .key = .{ .value = 1 }, .placement = .{ .source = .{ .point = .{ .x = 0, .y = 0 } } } },
+    });
+    try std.testing.expect(ctx.display_only_depth > 0);
+    ctx.endBox();
+    try std.testing.expectEqual(@as(u32, 0), ctx.display_only_depth);
+    ctx.endFrame();
 }
 
 test "layer: a frame with neither a layout tree nor a layer leaves the draw list alone" {

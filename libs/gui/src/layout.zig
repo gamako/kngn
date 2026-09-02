@@ -263,6 +263,10 @@ pub fn attachDetached(parent: *Node, child: *Node) void {
     std.debug.assert(child.parent == null);
     std.debug.assert(child.cfg.layer != null);
     child.parent = parent;
+    // The ordinal advances even though the chain does not. It is what auto-generated ids are
+    // built from, so leaving it still would give the box written after a marker the same id
+    // as the box written before it.
+    parent.child_count += 1;
 }
 
 /// Append at the end (O(1) via last_child).
