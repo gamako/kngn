@@ -80,7 +80,7 @@ does not alter the layout tree, draw list, framebuffer, or overlay state.
 
 Pure layout fixtures cover fixed-width text, overlapping flow siblings, and content
 extent beyond a fixed box. Exclusion fixtures cover clipping, scrolling, ellipsis,
-normal wrapping, anchored children, detached popup layers, and min/max constraints.
+normal wrapping, positioned children, detached popup layers, and min/max constraints.
 Gallery and torture-example checkpoints exercise the probe through the harness while
 retaining their existing DrawList expectations. Disabled and harness-following gate
 states are checked through `KNGN_LAYOUT_SANITY`; framebuffer snapshots are inspected
