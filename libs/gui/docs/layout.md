@@ -119,6 +119,47 @@ at the trailing end.
 positioned subtree; `measureHeights` measures that subtree without folding it
 into the parent's fit height; `placeHeights` applies the placement.
 
+## Layers
+
+`BoxConfig.position` takes a box out of its parent's flow but leaves it inside the parent's
+box, clip and scroll. A **layer** is the box that leaves the parent altogether.
+
+That is what a dropdown under a button needs, and a context menu at the cursor, and a
+tooltip beside what it explains. None of them is sized by the box it belongs to, none of
+them may be cut by that box's clip, and none of them should be carried away by its scroll.
+Every toolkit that has met this arrives at the same shape — a separate root, placed against
+an anchor — and reaching for a wider version of `position` instead is the approach CSS took
+and then had to work around.
+
+A layer is declared by a marker on a box. The box is laid out as a root of its own: it never
+joins its parent's sibling chain, so the parent's fit measure, cursor, gap, grow share, wrap
+split and content extent cannot see it, and no walk from the layer reaches back into the tree
+it was written in.
+
+**Where it goes** is a `LayerPlacement`: an anchor (a point, or a box elsewhere in the frame
+by explicit id), a `side`, a `cross` alignment, an `offset`, and two policies that insets
+cannot express:
+
+- **flip** moves the layer to the other side of its anchor when the preferred side has no
+  room and the other side has more. A layer that fits on neither side stays where it asked to
+  be, so that it fails where the caller expects rather than jumping.
+- **shift** slides it back inside the boundary when it hangs over an edge.
+
+`left` and `top` say where something goes; they have nowhere to say what to do when it does
+not fit. That is the greater part of why placing a layer is a different problem from
+positioning a box.
+
+**Sizing a root** has no parent to ask, so `.grow` is rejected there, `.fit` is the content's
+natural size, and `.fixed` / `.percent` resolve against the boundary. The width settles
+before the text folds — a root that wrapped at its natural width and was then squeezed would
+hold lines shorter than the box around them.
+
+**When it is drawn**: after the main tree, in `z` order, ties breaking on the order the
+layers were declared. An anchor is read from *this* frame's geometry, so a layer never draws
+at a coordinate its anchor has already left; a layer whose anchor is not in the frame at all
+is not drawn. Layers may anchor into other layers, which are then placed in dependency
+order; a cycle among them is a contract failure.
+
 Content extent: a positioned child is not part of the layout size. A parent
 with `clip_children = false` still folds whatever of it is actually visible (the usual extent rule) so a ScrollArea can reach it. A clipping
 parent does not include it.

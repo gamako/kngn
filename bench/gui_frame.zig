@@ -217,6 +217,10 @@ pub fn main(init: std.process.Init) !void {
     try runPositionScenario(io, &tracker, 0, "position-0");
     try runPositionScenario(io, &tracker, 100, "position-100");
     try runFlowScenario(io, &tracker, 100, "flow-100");
+    try runLayerScenario(io, &tracker, 0, "layer-0");
+    try runLayerScenario(io, &tracker, 1, "layer-1");
+    try runLayerScenario(io, &tracker, 4, "layer-4");
+    try runLayerScenario(io, &tracker, 32, "layer-32");
     try runIndentScenario(io, &tracker, 500, 0, "indent-d0-500");
     try runIndentScenario(io, &tracker, 1000, 0, "indent-d0-1000");
     try runIndentScenario(io, &tracker, 500, 3, "indent-d3-500");
@@ -327,6 +331,44 @@ fn buildFlowBoxes(ctx: *gui.Context, n: u32) void {
         ctx.beginBox(.{
             .width = .{ .fixed = 12 },
             .height = .{ .fixed = 12 },
+            .bg = gui.Color.rgba(0xC0, 0x30, 0x30, 0xFF),
+        });
+        ctx.endBox();
+    }
+    ctx.endBox();
+}
+
+/// A host with `n` layers anchored into boxes inside it. `n = 0` is the control: the same
+/// host, the same children, no layer at all — which is what says whether the layer machinery
+/// costs anything to a tree that never opens one.
+fn buildLayers(ctx: *gui.Context, n: u32) void {
+    ctx.beginBox(.{
+        .direction = .column,
+        .width = .{ .grow = 1 },
+        .height = .{ .grow = 1 },
+        .padding = .{ 8, 8, 8, 8 },
+        .bg = gui.Color.rgba(0x18, 0x1C, 0x24, 0xFF),
+    });
+    var i: u32 = 0;
+    while (i < 32) : (i += 1) {
+        ctx.beginBox(.{
+            .id = 0x5000 + i,
+            .width = .{ .fixed = 40 },
+            .height = .{ .fixed = 10 },
+            .bg = gui.Color.rgba(0x30, 0x34, 0x40, 0xFF),
+        });
+        ctx.endBox();
+    }
+    i = 0;
+    while (i < n) : (i += 1) {
+        ctx.beginBox(.{
+            .layer = .{
+                .key = .{ .value = 0x9000 + i },
+                .z = @intCast(i),
+                .placement = .{ .source = .{ .id = 0x5000 + i } },
+            },
+            .width = .{ .fixed = 60 },
+            .height = .{ .fixed = 24 },
             .bg = gui.Color.rgba(0xC0, 0x30, 0x30, 0xFF),
         });
         ctx.endBox();
@@ -458,6 +500,17 @@ fn runFlowScenario(io: std.Io, tracker: *peak_allocator.PeakTrackingAllocator, n
         }
     };
     Gen.n_boxes = n;
+    try runCountedScenario(io, tracker, name, Gen.build);
+}
+
+fn runLayerScenario(io: std.Io, tracker: *peak_allocator.PeakTrackingAllocator, n: u32, name: []const u8) !void {
+    const Gen = struct {
+        var n_layers: u32 = 0;
+        fn build(ctx: *gui.Context) void {
+            buildLayers(ctx, n_layers);
+        }
+    };
+    Gen.n_layers = n;
     try runCountedScenario(io, tracker, name, Gen.build);
 }
 

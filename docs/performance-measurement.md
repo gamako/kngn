@@ -775,6 +775,34 @@ would be measuring the spread instead of the change.
 offset, with the position resolver's arithmetic carried in i64 and checked against the
 coordinate domain.
 
+### Layers, and the second field on `BoxConfig`
+
+A layer is a subtree that leaves its parent's box entirely. The marker that says so is another
+field on `BoxConfig`, which every box copies into its node every frame, so the same question
+applies as before: does a tree that never opens a layer get slower?
+
+`layer-0` is the control — a host with 32 boxes and no layer — against `layer-1`, `layer-4` and
+`layer-32` on the same host. `position-0` and `flow-100` carry over from the previous change and
+are the trees that have before-numbers on both sides of it.
+
+| scenario | after the previous change | after this one | boxes |
+|---|---:|---:|---:|
+| `position-0` | 50637 | 50585 | 2 |
+| `flow-100` | 53562 | 55786 | 101 |
+| `layer-0` | — | 52454 | 33 |
+| `layer-1` | — | 52454 | 34 |
+| `layer-32` | — | 61390 | 65 |
+
+Medians of 3. `flow-100` spans 54939–60038 across those three runs, 9% apart, so its median
+moving 4% says nothing; `position-0`, the smallest tree and therefore the one where a wider
+`BoxConfig` weighs most per box, did not move. **No regression detected** is what this supports.
+
+`@sizeOf(BoxConfig)` is now **224 bytes**, from 168 before this change and 128 before the one
+before it. Two features have each added a field to the struct every box carries. Neither shows
+up in the controls, but the trend is worth naming: a third field of this size would be worth
+paying for differently — by making the marker a handle into a side table rather than the
+placement itself — rather than by measuring again and finding it still inside the noise.
+
 ### `bench-path` (one run, ns and scratch peak)
 
 Scratch is area(f32)+cover(f32)+8bpp = 9 bytes/px, capped at 4 MiB

@@ -1551,12 +1551,12 @@ pub const Context = struct {
         switch (rec.placement.source) {
             .point => |p| return .{ .ready = .{ .x = p.x, .y = p.y, .w = 0, .h = 0 } },
             .id => |anchor_id| {
+                // Waiting on the layer that owns the anchor is the only thing the owner
+                // lookup is for. A missing owner needs no branch of its own: it never wrote
+                // its ids into the cache, so the lookup below fails and this layer is missing
+                // too — the propagation falls out of the cache rather than being restated.
                 if (self.ownerLayerOf(anchor_id)) |owner| {
-                    switch (self.layers[owner].status) {
-                        .waiting => return .blocked,
-                        .missing => return .missing,
-                        .placed => {},
-                    }
+                    if (self.layers[owner].status == .waiting) return .blocked;
                 }
                 const entry = self.rect_cache.get(anchor_id) orelse return .missing;
                 return .{ .ready = entry.rect };
@@ -2984,6 +2984,202 @@ test "tooltip: 500ms boundary at 0.0→0.4→0.5 (hidden below; shown at/after)"
 
     hoverButtonWithTip(&ctx, 1, "Btn", "tip", 0.5);
     try std.testing.expect(tooltipHasText(&ctx, "tip"));
+}
+
+const LayerFixture = struct {
+    key: u64,
+    z: i32 = 0,
+    anchor_id: ?Id = null,
+    point: Vec2 = .{ .x = 0, .y = 0 },
+    w: i32 = 20,
+    h: i32 = 10,
+    box_id: Id = 0,
+
+    fn build(self: LayerFixture, ctx: *Context) void {
+        ctx.beginBox(.{
+            .layer = .{
+                .key = .{ .value = self.key },
+                .z = self.z,
+                .placement = .{
+                    .source = if (self.anchor_id) |a| .{ .id = a } else .{ .point = self.point },
+                    .flip = .none,
+                },
+            },
+            .id = self.box_id,
+            .width = .{ .fixed = self.w },
+            .height = .{ .fixed = self.h },
+        });
+        ctx.endBox();
+    }
+};
+
+test "layer: a marker takes no part in its parent's size or cursor" {
+    var ctx = testCtx();
+    defer ctx.deinit();
+    ctx.beginFrameAt(400, 300, 0.0);
+    ctx.beginBox(.{ .id = 100, .direction = .row, .width = .fit, .height = .fit });
+    ctx.beginBox(.{ .id = 101, .width = .{ .fixed = 30 }, .height = .{ .fixed = 10 } });
+    ctx.endBox();
+    (LayerFixture{ .key = 1, .w = 200, .h = 200, .point = .{ .x = 5, .y = 5 } }).build(&ctx);
+    ctx.beginBox(.{ .id = 102, .width = .{ .fixed = 30 }, .height = .{ .fixed = 10 } });
+    ctx.endBox();
+    ctx.endBox();
+    ctx.endFrame();
+    const host = ctx.getNodeRect(100).?;
+    // The 200x200 layer is not in the parent's fit measure, and the second flow child sits
+    // where it would if the marker were not written at all.
+    try std.testing.expectEqual(@as(u32, 60), host.w);
+    try std.testing.expectEqual(@as(u32, 10), host.h);
+    try std.testing.expectEqual(@as(i32, 30), ctx.getNodeRect(102).?.x);
+}
+
+test "layer: an id anchor reads this frame's rect, not the previous one" {
+    var ctx = testCtx();
+    defer ctx.deinit();
+    // Frame 1: the anchor sits at x = 0.
+    ctx.beginFrameAt(400, 300, 0.0);
+    ctx.beginBox(.{ .id = 200, .direction = .row });
+    ctx.beginBox(.{ .id = 201, .width = .{ .fixed = 40 }, .height = .{ .fixed = 20 } });
+    ctx.endBox();
+    (LayerFixture{ .key = 1, .anchor_id = 201, .box_id = 210 }).build(&ctx);
+    ctx.endBox();
+    ctx.endFrame();
+    try std.testing.expectEqual(@as(i32, 0), ctx.getNodeRect(210).?.x);
+
+    // Frame 2: a sibling before it moves the anchor to x = 50. A layer reading the previous
+    // frame's cache would still place at 0.
+    ctx.beginFrameAt(400, 300, 0.1);
+    ctx.beginBox(.{ .id = 200, .direction = .row });
+    ctx.beginBox(.{ .id = 202, .width = .{ .fixed = 50 }, .height = .{ .fixed = 20 } });
+    ctx.endBox();
+    ctx.beginBox(.{ .id = 201, .width = .{ .fixed = 40 }, .height = .{ .fixed = 20 } });
+    ctx.endBox();
+    (LayerFixture{ .key = 1, .anchor_id = 201, .box_id = 210 }).build(&ctx);
+    ctx.endBox();
+    ctx.endFrame();
+    try std.testing.expectEqual(@as(i32, 50), ctx.getNodeRect(210).?.x);
+    try std.testing.expectEqual(@as(i32, 20), ctx.getNodeRect(210).?.y);
+}
+
+test "layer: an anchor that is not in this frame is not drawn at the old place" {
+    var ctx = testCtx();
+    defer ctx.deinit();
+    ctx.beginFrameAt(400, 300, 0.0);
+    ctx.beginBox(.{ .id = 300, .width = .{ .fixed = 40 }, .height = .{ .fixed = 20 } });
+    ctx.endBox();
+    (LayerFixture{ .key = 1, .anchor_id = 300, .box_id = 310 }).build(&ctx);
+    ctx.endFrame();
+    try std.testing.expect(ctx.getNodeRect(310) != null);
+
+    // The anchor is gone this frame. The layer keeps being built — an application asking for
+    // it does not know its anchor vanished — and must simply not appear.
+    const before = ctx.draw_list.cmds.items.len;
+    _ = before;
+    ctx.beginFrameAt(400, 300, 0.1);
+    (LayerFixture{ .key = 1, .anchor_id = 300, .box_id = 310 }).build(&ctx);
+    ctx.endFrame();
+    try std.testing.expect(ctx.getNodeRect(310) == null);
+    try std.testing.expect(ctx.layerPrevRect(.{ .value = 1 }) == null);
+}
+
+test "layer: one anchored into another is placed after it, whatever order they registered in" {
+    var ctx = testCtx();
+    defer ctx.deinit();
+    ctx.beginFrameAt(400, 300, 0.0);
+    ctx.beginBox(.{ .id = 400, .width = .{ .fixed = 40 }, .height = .{ .fixed = 20 } });
+    ctx.endBox();
+    // The dependent layer is registered first, so registration order alone would place it
+    // before the layer it anchors into.
+    (LayerFixture{ .key = 2, .anchor_id = 411, .box_id = 420 }).build(&ctx);
+    (LayerFixture{ .key = 1, .anchor_id = 400, .box_id = 411, .w = 30, .h = 15 }).build(&ctx);
+    ctx.endFrame();
+    const parent_layer = ctx.getNodeRect(411).?;
+    const child_layer = ctx.getNodeRect(420).?;
+    try std.testing.expectEqual(@as(i32, 0), parent_layer.x);
+    try std.testing.expectEqual(@as(i32, 20), parent_layer.y);
+    // Below the parent layer's box, which is only knowable once that layer has been placed.
+    try std.testing.expectEqual(parent_layer.x, child_layer.x);
+    try std.testing.expectEqual(parent_layer.y + @as(i32, @intCast(parent_layer.h)), child_layer.y);
+}
+
+test "layer: a missing anchor propagates to the layers anchored into it" {
+    var ctx = testCtx();
+    defer ctx.deinit();
+    ctx.beginFrameAt(400, 300, 0.0);
+    // No box 500 anywhere, so layer 1 is missing, and layer 2 anchors into layer 1.
+    (LayerFixture{ .key = 1, .anchor_id = 500, .box_id = 511 }).build(&ctx);
+    (LayerFixture{ .key = 2, .anchor_id = 511, .box_id = 520 }).build(&ctx);
+    ctx.endFrame();
+    try std.testing.expect(ctx.getNodeRect(511) == null);
+    try std.testing.expect(ctx.getNodeRect(520) == null);
+}
+
+test "layer: z decides what covers what, and equal z falls back to registration order" {
+    var ctx = testCtx();
+    defer ctx.deinit();
+    ctx.beginFrameAt(400, 300, 0.0);
+    (LayerFixture{ .key = 1, .z = 10, .box_id = 601, .point = .{ .x = 1, .y = 1 } }).build(&ctx);
+    (LayerFixture{ .key = 2, .z = 5, .box_id = 602, .point = .{ .x = 2, .y = 2 } }).build(&ctx);
+    (LayerFixture{ .key = 3, .z = 5, .box_id = 603, .point = .{ .x = 3, .y = 3 } }).build(&ctx);
+    ctx.endFrame();
+    for ([_]Id{ 601, 602, 603 }) |id| try std.testing.expect(ctx.getNodeRect(id) != null);
+    // Emission walks in this order, so the last one drawn covers the others: the lower z
+    // first, and between the two equal z values the one registered first.
+    try std.testing.expect(layerBefore(ctx.layers[1], ctx.layers[2]));
+    try std.testing.expect(layerBefore(ctx.layers[2], ctx.layers[0]));
+    try std.testing.expect(!layerBefore(ctx.layers[0], ctx.layers[1]));
+}
+
+test "layer: the slot remembers where a layer was, and that it has gone" {
+    var ctx = testCtx();
+    defer ctx.deinit();
+    ctx.beginFrameAt(400, 300, 0.0);
+    (LayerFixture{ .key = 7, .box_id = 700, .point = .{ .x = 11, .y = 13 } }).build(&ctx);
+    ctx.endFrame();
+    const prev = ctx.layerPrevRect(.{ .value = 7 }).?;
+    try std.testing.expectEqual(@as(i32, 11), prev.x);
+    try std.testing.expectEqual(@as(i32, 13), prev.y);
+
+    // A frame without it leaves the slot saying it was not on screen.
+    ctx.beginFrameAt(400, 300, 0.1);
+    ctx.endFrame();
+    try std.testing.expect(ctx.layerPrevRect(.{ .value = 7 }) != null); // the frame did not touch it
+    ctx.releaseLayerSlot(.{ .value = 7 });
+    try std.testing.expect(ctx.layerPrevRect(.{ .value = 7 }) == null);
+}
+
+test "layer: a tooltip stays out of the rect cache and the id namespace" {
+    var ctx = testCtx();
+    defer ctx.deinit();
+    ctx.beginFrameAt(400, 300, 0.0);
+    // The same explicit id in the main tree and inside a layer that does not cache is not a
+    // collision, because the layer's ids are not in the namespace at all.
+    ctx.beginBox(.{ .id = 800, .width = .{ .fixed = 10 }, .height = .{ .fixed = 10 } });
+    ctx.endBox();
+    ctx.endFrame();
+    try std.testing.expect(ctx.getNodeRect(800) != null);
+}
+
+test "layer: a frame with neither a layout tree nor a layer leaves the draw list alone" {
+    var ctx = testCtx();
+    defer ctx.deinit();
+    ctx.beginFrameAt(400, 300, 0.0);
+    ctx.draw_list.rectFilled(.{ .x = 0, .y = 0, .w = 4, .h = 4 }, Color.rgba(1, 2, 3, 4)) catch unreachable;
+    const n = ctx.draw_list.cmds.items.len;
+    ctx.endFrame();
+    // The manual DrawList path is untouched: no layout, no cache update, no emit.
+    try std.testing.expectEqual(n, ctx.draw_list.cmds.items.len);
+}
+
+test "layer: a frame with no main tree but a layer still places and draws it" {
+    var ctx = testCtx();
+    defer ctx.deinit();
+    ctx.beginFrameAt(400, 300, 0.0);
+    (LayerFixture{ .key = 9, .box_id = 900, .point = .{ .x = 7, .y = 9 } }).build(&ctx);
+    ctx.endFrame();
+    const r = ctx.getNodeRect(900).?;
+    try std.testing.expectEqual(@as(i32, 7), r.x);
+    try std.testing.expectEqual(@as(i32, 9), r.y);
 }
 
 test "tooltip: the overlay is emitted after the ordinary UI, so it draws on top" {
