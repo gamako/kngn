@@ -100,6 +100,8 @@ pub const TextInputResult = struct {
 pub const ButtonOpts = struct {
     /// If > 0, minimum button width (ensures `min_w` even when text + padding is smaller).
     min_w: i32 = 0,
+    /// If > 0, minimum button height (ensures `min_h` even when text + padding is smaller).
+    min_h: i32 = 0,
     /// null → `style.spacing.control_padding`
     padding: ?[4]i32 = null,
     /// Selected look (accent fill + thick border). For tool-selection toggles.
@@ -209,14 +211,20 @@ fn buttonIdWithRoute(
         ctx.resolveButtonColorsWithStyle(id, base_bg, opts.selected, result.held, disabled, opts.style);
     const thickness = if (opts.selected) style.button_border_selected else style.button_border;
     const pad = opts.padding orelse style.spacing.control_padding;
-    // With `min_w`, width is fixed at call time assuming fixed-width font (`measure = 8×len`)
+    // With `min_w`, width is fixed at call time assuming fixed-width font (`measure = 8×len`).
     const width: layout.Sizing = if (opts.min_w > 0)
         .{ .fixed = @max(opts.min_w, @as(i32, @intCast(ctx.font.measure(label))) + pad[3] + pad[1]) }
+    else
+        .fit;
+    const natural_height = font_mod.fontInkHeight(ctx.font) + pad[0] + pad[2];
+    const height: layout.Sizing = if (opts.min_h > 0)
+        .{ .fixed = @max(opts.min_h, natural_height) }
     else
         .fit;
     ctx.beginBox(.{
         .id = id,
         .width = width,
+        .height = height,
         .padding = pad,
         .bg = colors.bg,
         .border = makeBorder(colors.border, thickness),
@@ -380,12 +388,11 @@ const IconButtonDraw = struct {
 /// the chord into something else (Cmd+Space belongs to the system, Shift+Enter to text), so only
 /// the bare key counts, and auto-repeat does not activate twice.
 ///
-/// While a popup or dialog is open it never fires: the overlay has taken over input, and the focus left behind
-/// it still points at a background widget. Nor does it fire in a frame the pointer is taking part
-/// in, for the reason `pointerEngaged` gives.
+/// The current layer scope decides whether the focused widget owns keyboard input. It also does
+/// not fire in a frame the pointer is taking part in, for the reason `pointerEngaged` gives.
 fn keyboardActivated(ctx: *const Context, id: Id) bool {
     if (id == 0 or ctx.state.focused_id != id or !ctx.current_layer_scope.keyboard_enabled) return false;
-    if (ctx.popup_state != null or ctx.popup_stack.len != 0 or ctx.pointerEngaged()) return false;
+    if (ctx.pointerEngaged()) return false;
     const all = input_mod.mod.all;
     return ctx.input.pressedPlain(input_mod.key.space, 0, all) or
         ctx.input.pressedPlain(input_mod.key.enter, 0, all);
@@ -1276,9 +1283,7 @@ fn sliderCore(ctx: *Context, id: Id, label: []const u8, cur: f64, spec: SliderSp
         // Arrow keys nudge the focused slider by one step, in the reading direction: right and up
         // raise the value, left and down lower it. Suppressed on the same terms as Space and Enter,
         // so a drag in progress is never fought over.
-        if (ctx.current_layer_scope.keyboard_enabled and ctx.state.focused_id == id and
-            ctx.popup_state == null and ctx.popup_stack.len == 0 and !ctx.pointerEngaged())
-        {
+        if (ctx.current_layer_scope.keyboard_enabled and ctx.state.focused_id == id and !ctx.pointerEngaged()) {
             const all = input_mod.mod.all;
             var delta: f64 = 0;
             if (ctx.input.pressedPlain(input_mod.key.right, 0, all) or
@@ -2627,15 +2632,15 @@ pub const ListNav = enum { none, prev, next };
 
 /// Poll Up/Down for list-style keyboard navigation. Call once, before building any row, so the
 /// newly selected row's look is correct in the frame the key arrived rather than one frame
-/// later. Gated the same way a focused slider's arrow-key nudge is — no popup open, no pointer
-/// engaged — and additionally only while `active_row_id` (the caller's current selection,
+/// later. Gated the same way a focused slider's arrow-key nudge is — no pointer engaged — and
+/// additionally only while `active_row_id` (the caller's current selection,
 /// passed as a widget id) holds the keyboard focus, so a list nothing has ever selected
 /// reports `.none` rather than reacting to a keypress meant for something else on screen.
 pub fn pollListNav(ctx: *const Context, active_row_id: Id) ListNav {
     if (active_row_id == 0 or ctx.state.focused_id != active_row_id or
         !ctx.current_layer_scope.keyboard_enabled)
         return .none;
-    if (ctx.popup_state != null or ctx.pointerEngaged()) return .none;
+    if (ctx.pointerEngaged()) return .none;
     const all = input_mod.mod.all;
     if (ctx.input.pressedPlain(input_mod.key.down, 0, all)) return .next;
     if (ctx.input.pressedPlain(input_mod.key.up, 0, all)) return .prev;

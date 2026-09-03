@@ -70,7 +70,7 @@ pub const SpacingTokens = struct {
     control_padding: [4]i32 = .{ 4, 8, 4, 8 },
     control_gap: i32 = 6,
     popup_inset: i32 = 4,
-    popup_item_height: i32 = 20,
+    popup_item_height: i32 = 24,
     dialog_panel_inset: i32 = 20,
     dialog_title_top: i32 = 16,
     dialog_body_top: i32 = 48,
@@ -374,7 +374,7 @@ test "default styles expose the canonical spacing tokens" {
     try std.testing.expectEqualSlices(i32, &.{ 4, 8, 4, 8 }, &dark.spacing.control_padding);
     try std.testing.expectEqual(@as(i32, 6), dark.spacing.control_gap);
     try std.testing.expectEqual(@as(i32, 4), dark.spacing.popup_inset);
-    try std.testing.expectEqual(@as(i32, 20), dark.spacing.popup_item_height);
+    try std.testing.expectEqual(@as(i32, 24), dark.spacing.popup_item_height);
     try std.testing.expectEqual(@as(i32, 20), dark.spacing.dialog_panel_inset);
     try std.testing.expectEqual(@as(i32, 16), dark.spacing.dialog_title_top);
     try std.testing.expectEqual(@as(i32, 48), dark.spacing.dialog_body_top);

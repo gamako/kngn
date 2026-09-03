@@ -181,10 +181,12 @@ pub const AnimationState = animation_mod.AnimationState;
 pub const PerIdState = state_mod.PerIdState;
 // Popup / context menu. Implementation and doc comments live in popup.zig.
 pub const PopupState = popup_mod.PopupState;
-pub const PopupStack = popup_mod.PopupStack;
 pub const PopupItem = popup_mod.PopupItem;
 pub const PopupResult = popup_mod.PopupResult;
 pub const PopupMenuOpts = popup_mod.PopupMenuOpts;
+pub const DialogState = popup_mod.DialogState;
+pub const DialogOptions = popup_mod.DialogOptions;
+pub const DialogResult = popup_mod.DialogResult;
 pub const stepgrid = stepgrid_mod;
 // Cross-widget drag-and-drop. Implementation and doc comments live in dnd.zig.
 pub const DragPayload = dnd_mod.DragPayload;
@@ -414,6 +416,11 @@ pub const Context = struct {
     layer_route: LayerRoute = .{},
     /// Outside dismissal is an edge result, not a close side effect. It is stable for the frame.
     dismissed_layer_key: ?LayerKey = null,
+    /// Whether the current frame's pointer press has been evaluated for outside dismissal. A
+    /// beginFrame call may happen before the loop pushes that frame's events, so a no-press check
+    /// remains open until the first consumer read; once evaluated, command-target consumption
+    /// cannot cause the same edge to be reported again.
+    layer_dismissal_checked: bool = false,
     /// Scope stack only changes at layer markers; ordinary boxes and widgets read one current
     /// scope without a tree walk or allocation.
     layer_scope_stack: [max_layers]LayerScope = undefined,
@@ -487,16 +494,6 @@ pub const Context = struct {
     /// Frame-local presence markers used to drop wake IDs for widgets absent from the tree.
     animation_seen_hover: Id = 0,
     animation_seen_press: Id = 0,
-    /// Popup / context-menu open state. The classic mechanism (openPopup/closePopup/popupMenu)
-    /// allows only one of these open at a time. null = closed. When non-null, buttonBehavior
-    /// suppresses hover/active on background widgets (modal absorption; see buttonBehavior's doc
-    /// comment / popup.zig).
-    popup_state: ?PopupState = null,
-    /// Additional popups open through `openPopupStacked`, independent of `popup_state` above —
-    /// see `PopupStack`'s doc comment in popup.zig for why this exists (a menu-bar dropdown and a
-    /// context menu held open at once). Empty for every caller that never uses the stacked API,
-    /// so it changes nothing for existing code.
-    popup_stack: PopupStack = .{},
     // ── tooltip. No PerIdStateStore; at most one candidate at a time.
     // Across frames: hover tracking (id / start time / rect). Frame-local fields reset in beginFrame.
     /// Widget id under continuous hover (0 = not tracking).
@@ -625,30 +622,10 @@ pub const Context = struct {
     pub const beginVirtualList = widgets.beginVirtualList;
     pub const endVirtualList = widgets.endVirtualList;
     pub const virtualScrollToRow = widgets.virtualScrollToRow;
-    // Popup / context menu. Implementation and contract: see popup.zig.
-    pub const openPopup = popup_mod.openPopup;
-    pub const closePopup = popup_mod.closePopup;
-    pub const hasOpenPopup = popup_mod.hasOpenPopup;
-    pub const hasOpenDialog = popup_mod.hasOpenDialog;
-    pub const isPopupOpen = popup_mod.isPopupOpen;
-    pub const isDialogOpen = popup_mod.isDialogOpen;
-    pub const isDialogOpenAny = popup_mod.isDialogOpenAny;
     pub const popupMenu = popup_mod.popupMenu;
     pub const popupMenuEx = popup_mod.popupMenuEx;
-    pub const openDialog = popup_mod.openDialog;
-    pub const openDialogAt = popup_mod.openDialogAt;
     pub const dialog = popup_mod.dialog;
-    // Stacked popups (coexist with the classic slot above; see PopupStack in popup.zig).
-    pub const openPopupStacked = popup_mod.openPopupStacked;
-    pub const closePopupStacked = popup_mod.closePopupStacked;
-    pub const isPopupOpenStacked = popup_mod.isPopupOpenStacked;
-    pub const isPopupOpenAny = popup_mod.isPopupOpenAny;
-    pub const openPopupCount = popup_mod.openPopupCount;
     pub const popupMenuStacked = popup_mod.popupMenuStacked;
-    pub const openDialogStacked = popup_mod.openDialogStacked;
-    pub const openDialogStackedAt = popup_mod.openDialogStackedAt;
-    pub const dialogStacked = popup_mod.dialogStacked;
-    pub const popupPos = popup_mod.popupPos;
     // Cross-widget drag-and-drop. Implementation and contract: see dnd.zig.
     pub const dragSource = dnd_mod.dragSource;
     pub const dropTarget = dnd_mod.dropTarget;
@@ -768,6 +745,7 @@ pub const Context = struct {
         // they are what carries a layer's geometry across the reset.
         self.layers_len = 0;
         self.command_targets_len = 0;
+        self.layer_dismissal_checked = false;
         self.input.beginFrame();
         self.id_stack.clear();
         self.state.beginFrame();
@@ -856,9 +834,9 @@ pub const Context = struct {
         requireContract(self.frameIsOpen(), what ++ " requires an open frame");
     }
 
-    /// Require an idle or final-overlay phase — the contract of the post-frame APIs (popups, menu
-    /// bar) and of opening a frame in the first place. This also fails during the synchronous
-    /// layout/emit work of `endFrame`, even though `endFrame` has not returned yet.
+    /// Require an idle or final-overlay phase. This is used by lifecycle APIs that are meaningful
+    /// only between frames. It also fails during the synchronous layout/emit work of `endFrame`,
+    /// even though `endFrame` has not returned yet.
     pub inline fn requireNoFrame(self: *const Context, comptime what: []const u8) void {
         requireContract(self.noFrameIsOpen(), what ++ " must be called with no frame open");
     }
@@ -1053,11 +1031,9 @@ pub const Context = struct {
     }
 
     /// A previous-frame placed modal layer owns the generic route, so its contribution is
-    /// latched before the current tree is built. The legacy popup contribution remains the
-    /// existing frame-local predicate until popup and layer routing are unified.
+    /// latched before the current tree is built.
     pub fn wantsMouse(self: *const Context) bool {
-        return self.layer_route.frontmost_key != null or self.state.active_id != 0 or self.state.this_frame_hovered_any or
-            self.popup_state != null or self.popup_stack.len != 0;
+        return self.layer_route.frontmost_key != null or self.state.active_id != 0 or self.state.this_frame_hovered_any;
     }
 
     pub fn wantsKeyboard(self: *const Context) bool {
@@ -1170,15 +1146,14 @@ pub const Context = struct {
     ///
     /// Widgets call this themselves; an application only calls it for something it draws and
     /// hit-tests by hand. Submitting the widget is what puts it in the order, so a widget behind a
-    /// closed branch leaves the order on its own. Legacy popup entries remain suppressed by the
-    /// existing popup guard.
+    /// closed branch leaves the order on its own.
     ///
     /// Runs once per focusable widget per frame; the append is amortised free after the first
     /// frame because `focus_order` keeps its capacity.
     pub fn registerFocusable(self: *Context, id: Id) void {
         self.requireFrame("registerFocusable");
         self.requireInteractiveAllowed("registerFocusable");
-        if (id == 0 or self.popup_state != null or self.popup_stack.len != 0) return;
+        if (id == 0) return;
         self.focus_order.append(self.gpa, id) catch @panic("Context.registerFocusable: OOM");
         self.focus_scope_order.append(self.gpa, .{
             .layer_key = self.current_layer_scope.layer_key,
@@ -1194,7 +1169,7 @@ pub const Context = struct {
     pub fn registerTextInput(self: *Context, id: Id) void {
         self.requireFrame("registerTextInput");
         self.requireInteractiveAllowed("registerTextInput");
-        if (id == 0 or self.popup_state != null or self.popup_stack.len != 0) return;
+        if (id == 0) return;
         self.text_input_ids.append(self.gpa, id) catch @panic("Context.registerTextInput: OOM");
     }
 
@@ -1628,11 +1603,29 @@ pub const Context = struct {
             self.layer_route.frontmost_key = slot.key;
         }
 
-        const frontmost = frontmost_index orelse return;
-        const slot = self.layer_slots[frontmost];
+        if (frontmost_index == null) return;
+        self.latchLayerDismissal();
+    }
+
+    /// Record an outside press against the begin-frame route. Event loops may push events either
+    /// before beginFrame (staged input) or after it (the usual poll/build loop); both paths must
+    /// produce the same frame result before a consumer reads layerDismissed.
+    fn latchLayerDismissal(self: *Context) void {
+        if (self.layer_dismissal_checked) return;
+        const frontmost = self.layer_route.frontmost_key orelse return;
+        var route_slot: ?LayerSlot = null;
+        for (self.layer_slots[0..self.layer_slots_len]) |candidate| {
+            if (candidate.key.eql(frontmost)) {
+                route_slot = candidate;
+                break;
+            }
+        }
+        const slot = route_slot orelse return;
         const any_mouse_press = self.input.mouse_pressed.left or
             self.input.mouse_pressed.right or self.input.mouse_pressed.middle;
-        if (slot.dismiss_on_outside and any_mouse_press) {
+        if (!any_mouse_press) return;
+        self.layer_dismissal_checked = true;
+        if (slot.dismiss_on_outside) {
             const screen = Rect{ .x = 0, .y = 0, .w = self.screen_w, .h = self.screen_h };
             if (!pointHitsVisible(slot.prev_root_rect, screen, self.input.mouse_pressed_pos)) {
                 self.dismissed_layer_key = slot.key;
@@ -1845,7 +1838,8 @@ pub const Context = struct {
 
     /// Whether the previous-frame frontmost modal layer received an outside press this frame.
     /// This is a stable event result; reading it never closes or consumes the layer.
-    pub fn layerDismissed(self: *const Context, layer_key: LayerKey) bool {
+    pub fn layerDismissed(self: *Context, layer_key: LayerKey) bool {
+        self.latchLayerDismissal();
         return if (self.dismissed_layer_key) |dismissed| dismissed.eql(layer_key) else false;
     }
 
@@ -1875,10 +1869,11 @@ pub const Context = struct {
     /// Whether a registered command target may use the pointer at `point`. The named menu must
     /// own the previous-frame route, and the point must be outside that route owner's root.
     /// Visible modal descendants therefore win before this exception is considered.
-    fn commandTargetOutsideRoute(self: *const Context, id: Id, route_key: LayerKey, point: Vec2) bool {
+    fn commandTargetOutsideRoute(self: *Context, id: Id, route_key: LayerKey, point: Vec2) bool {
         if (!self.commandTargetRegistered(id, route_key)) return false;
         const frontmost = self.layer_route.frontmost_key orelse return false;
         if (!frontmost.eql(route_key)) return false;
+        self.latchLayerDismissal();
         const root = self.layerPrevRect(route_key) orelse return false;
         const screen = Rect{ .x = 0, .y = 0, .w = self.screen_w, .h = self.screen_h };
         return !pointHitsVisible(root, screen, point);
@@ -1887,7 +1882,7 @@ pub const Context = struct {
     /// Pointer permission for a command target. Hover and press use their own edge coordinates;
     /// an already active target remains eligible for release even if the pointer later moves.
     fn commandTargetPointerEnabled(
-        self: *const Context,
+        self: *Context,
         id: Id,
         route_key: LayerKey,
         rect: Rect,
@@ -1936,15 +1931,14 @@ pub const Context = struct {
                     .height = .fit,
                     .padding = .{ pad, pad, pad, pad },
                 } };
-                // A row of the popup item height with the text centred in it, which is the
-                // shape a one-line tooltip has always had: the height comes from the style's
-                // item height, not from the font, so a tooltip is the same height as a menu
-                // item whatever font it is drawn in.
+                // Match popup items: keep the token as a minimum, but let a larger font's
+                // natural ink height expand the row so the text is never clipped.
+                const row_height = @max(style.spacing.popup_item_height, font_mod.fontInkHeight(self.font));
                 const row = self.allocator().create(layout.Node) catch @panic("tooltip: OOM");
                 row.* = .{ .cfg = .{
                     .direction = .row,
                     .width = .fit,
-                    .height = .{ .fixed = style.spacing.popup_item_height },
+                    .height = .{ .fixed = row_height },
                     .align_cross = .center,
                 } };
                 const leaf = self.allocator().create(layout.Node) catch @panic("tooltip: OOM");
@@ -2433,11 +2427,7 @@ pub const Context = struct {
         // above the children and is clipped by the ancestor rather than by the node's own clip.
         // A widget draws no ring of its own — the ring belongs to whichever node carries the id, and
         // updateRectCache has already asserted that only one node per frame does.
-        // A ring behind an open popup would point at a widget the popup has taken input away from,
-        // so none is drawn while one is open.
-        if (self.popup_state == null and self.popup_stack.len == 0 and self.state.focus_visible and
-            node.cfg.id != 0 and node.cfg.id == self.state.focused_id)
-        {
+        if (self.state.focus_visible and node.cfg.id != 0 and node.cfg.id == self.state.focused_id) {
             dl.rectOutlineEx(
                 node.rect,
                 self.style.accent.focus,
@@ -2557,10 +2547,6 @@ fn buttonBehaviorImpl(ctx: *Context, id: Id, rect: Rect, clip: Rect, command_poi
     ctx.requireFrame("buttonBehavior");
     ctx.requireInteractiveAllowed("buttonBehavior");
     if (!ctx.current_layer_scope.pointer_enabled and !command_pointer) return .{};
-    // Keep the legacy popup absorption until popup consumers are moved onto the layer route.
-    // The guard is intentionally removed in the popup migration; the generic layer scope then
-    // becomes the only input resolver.
-    if (ctx.popup_state != null or ctx.popup_stack.len != 0) return .{};
     const mp = ctx.input.mouse_pos;
     const hovered_now = pointHitsVisible(rect, clip, mp);
     var result: ButtonResult = .{};
@@ -2609,6 +2595,26 @@ const btn_rect = Rect{ .x = 0, .y = 0, .w = 100, .h = 50 };
 fn testCtx() Context {
     return Context.init(std.testing.allocator, font_mod.default_font);
 }
+
+// A synthetic font whose ink height exceeds the popup row token. This exercises the
+// natural-height branch without depending on an installed outline font.
+const tall_tooltip_dummy: u8 = 0;
+const tall_tooltip_vt: Font.VTable = .{
+    .measure = struct {
+        fn f(_: *const anyopaque, text: []const u8) u32 {
+            return 8 * @as(u32, @intCast(text.len));
+        }
+    }.f,
+    .drawTo = struct {
+        fn f(_: *const anyopaque, _: font_mod.RenderTarget, _: Vec2, _: []const u8, _: color_mod.Color, _: Rect, _: f32) void {}
+    }.f,
+    .metrics = struct {
+        fn f(_: *const anyopaque) font_mod.Metrics {
+            return .{ .line_height = 32, .ascent = 26, .descent = 6 };
+        }
+    }.f,
+};
+const tall_tooltip_font: Font = .{ .ptr = &tall_tooltip_dummy, .vtable = &tall_tooltip_vt };
 
 test "draw list access policy covers every phase" {
     const cases = [_]struct {
@@ -3719,6 +3725,30 @@ test "layer: a previous modal route is selected before current markers" {
     ctx.endFrame();
 }
 
+test "layer: outside dismissal also sees events pushed after beginFrame" {
+    var ctx = testCtx();
+    defer ctx.deinit();
+    const layer_key: LayerKey = .{ .value = 9041 };
+    const spec: LayerSpec = .{
+        .key = layer_key,
+        .input = .modal,
+        .dismiss_on_outside = true,
+        .placement = .{ .source = .{ .point = .{ .x = 20, .y = 20 } }, .flip = .none },
+    };
+
+    ctx.beginFrameAt(400, 300, 0.0);
+    ctx.beginBox(.{ .layer = &spec, .width = .{ .fixed = 40 }, .height = .{ .fixed = 20 } });
+    ctx.endBox();
+    ctx.endFrame();
+
+    ctx.beginFrameAt(400, 300, 0.1);
+    ctx.pushEvent(.{ .mouse_down = .{ .x = 200, .y = 200, .button = 0, .modifiers = 0 } });
+    try std.testing.expect(ctx.layerDismissed(layer_key));
+    ctx.beginBox(.{ .layer = &spec, .width = .{ .fixed = 40 }, .height = .{ .fixed = 20 } });
+    ctx.endBox();
+    ctx.endFrame();
+}
+
 test "layer: command target yields only to an inside hit" {
     var ctx = testCtx();
     defer ctx.deinit();
@@ -3814,6 +3844,220 @@ test "layer: command target does not bypass a different modal route owner" {
     ctx.endFrame();
 }
 
+test "layer: visible context and flipped menu roots win over a title target" {
+    const scenarios = [_]struct {
+        placement: LayerPlacement,
+        width: i32,
+        height: i32,
+    }{
+        .{
+            .placement = .{ .source = .{ .point = .{ .x = 0, .y = 0 } }, .flip = .none, .shift = .none },
+            .width = 120,
+            .height = 60,
+        },
+        .{
+            .placement = .{ .source = .{ .point = .{ .x = 399, .y = 299 } }, .flip = .main_axis, .shift = .both_axes },
+            .width = 120,
+            .height = 60,
+        },
+    };
+
+    for (scenarios) |scenario| {
+        var ctx = testCtx();
+        defer ctx.deinit();
+        const menu_key: LayerKey = .{ .value = 9081 };
+        const spec: LayerSpec = .{
+            .key = menu_key,
+            .input = .modal,
+            .dismiss_on_outside = true,
+            .placement = scenario.placement,
+        };
+        ctx.beginFrameAt(400, 300, 0.0);
+        ctx.beginBox(.{
+            .layer = &spec,
+            .width = .{ .fixed = scenario.width },
+            .height = .{ .fixed = scenario.height },
+        });
+        _ = ctx.buttonId(9083, "visible item", .{});
+        ctx.endBox();
+        ctx.endFrame();
+
+        const root = ctx.layerPrevRect(menu_key).?;
+        const item_rect = ctx.getNodeRect(9083).?;
+        const point = Vec2{
+            .x = item_rect.x + @as(i32, @intCast(item_rect.w / 2)),
+            .y = item_rect.y + @as(i32, @intCast(item_rect.h / 2)),
+        };
+        try std.testing.expect(root.contains(point));
+        ctx.pushEvent(.{ .mouse_down = .{ .x = point.x, .y = point.y, .button = 0, .modifiers = 0 } });
+        ctx.beginFrameAt(400, 300, 0.1);
+        ctx.registerCommandTarget(9082, menu_key);
+        const title = commandButtonBehavior(
+            &ctx,
+            9082,
+            .{ .x = point.x, .y = point.y, .w = 1, .h = 1 },
+            .{ .x = 0, .y = 0, .w = 400, .h = 300 },
+            menu_key,
+        );
+        try std.testing.expect(!title.hovered and !title.held and !title.clicked);
+        try std.testing.expect(!ctx.layerDismissed(menu_key));
+        ctx.beginBox(.{
+            .layer = &spec,
+            .width = .{ .fixed = scenario.width },
+            .height = .{ .fixed = scenario.height },
+        });
+        const item = ctx.buttonId(9083, "visible item", .{});
+        try std.testing.expect(item.held);
+        ctx.endBox();
+        ctx.endFrame();
+    }
+}
+
+const CommandTargetOwner = enum { none, menu_bar, other_modal };
+const CommandTargetPosition = enum { title, route_root, outside };
+
+const command_target_menu_key: LayerKey = .{ .value = 0x90A1 };
+const command_target_other_key: LayerKey = .{ .value = 0x90A2 };
+
+fn buildCommandTargetRoute(ctx: *Context, owner: CommandTargetOwner) void {
+    if (owner == .none) return;
+
+    const menu_spec: LayerSpec = .{
+        .key = command_target_menu_key,
+        .z = 10,
+        .input = .modal,
+        .placement = .{ .source = .{ .point = .{ .x = 120, .y = 120 } }, .flip = .none, .shift = .none },
+    };
+    ctx.beginBox(.{ .layer = &menu_spec, .width = .{ .fixed = 80 }, .height = .{ .fixed = 40 } });
+    ctx.endBox();
+
+    if (owner == .other_modal) {
+        const other_spec: LayerSpec = .{
+            .key = command_target_other_key,
+            .z = 20,
+            .input = .modal,
+            .placement = .{ .source = .{ .point = .{ .x = 240, .y = 120 } }, .flip = .none, .shift = .none },
+        };
+        ctx.beginBox(.{ .layer = &other_spec, .width = .{ .fixed = 80 }, .height = .{ .fixed = 40 } });
+        ctx.endBox();
+    }
+}
+
+fn commandTargetPosition(owner: CommandTargetOwner, position: CommandTargetPosition) Vec2 {
+    return switch (position) {
+        .title => .{ .x = 40, .y = 12 },
+        .route_root => switch (owner) {
+            .none, .menu_bar => .{ .x = 160, .y = 140 },
+            .other_modal => .{ .x = 280, .y = 140 },
+        },
+        .outside => .{ .x = 360, .y = 260 },
+    };
+}
+
+test "layer: command target routing distinguishes owner and visible regions" {
+    const owners = [_]CommandTargetOwner{ .none, .menu_bar, .other_modal };
+    const positions = [_]CommandTargetPosition{ .title, .route_root, .outside };
+    const title_id: Id = 9096;
+    const title_rect: Rect = .{ .x = 0, .y = 0, .w = 80, .h = 24 };
+
+    for (owners) |owner| {
+        for (positions) |position| {
+            {
+                var ctx = testCtx();
+                defer ctx.deinit();
+
+                ctx.beginFrameAt(400, 300, 0.0);
+                ctx.beginBox(.{ .id = title_id, .width = .{ .fixed = 80 }, .height = .{ .fixed = 24 } });
+                ctx.endBox();
+                buildCommandTargetRoute(&ctx, owner);
+                ctx.endFrame();
+
+                if (owner != .none) {
+                    const route_key = if (owner == .menu_bar) command_target_menu_key else command_target_other_key;
+                    const route_root = ctx.layerPrevRect(route_key).?;
+                    try std.testing.expect(route_root.contains(commandTargetPosition(owner, .route_root)));
+                }
+
+                const point = commandTargetPosition(owner, position);
+                const should_react = position == .title and (owner == .none or owner == .menu_bar);
+
+                ctx.beginFrameAt(400, 300, 0.1);
+                ctx.pushEvent(.{ .mouse_down = .{ .x = point.x, .y = point.y, .button = 0, .modifiers = 0 } });
+                ctx.registerCommandTarget(title_id, command_target_menu_key);
+                const down = commandButtonBehavior(
+                    &ctx,
+                    title_id,
+                    title_rect,
+                    full_clip,
+                    command_target_menu_key,
+                );
+                try std.testing.expectEqual(should_react, down.held);
+                try std.testing.expectEqual(if (should_react) title_id else 0, ctx.state.active_id);
+                buildCommandTargetRoute(&ctx, owner);
+                ctx.endFrame();
+
+                ctx.beginFrameAt(400, 300, 0.2);
+                ctx.pushEvent(.{ .mouse_up = .{ .x = point.x, .y = point.y, .button = 0, .modifiers = 0 } });
+                ctx.registerCommandTarget(title_id, command_target_menu_key);
+                const up = commandButtonBehavior(
+                    &ctx,
+                    title_id,
+                    title_rect,
+                    full_clip,
+                    command_target_menu_key,
+                );
+                try std.testing.expectEqual(should_react, up.clicked);
+                try std.testing.expectEqual(@as(Id, 0), ctx.state.active_id);
+                buildCommandTargetRoute(&ctx, owner);
+                ctx.endFrame();
+            }
+        }
+    }
+}
+
+test "layer: a dialog route absorbs menu title targets" {
+    var ctx = testCtx();
+    defer ctx.deinit();
+    const dialog_key: LayerKey = .{ .value = 9091 };
+    const menu_key: LayerKey = .{ .value = 9092 };
+    const spec: LayerSpec = .{
+        .key = dialog_key,
+        .input = .modal,
+        .placement = .{ .source = .{ .point = .{ .x = 0, .y = 0 } }, .flip = .none, .shift = .none },
+    };
+
+    ctx.beginFrameAt(400, 300, 0.0);
+    ctx.beginBox(.{
+        .layer = &spec,
+        .width = .{ .fixed = 400 },
+        .height = .{ .fixed = 300 },
+    });
+    _ = ctx.buttonId(9094, "dialog", .{});
+    ctx.endBox();
+    ctx.endFrame();
+
+    ctx.pushEvent(.{ .mouse_down = .{ .x = 10, .y = 10, .button = 0, .modifiers = 0 } });
+    ctx.beginFrameAt(400, 300, 0.1);
+    ctx.registerCommandTarget(9093, menu_key);
+    const title = commandButtonBehavior(
+        &ctx,
+        9093,
+        .{ .x = 0, .y = 0, .w = 80, .h = 24 },
+        .{ .x = 0, .y = 0, .w = 400, .h = 300 },
+        menu_key,
+    );
+    try std.testing.expect(!title.hovered and !title.held and !title.clicked);
+    ctx.beginBox(.{
+        .layer = &spec,
+        .width = .{ .fixed = 400 },
+        .height = .{ .fixed = 300 },
+    });
+    const dialog_content = ctx.buttonId(9094, "dialog", .{});
+    try std.testing.expect(dialog_content.held);
+    ctx.endBox();
+    ctx.endFrame();
+}
+
 test "layer: the latched route does not retain a compacted slot index" {
     try std.testing.expect(@hasField(LayerRoute, "frontmost_key"));
     try std.testing.expect(!@hasField(LayerRoute, "frontmost_slot"));
@@ -3898,9 +4142,7 @@ test "tooltip: a one-line tooltip keeps the popup item height and centres its te
     const bg = tooltipOverlayBgRect(&ctx, "tip").?;
     const pad = ctx.style.spacing.popup_inset;
     const item_h = ctx.style.spacing.popup_item_height;
-    // The height a tooltip has always had: one item row plus the inset above and below. It
-    // comes from the style rather than the font, so a tooltip matches a menu item's height
-    // whatever it is drawn in.
+    // The default bitmap font is shorter than the token, so the token determines this row.
     try std.testing.expectEqual(@as(u32, @intCast(item_h + 2 * pad)), bg.h);
 
     // And the text sits centred in that row rather than at its top.
@@ -3913,6 +4155,71 @@ test "tooltip: a one-line tooltip keeps the popup item height and centres its te
     _ = ink;
     try std.testing.expect(text_y.? > row_y);
     try std.testing.expect(text_y.? < row_y + item_h);
+}
+
+test "popup item: minimum height covers empty short long and CJK labels" {
+    const labels = [_][]const u8{ "", "A", "A longer menu item label", "日本語ラベル" };
+    const counts = [_]usize{ 1, 4 };
+
+    for (labels) |label| {
+        for (counts) |count| {
+            var ctx = testCtx();
+            defer ctx.deinit();
+            var state: popup_mod.PopupState = .{
+                .key = .{ .value = 0xD341 },
+                .open = true,
+                .placement = .{ .source = .{ .point = .{ .x = 10, .y = 10 } }, .flip = .none, .shift = .none },
+            };
+            var items: [4]popup_mod.PopupItem = undefined;
+            for (items[0..count]) |*item| item.* = .{ .label = label };
+
+            ctx.beginFrameAt(320, 200, 0.0);
+            _ = popup_mod.popupMenu(&ctx, &state, items[0..count]);
+            ctx.endFrame();
+
+            const min_height: u32 = @intCast(ctx.style.spacing.popup_item_height);
+            for (0..count) |index| {
+                const rect = ctx.getNodeRect(popup_mod.popupItemId(state.key, index)).?;
+                try std.testing.expect(rect.h >= min_height);
+            }
+        }
+    }
+}
+
+fn expectPopupAndTooltipRowHeight(font: Font, expected_height: i32) !void {
+    var menu_ctx = Context.init(std.testing.allocator, font);
+    defer menu_ctx.deinit();
+    var state: popup_mod.PopupState = .{
+        .key = .{ .value = 0xD342 },
+        .open = true,
+        .placement = .{ .source = .{ .point = .{ .x = 10, .y = 10 } }, .flip = .none, .shift = .none },
+    };
+    menu_ctx.beginFrameAt(320, 200, 0.0);
+    _ = popup_mod.popupMenu(&menu_ctx, &state, &.{.{ .label = "menu" }});
+    menu_ctx.endFrame();
+    const menu_height = menu_ctx.getNodeRect(popup_mod.popupItemId(state.key, 0)).?.h;
+
+    var tooltip_ctx = Context.init(std.testing.allocator, font);
+    defer tooltip_ctx.deinit();
+    tooltip_ctx.beginFrameAt(800, 600, 0.0);
+    _ = tooltip_ctx.buttonId(1, "Btn", .{});
+    tooltip_ctx.endFrame();
+    hoverButtonWithTip(&tooltip_ctx, 1, "Btn", "tip", 0.0);
+    hoverButtonWithTip(&tooltip_ctx, 1, "Btn", "tip", 0.5);
+
+    const bg = tooltipOverlayBgRect(&tooltip_ctx, "tip").?;
+    const pad = tooltip_ctx.style.spacing.popup_inset;
+    const tooltip_row_height: u32 = @intCast(@as(i32, @intCast(bg.h)) - 2 * pad);
+    try std.testing.expectEqual(@as(u32, @intCast(expected_height)), menu_height);
+    try std.testing.expectEqual(menu_height, tooltip_row_height);
+}
+
+test "popup item and tooltip: bitmap rows use the 24px token" {
+    try expectPopupAndTooltipRowHeight(font_mod.default_font, 24);
+}
+
+test "popup item and tooltip: tall rows share the natural font height" {
+    try expectPopupAndTooltipRowHeight(tall_tooltip_font, 32);
 }
 
 test "layer: a marker takes no part in its parent's size or cursor" {
@@ -5413,7 +5720,7 @@ test "focus traversal: claimFocus focuses without raising the ring" {
     try std.testing.expect(!ctx.isFocusVisible(2));
 }
 
-test "focus traversal: an open popup takes widgets out of the order" {
+test "focus traversal: a modal layer takes ownership of the order" {
     var ctx = testCtx();
     defer ctx.deinit();
 
@@ -5421,13 +5728,31 @@ test "focus traversal: an open popup takes widgets out of the order" {
     focusFrame(&ctx, &.{ 1, 2 }, 40, 20);
     ctx.endFrame();
 
-    ctx.popup_state = .{ .id = 99, .pos = .{ .x = 0, .y = 0 } };
     ctx.beginFrame(800, 600);
     focusFrame(&ctx, &.{ 1, 2 }, 40, 20);
+    const spec: LayerSpec = .{
+        .key = .{ .value = 99 },
+        .input = .modal,
+        .placement = .{ .source = .{ .point = .{ .x = 0, .y = 0 } }, .flip = .none },
+    };
+    ctx.beginBox(.{ .layer = &spec, .width = .{ .fixed = 80 }, .height = .{ .fixed = 20 } });
+    ctx.registerFocusable(3);
+    ctx.beginBox(.{ .id = 3, .width = .{ .fixed = 40 }, .height = .{ .fixed = 20 } });
+    ctx.endBox();
+    ctx.endBox();
+    ctx.endFrame();
+
+    ctx.beginFrame(800, 600);
+    focusFrame(&ctx, &.{ 1, 2 }, 40, 20);
+    ctx.beginBox(.{ .layer = &spec, .width = .{ .fixed = 80 }, .height = .{ .fixed = 20 } });
+    ctx.registerFocusable(3);
+    ctx.beginBox(.{ .id = 3, .width = .{ .fixed = 40 }, .height = .{ .fixed = 20 } });
+    ctx.endBox();
+    ctx.endBox();
     tabEvent(&ctx, 0);
     ctx.endFrame();
-    try std.testing.expectEqual(@as(usize, 0), ctx.focus_order.items.len);
-    try std.testing.expectEqual(@as(Id, 0), ctx.state.focused_id);
+    try std.testing.expectEqual(@as(usize, 3), ctx.focus_order.items.len);
+    try std.testing.expectEqual(@as(Id, 3), ctx.state.focused_id);
 }
 
 test "focus traversal: focus_order does not reallocate once the interface has settled" {
@@ -5559,11 +5884,13 @@ test "Context: the lifecycle contracts hold for ordinary use" {
     ctx.endFrame();
     _ = ctx.postFrameDrawList();
 
-    // The post-frame APIs are legal exactly where the frame is closed.
-    _ = ctx.popupMenu(1, &.{});
-
-    // And the next frame opens cleanly after all of it.
+    // Popup builders are ordinary frame-build calls, just like other layer consumers.
     ctx.beginFrame(800, 600);
+    var popup_state: PopupState = .{
+        .key = .{ .value = 1 },
+        .placement = .{ .source = .{ .point = .{ .x = 0, .y = 0 } } },
+    };
+    _ = ctx.popupMenu(&popup_state, &.{});
     ctx.endFrame();
 }
 

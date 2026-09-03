@@ -1,12 +1,12 @@
 //! Menu bar / dropdown built from Command definitions.
 //!
-//! Hot-path note: menu drawing runs as part of per-frame GUI drawing (not event-only).
-//! Stays within existing gui draw primitives + the per-frame arena: no new full-framebuffer loops, per-frame
-//! heap allocation, or full-screen copies. No new loops that would trigger the SIMD three-point checklist.
+//! Hot-path note: menu drawing runs once per visible layer and is proportional to the number of
+//! titles/items. It uses the frame arena and existing layout traversal; it adds no framebuffer
+//! loop, per-frame heap allocation, or full-screen copy.
 //!
 //! Usage (immediate-mode):
 //!   1. Inside `beginFrame`…`endFrame`, call `menuBar(...)` — top-menu (File/Edit/…) button row
-//!   2. After `endFrame`, call `menuBarPopup(...)` — dropdown draw / selection (same contract as popup.zig)
+//!   2. In the same frame, call `menuBarPopup(...)` — dropdown build / selection.
 //!
 //! gui does not execute Command. It returns the selected `CommandId`; the app's `dispatchCommand` owns execution.
 
@@ -16,15 +16,14 @@ const command_types = @import("command_types");
 const context_mod = @import("context.zig");
 const popup = @import("popup.zig");
 const id_mod = @import("id.zig");
-const geom = @import("geom.zig");
 
 pub const Context = context_mod.Context;
 pub const Command = command_types.Command;
 pub const CommandId = command_types.CommandId;
 pub const Shortcut = command_types.Shortcut;
 pub const Id = id_mod.Id;
-pub const Vec2 = geom.Vec2;
 pub const PopupItem = popup.PopupItem;
+pub const LayerKey = popup.LayerKey;
 
 /// Menu-bar open/close state (caller-owned; passed every frame).
 pub const MenuBarState = struct {
@@ -33,6 +32,10 @@ pub const MenuBarState = struct {
     /// Flag that a different top menu was switched to in the same frame (set by menuBar, consumed by menuBarPopup).
     /// Internal state that distinguishes outside-popup click = dismiss from "switch to another menu" click.
     switch_click: bool = false,
+    popup: popup.PopupState = .{
+        .key = .{ .value = 0x4D4E5501 },
+        .placement = .{ .source = .{ .point = .{ .x = 0, .y = 0 } } },
+    },
 };
 
 pub const MenuBarResult = struct {
@@ -42,8 +45,8 @@ pub const MenuBarResult = struct {
     open: bool = false,
 };
 
-/// Fixed popup ID for the menu bar (only one menu at a time; same MVP contract as popup.zig).
-pub const MENU_BAR_POPUP_ID: Id = 0x4D4E5501; // 'MNU\x01'
+/// Stable route identity for the menu bar's one consumer-owned menu descriptor.
+pub const MENU_BAR_LAYER_KEY: LayerKey = .{ .value = 0x4D4E5501 };
 
 const KeyCode = @TypeOf(@as(Shortcut, undefined).key);
 
@@ -216,62 +219,43 @@ pub fn formatItemLabel(allocator: std.mem.Allocator, cmd: Command) ![]const u8 {
 pub fn menuBar(ctx: *Context, commands: []const Command, state: *MenuBarState) void {
     ctx.requireInteractiveAllowed("menuBar");
     state.switch_click = false;
+    state.popup.key = MENU_BAR_LAYER_KEY;
     var titles: [16][]const u8 = undefined;
     const n = collectMenuTitles(commands, &titles);
     var i: usize = 0;
     while (i < n) : (i += 1) {
         const title = titles[i];
         const is_open = if (state.open_title) |t| std.mem.eql(u8, t, title) else false;
-        if (ctx.buttonEx(title, .{ .selected = is_open }).clicked) {
+        const title_id = ctx.id_stack.make(title);
+        if (ctx.commandButtonId(title_id, title, .{ .selected = is_open }, MENU_BAR_LAYER_KEY).clicked) {
             if (is_open) {
                 state.open_title = null;
-                popup.closePopup(ctx);
             } else {
                 state.open_title = title;
-            }
-        } else if (state.open_title != null and !is_open and ctx.input.mouse_pressed.left) {
-            // While the popup's modal absorption is active, buttonBehavior does not respond, so a switch-click
-            // to another top menu while open is picked up via a manual hit-test against the previous-frame rect
-            // (standard menu-bar behavior). Distinguishes from dismiss by passing switch_click to menuBarPopup.
-            if (ctx.getNodeRect(ctx.id_stack.make(title))) |r| {
-                const p = ctx.input.mouse_pressed_pos;
-                if (p.x >= r.x and p.x < r.x + @as(i32, @intCast(r.w)) and
-                    p.y >= r.y and p.y < r.y + @as(i32, @intCast(r.h)))
-                {
-                    state.open_title = title;
-                    state.switch_click = true;
-                }
+                state.switch_click = state.open_title != null and !is_open;
             }
         }
     }
 }
 
-/// After `endFrame`: draw the open dropdown and return the selected CommandId.
+/// In the current frame: build the open dropdown and return the selected CommandId.
 pub fn menuBarPopup(ctx: *Context, commands: []const Command, state: *MenuBarState) MenuBarResult {
-    ctx.requireNoFrame("menuBarPopup");
+    ctx.requireFrame("menuBarPopup");
     const title = state.open_title orelse {
-        if (popup.isPopupOpen(ctx, MENU_BAR_POPUP_ID)) popup.closePopup(ctx);
+        state.popup.open = false;
         return .{};
     };
 
     const title_id = ctx.id_stack.make(title);
-    if (ctx.getNodeRect(title_id)) |r| {
-        const pos: Vec2 = .{ .x = r.x, .y = r.y + @as(i32, @intCast(r.h)) };
-        if (!popup.isPopupOpen(ctx, MENU_BAR_POPUP_ID)) {
-            popup.openPopup(ctx, MENU_BAR_POPUP_ID, pos);
-        } else {
-            ctx.popup_state.?.pos = pos;
-        }
-    } else {
-        // Rect not yet settled on the first frame etc. → wait for the next frame
-        return .{ .open = true };
-    }
+    state.popup.key = MENU_BAR_LAYER_KEY;
+    state.popup.open = true;
+    state.popup.placement = .{ .source = .{ .id = title_id }, .side = .below };
 
     var cmd_ptrs: [32]*const Command = undefined;
     const cmd_n = collectMenuCommands(commands, title, &cmd_ptrs);
     if (cmd_n == 0) {
         state.open_title = null;
-        popup.closePopup(ctx);
+        state.popup.open = false;
         return .{};
     }
 
@@ -287,21 +271,21 @@ pub fn menuBarPopup(ctx: *Context, commands: []const Command, state: *MenuBarSta
         };
     }
 
-    const res = popup.popupMenu(ctx, MENU_BAR_POPUP_ID, items[0..item_n]);
+    const res = popup.popupMenu(ctx, &state.popup, items[0..item_n]);
     if (res.selected) |idx| {
         state.open_title = null;
+        state.popup.open = false;
         const c = cmd_ptrs[idx].*;
         if (c.kind == .separator or !c.enabled) return .{};
         return .{ .selected = c.id };
     }
     if (res.dismissed) {
         if (state.switch_click) {
-            // Switch-click to another top menu (already detected by menuBar). Do not close; on the next frame
-            // reopen the popup at the new title's position (do not treat as dismiss).
             state.switch_click = false;
             return .{ .open = true };
         }
         state.open_title = null;
+        state.popup.open = false;
         return .{};
     }
     return .{ .open = res.open };
@@ -385,22 +369,21 @@ test "menuBarPopup: disabled items do not return selected (popup enabled contrac
     };
     var state: MenuBarState = .{ .open_title = "File" };
 
-    // frame 1: settle the File button rect + open the popup
+    // frame 1: settle the File button and build the popup marker
     ctx.beginFrame(400, 300);
     menuBar(&ctx, &cmds, &state);
-    ctx.endFrame();
     _ = menuBarPopup(&ctx, &cmds, &state);
-    try std.testing.expect(popup.isPopupOpen(&ctx, MENU_BAR_POPUP_ID));
+    ctx.endFrame();
+    try std.testing.expect(state.popup.open);
 
-    const title_id = ctx.id_stack.make("File");
-    const tr = ctx.getNodeRect(title_id).?;
-    const item1_y = tr.y + @as(i32, @intCast(tr.h)) + ctx.style.spacing.popup_inset + ctx.style.spacing.popup_item_height + 2;
+    const item1_id = id_mod.hashInt(MENU_BAR_LAYER_KEY.value, 2);
+    const item1 = ctx.getNodeRect(item1_id).?;
 
     // frame 2: click the disabled second row (edge via pushEvent between beginFrame and endFrame)
     ctx.beginFrame(400, 300);
     menuBar(&ctx, &cmds, &state);
-    ctx.pushEvent(.{ .mouse_down = .{ .x = tr.x + 8, .y = item1_y, .button = 0, .modifiers = 0 } });
-    ctx.endFrame();
+    ctx.pushEvent(.{ .mouse_down = .{ .x = item1.x + 8, .y = item1.y + 2, .button = 0, .modifiers = 0 } });
     const res = menuBarPopup(&ctx, &cmds, &state);
+    ctx.endFrame();
     try std.testing.expect(res.selected == null);
 }

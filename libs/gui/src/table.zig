@@ -77,6 +77,7 @@ const Color = color_mod.Color;
 const Id = id_mod.Id;
 const Rect = geom.Rect;
 const Vec2f = input_mod.Vec2f;
+const LayerSpec = context_mod.LayerSpec;
 
 /// One column spec. Identity is the column's index in the `cols` slice.
 pub const TableCol = struct {
@@ -204,14 +205,10 @@ fn sizingFillsViewport(s: layout.Sizing) bool {
 
 fn keyboardActivated(ctx: *const Context, id: Id) bool {
     if (id == 0 or ctx.state.focused_id != id or !ctx.current_layer_scope.keyboard_enabled) return false;
-    if (ctx.popup_state != null or ctx.popup_stack.len != 0 or ctx.pointerEngaged()) return false;
+    if (ctx.pointerEngaged()) return false;
     const all = input_mod.mod.all;
     return ctx.input.pressedPlain(input_mod.key.space, 0, all) or
         ctx.input.pressedPlain(input_mod.key.enter, 0, all);
-}
-
-fn popupOpen(ctx: *const Context) bool {
-    return ctx.popup_state != null or ctx.popup_stack.len != 0;
 }
 
 /// Hover-only half of the row hit-test (phase 1, beginTableRow).
@@ -220,13 +217,11 @@ fn popupOpen(ctx: *const Context) bool {
 /// writer wins) and press (first writer wins) to any cell widget built after
 /// this. Phase 1 therefore registers hover and never acquires press.
 ///
-/// Side effects assigned to this phase: popup suppression, disabled
-/// `clearDisabledInteraction` + zero-rect `noteLastInteractive`, previous-frame
+/// Side effects assigned to this phase: disabled `clearDisabledInteraction` + zero-rect `noteLastInteractive`, previous-frame
 /// rect/clip hover, `next_hot_id` (only when `active_id == 0 or active_id ==
 /// row_id`), `this_frame_hovered_any`, selected-row `registerFocusable`
 /// (roving tab stop), `noteLastInteractive`.
 fn rowHoverOnly(ctx: *Context, id: Id, selected: bool) void {
-    if (popupOpen(ctx)) return;
     if (ctx.isDisabled()) {
         ctx.clearDisabledInteraction(id);
         ctx.noteLastInteractive(id, .{ .x = 0, .y = 0, .w = 0, .h = 0 }, false);
@@ -253,10 +248,7 @@ fn rowHoverOnly(ctx: *Context, id: Id, selected: bool) void {
 
 /// Press / held / click / keyboard half of the row hit-test (phase 2, endTableRow).
 ///
-/// Re-checks popup and disabled against the state after cell build: a cell that
-/// opens a popup in this frame must not leave the row activating. `openPopup`
-/// already resets `active_id` to 0, so a row that was active is already
-/// released and needs no extra case.
+/// Re-checks disabled against the state after cell build so a disabled row cannot activate.
 ///
 /// Side effects assigned to this phase: press acquire (`active_id == 0` and
 /// left press origin inside the visible region), held + `active_submitted`
@@ -264,7 +256,6 @@ fn rowHoverOnly(ctx: *Context, id: Id, selected: bool) void {
 /// not drop a row drag), click on release when `dragPos` is visible (clip-out
 /// release frees active without clicking), keyboard activate.
 fn rowPressResolve(ctx: *Context, id: Id, rect: Rect, clip: Rect) TableRowResult {
-    if (popupOpen(ctx)) return .{};
     if (ctx.isDisabled()) {
         ctx.clearDisabledInteraction(id);
         return .{};
@@ -1633,11 +1624,16 @@ test "table interactive row: press-drag-release keeps active_submitted so the dr
     try std.testing.expectEqual(RID, ctx.state.active_id);
 }
 
-test "table interactive row: disabled and an open popup suppress activate" {
+test "table interactive row: disabled and a modal layer suppress activate" {
     var ctx = testCtx();
     defer ctx.deinit();
     const TID: Id = 0xA054;
     const RID: Id = 0xA055;
+    const layer_spec: LayerSpec = .{
+        .key = .{ .value = 0xA056 },
+        .input = .modal,
+        .placement = .{ .source = .{ .point = .{ .x = 120, .y = 120 } }, .flip = .none },
+    };
     const cols = [_]TableCol{.{ .width = .{ .fixed = 80 } }};
 
     ctx.beginFrame(200, 200);
@@ -1648,6 +1644,8 @@ test "table interactive row: disabled and an open popup suppress activate" {
     ctx.endTableCell();
     _ = ctx.endTableRow();
     ctx.endTable();
+    ctx.beginBox(.{ .layer = &layer_spec, .width = .{ .fixed = 40 }, .height = .{ .fixed = 20 } });
+    ctx.endBox();
     ctx.endFrame();
     const rc = center(ctx.getNodeRect(RID).?);
 
@@ -1662,12 +1660,13 @@ test "table interactive row: disabled and an open popup suppress activate" {
     const dis = ctx.endTableRow();
     ctx.endTable();
     ctx.endDisabled();
+    ctx.beginBox(.{ .layer = &layer_spec, .width = .{ .fixed = 40 }, .height = .{ .fixed = 20 } });
+    ctx.endBox();
     ctx.endFrame();
     try std.testing.expect(!dis.activated);
 
     ctx.beginFrame(200, 200);
     clickAt(&ctx, rc.x, rc.y);
-    ctx.openPopup(0xA056, .{ .x = 0, .y = 0 });
     ctx.beginTable(TID, &cols, .{ .width = .fit, .height = .fit });
     ctx.beginTableRow(.{ .interactive = .{ .id = RID, .selected = false } });
     ctx.beginTableCell();
@@ -1675,6 +1674,8 @@ test "table interactive row: disabled and an open popup suppress activate" {
     ctx.endTableCell();
     const pop = ctx.endTableRow();
     ctx.endTable();
+    ctx.beginBox(.{ .layer = &layer_spec, .width = .{ .fixed = 40 }, .height = .{ .fixed = 20 } });
+    ctx.endBox();
     ctx.endFrame();
     try std.testing.expect(!pop.activated);
 }
@@ -1685,7 +1686,6 @@ test "table interactive row: a cell that opens a popup in the same frame does no
     const TID: Id = 0xA057;
     const RID: Id = 0xA058;
     const BID: Id = 0xA059;
-    const PID: Id = 0xA05A;
     const cols = [_]TableCol{.{ .width = .fit }};
 
     ctx.beginFrame(300, 200);
@@ -1704,12 +1704,11 @@ test "table interactive row: a cell that opens a popup in the same frame does no
     ctx.beginTable(TID, &cols, .{ .width = .fit, .height = .fit });
     ctx.beginTableRow(.{ .interactive = .{ .id = RID, .selected = false } });
     ctx.beginTableCell();
-    if (ctx.buttonId(BID, "Menu", .{}).clicked) ctx.openPopup(PID, .{ .x = 8, .y = 8 });
+    _ = ctx.buttonId(BID, "Menu", .{});
     ctx.endTableCell();
     const row = ctx.endTableRow();
     ctx.endTable();
     ctx.endFrame();
-    try std.testing.expect(ctx.popup_state != null);
     try std.testing.expect(!row.activated);
 }
 

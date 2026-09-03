@@ -31,10 +31,8 @@
 // already uses elsewhere) -- this is what keeps an armed drag resubmitted while the pointer is
 // still deciding whether to cross the threshold.
 //
-// Contract with popups: opening a popup while a drag is in flight is a caller error (call
-// `cancelDrag` first). `openPopup`/`openPopupStacked` clear `ctx.drag` as a fail-safe (matching
-// the existing active_id/hot_id/next_hot_id reset there), but the payload is lost when that
-// fail-safe fires -- it is not a substitute for calling `cancelDrag`.
+// Contract with modal layers: opening a layer while a drag is in flight is a caller error (call
+// `cancelDrag` first). The consumer owns both the layer presence and the drag transition.
 
 const std = @import("std");
 const context_mod = @import("context.zig");
@@ -129,8 +127,6 @@ pub fn dragSource(ctx: *Context, id: Id, payload: DragPayload) DragSourceResult 
         ctx.clearDisabledInteraction(id);
         return .{};
     }
-    if (ctx.popup_state != null or ctx.popup_stack.len != 0) return .{};
-
     if (ctx.drag) |*d| {
         if (d.source_id != id) return .{}; // a different drag (or none started by this id) owns the singleton
         ctx.drag_submitted_this_frame = true;
@@ -191,8 +187,6 @@ pub fn dropTarget(ctx: *Context, id: Id, can_accept: bool) DropResult {
         ctx.clearDisabledInteraction(id);
         return .{};
     }
-    if (ctx.popup_state != null or ctx.popup_stack.len != 0) return .{};
-
     const d = if (ctx.drag) |*d| d else return .{};
     if (d.phase != .dragging or d.accepted) return .{};
     const cached = ctx.rect_cache.get(id) orelse return .{};
