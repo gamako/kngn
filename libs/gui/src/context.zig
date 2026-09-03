@@ -398,6 +398,10 @@ pub const Context = struct {
     layers_len: usize = 0,
     layer_slots: [max_layers]LayerSlot = undefined,
     layer_slots_len: usize = 0,
+    /// Explicit IDs owned by cache-enabled layer roots, indexed once before placement.
+    /// This replaces a recursive search for every layer anchor resolution. The table is retained
+    /// across frames but is touched only on frames that register at least one layer.
+    layer_owner_map: std.AutoHashMapUnmanaged(Id, usize) = .empty,
     /// Input route latched from the previous frame's placed layer slots.
     layer_route: LayerRoute = .{},
     /// Outside dismissal is an edge result, not a close side effect. It is stable for the frame.
@@ -655,6 +659,7 @@ pub const Context = struct {
 
     pub fn deinit(self: *Context) void {
         self.rect_cache.deinit(self.gpa);
+        self.layer_owner_map.deinit(self.gpa);
         self.per_id_state.deinit(self.gpa);
         self.focus_order.deinit(self.gpa);
         self.focus_scope_order.deinit(self.gpa);
@@ -1765,6 +1770,8 @@ pub const Context = struct {
     /// Hot path: every frame, once per layer. O(1), and a frame with no layer never reaches
     /// it — a tree that uses no layer pays one null check per box for the whole feature.
     fn registerLayer(self: *Context, spec: LayerSpec, root: *layout.Node, logical_parent: *layout.Node) void {
+        requireContract(spec.cache or spec.input != .modal, "a modal layer must be cache-enabled");
+        requireContract(spec.input == .modal or !spec.dismiss_on_outside, "outside dismissal requires a modal layer");
         var i: usize = 0;
         while (i < self.layers_len) : (i += 1) {
             requireContract(
@@ -1909,6 +1916,7 @@ pub const Context = struct {
     /// Hot path: every frame, once per layer, and not reached at all on a frame with none.
     fn placeLayers(self: *Context, boundary: Rect) void {
         if (self.layers_len == 0) return;
+        self.indexLayerOwners();
         // Each pass places at least one layer, or every remaining layer is blocked and the
         // block is a cycle. Bounding the passes by the count is what turns a cycle into a
         // contract failure rather than a hang.
@@ -1971,12 +1979,29 @@ pub const Context = struct {
     /// Which layer, if any, owns the box with this explicit id. Only layers that join the
     /// cache can own one, because only their ids are in the namespace at all.
     fn ownerLayerOf(self: *Context, anchor_id: Id) ?usize {
-        var i: usize = 0;
-        while (i < self.layers_len) : (i += 1) {
-            if (!self.layers[i].cache) continue;
-            if (subtreeHasId(self.layers[i].root, anchor_id)) return i;
+        return self.layer_owner_map.get(anchor_id);
+    }
+
+    /// Index cache-visible IDs once for this frame. Layer roots are detached from the main tree
+    /// and from one another's child chains, so an inner layer is visited only by its own record;
+    /// it cannot be counted as part of its outer layer as well.
+    fn indexLayerOwners(self: *Context) void {
+        self.layer_owner_map.clearRetainingCapacity();
+        for (self.layers[0..self.layers_len], 0..) |record, i| {
+            if (!record.cache) continue;
+            self.indexLayerOwnerSubtree(record.root, i);
         }
-        return null;
+    }
+
+    fn indexLayerOwnerSubtree(self: *Context, node: *const layout.Node, owner: usize) void {
+        if (node.cfg.id != 0) {
+            const gop = self.layer_owner_map.getOrPut(self.gpa, node.cfg.id) catch
+                @panic("Context.placeLayers: OOM");
+            requireContract(!gop.found_existing, "two cache-enabled layer boxes have the same explicit id");
+            gop.value_ptr.* = owner;
+        }
+        var it = node.first_child;
+        while (it) |child| : (it = child.next_sibling) self.indexLayerOwnerSubtree(child, owner);
     }
 
     /// Emit the layers over the main tree, nearest the viewer last.
@@ -2418,15 +2443,6 @@ fn layerSlotIsFrontmost(candidate: LayerSlot, current: LayerSlot) bool {
 fn layerBefore(a: LayerRecord, b: LayerRecord) bool {
     if (a.z != b.z) return a.z < b.z;
     return a.serial < b.serial;
-}
-
-fn subtreeHasId(node: *const layout.Node, wanted: Id) bool {
-    if (node.cfg.id == wanted) return true;
-    var it = node.first_child;
-    while (it) |c| : (it = c.next_sibling) {
-        if (subtreeHasId(c, wanted)) return true;
-    }
-    return false;
 }
 
 pub fn pointHitsVisible(rect: Rect, clip: Rect, p: Vec2) bool {
@@ -3618,6 +3634,12 @@ test "layer: the latched route does not retain a compacted slot index" {
     try std.testing.expect(!@hasField(LayerRoute, "frontmost_slot"));
 }
 
+test "layer: presence-only lifecycle has no retained open bit" {
+    // A marker submitted in this frame is the only presence source; an open bit would duplicate
+    // consumer state and reintroduce delayed or undefined lifecycle cases.
+    try std.testing.expect(!@hasField(LayerSlot, "open"));
+}
+
 test "layer: outside dismissal covers every mouse button and edge position" {
     var ctx = testCtx();
     defer ctx.deinit();
@@ -3908,6 +3930,238 @@ test "layer: one anchored into another is placed after it, whatever order they r
     // Below the parent layer's box, which is only knowable once that layer has been placed.
     try std.testing.expectEqual(parent_layer.x, child_layer.x);
     try std.testing.expectEqual(parent_layer.y + @as(i32, @intCast(parent_layer.h)), child_layer.y);
+}
+
+fn countSolidRectColor(ctx: *Context, color: Color) usize {
+    var count: usize = 0;
+    for (ctx.postFrameDrawList().cmds.items) |cmd| {
+        if (cmd != .rect_filled or cmd.rect_filled.paint != .solid) continue;
+        if (std.meta.eql(cmd.rect_filled.paint.solid, color)) count += 1;
+    }
+    return count;
+}
+
+test "layer: nested roots are emitted once in either z order" {
+    const cases = [_]struct { outer_z: i32, inner_z: i32 }{
+        .{ .outer_z = 10, .inner_z = 1 },
+        .{ .outer_z = 1, .inner_z = 10 },
+    };
+    const outer_color = Color.rgba(0xA1, 0x10, 0x10, 0xFF);
+    const inner_color = Color.rgba(0x10, 0xA1, 0x10, 0xFF);
+
+    for (cases) |case| {
+        var ctx = testCtx();
+        defer ctx.deinit();
+        const outer_id: Id = 1501;
+        const inner_id: Id = 1502;
+        const outer_spec: LayerSpec = .{
+            .key = .{ .value = 1503 },
+            .z = case.outer_z,
+            .placement = .{ .source = .{ .point = .{ .x = 20, .y = 20 } }, .flip = .none, .shift = .none },
+        };
+        const inner_spec: LayerSpec = .{
+            .key = .{ .value = 1504 },
+            .z = case.inner_z,
+            .placement = .{ .source = .{ .id = outer_id }, .flip = .none, .shift = .none },
+        };
+
+        ctx.beginFrameAt(400, 300, 0.0);
+        ctx.beginBox(.{
+            .layer = &outer_spec,
+            .id = outer_id,
+            .width = .{ .fixed = 60 },
+            .height = .{ .fixed = 30 },
+            .bg = outer_color,
+        });
+        ctx.beginBox(.{
+            .layer = &inner_spec,
+            .id = inner_id,
+            .width = .{ .fixed = 40 },
+            .height = .{ .fixed = 20 },
+            .bg = inner_color,
+        });
+        ctx.endBox();
+        ctx.endBox();
+        ctx.endFrame();
+
+        // The inner marker is a detached root, not an ordinary child of the outer root. One
+        // occurrence of each fill therefore proves that neither layout traversal nor layer
+        // emission reached the same root twice.
+        try std.testing.expectEqual(@as(usize, 1), countSolidRectColor(&ctx, outer_color));
+        try std.testing.expectEqual(@as(usize, 1), countSolidRectColor(&ctx, inner_color));
+        try std.testing.expectEqual(@as(usize, 2), ctx.layer_owner_map.count());
+        try std.testing.expect(ctx.getNodeRect(outer_id) != null);
+        try std.testing.expect(ctx.getNodeRect(inner_id) != null);
+
+        var order: [2]u8 = undefined;
+        var order_len: usize = 0;
+        for (ctx.postFrameDrawList().cmds.items) |cmd| {
+            if (cmd != .rect_filled or cmd.rect_filled.paint != .solid) continue;
+            const color = cmd.rect_filled.paint.solid;
+            const tag: u8 = if (std.meta.eql(color, outer_color)) 1 else if (std.meta.eql(color, inner_color)) 2 else 0;
+            if (tag == 0) continue;
+            order[order_len] = tag;
+            order_len += 1;
+        }
+        const expected = if (case.outer_z < case.inner_z) [2]u8{ 1, 2 } else [2]u8{ 2, 1 };
+        try std.testing.expectEqual(expected, order);
+    }
+}
+
+test "layer: nested roots are counted once by the layout sanity probe" {
+    var ctx = testCtx();
+    defer ctx.deinit();
+    ctx.setLayoutSanityEnabled(true);
+    const outer_id: Id = 1505;
+    const inner_id: Id = 1506;
+    const outer: LayerSpec = .{
+        .key = .{ .value = 1507 },
+        .placement = .{ .source = .{ .point = .{ .x = 20, .y = 20 } }, .flip = .none, .shift = .none },
+    };
+    const inner: LayerSpec = .{
+        .key = .{ .value = 1508 },
+        .placement = .{ .source = .{ .id = outer_id }, .flip = .none, .shift = .none },
+    };
+
+    ctx.beginFrameAt(400, 300, 0.0);
+    ctx.beginBox(.{
+        .layer = &outer,
+        .id = outer_id,
+        .width = .{ .fixed = 60 },
+        .height = .{ .fixed = 30 },
+    });
+    ctx.beginBox(.{
+        .layer = &inner,
+        .id = inner_id,
+        .width = .{ .fixed = 10 },
+        .height = .{ .fixed = 10 },
+    });
+    ctx.beginBox(.{ .width = .{ .fixed = 20 }, .height = .{ .fixed = 20 } });
+    ctx.endBox();
+    ctx.endBox();
+    ctx.endBox();
+    ctx.endFrame();
+
+    // Only the inner root has a child extent larger than its fixed root. An outer traversal
+    // reaching the detached inner root too would report the same violation a second time.
+    try std.testing.expectEqual(@as(u32, 1), ctx.layout_sanity_result.content_overflow);
+}
+
+test "layer: detached roots do not inherit parent clip or scroll in draw commands" {
+    var ctx = testCtx();
+    defer ctx.deinit();
+    const layer_color = Color.rgba(0x10, 0x20, 0xE0, 0xFF);
+    const spec: LayerSpec = .{
+        .key = .{ .value = 1510 },
+        .placement = .{ .source = .{ .point = .{ .x = 100, .y = 100 } }, .flip = .none, .shift = .none },
+    };
+
+    ctx.beginFrameAt(400, 300, 0.0);
+    ctx.beginBox(.{
+        .width = .{ .fixed = 20 },
+        .height = .{ .fixed = 20 },
+        .clip_children = true,
+        .scroll_x = 40,
+        .scroll_y = 30,
+    });
+    ctx.beginBox(.{
+        .layer = &spec,
+        .width = .{ .fixed = 30 },
+        .height = .{ .fixed = 15 },
+        .bg = layer_color,
+    });
+    ctx.endBox();
+    ctx.endBox();
+    ctx.endFrame();
+
+    var found = false;
+    for (ctx.postFrameDrawList().cmds.items) |cmd| {
+        if (cmd != .rect_filled or cmd.rect_filled.paint != .solid) continue;
+        if (!std.meta.eql(cmd.rect_filled.paint.solid, layer_color)) continue;
+        found = true;
+        // This is the layer root's own command clip. The parent's clip and scroll must not
+        // cross the detach boundary; the screen root clip remains the active draw clip.
+        try std.testing.expectEqual(Rect{ .x = 0, .y = 0, .w = 400, .h = 300 }, cmd.rect_filled.clip);
+        try std.testing.expectEqual(Rect{ .x = 100, .y = 100, .w = 30, .h = 15 }, cmd.rect_filled.rect);
+    }
+    try std.testing.expect(found);
+}
+
+fn buildDetachedHitTree(ctx: *Context, marker: *const LayerSpec, main_id: Id, layer_id: Id) ButtonResult {
+    ctx.beginBox(.{
+        .width = .{ .fixed = 20 },
+        .height = .{ .fixed = 20 },
+        .clip_children = true,
+        .scroll_x = 40,
+        .scroll_y = 30,
+    });
+    _ = ctx.buttonId(main_id, "main", .{});
+    ctx.beginBox(.{
+        .layer = marker,
+        .width = .{ .fixed = 100 },
+        .height = .{ .fixed = 40 },
+    });
+    const result = ctx.buttonId(layer_id, "layer", .{});
+    ctx.endBox();
+    ctx.endBox();
+    return result;
+}
+
+test "layer: detached roots use their own previous-frame clip for hit-test" {
+    var ctx = testCtx();
+    defer ctx.deinit();
+    const marker: LayerSpec = .{
+        .key = .{ .value = 1511 },
+        .input = .modal,
+        .placement = .{ .source = .{ .point = .{ .x = 100, .y = 100 } }, .flip = .none, .shift = .none },
+    };
+    const main_id: Id = 1512;
+    const layer_id: Id = 1513;
+
+    ctx.beginFrameAt(400, 300, 0.0);
+    _ = buildDetachedHitTree(&ctx, &marker, main_id, layer_id);
+    ctx.endFrame();
+    const layer_rect = ctx.getNodeRect(layer_id).?;
+    const center = Vec2{
+        .x = layer_rect.x + @as(i32, @intCast(layer_rect.w / 2)),
+        .y = layer_rect.y + @as(i32, @intCast(layer_rect.h / 2)),
+    };
+    const layer_cached = ctx.getNodeCachedRect(layer_id).?;
+    try std.testing.expectEqual(Rect{ .x = 0, .y = 0, .w = 400, .h = 300 }, layer_cached.clip);
+    try std.testing.expect(pointHitsVisible(layer_cached.rect, layer_cached.clip, center));
+
+    ctx.pushEvent(.{ .mouse_down = .{ .x = center.x, .y = center.y, .button = 0, .modifiers = 0 } });
+    ctx.beginFrameAt(400, 300, 0.1);
+    const held = buildDetachedHitTree(&ctx, &marker, main_id, layer_id);
+    try std.testing.expect(held.held);
+    ctx.endFrame();
+
+    ctx.pushEvent(.{ .mouse_up = .{ .x = center.x, .y = center.y, .button = 0, .modifiers = 0 } });
+    ctx.beginFrameAt(400, 300, 0.2);
+    const clicked = buildDetachedHitTree(&ctx, &marker, main_id, layer_id);
+    try std.testing.expect(clicked.clicked);
+    ctx.endFrame();
+}
+
+test "layer: owner indexing is skipped when a frame has no layer markers" {
+    var ctx = testCtx();
+    defer ctx.deinit();
+    const marker: LayerSpec = .{
+        .key = .{ .value = 1514 },
+        .placement = .{ .source = .{ .point = .{ .x = 4, .y = 5 } }, .flip = .none, .shift = .none },
+    };
+
+    ctx.beginFrameAt(100, 80, 0.0);
+    ctx.beginBox(.{ .layer = &marker, .id = 1515, .width = .{ .fixed = 8 }, .height = .{ .fixed = 8 } });
+    ctx.endBox();
+    ctx.endFrame();
+    try std.testing.expectEqual(@as(usize, 1), ctx.layer_owner_map.count());
+
+    // The retained table is deliberately left alone here. The early return in placeLayers is
+    // the no-marker fast path; the next layer frame clears and rebuilds it before resolving.
+    ctx.beginFrameAt(100, 80, 0.1);
+    ctx.endFrame();
+    try std.testing.expectEqual(@as(usize, 1), ctx.layer_owner_map.count());
 }
 
 test "layer: a missing anchor propagates to the layers anchored into it" {

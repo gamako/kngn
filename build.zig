@@ -2638,6 +2638,8 @@ pub fn build(b: *std.Build) void {
             .{ .case = "tooltip_builder_id_stack", .message = "tooltipBox builder left the id stack unbalanced" },
             .{ .case = "marker_main_draw_list", .message = "mainDrawList is not available in a layer scope" },
             .{ .case = "marker_post_frame_draw_list", .message = "postFrameDrawList is not available in a layer scope" },
+            .{ .case = "modal_layer_without_cache", .message = "a modal layer must be cache-enabled" },
+            .{ .case = "none_layer_with_outside_dismiss", .message = "outside dismissal requires a modal layer" },
             .{ .case = "tooltip_main_draw_list", .message = "mainDrawList is not available in phase display_only_build" },
             .{ .case = "tooltip_post_frame_draw_list", .message = "postFrameDrawList is not available in phase display_only_build" },
         };

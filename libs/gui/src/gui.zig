@@ -12,6 +12,8 @@
 //   try dl.rectFilled(...);
 //   gui.render(target, &dl, gui.default_font, 1.0);
 
+const std = @import("std");
+
 pub const Rect = @import("geom.zig").Rect;
 pub const Vec2 = @import("geom.zig").Vec2;
 pub const RenderTarget = @import("geom.zig").RenderTarget;
@@ -164,9 +166,11 @@ pub const Direction = @import("layout.zig").Direction;
 pub const Sizing = @import("layout.zig").Sizing;
 pub const Align = @import("layout.zig").Align;
 pub const Inset = @import("layout.zig").Inset;
-// Layer placement. A marker subtree is display-only: use custom leaves for visuals so commands
-// are emitted at the layer's position in the shared list.
+// Declarative layer markers. A marker becomes an independent root; its input policy determines
+// whether the previous-frame route may enable ordinary widget interaction in its subtree.
 pub const LayerKey = @import("layer_types.zig").LayerKey;
+pub const LayerInputPolicy = @import("layer_types.zig").LayerInputPolicy;
+pub const LayerSpec = @import("layer_types.zig").LayerSpec;
 pub const LayerPlacement = @import("layer_types.zig").LayerPlacement;
 pub const AnchorSource = @import("layer_types.zig").AnchorSource;
 pub const Side = @import("layer_types.zig").Side;
@@ -396,4 +400,21 @@ test {
     _ = @import("overlay.zig");
     _ = @import("text_wrap.zig");
     _ = @import("table.zig");
+}
+
+test "public layer marker API uses a borrowed specification handle" {
+    const spec: LayerSpec = .{
+        .key = .{ .value = 1 },
+        .placement = .{ .source = .{ .point = .{ .x = 0, .y = 0 } } },
+    };
+    const cfg: BoxConfig = .{ .layer = &spec };
+    try std.testing.expect(cfg.layer != null);
+    try std.testing.expect(@sizeOf(?*const LayerSpec) < @sizeOf(?LayerSpec));
+    try std.testing.expect(@sizeOf(BoxConfig) <= 176);
+
+    // The marker submission is the only presence source. An open API would add a second state
+    // machine and restore the undefined omission/open-close cases and drawing delay.
+    try std.testing.expect(!@hasDecl(Context, "openLayer"));
+    try std.testing.expect(!@hasDecl(Context, "closeLayer"));
+    try std.testing.expect(!@hasDecl(Context, "layerIsOpen"));
 }

@@ -107,6 +107,10 @@ const Case = enum {
     /// A marker subtree may not access either frame draw-list accessor.
     marker_main_draw_list,
     marker_post_frame_draw_list,
+    /// A modal marker must retain geometry for previous-frame input routing.
+    modal_layer_without_cache,
+    /// Outside dismissal is meaningful only for an input-owning marker.
+    none_layer_with_outside_dismiss,
     /// A tooltip subtree may not access either frame draw-list accessor.
     tooltip_main_draw_list,
     tooltip_post_frame_draw_list,
@@ -140,6 +144,29 @@ fn runMarkerPostFrameDrawList(ctx: *gui.Context) void {
         .layer = &.{ .key = .{ .value = 1 }, .placement = .{ .source = .{ .point = .{ .x = 0, .y = 0 } } } },
     });
     _ = ctx.postFrameDrawList();
+}
+
+fn runModalLayerWithoutCache(ctx: *gui.Context) void {
+    ctx.beginFrame(320, 240);
+    ctx.beginBox(.{
+        .layer = &.{
+            .key = .{ .value = 2 },
+            .cache = false,
+            .input = .modal,
+            .placement = .{ .source = .{ .point = .{ .x = 0, .y = 0 } } },
+        },
+    });
+}
+
+fn runNoneLayerWithOutsideDismiss(ctx: *gui.Context) void {
+    ctx.beginFrame(320, 240);
+    ctx.beginBox(.{
+        .layer = &.{
+            .key = .{ .value = 3 },
+            .dismiss_on_outside = true,
+            .placement = .{ .source = .{ .point = .{ .x = 0, .y = 0 } } },
+        },
+    });
 }
 
 pub fn main(init: std.process.Init) !void {
@@ -517,6 +544,8 @@ pub fn main(init: std.process.Init) !void {
         }.build),
         .marker_main_draw_list => runMarkerMainDrawList(&ctx),
         .marker_post_frame_draw_list => runMarkerPostFrameDrawList(&ctx),
+        .modal_layer_without_cache => runModalLayerWithoutCache(&ctx),
+        .none_layer_with_outside_dismiss => runNoneLayerWithOutsideDismiss(&ctx),
         .tooltip_main_draw_list => runDisplayOnly(&ctx, struct {
             fn build(_: *anyopaque, c: *gui.Context) void {
                 _ = c.mainDrawList();
