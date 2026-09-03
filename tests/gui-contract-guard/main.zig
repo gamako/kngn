@@ -30,9 +30,9 @@ pub const panic = std.debug.FullPanic(struct {
 const Case = enum {
     /// A widget built with no frame open.
     widget_outside_frame,
-    /// A post-frame API called while a frame is open.
+    /// A popup consumer called with no frame open.
     popup_inside_frame,
-    /// The other post-frame API — the menu bar dropdown — called while a frame is open.
+    /// A menu-bar consumer called with no frame open.
     menu_inside_frame,
     /// A frame closed with a box still open.
     unclosed_box,
@@ -87,10 +87,10 @@ const Case = enum {
     display_only_end_scroll,
     display_only_begin_slider_group,
     display_only_end_slider_group,
-    display_only_open_popup,
-    display_only_close_popup,
-    display_only_open_popup_stacked,
-    display_only_close_popup_stacked,
+    display_only_popup_menu,
+    display_only_popup_menu_ex,
+    display_only_popup_menu_stacked,
+    display_only_dialog,
     display_only_drag_source,
     display_only_drop_target,
     display_only_finish_drag,
@@ -192,15 +192,16 @@ pub fn main(init: std.process.Init) !void {
             ctx.label("built with no frame open");
         },
         .popup_inside_frame => {
-            ctx.beginFrame(320, 240);
-            _ = ctx.popupMenu(1, &.{});
-            ctx.endFrame();
+            var state: gui.PopupState = .{
+                .key = .{ .value = 11 },
+                .placement = .{ .source = .{ .point = .{ .x = 0, .y = 0 } } },
+                .open = true,
+            };
+            _ = ctx.popupMenu(&state, &.{.{ .label = "item" }});
         },
         .menu_inside_frame => {
             var menu_state: gui.MenuBarState = .{};
-            ctx.beginFrame(320, 240);
             _ = gui.menuBarPopup(&ctx, &.{}, &menu_state);
-            ctx.endFrame();
         },
         .unclosed_box => {
             ctx.beginFrame(320, 240);
@@ -451,24 +452,47 @@ pub fn main(init: std.process.Init) !void {
                 c.endSliderGroup();
             }
         }.build),
-        .display_only_open_popup => runDisplayOnly(&ctx, struct {
+        .display_only_popup_menu => runDisplayOnly(&ctx, struct {
             fn build(_: *anyopaque, c: *gui.Context) void {
-                c.openPopup(2, .{ .x = 0, .y = 0 });
+                var state: gui.PopupState = .{
+                    .key = .{ .value = 12 },
+                    .placement = .{ .source = .{ .point = .{ .x = 0, .y = 0 } } },
+                    .open = true,
+                };
+                _ = c.popupMenu(&state, &.{.{ .label = "item" }});
             }
         }.build),
-        .display_only_close_popup => runDisplayOnly(&ctx, struct {
+        .display_only_popup_menu_ex => runDisplayOnly(&ctx, struct {
             fn build(_: *anyopaque, c: *gui.Context) void {
-                c.closePopup();
+                var state: gui.PopupState = .{
+                    .key = .{ .value = 13 },
+                    .placement = .{ .source = .{ .point = .{ .x = 0, .y = 0 } } },
+                    .open = true,
+                };
+                _ = c.popupMenuEx(&state, &.{.{ .label = "item" }}, .{});
             }
         }.build),
-        .display_only_open_popup_stacked => runDisplayOnly(&ctx, struct {
+        .display_only_popup_menu_stacked => runDisplayOnly(&ctx, struct {
             fn build(_: *anyopaque, c: *gui.Context) void {
-                c.openPopupStacked(2, .{ .x = 0, .y = 0 });
+                var state: gui.PopupState = .{
+                    .key = .{ .value = 14 },
+                    .placement = .{ .source = .{ .point = .{ .x = 0, .y = 0 } } },
+                    .open = true,
+                };
+                _ = c.popupMenuStacked(&state, &.{.{ .label = "item" }}, .{});
             }
         }.build),
-        .display_only_close_popup_stacked => runDisplayOnly(&ctx, struct {
+        .display_only_dialog => runDisplayOnly(&ctx, struct {
             fn build(_: *anyopaque, c: *gui.Context) void {
-                c.closePopupStacked(2);
+                var state: gui.DialogState = .{
+                    .popup = .{
+                        .key = .{ .value = 15 },
+                        .placement = .{ .source = .{ .point = .{ .x = 0, .y = 0 } } },
+                        .open = true,
+                    },
+                    .options = .{ .title = "title", .body = "body", .actions = &.{.{ .label = "OK" }}},
+                };
+                _ = c.dialog(&state);
             }
         }.build),
         .display_only_drag_source => runDisplayOnly(&ctx, struct {

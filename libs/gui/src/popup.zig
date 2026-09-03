@@ -32,15 +32,18 @@ pub const DialogAction = struct {
     enabled: bool = true,
 };
 
+pub const DialogBuildFn = *const fn (ctx: *Context, user_data: *anyopaque) void;
+
 pub const DialogOptions = struct {
     title: []const u8 = "",
     body: []const u8 = "",
     actions: []const DialogAction = &.{},
     width: u32 = 360,
+    height: u32 = 168,
     dismiss_on_escape: bool = true,
+    build: ?DialogBuildFn = null,
+    user_data: *anyopaque = undefined,
 };
-
-pub const PopupKind = enum { menu, dialog };
 
 /// Consumer-owned presence and placement for one menu or context popup.
 pub const PopupState = struct {
@@ -93,7 +96,7 @@ fn popupSpec(state: *const PopupState) LayerSpec {
     };
 }
 
-fn popupItemId(key: LayerKey, index: usize) Id {
+pub fn popupItemId(key: LayerKey, index: usize) Id {
     return id_mod.hashInt(key.value, @as(u64, @intCast(index + 1)));
 }
 
@@ -126,12 +129,14 @@ pub fn popupMenu(ctx: *Context, state: *PopupState, items: []const PopupItem) Po
 
 pub fn popupMenuEx(ctx: *Context, state: *PopupState, items: []const PopupItem, opts: PopupMenuOpts) PopupResult {
     ctx.requireFrame("popupMenu");
+    ctx.requireInteractiveAllowed("popupMenu");
     if (!state.open) return .{};
     if (ctx.layerDismissed(state.key)) return .{ .dismissed = true };
     if (items.len == 0) return .{ .dismissed = true };
 
     const spec = popupSpec(state);
     ctx.beginBox(.{
+        .id = state.key.value,
         .layer = &spec,
         .direction = .column,
         .width = .fit,
@@ -191,6 +196,7 @@ fn dialogActionIdForIndex(key: LayerKey, index: usize) Id {
 /// No action rectangle or focus index is retained by the framework.
 pub fn dialog(ctx: *Context, state: *DialogState) DialogResult {
     ctx.requireFrame("dialog");
+    ctx.requireInteractiveAllowed("dialog");
     if (!state.popup.open) return .{};
     if (ctx.layerDismissed(state.popup.key)) return .{ .dismissed = true };
 
@@ -210,7 +216,7 @@ pub fn dialog(ctx: *Context, state: *DialogState) DialogResult {
     ctx.beginBox(.{
         .direction = .column,
         .width = .{ .fixed = dialogWidth(state.options) },
-        .height = .{ .fixed = 168 },
+        .height = .{ .fixed = @intCast(@max(state.options.height, 96)) },
         .gap = 8,
         .padding = .{ 20, 20, 16, 20 },
         .bg = ctx.style.surface.control,
@@ -219,7 +225,11 @@ pub fn dialog(ctx: *Context, state: *DialogState) DialogResult {
         .clip_children = true,
     });
     ctx.labelEx(state.options.title, ctx.style.text_tokens.primary);
-    ctx.labelEx(state.options.body, ctx.style.text_tokens.subtle);
+    if (state.options.build) |build| {
+        build(ctx, state.options.user_data);
+    } else {
+        ctx.labelEx(state.options.body, ctx.style.text_tokens.subtle);
+    }
     ctx.beginBox(.{ .width = .{ .grow = 1 }, .height = .{ .grow = 1 } });
     ctx.endBox();
     ctx.beginBox(.{ .direction = .row, .width = .{ .grow = 1 }, .height = .{ .fixed = 32 }, .gap = ctx.style.spacing.dialog_action_gap });
@@ -451,6 +461,20 @@ test "dialog: actions use the generic focus scope" {
     ctx.endFrame();
     try std.testing.expect(ctx.layerWasPlaced(state.popup.key));
     try std.testing.expect(ctx.getNodeRect(dialogActionId(state.popup.key, 0)) != null);
+}
+
+test "popup surface: imperative geometry and stack declarations stay absent" {
+    try std.testing.expect(!@hasDecl(@This(), "runPopup"));
+    try std.testing.expect(!@hasDecl(@This(), "popupContentWidth"));
+    try std.testing.expect(!@hasDecl(@This(), "measurePopupContentWidth"));
+    try std.testing.expect(!@hasDecl(@This(), "layoutPopup"));
+    try std.testing.expect(!@hasDecl(@This(), "itemRect"));
+    try std.testing.expect(!@hasDecl(@This(), "hitTestItem"));
+    try std.testing.expect(!@hasDecl(@This(), "DialogGeometry"));
+    try std.testing.expect(!@hasDecl(@This(), "dialogActionRect"));
+    try std.testing.expect(!@hasDecl(@This(), "drawDialog"));
+    try std.testing.expect(!@hasDecl(@This(), "PopupStack"));
+    try std.testing.expect(!@hasField(DialogState, "focus_index"));
 }
 
 test "layer placement: below, flip and shift follow the generic placement contract" {

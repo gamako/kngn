@@ -241,6 +241,7 @@ pub fn menuBar(ctx: *Context, commands: []const Command, state: *MenuBarState) v
 /// In the current frame: build the open dropdown and return the selected CommandId.
 pub fn menuBarPopup(ctx: *Context, commands: []const Command, state: *MenuBarState) MenuBarResult {
     ctx.requireFrame("menuBarPopup");
+    ctx.requireInteractiveAllowed("menuBarPopup");
     const title = state.open_title orelse {
         state.popup.open = false;
         return .{};

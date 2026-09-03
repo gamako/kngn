@@ -416,11 +416,6 @@ pub const Context = struct {
     layer_route: LayerRoute = .{},
     /// Outside dismissal is an edge result, not a close side effect. It is stable for the frame.
     dismissed_layer_key: ?LayerKey = null,
-    /// Whether the current frame's pointer press has been evaluated for outside dismissal. A
-    /// beginFrame call may happen before the loop pushes that frame's events, so a no-press check
-    /// remains open until the first consumer read; once evaluated, command-target consumption
-    /// cannot cause the same edge to be reported again.
-    layer_dismissal_checked: bool = false,
     /// Scope stack only changes at layer markers; ordinary boxes and widgets read one current
     /// scope without a tree walk or allocation.
     layer_scope_stack: [max_layers]LayerScope = undefined,
@@ -745,7 +740,6 @@ pub const Context = struct {
         // they are what carries a layer's geometry across the reset.
         self.layers_len = 0;
         self.command_targets_len = 0;
-        self.layer_dismissal_checked = false;
         self.input.beginFrame();
         self.id_stack.clear();
         self.state.beginFrame();
@@ -1603,29 +1597,11 @@ pub const Context = struct {
             self.layer_route.frontmost_key = slot.key;
         }
 
-        if (frontmost_index == null) return;
-        self.latchLayerDismissal();
-    }
-
-    /// Record an outside press against the begin-frame route. Event loops may push events either
-    /// before beginFrame (staged input) or after it (the usual poll/build loop); both paths must
-    /// produce the same frame result before a consumer reads layerDismissed.
-    fn latchLayerDismissal(self: *Context) void {
-        if (self.layer_dismissal_checked) return;
-        const frontmost = self.layer_route.frontmost_key orelse return;
-        var route_slot: ?LayerSlot = null;
-        for (self.layer_slots[0..self.layer_slots_len]) |candidate| {
-            if (candidate.key.eql(frontmost)) {
-                route_slot = candidate;
-                break;
-            }
-        }
-        const slot = route_slot orelse return;
+        const frontmost = frontmost_index orelse return;
+        const slot = self.layer_slots[frontmost];
         const any_mouse_press = self.input.mouse_pressed.left or
             self.input.mouse_pressed.right or self.input.mouse_pressed.middle;
-        if (!any_mouse_press) return;
-        self.layer_dismissal_checked = true;
-        if (slot.dismiss_on_outside) {
+        if (slot.dismiss_on_outside and any_mouse_press) {
             const screen = Rect{ .x = 0, .y = 0, .w = self.screen_w, .h = self.screen_h };
             if (!pointHitsVisible(slot.prev_root_rect, screen, self.input.mouse_pressed_pos)) {
                 self.dismissed_layer_key = slot.key;
@@ -1838,8 +1814,7 @@ pub const Context = struct {
 
     /// Whether the previous-frame frontmost modal layer received an outside press this frame.
     /// This is a stable event result; reading it never closes or consumes the layer.
-    pub fn layerDismissed(self: *Context, layer_key: LayerKey) bool {
-        self.latchLayerDismissal();
+    pub fn layerDismissed(self: *const Context, layer_key: LayerKey) bool {
         return if (self.dismissed_layer_key) |dismissed| dismissed.eql(layer_key) else false;
     }
 
@@ -1869,11 +1844,10 @@ pub const Context = struct {
     /// Whether a registered command target may use the pointer at `point`. The named menu must
     /// own the previous-frame route, and the point must be outside that route owner's root.
     /// Visible modal descendants therefore win before this exception is considered.
-    fn commandTargetOutsideRoute(self: *Context, id: Id, route_key: LayerKey, point: Vec2) bool {
+    fn commandTargetOutsideRoute(self: *const Context, id: Id, route_key: LayerKey, point: Vec2) bool {
         if (!self.commandTargetRegistered(id, route_key)) return false;
         const frontmost = self.layer_route.frontmost_key orelse return false;
         if (!frontmost.eql(route_key)) return false;
-        self.latchLayerDismissal();
         const root = self.layerPrevRect(route_key) orelse return false;
         const screen = Rect{ .x = 0, .y = 0, .w = self.screen_w, .h = self.screen_h };
         return !pointHitsVisible(root, screen, point);
@@ -1882,7 +1856,7 @@ pub const Context = struct {
     /// Pointer permission for a command target. Hover and press use their own edge coordinates;
     /// an already active target remains eligible for release even if the pointer later moves.
     fn commandTargetPointerEnabled(
-        self: *Context,
+        self: *const Context,
         id: Id,
         route_key: LayerKey,
         rect: Rect,
@@ -3725,30 +3699,6 @@ test "layer: a previous modal route is selected before current markers" {
     ctx.endFrame();
 }
 
-test "layer: outside dismissal also sees events pushed after beginFrame" {
-    var ctx = testCtx();
-    defer ctx.deinit();
-    const layer_key: LayerKey = .{ .value = 9041 };
-    const spec: LayerSpec = .{
-        .key = layer_key,
-        .input = .modal,
-        .dismiss_on_outside = true,
-        .placement = .{ .source = .{ .point = .{ .x = 20, .y = 20 } }, .flip = .none },
-    };
-
-    ctx.beginFrameAt(400, 300, 0.0);
-    ctx.beginBox(.{ .layer = &spec, .width = .{ .fixed = 40 }, .height = .{ .fixed = 20 } });
-    ctx.endBox();
-    ctx.endFrame();
-
-    ctx.beginFrameAt(400, 300, 0.1);
-    ctx.pushEvent(.{ .mouse_down = .{ .x = 200, .y = 200, .button = 0, .modifiers = 0 } });
-    try std.testing.expect(ctx.layerDismissed(layer_key));
-    ctx.beginBox(.{ .layer = &spec, .width = .{ .fixed = 40 }, .height = .{ .fixed = 20 } });
-    ctx.endBox();
-    ctx.endFrame();
-}
-
 test "layer: command target yields only to an inside hit" {
     var ctx = testCtx();
     defer ctx.deinit();
@@ -3910,108 +3860,6 @@ test "layer: visible context and flipped menu roots win over a title target" {
         try std.testing.expect(item.held);
         ctx.endBox();
         ctx.endFrame();
-    }
-}
-
-const CommandTargetOwner = enum { none, menu_bar, other_modal };
-const CommandTargetPosition = enum { title, route_root, outside };
-
-const command_target_menu_key: LayerKey = .{ .value = 0x90A1 };
-const command_target_other_key: LayerKey = .{ .value = 0x90A2 };
-
-fn buildCommandTargetRoute(ctx: *Context, owner: CommandTargetOwner) void {
-    if (owner == .none) return;
-
-    const menu_spec: LayerSpec = .{
-        .key = command_target_menu_key,
-        .z = 10,
-        .input = .modal,
-        .placement = .{ .source = .{ .point = .{ .x = 120, .y = 120 } }, .flip = .none, .shift = .none },
-    };
-    ctx.beginBox(.{ .layer = &menu_spec, .width = .{ .fixed = 80 }, .height = .{ .fixed = 40 } });
-    ctx.endBox();
-
-    if (owner == .other_modal) {
-        const other_spec: LayerSpec = .{
-            .key = command_target_other_key,
-            .z = 20,
-            .input = .modal,
-            .placement = .{ .source = .{ .point = .{ .x = 240, .y = 120 } }, .flip = .none, .shift = .none },
-        };
-        ctx.beginBox(.{ .layer = &other_spec, .width = .{ .fixed = 80 }, .height = .{ .fixed = 40 } });
-        ctx.endBox();
-    }
-}
-
-fn commandTargetPosition(owner: CommandTargetOwner, position: CommandTargetPosition) Vec2 {
-    return switch (position) {
-        .title => .{ .x = 40, .y = 12 },
-        .route_root => switch (owner) {
-            .none, .menu_bar => .{ .x = 160, .y = 140 },
-            .other_modal => .{ .x = 280, .y = 140 },
-        },
-        .outside => .{ .x = 360, .y = 260 },
-    };
-}
-
-test "layer: command target routing distinguishes owner and visible regions" {
-    const owners = [_]CommandTargetOwner{ .none, .menu_bar, .other_modal };
-    const positions = [_]CommandTargetPosition{ .title, .route_root, .outside };
-    const title_id: Id = 9096;
-    const title_rect: Rect = .{ .x = 0, .y = 0, .w = 80, .h = 24 };
-
-    for (owners) |owner| {
-        for (positions) |position| {
-            {
-                var ctx = testCtx();
-                defer ctx.deinit();
-
-                ctx.beginFrameAt(400, 300, 0.0);
-                ctx.beginBox(.{ .id = title_id, .width = .{ .fixed = 80 }, .height = .{ .fixed = 24 } });
-                ctx.endBox();
-                buildCommandTargetRoute(&ctx, owner);
-                ctx.endFrame();
-
-                if (owner != .none) {
-                    const route_key = if (owner == .menu_bar) command_target_menu_key else command_target_other_key;
-                    const route_root = ctx.layerPrevRect(route_key).?;
-                    try std.testing.expect(route_root.contains(commandTargetPosition(owner, .route_root)));
-                }
-
-                const point = commandTargetPosition(owner, position);
-                const should_react = position == .title and (owner == .none or owner == .menu_bar);
-
-                ctx.beginFrameAt(400, 300, 0.1);
-                ctx.pushEvent(.{ .mouse_down = .{ .x = point.x, .y = point.y, .button = 0, .modifiers = 0 } });
-                ctx.registerCommandTarget(title_id, command_target_menu_key);
-                const down = commandButtonBehavior(
-                    &ctx,
-                    title_id,
-                    title_rect,
-                    full_clip,
-                    command_target_menu_key,
-                );
-                try std.testing.expectEqual(should_react, down.held);
-                try std.testing.expectEqual(if (should_react) title_id else 0, ctx.state.active_id);
-                buildCommandTargetRoute(&ctx, owner);
-                ctx.endFrame();
-
-                ctx.beginFrameAt(400, 300, 0.2);
-                ctx.pushEvent(.{ .mouse_up = .{ .x = point.x, .y = point.y, .button = 0, .modifiers = 0 } });
-                ctx.registerCommandTarget(title_id, command_target_menu_key);
-                const up = commandButtonBehavior(
-                    &ctx,
-                    title_id,
-                    title_rect,
-                    full_clip,
-                    command_target_menu_key,
-                );
-                try std.testing.expectEqual(should_react, up.clicked);
-                try std.testing.expectEqual(@as(Id, 0), ctx.state.active_id);
-                buildCommandTargetRoute(&ctx, owner);
-                ctx.endFrame();
-            }
-        }
     }
 }
 

@@ -311,11 +311,13 @@ pub const PopupResult = @import("popup.zig").PopupResult;
 pub const PopupMenuOpts = @import("popup.zig").PopupMenuOpts;
 pub const DialogAction = @import("popup.zig").DialogAction;
 pub const DialogOptions = @import("popup.zig").DialogOptions;
+pub const DialogBuildFn = @import("popup.zig").DialogBuildFn;
 pub const DialogState = @import("popup.zig").DialogState;
 pub const DialogResult = @import("popup.zig").DialogResult;
 pub const popupMenu = @import("popup.zig").popupMenu;
 pub const popupMenuStacked = @import("popup.zig").popupMenuStacked;
 pub const popupMenuEx = @import("popup.zig").popupMenuEx;
+pub const popupItemId = @import("popup.zig").popupItemId;
 pub const dialog = @import("popup.zig").dialog;
 pub const dialogStacked = @import("popup.zig").dialogStacked;
 
