@@ -2,13 +2,13 @@
 //! pixels around the cursor, independent of the canvas's own view zoom (a separate local
 //! magnifier, not a replacement for it).
 //!
-//! Like `bezier_overlay.zig` / `selection_overlay.zig`, draws into `ctx.draw_list`, clipped to the
+//! Like `bezier_overlay.zig` / `selection_overlay.zig`, draws into `postFrameDrawList()`, clipped to the
 //! canvas area (cannot invade the right pane/menu). All coordinates here (`hover_screen`,
-//! `clip_area`, `LOUPE_SCALE`) are logical GUI coordinates, the same space every draw_list call
+//! `clip_area`, `LOUPE_SCALE`) are logical GUI coordinates, the same space every DrawList call
 //! uses; HiDPI `content_scale` is applied later, during the physical present, not here.
 //!
 //! Hot-path note: runs every frame while the loupe is visible. It is a nearest-neighbor resample
-//! of a small fixed source region (12x12 canvas pixels), drawn as one `draw_list.rectFilled` per
+//! of a small fixed source region (12x12 canvas pixels), drawn as one `DrawList.rectFilled` per
 //! source cell (a compile-time-constant `LOUPE_SCALE x LOUPE_SCALE` screen block), not a
 //! per-screen-pixel loop, so there is no per-pixel division anywhere. The source row/column range
 //! is intersected with the document bounds once, before either loop, so the inner loops are
@@ -36,7 +36,7 @@ const BORDER_COLOR = gui.Color.rgba(0xE0, 0xE0, 0xE0, 0xFF);
 pub fn draw(ctx: *gui.Context, hover_screen: core.Vec2, hover_cell: core.Vec2, pixels: []const u32, doc_w: u32, doc_h: u32, clip_area: gui.Rect) void {
     if (clip_area.isEmpty()) return;
 
-    const dl = &ctx.draw_list;
+    const dl = ctx.postFrameDrawList();
     dl.pushClip(clip_area) catch @panic("loupe_overlay: OOM");
     defer dl.popClip();
 

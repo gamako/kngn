@@ -923,7 +923,7 @@ pub fn main(init: std.process.Init) !void {
         }
 
         const target: gui.RenderTarget = .{ .pixels = fb.pixels, .width = fb.width, .height = fb.height };
-        gui.render(target, &ctx.draw_list, ctx.font, 1.0);
+        gui.render(target, ctx.postFrameDrawList(), ctx.font, 1.0);
         app.render_completed = 1;
         app.draw_ok = 1;
         window.present();

@@ -1,9 +1,9 @@
 //! Bezier (pen) tool non-destructive preview drawing.
 //!
-//! Draws the PathEditor path (anchors/handles/flattened curve) into ctx.draw_list. Draw order in
-//! main is bg → canvas blit → gui.render(draw_list), so this sits on the front of the canvas.
+//! Draws the PathEditor path (anchors/handles/flattened curve) into postFrameDrawList(). Draw order in
+//! main is bg → canvas blit → gui.render(postFrameDrawList()), so this sits on the front of the canvas.
 //! Coords: canvas-logical (f32) → window (rect.x + p*zoom). pushClip to the canvas display area.
-//! draw_list APIs return Allocator.Error; unify with existing emitNode via catch @panic.
+//! DrawList APIs return Allocator.Error; unify with existing emitNode via catch @panic.
 
 const std = @import("std");
 const gui = @import("kit").gui;
@@ -23,7 +23,7 @@ pub fn draw(ctx: *gui.Context, editor: *const core.PathEditor, canvas_rect: core
     const path = &editor.path;
     if (path.anchors.items.len == 0) return;
 
-    const dl = &ctx.draw_list;
+    const dl = ctx.postFrameDrawList();
     const disp: gui.Rect = .{
         .x = canvas_rect.x,
         .y = canvas_rect.y,

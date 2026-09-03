@@ -3309,7 +3309,7 @@ fn drawMiniTrace(dl: *gui.DrawList, rect: gui.Rect, kind: PortKind, samples: []c
 // ============================================================================
 // C: master-output visualisation strip (screen bottom). Two-layer draw.
 // Layer A: draw Spec/Scope/Meter into a fixed logical-resolution bitmap; DrawList.image nearest-scales it.
-// Layer B: add labels/ticks to gui_ctx.draw_list in logical coords; gui.render(scale) draws them in physical px afterwards.
+// Layer B: add labels/ticks to postFrameDrawList() in logical coords; gui.render(scale) draws them in physical px afterwards.
 // Intermediate bitmap is allocated once at startup (no per-frame allocation). comptime Spec/Scope sizes are fixed.
 // ============================================================================
 const FreqLabel = struct { hz: f32, text: []const u8 };
@@ -3773,11 +3773,11 @@ pub fn main(init: std.process.Init) !void {
             }
             app.captureParamRows(&gui_ctx);
             app.advanceParamEdits();
-            app.drawGhostMarkers(&gui_ctx.draw_list);
+            app.drawGhostMarkers(gui_ctx.postFrameDrawList());
             // Layer B: labels at the end of the second render (after layer A's nearest scale; physical font).
-            drawVizLabels(&app, &gui_ctx.draw_list, spec);
+            drawVizLabels(&app, gui_ctx.postFrameDrawList(), spec);
             Prof.mark(.overlays);
-            gui.render(target, &gui_ctx.draw_list, gui_ctx.font, content_scale);
+            gui.render(target, gui_ctx.postFrameDrawList(), gui_ctx.font, content_scale);
             Prof.mark(.gui_render);
 
             window.present();

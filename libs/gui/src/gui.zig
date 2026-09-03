@@ -4,7 +4,7 @@
 //   ctx.beginFrame(fb_w, fb_h);
 //   // pushEvent → widget (sync hit-test against previous-frame rect) → beginBox/label/endBox
 //   ctx.endFrame(); // finalize layout + emit draw cmds + update rect cache
-//   gui.render(target, &ctx.draw_list, ctx.font, 1.0);
+//   gui.render(target, ctx.postFrameDrawList(), ctx.font, 1.0);
 //
 // Low-level DrawList-only use (no layout) is also supported:
 //   var dl = gui.DrawList.init(gpa);
@@ -164,8 +164,8 @@ pub const Direction = @import("layout.zig").Direction;
 pub const Sizing = @import("layout.zig").Sizing;
 pub const Align = @import("layout.zig").Align;
 pub const Inset = @import("layout.zig").Inset;
-// Layer placement. The marker (`BoxConfig.layer`) is not published yet: a marker subtree's raw
-// `draw_list` calls would escape the layer's z order while `draw_list` is a public field.
+// Layer placement. A marker subtree is display-only: use custom leaves for visuals so commands
+// are emitted at the layer's position in the shared list.
 pub const LayerKey = @import("layer_types.zig").LayerKey;
 pub const LayerPlacement = @import("layer_types.zig").LayerPlacement;
 pub const AnchorSource = @import("layer_types.zig").AnchorSource;

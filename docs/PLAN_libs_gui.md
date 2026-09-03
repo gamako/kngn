@@ -30,7 +30,7 @@ Per-layer detail lives with the implementation and in `libs/gui/README.md`.
 │     if (ctx.button("Save")) saveFile();    ← declare + respond   │
 │     ctx.label("FPS: 60");                                        │
 │     ctx.endFrame()                                               │
-│     renderer.render(target, ctx.draw_list)                       │
+│     renderer.render(target, ctx.postFrameDrawList())             │
 │                                                                  │
 └─────────────────────────────┬────────────────────────────────────┘
                               │ public API: @import("gui")
@@ -138,7 +138,7 @@ layout runs in `endFrame`. Dear ImGui–style synchronous hit-test reconciles th
        · id_stack.clear
        · state.beginFrame               (hot_id ← next_hot_id, next_hot_id=0,
                                          this_frame_hovered_any=false)
-       · draw_list.reset / layout_tree.reset
+       · Context draw-list reset / layout_tree.reset
               │
               ▼
   3. ctx.pushEvent(ev) for each buffered event
@@ -176,7 +176,7 @@ layout runs in `endFrame`. Dear ImGui–style synchronous hit-test reconciles th
          (cursor changes, click tools that are not drags, …).
               │
               ▼
-  7. canvas.render(target) → Renderer.render(target, ctx.draw_list)
+  7. canvas.render(target) → Renderer.render(target, ctx.postFrameDrawList())
        (bake canvas as the base, then GUI DrawCmds on top; apply clip)
               │
               ▼
@@ -193,7 +193,7 @@ layout runs in `endFrame`. Dear ImGui–style synchronous hit-test reconciles th
 - **ArrayLists** (cmds / clip_stack / id_stack / layout_tree) live on the gpa and
   `clearRetainingCapacity()` each frame.
   - The arena holds only cmd payloads (text / image slices, …).
-- After `endFrame`, references to `draw_list` / `id_stack` / `state` / `layout_tree` / the rect
+- After `endFrame`, the post-frame draw list / `id_stack` / `state` / `layout_tree` / the rect
   cache stay valid until the next `beginFrame`.
 
 ---

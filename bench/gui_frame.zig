@@ -139,7 +139,7 @@ fn runScenario(io: std.Io, tracker: *peak_allocator.PeakTrackingAllocator, rows:
         ctx.beginFrame(W, H);
         buildRows(&ctx, &labels);
         ctx.endFrame();
-        gui.render(target, &ctx.draw_list, ctx.font, scale);
+        gui.render(target, ctx.postFrameDrawList(), ctx.font, scale);
     }
     const raster_after_warmup = family.coverage.rasterization_count;
 
@@ -151,12 +151,12 @@ fn runScenario(io: std.Io, tracker: *peak_allocator.PeakTrackingAllocator, rows:
         ctx.beginFrame(W, H);
         buildRows(&ctx, &labels);
         ctx.endFrame();
-        gui.render(target, &ctx.draw_list, ctx.font, scale);
+        gui.render(target, ctx.postFrameDrawList(), ctx.font, scale);
         const ns: u64 = @intCast(start.untilNow(io).raw.nanoseconds);
         samples[i] = ns;
         // DCE guard: observe rendered pixels + draw list length
         acc +%= pixels[i % pixels.len];
-        acc +%= @truncate(ctx.draw_list.cmds.items.len);
+        acc +%= @truncate(ctx.postFrameDrawList().cmds.items.len);
     }
     std.mem.doNotOptimizeAway(acc);
 
@@ -249,7 +249,7 @@ fn runWrapScenario(io: std.Io, tracker: *peak_allocator.PeakTrackingAllocator, k
         ctx.beginFrame(W, H);
         buildWrap(&ctx, kind, lines, long_n);
         ctx.endFrame();
-        gui.render(target, &ctx.draw_list, ctx.font, 1.0);
+        gui.render(target, ctx.postFrameDrawList(), ctx.font, 1.0);
     }
     const raster_after_warmup = family.coverage.rasterization_count;
 
@@ -263,12 +263,12 @@ fn runWrapScenario(io: std.Io, tracker: *peak_allocator.PeakTrackingAllocator, k
         ctx.beginFrame(W, H);
         buildWrap(&ctx, kind, lines, long_n);
         ctx.endFrame();
-        gui.render(target, &ctx.draw_list, ctx.font, 1.0);
+        gui.render(target, ctx.postFrameDrawList(), ctx.font, 1.0);
         const ns: u64 = @intCast(start.untilNow(io).raw.nanoseconds);
         samples[i] = ns;
         arena_peak = @max(arena_peak, ctx.arena.queryCapacity());
         acc +%= pixels[i % pixels.len];
-        acc +%= @truncate(ctx.draw_list.cmds.items.len);
+        acc +%= @truncate(ctx.postFrameDrawList().cmds.items.len);
     }
     std.mem.doNotOptimizeAway(acc);
     std.mem.sort(u64, samples[0..], {}, std.sort.asc(u64));
@@ -443,7 +443,7 @@ fn runCountedScenario(
         ctx.beginFrame(W, H);
         build(&ctx);
         ctx.endFrame();
-        gui.render(target, &ctx.draw_list, ctx.font, 1.0);
+        gui.render(target, ctx.postFrameDrawList(), ctx.font, 1.0);
     }
 
     tracker.reset();
@@ -457,11 +457,11 @@ fn runCountedScenario(
         ctx.beginFrame(W, H);
         build(&ctx);
         ctx.endFrame();
-        gui.render(target, &ctx.draw_list, ctx.font, 1.0);
+        gui.render(target, ctx.postFrameDrawList(), ctx.font, 1.0);
         const ns: u64 = @intCast(start.untilNow(io).raw.nanoseconds);
         samples[i] = ns;
         arena_peak = @max(arena_peak, ctx.arena.queryCapacity());
-        cmds = ctx.draw_list.cmds.items.len;
+        cmds = ctx.postFrameDrawList().cmds.items.len;
         acc +%= pixels[i % pixels.len];
         acc +%= @truncate(cmds);
     }

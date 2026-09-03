@@ -81,7 +81,7 @@ const App = struct {
         // Per-frame full-pixel fill: use kit.pixelops.fill32 (Performance rules).
         kit.pixelops.fill32(fb.pixels, self.color);
         const target: gui.RenderTarget = .{ .pixels = fb.pixels, .width = fb.width, .height = fb.height };
-        gui.render(target, &self.ctx.draw_list, self.ctx.font, 1.0);
+        gui.render(target, self.ctx.postFrameDrawList(), self.ctx.font, 1.0);
         win.present();
 
         return running;

@@ -1056,7 +1056,7 @@ test "PanelHost: panel build error still keeps begin/end balanced and advances t
     // If box / collapsible were closed, endFrame's layout_current==root assert passes
     ctx.endFrame();
 
-    // Next frame: beginFrame's !frame_active assert passes
+    // Next frame: beginFrame's no-frame contract passes
     panels[0].build = noopBuild;
     try frame(&host, &ctx, 800, 600);
     try std.testing.expect(host.centerRect(&ctx) != null);

@@ -5,14 +5,14 @@
 // and not RT (per sample). Draw cost is a menu rect plus a few items (the performance
 // SIMD three-point checklist does not apply; underlying gui.render already follows it).
 //
-// Design (same "manual draw into draw_list after endFrame" overlay style as
+// Design (same "manual draw into postFrameDrawList() after endFrame" overlay style as
 // apps/editor/apps/pixie/selection_overlay.zig):
 //   Not placed on the existing layout tree (beginBox/endBox). That tree's rect_cache
 //   returns the previous-frame rect of explicit-ID nodes under the sync hit-test contract
 //   (see the contract comment at the top of context.zig), so a popup opened this frame
 //   cannot be hit-tested in place. Therefore popupMenu() **must be called after ctx.endFrame()**,
 //   reads this frame's ctx.input directly, hit-tests with Rect.contains, and
-//   pushes commands straight onto ctx.draw_list (after layout-emitted ordinary UI, so it
+//   pushes commands straight onto postFrameDrawList() (after layout-emitted ordinary UI, so it
 //   draws on top — same shape as selection_overlay.zig).
 //
 // Modal absorption: openPopup() resets active_id/hot_id/next_hot_id to 0, and
@@ -644,7 +644,7 @@ fn runDialog(ctx: *Context, state: *PopupState) DialogResult {
 }
 
 fn drawDialog(ctx: *Context, id: Id, geo: DialogGeometry, options: DialogOptions, focus_index: ?usize) void {
-    const dl = &ctx.draw_list;
+    const dl = ctx.postFrameDrawList();
     const style = ctx.style;
     dl.rectFilled(.{ .x = 0, .y = 0, .w = ctx.screen_w, .h = ctx.screen_h }, Color.rgba(0, 0, 0, 0x88)) catch @panic("dialog: OOM");
     dl.box(geo.outer, .{
@@ -683,7 +683,7 @@ fn drawDialog(ctx: *Context, id: Id, geo: DialogGeometry, options: DialogOptions
 /// If not open, do nothing and return `.{}` (open=false) — safe to call unconditionally every frame
 /// (immediate-mode style).
 ///
-/// **Contract: call after ctx.endFrame()** (to draw on top; same "manual draw into draw_list
+/// **Contract: call after ctx.endFrame()** (to draw on top; same "manual draw into postFrameDrawList()
 /// after endFrame" overlay rule as selection_overlay.zig).
 pub fn popupMenu(ctx: *Context, id: Id, items: []const PopupItem) PopupResult {
     return popupMenuEx(ctx, id, items, .{});
@@ -751,7 +751,7 @@ pub fn dialogStacked(ctx: *Context, id: Id) DialogResult {
 }
 
 fn draw(ctx: *Context, geo: PopupGeometry, items: []const PopupItem, hovered_idx: ?usize) void {
-    const dl = &ctx.draw_list;
+    const dl = ctx.postFrameDrawList();
     const style = ctx.style;
     // Clip to outer, not screen: outer may be smaller than natural content after screen shrink
     // (see layoutPopup). Clipping to screen would let trailing items draw past outer's
@@ -812,7 +812,7 @@ pub fn drawTooltipOverlay(ctx: *Context, text: []const u8, anchor: Rect) void {
     };
     const geo = layoutPopup(pos, 1, content_w, item_h, pad, ctx.screen_w, ctx.screen_h);
 
-    const dl = &ctx.draw_list;
+    const dl = ctx.postFrameDrawList();
     dl.pushClip(geo.outer) catch @panic("tooltip: OOM");
     defer dl.popClip();
     dl.rectFilled(geo.outer, style.surface.control) catch @panic("tooltip: OOM");
@@ -1202,7 +1202,7 @@ test "popupMenu: calling with a closed id is a no-op" {
     try std.testing.expect(!result.open);
     try std.testing.expectEqual(@as(?usize, null), result.selected);
     try std.testing.expect(!result.dismissed);
-    try std.testing.expectEqual(@as(usize, 0), ctx.draw_list.cmds.items.len);
+    try std.testing.expectEqual(@as(usize, 0), ctx.postFrameDrawList().cmds.items.len);
 }
 
 test "popupMenu: draws while open (background + border + text)" {
@@ -1212,11 +1212,11 @@ test "popupMenu: draws while open (background + border + text)" {
     ctx.endFrame();
 
     ctx.openPopup(1, .{ .x = 10, .y = 10 });
-    const before = ctx.draw_list.cmds.items.len;
+    const before = ctx.postFrameDrawList().cmds.items.len;
     const result = ctx.popupMenu(1, &items3);
     try std.testing.expect(result.open);
     // bg(1) + border(1) + text*3 = 5 commands added
-    try std.testing.expectEqual(before + 5, ctx.draw_list.cmds.items.len);
+    try std.testing.expectEqual(before + 5, ctx.postFrameDrawList().cmds.items.len);
 }
 
 test "popupMenu: click inside an item returns selected and closes the popup" {
@@ -1298,7 +1298,7 @@ test "popupMenu: opening near a screen edge still keeps the menu rect inside the
     ctx.openPopup(1, .{ .x = 95, .y = 95 });
     _ = ctx.popupMenu(1, &items3);
     // Confirm the drawn rect_filled (background) fits inside the screen
-    const bg = ctx.draw_list.cmds.items[ctx.draw_list.cmds.items.len - 5].rect_filled.rect;
+    const bg = ctx.postFrameDrawList().cmds.items[ctx.postFrameDrawList().cmds.items.len - 5].rect_filled.rect;
     try std.testing.expect(@as(i64, bg.x) + bg.w <= 100);
     try std.testing.expect(@as(i64, bg.y) + bg.h <= 100);
 }
@@ -1321,7 +1321,7 @@ test "popupMenu: opening a long item on 100x100 still keeps outer inside the vie
     try std.testing.expect(result.open);
 
     // Background rect (first rect_filled) inside [0,100)×[0,100)
-    const bg = ctx.draw_list.cmds.items[0].rect_filled.rect;
+    const bg = ctx.postFrameDrawList().cmds.items[0].rect_filled.rect;
     try std.testing.expectEqual(@as(u32, 100), bg.w);
     try std.testing.expect(@as(i64, bg.x) + bg.w <= 100);
     try std.testing.expect(@as(i64, bg.y) + bg.h <= 100);
@@ -1349,7 +1349,7 @@ test "popupMenu: a temporary label buffer is unaffected by later rewrites (arena
     buf[0] = 'X'; // Rewrite the caller buffer after popupMenu returns
 
     // The last text command is still the original "hello"
-    const last = ctx.draw_list.cmds.items[ctx.draw_list.cmds.items.len - 1];
+    const last = ctx.postFrameDrawList().cmds.items[ctx.postFrameDrawList().cmds.items.len - 1];
     try std.testing.expectEqualStrings("hello", last.text.text);
 }
 
@@ -1424,7 +1424,7 @@ test "Dialog: scrim absorbs outside input and focus stays within enabled actions
     try std.testing.expect(ctx.hasOpenDialog());
     try std.testing.expectEqual(PopupKind.dialog, ctx.popup_state.?.kind);
     var shadow_commands: usize = 0;
-    for (ctx.draw_list.cmds.items) |command| switch (command) {
+    for (ctx.postFrameDrawList().cmds.items) |command| switch (command) {
         .shadow => shadow_commands += 1,
         else => {},
     };
@@ -1531,7 +1531,7 @@ test "Dialog: action row stays inside the panel padding" {
     );
     var action_rects: [2]Rect = undefined;
     var action_count: usize = 0;
-    for (ctx.draw_list.cmds.items) |command| switch (command) {
+    for (ctx.postFrameDrawList().cmds.items) |command| switch (command) {
         .rect_filled => |filled| if (filled.radius == ctx.style.control_radius) {
             if (action_count < action_rects.len) action_rects[action_count] = filled.rect;
             action_count += 1;
@@ -1614,7 +1614,7 @@ test "popup text_y is ink-centered (item_h=20, ink=18 → +1)" {
     const expected_outer_h: u32 = @intCast(2 * item_h + 2 * pad);
     var saw_bg = false;
     var text_count: usize = 0;
-    for (ctx.draw_list.cmds.items) |cmd| switch (cmd) {
+    for (ctx.postFrameDrawList().cmds.items) |cmd| switch (cmd) {
         .rect_filled => |rf| {
             // First background is outer (h == expected_outer_h)
             if (!saw_bg and rf.rect.h == expected_outer_h) {
@@ -1659,7 +1659,7 @@ test "tooltip text_y uses the same item_h/ink centering as popup" {
     // layout: pos = (50, 50+20+4=74), outer.h = item_h + 2*pad
     const expected_outer_h: u32 = @intCast(item_h + 2 * pad);
     var saw_text = false;
-    for (ctx.draw_list.cmds.items) |cmd| switch (cmd) {
+    for (ctx.postFrameDrawList().cmds.items) |cmd| switch (cmd) {
         .rect_filled => |rf| {
             if (rf.rect.h == expected_outer_h) {
                 try std.testing.expectEqual(@as(i32, 50), rf.rect.x);
@@ -1691,12 +1691,12 @@ test "popupMenu: a checked item draws an extra rect_filled (the check mark) besi
         .{ .label = "Issues", .checked = false },
     };
     ctx.openPopup(1, .{ .x = 10, .y = 10 });
-    const before = ctx.draw_list.cmds.items.len;
+    const before = ctx.postFrameDrawList().cmds.items.len;
     const result = ctx.popupMenu(1, &items);
     try std.testing.expect(result.open);
     // bg(1) + border(1) + check-mark(1, only the checked row) + text*2 = 5 commands added
     // (one more rect_filled than the unchecked-only "draws while open" test above).
-    try std.testing.expectEqual(before + 5, ctx.draw_list.cmds.items.len);
+    try std.testing.expectEqual(before + 5, ctx.postFrameDrawList().cmds.items.len);
 }
 
 test "popupMenuEx: keep_open_on_select stays open and reports selected in the same call" {

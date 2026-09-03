@@ -112,7 +112,7 @@ fn runKind(io: std.Io, tracker: *peak_allocator.PeakTrackingAllocator, kind: Kin
     while (w < WARMUP) : (w += 1) {
         const now: f64 = if (kind == .showing) 1.0 else 0.0;
         hostUi(&ctx, &tip, kind, now, mouse_on);
-        gui.render(target, &ctx.draw_list, ctx.font, 1.0);
+        gui.render(target, ctx.postFrameDrawList(), ctx.font, 1.0);
     }
 
     var samples: [ITERS]u64 = undefined;
@@ -127,14 +127,14 @@ fn runKind(io: std.Io, tracker: *peak_allocator.PeakTrackingAllocator, kind: Kin
         const now: f64 = if (kind == .showing) 1.0 else 0.0;
         const start = std.Io.Clock.Timestamp.now(io, .awake);
         hostUi(&ctx, &tip, kind, now, mouse_on);
-        gui.render(target, &ctx.draw_list, ctx.font, 1.0);
+        gui.render(target, ctx.postFrameDrawList(), ctx.font, 1.0);
         const ns: u64 = @intCast(start.untilNow(io).raw.nanoseconds);
         samples[i] = ns;
         last_builder = ctx.tooltip_builder_calls;
         last_layout = ctx.tooltip_layout_calls;
         last_allocs = ctx.frame_arena_allocs;
         last_peak = ctx.frame_arena_peak;
-        last_cmds = ctx.draw_list.cmds.items.len;
+        last_cmds = ctx.postFrameDrawList().cmds.items.len;
         acc +%= pixels[i % pixels.len];
         acc +%= @truncate(last_cmds);
     }

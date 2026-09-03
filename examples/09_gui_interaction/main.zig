@@ -48,6 +48,7 @@ pub fn main(init: std.process.Init) !void {
         defer fb.unlock();
 
         ctx.beginFrame(fb.width, fb.height);
+        const draw_list = ctx.mainDrawList();
 
         // ── Event handling (pushEvent after beginFrame, before widgets) ──
         while (window.nextEvent()) |ev| {
@@ -71,7 +72,7 @@ pub fn main(init: std.process.Init) !void {
 
         const full_clip = gui.Rect{ .x = 0, .y = 0, .w = fb.width, .h = fb.height };
 
-        try ctx.draw_list.text(.{ .x = 50, .y = 24 }, help_text, gui.Color.rgba(0xAA, 0xAA, 0xAA, 0xFF));
+        try draw_list.text(.{ .x = 50, .y = 24 }, help_text, gui.Color.rgba(0xAA, 0xAA, 0xAA, 0xFF));
 
         // ── Buttons (direct buttonBehavior) ──
         for (buttons, 0..) |btn, i| {
@@ -86,22 +87,22 @@ pub fn main(init: std.process.Init) !void {
                 gui.Color.rgba(0x50, 0x50, 0x60, 0xFF)
             else
                 gui.Color.rgba(0x38, 0x38, 0x40, 0xFF);
-            try ctx.draw_list.rectFilled(btn.rect, fill);
+            try draw_list.rectFilled(btn.rect, fill);
 
             const border = if (ctx.state.hot_id == id)
                 gui.Color.rgba(0xFF, 0xD0, 0x40, 0xFF)
             else
                 gui.Color.rgba(0x80, 0x80, 0x90, 0xFF);
-            try ctx.draw_list.rectOutline(btn.rect, border, 2);
+            try draw_list.rectOutline(btn.rect, border, 2);
 
-            try ctx.draw_list.text(
+            try draw_list.text(
                 .{ .x = btn.rect.x + 12, .y = btn.rect.y + 14 },
                 btn.label,
                 gui.Color.rgba(0xFF, 0xFF, 0xFF, 0xFF),
             );
             // Format the click count on the arena (payload valid until next beginFrame)
             const txt = try std.fmt.allocPrint(ctx.allocator(), "clicks: {d}", .{click_counts[i]});
-            try ctx.draw_list.text(
+            try draw_list.text(
                 .{ .x = btn.rect.x + 12, .y = btn.rect.y + 36 },
                 txt,
                 gui.Color.rgba(0xB0, 0xB0, 0xB0, 0xFF),
@@ -139,9 +140,9 @@ pub fn main(init: std.process.Init) !void {
         ctx.endBox();
 
         // ── Canvas region ──
-        try ctx.draw_list.rectFilled(canvas_rect, gui.Color.rgba(0x18, 0x18, 0x1C, 0xFF));
-        try ctx.draw_list.rectOutline(canvas_rect, gui.Color.rgba(0x60, 0x60, 0x70, 0xFF), 1);
-        try ctx.draw_list.text(
+        try draw_list.rectFilled(canvas_rect, gui.Color.rgba(0x18, 0x18, 0x1C, 0xFF));
+        try draw_list.rectOutline(canvas_rect, gui.Color.rgba(0x60, 0x60, 0x70, 0xFF), 1);
+        try draw_list.text(
             .{ .x = canvas_rect.x + 10, .y = canvas_rect.y + 10 },
             "canvas (wantsMouse == false here)",
             gui.Color.rgba(0x70, 0x70, 0x80, 0xFF),
@@ -151,7 +152,7 @@ pub fn main(init: std.process.Init) !void {
         if (!ctx.wantsMouse()) {
             const mp = ctx.input.mouse_pos;
             if (canvas_rect.contains(mp)) {
-                try ctx.draw_list.rectFilled(
+                try draw_list.rectFilled(
                     .{ .x = mp.x - 2, .y = mp.y - 2, .w = 5, .h = 5 },
                     gui.Color.rgba(0xFF, 0x50, 0x50, 0xFF),
                 );
@@ -160,7 +161,7 @@ pub fn main(init: std.process.Init) !void {
 
         ctx.endFrame();
 
-        gui.render(target, &ctx.draw_list, ctx.font, 1.0);
+        gui.render(target, ctx.postFrameDrawList(), ctx.font, 1.0);
         window.present();
     }
 }

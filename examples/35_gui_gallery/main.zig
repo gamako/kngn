@@ -320,7 +320,7 @@ fn galleryDigest(ctx_ptr: *anyopaque, buf: []u8) []const u8 {
     var dialog_shadow: u32 = 0;
     var dialog_focus: u32 = 0;
     if (app.ctx.hasOpenDialog()) {
-        for (app.ctx.draw_list.cmds.items) |cmd| {
+        for (app.ctx.postFrameDrawList().cmds.items) |cmd| {
             if (cmd == .shadow) dialog_shadow += 1;
         }
         if (app.ctx.popup_state) |state| if (state.kind == .dialog) if (state.dialog) |dialog_state_data| {
@@ -874,7 +874,7 @@ pub fn main(init: std.process.Init) !void {
             app.dialog_result = "dismissed_escape";
         }
         const target: gui.RenderTarget = .{ .pixels = fb.pixels, .width = fb.width, .height = fb.height };
-        gui.render(target, &ctx.draw_list, ctx.font, 1.0);
+        gui.render(target, ctx.postFrameDrawList(), ctx.font, 1.0);
         window.present();
 
         // Follow this frame's settled focus onto the IME path (forward keyDown to IME only while a text field

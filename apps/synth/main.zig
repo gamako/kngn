@@ -484,7 +484,7 @@ fn appFrame(self: *App, window: *platform.Window) !bool {
     self.meter.draw(fb.pixels, fb.width, fb.height, METER_X0, VIS_Y0, METER_W, VIS_H);
     drawSpecLabels(fb, self.spec);
     const target: gui.RenderTarget = .{ .pixels = fb.pixels, .width = fb.width, .height = fb.height };
-    gui.render(target, &self.ctx.draw_list, self.ctx.font, 1.0);
+    gui.render(target, self.ctx.postFrameDrawList(), self.ctx.font, 1.0);
 
     window.present();
     // Pacing is owned by app_runtime (wasm is paced by rAF, so no pacing here).

@@ -1,7 +1,7 @@
 //! Soft cursor overlay drawing (tool glyph + brush footprint outline ring).
 //!
 //! Same "dumb drawer" style as bezier_overlay.zig / selection_overlay.zig: no App / ToolKind dependency;
-//! only writes into ctx.draw_list. Draw order in main is canvas blit → bezier_overlay/selection_overlay → here
+//! only writes into postFrameDrawList(). Draw order in main is canvas blit → bezier_overlay/selection_overlay → here
 //! (frontmost) → gui.render, so the tool glyph and outline ring always sit on top.
 //! Decoration around the OS hard cursor (default/crosshair) precision point, so a one-frame delay does not
 //! shift the precision point itself.
@@ -36,7 +36,7 @@ const BADGE_OFFSET_Y: i32 = 10;
 /// clip is the whole canvas area (the glyph follows the cursor even over letterbox margins; unlike
 /// drawRing, which is limited to the real canvas pixel rect).
 pub fn drawGlyph(ctx: *gui.Context, hover_screen: gui.Vec2, label: []const u8, bg: gui.Color, clip_area: gui.Rect) void {
-    const dl = &ctx.draw_list;
+    const dl = ctx.postFrameDrawList();
     dl.pushClip(clip_area) catch @panic("cursor_overlay: OOM");
     defer dl.popClip();
 
@@ -65,7 +65,7 @@ pub fn drawRing(
     color_a: gui.Color,
     color_b: gui.Color,
 ) void {
-    const dl = &ctx.draw_list;
+    const dl = ctx.postFrameDrawList();
     const disp: gui.Rect = .{
         .x = canvas_rect.x,
         .y = canvas_rect.y,

@@ -98,7 +98,7 @@ examples [`examples/47_screen_layout`](../examples/47_screen_layout) (assembling
 
 §5 and §6 of [`docs/app-authoring.md`](app-authoring.md) are the contract for building a
 screen and for the visual calls. What that document does not enumerate is **the rest of what
-`ctx.draw_list` holds**, so here is the index — the source is
+the Context draw-list accessors hold**, so here is the index — the source is
 [`libs/gui/src/draw.zig`](../libs/gui/src/draw.zig):
 
 - rectangles: `rectFilled`, `rectOutline`, and the `…Ex` forms taking a corner radius

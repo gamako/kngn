@@ -3635,11 +3635,11 @@ fn canvasSnapshot(ctx: *anyopaque, allocator: std.mem.Allocator) anyerror![]u8 {
 /// drawlist digest/snapshot: the current frame's DrawList (see libs/gui/src/drawlist_probe.zig).
 fn drawlistDigest(ctx: *anyopaque, buf: []u8) []const u8 {
     const app: *App = @ptrCast(@alignCast(ctx));
-    return gui.drawlistDigest(&app.ctx.draw_list, buf);
+    return gui.drawlistDigest(app.ctx.postFrameDrawList(), buf);
 }
 fn drawlistSnapshot(ctx: *anyopaque, allocator: std.mem.Allocator) anyerror![]u8 {
     const app: *App = @ptrCast(@alignCast(ctx));
-    return gui.drawlistDumpAlloc(allocator, &app.ctx.draw_list);
+    return gui.drawlistDumpAlloc(allocator, app.ctx.postFrameDrawList());
 }
 
 /// undo digest/snapshot: undo/redo stack depths (one JSON line). undo reduces depth.
@@ -5482,7 +5482,7 @@ fn drawPresenceOverlay(app: *App, canvas_rect_opt: ?core.Rect) void {
         .w = @intCast(zoom.displayExtent(@intCast(canvas_rect.w))),
         .h = @intCast(zoom.displayExtent(@intCast(canvas_rect.h))),
     };
-    const dl = &app.ctx.draw_list;
+    const dl = app.ctx.postFrameDrawList();
     dl.pushClip(disp.intersect(clip_area)) catch return;
     defer dl.popClip();
 
@@ -6998,7 +6998,7 @@ fn loadProjectPath(app: *App, path: []const u8) !void {
 
 /// Draw status-bar zoom%/cursor directly with post-updateViewport values.
 /// Call after endFrame and after canvas_rect recompute. getNodeRect sees the latest layout (endFrame done).
-/// draw_list.text does not own the string, so dupe the payload into the frame arena
+/// DrawList.text does not own the string, so dupe the payload into the frame arena
 /// (valid until the next beginFrame arena.reset; same contract as labelEx).
 fn drawStatusBarLive(ctx: *gui.Context, app: *const App, canvas_rect: ?core.Rect) !void {
     const col = ctx.style.text_subtle;
@@ -7018,40 +7018,44 @@ fn drawStatusBarLive(ctx: *gui.Context, app: *const App, canvas_rect: ?core.Rect
             break :blk "cursor: -";
         };
         const txt = try arena.dupe(u8, raw);
-        try ctx.draw_list.rectFilled(r, STATUS_BAR_BG);
-        try ctx.draw_list.text(.{ .x = r.x, .y = r.y }, txt, col);
+        const dl = ctx.postFrameDrawList();
+        try dl.rectFilled(r, STATUS_BAR_BG);
+        try dl.text(.{ .x = r.x, .y = r.y }, txt, col);
     }
     if (ctx.getNodeRect(STATUS_ZOOM_ID)) |r| {
         var buf: [32]u8 = undefined;
         const raw = std.fmt.bufPrint(&buf, "zoom: {d}%", .{app.view_zoom.pct()}) catch "zoom: ?%";
         const txt = try arena.dupe(u8, raw);
-        try ctx.draw_list.rectFilled(r, STATUS_BAR_BG);
-        try ctx.draw_list.text(.{ .x = r.x, .y = r.y }, txt, col);
+        const dl = ctx.postFrameDrawList();
+        try dl.rectFilled(r, STATUS_BAR_BG);
+        try dl.text(.{ .x = r.x, .y = r.y }, txt, col);
     }
 }
 
 fn drawAppshellOverlay(ctx: *gui.Context, app: *const App) !void {
     if (app.recovery != null) {
-        try ctx.draw_list.rectFilled(.{ .x = 75, .y = 420, .w = 460, .h = 120 }, gui.Color.rgba(0x20, 0x24, 0x30, 0xF8));
-        try ctx.draw_list.rectOutline(.{ .x = 75, .y = 420, .w = 460, .h = 120 }, gui.Color.rgba(0xFF, 0xD0, 0x80, 0xFF), 2);
-        try ctx.draw_list.text(.{ .x = 100, .y = 438 }, "Recover autosaved changes?", gui.Color.rgba(0xFF, 0xFF, 0xFF, 0xFF));
-        try ctx.draw_list.rectFilled(.{ .x = 100, .y = 480, .w = 110, .h = 30 }, gui.Color.rgba(0x40, 0x80, 0xC0, 0xFF));
-        try ctx.draw_list.rectFilled(.{ .x = 245, .y = 480, .w = 110, .h = 30 }, gui.Color.rgba(0x80, 0x60, 0x40, 0xFF));
-        try ctx.draw_list.text(.{ .x = 120, .y = 489 }, "Recover", gui.Color.rgba(0xFF, 0xFF, 0xFF, 0xFF));
-        try ctx.draw_list.text(.{ .x = 262, .y = 489 }, "Discard", gui.Color.rgba(0xFF, 0xFF, 0xFF, 0xFF));
+        const dl = ctx.postFrameDrawList();
+        try dl.rectFilled(.{ .x = 75, .y = 420, .w = 460, .h = 120 }, gui.Color.rgba(0x20, 0x24, 0x30, 0xF8));
+        try dl.rectOutline(.{ .x = 75, .y = 420, .w = 460, .h = 120 }, gui.Color.rgba(0xFF, 0xD0, 0x80, 0xFF), 2);
+        try dl.text(.{ .x = 100, .y = 438 }, "Recover autosaved changes?", gui.Color.rgba(0xFF, 0xFF, 0xFF, 0xFF));
+        try dl.rectFilled(.{ .x = 100, .y = 480, .w = 110, .h = 30 }, gui.Color.rgba(0x40, 0x80, 0xC0, 0xFF));
+        try dl.rectFilled(.{ .x = 245, .y = 480, .w = 110, .h = 30 }, gui.Color.rgba(0x80, 0x60, 0x40, 0xFF));
+        try dl.text(.{ .x = 120, .y = 489 }, "Recover", gui.Color.rgba(0xFF, 0xFF, 0xFF, 0xFF));
+        try dl.text(.{ .x = 262, .y = 489 }, "Discard", gui.Color.rgba(0xFF, 0xFF, 0xFF, 0xFF));
         return;
     }
     if (app.host.confirmation() != .none) {
-        try ctx.draw_list.rectFilled(.{ .x = 75, .y = 420, .w = 460, .h = 120 }, gui.Color.rgba(0x20, 0x24, 0x30, 0xF8));
-        try ctx.draw_list.rectOutline(.{ .x = 75, .y = 420, .w = 460, .h = 120 }, gui.Color.rgba(0xFF, 0xD0, 0x80, 0xFF), 2);
-        try ctx.draw_list.text(.{ .x = 100, .y = 438 }, "Unsaved changes", gui.Color.rgba(0xFF, 0xFF, 0xFF, 0xFF));
-        try ctx.draw_list.text(.{ .x = 100, .y = 458 }, "Save before continuing?", gui.Color.rgba(0xC0, 0xC8, 0xD8, 0xFF));
-        try ctx.draw_list.rectFilled(.{ .x = 100, .y = 480, .w = 110, .h = 30 }, gui.Color.rgba(0x40, 0x80, 0xC0, 0xFF));
-        try ctx.draw_list.rectFilled(.{ .x = 245, .y = 480, .w = 110, .h = 30 }, gui.Color.rgba(0x80, 0x60, 0x40, 0xFF));
-        try ctx.draw_list.rectFilled(.{ .x = 390, .y = 480, .w = 110, .h = 30 }, gui.Color.rgba(0x50, 0x58, 0x68, 0xFF));
-        try ctx.draw_list.text(.{ .x = 120, .y = 489 }, "Save", gui.Color.rgba(0xFF, 0xFF, 0xFF, 0xFF));
-        try ctx.draw_list.text(.{ .x = 262, .y = 489 }, "Discard", gui.Color.rgba(0xFF, 0xFF, 0xFF, 0xFF));
-        try ctx.draw_list.text(.{ .x = 410, .y = 489 }, "Cancel", gui.Color.rgba(0xFF, 0xFF, 0xFF, 0xFF));
+        const dl = ctx.postFrameDrawList();
+        try dl.rectFilled(.{ .x = 75, .y = 420, .w = 460, .h = 120 }, gui.Color.rgba(0x20, 0x24, 0x30, 0xF8));
+        try dl.rectOutline(.{ .x = 75, .y = 420, .w = 460, .h = 120 }, gui.Color.rgba(0xFF, 0xD0, 0x80, 0xFF), 2);
+        try dl.text(.{ .x = 100, .y = 438 }, "Unsaved changes", gui.Color.rgba(0xFF, 0xFF, 0xFF, 0xFF));
+        try dl.text(.{ .x = 100, .y = 458 }, "Save before continuing?", gui.Color.rgba(0xC0, 0xC8, 0xD8, 0xFF));
+        try dl.rectFilled(.{ .x = 100, .y = 480, .w = 110, .h = 30 }, gui.Color.rgba(0x40, 0x80, 0xC0, 0xFF));
+        try dl.rectFilled(.{ .x = 245, .y = 480, .w = 110, .h = 30 }, gui.Color.rgba(0x80, 0x60, 0x40, 0xFF));
+        try dl.rectFilled(.{ .x = 390, .y = 480, .w = 110, .h = 30 }, gui.Color.rgba(0x50, 0x58, 0x68, 0xFF));
+        try dl.text(.{ .x = 120, .y = 489 }, "Save", gui.Color.rgba(0xFF, 0xFF, 0xFF, 0xFF));
+        try dl.text(.{ .x = 262, .y = 489 }, "Discard", gui.Color.rgba(0xFF, 0xFF, 0xFF, 0xFF));
+        try dl.text(.{ .x = 410, .y = 489 }, "Cancel", gui.Color.rgba(0xFF, 0xFF, 0xFF, 0xFF));
     }
 }
 
@@ -7802,7 +7806,7 @@ fn appFrameInner(self: *App, win: *platform.Window) !void {
         Prof.mark(.canvas_blit);
         // Pixel grid overlays — fine (1px, zoom>=4x only) and coarse (user-chosen spacing, any
         // zoom) — are independent toggles sharing one clip_area/minimap_rect computation (view-only;
-        // draw_list-based, so they paint on top of the raw-pixel canvas/minimap regardless of call
+        // DrawList-based, so they paint on top of the raw-pixel canvas/minimap regardless of call
         // order relative to those, same as every other overlay below). The minimap sits inside this
         // same clip_area, so its rect is carved out of both grids' lines (see grid_overlay.zig's doc
         // comment) rather than relying on draw order to keep it clear.
@@ -7819,7 +7823,7 @@ fn appFrameInner(self: *App, win: *platform.Window) !void {
         }
         // presence overlay (right after canvas blit; below bezier/selection)
         drawPresenceOverlay(self, canvas_rect);
-        // Bezier edit handles/anchors into draw_list (above preview; burned by gui.render; clip to area)
+        // Bezier edit handles/anchors into the DrawList (above preview; burned by gui.render; clip to area)
         if (self.active_kind == .bezier) {
             if (canvas_rect) |rect| if (self.last_area) |area| {
                 const clip_area: gui.Rect = .{ .x = area.x, .y = area.y, .w = @intCast(area.w), .h = @intCast(area.h) };
@@ -7936,7 +7940,7 @@ fn appFrameInner(self: *App, win: *platform.Window) !void {
         // GUI DrawList stays in logical coords. Inject scale at the render exit.
         gui.render(
             .{ .pixels = fb.pixels, .width = phys_w, .height = phys_h },
-            &self.ctx.draw_list,
+            self.ctx.postFrameDrawList(),
             self.ctx.font,
             content_scale,
         );

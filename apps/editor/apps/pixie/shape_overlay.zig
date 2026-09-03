@@ -1,6 +1,6 @@
 //! Outline preview while dragging a shape.
 //!
-//! Same shape as selection_overlay / bezier_overlay: draw into draw_list after canvas blit, before gui.render.
+//! Same shape as selection_overlay / bezier_overlay: draw into postFrameDrawList() after canvas blit, before gui.render.
 //! Coords: canvas-logical → window (rect + p*zoom). clip = canvas display rect ∩ area.
 //! Draws outline pixels only (even for a fill preview, outline; fill is applied on commit).
 
@@ -21,7 +21,7 @@ pub fn draw(
     clip_area: gui.Rect,
 ) void {
     const prev = si.previewPoints() orelse return;
-    const dl = &ctx.draw_list;
+    const dl = ctx.postFrameDrawList();
     const disp: gui.Rect = .{
         .x = canvas_rect.x,
         .y = canvas_rect.y,

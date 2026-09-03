@@ -2,7 +2,7 @@
 //! (`draw`, only above 4x zoom) and a *coarse* grid at a user-chosen canvas-pixel spacing (`drawCoarse`,
 //! shown at any zoom, for spotting tile/sprite boundaries at normal magnification).
 //!
-//! Like `bezier_overlay.zig` / `selection_overlay.zig`, both draw into `ctx.draw_list` (called
+//! Like `bezier_overlay.zig` / `selection_overlay.zig`, both draw into `postFrameDrawList()` (called
 //! after the canvas blit, before `gui.render`), clipped to the intersection of the canvas display
 //! rect and the canvas area (cannot invade the right pane/menu). The minimap overlay sits *inside*
 //! that same canvas area (bottom-right corner), so a grid line clipped only to the canvas area
@@ -71,7 +71,7 @@ pub fn draw(ctx: *gui.Context, canvas_rect: core.Rect, zoom: Zoom, clip_area: gu
         break :blk if (inter.isEmpty()) null else inter;
     };
 
-    const dl = &ctx.draw_list;
+    const dl = ctx.postFrameDrawList();
     dl.pushClip(clip) catch @panic("grid_overlay: OOM");
     defer dl.popClip();
 
@@ -125,7 +125,7 @@ pub fn drawCoarse(ctx: *gui.Context, canvas_rect: core.Rect, zoom: Zoom, clip_ar
         break :blk if (inter.isEmpty()) null else inter;
     };
 
-    const dl = &ctx.draw_list;
+    const dl = ctx.postFrameDrawList();
     dl.pushClip(clip) catch @panic("grid_overlay: OOM");
     defer dl.popClip();
 

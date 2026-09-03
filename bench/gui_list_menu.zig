@@ -95,7 +95,7 @@ fn runCase(io: std.Io, parent: std.mem.Allocator, case: Case) !void {
         ctx.beginFrame(W, H);
         ui.buildUi(&app);
         ctx.endFrame();
-        gui.render(target, &ctx.draw_list, ctx.font, 1.0);
+        gui.render(target, ctx.postFrameDrawList(), ctx.font, 1.0);
     }
 
     counter.allocs = 0;
@@ -109,11 +109,11 @@ fn runCase(io: std.Io, parent: std.mem.Allocator, case: Case) !void {
         ctx.beginFrame(W, H);
         ui.buildUi(&app);
         ctx.endFrame();
-        gui.render(target, &ctx.draw_list, ctx.font, 1.0);
+        gui.render(target, ctx.postFrameDrawList(), ctx.font, 1.0);
         const ns: u64 = @intCast(start.untilNow(io).raw.nanoseconds);
         samples[i] = ns;
         acc +%= pixels[i % pixels.len];
-        acc +%= @truncate(ctx.draw_list.cmds.items.len);
+        acc +%= @truncate(ctx.postFrameDrawList().cmds.items.len);
     }
     std.mem.doNotOptimizeAway(acc);
 

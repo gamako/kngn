@@ -104,6 +104,12 @@ const Case = enum {
     display_only_button_behavior,
     tooltip_builder_unclosed_box,
     tooltip_builder_id_stack,
+    /// A marker subtree may not access either frame draw-list accessor.
+    marker_main_draw_list,
+    marker_post_frame_draw_list,
+    /// A tooltip subtree may not access either frame draw-list accessor.
+    tooltip_main_draw_list,
+    tooltip_post_frame_draw_list,
 };
 
 fn runDisplayOnly(ctx: *gui.Context, build_fn: gui.TooltipBuildFn) void {
@@ -118,6 +124,22 @@ fn runDisplayOnly(ctx: *gui.Context, build_fn: gui.TooltipBuildFn) void {
     var dummy: u8 = 0;
     ctx.tooltipBox(build_fn, &dummy);
     ctx.endFrame();
+}
+
+fn runMarkerMainDrawList(ctx: *gui.Context) void {
+    ctx.beginFrame(320, 240);
+    ctx.beginBox(.{
+        .layer = .{ .key = .{ .value = 1 }, .placement = .{ .source = .{ .point = .{ .x = 0, .y = 0 } } } },
+    });
+    _ = ctx.mainDrawList();
+}
+
+fn runMarkerPostFrameDrawList(ctx: *gui.Context) void {
+    ctx.beginFrame(320, 240);
+    ctx.beginBox(.{
+        .layer = .{ .key = .{ .value = 1 }, .placement = .{ .source = .{ .point = .{ .x = 0, .y = 0 } } } },
+    });
+    _ = ctx.postFrameDrawList();
 }
 
 pub fn main(init: std.process.Init) !void {
@@ -491,6 +513,18 @@ pub fn main(init: std.process.Init) !void {
         .tooltip_builder_id_stack => runDisplayOnly(&ctx, struct {
             fn build(_: *anyopaque, c: *gui.Context) void {
                 c.id_stack.push("x");
+            }
+        }.build),
+        .marker_main_draw_list => runMarkerMainDrawList(&ctx),
+        .marker_post_frame_draw_list => runMarkerPostFrameDrawList(&ctx),
+        .tooltip_main_draw_list => runDisplayOnly(&ctx, struct {
+            fn build(_: *anyopaque, c: *gui.Context) void {
+                _ = c.mainDrawList();
+            }
+        }.build),
+        .tooltip_post_frame_draw_list => runDisplayOnly(&ctx, struct {
+            fn build(_: *anyopaque, c: *gui.Context) void {
+                _ = c.postFrameDrawList();
             }
         }.build),
     }

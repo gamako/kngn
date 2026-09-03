@@ -29,7 +29,7 @@ Immediate-mode GUI library for KNGN. Standalone and platform-independent;
 ctx.beginFrame(logical_w, logical_h); // logical size, not the physical framebuffer
 // pushEvent → widgets (sync hit-test against previous-frame rects) → beginBox/label/endBox builds the tree
 ctx.endFrame(); // finalize layout + emit draw cmds + update rect cache
-gui.render(target, &ctx.draw_list, ctx.font, scale);
+gui.render(target, ctx.postFrameDrawList(), ctx.font, scale);
 ```
 
 The size passed to `beginFrame` is the **logical** size. Under a physical framebuffer it differs
@@ -351,8 +351,8 @@ ctx.custom(.{ .x = 120, .y = 12 }, Meter.draw, meter);
   are built (`src/widgets.zig`, with `SwatchDraw` / `IconButtonDraw` as the leaves) — read those
   two for a working custom-drawn widget.
 
-**Draw order.** Layout draw commands are appended to `draw_list` *after* anything the caller
-pushed onto it directly during the frame, so the interface draws over a hand-drawn background. A
+**Draw order.** Layout draw commands are appended to the list *after* anything the caller
+pushed through `mainDrawList()` during the frame, so the interface draws over a hand-drawn background. A
 custom leaf sits where the layout puts it, inside its parent's emit order of background →
 children → border: the parent's background is under it and the parent's border is drawn over it.
 An ancestor's clip applies where that ancestor sets `clip_children = true`.

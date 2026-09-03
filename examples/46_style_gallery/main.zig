@@ -339,7 +339,7 @@ fn renderFrame(ctx: *gui.Context, app: *App) void {
 
 /// Appends a fixed rounded-primitive scene once per frame.
 fn appendRounded(app: *App) !void {
-    const draw_list = &app.ctx.draw_list;
+    const draw_list = app.ctx.postFrameDrawList();
     app.fill_count = 0;
     app.stroke_count = 0;
     app.aa_on_count = 0;
@@ -400,7 +400,7 @@ fn appendRounded(app: *App) !void {
 
 /// Appends a fixed scene covering the supported rectangle paint variants.
 fn appendGradients(app: *App) !void {
-    const draw_list = &app.ctx.draw_list;
+    const draw_list = app.ctx.postFrameDrawList();
     app.fill_count = 0;
     app.stroke_count = 0;
     app.aa_on_count = 0;
@@ -447,7 +447,7 @@ fn appendGradients(app: *App) !void {
 }
 
 fn appendShadows(app: *App) !void {
-    const draw_list = &app.ctx.draw_list;
+    const draw_list = app.ctx.postFrameDrawList();
     app.fill_count = 0;
     app.stroke_count = 0;
     app.aa_on_count = 0;
@@ -487,7 +487,7 @@ fn appendShadows(app: *App) !void {
 /// Appends the fixed path scene once per frame; all shapes are inside the framebuffer.
 fn appendPaths(app: *App, arena: *std.heap.ArenaAllocator) !void {
     const ctx = app.ctx;
-    const draw_list = &ctx.draw_list;
+    const draw_list = ctx.postFrameDrawList();
     app.fill_count = 0;
     app.stroke_count = 0;
     app.aa_on_count = 0;
@@ -605,7 +605,7 @@ pub fn main(init: std.process.Init) !void {
 
     var app: App = .{ .ctx = &ctx, .text = &text };
     platform.registerProbe(.{ .name = "showcase", .ctx = &app, .ext = "txt", .digest = showcaseDigest, .desc = "style showcase section and widget state" });
-    platform.registerProbe(.{ .name = "drawlist", .ctx = &ctx.draw_list, .ext = "txt", .digest = drawlistDigest, .snapshot = drawlistDumpAlloc, .desc = "style showcase DrawList command digest and structure dump" });
+    platform.registerProbe(.{ .name = "drawlist", .ctx = ctx.postFrameDrawList(), .ext = "txt", .digest = drawlistDigest, .snapshot = drawlistDumpAlloc, .desc = "style showcase DrawList command digest and structure dump" });
     platform.registerProbe(.{ .name = Prof.probe_name, .ctx = &app, .ext = "txt", .digest = Prof.probeDigest, .desc = "frame section timing for the style showcase" });
     platform.registerAction(.{ .name = Prof.reset_action_name, .ctx = &app, .run = Prof.resetAction, .network_policy = .local_only, .desc = "reset style showcase frame timing" });
 
@@ -657,7 +657,7 @@ pub fn main(init: std.process.Init) !void {
         Prof.mark(.paths);
 
         const target: gui.RenderTarget = .{ .pixels = fb.pixels, .width = fb.width, .height = fb.height };
-        gui.render(target, &ctx.draw_list, ctx.font, 1.0);
+        gui.render(target, ctx.postFrameDrawList(), ctx.font, 1.0);
         Prof.mark(.gui_render);
         window.setTextInputActive(ctx.wantsTextInput());
         window.present();

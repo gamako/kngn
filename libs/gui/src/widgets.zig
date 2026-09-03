@@ -1904,7 +1904,7 @@ const CollapsibleGlyph = struct {
     open: bool,
     fg: Color,
 
-    fn draw(ctx_ptr: *anyopaque, _: *DrawList, rect: Rect) void {
+    fn draw(ctx_ptr: *anyopaque, dl: *DrawList, rect: Rect) void {
         const self: *const CollapsibleGlyph = @ptrCast(@alignCast(ctx_ptr));
         const w: i32 = @intCast(rect.w);
         const h: i32 = @intCast(rect.h);
@@ -1921,7 +1921,7 @@ const CollapsibleGlyph = struct {
         const fy = @as(f32, @floatFromInt(oy));
         const fw = @as(f32, @floatFromInt(iw));
         const fh = @as(f32, @floatFromInt(ih));
-        var path = self.ctx.beginPath();
+        var path = dl.beginPath(self.ctx.allocator());
         if (self.open) {
             // Pointing down: wide top edge, tapering downward.
             path.moveTo(.{ .x = fx, .y = fy }) catch @panic("collapsible: Invalid path");
@@ -2907,8 +2907,8 @@ fn center(rect: Rect) struct { x: i32, y: i32 } {
 /// Every solid-filled rectangle in the frame. `emitNode` emits bg → children → border, so a
 /// fixed command index moves as soon as a box in the fixture gains a background; asserting on
 /// the set instead also catches an implementation that paints one rectangle too many.
-fn solidFills(ctx: *const Context, out: *std.ArrayList(Rect), colors: *std.ArrayList(Color)) !void {
-    for (ctx.draw_list.cmds.items) |cmd| {
+fn solidFills(ctx: *Context, out: *std.ArrayList(Rect), colors: *std.ArrayList(Color)) !void {
+    for (ctx.postFrameDrawList().cmds.items) |cmd| {
         switch (cmd) {
             .rect_filled => |r| switch (r.paint) {
                 .solid => |c| {
@@ -3261,9 +3261,9 @@ test "separator: the parent's own min on the cross axis establishes it" {
 }
 
 fn expectButtonDrawColors(ctx: *Context, background: Color, border: Color, text: Color) !void {
-    try std.testing.expectEqual(background, ctx.draw_list.cmds.items[0].rect_filled.paint.solid);
-    try std.testing.expectEqual(text, ctx.draw_list.cmds.items[1].text.color);
-    try std.testing.expectEqual(border, ctx.draw_list.cmds.items[2].rect_outline.color);
+    try std.testing.expectEqual(background, ctx.postFrameDrawList().cmds.items[0].rect_filled.paint.solid);
+    try std.testing.expectEqual(text, ctx.postFrameDrawList().cmds.items[1].text.color);
+    try std.testing.expectEqual(border, ctx.postFrameDrawList().cmds.items[2].rect_outline.color);
 }
 
 test "button style override: draw commands cover the full state matrix" {
@@ -3586,7 +3586,7 @@ test "colorSwatch: selected thick border is distinguishable in pixels" {
     var pixels: [100 * 30]u32 = undefined;
     @memset(&pixels, 0xFF000000);
     const target: geom.RenderTarget = .{ .pixels = &pixels, .width = 100, .height = 30 };
-    render_mod.render(target, &ctx.draw_list, ctx.font, 1.0);
+    render_mod.render(target, ctx.postFrameDrawList(), ctx.font, 1.0);
 
     const sel = ctx.getNodeRect(1).?;
     const unsel = ctx.getNodeRect(2).?;
@@ -3618,7 +3618,7 @@ test "button: selected thick border and accent fill are distinguishable in pixel
     var pixels: [200 * 40]u32 = undefined;
     @memset(&pixels, 0xFF000000);
     const target: geom.RenderTarget = .{ .pixels = &pixels, .width = 200, .height = 40 };
-    render_mod.render(target, &ctx.draw_list, ctx.font, 1.0);
+    render_mod.render(target, ctx.postFrameDrawList(), ctx.font, 1.0);
 
     const sel = ctx.getNodeRect(ctx.id_stack.make("Pen")).?;
     const unsel = ctx.getNodeRect(ctx.id_stack.make("Eraser")).?;
@@ -3695,14 +3695,14 @@ test "button: held frame paints bg_active; hover frame paints bg_hover" {
     moveTo(&ctx, c.x, c.y);
     _ = ctx.button("Btn");
     ctx.endFrame();
-    try std.testing.expectEqual(@as(u32, @bitCast(ctx.style.bg)), @as(u32, @bitCast(ctx.draw_list.cmds.items[0].rect_filled.paint.solid)));
+    try std.testing.expectEqual(@as(u32, @bitCast(ctx.style.bg)), @as(u32, @bitCast(ctx.postFrameDrawList().cmds.items[0].rect_filled.paint.solid)));
 
     // Frame 3: hover continues (hot_id promoted) → bg_hover
     ctx.beginFrame(800, 600);
     moveTo(&ctx, c.x, c.y);
     _ = ctx.button("Btn");
     ctx.endFrame();
-    try std.testing.expectEqual(@as(u32, @bitCast(ctx.style.bg_hover)), @as(u32, @bitCast(ctx.draw_list.cmds.items[0].rect_filled.paint.solid)));
+    try std.testing.expectEqual(@as(u32, @bitCast(ctx.style.bg_hover)), @as(u32, @bitCast(ctx.postFrameDrawList().cmds.items[0].rect_filled.paint.solid)));
 
     // Frame 4: press → held → bg_active
     ctx.beginFrame(800, 600);
@@ -3710,7 +3710,7 @@ test "button: held frame paints bg_active; hover frame paints bg_hover" {
     const res = ctx.button("Btn");
     ctx.endFrame();
     try std.testing.expect(!res);
-    try std.testing.expectEqual(@as(u32, @bitCast(ctx.style.bg_active)), @as(u32, @bitCast(ctx.draw_list.cmds.items[0].rect_filled.paint.solid)));
+    try std.testing.expectEqual(@as(u32, @bitCast(ctx.style.bg_active)), @as(u32, @bitCast(ctx.postFrameDrawList().cmds.items[0].rect_filled.paint.solid)));
 }
 
 // ── iconButton tests ──────────────────────────
@@ -3761,7 +3761,7 @@ test "iconButton: selected vs non-selected border/bg distinguishable in pixels" 
     var pixels: [200 * 40]u32 = undefined;
     @memset(&pixels, 0xFF000000);
     const target: geom.RenderTarget = .{ .pixels = &pixels, .width = 200, .height = 40 };
-    render_mod.render(target, &ctx.draw_list, ctx.font, 1.0);
+    render_mod.render(target, ctx.postFrameDrawList(), ctx.font, 1.0);
 
     const sel = ctx.getNodeRect(1).?;
     const unsel = ctx.getNodeRect(2).?;
@@ -3794,14 +3794,14 @@ test "iconButton: hot uses bg_hover; held uses bg_active" {
     moveTo(&ctx, c.x, c.y);
     _ = ctx.iconButtonId(0x1452, &test_icon_center, false);
     ctx.endFrame();
-    try std.testing.expectEqual(@as(u32, @bitCast(ctx.style.bg)), @as(u32, @bitCast(ctx.draw_list.cmds.items[0].rect_filled.paint.solid)));
+    try std.testing.expectEqual(@as(u32, @bitCast(ctx.style.bg)), @as(u32, @bitCast(ctx.postFrameDrawList().cmds.items[0].rect_filled.paint.solid)));
 
     // Hover continues → bg_hover
     ctx.beginFrame(800, 600);
     moveTo(&ctx, c.x, c.y);
     _ = ctx.iconButtonId(0x1452, &test_icon_center, false);
     ctx.endFrame();
-    try std.testing.expectEqual(@as(u32, @bitCast(ctx.style.bg_hover)), @as(u32, @bitCast(ctx.draw_list.cmds.items[0].rect_filled.paint.solid)));
+    try std.testing.expectEqual(@as(u32, @bitCast(ctx.style.bg_hover)), @as(u32, @bitCast(ctx.postFrameDrawList().cmds.items[0].rect_filled.paint.solid)));
 
     // press → held → bg_active
     ctx.beginFrame(800, 600);
@@ -3810,7 +3810,7 @@ test "iconButton: hot uses bg_hover; held uses bg_active" {
     ctx.endFrame();
     try std.testing.expect(res.held);
     try std.testing.expect(!res.clicked);
-    try std.testing.expectEqual(@as(u32, @bitCast(ctx.style.bg_active)), @as(u32, @bitCast(ctx.draw_list.cmds.items[0].rect_filled.paint.solid)));
+    try std.testing.expectEqual(@as(u32, @bitCast(ctx.style.bg_active)), @as(u32, @bitCast(ctx.postFrameDrawList().cmds.items[0].rect_filled.paint.solid)));
 }
 
 test "iconButton: mouse down-up yields clicked" {
@@ -3839,7 +3839,7 @@ test "iconButton: set bits are foreground; clear bits stay background" {
     var pixels: [80 * 40]u32 = undefined;
     @memset(&pixels, 0xFF000000);
     const target: geom.RenderTarget = .{ .pixels = &pixels, .width = 80, .height = 40 };
-    render_mod.render(target, &ctx.draw_list, ctx.font, 1.0);
+    render_mod.render(target, ctx.postFrameDrawList(), ctx.font, 1.0);
 
     const r = ctx.getNodeRect(1).?;
     const pad = ctx.style.spacing.control_padding;
@@ -4074,7 +4074,7 @@ test "collapsible: dynamic title updates every frame" {
     ctx.endFrame();
     // label is a text cmd; includes TitleA
     var found_a = false;
-    for (ctx.draw_list.cmds.items) |cmd| {
+    for (ctx.postFrameDrawList().cmds.items) |cmd| {
         if (cmd == .text and std.mem.eql(u8, cmd.text.text, "TitleA")) found_a = true;
     }
     try std.testing.expect(found_a);
@@ -4086,7 +4086,7 @@ test "collapsible: dynamic title updates every frame" {
     ctx.endFrame();
     var found_b = false;
     var found_a2 = false;
-    for (ctx.draw_list.cmds.items) |cmd| {
+    for (ctx.postFrameDrawList().cmds.items) |cmd| {
         if (cmd == .text and std.mem.eql(u8, cmd.text.text, "TitleB")) found_b = true;
         if (cmd == .text and std.mem.eql(u8, cmd.text.text, "TitleA")) found_a2 = true;
     }
@@ -4146,7 +4146,7 @@ test "collapsible: glyph right/down shapes are distinguishable in pixels" {
     var pixels: [200 * 40]u32 = undefined;
     @memset(&pixels, 0xFF000000);
     const target: geom.RenderTarget = .{ .pixels = &pixels, .width = 200, .height = 40 };
-    render_mod.render(target, &ctx.draw_list, ctx.font, 1.0);
+    render_mod.render(target, ctx.postFrameDrawList(), ctx.font, 1.0);
 
     const ra = ctx.getNodeRect(1).?;
     const rb = ctx.getNodeRect(2).?;
@@ -4180,9 +4180,9 @@ test "colorSwatch: opaque emits bg+border only; semi-transparent emits checker+b
     ctx.beginFrame(800, 600);
     _ = ctx.colorSwatchId(1, .{ .color = Color.rgba(0xFF, 0x00, 0x00, 0xFF) });
     ctx.endFrame();
-    try std.testing.expectEqual(@as(usize, 2), ctx.draw_list.cmds.items.len);
-    try std.testing.expect(ctx.draw_list.cmds.items[0] == .rect_filled);
-    try std.testing.expect(ctx.draw_list.cmds.items[1] == .rect_outline);
+    try std.testing.expectEqual(@as(usize, 2), ctx.postFrameDrawList().cmds.items.len);
+    try std.testing.expect(ctx.postFrameDrawList().cmds.items[0] == .rect_filled);
+    try std.testing.expect(ctx.postFrameDrawList().cmds.items[1] == .rect_outline);
 
     // semi-transparent: checker (18px / 4px cell = 5×5) + blend fill + border = 27 cmds.
     // Last rect_filled is the semi-transparent color itself (blend happens at render)
@@ -4190,7 +4190,7 @@ test "colorSwatch: opaque emits bg+border only; semi-transparent emits checker+b
     ctx.beginFrame(800, 600);
     _ = ctx.colorSwatchId(1, .{ .color = translucent });
     ctx.endFrame();
-    const cmds = ctx.draw_list.cmds.items;
+    const cmds = ctx.postFrameDrawList().cmds.items;
     try std.testing.expectEqual(@as(usize, 27), cmds.len);
     try std.testing.expect(cmds[cmds.len - 1] == .rect_outline);
     try std.testing.expectEqual(
@@ -4680,7 +4680,7 @@ test "svSquare: emits dl.image" {
     ctx.endFrame();
 
     var has_image = false;
-    for (ctx.draw_list.cmds.items) |cmd| {
+    for (ctx.postFrameDrawList().cmds.items) |cmd| {
         if (cmd == .image) {
             has_image = true;
             try std.testing.expectEqual(@as(u32, 32), cmd.image.src_w);
@@ -4766,7 +4766,7 @@ test "imageBox: reserves a fixed wxh leaf and emits a 1:1 image cmd" {
 
     // Exactly one image cmd with matching src_w/src_h and rect.w
     var found = false;
-    for (ctx.draw_list.cmds.items) |cmd| switch (cmd) {
+    for (ctx.postFrameDrawList().cmds.items) |cmd| switch (cmd) {
         .image => |im| {
             try std.testing.expectEqual(@as(u32, 24), im.src_w);
             try std.testing.expectEqual(@as(u32, 20), im.src_h);
@@ -5233,7 +5233,7 @@ test "checkbox: ON/OFF changes the pixel at the glyph inner center" {
     var pixels: [200 * 40]u32 = undefined;
     @memset(&pixels, 0xFF000000);
     const target: geom.RenderTarget = .{ .pixels = &pixels, .width = 200, .height = 40 };
-    render_mod.render(target, &ctx.draw_list, ctx.font, 1.0);
+    render_mod.render(target, ctx.postFrameDrawList(), ctx.font, 1.0);
 
     const on = ctx.getNodeRect(0xA1).?;
     const off = ctx.getNodeRect(0xA2).?;
@@ -5261,7 +5261,7 @@ test "toggle: ON/OFF changes knob position and track color" {
     var pixels: [200 * 40]u32 = undefined;
     @memset(&pixels, 0xFF000000);
     const target: geom.RenderTarget = .{ .pixels = &pixels, .width = 200, .height = 40 };
-    render_mod.render(target, &ctx.draw_list, ctx.font, 1.0);
+    render_mod.render(target, ctx.postFrameDrawList(), ctx.font, 1.0);
 
     const style = ctx.style;
     const side = @max(1, style.switch_h - 2 * ToggleGlyph.margin);
@@ -5298,7 +5298,7 @@ test "radio: selected center dot is accent; non-selected is box interior color" 
     var pixels: [200 * 40]u32 = undefined;
     @memset(&pixels, 0xFF000000);
     const target: geom.RenderTarget = .{ .pixels = &pixels, .width = 200, .height = 40 };
-    render_mod.render(target, &ctx.draw_list, ctx.font, 1.0);
+    render_mod.render(target, ctx.postFrameDrawList(), ctx.font, 1.0);
 
     const sel = ctx.getNodeRect(0x4A01).?;
     const uns = ctx.getNodeRect(0x4A02).?;
@@ -5335,7 +5335,7 @@ test "checkbox toggle radio: partial style overrides reach glyph border and labe
     var saw_fill = false;
     var saw_border = false;
     var saw_text = false;
-    for (ctx.draw_list.cmds.items) |cmd| switch (cmd) {
+    for (ctx.postFrameDrawList().cmds.items) |cmd| switch (cmd) {
         .rect_filled => |c| if (c.paint == .solid) {
             if (std.meta.eql(c.paint.solid, bg)) saw_bg = true;
             if (std.meta.eql(c.paint.solid, fill)) saw_fill = true;
@@ -5369,11 +5369,11 @@ test "widget chrome: button background and border use the control radius" {
     _ = ctx.buttonId(0xB001, "Button", .{});
     ctx.endFrame();
 
-    try std.testing.expectEqual(@as(usize, 3), ctx.draw_list.cmds.items.len);
-    try std.testing.expectEqual(@as(u32, 6), ctx.draw_list.cmds.items[0].rect_filled.radius);
-    try std.testing.expect(ctx.draw_list.cmds.items[0].rect_filled.aa);
-    try std.testing.expectEqual(@as(u32, 6), ctx.draw_list.cmds.items[2].rect_outline.radius);
-    try std.testing.expect(ctx.draw_list.cmds.items[2].rect_outline.aa);
+    try std.testing.expectEqual(@as(usize, 3), ctx.postFrameDrawList().cmds.items.len);
+    try std.testing.expectEqual(@as(u32, 6), ctx.postFrameDrawList().cmds.items[0].rect_filled.radius);
+    try std.testing.expect(ctx.postFrameDrawList().cmds.items[0].rect_filled.aa);
+    try std.testing.expectEqual(@as(u32, 6), ctx.postFrameDrawList().cmds.items[2].rect_outline.radius);
+    try std.testing.expect(ctx.postFrameDrawList().cmds.items[2].rect_outline.aa);
 }
 
 test "widget chrome: checkbox glyph uses the checkbox radius for every rect" {
@@ -5385,10 +5385,10 @@ test "widget chrome: checkbox glyph uses the checkbox radius for every rect" {
     _ = ctx.checkboxId(0xB002, "Check", &value);
     ctx.endFrame();
 
-    try std.testing.expectEqual(@as(u32, 4), ctx.draw_list.cmds.items[0].rect_filled.radius);
-    try std.testing.expectEqual(@as(u32, 4), ctx.draw_list.cmds.items[1].rect_filled.radius);
-    try std.testing.expectEqual(@as(u32, 4), ctx.draw_list.cmds.items[2].rect_outline.radius);
-    for (ctx.draw_list.cmds.items[0..3]) |cmd| switch (cmd) {
+    try std.testing.expectEqual(@as(u32, 4), ctx.postFrameDrawList().cmds.items[0].rect_filled.radius);
+    try std.testing.expectEqual(@as(u32, 4), ctx.postFrameDrawList().cmds.items[1].rect_filled.radius);
+    try std.testing.expectEqual(@as(u32, 4), ctx.postFrameDrawList().cmds.items[2].rect_outline.radius);
+    for (ctx.postFrameDrawList().cmds.items[0..3]) |cmd| switch (cmd) {
         .rect_filled => |c| try std.testing.expect(c.aa),
         .rect_outline => |c| try std.testing.expect(c.aa),
         else => try std.testing.expect(false),
@@ -5404,12 +5404,12 @@ test "widget chrome: toggle uses a pill track and a circular knob" {
     _ = ctx.toggleId(0xB003, "Toggle", &value);
     ctx.endFrame();
 
-    try std.testing.expectEqual(@as(u32, 8), ctx.draw_list.cmds.items[0].rect_filled.radius);
-    try std.testing.expect(ctx.draw_list.cmds.items[0].rect_filled.aa);
-    try std.testing.expect(ctx.draw_list.cmds.items[1] == .circle_filled);
-    try std.testing.expectEqual(@as(u32, 6), ctx.draw_list.cmds.items[1].circle_filled.radius);
-    try std.testing.expect(ctx.draw_list.cmds.items[1].circle_filled.aa);
-    try std.testing.expectEqual(@as(u32, 8), ctx.draw_list.cmds.items[2].rect_outline.radius);
+    try std.testing.expectEqual(@as(u32, 8), ctx.postFrameDrawList().cmds.items[0].rect_filled.radius);
+    try std.testing.expect(ctx.postFrameDrawList().cmds.items[0].rect_filled.aa);
+    try std.testing.expect(ctx.postFrameDrawList().cmds.items[1] == .circle_filled);
+    try std.testing.expectEqual(@as(u32, 6), ctx.postFrameDrawList().cmds.items[1].circle_filled.radius);
+    try std.testing.expect(ctx.postFrameDrawList().cmds.items[1].circle_filled.aa);
+    try std.testing.expectEqual(@as(u32, 8), ctx.postFrameDrawList().cmds.items[2].rect_outline.radius);
 }
 
 test "widget chrome: radio uses analytic circles without scanline rects" {
@@ -5420,13 +5420,13 @@ test "widget chrome: radio uses analytic circles without scanline rects" {
     _ = ctx.radioId(0xB004, "Radio", true);
     ctx.endFrame();
 
-    try std.testing.expect(ctx.draw_list.cmds.items[0] == .circle_filled);
-    try std.testing.expect(ctx.draw_list.cmds.items[1] == .circle_outline);
-    try std.testing.expect(ctx.draw_list.cmds.items[2] == .circle_filled);
-    try std.testing.expect(ctx.draw_list.cmds.items[0].circle_filled.aa);
-    try std.testing.expect(ctx.draw_list.cmds.items[1].circle_outline.aa);
-    try std.testing.expect(ctx.draw_list.cmds.items[2].circle_filled.aa);
-    for (ctx.draw_list.cmds.items[0..3]) |cmd| {
+    try std.testing.expect(ctx.postFrameDrawList().cmds.items[0] == .circle_filled);
+    try std.testing.expect(ctx.postFrameDrawList().cmds.items[1] == .circle_outline);
+    try std.testing.expect(ctx.postFrameDrawList().cmds.items[2] == .circle_filled);
+    try std.testing.expect(ctx.postFrameDrawList().cmds.items[0].circle_filled.aa);
+    try std.testing.expect(ctx.postFrameDrawList().cmds.items[1].circle_outline.aa);
+    try std.testing.expect(ctx.postFrameDrawList().cmds.items[2].circle_filled.aa);
+    for (ctx.postFrameDrawList().cmds.items[0..3]) |cmd| {
         try std.testing.expect(cmd != .rect_filled);
     }
 }
@@ -5441,7 +5441,7 @@ test "widget chrome: collapsible arrow is one closed antialiased path" {
     ctx.endFrame();
 
     var path_count: usize = 0;
-    for (ctx.draw_list.cmds.items) |cmd| {
+    for (ctx.postFrameDrawList().cmds.items) |cmd| {
         if (cmd == .path) {
             path_count += 1;
             try std.testing.expect(cmd.path.aa);
@@ -5683,8 +5683,8 @@ test "TextInput: composition start/update leaves TextBuffer unchanged; draws pre
     try std.testing.expect(r.focused);
     ctx.endFrame();
 
-    try std.testing.expect(countDrawText(ctx.draw_list.cmds.items, "に") >= 1);
-    try std.testing.expect(countDrawLines(ctx.draw_list.cmds.items) >= 1);
+    try std.testing.expect(countDrawText(ctx.postFrameDrawList().cmds.items, "に") >= 1);
+    try std.testing.expect(countDrawLines(ctx.postFrameDrawList().cmds.items) >= 1);
 }
 
 test "TextInput: preedit cursor clamps to UTF-8 boundaries and caret_rect.x follows" {
@@ -5775,8 +5775,8 @@ test "TextInput: after commit preedit clears and TextBuffer remains; cancel leav
     _ = ctx.textInputId(id, &buffer, .{ .width = .{ .fixed = 80 } });
     ctx.endFrame();
     try std.testing.expectEqualStrings("日本", buffer.slice());
-    try std.testing.expectEqual(@as(usize, 0), countDrawText(ctx.draw_list.cmds.items, "に"));
-    try std.testing.expectEqual(@as(usize, 0), countDrawLines(ctx.draw_list.cmds.items));
+    try std.testing.expectEqual(@as(usize, 0), countDrawText(ctx.postFrameDrawList().cmds.items, "に"));
+    try std.testing.expectEqual(@as(usize, 0), countDrawLines(ctx.postFrameDrawList().cmds.items));
 
     // Cancel-like: after showing preedit, active=false; buffer unchanged
     const before = try std.testing.allocator.dupe(u8, buffer.slice());
@@ -5785,14 +5785,14 @@ test "TextInput: after commit preedit clears and TextBuffer remains; cancel leav
     ctx.setComposition(.{ .active = true, .text = "変", .cursor = 0 });
     _ = ctx.textInputId(id, &buffer, .{ .width = .{ .fixed = 80 } });
     ctx.endFrame();
-    try std.testing.expect(countDrawText(ctx.draw_list.cmds.items, "変") >= 1);
+    try std.testing.expect(countDrawText(ctx.postFrameDrawList().cmds.items, "変") >= 1);
 
     ctx.beginFrameAt(240, 120, 0.4);
     ctx.setComposition(.{ .active = false, .text = "", .cursor = 0 });
     _ = ctx.textInputId(id, &buffer, .{ .width = .{ .fixed = 80 } });
     ctx.endFrame();
     try std.testing.expectEqualStrings(before, buffer.slice());
-    try std.testing.expectEqual(@as(usize, 0), countDrawText(ctx.draw_list.cmds.items, "変"));
+    try std.testing.expectEqual(@as(usize, 0), countDrawText(ctx.postFrameDrawList().cmds.items, "変"));
 }
 
 test "TextInput: scroll follows when the preedit caret is outside the viewport" {
@@ -5834,7 +5834,7 @@ test "TextInput: composition is not stale after beginFrame" {
     ctx.setComposition(.{ .active = true, .text = "あ", .cursor = 0 });
     _ = ctx.textInputId(id, &buffer, .{ .width = .{ .fixed = 80 } });
     ctx.endFrame();
-    try std.testing.expect(countDrawText(ctx.draw_list.cmds.items, "あ") >= 1);
+    try std.testing.expect(countDrawText(ctx.postFrameDrawList().cmds.items, "あ") >= 1);
 
     // beginFrame without setComposition → reset to empty
     ctx.beginFrameAt(240, 120, 0.3);
@@ -5842,7 +5842,7 @@ test "TextInput: composition is not stale after beginFrame" {
     try std.testing.expectEqual(@as(usize, 0), ctx.composition.text.len);
     _ = ctx.textInputId(id, &buffer, .{ .width = .{ .fixed = 80 } });
     ctx.endFrame();
-    try std.testing.expectEqual(@as(usize, 0), countDrawText(ctx.draw_list.cmds.items, "あ"));
+    try std.testing.expectEqual(@as(usize, 0), countDrawText(ctx.postFrameDrawList().cmds.items, "あ"));
 }
 
 test "TextInput: uses ascent+descent for content height" {
@@ -5916,7 +5916,7 @@ test "TextInput: uses ascent+descent for content height" {
     var saw_selection = false;
     var saw_caret = false;
     var saw_underline = false;
-    for (ctx.draw_list.cmds.items) |cmd| switch (cmd) {
+    for (ctx.postFrameDrawList().cmds.items) |cmd| switch (cmd) {
         .text => |t| {
             if (std.mem.eql(u8, t.text, "に") or std.mem.eql(u8, t.text, "ab") or
                 std.mem.eql(u8, t.text, "a") or std.mem.eql(u8, t.text, "b"))
@@ -5997,7 +5997,7 @@ test "selectableLabel: ink height matches selection/text y" {
 
     var saw_text = false;
     var saw_sel = false;
-    for (ctx.draw_list.cmds.items) |cmd| switch (cmd) {
+    for (ctx.postFrameDrawList().cmds.items) |cmd| switch (cmd) {
         .text => |t| {
             if (std.mem.eql(u8, t.text, "hello")) {
                 try std.testing.expectEqual(node.y, t.pos.y);
@@ -6059,7 +6059,7 @@ test "button label uses ink height and excludes line_gap" {
     // text command y = box.y + pad_top (leaf placement before label centers in a fit box
     // depends on column/row defaults; button places the label in a row-like fit box).
     var saw = false;
-    for (ctx.draw_list.cmds.items) |cmd| switch (cmd) {
+    for (ctx.postFrameDrawList().cmds.items) |cmd| switch (cmd) {
         .text => |t| {
             if (std.mem.eql(u8, t.text, "Go")) {
                 try std.testing.expectEqual(node.y + pad[0], t.pos.y);
@@ -6352,7 +6352,7 @@ test "TextInput: only focused consumes composition (unfocused: no preedit draw, 
     _ = ctx.textInputId(id_b, &b, .{ .width = .{ .fixed = 80 } });
     ctx.endBox();
     ctx.endFrame();
-    try std.testing.expectEqual(@as(usize, 1), countDrawText(ctx.draw_list.cmds.items, "あ"));
+    try std.testing.expectEqual(@as(usize, 1), countDrawText(ctx.postFrameDrawList().cmds.items, "あ"));
 
     // Move focus to B before loading composition (avoid same-frame press race)
     ctx.beginFrameAt(320, 160, 0.2);
@@ -6374,8 +6374,8 @@ test "TextInput: only focused consumes composition (unfocused: no preedit draw, 
     ctx.endFrame();
     try std.testing.expectEqualStrings("A", a.slice());
     try std.testing.expectEqualStrings("B", b.slice()); // B focused + composing → Backspace suppressed
-    try std.testing.expectEqual(@as(usize, 1), countDrawText(ctx.draw_list.cmds.items, "い"));
-    try std.testing.expectEqual(@as(usize, 0), countDrawText(ctx.draw_list.cmds.items, "あ"));
+    try std.testing.expectEqual(@as(usize, 1), countDrawText(ctx.postFrameDrawList().cmds.items, "い"));
+    try std.testing.expectEqual(@as(usize, 0), countDrawText(ctx.postFrameDrawList().cmds.items, "あ"));
 
     // Clear B’s composition; without composition, Backspace on B works
     ctx.perIdState(id_b).selection = .{ .anchor = 1, .extent = 1 };
@@ -6496,7 +6496,7 @@ test "TextInput: char_input during composition also respects the limit" {
     try std.testing.expectEqualStrings("xy", buffer.slice());
     ctx.endFrame();
     // Preedit itself is not truncated by max_len
-    try std.testing.expect(countDrawText(ctx.draw_list.cmds.items, "あ") >= 1);
+    try std.testing.expect(countDrawText(ctx.postFrameDrawList().cmds.items, "あ") >= 1);
 }
 
 test "TextInput: after composition confirm only TextBuffer is within the limit" {
@@ -6520,7 +6520,7 @@ test "TextInput: after composition confirm only TextBuffer is within the limit" 
     _ = ctx.textInputId(id, &buffer, opts);
     ctx.endFrame();
     try std.testing.expectEqualStrings("a日", buffer.slice());
-    try std.testing.expectEqual(@as(usize, 0), countDrawText(ctx.draw_list.cmds.items, "に"));
+    try std.testing.expectEqual(@as(usize, 0), countDrawText(ctx.postFrameDrawList().cmds.items, "に"));
 }
 
 test "TextInput: max_len=null leaves existing TextInput behavior unchanged" {
@@ -7013,7 +7013,7 @@ test "beginListboxRow: depth=0 is bit-identical to a row with no depth" {
     b.endFrame();
 
     try std.testing.expectEqual(countLayoutNodes(a.layout_root.?), countLayoutNodes(b.layout_root.?));
-    try std.testing.expectEqual(a.draw_list.cmds.items.len, b.draw_list.cmds.items.len);
+    try std.testing.expectEqual(a.postFrameDrawList().cmds.items.len, b.postFrameDrawList().cmds.items.len);
     try std.testing.expectEqual(a.getNodeRect(id).?, b.getNodeRect(id).?);
 }
 
@@ -7038,7 +7038,7 @@ test "beginListboxRow: indent_w=0 emits no guide even when depth>0" {
     plain.endFrame();
 
     try std.testing.expectEqual(countLayoutNodes(plain.layout_root.?), countLayoutNodes(zero.layout_root.?));
-    try std.testing.expectEqual(plain.draw_list.cmds.items.len, zero.draw_list.cmds.items.len);
+    try std.testing.expectEqual(plain.postFrameDrawList().cmds.items.len, zero.postFrameDrawList().cmds.items.len);
 }
 
 test "beginListboxRow: indent width, line count, and line x sit at i*indent_w" {
@@ -7069,7 +7069,7 @@ test "beginListboxRow: indent width, line count, and line x sit at i*indent_w" {
     try std.testing.expectEqual(@as(u32, depth), lines);
 
     var filled: usize = 0;
-    for (ctx.draw_list.cmds.items) |cmd| {
+    for (ctx.postFrameDrawList().cmds.items) |cmd| {
         if (cmd == .rect_filled and cmd.rect_filled.paint == .solid and std.meta.eql(cmd.rect_filled.paint.solid, ctx.style.border)) filled += 1;
     }
     try std.testing.expectEqual(@as(usize, depth), filled);
@@ -7191,7 +7191,7 @@ test "labelEllipsis: draws the truncated text as a label" {
     const r = labelEllipsis(&ctx, "a-very-long-file-name-that-does-not-fit.txt", 80, Color.rgba(0xFF, 0xFF, 0xFF, 0xFF));
     ctx.endFrame();
     try std.testing.expect(r.truncated);
-    try std.testing.expectEqual(@as(usize, 1), countDrawText(ctx.draw_list.cmds.items, r.text));
+    try std.testing.expectEqual(@as(usize, 1), countDrawText(ctx.postFrameDrawList().cmds.items, r.text));
 }
 
 // ── Form row ──
@@ -7206,9 +7206,9 @@ test "beginFormRow/endFormRow: draws the label and description around the caller
     endFormRow(&ctx);
     ctx.endFrame();
 
-    try std.testing.expectEqual(@as(usize, 1), countDrawText(ctx.draw_list.cmds.items, "Paths"));
-    try std.testing.expectEqual(@as(usize, 1), countDrawText(ctx.draw_list.cmds.items, "Settings file path."));
-    try std.testing.expectEqual(@as(usize, 1), countDrawText(ctx.draw_list.cmds.items, "control-placeholder"));
+    try std.testing.expectEqual(@as(usize, 1), countDrawText(ctx.postFrameDrawList().cmds.items, "Paths"));
+    try std.testing.expectEqual(@as(usize, 1), countDrawText(ctx.postFrameDrawList().cmds.items, "Settings file path."));
+    try std.testing.expectEqual(@as(usize, 1), countDrawText(ctx.postFrameDrawList().cmds.items, "control-placeholder"));
 }
 
 test "beginFormRow: omits the description draw command when unset" {
@@ -7220,7 +7220,7 @@ test "beginFormRow: omits the description draw command when unset" {
     endFormRow(&ctx);
     ctx.endFrame();
 
-    try std.testing.expectEqual(@as(usize, 1), countDrawText(ctx.draw_list.cmds.items, "Cache"));
+    try std.testing.expectEqual(@as(usize, 1), countDrawText(ctx.postFrameDrawList().cmds.items, "Cache"));
 }
 
 // ── Disabled ──
@@ -7257,7 +7257,7 @@ test "beginDisabled: a button rejects a click and paints disabledColor(bg)" {
     var pixels: [200 * 40]u32 = undefined;
     @memset(&pixels, 0xFF000000);
     const target: geom.RenderTarget = .{ .pixels = &pixels, .width = 200, .height = 40 };
-    render_mod.render(target, &ctx.draw_list, ctx.font, 1.0);
+    render_mod.render(target, ctx.postFrameDrawList(), ctx.font, 1.0);
     const rect = ctx.getNodeRect(ctx.id_stack.make("Save")).?;
     const expect_bg: u32 = @bitCast(ctx.style.disabledColor(ctx.style.bg));
     const mid_y: u32 = @intCast(rect.y + @as(i32, @intCast(rect.h / 2)));

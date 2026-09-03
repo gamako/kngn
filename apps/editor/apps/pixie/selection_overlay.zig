@@ -1,6 +1,6 @@
 //! Selection marching-ants drawing.
 //!
-//! Like `bezier_overlay.zig`, draws into `ctx.draw_list` (called after canvas blit, before gui.render,
+//! Like `bezier_overlay.zig`, draws into `postFrameDrawList()` (called after canvas blit, before gui.render,
 //! so it sits on the front of the canvas). Clips to canvas display rect ∩ canvas area so it cannot invade the right pane/menu.
 //! phase (dash-animation phase) is computed in main from `platform.getTime()` and passed in (this module stays
 //! platform-independent. With the harness virtual clock, replay advances deterministically).
@@ -18,7 +18,7 @@ const BLACK = gui.Color.rgba(0x00, 0x00, 0x00, 0xFF);
 /// canvas_rect is the canvasBlitRect result (rect.w/h = canvas pixel count); zoom is the display magnification.
 pub fn draw(ctx: *gui.Context, sel: ?core.Rect, canvas_rect: core.Rect, zoom: Zoom, clip_area: gui.Rect, phase: i32) void {
     const rect = sel orelse return;
-    const dl = &ctx.draw_list;
+    const dl = ctx.postFrameDrawList();
     const disp: gui.Rect = .{
         .x = canvas_rect.x,
         .y = canvas_rect.y,

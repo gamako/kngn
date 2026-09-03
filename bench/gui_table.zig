@@ -125,7 +125,7 @@ fn runKind(io: std.Io, tracker: *peak_allocator.PeakTrackingAllocator, kind: Kin
         ctx.beginFrame(W, H);
         buildTable(&ctx, kind, &scroll, labels);
         ctx.endFrame();
-        gui.render(target, &ctx.draw_list, ctx.font, 1.0);
+        gui.render(target, ctx.postFrameDrawList(), ctx.font, 1.0);
     }
 
     var samples: [ITERS]u64 = undefined;
@@ -136,11 +136,11 @@ fn runKind(io: std.Io, tracker: *peak_allocator.PeakTrackingAllocator, kind: Kin
         ctx.beginFrame(W, H);
         buildTable(&ctx, kind, &scroll, labels);
         ctx.endFrame();
-        gui.render(target, &ctx.draw_list, ctx.font, 1.0);
+        gui.render(target, ctx.postFrameDrawList(), ctx.font, 1.0);
         const ns: u64 = @intCast(start.untilNow(io).raw.nanoseconds);
         samples[i] = ns;
         acc +%= pixels[i % pixels.len];
-        acc +%= @truncate(ctx.draw_list.cmds.items.len);
+        acc +%= @truncate(ctx.postFrameDrawList().cmds.items.len);
     }
     std.mem.doNotOptimizeAway(acc);
 

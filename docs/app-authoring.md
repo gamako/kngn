@@ -151,7 +151,7 @@ App.frame(win, now):
     }
     ctx.<widget calls>                       -- the frame's tree of boxes and widgets (§5)
   ctx.endFrame()                             -- closes the window; layout and draw cmds are final
-  gui.render(target, &ctx.draw_list, ctx.font, scale)
+  gui.render(target, ctx.postFrameDrawList(), ctx.font, scale)
                                               -- scale: fb.content_scale under .physical, 1.0 under .logical
   win.present()
   fb.unlock()                                -- via defer, right after lockFramebuffer
@@ -211,7 +211,7 @@ contracts and the traps.
 
 **`Context` is not the only entry point to drawing, but it is the default one.** A screen is a
 tree of boxes and widgets that the layout engine resolves to rectangles at `endFrame`. Reaching
-past that to `ctx.draw_list` and passing coordinates by hand is available (§5.6) and
+past that to the Context draw-list accessors and passing coordinates by hand is available (§5.6) and
 occasionally right, but it is the exit, not the entrance: hand-computed positions accumulate
 error as a screen grows, while a declared size is either correct or wrong on its own.
 
@@ -226,7 +226,7 @@ rather than misbehaving quietly.
 | Inside the frame (required) | the widgets (§5.3) | yes | yes | the layout engine |
 | Inside the frame (required) | `beginBox` / `endBox` | yes | not itself; the widgets inside it are | the layout engine |
 | Inside the frame (required) | `ctx.custom` | yes | no — no id, no hit-test, no focus | the layout engine |
-| Inside the frame | `ctx.draw_list.*` directly | no | no | you |
+| Inside the frame | `ctx.mainDrawList().*` directly | no | no | you |
 | After `endFrame` (required) | `popupMenu*`, `dialog*`, `menuBarPopup` | a separate layer | yes | the library |
 
 Only the *drawing* half of a popup or dialog is in that last group, and only that half is what
@@ -234,7 +234,7 @@ the frame boundary constrains. Opening one (`openPopup`, `openDialog`) sets stat
 frame of its own, and building a menu bar's button row (`menuBar`) is an ordinary in-frame call;
 the matching `popupMenu` / `dialog` / `menuBarPopup` paints it after the frame is closed.
 
-Draw order follows the same order: whatever you pushed onto `draw_list` during the frame
+Draw order follows the same order: whatever you pushed onto `mainDrawList()` during the frame
 is already in the list when `endFrame` appends the interface's own commands, so widgets paint
 **over** a hand-drawn background; the post-`endFrame` layers paint over everything.
 
@@ -245,7 +245,7 @@ Which one a thing is:
 | A control — something with a state the user changes | a widget | §5.3 |
 | An arrangement — a panel, a row, a column, a card, a gap | a box | §5.1 |
 | A drawing that belongs to the layout — a meter, a waveform, a thumbnail | `ctx.custom` | §5.5 |
-| A drawing that belongs to no box — a full-window background, a debug overlay | `ctx.draw_list` | §5.6 |
+| A drawing that belongs to no box — a full-window background, a debug overlay | `ctx.mainDrawList()` or `ctx.postFrameDrawList()` | §5.6 |
 
 ### 5.1 The box tree
 
@@ -558,9 +558,10 @@ Five things to get right:
 The full contract, and two worked custom-drawn widgets to copy, are in
 [`libs/gui/README.md`](../libs/gui/README.md).
 
-### 5.6 Drawing outside the layout: `ctx.draw_list`
+### 5.6 Drawing outside the layout: Context draw-list accessors
 
-`ctx.draw_list` is public and can be written to directly during the frame. What you give up
+`ctx.mainDrawList()` can be written to directly during the frame. `ctx.postFrameDrawList()` is
+the matching accessor for non-interactive drawing after `endFrame`. What you give up
 is everything the tree provides: you supply absolute coordinates, nothing is hit-tested, and
 nothing follows a resize unless you make it. What you get is a drawing that answers to no
 box — a background behind the whole interface, a decoration spanning several panels, a debug

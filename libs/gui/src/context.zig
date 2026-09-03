@@ -1,4 +1,4 @@
-// Context: bundles input + ID stack + interaction state + draw list + arena + font + layout.
+// Context: bundles input + ID stack + interaction state + drawing phases + arena + font + layout.
 // Frame lifecycle (beginFrame / endFrame) and the starting point for widget behavior.
 //
 // Current contracts for lifecycle, sync hit-test, and clip visibility follow.
@@ -7,7 +7,7 @@
 //
 // Lifecycle contract (Context as the contract guardian + layout):
 //   beginFrame(w,h): arena.reset → input/id_stack/state.beginFrame → per_id_state.beginFrame
-//                    → draw_list.reset(w,h)  ※ w/h are logical size (not the physical fb)
+//                    → the main draw list reset(w,h)  ※ w/h are logical size (not the physical fb)
 //                    → allocate the implicit layout-tree root on the arena (not yet measure/place this frame)
 //                    → apply input staged since the last frame (arrival order, edges already cleared)
 //   input:           pushEvent / setComposition may be called at any point in the loop. Inside a
@@ -17,11 +17,11 @@
 //   widget calls: sync hit-test against the previous-frame rect_cache (never the layout rects still under construction)
 //   endFrame():      layoutTree (measureWidths → placeWidths → wrapText →
 //                    measureHeights → placeHeights) → rect_cache.clearRetainingCapacity
-//                    → updateRectCache → emitNode (emit draw cmds) → frame_active=false
+//                    → updateRectCache → emitNode (emit draw cmds) → final_overlay
 //                    → focus cleanup → active cleanup → PerIdStateStore.trim (frame boundary only)
 //                    No hit-test here. The new rect_cache is referenced from the next frame after this endFrame completes.
 //                    Does not touch the arena (Context is the contract guardian).
-//                    After endFrame, draw_list / id_stack / state / the layout tree stay
+//                    After endFrame, the post-frame draw list / id_stack / state / the layout tree stay
 //                    valid until the next beginFrame. The rect cache (GPA-owned) stays valid until the next endFrame.
 //                    PerIdStateStore LRU trim runs only at the end of endFrame (never during widget build).
 //
@@ -41,7 +41,7 @@
 //   - The predicate is pointHitsVisible(rect, clip, p). Active drag capture is kept even outside clip;
 //     only the click on release must land inside the visible region.
 //
-// Draw emit order: layout cmds are appended after any cmds the caller pushed directly onto draw_list
+// Draw emit order: layout cmds are appended after any commands the caller pushed through mainDrawList
 // during the frame (= layout UI draws on top).
 
 const std = @import("std");
@@ -306,6 +306,34 @@ pub const SliderGroupState = struct {
     value_w: i32 = 0,
 };
 
+const DrawPhase = enum {
+    idle,
+    main_build,
+    display_only_build,
+    main_emit,
+    layer_emit,
+    final_overlay,
+};
+
+const DrawAccess = enum {
+    main,
+    post_frame,
+};
+
+const DrawListHolder = struct {
+    list: DrawList,
+    phase: DrawPhase = .idle,
+    display_only_depth: u32 = 0,
+};
+
+fn drawAccessAllowed(phase: DrawPhase, access: DrawAccess) bool {
+    return switch (phase) {
+        .idle, .final_overlay => access == .post_frame,
+        .main_build => access == .main,
+        .display_only_build, .main_emit, .layer_emit => false,
+    };
+}
+
 pub const Context = struct {
     gpa: Allocator,
     arena: std.heap.ArenaAllocator,
@@ -313,14 +341,13 @@ pub const Context = struct {
     id_stack: IdStack,
     state: InteractionState = .{},
     per_id_state: state_mod.PerIdStateStore = .{},
-    draw_list: DrawList,
+    draw_holder: DrawListHolder,
     font: Font,
     /// Non-null only when `font` is the deterministic default proxy. Tier variants borrow this
     /// family; custom bitmap or outline fonts stay untouched by tier size/weight.
     default_family: ?*font_mod.OutlineFontFamily = null,
     screen_w: u32 = 0,
     screen_h: u32 = 0,
-    frame_active: bool = false,
     frame_index: u64 = 0,
     now_s: f64 = 0,
     /// Implicit root of the layout tree (allocated on the arena in beginFrame)
@@ -411,9 +438,6 @@ pub const Context = struct {
     /// Candidate emitted at this frame's endFrame (null if not yet due). Last writer wins.
     tooltip_candidate: ?TooltipCandidate = null,
     tooltip_candidate_anchor: Rect = .{ .x = 0, .y = 0, .w = 0, .h = 0 },
-    /// Non-zero while a custom-tooltip builder is running. Interactive / state-mutating
-    /// APIs are forbidden in this mode (lifecycle violation in every optimisation mode).
-    display_only_depth: u32 = 0,
     /// This-frame custom-tooltip work. Reset in beginFrame.
     /// Hover checks run every frame; build and measure/place run only while a custom tooltip shows.
     tooltip_builder_calls: u32 = 0,
@@ -562,7 +586,7 @@ pub const Context = struct {
             .arena = std.heap.ArenaAllocator.init(gpa),
             .input = Input.init(gpa),
             .id_stack = IdStack.init(gpa),
-            .draw_list = DrawList.init(gpa),
+            .draw_holder = .{ .list = DrawList.init(gpa) },
             .font = font,
             .default_family = if (font_mod.isDefaultFont(font)) font_mod.defaultFontFamily() else null,
             .style = style_mod.defaultStyle(),
@@ -577,7 +601,7 @@ pub const Context = struct {
         self.scroll_stack.deinit(self.gpa);
         self.scroll_areas_prev.deinit(self.gpa);
         self.scroll_areas_cur.deinit(self.gpa);
-        self.draw_list.deinit();
+        self.draw_holder.list.deinit();
         self.id_stack.deinit();
         self.input.deinit();
         self.arena.deinit();
@@ -605,10 +629,32 @@ pub const Context = struct {
         return self.allocator().dupe(u32, pixels) catch @panic("dupePixels: OOM");
     }
 
+    /// Access the frame's main draw list while the widget tree is being built.
+    /// The returned pointer is borrowed until the next phase transition; retaining it and using
+    /// it in a later phase violates the Context lifecycle contract.
+    pub fn mainDrawList(self: *Context) *DrawList {
+        return self.drawListFor(.main, "mainDrawList");
+    }
+
+    /// Access the draw list after a frame, or before the first frame for inspection setup.
+    /// The returned pointer is borrowed until the next beginFrame; retaining it and using it
+    /// during main or display-only build violates the Context lifecycle contract.
+    pub fn postFrameDrawList(self: *Context) *DrawList {
+        return self.drawListFor(.post_frame, "postFrameDrawList");
+    }
+
+    fn drawListFor(self: *Context, access: DrawAccess, accessor: []const u8) *DrawList {
+        const phase = self.draw_holder.phase;
+        if (!drawAccessAllowed(phase, access)) {
+            std.debug.panic("gui: {s} is not available in phase {s}", .{ accessor, @tagName(phase) });
+        }
+        return &self.draw_holder.list;
+    }
+
     /// Start a filled path. Verbs and points go on the frame arena; `finish`
     /// appends one DrawCmd on success and nothing on InvalidPath or OOM.
     pub fn beginPath(self: *Context) draw.PathBuilder {
-        return self.draw_list.beginPath(self.allocator());
+        return self.mainDrawList().beginPath(self.allocator());
     }
 
     /// screen_w/screen_h are logical size (DrawList root clip / layout root).
@@ -627,7 +673,8 @@ pub const Context = struct {
 
     fn beginFrameAtInternal(self: *Context, screen_w: u32, screen_h: u32, now_s: f64) void {
         self.requireNoFrame("beginFrame");
-        self.frame_active = true;
+        self.draw_holder.phase = .main_build;
+        self.draw_holder.display_only_depth = 0;
         self.screen_w = screen_w;
         self.screen_h = screen_h;
         self.now_s = now_s;
@@ -663,7 +710,6 @@ pub const Context = struct {
         self.tooltip_hover_refreshed = false;
         self.tooltip_candidate = null;
         self.tooltip_candidate_anchor = .{ .x = 0, .y = 0, .w = 0, .h = 0 };
-        self.display_only_depth = 0;
         self.tooltip_builder_calls = 0;
         self.tooltip_layout_calls = 0;
         self.frame_arena_allocs = 0;
@@ -673,7 +719,7 @@ pub const Context = struct {
         // The cells a group collects live on the frame arena, so the group cannot outlive the frame.
         self.slider_group = null;
         self.table = null;
-        self.draw_list.reset(screen_w, screen_h);
+        self.draw_holder.list.reset(screen_w, screen_h);
         // Implicit layout-tree root (callers just start with beginBox)
         const root = self.allocator().create(layout.Node) catch @panic("Context.beginFrame: OOM");
         root.* = .{ .cfg = .{
@@ -706,15 +752,18 @@ pub const Context = struct {
         if (!ok) @panic("gui: " ++ what);
     }
 
-    /// Require an open frame: `beginFrame` has run and `endFrame` has not.
+    /// Require a frame-build phase: `beginFrame` has run and the Context is still accepting
+    /// frame-build calls. This fails from custom draw callbacks, because emit phases are not a
+    /// frame-build phase.
     pub inline fn requireFrame(self: *const Context, comptime what: []const u8) void {
-        requireContract(self.frame_active, what ++ " requires an open frame");
+        requireContract(self.frameIsOpen(), what ++ " requires an open frame");
     }
 
-    /// Require that no frame is open — the contract of the post-frame APIs (popups, menu bar)
-    /// and of opening a frame in the first place.
+    /// Require an idle or final-overlay phase — the contract of the post-frame APIs (popups, menu
+    /// bar) and of opening a frame in the first place. This also fails during the synchronous
+    /// layout/emit work of `endFrame`, even though `endFrame` has not returned yet.
     pub inline fn requireNoFrame(self: *const Context, comptime what: []const u8) void {
-        requireContract(!self.frame_active, what ++ " must be called with no frame open");
+        requireContract(self.noFrameIsOpen(), what ++ " must be called with no frame open");
     }
 
     /// Require that a display-only tooltip builder is not running.
@@ -726,7 +775,26 @@ pub const Context = struct {
     /// any caller-owned write, so a first-frame (empty rect cache) call still
     /// fails. Panics in every optimisation mode (same class as `requireContract`).
     pub inline fn requireInteractiveAllowed(self: *const Context, comptime what: []const u8) void {
-        requireContract(self.display_only_depth == 0, what ++ " is not allowed in a display-only subtree");
+        requireContract(self.draw_holder.display_only_depth == 0, what ++ " is not allowed in a display-only subtree");
+    }
+
+    fn frameIsOpen(self: *const Context) bool {
+        return switch (self.draw_holder.phase) {
+            .main_build, .display_only_build => true,
+            .idle, .main_emit, .layer_emit, .final_overlay => false,
+        };
+    }
+
+    fn noFrameIsOpen(self: *const Context) bool {
+        return switch (self.draw_holder.phase) {
+            .idle, .final_overlay => true,
+            .main_build, .display_only_build, .main_emit, .layer_emit => false,
+        };
+    }
+
+    fn checkDisplayOnlyInvariant(self: *const Context) void {
+        const in_display_only = self.draw_holder.phase == .display_only_build;
+        requireContract(in_display_only == (self.draw_holder.display_only_depth > 0), "display-only phase and depth disagree");
     }
 
     pub fn endFrame(self: *Context) void {
@@ -738,7 +806,8 @@ pub const Context = struct {
         // written back there, so an unclosed group would leave its rows at zero-width columns.
         requireContract(self.slider_group == null, "endFrame with a slider group still open");
         requireContract(self.table == null, "endFrame with a table still open");
-        requireContract(self.display_only_depth == 0, "endFrame with a display-only subtree still open");
+        requireContract(self.draw_holder.display_only_depth == 0, "endFrame with a display-only subtree still open");
+        self.checkDisplayOnlyInvariant();
         const root = self.layout_root.?;
         // Detect beginBox / endBox mismatches
         requireContract(self.layout_current == root, "endFrame with a box still open");
@@ -762,7 +831,9 @@ pub const Context = struct {
             // half-updated state in between.
             if (has_main) self.updateRectCache(root, screen_rect);
             self.placeLayers(screen_rect);
-            if (has_main) self.emitNode(root);
+            self.draw_holder.phase = .main_emit;
+            if (has_main) self.emitNode(root, &self.draw_holder.list);
+            self.draw_holder.phase = .layer_emit;
             self.emitLayers();
         }
         if (self.layout_sanity_enabled) {
@@ -788,7 +859,6 @@ pub const Context = struct {
         if (self.tooltip_hover_id != 0 and !self.tooltip_hover_refreshed) {
             self.tooltip_hover_id = 0;
         }
-        self.frame_active = false;
         // Tab moves the focus forward, Shift+Tab back. The event is read but not consumed, so an
         // application that gives Tab its own meaning still sees it.
         if (self.input.pressedPlain(input_mod.key.tab, input_mod.mod.shift, input_mod.mod.ctrl | input_mod.mod.alt | input_mod.mod.cmd)) {
@@ -847,7 +917,9 @@ pub const Context = struct {
             .animation_hover_id = self.animation_wake_hover,
             .animation_press_id = self.animation_wake_press,
         });
-        // Neither the arena nor draw_list is reset here (Context is the contract guardian).
+        // Neither the arena nor the draw list is reset here (Context is the contract guardian).
+        self.draw_holder.phase = .final_overlay;
+        self.checkDisplayOnlyInvariant();
     }
 
     /// Hand one input event to the GUI. Callable at any point in the loop: inside a frame it
@@ -856,7 +928,7 @@ pub const Context = struct {
     /// when that frame opens, so reading `ctx.input` before beginFrame does not see it yet.
     pub fn pushEvent(self: *Context, ev: InputEvent) void {
         self.requireInteractiveAllowed("pushEvent");
-        if (self.frame_active) {
+        if (self.frameIsOpen()) {
             self.input.pushEvent(ev);
         } else {
             self.staged_input.pushEvent(ev);
@@ -869,7 +941,7 @@ pub const Context = struct {
     /// Does not accept platform types (ADR-007).
     pub fn setComposition(self: *Context, state: input_mod.CompositionState) void {
         self.requireInteractiveAllowed("setComposition");
-        if (self.frame_active) {
+        if (self.frameIsOpen()) {
             self.composition = state;
         } else {
             self.staged_input.setComposition(state);
@@ -1225,13 +1297,19 @@ pub const Context = struct {
         const saved_collapsible = widgets.collapsibleBodyDepth();
         const saved_id_len = self.id_stack.stack.items.len;
         const saved_ids = self.allocator().dupe(Id, self.id_stack.stack.items) catch @panic("tooltipBox: OOM");
-        const saved_display = self.display_only_depth;
+        const saved_phase = self.draw_holder.phase;
+        const saved_display = self.draw_holder.display_only_depth;
 
         self.layout_current = root;
-        self.display_only_depth += 1;
+        requireContract(saved_phase == .main_build, "tooltipBox builder started in an unexpected draw phase");
+        self.draw_holder.display_only_depth += 1;
+        self.draw_holder.phase = .display_only_build;
+        self.checkDisplayOnlyInvariant();
         defer {
             self.layout_current = saved_layout;
-            self.display_only_depth = saved_display;
+            self.draw_holder.display_only_depth = saved_display;
+            self.draw_holder.phase = saved_phase;
+            self.checkDisplayOnlyInvariant();
         }
 
         build_fn(build_ctx, self);
@@ -1242,7 +1320,7 @@ pub const Context = struct {
         requireContract(sliderGroupUnchanged(self.slider_group, saved_slider), "tooltipBox builder changed slider group");
         requireContract(tableUnchanged(self.table, saved_table), "tooltipBox builder changed table");
         requireContract(widgets.collapsibleBodyDepth() == saved_collapsible, "tooltipBox builder changed collapsible depth");
-        requireContract(self.display_only_depth == saved_display + 1, "tooltipBox builder changed display-only depth");
+        requireContract(self.draw_holder.display_only_depth == saved_display + 1, "tooltipBox builder changed display-only depth");
         requireContract(self.id_stack.stack.items.len == saved_id_len, "tooltipBox builder left the id stack unbalanced");
         requireContract(std.mem.eql(Id, self.id_stack.stack.items, saved_ids), "tooltipBox builder changed id stack contents");
         return root;
@@ -1387,7 +1465,9 @@ pub const Context = struct {
             // under it, so a button inside one would be a button the box beneath it also
             // gets. The existing display-only guard is what says so, and it is lifted when
             // that arbitration arrives.
-            self.display_only_depth += 1;
+            self.draw_holder.display_only_depth += 1;
+            self.draw_holder.phase = .display_only_build;
+            self.checkDisplayOnlyInvariant();
         } else {
             layout.appendChild(parent, node);
         }
@@ -1621,7 +1701,7 @@ pub const Context = struct {
             order[j] = i;
             n += 1;
         }
-        for (order[0..n]) |i| self.emitNode(self.layers[i].root);
+        for (order[0..n]) |i| self.emitNode(self.layers[i].root, &self.draw_holder.list);
     }
 
     /// Carry this frame's result into the slots, so the next frame can ask where a layer was
@@ -1680,7 +1760,12 @@ pub const Context = struct {
         // cannot pick up the parent's clip, scroll or extent by accident.
         if (cur.is_layer_root) {
             cur.parent = null;
-            self.display_only_depth -= 1;
+            requireContract(self.draw_holder.display_only_depth > 0, "layer closed without a display-only scope");
+            self.draw_holder.display_only_depth -= 1;
+            if (self.draw_holder.display_only_depth == 0) {
+                self.draw_holder.phase = .main_build;
+            }
+            self.checkDisplayOnlyInvariant();
         }
     }
 
@@ -1851,16 +1936,16 @@ pub const Context = struct {
     /// popClip → border.
     /// `pushClip` uses the content box (rect minus padding), matching `updateRectCache`.
     /// border is emitted after popClip (= ancestor clip) so the frame sits on top of children.
-    fn emitNode(self: *Context, node: *const layout.Node) void {
+    fn emitNode(self: *Context, node: *const layout.Node, dl: *DrawList) void {
         if (node.leaf) |leaf| {
             switch (leaf) {
                 .text => |t| {
                     const clip_self = t.overflow == .clip;
                     if (clip_self) {
-                        self.draw_list.pushClip(node.rect) catch @panic("Context.endFrame: OOM");
+                        dl.pushClip(node.rect) catch @panic("Context.endFrame: OOM");
                     }
                     if (node.lines.len == 0) {
-                        self.draw_list.textEx(
+                        dl.textEx(
                             .{ .x = node.rect.x, .y = node.rect.y },
                             t.str,
                             t.color,
@@ -1868,7 +1953,7 @@ pub const Context = struct {
                         ) catch @panic("Context.endFrame: OOM");
                     } else {
                         for (node.lines) |line| {
-                            self.draw_list.textEx(
+                            dl.textEx(
                                 .{ .x = node.rect.x, .y = node.rect.y + line.y_offset },
                                 line.text,
                                 t.color,
@@ -1876,25 +1961,25 @@ pub const Context = struct {
                             ) catch @panic("Context.endFrame: OOM");
                         }
                     }
-                    if (clip_self) self.draw_list.popClip();
+                    if (clip_self) dl.popClip();
                 },
-                .custom => |c| c.draw_fn(c.ctx, &self.draw_list, node.rect),
+                .custom => |c| c.draw_fn(c.ctx, dl, node.rect),
             }
             return;
         }
         if (node.cfg.bg) |bg| {
-            self.draw_list.rectFilledEx(node.rect, bg, .{ .radius = node.cfg.radius }) catch
+            dl.rectFilledEx(node.rect, bg, .{ .radius = node.cfg.radius }) catch
                 @panic("Context.endFrame: OOM");
         }
         if (node.cfg.clip_children) {
-            self.draw_list.pushClip(layout.contentBox(node.rect, node.cfg.padding)) catch
+            dl.pushClip(layout.contentBox(node.rect, node.cfg.padding)) catch
                 @panic("Context.endFrame: OOM");
         }
         var it = node.first_child;
-        while (it) |c| : (it = c.next_sibling) self.emitNode(c);
-        if (node.cfg.clip_children) self.draw_list.popClip();
+        while (it) |c| : (it = c.next_sibling) self.emitNode(c, dl);
+        if (node.cfg.clip_children) dl.popClip();
         if (node.cfg.border) |b| {
-            self.draw_list.rectOutlineEx(node.rect, b.color, b.thickness, .{ .radius = node.cfg.radius }) catch
+            dl.rectOutlineEx(node.rect, b.color, b.thickness, .{ .radius = node.cfg.radius }) catch
                 @panic("Context.endFrame: OOM");
         }
         // Focus ring, on the same terms as the border: this frame's rect, after popClip, so it sits
@@ -1906,7 +1991,7 @@ pub const Context = struct {
         if (self.popup_state == null and self.popup_stack.len == 0 and self.state.focus_visible and
             node.cfg.id != 0 and node.cfg.id == self.state.focused_id)
         {
-            self.draw_list.rectOutlineEx(
+            dl.rectOutlineEx(
                 node.rect,
                 self.style.accent.focus,
                 self.style.focus_ring_thickness,
@@ -2064,6 +2149,46 @@ fn testCtx() Context {
     return Context.init(std.testing.allocator, font_mod.default_font);
 }
 
+test "draw list access policy covers every phase" {
+    const cases = [_]struct {
+        phase: DrawPhase,
+        main_allowed: bool,
+        post_frame_allowed: bool,
+    }{
+        .{ .phase = .idle, .main_allowed = false, .post_frame_allowed = true },
+        .{ .phase = .main_build, .main_allowed = true, .post_frame_allowed = false },
+        .{ .phase = .display_only_build, .main_allowed = false, .post_frame_allowed = false },
+        .{ .phase = .main_emit, .main_allowed = false, .post_frame_allowed = false },
+        .{ .phase = .layer_emit, .main_allowed = false, .post_frame_allowed = false },
+        .{ .phase = .final_overlay, .main_allowed = false, .post_frame_allowed = true },
+    };
+    for (cases) |case| {
+        try std.testing.expectEqual(case.main_allowed, drawAccessAllowed(case.phase, .main));
+        try std.testing.expectEqual(case.post_frame_allowed, drawAccessAllowed(case.phase, .post_frame));
+    }
+}
+
+test "Context draw list accessors follow frame lifecycle" {
+    var ctx = testCtx();
+    defer ctx.deinit();
+
+    try std.testing.expectEqual(@as(usize, 0), ctx.postFrameDrawList().cmds.items.len);
+
+    ctx.beginFrame(320, 240);
+    const main = ctx.mainDrawList();
+    try main.rectFilled(.{ .x = 0, .y = 0, .w = 4, .h = 4 }, Color.rgba(1, 2, 3, 0xFF));
+    ctx.endFrame();
+
+    const post = ctx.postFrameDrawList();
+    try std.testing.expectEqual(@intFromPtr(main), @intFromPtr(post));
+    try std.testing.expectEqual(@as(usize, 1), post.cmds.items.len);
+    try post.rectFilled(.{ .x = 4, .y = 0, .w = 4, .h = 4 }, Color.rgba(4, 5, 6, 0xFF));
+
+    ctx.beginFrame(320, 240);
+    try std.testing.expectEqual(@as(usize, 0), ctx.mainDrawList().cmds.items.len);
+    ctx.endFrame();
+}
+
 test "layout: rounded box and focus ring preserve the configured radius" {
     var ctx = testCtx();
     defer ctx.deinit();
@@ -2082,13 +2207,13 @@ test "layout: rounded box and focus ring preserve the configured radius" {
     ctx.endBox();
     ctx.endFrame();
 
-    try std.testing.expectEqual(@as(usize, 3), ctx.draw_list.cmds.items.len);
-    try std.testing.expectEqual(@as(u32, 9), ctx.draw_list.cmds.items[0].rect_filled.radius);
-    try std.testing.expect(ctx.draw_list.cmds.items[0].rect_filled.aa);
-    try std.testing.expectEqual(@as(u32, 9), ctx.draw_list.cmds.items[1].rect_outline.radius);
-    try std.testing.expect(ctx.draw_list.cmds.items[1].rect_outline.aa);
-    try std.testing.expectEqual(@as(u32, 9), ctx.draw_list.cmds.items[2].rect_outline.radius);
-    try std.testing.expect(ctx.draw_list.cmds.items[2].rect_outline.aa);
+    try std.testing.expectEqual(@as(usize, 3), ctx.postFrameDrawList().cmds.items.len);
+    try std.testing.expectEqual(@as(u32, 9), ctx.postFrameDrawList().cmds.items[0].rect_filled.radius);
+    try std.testing.expect(ctx.postFrameDrawList().cmds.items[0].rect_filled.aa);
+    try std.testing.expectEqual(@as(u32, 9), ctx.postFrameDrawList().cmds.items[1].rect_outline.radius);
+    try std.testing.expect(ctx.postFrameDrawList().cmds.items[1].rect_outline.aa);
+    try std.testing.expectEqual(@as(u32, 9), ctx.postFrameDrawList().cmds.items[2].rect_outline.radius);
+    try std.testing.expect(ctx.postFrameDrawList().cmds.items[2].rect_outline.aa);
 }
 
 test "buttonBehavior: down→up across frames while hovered makes clicked true for one frame only" {
@@ -2549,7 +2674,7 @@ test "Context.beginFrame: screen_w/h are logical root clip size" {
     ctx.beginFrame(320, 240);
     try std.testing.expectEqual(@as(u32, 320), ctx.screen_w);
     try std.testing.expectEqual(@as(u32, 240), ctx.screen_h);
-    const root = ctx.draw_list.clip_stack.items[0];
+    const root = ctx.mainDrawList().clip_stack.items[0];
     try std.testing.expectEqual(@as(u32, 320), root.w);
     try std.testing.expectEqual(@as(u32, 240), root.h);
     try std.testing.expectEqual(@as(i32, 320), ctx.layout_root.?.cfg.width.fixed);
@@ -2557,25 +2682,25 @@ test "Context.beginFrame: screen_w/h are logical root clip size" {
     ctx.endFrame();
 }
 
-test "Context: beginFrame resets; endFrame keeps draw_list/id_stack/state" {
+test "Context: beginFrame resets; endFrame keeps draw state/id_stack/state" {
     var ctx = testCtx();
     defer ctx.deinit();
 
     ctx.beginFrame(800, 600);
-    try ctx.draw_list.rectFilled(.{ .x = 0, .y = 0, .w = 10, .h = 10 }, color_mod.Color.rgba(0xFF, 0, 0, 0xFF));
+    try ctx.mainDrawList().rectFilled(.{ .x = 0, .y = 0, .w = 10, .h = 10 }, color_mod.Color.rgba(0xFF, 0, 0, 0xFF));
     ctx.id_stack.push("scope");
     ctx.pushEvent(.{ .mouse_move = .{ .x = 10, .y = 10, .modifiers = 0 } });
     _ = buttonBehavior(&ctx, 1, btn_rect, full_clip);
     ctx.endFrame();
 
     // Still valid after endFrame (referenceable until the next beginFrame)
-    try std.testing.expect(ctx.draw_list.cmds.items.len > 0);
+    try std.testing.expect(ctx.postFrameDrawList().cmds.items.len > 0);
     try std.testing.expect(ctx.id_stack.stack.items.len > 0);
     try std.testing.expect(ctx.state.this_frame_hovered_any);
 
     // Reset on the next beginFrame
     ctx.beginFrame(800, 600);
-    try std.testing.expectEqual(@as(usize, 0), ctx.draw_list.cmds.items.len);
+    try std.testing.expectEqual(@as(usize, 0), ctx.mainDrawList().cmds.items.len);
     try std.testing.expectEqual(@as(usize, 0), ctx.id_stack.stack.items.len);
     try std.testing.expect(!ctx.state.this_frame_hovered_any);
     ctx.endFrame();
@@ -2713,10 +2838,10 @@ test "layout: clip_children bakes the parent rect into children's draw cmds" {
     ctx.endFrame();
 
     // Emit order: bg (clip = screen) → text (clip already intersected with parent rect)
-    try std.testing.expectEqual(@as(usize, 2), ctx.draw_list.cmds.items.len);
-    const bg_clip = ctx.draw_list.cmds.items[0].rect_filled.clip;
+    try std.testing.expectEqual(@as(usize, 2), ctx.postFrameDrawList().cmds.items.len);
+    const bg_clip = ctx.postFrameDrawList().cmds.items[0].rect_filled.clip;
     try std.testing.expectEqual(@as(u32, 800), bg_clip.w);
-    const text_clip = ctx.draw_list.cmds.items[1].text.clip;
+    const text_clip = ctx.postFrameDrawList().cmds.items[1].text.clip;
     try std.testing.expectEqual(@as(i32, 0), text_clip.x);
     try std.testing.expectEqual(@as(u32, 100), text_clip.w);
     try std.testing.expectEqual(@as(u32, 40), text_clip.h);
@@ -2750,7 +2875,7 @@ test "position: clip_children clips an overflowing positioned child's draw comma
     const badge_r = ctx.getNodeRect(badge).?;
     try std.testing.expect(badge_r.x + @as(i32, @intCast(badge_r.w)) > host_r.x + @as(i32, @intCast(host_r.w)));
     var found = false;
-    for (ctx.draw_list.cmds.items) |cmd| {
+    for (ctx.postFrameDrawList().cmds.items) |cmd| {
         if (cmd != .rect_filled) continue;
         if (cmd.rect_filled.paint != .solid or !std.meta.eql(cmd.rect_filled.paint.solid, Color.rgba(0xC0, 0x30, 0x30, 0xFF))) continue;
         try std.testing.expectEqual(@as(i32, 0), cmd.rect_filled.clip.x);
@@ -2840,20 +2965,20 @@ test "position: a tree with none keeps the in-flow rect and DrawCmd contract" {
     try std.testing.expectEqual(Rect{ .x = 0, .y = 0, .w = 40, .h = 16 }, left_r);
     try std.testing.expectEqual(Rect{ .x = 44, .y = 0, .w = 156, .h = 40 }, right_r);
 
-    try std.testing.expectEqual(@as(usize, 5), ctx.draw_list.cmds.items.len);
-    try std.testing.expect(ctx.draw_list.cmds.items[0] == .rect_filled);
-    try std.testing.expectEqual(row_r, ctx.draw_list.cmds.items[0].rect_filled.rect);
-    try std.testing.expectEqual(red, ctx.draw_list.cmds.items[0].rect_filled.paint.solid);
-    try std.testing.expectEqual(left_r, ctx.draw_list.cmds.items[1].rect_filled.rect);
-    try std.testing.expectEqual(blue, ctx.draw_list.cmds.items[1].rect_filled.paint.solid);
-    try std.testing.expectEqualStrings("ab", ctx.draw_list.cmds.items[2].text.text);
-    try std.testing.expectEqual(@as(i32, 0), ctx.draw_list.cmds.items[2].text.pos.x);
-    try std.testing.expectEqual(@as(i32, 0), ctx.draw_list.cmds.items[2].text.pos.y);
-    try std.testing.expectEqual(right_r, ctx.draw_list.cmds.items[3].rect_filled.rect);
-    try std.testing.expectEqual(green, ctx.draw_list.cmds.items[3].rect_filled.paint.solid);
-    try std.testing.expectEqualStrings("cd", ctx.draw_list.cmds.items[4].text.text);
-    try std.testing.expectEqual(@as(i32, 44), ctx.draw_list.cmds.items[4].text.pos.x);
-    try std.testing.expectEqual(@as(i32, 0), ctx.draw_list.cmds.items[4].text.pos.y);
+    try std.testing.expectEqual(@as(usize, 5), ctx.postFrameDrawList().cmds.items.len);
+    try std.testing.expect(ctx.postFrameDrawList().cmds.items[0] == .rect_filled);
+    try std.testing.expectEqual(row_r, ctx.postFrameDrawList().cmds.items[0].rect_filled.rect);
+    try std.testing.expectEqual(red, ctx.postFrameDrawList().cmds.items[0].rect_filled.paint.solid);
+    try std.testing.expectEqual(left_r, ctx.postFrameDrawList().cmds.items[1].rect_filled.rect);
+    try std.testing.expectEqual(blue, ctx.postFrameDrawList().cmds.items[1].rect_filled.paint.solid);
+    try std.testing.expectEqualStrings("ab", ctx.postFrameDrawList().cmds.items[2].text.text);
+    try std.testing.expectEqual(@as(i32, 0), ctx.postFrameDrawList().cmds.items[2].text.pos.x);
+    try std.testing.expectEqual(@as(i32, 0), ctx.postFrameDrawList().cmds.items[2].text.pos.y);
+    try std.testing.expectEqual(right_r, ctx.postFrameDrawList().cmds.items[3].rect_filled.rect);
+    try std.testing.expectEqual(green, ctx.postFrameDrawList().cmds.items[3].rect_filled.paint.solid);
+    try std.testing.expectEqualStrings("cd", ctx.postFrameDrawList().cmds.items[4].text.text);
+    try std.testing.expectEqual(@as(i32, 44), ctx.postFrameDrawList().cmds.items[4].text.pos.x);
+    try std.testing.expectEqual(@as(i32, 0), ctx.postFrameDrawList().cmds.items[4].text.pos.y);
 }
 
 test "layout: label dupes the string onto the arena (immune to later caller-buffer rewrites)" {
@@ -2868,7 +2993,7 @@ test "layout: label dupes the string onto the arena (immune to later caller-buff
     buf[0] = 'X'; // Rewrite the caller buffer before endFrame (emit)
     ctx.endFrame();
 
-    try std.testing.expectEqualStrings("hello", ctx.draw_list.cmds.items[0].text.text);
+    try std.testing.expectEqualStrings("hello", ctx.postFrameDrawList().cmds.items[0].text.text);
 }
 
 test "layout: frames unused by the layout API emit no draws and keep the rect cache" {
@@ -2886,7 +3011,7 @@ test "layout: frames unused by the layout API emit no draws and keep the rect ca
     // Frame 2: layout unused (manual DrawList compatibility)
     ctx.beginFrame(800, 600);
     ctx.endFrame();
-    try std.testing.expectEqual(@as(usize, 0), ctx.draw_list.cmds.items.len);
+    try std.testing.expectEqual(@as(usize, 0), ctx.postFrameDrawList().cmds.items.len);
     try std.testing.expect(ctx.getNodeRect(id) != null); // Keep previous values
 }
 
@@ -2915,7 +3040,7 @@ test "layout: custom leaf is called during endFrame with the final rect" {
     try std.testing.expectEqual(@as(i32, 5), cap.rect.y);
     try std.testing.expectEqual(@as(u32, 64), cap.rect.w);
     try std.testing.expectEqual(@as(u32, 32), cap.rect.h);
-    try std.testing.expectEqual(@as(usize, 1), ctx.draw_list.cmds.items.len);
+    try std.testing.expectEqual(@as(usize, 1), ctx.postFrameDrawList().cmds.items.len);
 }
 
 // ──────────────────────────────────────────────
@@ -2937,10 +3062,10 @@ test "layout: border emits in order bg → children → border" {
     ctx.endBox();
     ctx.endFrame();
 
-    try std.testing.expectEqual(@as(usize, 3), ctx.draw_list.cmds.items.len);
-    try std.testing.expect(ctx.draw_list.cmds.items[0] == .rect_filled);
-    try std.testing.expect(ctx.draw_list.cmds.items[1] == .text);
-    const outline = ctx.draw_list.cmds.items[2].rect_outline;
+    try std.testing.expectEqual(@as(usize, 3), ctx.postFrameDrawList().cmds.items.len);
+    try std.testing.expect(ctx.postFrameDrawList().cmds.items[0] == .rect_filled);
+    try std.testing.expect(ctx.postFrameDrawList().cmds.items[1] == .text);
+    const outline = ctx.postFrameDrawList().cmds.items[2].rect_outline;
     try std.testing.expectEqual(@as(u32, 2), outline.thickness);
     try std.testing.expectEqual(@as(u32, 100), outline.rect.w);
 }
@@ -2957,15 +3082,15 @@ test "label: default color follows the primary text token" {
     ctx.endBox();
     ctx.endFrame();
 
-    try std.testing.expectEqual(red, ctx.draw_list.cmds.items[0].text.color);
+    try std.testing.expectEqual(red, ctx.postFrameDrawList().cmds.items[0].text.color);
 }
 
 // ──────────────────────────────────────────────
 // tooltip
 // ──────────────────────────────────────────────
 
-fn tooltipHasText(ctx: *const Context, expected: []const u8) bool {
-    for (ctx.draw_list.cmds.items) |cmd| {
+fn tooltipHasText(ctx: *Context, expected: []const u8) bool {
+    for (ctx.postFrameDrawList().cmds.items) |cmd| {
         // Path commands are not tooltip labels; only `.text` is inspected.
         if (cmd == .text and std.mem.eql(u8, cmd.text.text, expected)) return true;
     }
@@ -2976,16 +3101,16 @@ fn tooltipHasText(ctx: *const Context, expected: []const u8) bool {
 /// nearest filled rect. The tooltip is emitted as a layer — a box with a background, its
 /// children, then its border — so the background is the last fill before the text rather
 /// than a fixed number of commands away.
-fn tooltipOverlayBgRect(ctx: *const Context, tip: []const u8) ?Rect {
+fn tooltipOverlayBgRect(ctx: *Context, tip: []const u8) ?Rect {
     var i: usize = 0;
-    while (i < ctx.draw_list.cmds.items.len) : (i += 1) {
-        const cmd = ctx.draw_list.cmds.items[i];
+    while (i < ctx.postFrameDrawList().cmds.items.len) : (i += 1) {
+        const cmd = ctx.postFrameDrawList().cmds.items[i];
         if (cmd != .text or !std.mem.eql(u8, cmd.text.text, tip)) continue;
         var j = i;
         while (j > 0) {
             j -= 1;
-            if (ctx.draw_list.cmds.items[j] == .rect_filled) {
-                return ctx.draw_list.cmds.items[j].rect_filled.rect;
+            if (ctx.postFrameDrawList().cmds.items[j] == .rect_filled) {
+                return ctx.postFrameDrawList().cmds.items[j].rect_filled.rect;
             }
         }
         return null;
@@ -3080,7 +3205,7 @@ test "tooltip: a one-line tooltip keeps the popup item height and centres its te
 
     // And the text sits centred in that row rather than at its top.
     var text_y: ?i32 = null;
-    for (ctx.draw_list.cmds.items) |cmd| {
+    for (ctx.postFrameDrawList().cmds.items) |cmd| {
         if (cmd == .text and std.mem.eql(u8, cmd.text.text, "tip")) text_y = cmd.text.pos.y;
     }
     const row_y = bg.y + pad;
@@ -3150,7 +3275,7 @@ test "layer: an anchor that is not in this frame is not drawn at the old place" 
 
     // The anchor is gone this frame. The layer keeps being built — an application asking for
     // it does not know its anchor vanished — and must simply not appear.
-    const before = ctx.draw_list.cmds.items.len;
+    const before = ctx.postFrameDrawList().cmds.items.len;
     _ = before;
     ctx.beginFrameAt(400, 300, 0.1);
     (LayerFixture{ .key = 1, .anchor_id = 300, .box_id = 310 }).build(&ctx);
@@ -3307,7 +3432,7 @@ test "layer: emission puts every layer after the main tree, in z order" {
 
     var order: [3]u8 = .{ 0, 0, 0 };
     var n: usize = 0;
-    for (ctx.draw_list.cmds.items) |cmd| {
+    for (ctx.postFrameDrawList().cmds.items) |cmd| {
         if (cmd != .rect_filled) continue;
         if (cmd.rect_filled.paint != .solid) continue;
         const c = cmd.rect_filled.paint.solid;
@@ -3318,6 +3443,44 @@ test "layer: emission puts every layer after the main tree, in z order" {
     }
     // main, then z = 1, then z = 10: the draw list itself, not just the comparator.
     try std.testing.expectEqual([3]u8{ 1, 2, 3 }, order);
+}
+
+test "layer: custom leaves emit into one list in tree then layer order" {
+    var ctx = testCtx();
+    defer ctx.deinit();
+
+    const Capture = struct {
+        color: Color,
+        list: ?*DrawList = null,
+
+        fn drawFn(ctx_ptr: *anyopaque, dl: *DrawList, rect: Rect) void {
+            const self: *@This() = @ptrCast(@alignCast(ctx_ptr));
+            self.list = dl;
+            dl.rectFilled(rect, self.color) catch @panic("custom leaf: OOM");
+        }
+    };
+    var main_cap = Capture{ .color = Color.rgba(0x11, 0x11, 0x11, 0xFF) };
+    var layer_cap = Capture{ .color = Color.rgba(0x22, 0x22, 0x22, 0xFF) };
+
+    ctx.beginFrameAt(400, 300, 0.0);
+    ctx.beginBox(.{ .width = .{ .fixed = 40 }, .height = .{ .fixed = 20 } });
+    ctx.custom(.{ .x = 40, .y = 20 }, Capture.drawFn, &main_cap);
+    ctx.endBox();
+    ctx.beginBox(.{
+        .layer = .{ .key = .{ .value = 1 }, .placement = .{ .source = .{ .point = .{ .x = 0, .y = 0 } } } },
+        .width = .{ .fixed = 40 },
+        .height = .{ .fixed = 20 },
+    });
+    ctx.custom(.{ .x = 40, .y = 20 }, Capture.drawFn, &layer_cap);
+    ctx.endBox();
+    ctx.endFrame();
+
+    const cmds = ctx.postFrameDrawList().cmds.items;
+    try std.testing.expectEqual(@as(usize, 2), cmds.len);
+    try std.testing.expectEqual(main_cap.color, cmds[0].rect_filled.paint.solid);
+    try std.testing.expectEqual(layer_cap.color, cmds[1].rect_filled.paint.solid);
+    try std.testing.expectEqual(@intFromPtr(main_cap.list.?), @intFromPtr(layer_cap.list.?));
+    try std.testing.expectEqual(@intFromPtr(main_cap.list.?), @intFromPtr(ctx.postFrameDrawList()));
 }
 
 test "layer: a root sizes against the boundary, not against a parent it does not have" {
@@ -3346,9 +3509,8 @@ test "layer: a marker subtree may not take input" {
     ctx.beginBox(.{
         .layer = .{ .key = .{ .value = 1 }, .placement = .{ .source = .{ .point = .{ .x = 0, .y = 0 } } } },
     });
-    try std.testing.expect(ctx.display_only_depth > 0);
     ctx.endBox();
-    try std.testing.expectEqual(@as(u32, 0), ctx.display_only_depth);
+    _ = ctx.mainDrawList();
     ctx.endFrame();
 }
 
@@ -3356,11 +3518,12 @@ test "layer: a frame with neither a layout tree nor a layer leaves the draw list
     var ctx = testCtx();
     defer ctx.deinit();
     ctx.beginFrameAt(400, 300, 0.0);
-    ctx.draw_list.rectFilled(.{ .x = 0, .y = 0, .w = 4, .h = 4 }, Color.rgba(1, 2, 3, 4)) catch unreachable;
-    const n = ctx.draw_list.cmds.items.len;
+    const dl = ctx.mainDrawList();
+    dl.rectFilled(.{ .x = 0, .y = 0, .w = 4, .h = 4 }, Color.rgba(1, 2, 3, 4)) catch unreachable;
+    const n = dl.cmds.items.len;
     ctx.endFrame();
     // The manual DrawList path is untouched: no layout, no cache update, no emit.
-    try std.testing.expectEqual(n, ctx.draw_list.cmds.items.len);
+    try std.testing.expectEqual(n, ctx.postFrameDrawList().cmds.items.len);
 }
 
 test "layer: a frame with no main tree but a layer still places and draws it" {
@@ -3383,10 +3546,10 @@ test "tooltip: the overlay is emitted after the ordinary UI, so it draws on top"
     ctx.endFrame();
     const before_tip_len = blk: {
         hoverButtonWithTip(&ctx, 1, "Btn", "tail tip", 0.0);
-        break :blk ctx.draw_list.cmds.items.len;
+        break :blk ctx.postFrameDrawList().cmds.items.len;
     };
     hoverButtonWithTip(&ctx, 1, "Btn", "tail tip", 0.5);
-    const cmds = ctx.draw_list.cmds.items;
+    const cmds = ctx.postFrameDrawList().cmds.items;
     try std.testing.expect(cmds.len > before_tip_len);
     // The tooltip is a layer, so it emits a background, its content and a border. What the
     // ordering has to guarantee is that all of it lands after the frame's ordinary UI —
@@ -3727,7 +3890,7 @@ test "tooltipBox: image pixels from the frame arena survive emit" {
     hoverButtonWithBox(&ctx, 1, "Btn", ImageTip.build, &dummy, 0.5);
 
     var saw_image = false;
-    for (ctx.draw_list.cmds.items) |cmd| {
+    for (ctx.postFrameDrawList().cmds.items) |cmd| {
         if (cmd == .image) {
             saw_image = true;
             try std.testing.expectEqual(@as(u32, 2), cmd.image.src_w);
@@ -3736,6 +3899,64 @@ test "tooltipBox: image pixels from the frame arena survive emit" {
         }
     }
     try std.testing.expect(saw_image);
+}
+
+test "tooltipBox: custom leaf emits at the tooltip layer position" {
+    var ctx = testCtx();
+    defer ctx.deinit();
+
+    const CustomTip = struct {
+        color: Color,
+        list: ?*DrawList = null,
+
+        fn build(ptr: *anyopaque, c: *Context) void {
+            c.beginBox(.{ .width = .{ .fixed = 40 }, .height = .{ .fixed = 20 } });
+            c.custom(.{ .x = 40, .y = 20 }, @This().draw, ptr);
+            c.endBox();
+        }
+
+        fn draw(ptr: *anyopaque, dl: *DrawList, rect: Rect) void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.list = dl;
+            dl.rectFilled(rect, self.color) catch @panic("tooltip custom leaf: OOM");
+        }
+    };
+    const main_color = Color.rgba(0x11, 0x11, 0x11, 0xFF);
+    const tooltip_color = Color.rgba(0x22, 0x22, 0x22, 0xFF);
+    const post_color = Color.rgba(0x33, 0x33, 0x33, 0xFF);
+    var tip = CustomTip{ .color = tooltip_color };
+
+    ctx.beginFrameAt(800, 600, 0.0);
+    _ = ctx.buttonId(1, "Btn", .{});
+    ctx.endFrame();
+    hoverButtonWithBox(&ctx, 1, "Btn", CustomTip.build, &tip, 0.0);
+
+    ctx.beginFrameAt(800, 600, 0.5);
+    const r = ctx.getNodeRect(1).?;
+    ctx.pushEvent(.{ .mouse_move = .{
+        .x = r.x + @as(i32, @intCast(r.w / 2)),
+        .y = r.y + @as(i32, @intCast(r.h / 2)),
+        .modifiers = 0,
+    } });
+    try ctx.mainDrawList().rectFilled(.{ .x = 0, .y = 0, .w = 4, .h = 4 }, main_color);
+    _ = ctx.buttonId(1, "Btn", .{});
+    ctx.tooltipBox(CustomTip.build, &tip);
+    ctx.endFrame();
+    try ctx.postFrameDrawList().rectFilled(.{ .x = 4, .y = 0, .w = 4, .h = 4 }, post_color);
+
+    var main_index: ?usize = null;
+    var tooltip_index: ?usize = null;
+    var post_index: ?usize = null;
+    for (ctx.postFrameDrawList().cmds.items, 0..) |cmd, i| {
+        if (cmd != .rect_filled or cmd.rect_filled.paint != .solid) continue;
+        const color = cmd.rect_filled.paint.solid;
+        if (std.meta.eql(color, main_color)) main_index = i;
+        if (std.meta.eql(color, tooltip_color)) tooltip_index = i;
+        if (std.meta.eql(color, post_color)) post_index = i;
+    }
+    try std.testing.expectEqual(@intFromPtr(ctx.postFrameDrawList()), @intFromPtr(tip.list.?));
+    try std.testing.expect(main_index.? < tooltip_index.?);
+    try std.testing.expect(tooltip_index.? < post_index.?);
 }
 
 // ── Keyboard focus traversal ──
@@ -4101,7 +4322,7 @@ test "Context: the lifecycle contracts hold for ordinary use" {
     ctx.endDisabled();
     ctx.endBox();
     ctx.endFrame();
-    try std.testing.expect(!ctx.frame_active);
+    _ = ctx.postFrameDrawList();
 
     // The post-frame APIs are legal exactly where the frame is closed.
     _ = ctx.popupMenu(1, &.{});
@@ -4126,16 +4347,16 @@ test "Context: a slider group opened and closed in one frame leaves no state beh
     try std.testing.expectEqual(@as(u32, 0), ctx.disabled_depth);
 }
 
-fn countTextCmds(ctx: *const Context) usize {
+fn countTextCmds(ctx: *Context) usize {
     var n: usize = 0;
-    for (ctx.draw_list.cmds.items) |cmd| {
+    for (ctx.postFrameDrawList().cmds.items) |cmd| {
         if (cmd == .text) n += 1;
     }
     return n;
 }
 
-fn firstText(ctx: *const Context) ?draw.DrawCmd {
-    for (ctx.draw_list.cmds.items) |cmd| {
+fn firstText(ctx: *Context) ?draw.DrawCmd {
+    for (ctx.postFrameDrawList().cmds.items) |cmd| {
         if (cmd == .text) return cmd;
     }
     return null;
@@ -4152,7 +4373,7 @@ test "label: explicit newline is two lines without wrap" {
     try std.testing.expectEqual(@as(usize, 2), countTextCmds(&ctx));
     var i: usize = 0;
     var texts: [2][]const u8 = .{ "", "" };
-    for (ctx.draw_list.cmds.items) |cmd| {
+    for (ctx.postFrameDrawList().cmds.items) |cmd| {
         if (cmd == .text) {
             texts[i] = cmd.text.text;
             i += 1;
@@ -4214,7 +4435,7 @@ test "text: ellipsis + max_lines=0 is one line with a marker (wrap on and off)" 
     ctx.endBox();
     ctx.endFrame();
     try std.testing.expectEqual(@as(usize, 2), countTextCmds(&ctx));
-    for (ctx.draw_list.cmds.items) |cmd| {
+    for (ctx.postFrameDrawList().cmds.items) |cmd| {
         if (cmd == .text) {
             try std.testing.expect(std.mem.endsWith(u8, cmd.text.text, "..."));
             try std.testing.expect(@as(i32, @intCast(ctx.font.measure(cmd.text.text))) <= 40);
@@ -4242,7 +4463,7 @@ test "text: clip + max_lines>0 hard-cuts without an ellipsis" {
     ctx.endBox();
     ctx.endFrame();
     try std.testing.expectEqual(@as(usize, 2), countTextCmds(&ctx));
-    for (ctx.draw_list.cmds.items) |cmd| {
+    for (ctx.postFrameDrawList().cmds.items) |cmd| {
         if (cmd == .text) try std.testing.expect(!std.mem.endsWith(u8, cmd.text.text, "..."));
     }
 }
@@ -4257,7 +4478,7 @@ test "text: ellipsis + max_lines=3 puts the marker on the last visible line" {
     ctx.endFrame();
     try std.testing.expectEqual(@as(usize, 3), countTextCmds(&ctx));
     var last: []const u8 = "";
-    for (ctx.draw_list.cmds.items) |cmd| {
+    for (ctx.postFrameDrawList().cmds.items) |cmd| {
         if (cmd == .text) last = cmd.text.text;
     }
     try std.testing.expect(std.mem.endsWith(u8, last, "..."));
@@ -4284,7 +4505,7 @@ test "text: non-wrap explicit newline + ellipsis width-guarantees every line" {
     ctx.endFrame();
     try std.testing.expectEqual(@as(usize, 2), countTextCmds(&ctx));
     var i: usize = 0;
-    for (ctx.draw_list.cmds.items) |cmd| {
+    for (ctx.postFrameDrawList().cmds.items) |cmd| {
         if (cmd != .text) continue;
         try std.testing.expect(@as(i32, @intCast(ctx.font.measure(cmd.text.text))) <= 40);
         if (i == 0) try std.testing.expect(std.mem.endsWith(u8, cmd.text.text, "..."));
@@ -4303,7 +4524,7 @@ test "text: non-wrap explicit newline + max_lines ellipsis targets the last visi
     ctx.endFrame();
     try std.testing.expectEqual(@as(usize, 2), countTextCmds(&ctx));
     var last: []const u8 = "";
-    for (ctx.draw_list.cmds.items) |cmd| {
+    for (ctx.postFrameDrawList().cmds.items) |cmd| {
         if (cmd == .text) last = cmd.text.text;
     }
     try std.testing.expect(std.mem.endsWith(u8, last, "..."));
@@ -4323,7 +4544,7 @@ fn labelEveryTier(ctx: *Context, out_color: *[tier_count]Color, out_font: *[tier
     ctx.endBox();
     ctx.endFrame();
     var n: usize = 0;
-    for (ctx.draw_list.cmds.items) |cmd| {
+    for (ctx.postFrameDrawList().cmds.items) |cmd| {
         if (cmd != .text) continue;
         if (n == tier_count) return error.TestUnexpectedResult;
         out_color[n] = cmd.text.color;
@@ -4402,7 +4623,7 @@ test "labelStyled: uses the text path for paragraphs and overflow" {
     try std.testing.expectEqual(@as(usize, 4), countTextCmds(&ctx));
     var texts: [4][]const u8 = .{ "", "", "", "" };
     var i: usize = 0;
-    for (ctx.draw_list.cmds.items) |cmd| {
+    for (ctx.postFrameDrawList().cmds.items) |cmd| {
         if (cmd == .text) {
             texts[i] = cmd.text.text;
             i += 1;

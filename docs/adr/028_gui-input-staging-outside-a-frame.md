@@ -6,7 +6,7 @@ Status: Accepted
 
 `libs/gui` is immediate mode: a caller opens a frame with `beginFrame`, hands the frame its
 input, builds widgets, and closes the frame with `endFrame`. Until now `pushEvent` and
-`setComposition` asserted `frame_active`, so input was only legal between those two calls.
+`setComposition` used to require the frame-build interval, so input was only legal between those two calls.
 
 An application author writing against `kit` forwarded window events in the order a native
 loop makes natural — poll the window, hand the events to the GUI, then open the frame — and

@@ -357,7 +357,7 @@ This shell was asked to reproduce four capabilities (drag-and-drop, tooltip, gam
 Only two of the four are genuine gaps:
 
 - **Drag and drop**: no dedicated API. Pointer glue in `main.zig` (press-on-a-filled-slot starts a drag,
-  release hit-tests the destination) plus a translucent ghost square drawn directly onto `ctx.draw_list`
+  release hit-tests the destination) plus a translucent ghost square drawn directly onto `ctx.postFrameDrawList()`
   after `endFrame` (the same "overlay after the layout tree" placement `popup.zig` uses for popups and
   `ctx.tooltip`) are both example-side. **Requested here; not filed as a new task** per this family's
   standing rule — recorded as a hack (pointer glue) plus a custom draw (the ghost) in §17.2.
@@ -400,9 +400,9 @@ unimplemented" in this family, grep libs/gui/src for the capability first.**
 | drag-and-drop pointer glue | 1 | press-on-filled-slot starts drag / release hit-tests destination / locked slots and locked destinations reject it (`ui.beginDrag`/`endDrag`) |
 | 2D grid cursor nav | 1 | `moveCursor`/`activateCursor`, shared by keyboard arrows+Enter/Space and gamepad dpad+A (one gap, two input devices) |
 | knob interaction | 1 | vertical mouse-drag → value, hand-rolled hit-test against a reserved `beginBox` |
-| drag ghost (custom draw) | 1 | translucent `rectFilled` at the cursor, direct `ctx.draw_list` use after `endFrame` |
-| knob face + indicator (custom draw) | 1 | base-plate `rectFilled`/`rectOutline` plus one angle-placed indicator dot, direct `ctx.draw_list` use |
-| rarity-dim overlay (custom draw) | 1 | a translucent `rectFilled` over each slot below the knob's threshold, direct `ctx.draw_list` use |
+| drag ghost (custom draw) | 1 | translucent `rectFilled` at the cursor, direct `ctx.postFrameDrawList()` use after `endFrame` |
+| knob face + indicator (custom draw) | 1 | base-plate `rectFilled`/`rectOutline` plus one angle-placed indicator dot, direct `ctx.postFrameDrawList()` use |
+| rarity-dim overlay (custom draw) | 1 | a translucent `rectFilled` over each slot below the knob's threshold, direct `ctx.postFrameDrawList()` use |
 
 ### 17.3 Scorecard
 

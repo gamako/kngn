@@ -2636,6 +2636,10 @@ pub fn build(b: *std.Build) void {
             .{ .case = "display_only_button_behavior", .message = "buttonBehavior is not allowed in a display-only subtree" },
             .{ .case = "tooltip_builder_unclosed_box", .message = "tooltipBox builder left a box open" },
             .{ .case = "tooltip_builder_id_stack", .message = "tooltipBox builder left the id stack unbalanced" },
+            .{ .case = "marker_main_draw_list", .message = "mainDrawList is not available in phase display_only_build" },
+            .{ .case = "marker_post_frame_draw_list", .message = "postFrameDrawList is not available in phase display_only_build" },
+            .{ .case = "tooltip_main_draw_list", .message = "mainDrawList is not available in phase display_only_build" },
+            .{ .case = "tooltip_post_frame_draw_list", .message = "postFrameDrawList is not available in phase display_only_build" },
         };
         for (cases) |c| {
             const run_guard = b.addRunArtifact(guard_exe);

@@ -402,7 +402,7 @@ fn updatePopupGeo(app: *App) void {
 }
 
 /// After endFrame: the item context menu (Lock / Discard), the drag ghost, and the knob's radial
-/// indicator (all drawn directly onto `ctx.draw_list`, the same "overlay after the layout tree"
+/// indicator (all drawn directly onto `postFrameDrawList()`, the same "overlay after the layout tree"
 /// placement `popup.zig` uses for popups and tooltips -- not a per-pixel custom rasterizer, a
 /// fixed small number of `rectFilled`/`text` calls).
 pub fn handleOverlays(app: *App) void {
@@ -433,7 +433,7 @@ pub fn handleOverlays(app: *App) void {
         app.context_outer = .{ .x = 0, .y = 0, .w = 0, .h = 0 };
     }
 
-    const dl = &ctx.draw_list;
+    const dl = ctx.postFrameDrawList();
 
     // Rarity dim overlay: a translucent dark rect over every filled, non-empty slot below the
     // knob's threshold. Read back through the same rect cache the hit-tests use, so this always

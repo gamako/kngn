@@ -114,7 +114,7 @@ pub fn main(init: std.process.Init) !void {
 
         ctx.endFrame();
 
-        gui.render(target, &ctx.draw_list, ctx.font, 1.0);
+        gui.render(target, ctx.postFrameDrawList(), ctx.font, 1.0);
         window.present();
     }
 }
