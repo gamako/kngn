@@ -778,30 +778,56 @@ coordinate domain.
 ### Layers, and the second field on `BoxConfig`
 
 A layer is a subtree that leaves its parent's box entirely. The marker that says so is another
-field on `BoxConfig`, which every box copies into its node every frame, so the same question
-applies as before: does a tree that never opens a layer get slower?
+field on `BoxConfig`, which every box copies into its node every frame. The public field is a
+call-time `?*const LayerSpec` handle: `beginBox` copies the specification into the layer record
+and no later phase dereferences the caller's pointer. This keeps the marker's metadata out of
+the inline footprint paid by every box.
 
-`layer-0` is the control — a host with 32 boxes and no layer — against `layer-1`, `layer-4` and
-`layer-32` on the same host. `position-0` and `flow-100` carry over from the previous change and
-are the trees that have before-numbers on both sides of it.
+`layer-0` is the no-marker control — a host with 32 boxes and no layer — against `layer-1`,
+`layer-4` and `layer-32` on the same host. `position-0` and `flow-100` carry over from the
+previous change and are the trees that have before-numbers on both sides of it.
 
-| scenario | after the previous change | after this one | boxes |
+| scenario | before (`yxovuyrx`) | after | boxes |
 |---|---:|---:|---:|
-| `position-0` | 50637 | 50585 | 2 |
-| `flow-100` | 53562 | 55786 | 101 |
-| `layer-0` | — | 52454 | 33 |
-| `layer-1` | — | 52454 | 34 |
-| `layer-32` | — | 61390 | 65 |
+| `layer-0` | 52673 | 55580 | 33 |
+| `layer-1` | 59538 | 51685 | 34 |
+| `layer-4` | 54455 | 54600 | 37 |
+| `layer-32` | 59671 | 60679 | 65 |
 
-Medians of 3. `flow-100` spans 54939–60038 across those three runs, 9% apart, so its median
-moving 4% says nothing; `position-0`, the smallest tree and therefore the one where a wider
-`BoxConfig` weighs most per box, did not move. **No regression detected** is what this supports.
+Medians of three runs on each revision, Apple Silicon macOS (`aarch64-darwin`), ReleaseFast, no
+display, logical 1024×768, 100 warm-up frames and 1000 measured frames. The before revision is
+the preceding draw-list revision `yxovuyrx`; after is the current layer-routing workspace. The
+required no-marker control, `layer-0`, has a 5.5% median difference, while its before samples
+span 52103–109733 ns and its after samples span 49582–73826 ns. The spread is larger than that
+difference, so the result supports **no regression detected**, not a speedup claim.
 
-`@sizeOf(BoxConfig)` is now **224 bytes**, from 168 before this change and 128 before the one
-before it. Two features have each added a field to the struct every box carries. Neither shows
-up in the controls, but the trend is worth naming: a third field of this size would be worth
-paying for differently — by making the marker a handle into a side table rather than the
-placement itself — rather than by measuring again and finding it still inside the noise.
+The timing is noise-dominated, so it is not the load-bearing evidence. The same run reports
+`alloc_calls=0` and `peak_bytes=0` for `layer-0`, and those are exact: a frame that submits no
+marker performs no allocation for the feature at all. That is what the rule about a new feature
+costing nothing to the code that does not use it actually asks for, and unlike a nanosecond
+median it cannot drift between runs. Read the two together — the counter for the contract, the
+median only to catch an order-of-magnitude change.
+
+#### BoxConfig layout measurement
+
+The following diagnostic was measured on Apple Silicon macOS (`aarch64-darwin`) with Zig 0.16.
+It records the three relevant layouts: the inline marker as it existed before this change, the
+same inline marker after adding the input policy and outside-dismissal flag, and the handle used
+by the current implementation. The optional payload sizes are included so the 48-byte saving is
+reproducible rather than inferred from the field declaration.
+
+| condition | `BoxConfig` | marker field |
+|---|---:|---:|
+| Existing inline `?LayerSpec` before the handle | 224 bytes | `?LayerSpec` = 56 bytes |
+| Inline `?LayerSpec` with `input` and `dismiss_on_outside` | 224 bytes | `?LayerSpec` = 56 bytes |
+| Current call-time handle `?*const LayerSpec` | 176 bytes | `?*const LayerSpec` = 8 bytes |
+
+The inline extension fits existing alignment padding, so it does not change the 224-byte
+`BoxConfig` result, but it still embeds a 56-byte optional payload in every node. The handle moves
+that rare metadata to the per-frame layer record and reduces the per-box footprint to 176 bytes.
+The benchmark itself prints the current `BoxConfig` size; the historical inline value comes from
+the same benchmark at `yxovuyrx`, and the optional payload values come from the current diagnostic
+run.
 
 ### `bench-path` (one run, ns and scratch peak)
 

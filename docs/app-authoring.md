@@ -43,6 +43,91 @@ it publishes, the sample that is the worked example for each, and the places whe
 the source leads to the wrong call. This document is the one to read through; that one is the
 one to look things up in.
 
+### 2.1 Declarative layers and input ownership
+
+`kit.gui` exposes declarative layer markers for surfaces such as dropdowns, menus and anchored
+popovers. A marker is also the layer's presence declaration: application state decides whether
+the marked box is submitted in a frame. The `Context` does not keep a second open bit, and there
+is no `openLayer` / `closeLayer` lifecycle to synchronize with that state.
+
+The marker is drawn in the frame in which it is submitted. Generic pointer, keyboard, focus and
+wheel routing is selected at `beginFrame` from modal layers that were placed in the previous
+completed frame. Thus a newly visible modal layer draws immediately but begins owning framework
+input on the following frame. The frontmost layer is the highest `z`, with declaration order as
+the tie-breaker, among that previous-frame set.
+
+`BoxConfig.layer` is a call-time handle. `beginBox` copies the pointed-to `LayerSpec` before it
+returns; the specification only needs to remain alive for that call. This is valid for a local
+specification and for a temporary literal:
+
+```zig
+const key: gui.LayerKey = .{ .value = 0x4801 };
+const spec: gui.LayerSpec = .{
+    .key = key,
+    .z = 10,
+    .placement = .{ .source = .{ .id = trigger_id }, .side = .below },
+    .input = .modal,
+    .dismiss_on_outside = true,
+};
+ctx.beginBox(.{ .layer = &spec, .width = .{ .fixed = 280 }, .height = .fit });
+defer ctx.endBox();
+```
+
+An outside press does not close application state by itself. `dismiss_on_outside` requests a
+latched frame event; the consumer must read `ctx.layerDismissed(key)` and clear its own state.
+Ignoring the event is allowed and does not panic, so a consumer can keep submitting the marker.
+The event is reported only for the top previous-frame placed modal layer and never propagates to
+the main tree.
+
+Raw `ctx.input` remains raw and is not filtered by the layer router. A host shortcut that reads
+raw keyboard input must gate its action with `ctx.wantsKeyboard()` (and use the corresponding
+`wantsTextInput()` result for text-input ownership). Code inside the modal consumer may read the
+same raw input for its own commands, such as Escape, and update its own state:
+
+```zig
+const escape_pressed = ctx.input.wasPressed(escape_code);
+const escape_consumed = self.dropdown_open and escape_pressed;
+if (escape_consumed) self.dropdown_open = false;
+if (escape_pressed and !escape_consumed and !ctx.wantsKeyboard()) {
+    self.main_escape_count += 1;
+}
+```
+
+Here is the smallest dropdown shape. The trigger owns `dropdown_open`, and the marker is built
+only while that state is true. A real dropdown can put a text field and list rows inside the
+marked box; they use the ordinary widget calls and inherit the modal scope. `options` and
+`selected_row` below are application-owned state:
+
+```zig
+fn buildDropdown(self: *App, ctx: *gui.Context, trigger_id: gui.Id) void {
+    const key: gui.LayerKey = .{ .value = 0x4801 };
+    if (ctx.layerDismissed(key)) self.dropdown_open = false;
+    if (!self.dropdown_open) return;
+
+    const spec: gui.LayerSpec = .{
+        .key = key,
+        .z = 10,
+        .placement = .{ .source = .{ .id = trigger_id }, .side = .below,
+            .flip = .main_axis, .shift = .both_axes },
+        .input = .modal,
+        .dismiss_on_outside = true,
+    };
+    ctx.beginBox(.{ .id = 0x4803, .layer = &spec, .direction = .column,
+        .width = .{ .fixed = 280 }, .height = .fit, .gap = 8 });
+    _ = ctx.textInputId(0x4804, &self.search, .{ .placeholder = "Search colors" });
+    for (options, 0..) |label, i| {
+        const row = ctx.beginListboxRow(0x4810 + @as(gui.Id, @intCast(i)), self.selected_row == i, .{});
+        ctx.label(label);
+        ctx.endListboxRow();
+        if (row.activated) {
+            self.selected_row = i;
+            self.dropdown_open = false;
+        }
+    }
+    ctx.endBox();
+}
+```
+
 ## 3. The `Runtime(App)` shape
 
 Prefer `kit.app_runtime.Runtime(App)` over a hand-written event loop. The app provides:
