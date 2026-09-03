@@ -154,6 +154,14 @@ const FocusScopeEntry = struct {
     layer_key: ?LayerKey = null,
     enabled: bool = true,
 };
+
+/// A main-tree control that may receive a pointer click while its own menu layer owns the route.
+/// Command targets are explicit widgets, not a subtree-wide escape hatch. Their geometry is
+/// still read from the previous-frame rect cache, just like every other synchronous hit-test.
+const CommandTarget = struct {
+    id: Id,
+    route_key: LayerKey,
+};
 pub const Color = color_mod.Color;
 pub const Id = id_mod.Id;
 pub const IdStack = id_mod.IdStack;
@@ -411,6 +419,11 @@ pub const Context = struct {
     layer_scope_stack: [max_layers]LayerScope = undefined,
     layer_scope_depth: usize = 0,
     current_layer_scope: LayerScope = .{},
+    /// Main-tree command targets registered by menuBar for the current frame. These are only
+    /// eligible when the named menu layer is the previous-frame route owner and the press is
+    /// outside that layer's previous root rect.
+    command_targets: [max_layers]CommandTarget = undefined,
+    command_targets_len: usize = 0,
     /// beginBox / endBox cursor (current parent)
     layout_current: ?*layout.Node = null,
     /// Layout sanity is opt-in; the result is copied out of the frame arena after the tree scan.
@@ -538,6 +551,7 @@ pub const Context = struct {
     pub const button = widgets.button;
     pub const buttonEx = widgets.buttonEx;
     pub const buttonId = widgets.buttonId;
+    pub const commandButtonId = widgets.commandButtonId;
     pub const colorSwatch = widgets.colorSwatch;
     pub const colorSwatchEx = widgets.colorSwatchEx;
     pub const colorSwatchId = widgets.colorSwatchId;
@@ -753,6 +767,7 @@ pub const Context = struct {
         // The layer records point into the arena that was just released. The slots do not:
         // they are what carries a layer's geometry across the reset.
         self.layers_len = 0;
+        self.command_targets_len = 0;
         self.input.beginFrame();
         self.id_stack.clear();
         self.state.beginFrame();
@@ -1834,6 +1849,65 @@ pub const Context = struct {
         return if (self.dismissed_layer_key) |dismissed| dismissed.eql(layer_key) else false;
     }
 
+    /// Register one explicit main-tree control that menuBar may keep clickable while its own
+    /// modal layer owns the route. The control is only eligible for pointer input outside that
+    /// layer's previous-frame root; it never opens a general escape from modal routing.
+    pub fn registerCommandTarget(self: *Context, id: Id, route_key: LayerKey) void {
+        self.requireFrame("registerCommandTarget");
+        self.requireInteractiveAllowed("registerCommandTarget");
+        requireContract(id != 0, "command target requires a non-zero id");
+        var i: usize = 0;
+        while (i < self.command_targets_len) : (i += 1) {
+            requireContract(self.command_targets[i].id != id, "two command targets with the same id in one frame");
+        }
+        requireContract(self.command_targets_len < self.command_targets.len, "more command targets than the maximum");
+        self.command_targets[self.command_targets_len] = .{ .id = id, .route_key = route_key };
+        self.command_targets_len += 1;
+    }
+
+    fn commandTargetRegistered(self: *const Context, id: Id, route_key: LayerKey) bool {
+        for (self.command_targets[0..self.command_targets_len]) |target| {
+            if (target.id == id and target.route_key.eql(route_key)) return true;
+        }
+        return false;
+    }
+
+    /// Whether a registered command target may use the pointer at `point`. The named menu must
+    /// own the previous-frame route, and the point must be outside that route owner's root.
+    /// Visible modal descendants therefore win before this exception is considered.
+    fn commandTargetOutsideRoute(self: *const Context, id: Id, route_key: LayerKey, point: Vec2) bool {
+        if (!self.commandTargetRegistered(id, route_key)) return false;
+        const frontmost = self.layer_route.frontmost_key orelse return false;
+        if (!frontmost.eql(route_key)) return false;
+        const root = self.layerPrevRect(route_key) orelse return false;
+        const screen = Rect{ .x = 0, .y = 0, .w = self.screen_w, .h = self.screen_h };
+        return !pointHitsVisible(root, screen, point);
+    }
+
+    /// Pointer permission for a command target. Hover and press use their own edge coordinates;
+    /// an already active target remains eligible for release even if the pointer later moves.
+    fn commandTargetPointerEnabled(
+        self: *const Context,
+        id: Id,
+        route_key: LayerKey,
+        rect: Rect,
+        clip: Rect,
+    ) bool {
+        if (self.current_layer_scope.pointer_enabled) return true;
+        if (self.state.active_id == id) return true;
+        if (self.commandTargetOutsideRoute(id, route_key, self.input.mouse_pos) and
+            pointHitsVisible(rect, clip, self.input.mouse_pos)) return true;
+        return self.input.mouse_pressed.left and
+            self.commandTargetOutsideRoute(id, route_key, self.input.mouse_pressed_pos) and
+            pointHitsVisible(rect, clip, self.input.mouse_pressed_pos);
+    }
+
+    fn noteCommandTargetPress(self: *Context, route_key: LayerKey) void {
+        if (self.dismissed_layer_key) |dismissed| {
+            if (dismissed.eql(route_key)) self.dismissed_layer_key = null;
+        }
+    }
+
     /// The key the tooltip layer occupies. Reserved rather than derived, because there is
     /// exactly one tooltip at a time and its slot has to be the same one across frames.
     const tooltip_layer_key: LayerKey = .{ .value = 0x0071717 };
@@ -2458,19 +2532,35 @@ pub fn pointHitsVisible(rect: Rect, clip: Rect, p: Vec2) bool {
 /// steal active. Click on release succeeds only when `pointHitsVisible` (inside the visible region).
 /// Contract that keeps TextInput range select, slider, and ScrollArea thumb drags working.
 pub fn buttonBehavior(ctx: *Context, id: Id, rect: Rect, clip: Rect) ButtonResult {
+    return buttonBehaviorImpl(ctx, id, rect, clip, false);
+}
+
+/// Button behaviour for a menuBar command target. It shares the normal state machine but may
+/// borrow pointer permission only when the target was registered for the current menu route and
+/// the pointer is outside that route owner's previous root.
+pub fn commandButtonBehavior(
+    ctx: *Context,
+    id: Id,
+    rect: Rect,
+    clip: Rect,
+    route_key: LayerKey,
+) ButtonResult {
+    const command_pointer = ctx.commandTargetPointerEnabled(id, route_key, rect, clip);
+    const result = buttonBehaviorImpl(ctx, id, rect, clip, command_pointer);
+    if (command_pointer and (result.held or result.clicked)) {
+        ctx.noteCommandTargetPress(route_key);
+    }
+    return result;
+}
+
+fn buttonBehaviorImpl(ctx: *Context, id: Id, rect: Rect, clip: Rect, command_pointer: bool) ButtonResult {
     ctx.requireFrame("buttonBehavior");
     ctx.requireInteractiveAllowed("buttonBehavior");
-    if (!ctx.current_layer_scope.pointer_enabled) return .{};
-    // Generic layer absorption is latched in current_layer_scope. While a legacy popup is open
-    // (the classic slot or a stacked one — see popup.zig's PopupStack), background widgets get no
-    // hover/hot/active at all as well.
-    // popup.openPopup()/openPopupStacked() always reset active_id/hot_id/next_hot_id to 0 on
-    // open, so there is no special case for "already-active widgets"; this guard alone blocks
-    // new acquires, and active_id cannot become non-zero while a popup is open.
-    // The popup itself uses manual hit-test (hitTestItem in popup.zig) and does not go through
-    // buttonBehavior, so this guard does not affect it.
+    if (!ctx.current_layer_scope.pointer_enabled and !command_pointer) return .{};
+    // Keep the legacy popup absorption until popup consumers are moved onto the layer route.
+    // The guard is intentionally removed in the popup migration; the generic layer scope then
+    // becomes the only input resolver.
     if (ctx.popup_state != null or ctx.popup_stack.len != 0) return .{};
-
     const mp = ctx.input.mouse_pos;
     const hovered_now = pointHitsVisible(rect, clip, mp);
     var result: ButtonResult = .{};
@@ -3626,6 +3716,101 @@ test "layer: a previous modal route is selected before current markers" {
     ctx.endBox();
     try std.testing.expect(!ctx.current_layer_scope.pointer_enabled);
     try std.testing.expectEqual(ctx.current_layer_scope.pointer_enabled, ctx.current_layer_scope.route_active);
+    ctx.endFrame();
+}
+
+test "layer: command target yields only to an inside hit" {
+    var ctx = testCtx();
+    defer ctx.deinit();
+    const title_id: Id = 9051;
+    const item_id: Id = 9052;
+    const menu_key: LayerKey = .{ .value = 9053 };
+    const spec: LayerSpec = .{
+        .key = menu_key,
+        .input = .modal,
+        .dismiss_on_outside = true,
+        .placement = .{ .source = .{ .point = .{ .x = 0, .y = 0 } }, .flip = .none },
+    };
+
+    ctx.beginFrameAt(400, 300, 0.0);
+    _ = ctx.buttonId(title_id, "File", .{});
+    ctx.beginBox(.{ .layer = &spec, .width = .{ .fixed = 120 }, .height = .{ .fixed = 60 } });
+    _ = ctx.buttonId(item_id, "Open", .{});
+    ctx.endBox();
+    ctx.endFrame();
+
+    const title = ctx.getNodeRect(title_id).?;
+    ctx.pushEvent(.{ .mouse_down = .{ .x = title.x + 8, .y = title.y + 8, .button = 0, .modifiers = 0 } });
+    ctx.beginFrameAt(400, 300, 0.1);
+    ctx.registerCommandTarget(title_id, menu_key);
+    const command = commandButtonBehavior(&ctx, title_id, title, Rect{ .x = 0, .y = 0, .w = 400, .h = 300 }, menu_key);
+    try std.testing.expect(!command.hovered and !command.held and !command.clicked);
+    try std.testing.expect(!ctx.layerDismissed(menu_key));
+    ctx.beginBox(.{ .layer = &spec, .width = .{ .fixed = 120 }, .height = .{ .fixed = 60 } });
+    const item = ctx.buttonId(item_id, "Open", .{});
+    try std.testing.expect(item.hovered);
+    try std.testing.expect(item.held);
+    ctx.endBox();
+    ctx.endFrame();
+}
+
+test "layer: command target exclusively consumes an outside retarget press" {
+    var ctx = testCtx();
+    defer ctx.deinit();
+    const title_id: Id = 9061;
+    const menu_key: LayerKey = .{ .value = 9062 };
+    const spec: LayerSpec = .{
+        .key = menu_key,
+        .input = .modal,
+        .dismiss_on_outside = true,
+        .placement = .{ .source = .{ .point = .{ .x = 120, .y = 120 } }, .flip = .none },
+    };
+
+    ctx.beginFrameAt(400, 300, 0.0);
+    _ = ctx.buttonId(title_id, "File", .{});
+    ctx.beginBox(.{ .layer = &spec, .width = .{ .fixed = 80 }, .height = .{ .fixed = 40 } });
+    ctx.endBox();
+    ctx.endFrame();
+
+    const title = ctx.getNodeRect(title_id).?;
+    ctx.pushEvent(.{ .mouse_down = .{ .x = title.x + 8, .y = title.y + 8, .button = 0, .modifiers = 0 } });
+    ctx.beginFrameAt(400, 300, 0.1);
+    try std.testing.expect(ctx.layerDismissed(menu_key));
+    ctx.registerCommandTarget(title_id, menu_key);
+    const command = commandButtonBehavior(&ctx, title_id, title, Rect{ .x = 0, .y = 0, .w = 400, .h = 300 }, menu_key);
+    try std.testing.expect(command.held);
+    try std.testing.expect(!ctx.layerDismissed(menu_key));
+    ctx.beginBox(.{ .layer = &spec, .width = .{ .fixed = 80 }, .height = .{ .fixed = 40 } });
+    ctx.endBox();
+    ctx.endFrame();
+}
+
+test "layer: command target does not bypass a different modal route owner" {
+    var ctx = testCtx();
+    defer ctx.deinit();
+    const title_id: Id = 9071;
+    const owner_key: LayerKey = .{ .value = 9072 };
+    const menu_key: LayerKey = .{ .value = 9073 };
+    const spec: LayerSpec = .{
+        .key = owner_key,
+        .input = .modal,
+        .placement = .{ .source = .{ .point = .{ .x = 120, .y = 120 } }, .flip = .none },
+    };
+
+    ctx.beginFrameAt(400, 300, 0.0);
+    _ = ctx.buttonId(title_id, "File", .{});
+    ctx.beginBox(.{ .layer = &spec, .width = .{ .fixed = 80 }, .height = .{ .fixed = 40 } });
+    ctx.endBox();
+    ctx.endFrame();
+
+    const title = ctx.getNodeRect(title_id).?;
+    ctx.pushEvent(.{ .mouse_down = .{ .x = title.x + 8, .y = title.y + 8, .button = 0, .modifiers = 0 } });
+    ctx.beginFrameAt(400, 300, 0.1);
+    ctx.registerCommandTarget(title_id, menu_key);
+    const command = commandButtonBehavior(&ctx, title_id, title, Rect{ .x = 0, .y = 0, .w = 400, .h = 300 }, menu_key);
+    try std.testing.expect(!command.hovered and !command.held and !command.clicked);
+    ctx.beginBox(.{ .layer = &spec, .width = .{ .fixed = 80 }, .height = .{ .fixed = 40 } });
+    ctx.endBox();
     ctx.endFrame();
 }
 

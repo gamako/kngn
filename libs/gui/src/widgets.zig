@@ -37,6 +37,7 @@ const text_wrap = @import("text_wrap.zig");
 const state_mod = @import("state.zig");
 const font_mod = @import("font.zig");
 const style_mod = @import("style.zig");
+const layer_types = @import("layer_types.zig");
 pub const Vec2f = input_mod.Vec2f;
 
 pub const Context = context_mod.Context;
@@ -45,6 +46,7 @@ pub const Color = color_mod.Color;
 pub const DrawList = draw_mod.DrawList;
 pub const Rect = geom.Rect;
 pub const Id = id_mod.Id;
+pub const LayerKey = layer_types.LayerKey;
 pub const TextRange = text_edit.TextRange;
 pub const CopyRequest = text_edit.CopyRequest;
 pub const CopyKind = text_edit.CopyKind;
@@ -158,8 +160,26 @@ pub fn buttonEx(ctx: *Context, label: []const u8, opts: ButtonOpts) ButtonResult
 /// Explicit-ID form. Use when callers need `getNodeRect(id)` (e.g. pixie Save) or
 /// the same label appears more than once in one scope.
 pub fn buttonId(ctx: *Context, id: Id, label: []const u8, opts: ButtonOpts) ButtonResult {
+    return buttonIdWithRoute(ctx, id, label, opts, null);
+}
+
+/// Explicit-ID menu title form. The title remains an ordinary main-tree button when no menu
+/// route owns input. While its named menu owns the route, only its pointer command exception is
+/// enabled; keyboard, focus and wheel continue to follow the modal layer scope.
+pub fn commandButtonId(ctx: *Context, id: Id, label: []const u8, opts: ButtonOpts, route_key: LayerKey) ButtonResult {
+    ctx.registerCommandTarget(id, route_key);
+    return buttonIdWithRoute(ctx, id, label, opts, route_key);
+}
+
+fn buttonIdWithRoute(
+    ctx: *Context,
+    id: Id,
+    label: []const u8,
+    opts: ButtonOpts,
+    route_key: ?LayerKey,
+) ButtonResult {
     ctx.requireInteractiveAllowed("button");
-    const result = behaviorFromCache(ctx, id);
+    const result = behaviorFromCacheWithRoute(ctx, id, route_key);
     const style = ctx.style;
     const disabled = ctx.isDisabled();
     const hot = ctx.state.hot_id == id;
@@ -383,6 +403,10 @@ fn keyboardActivated(ctx: *const Context, id: Id) bool {
 /// before it became disabled. The caller still lays it out and draws it (grayed, via the widget's
 /// own `Style.disabledColor` draw path) — only interaction is rejected.
 fn behaviorFromCache(ctx: *Context, id: Id) ButtonResult {
+    return behaviorFromCacheWithRoute(ctx, id, null);
+}
+
+fn behaviorFromCacheWithRoute(ctx: *Context, id: Id, route_key: ?LayerKey) ButtonResult {
     if (ctx.isDisabled()) {
         ctx.clearDisabledInteraction(id);
         ctx.noteLastInteractive(id, .{ .x = 0, .y = 0, .w = 0, .h = 0 }, false);
@@ -397,7 +421,10 @@ fn behaviorFromCache(ctx: *Context, id: Id) ButtonResult {
         // has gone out of the layout cannot be operated.
         return .{};
     };
-    var result = context_mod.buttonBehavior(ctx, id, cached.rect, cached.clip);
+    var result = if (route_key) |key|
+        context_mod.commandButtonBehavior(ctx, id, cached.rect, cached.clip, key)
+    else
+        context_mod.buttonBehavior(ctx, id, cached.rect, cached.clip);
     // Pressing a widget focuses it, so a pointer and the keyboard agree on where the focus is.
     if (result.held) _ = ctx.claimFocus(id);
     if (keyboardActivated(ctx, id)) result.clicked = true;
