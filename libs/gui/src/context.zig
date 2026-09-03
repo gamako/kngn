@@ -104,6 +104,7 @@ pub const LayerRecord = struct {
     /// Registration order, which breaks ties between equal `z` the way sibling order already
     /// breaks ties between boxes.
     serial: u32,
+    root_order: u16 = 0,
     root: *layout.Node,
     placement: LayerPlacement,
     status: LayerStatus,
@@ -124,15 +125,16 @@ pub const LayerSlot = struct {
     key: LayerKey,
     z: i32 = 0,
     serial: u32 = 0,
+    root_order: u16 = 0,
     input: LayerInputPolicy = .none,
     dismiss_on_outside: bool = false,
     prev_root_rect: Rect = .{ .x = 0, .y = 0, .w = 0, .h = 0 },
     was_placed: bool = false,
 };
 
-/// The previous-frame route selected at beginFrame. A null slot means that main owns input.
+/// The previous-frame route selected at beginFrame. A null key means that main owns input.
 const LayerRoute = struct {
-    frontmost_slot: ?usize = null,
+    frontmost_key: ?LayerKey = null,
 };
 
 /// O(1) input permissions for the current marker scope. Widget code reads these flags rather
@@ -145,6 +147,12 @@ const LayerScope = struct {
     wheel_enabled: bool = true,
     previous_geometry_available: bool = true,
     route_active: bool = false,
+    root_order: u16 = 0,
+};
+
+const FocusScopeEntry = struct {
+    layer_key: ?LayerKey = null,
+    enabled: bool = true,
 };
 pub const Color = color_mod.Color;
 pub const Id = id_mod.Id;
@@ -269,14 +277,15 @@ pub const ScrollAreaRecord = struct {
     serial: u16 = 0,
 };
 
-/// Pick the wheel-chain head from previous-frame geometry: deepest record whose
-/// viewport contains `mouse`, ties at the same depth broken by reverse end-order
-/// (later `endScrollArea` wins). An empty / zero-size rect never matches.
+/// Pick the wheel-chain head from previous-frame geometry: frontmost root whose viewport contains
+/// `mouse`, then deepest record, with reverse end-order as the final tie-break. An empty / zero-size
+/// rect never matches.
 ///
 /// This is the same scan order as end-time LIFO for nested areas, made unique
 /// for same-depth overlapping siblings. Amounts are not decided here.
 pub fn pickWheelChainHead(records: []const ScrollAreaRecord, mouse: Vec2) Id {
     var best_id: Id = 0;
+    var best_root_order: i32 = -1;
     var best_depth: i32 = -1;
     var best_serial: i32 = -1;
     for (records) |rec| {
@@ -286,10 +295,14 @@ pub fn pickWheelChainHead(records: []const ScrollAreaRecord, mouse: Vec2) Id {
         const inside = mouse.x >= rec.rect.x and mouse.x < rec.rect.x + rw and
             mouse.y >= rec.rect.y and mouse.y < rec.rect.y + rh;
         if (!inside) continue;
-        const deeper = @as(i32, rec.depth) > best_depth;
-        const later = rec.depth == best_depth and @as(i32, rec.serial) > best_serial;
-        if (deeper or later) {
+        const nearer_root = @as(i32, rec.root_order) > best_root_order;
+        const same_root = @as(i32, rec.root_order) == best_root_order;
+        const deeper = same_root and @as(i32, rec.depth) > best_depth;
+        const later = same_root and
+            @as(i32, rec.depth) == best_depth and @as(i32, rec.serial) > best_serial;
+        if (nearer_root or deeper or later) {
             best_id = rec.id;
+            best_root_order = rec.root_order;
             best_depth = rec.depth;
             best_serial = rec.serial;
         }
@@ -406,6 +419,9 @@ pub const Context = struct {
     /// which is draw order, so Tab walks the interface the way it looks. Cleared every frame with
     /// the capacity kept, so a steady interface reallocates nothing after the first frame.
     focus_order: std.ArrayList(Id) = .empty,
+    /// Scope metadata parallel to `focus_order`. Inactive entries remain recorded so the
+    /// resolver can preserve the main focus while a modal route owns the current frame.
+    focus_scope_order: std.ArrayList(FocusScopeEntry) = .empty,
     /// A Tab press waiting to be resolved at the end of the frame, once `focus_order` is complete.
     focus_move: enum { none, next, prev } = .none,
     /// The text fields submitted this frame, enabled ones only. `focus_order` records every
@@ -420,6 +436,13 @@ pub const Context = struct {
     /// The text field that held the focus when the last frame finished, or 0. Written once per
     /// frame in `endFrame`, after the focus has settled. See `wantsTextInput`.
     focused_text_input_id: Id = 0,
+    focused_text_input_layer_key: ?LayerKey = null,
+    /// Main focus remembered while a modal route temporarily owns the interface.
+    saved_main_focus_id: Id = 0,
+    saved_main_text_input_id: Id = 0,
+    focused_layer_key: ?LayerKey = null,
+    /// Generic layer input-gate contribution latched at beginFrame.
+    latched_layer_text_input: bool = false,
     /// Scroll-area begin→end state stack (supports nesting). Not on the arena (push/pop within the frame).
     scroll_stack: std.ArrayList(ScrollState) = .empty,
     /// Unconsumed wheel delta for the frame (seeded from input.scroll_delta at the first wheel apply).
@@ -428,8 +451,10 @@ pub const Context = struct {
     wheel_remaining_seeded: bool = false,
     /// Previous-frame ScrollArea geometry (order only). Swapped with `scroll_areas_cur` in beginFrame.
     scroll_areas_prev: std.ArrayList(ScrollAreaRecord) = .empty,
+    scroll_area_layers_prev: std.ArrayList(?LayerKey) = .empty,
     /// This frame's ScrollArea records, written in `endScrollArea` and given settled rects in endFrame.
     scroll_areas_cur: std.ArrayList(ScrollAreaRecord) = .empty,
+    scroll_area_layers_cur: std.ArrayList(?LayerKey) = .empty,
     /// Whether `ensureWheelChain` has sealed this frame's chain head.
     wheel_chain_ready: bool = false,
     /// Viewport id of the chain head (0 = none). Only this area consumes wheel in begin.
@@ -632,10 +657,13 @@ pub const Context = struct {
         self.rect_cache.deinit(self.gpa);
         self.per_id_state.deinit(self.gpa);
         self.focus_order.deinit(self.gpa);
+        self.focus_scope_order.deinit(self.gpa);
         self.text_input_ids.deinit(self.gpa);
         self.scroll_stack.deinit(self.gpa);
         self.scroll_areas_prev.deinit(self.gpa);
+        self.scroll_area_layers_prev.deinit(self.gpa);
         self.scroll_areas_cur.deinit(self.gpa);
+        self.scroll_area_layers_cur.deinit(self.gpa);
         self.draw_holder.list.deinit();
         self.id_stack.deinit();
         self.input.deinit();
@@ -680,6 +708,9 @@ pub const Context = struct {
 
     fn drawListFor(self: *Context, access: DrawAccess, accessor: []const u8) *DrawList {
         const phase = self.draw_holder.phase;
+        if (self.layer_scope_depth != 0) {
+            std.debug.panic("gui: {s} is not available in a layer scope", .{accessor});
+        }
         if (!drawAccessAllowed(phase, access)) {
             std.debug.panic("gui: {s} is not available in phase {s}", .{ accessor, @tagName(phase) });
         }
@@ -725,6 +756,7 @@ pub const Context = struct {
         self.animation_seen_press = 0;
         self.composition = .{};
         self.focus_order.clearRetainingCapacity();
+        self.focus_scope_order.clearRetainingCapacity();
         self.text_input_ids.clearRetainingCapacity();
         self.focus_move = .none;
         self.wheel_remaining = .{};
@@ -734,6 +766,10 @@ pub const Context = struct {
             self.scroll_areas_prev = self.scroll_areas_cur;
             self.scroll_areas_cur = tmp;
             self.scroll_areas_cur.clearRetainingCapacity();
+            const layer_tmp = self.scroll_area_layers_prev;
+            self.scroll_area_layers_prev = self.scroll_area_layers_cur;
+            self.scroll_area_layers_cur = layer_tmp;
+            self.scroll_area_layers_cur.clearRetainingCapacity();
         }
         self.wheel_chain_ready = false;
         self.wheel_chain_head = 0;
@@ -768,7 +804,10 @@ pub const Context = struct {
         // cleared the previous frame's edges, before any widget reads input — so that a caller
         // may forward events either side of beginFrame and see the same result.
         if (self.staged_input.drain(&self.input)) |staged| self.composition = staged;
+        const previous_route_key = self.layer_route.frontmost_key;
         self.latchLayerRoute();
+        self.applyLayerRouteTransition(previous_route_key);
+        self.latchLayerTextInputGate();
         self.current_layer_scope = self.mainLayerScope();
         self.layer_scope_depth = 0;
     }
@@ -808,8 +847,8 @@ pub const Context = struct {
     ///
     /// Interactive widgets, focus / scroll / popup / drag mutation, per-id store
     /// touches, nested tooltips, and input injection are lifecycle violations
-    /// inside a display-only subtree — a custom-tooltip builder, or a layer, which does not
-    /// arbitrate against what is under it yet. Checked at each public API entry, before
+    /// inside a display-only tooltip subtree, which does not arbitrate against what is under it.
+    /// Checked at each public API entry, before
     /// any caller-owned write, so a first-frame (empty rect cache) call still
     /// fails. Panics in every optimisation mode (same class as `requireContract`).
     pub inline fn requireInteractiveAllowed(self: *const Context, comptime what: []const u8) void {
@@ -875,7 +914,6 @@ pub const Context = struct {
             self.draw_holder.phase = .layer_emit;
             self.emitLayers();
         }
-        if (self.layers_len != 0 or self.layer_slots_len != 0) self.sealLayerSlots();
         if (self.layout_sanity_enabled) {
             self.layout_sanity_result = layout_sanity_probe.scan(root, self.font, self.allocator());
             // Each placed layer is a root of its own, scanned separately and summed in. A
@@ -895,6 +933,9 @@ pub const Context = struct {
         for (self.scroll_areas_cur.items) |*rec| {
             if (self.rect_cache.get(rec.id)) |c| rec.rect = c.rect;
         }
+        self.sealScrollAreaRootOrders();
+        self.clearMissingLayerFocus();
+        if (self.layers_len != 0 or self.layer_slots_len != 0) self.sealLayerSlots();
         // If the target was not refreshed this frame, clear the timer (suppress stale overlays for hidden widgets)
         if (self.tooltip_hover_id != 0 and !self.tooltip_hover_refreshed) {
             self.tooltip_hover_id = 0;
@@ -912,6 +953,7 @@ pub const Context = struct {
         // Frames with no mouse down keep focus.
         if (self.input.mouse_pressed.left and !self.state.focus_claimed_this_frame) {
             self.state.focused_id = 0;
+            self.focused_layer_key = null;
             self.state.focus_visible = false;
         }
         // If the active widget was not evaluated this frame (hidden / branched away) and the button is
@@ -935,9 +977,11 @@ pub const Context = struct {
         // The focus is settled now — an outside click has cleared it and Tab has moved it — so this
         // is the first point at which "is the focus on a text field?" has a final answer.
         self.focused_text_input_id = 0;
+        self.focused_text_input_layer_key = null;
         for (self.text_input_ids.items) |id| {
             if (id == self.state.focused_id) {
                 self.focused_text_input_id = id;
+                self.focused_text_input_layer_key = self.focusOwnerForId(id);
                 break;
             }
         }
@@ -988,17 +1032,16 @@ pub const Context = struct {
         }
     }
 
-    /// While a popup is open, background widgets' buttonBehavior never raises hover and
-    /// this_frame_hovered_any stays false, so popup_state is ORed in explicitly
-    /// (keeps "while modal absorption is active, wantsMouse() is effectively true". App canvas
-    /// input gates can use this to suppress background input).
+    /// A previous-frame placed modal layer owns the generic route, so its contribution is
+    /// latched before the current tree is built. The legacy popup contribution remains the
+    /// existing frame-local predicate until popup and layer routing are unified.
     pub fn wantsMouse(self: *const Context) bool {
-        return self.state.active_id != 0 or self.state.this_frame_hovered_any or
+        return self.layer_route.frontmost_key != null or self.state.active_id != 0 or self.state.this_frame_hovered_any or
             self.popup_state != null or self.popup_stack.len != 0;
     }
 
     pub fn wantsKeyboard(self: *const Context) bool {
-        return self.state.focused_id != 0;
+        return self.layer_route.frontmost_key != null or self.state.focused_id != 0;
     }
 
     /// Whether the keyboard focus is on a text field, which is the value a native IME is switched
@@ -1013,7 +1056,10 @@ pub const Context = struct {
     /// answers yes or no and does not name the field — `focusedId()` is what tells several fields
     /// apart.
     pub fn wantsTextInput(self: *const Context) bool {
-        return self.focused_text_input_id != 0;
+        return if (self.layer_route.frontmost_key != null)
+            self.latched_layer_text_input
+        else
+            self.focused_text_input_id != 0;
     }
 
     /// Enter a disabled scope: every ordinary widget built before the matching `endDisabled`
@@ -1054,6 +1100,7 @@ pub const Context = struct {
         self.requireInteractiveAllowed("clearDisabledInteraction");
         if (self.state.focused_id == id) {
             self.state.focused_id = 0;
+            self.focused_layer_key = null;
             self.state.focus_visible = false;
         }
         if (self.state.active_id == id) self.state.active_id = 0;
@@ -1069,8 +1116,9 @@ pub const Context = struct {
     pub fn claimFocus(self: *Context, id: Id) bool {
         self.requireFrame("claimFocus");
         self.requireInteractiveAllowed("claimFocus");
-        if (id == 0) return false;
+        if (id == 0 or !self.current_layer_scope.focus_enabled) return false;
         self.state.focused_id = id;
+        self.focused_layer_key = self.current_layer_scope.layer_key;
         self.state.focus_visible = false;
         self.state.focus_claimed_this_frame = true;
         return true;
@@ -1082,6 +1130,7 @@ pub const Context = struct {
         self.requireFrame("releaseFocus");
         self.requireInteractiveAllowed("releaseFocus");
         self.state.focused_id = 0;
+        self.focused_layer_key = null;
         self.state.focus_visible = false;
     }
 
@@ -1095,12 +1144,14 @@ pub const Context = struct {
         return id != 0 and self.state.focused_id == id and self.state.focus_visible;
     }
 
-    /// Enter `id` into this frame's Tab traversal, at the point it is submitted.
+    /// Enter `id` into this frame's Tab traversal, at the point it is submitted. The scope
+    /// metadata is retained beside the submission so the resolver can keep main-tree entries for
+    /// restoration while selecting only the latched modal scope.
     ///
     /// Widgets call this themselves; an application only calls it for something it draws and
     /// hit-tests by hand. Submitting the widget is what puts it in the order, so a widget behind a
-    /// closed branch leaves the order on its own. A widget behind an open popup is not submitted
-    /// for these purposes at all — see the popup guard in `buttonBehavior`.
+    /// closed branch leaves the order on its own. Legacy popup entries remain suppressed by the
+    /// existing popup guard.
     ///
     /// Runs once per focusable widget per frame; the append is amortised free after the first
     /// frame because `focus_order` keeps its capacity.
@@ -1109,6 +1160,10 @@ pub const Context = struct {
         self.requireInteractiveAllowed("registerFocusable");
         if (id == 0 or self.popup_state != null or self.popup_stack.len != 0) return;
         self.focus_order.append(self.gpa, id) catch @panic("Context.registerFocusable: OOM");
+        self.focus_scope_order.append(self.gpa, .{
+            .layer_key = self.current_layer_scope.layer_key,
+            .enabled = self.current_layer_scope.focus_enabled,
+        }) catch @panic("Context.registerFocusable: OOM");
     }
 
     /// Record that `id`, already registered as focusable, is a text field. Called by `textInputId`
@@ -1144,6 +1199,28 @@ pub const Context = struct {
         return visible.w > 0 and visible.h > 0;
     }
 
+    /// A layer that was routed from the previous frame can lose its anchor before this frame is
+    /// placed. The route still absorbs input for the synchronization frame, but no focus may
+    /// survive on a layer that was not placed in the frame being sealed. A later reappearance is
+    /// a new focus context; main focus restoration remains owned by applyLayerRouteTransition.
+    fn clearMissingLayerFocus(self: *Context) void {
+        const focused_layer = self.focused_layer_key orelse return;
+        var found = false;
+        for (self.layers[0..self.layers_len]) |record| {
+            if (!record.key.eql(focused_layer)) continue;
+            found = true;
+            if (record.status == .placed) return;
+            break;
+        }
+        // An omitted marker is the consumer's close-after-event synchronization frame. Keep its
+        // focus until the route is released; only a marker that was submitted but could not be
+        // placed loses focus because its anchor no longer describes the visible frame.
+        if (!found) return;
+        self.state.focused_id = 0;
+        self.focused_layer_key = null;
+        self.state.focus_visible = false;
+    }
+
     /// Move the focus to the next or previous entry of this frame's traversal order.
     ///
     /// Called from endFrame after the draw commands are emitted, so the move lands on the *next*
@@ -1151,12 +1228,13 @@ pub const Context = struct {
     fn resolveFocusMove(self: *Context) void {
         const direction = self.focus_move;
         if (direction == .none) return;
+        requireContract(self.focus_order.items.len == self.focus_scope_order.items.len, "focus scope metadata is out of sync");
 
         // Reachability is decided from the rect cache endFrame has just refreshed, so this reads
         // the geometry of the frame that is ending, not of the one before it.
         var reachable: usize = 0;
-        for (self.focus_order.items) |id| {
-            if (self.focusReachable(id)) reachable += 1;
+        for (self.focus_order.items, 0..) |id, i| {
+            if (self.focusEntryAllowed(i) and self.focusReachable(id)) reachable += 1;
         }
         // Nothing to land on. Leaving focus_claimed_this_frame alone matters: raising it here would
         // suppress the outside-click clear for a move that never happened.
@@ -1165,7 +1243,7 @@ pub const Context = struct {
         const current = self.state.focused_id;
         var current_index: ?usize = null;
         for (self.focus_order.items, 0..) |id, i| {
-            if (id == current and self.focusReachable(id)) {
+            if (id == current and self.focusEntryAllowed(i) and self.focusReachable(id)) {
                 current_index = i;
                 break;
             }
@@ -1183,22 +1261,22 @@ pub const Context = struct {
                     .none => unreachable,
                 };
                 const id = self.focus_order.items[i];
-                if (self.focusReachable(id)) break :blk id;
+                if (self.focusEntryAllowed(i) and self.focusReachable(id)) break :blk id;
             }
             break :blk current;
         } else blk: {
             // The focus is gone (or was never in the order): start from whichever end the
             // direction implies.
             switch (direction) {
-                .next => for (self.focus_order.items) |id| {
-                    if (self.focusReachable(id)) break :blk id;
+                .next => for (self.focus_order.items, 0..) |id, i| {
+                    if (self.focusEntryAllowed(i) and self.focusReachable(id)) break :blk id;
                 },
                 .prev => {
                     var i = self.focus_order.items.len;
                     while (i > 0) {
                         i -= 1;
                         const id = self.focus_order.items[i];
-                        if (self.focusReachable(id)) break :blk id;
+                        if (self.focusEntryAllowed(i) and self.focusReachable(id)) break :blk id;
                     }
                 },
                 .none => unreachable,
@@ -1207,8 +1285,30 @@ pub const Context = struct {
         };
 
         self.state.focused_id = next_id;
+        self.focused_layer_key = null;
+        for (self.focus_order.items, 0..) |id, i| {
+            if (id == next_id and self.focusEntryAllowed(i) and self.focusReachable(id)) {
+                self.focused_layer_key = self.focus_scope_order.items[i].layer_key;
+                break;
+            }
+        }
         self.state.focus_visible = true;
         self.state.focus_claimed_this_frame = true;
+    }
+
+    fn focusEntryAllowed(self: *const Context, index: usize) bool {
+        const entry = self.focus_scope_order.items[index];
+        if (!entry.enabled) return false;
+        const frontmost = self.layer_route.frontmost_key orelse return entry.layer_key == null;
+        const owner = entry.layer_key orelse return false;
+        return owner.eql(frontmost);
+    }
+
+    fn focusOwnerForId(self: *const Context, id: Id) ?LayerKey {
+        for (self.focus_order.items, 0..) |entry_id, i| {
+            if (entry_id == id) return self.focus_scope_order.items[i].layer_key;
+        }
+        return null;
     }
 
     pub fn now(self: *const Context) f64 {
@@ -1481,6 +1581,14 @@ pub const Context = struct {
         return a.x == b.x and a.y == b.y and a.w == b.w and a.h == b.h;
     }
 
+    fn sameLayerKey(a: ?LayerKey, b: ?LayerKey) bool {
+        if (a) |left| {
+            if (b) |right| return left.eql(right);
+            return false;
+        }
+        return b == null;
+    }
+
     /// Runs once per frame over the retained layer slots, never over the current tree. It fixes
     /// the input owner before the current frame's marker submission can affect it.
     fn latchLayerRoute(self: *Context) void {
@@ -1488,17 +1596,19 @@ pub const Context = struct {
         self.dismissed_layer_key = null;
         if (self.layer_slots_len == 0) return;
 
+        var frontmost_index: ?usize = null;
         var i: usize = 0;
         while (i < self.layer_slots_len) : (i += 1) {
             const slot = self.layer_slots[i];
             if (!slot.was_placed or slot.input != .modal) continue;
-            if (self.layer_route.frontmost_slot) |frontmost| {
+            if (frontmost_index) |frontmost| {
                 if (!layerSlotIsFrontmost(slot, self.layer_slots[frontmost])) continue;
             }
-            self.layer_route.frontmost_slot = i;
+            frontmost_index = i;
+            self.layer_route.frontmost_key = slot.key;
         }
 
-        const frontmost = self.layer_route.frontmost_slot orelse return;
+        const frontmost = frontmost_index orelse return;
         const slot = self.layer_slots[frontmost];
         const any_mouse_press = self.input.mouse_pressed.left or
             self.input.mouse_pressed.right or self.input.mouse_pressed.middle;
@@ -1510,8 +1620,61 @@ pub const Context = struct {
         }
     }
 
+    /// Apply ownership-transition cleanup after the previous-frame route has been selected.
+    /// Pointer state never crosses a route boundary; main focus is restored only after a modal
+    /// route has gone away, using the focus that was saved when the route first appeared.
+    fn applyLayerRouteTransition(self: *Context, previous: ?LayerKey) void {
+        const current = self.layer_route.frontmost_key;
+        if (sameLayerKey(previous, current)) return;
+
+        self.state.active_id = 0;
+        self.state.hot_id = 0;
+        self.state.next_hot_id = 0;
+        self.drag = null;
+
+        if (previous == null and current != null) {
+            self.saved_main_focus_id = if (self.focused_layer_key == null) self.state.focused_id else 0;
+            self.saved_main_text_input_id = if (self.focused_text_input_layer_key == null)
+                self.focused_text_input_id
+            else
+                0;
+            self.state.focus_visible = false;
+        } else if (previous != null and current == null) {
+            if (self.saved_main_focus_id != 0) {
+                self.state.focused_id = self.saved_main_focus_id;
+                self.focused_layer_key = null;
+                self.state.focus_visible = false;
+            } else if (self.focused_layer_key != null) {
+                self.state.focused_id = 0;
+                self.focused_layer_key = null;
+                self.state.focus_visible = false;
+            }
+            self.focused_text_input_id = self.saved_main_text_input_id;
+            self.focused_text_input_layer_key = null;
+            self.saved_main_focus_id = 0;
+            self.saved_main_text_input_id = 0;
+        } else if (current != null) {
+            if (self.focused_layer_key) |focused_layer| {
+                if (!focused_layer.eql(current.?)) {
+                    self.state.focused_id = 0;
+                    self.focused_layer_key = null;
+                    self.state.focus_visible = false;
+                }
+            }
+        }
+    }
+
+    fn latchLayerTextInputGate(self: *Context) void {
+        self.latched_layer_text_input = if (self.layer_route.frontmost_key) |frontmost| blk: {
+            break :blk if (self.focused_text_input_layer_key) |owner|
+                owner.eql(frontmost) and self.focused_text_input_id != 0
+            else
+                false;
+        } else self.focused_text_input_layer_key == null and self.focused_text_input_id != 0;
+    }
+
     fn mainLayerScope(self: *const Context) LayerScope {
-        const blocked = self.layer_route.frontmost_slot != null;
+        const blocked = self.layer_route.frontmost_key != null;
         return .{
             .pointer_enabled = !blocked,
             .keyboard_enabled = !blocked,
@@ -1519,6 +1682,7 @@ pub const Context = struct {
             .wheel_enabled = !blocked,
             .previous_geometry_available = true,
             .route_active = !blocked,
+            .root_order = 0,
         };
     }
 
@@ -1528,8 +1692,10 @@ pub const Context = struct {
         while (i < self.layer_slots_len) : (i += 1) {
             const slot = self.layer_slots[i];
             if (!slot.key.eql(layer_key)) continue;
-            const owns_route = input_policy == .modal and slot.was_placed and
-                self.layer_route.frontmost_slot == i;
+            const owns_route = input_policy == .modal and slot.was_placed and blk: {
+                const frontmost = self.layer_route.frontmost_key orelse break :blk false;
+                break :blk slot.key.eql(frontmost);
+            };
             return .{
                 .layer_key = layer_key,
                 .pointer_enabled = owns_route,
@@ -1538,6 +1704,7 @@ pub const Context = struct {
                 .wheel_enabled = owns_route,
                 .previous_geometry_available = slot.was_placed,
                 .route_active = owns_route,
+                .root_order = slot.root_order,
             };
         }
         return .{
@@ -1548,6 +1715,7 @@ pub const Context = struct {
             .wheel_enabled = false,
             .previous_geometry_available = false,
             .route_active = false,
+            .root_order = 0,
         };
     }
 
@@ -1586,13 +1754,6 @@ pub const Context = struct {
             self.registerLayer(spec, node, parent);
             layout.attachDetached(parent, node);
             self.pushLayerScope(spec.key, spec.input);
-            // Layers do not take input yet: nothing arbitrates between a layer and what is
-            // under it, so a button inside one would be a button the box beneath it also
-            // gets. The existing display-only guard is what says so, and it is lifted when
-            // that arbitration arrives.
-            self.draw_holder.display_only_depth += 1;
-            self.draw_holder.phase = .display_only_build;
-            self.checkDisplayOnlyInvariant();
         } else {
             layout.appendChild(parent, node);
         }
@@ -1624,6 +1785,7 @@ pub const Context = struct {
             .key = spec.key,
             .z = spec.z,
             .serial = @intCast(self.layers_len),
+            .root_order = 0,
             .root = root,
             .placement = spec.placement,
             .status = .waiting,
@@ -1833,7 +1995,34 @@ pub const Context = struct {
             order[j] = i;
             n += 1;
         }
-        for (order[0..n]) |i| self.emitNode(self.layers[i].root, &self.draw_holder.list);
+        for (order[0..n], 0..) |i, root_index| {
+            self.layers[i].root_order = @intCast(root_index + 1);
+            self.emitNode(self.layers[i].root, &self.draw_holder.list);
+        }
+    }
+
+    /// Give current-frame scroll records the same root order that the layer emitter uses.
+    /// The parallel key list keeps LayerKey and z/serial details out of the public record.
+    fn sealScrollAreaRootOrders(self: *Context) void {
+        requireContract(
+            self.scroll_areas_cur.items.len == self.scroll_area_layers_cur.items.len,
+            "scroll area scope metadata is out of sync",
+        );
+        for (self.scroll_areas_cur.items, self.scroll_area_layers_cur.items) |*record, maybe_key| {
+            if (maybe_key) |layer_key| {
+                record.root_order = self.layerRootOrder(layer_key);
+                if (record.root_order == 0) record.rect = .{ .x = 0, .y = 0, .w = 0, .h = 0 };
+            } else {
+                record.root_order = 0;
+            }
+        }
+    }
+
+    fn layerRootOrder(self: *const Context, layer_key: LayerKey) u16 {
+        for (self.layers[0..self.layers_len]) |record| {
+            if (record.status == .placed and record.input == .modal and record.key.eql(layer_key)) return record.root_order;
+        }
+        return 0;
     }
 
     /// Carry placed current markers into the one-frame history and release every absent or
@@ -1867,6 +2056,7 @@ pub const Context = struct {
                 .key = rec.key,
                 .z = rec.z,
                 .serial = rec.serial,
+                .root_order = rec.root_order,
                 .input = rec.input,
                 .dismiss_on_outside = rec.dismiss_on_outside,
                 .prev_root_rect = rec.root.rect,
@@ -1924,12 +2114,6 @@ pub const Context = struct {
         if (cur.is_layer_root) {
             cur.parent = null;
             self.popLayerScope();
-            requireContract(self.draw_holder.display_only_depth > 0, "layer closed without a display-only scope");
-            self.draw_holder.display_only_depth -= 1;
-            if (self.draw_holder.display_only_depth == 0) {
-                self.draw_holder.phase = .main_build;
-            }
-            self.checkDisplayOnlyInvariant();
         }
     }
 
@@ -2016,7 +2200,7 @@ pub const Context = struct {
     /// frame, once `endFrame` has recorded its rect.
     pub fn ensureWheelChain(self: *Context) void {
         // Sealing the chain picks which scroll area the wheel belongs to for the rest of the
-        // frame, which is input routing state — not something a display-only subtree may set.
+        // frame, which is input routing state — not something a display-only tooltip subtree may set.
         self.requireInteractiveAllowed("ensureWheelChain");
         if (self.wheel_chain_ready) return;
         self.wheel_chain_ready = true;
@@ -2260,8 +2444,10 @@ pub fn pointHitsVisible(rect: Rect, clip: Rect, p: Vec2) bool {
 pub fn buttonBehavior(ctx: *Context, id: Id, rect: Rect, clip: Rect) ButtonResult {
     ctx.requireFrame("buttonBehavior");
     ctx.requireInteractiveAllowed("buttonBehavior");
-    // Modal absorption: while a popup is open (the classic slot or a stacked one — see
-    // popup.zig's PopupStack), background widgets get no hover/hot/active at all.
+    if (!ctx.current_layer_scope.pointer_enabled) return .{};
+    // Generic layer absorption is latched in current_layer_scope. While a legacy popup is open
+    // (the classic slot or a stacked one — see popup.zig's PopupStack), background widgets get no
+    // hover/hot/active at all as well.
     // popup.openPopup()/openPopupStacked() always reset active_id/hot_id/next_hot_id to 0 on
     // open, so there is no special case for "already-active widgets"; this guard alone blocks
     // new acquires, and active_id cannot become non-zero while a popup is open.
@@ -3407,7 +3593,7 @@ test "layer: a previous modal route is selected before current markers" {
 
     ctx.pushEvent(.{ .mouse_down = .{ .x = 100, .y = 100, .button = 0, .modifiers = 0 } });
     ctx.beginFrameAt(400, 300, 0.1);
-    try std.testing.expect(ctx.layer_route.frontmost_slot != null);
+    try std.testing.expect(ctx.layer_route.frontmost_key != null);
     try std.testing.expect(!ctx.current_layer_scope.pointer_enabled);
     try std.testing.expectEqual(ctx.current_layer_scope.pointer_enabled, ctx.current_layer_scope.route_active);
     try std.testing.expect(ctx.layerDismissed(.{ .value = 903 }));
@@ -3425,6 +3611,11 @@ test "layer: a previous modal route is selected before current markers" {
     try std.testing.expect(!ctx.current_layer_scope.pointer_enabled);
     try std.testing.expectEqual(ctx.current_layer_scope.pointer_enabled, ctx.current_layer_scope.route_active);
     ctx.endFrame();
+}
+
+test "layer: the latched route does not retain a compacted slot index" {
+    try std.testing.expect(@hasField(LayerRoute, "frontmost_key"));
+    try std.testing.expect(!@hasField(LayerRoute, "frontmost_slot"));
 }
 
 test "layer: outside dismissal covers every mouse button and edge position" {
@@ -3584,6 +3775,119 @@ test "layer: an anchor that is not in this frame is not drawn at the old place" 
     ctx.endFrame();
     try std.testing.expect(ctx.getNodeRect(310) == null);
     try std.testing.expect(ctx.layerPrevRect(.{ .value = 1 }) == null);
+}
+
+test "layer: a missing anchor keeps pointer input away from the main tree for one frame" {
+    var ctx = testCtx();
+    defer ctx.deinit();
+    const main_id: Id = 1510;
+    const anchor_id: Id = 1511;
+    const layer_id: Id = 1512;
+    const spec: LayerSpec = .{
+        .key = .{ .value = 1513 },
+        .input = .modal,
+        .placement = .{ .source = .{ .id = anchor_id }, .flip = .none },
+    };
+
+    ctx.beginFrameAt(400, 200, 0.0);
+    _ = ctx.buttonId(main_id, "main", .{});
+    ctx.beginBox(.{ .id = anchor_id, .width = .{ .fixed = 80 }, .height = .{ .fixed = 20 } });
+    ctx.endBox();
+    ctx.beginBox(.{ .layer = &spec, .width = .{ .fixed = 100 }, .height = .{ .fixed = 40 } });
+    _ = ctx.buttonId(layer_id, "layer", .{});
+    ctx.endBox();
+    ctx.endFrame();
+    const main_rect = ctx.getNodeRect(main_id).?;
+
+    // The anchor disappears, but the previous placement still owns pointer routing for this
+    // synchronization frame. The main button must not see a press at its old coordinates.
+    ctx.pushEvent(.{ .mouse_down = .{
+        .x = main_rect.x + @as(i32, @intCast(main_rect.w / 2)),
+        .y = main_rect.y + @as(i32, @intCast(main_rect.h / 2)),
+        .button = 0,
+        .modifiers = 0,
+    } });
+    ctx.beginFrameAt(400, 200, 0.1);
+    try std.testing.expect(ctx.wantsMouse());
+    const main = ctx.buttonId(main_id, "main", .{});
+    ctx.beginBox(.{ .layer = &spec, .width = .{ .fixed = 100 }, .height = .{ .fixed = 40 } });
+    _ = ctx.buttonId(layer_id, "layer", .{});
+    ctx.endBox();
+    try std.testing.expect(!main.hovered and !main.held and !main.clicked);
+    ctx.endFrame();
+}
+
+test "layer: a missing anchor drops layer focus and keeps raw Escape available" {
+    var ctx = testCtx();
+    defer ctx.deinit();
+    const main_id: Id = 1520;
+    const anchor_id: Id = 1521;
+    const layer_id: Id = 1522;
+    const spec: LayerSpec = .{
+        .key = .{ .value = 1523 },
+        .input = .modal,
+        .placement = .{ .source = .{ .id = anchor_id }, .flip = .none },
+    };
+
+    ctx.beginFrameAt(400, 200, 0.0);
+    _ = ctx.buttonId(main_id, "main", .{});
+    ctx.beginBox(.{ .id = anchor_id, .width = .{ .fixed = 80 }, .height = .{ .fixed = 20 } });
+    ctx.endBox();
+    ctx.beginBox(.{ .layer = &spec, .width = .{ .fixed = 100 }, .height = .{ .fixed = 40 } });
+    _ = ctx.buttonId(layer_id, "layer", .{});
+    ctx.endBox();
+    ctx.endFrame();
+    const layer_rect = ctx.getNodeRect(layer_id).?;
+
+    // Focus the layer while its anchor is present.
+    ctx.pushEvent(.{ .mouse_down = .{
+        .x = layer_rect.x + @as(i32, @intCast(layer_rect.w / 2)),
+        .y = layer_rect.y + @as(i32, @intCast(layer_rect.h / 2)),
+        .button = 0,
+        .modifiers = 0,
+    } });
+    ctx.pushEvent(.{ .mouse_up = .{
+        .x = layer_rect.x + @as(i32, @intCast(layer_rect.w / 2)),
+        .y = layer_rect.y + @as(i32, @intCast(layer_rect.h / 2)),
+        .button = 0,
+        .modifiers = 0,
+    } });
+    ctx.beginFrameAt(400, 200, 0.1);
+    _ = ctx.buttonId(main_id, "main", .{});
+    ctx.beginBox(.{ .id = anchor_id, .width = .{ .fixed = 80 }, .height = .{ .fixed = 20 } });
+    ctx.endBox();
+    ctx.beginBox(.{ .layer = &spec, .width = .{ .fixed = 100 }, .height = .{ .fixed = 40 } });
+    _ = ctx.buttonId(layer_id, "layer", .{});
+    ctx.endBox();
+    ctx.endFrame();
+    try std.testing.expectEqual(layer_id, ctx.focusedId());
+
+    // The route absorbs the main tree even though the current anchor is absent. Focus traversal
+    // has no reachable layer geometry, while a layer consumer can still read raw Escape.
+    ctx.pushEvent(.{ .key_down = .{ .code = input_mod.key.tab, .modifiers = 0, .repeat = false } });
+    ctx.pushEvent(.{ .key_down = .{ .code = input_mod.key.escape, .modifiers = 0, .repeat = false } });
+    ctx.beginFrameAt(400, 200, 0.2);
+    try std.testing.expect(ctx.wantsKeyboard());
+    try std.testing.expect(ctx.input.pressedPlain(input_mod.key.escape, 0, input_mod.mod.all));
+    _ = ctx.buttonId(main_id, "main", .{});
+    ctx.beginBox(.{ .layer = &spec, .width = .{ .fixed = 100 }, .height = .{ .fixed = 40 } });
+    _ = ctx.buttonId(layer_id, "layer", .{});
+    ctx.endBox();
+    ctx.endFrame();
+    try std.testing.expectEqual(@as(Id, 0), ctx.focusedId());
+
+    // The slot was released at the missing frame's seal. Reappearing is a new context and does
+    // not restore the focus that belonged to the missing layer.
+    ctx.beginFrameAt(400, 200, 0.3);
+    try std.testing.expect(!ctx.wantsKeyboard());
+    _ = ctx.buttonId(main_id, "main", .{});
+    ctx.beginBox(.{ .id = anchor_id, .width = .{ .fixed = 80 }, .height = .{ .fixed = 20 } });
+    ctx.endBox();
+    ctx.beginBox(.{ .layer = &spec, .width = .{ .fixed = 100 }, .height = .{ .fixed = 40 } });
+    _ = ctx.buttonId(layer_id, "layer", .{});
+    ctx.endBox();
+    ctx.endFrame();
+    try std.testing.expectEqual(@as(Id, 0), ctx.focusedId());
 }
 
 test "layer: one anchored into another is placed after it, whatever order they registered in" {
@@ -3801,18 +4105,209 @@ test "layer: a root sizes against the boundary, not against a parent it does not
     try std.testing.expectEqual(@as(u32, 30), r.h);
 }
 
-test "layer: a marker subtree may not take input" {
-    // Layers do not arbitrate against what is under them yet, so a widget inside one would be
-    // a widget the box beneath it also receives. The existing display-only guard says so.
+test "layer: a modal marker owns shared widget input" {
     var ctx = testCtx();
     defer ctx.deinit();
+
+    const main_id: Id = 1301;
+    const layer_id: Id = 1302;
+    const spec: LayerSpec = .{
+        .key = .{ .value = 1303 },
+        .input = .modal,
+        .placement = .{ .source = .{ .point = .{ .x = 100, .y = 40 } }, .flip = .none },
+    };
+
+    // First-visible frame: the marker is drawable but has no previous geometry, so neither
+    // button can acquire input from it.
     ctx.beginFrameAt(400, 300, 0.0);
+    _ = ctx.buttonId(main_id, "main", .{});
     ctx.beginBox(.{
-        .layer = &.{ .key = .{ .value = 1 }, .placement = .{ .source = .{ .point = .{ .x = 0, .y = 0 } } } },
+        .layer = &spec,
+        .width = .{ .fixed = 100 },
+        .height = .{ .fixed = 40 },
     });
+    _ = ctx.buttonId(layer_id, "layer", .{});
     ctx.endBox();
-    _ = ctx.mainDrawList();
     ctx.endFrame();
+
+    const layer_rect = ctx.getNodeRect(layer_id).?;
+
+    // The main tree is built first, but the previous-frame modal marker owns the press.
+    ctx.pushEvent(.{ .mouse_down = .{
+        .x = layer_rect.x + @as(i32, @intCast(layer_rect.w / 2)),
+        .y = layer_rect.y + @as(i32, @intCast(layer_rect.h / 2)),
+        .button = 0,
+        .modifiers = 0,
+    } });
+    ctx.beginFrameAt(400, 300, 0.1);
+    const main_first = ctx.buttonId(main_id, "main", .{});
+    ctx.beginBox(.{ .layer = &spec, .width = .{ .fixed = 100 }, .height = .{ .fixed = 40 } });
+    const layer_first = ctx.buttonId(layer_id, "layer", .{});
+    ctx.endBox();
+    try std.testing.expect(!main_first.hovered and !main_first.held and !main_first.clicked);
+    try std.testing.expect(layer_first.held);
+    try std.testing.expectEqual(layer_id, ctx.focusedId());
+    try std.testing.expectEqual(@as(usize, 2), ctx.focus_order.items.len);
+    try std.testing.expect(!ctx.focus_scope_order.items[0].enabled);
+    try std.testing.expect(ctx.focus_scope_order.items[1].enabled);
+    ctx.endFrame();
+
+    // Reverse build order: releasing in the layer still cannot activate the main button.
+    ctx.pushEvent(.{ .mouse_up = .{ .x = layer_rect.x, .y = layer_rect.y, .button = 0, .modifiers = 0 } });
+    ctx.beginFrameAt(400, 300, 0.2);
+    ctx.beginBox(.{ .layer = &spec, .width = .{ .fixed = 100 }, .height = .{ .fixed = 40 } });
+    const layer_second = ctx.buttonId(layer_id, "layer", .{});
+    ctx.endBox();
+    const main_second = ctx.buttonId(main_id, "main", .{});
+    try std.testing.expect(layer_second.clicked);
+    try std.testing.expect(!main_second.clicked);
+    ctx.endFrame();
+}
+
+test "layer: generic input gates are stable before, inside, after, and outside a marker" {
+    var ctx = testCtx();
+    defer ctx.deinit();
+    const spec: LayerSpec = .{
+        .key = .{ .value = 1310 },
+        .input = .modal,
+        .placement = .{ .source = .{ .point = .{ .x = 100, .y = 40 } }, .flip = .none },
+    };
+
+    ctx.beginFrameAt(400, 300, 0.0);
+    try std.testing.expect(!ctx.wantsMouse());
+    try std.testing.expect(!ctx.wantsKeyboard());
+    try std.testing.expect(!ctx.wantsTextInput());
+    ctx.beginBox(.{ .layer = &spec, .width = .{ .fixed = 100 }, .height = .{ .fixed = 40 } });
+    try std.testing.expect(!ctx.wantsMouse());
+    try std.testing.expect(!ctx.wantsKeyboard());
+    try std.testing.expect(!ctx.wantsTextInput());
+    ctx.endBox();
+    try std.testing.expect(!ctx.wantsMouse());
+    try std.testing.expect(!ctx.wantsKeyboard());
+    try std.testing.expect(!ctx.wantsTextInput());
+    ctx.endFrame();
+    try std.testing.expect(!ctx.wantsMouse());
+    try std.testing.expect(!ctx.wantsKeyboard());
+    try std.testing.expect(!ctx.wantsTextInput());
+
+    ctx.beginFrameAt(400, 300, 0.1);
+    try std.testing.expect(ctx.wantsMouse());
+    try std.testing.expect(ctx.wantsKeyboard());
+    try std.testing.expect(!ctx.wantsTextInput());
+    ctx.beginBox(.{ .layer = &spec, .width = .{ .fixed = 100 }, .height = .{ .fixed = 40 } });
+    try std.testing.expect(ctx.wantsMouse());
+    try std.testing.expect(ctx.wantsKeyboard());
+    try std.testing.expect(!ctx.wantsTextInput());
+    ctx.endBox();
+    try std.testing.expect(ctx.wantsMouse());
+    try std.testing.expect(ctx.wantsKeyboard());
+    try std.testing.expect(!ctx.wantsTextInput());
+    ctx.endFrame();
+    try std.testing.expect(ctx.wantsMouse());
+    try std.testing.expect(ctx.wantsKeyboard());
+    try std.testing.expect(!ctx.wantsTextInput());
+}
+
+test "layer: none markers never request mouse input" {
+    var ctx = testCtx();
+    defer ctx.deinit();
+    const spec: LayerSpec = .{
+        .key = .{ .value = 1320 },
+        .input = .none,
+        .placement = .{ .source = .{ .point = .{ .x = 20, .y = 20 } }, .flip = .none },
+    };
+
+    ctx.beginFrameAt(200, 100, 0.0);
+    ctx.beginBox(.{ .layer = &spec, .width = .{ .fixed = 40 }, .height = .{ .fixed = 20 } });
+    try std.testing.expect(!ctx.current_layer_scope.pointer_enabled);
+    try std.testing.expect(!ctx.wantsMouse());
+    ctx.endBox();
+    ctx.endFrame();
+
+    ctx.beginFrameAt(200, 100, 0.1);
+    ctx.beginBox(.{ .layer = &spec, .width = .{ .fixed = 40 }, .height = .{ .fixed = 20 } });
+    try std.testing.expect(!ctx.current_layer_scope.pointer_enabled);
+    try std.testing.expect(!ctx.wantsMouse());
+    ctx.endBox();
+    ctx.endFrame();
+}
+
+test "layer: main focus is restored after a modal route is released" {
+    var ctx = testCtx();
+    defer ctx.deinit();
+    const main_id: Id = 1331;
+    const layer_id: Id = 1332;
+    const spec: LayerSpec = .{
+        .key = .{ .value = 1333 },
+        .input = .modal,
+        .placement = .{ .source = .{ .point = .{ .x = 100, .y = 40 } }, .flip = .none },
+    };
+
+    ctx.beginFrameAt(400, 200, 0.0);
+    _ = ctx.buttonId(main_id, "main", .{});
+    ctx.endFrame();
+    const main_rect = ctx.getNodeRect(main_id).?;
+
+    ctx.beginFrameAt(400, 200, 0.1);
+    const main_center = .{
+        .x = main_rect.x + @as(i32, @intCast(main_rect.w / 2)),
+        .y = main_rect.y + @as(i32, @intCast(main_rect.h / 2)),
+    };
+    ctx.pushEvent(.{ .mouse_down = .{ .x = main_center.x, .y = main_center.y, .button = 0, .modifiers = 0 } });
+    ctx.pushEvent(.{ .mouse_up = .{ .x = main_center.x, .y = main_center.y, .button = 0, .modifiers = 0 } });
+    _ = ctx.buttonId(main_id, "main", .{});
+    ctx.endFrame();
+    try std.testing.expectEqual(main_id, ctx.focusedId());
+
+    // The first visible frame has no route yet, so main keeps its focus while the layer draws.
+    ctx.beginFrameAt(400, 200, 0.2);
+    _ = ctx.buttonId(main_id, "main", .{});
+    ctx.beginBox(.{ .layer = &spec, .width = .{ .fixed = 140 }, .height = .{ .fixed = 32 } });
+    ctx.endBox();
+    ctx.endFrame();
+
+    // On the next frame the prior placement latches the modal route. Tab can now select only
+    // the modal child; its focus is later restored to the saved main id.
+    ctx.beginFrameAt(400, 200, 0.3);
+    _ = ctx.buttonId(main_id, "main", .{});
+    ctx.beginBox(.{ .layer = &spec, .width = .{ .fixed = 140 }, .height = .{ .fixed = 32 } });
+    _ = ctx.buttonId(layer_id, "layer", .{});
+    ctx.endBox();
+    ctx.pushEvent(.{ .key_down = .{ .code = input_mod.key.tab, .modifiers = 0, .repeat = false } });
+    ctx.endFrame();
+    try std.testing.expectEqual(layer_id, ctx.focusedId());
+
+    // Reverse traversal must stay inside the modal scope as well: a main entry is still in the
+    // submission order for restoration, but it is not a candidate while the route is active.
+    ctx.beginFrameAt(400, 200, 0.35);
+    _ = ctx.buttonId(main_id, "main", .{});
+    ctx.beginBox(.{ .layer = &spec, .width = .{ .fixed = 140 }, .height = .{ .fixed = 32 } });
+    _ = ctx.buttonId(layer_id, "layer", .{});
+    ctx.endBox();
+    ctx.pushEvent(.{ .key_down = .{ .code = input_mod.key.tab, .modifiers = input_mod.mod.shift, .repeat = false } });
+    ctx.endFrame();
+    try std.testing.expectEqual(layer_id, ctx.focusedId());
+
+    // The omitted marker is still absorbed by the previous-frame route, then its slot is freed.
+    ctx.beginFrameAt(400, 200, 0.4);
+    _ = ctx.buttonId(main_id, "main", .{});
+    ctx.endFrame();
+    try std.testing.expectEqual(layer_id, ctx.focusedId());
+
+    ctx.beginFrameAt(400, 200, 0.5);
+    try std.testing.expectEqual(main_id, ctx.focusedId());
+    _ = ctx.buttonId(main_id, "main", .{});
+    ctx.endFrame();
+}
+
+test "layer: root order takes precedence over scroll depth and serial" {
+    const records = [_]ScrollAreaRecord{
+        .{ .id = 1401, .rect = .{ .x = 0, .y = 0, .w = 100, .h = 100 }, .root_order = 0, .depth = 9, .serial = 9 },
+        .{ .id = 1402, .rect = .{ .x = 0, .y = 0, .w = 100, .h = 100 }, .root_order = 1, .depth = 0, .serial = 1 },
+        .{ .id = 1403, .rect = .{ .x = 0, .y = 0, .w = 100, .h = 100 }, .root_order = 1, .depth = 2, .serial = 0 },
+        .{ .id = 1404, .rect = .{ .x = 0, .y = 0, .w = 100, .h = 100 }, .root_order = 1, .depth = 2, .serial = 3 },
+    };
+    try std.testing.expectEqual(@as(Id, 1404), pickWheelChainHead(&records, .{ .x = 50, .y = 50 }));
 }
 
 test "layer: a frame with neither a layout tree nor a layer leaves the draw list alone" {

@@ -203,7 +203,7 @@ fn sizingFillsViewport(s: layout.Sizing) bool {
 }
 
 fn keyboardActivated(ctx: *const Context, id: Id) bool {
-    if (id == 0 or ctx.state.focused_id != id) return false;
+    if (id == 0 or ctx.state.focused_id != id or !ctx.current_layer_scope.keyboard_enabled) return false;
     if (ctx.popup_state != null or ctx.popup_stack.len != 0 or ctx.pointerEngaged()) return false;
     const all = input_mod.mod.all;
     return ctx.input.pressedPlain(input_mod.key.space, 0, all) or
@@ -234,6 +234,10 @@ fn rowHoverOnly(ctx: *Context, id: Id, selected: bool) void {
     }
     if (selected) ctx.registerFocusable(id);
     if (ctx.rect_cache.get(id)) |cached| {
+        if (!ctx.current_layer_scope.pointer_enabled) {
+            ctx.noteLastInteractive(id, cached.rect, false);
+            return;
+        }
         const hovered = context_mod.pointHitsVisible(cached.rect, cached.clip, ctx.input.mouse_pos);
         if (hovered) {
             if (ctx.state.active_id == 0 or ctx.state.active_id == id) {
@@ -265,6 +269,8 @@ fn rowPressResolve(ctx: *Context, id: Id, rect: Rect, clip: Rect) TableRowResult
         ctx.clearDisabledInteraction(id);
         return .{};
     }
+
+    if (!ctx.current_layer_scope.pointer_enabled) return .{ .activated = keyboardActivated(ctx, id) };
 
     var clicked = false;
     var held = false;
@@ -614,6 +620,7 @@ pub fn endTableCell(ctx: *Context) void {
 }
 
 fn applyHeaderWheel(ctx: *Context, header_rect: Rect, st: *context_mod.ScrollState) void {
+    if (!ctx.current_layer_scope.wheel_enabled) return;
     ctx.ensureWheelChain();
     if (!ctx.wheel_remaining_seeded) {
         ctx.wheel_remaining = ctx.input.scroll_delta;

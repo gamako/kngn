@@ -124,6 +124,7 @@ pub fn dragSource(ctx: *Context, id: Id, payload: DragPayload) DragSourceResult 
     ctx.requireFrame("dragSource");
     ctx.requireInteractiveAllowed("dragSource");
     std.debug.assert(id != 0);
+    if (!ctx.current_layer_scope.pointer_enabled) return .{};
     if (ctx.isDisabled()) {
         ctx.clearDisabledInteraction(id);
         return .{};
@@ -185,6 +186,7 @@ pub fn dropTarget(ctx: *Context, id: Id, can_accept: bool) DropResult {
     ctx.requireFrame("dropTarget");
     ctx.requireInteractiveAllowed("dropTarget");
     std.debug.assert(id != 0);
+    if (!ctx.current_layer_scope.pointer_enabled) return .{};
     if (ctx.isDisabled()) {
         ctx.clearDisabledInteraction(id);
         return .{};

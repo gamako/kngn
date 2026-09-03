@@ -166,6 +166,27 @@ parent does not include it.
 
 An explicit `id` is cached and hit-tested like any other box.
 
+### Layer input timing
+
+Layer input routing is latched at `beginFrame` from the set of modal layers that were placed in
+the previous completed frame. Therefore "frontmost" means the frontmost member of that previous
+frame set: a newly submitted layer is drawn in its first visible frame, but starts owning input
+from the following frame. This keeps routing independent of the order in which the current tree
+is built. A layer marker is presence-only; omitting it is how the application closes the layer.
+
+The previous-frame rule creates two visible synchronization cases. If a submitted layer loses its
+anchor, the old modal route remains for that frame even though the layer is not drawn. It absorbs
+pointer and keyboard input from the main tree, so the main tree can be unresponsive for one frame
+while nothing is visible. The missing layer has no reachable current geometry: focus traversal does
+not select its controls, and any focus already owned by that layer is cleared when the frame is
+sealed. If the anchor returns later, that layer focus is not restored. Raw `ctx.input` remains raw;
+an Escape handler inside the layer can still read it during this synchronization frame.
+
+If the marker itself disappears because the application closed it after an interaction, the
+previous route likewise absorbs input for exactly one synchronization frame. The slot is released
+at that frame's seal, and the main tree owns the following frame. This is the same previous-frame
+geometry contract as hit-testing, not an additional open-state machine.
+
 ## Main-axis alignment
 
 `BoxConfig.align_main` (CSS `justify-content`, limited to `.start` / `.center` /

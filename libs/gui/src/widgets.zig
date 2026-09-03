@@ -364,7 +364,7 @@ const IconButtonDraw = struct {
 /// it still points at a background widget. Nor does it fire in a frame the pointer is taking part
 /// in, for the reason `pointerEngaged` gives.
 fn keyboardActivated(ctx: *const Context, id: Id) bool {
-    if (id == 0 or ctx.state.focused_id != id) return false;
+    if (id == 0 or ctx.state.focused_id != id or !ctx.current_layer_scope.keyboard_enabled) return false;
     if (ctx.popup_state != null or ctx.popup_stack.len != 0 or ctx.pointerEngaged()) return false;
     const all = input_mod.mod.all;
     return ctx.input.pressedPlain(input_mod.key.space, 0, all) or
@@ -437,7 +437,7 @@ pub fn selectableLabelId(
         const rect = cached.rect;
         const clip = cached.clip;
         // Visibility gate on press only (same `pointHitsVisible` as `buttonBehavior`). Drag continues outside clip.
-        const down = ctx.input.mouse_pressed.left and
+        const down = ctx.current_layer_scope.pointer_enabled and ctx.input.mouse_pressed.left and
             context_mod.pointHitsVisible(rect, clip, ctx.input.mouse_pressed_pos);
         if (down) {
             const index = text_edit.hitTest(layout_data, ctx.input.mouse_pressed_pos.x - rect.x);
@@ -456,10 +456,12 @@ pub fn selectableLabelId(
 
         // Input keeps state across frames so, even without a move event,
         // the captured extent tracks the latest `mouse_pos`. Outside the rect is intentionally allowed.
-        if (per_id.selection.dragging and ctx.state.focused_id == id and ctx.input.mouse_buttons.left) {
+        if (ctx.current_layer_scope.pointer_enabled and per_id.selection.dragging and
+            ctx.state.focused_id == id and ctx.input.mouse_buttons.left)
+        {
             per_id.selection.updateDrag(text_edit.hitTest(layout_data, ctx.input.mouse_pos.x - rect.x));
         }
-        if (ctx.input.mouse_released.left) {
+        if (ctx.current_layer_scope.pointer_enabled and ctx.input.mouse_released.left) {
             if (per_id.selection.dragging) {
                 per_id.selection.updateDrag(text_edit.hitTest(layout_data, ctx.input.mouse_released_pos.x - rect.x));
                 per_id.selection.dragging = false;
@@ -475,7 +477,7 @@ pub fn selectableLabelId(
     }
 
     var copy_request: ?CopyRequest = null;
-    if (ctx.state.focused_id == id) {
+    if (ctx.current_layer_scope.keyboard_enabled and ctx.state.focused_id == id) {
         for (ctx.input.orderedTextEvents()) |event| switch (event) {
             .key_down => |key| {
                 // libs/gui does not import core/platform. Shared `KeyCode.C` value follows
@@ -579,7 +581,7 @@ pub fn textInputId(
         if (ctx.rect_cache.get(id)) |cached| {
             // Press focus/caret acquisition is visibility-gated only (same contract as `buttonBehavior`).
             // Selection drag continues outside clip (active drag capture).
-            const down = ctx.input.mouse_pressed.left and
+            const down = ctx.current_layer_scope.pointer_enabled and ctx.input.mouse_pressed.left and
                 context_mod.pointHitsVisible(cached.rect, cached.clip, ctx.input.mouse_pressed_pos);
             if (down) {
                 claimed_here = true;
@@ -590,13 +592,15 @@ pub fn textInputId(
                 per_id.caret_blink_start_s = ctx.now();
             }
 
-            if (per_id.selection.dragging and ctx.focusedId() == id and ctx.input.mouse_buttons.left) {
+            if (ctx.current_layer_scope.pointer_enabled and per_id.selection.dragging and
+                ctx.focusedId() == id and ctx.input.mouse_buttons.left)
+            {
                 const local_x = ctx.input.mouse_pos.x - cached.rect.x - opts.padding[3] + per_id.scroll_x;
                 per_id.selection.updateDrag(text_edit.hitTest(text_layout, local_x));
                 per_id.caret = per_id.selection.extent;
                 per_id.caret_blink_start_s = ctx.now();
             }
-            if (ctx.input.mouse_released.left and per_id.selection.dragging) {
+            if (ctx.current_layer_scope.pointer_enabled and ctx.input.mouse_released.left and per_id.selection.dragging) {
                 const local_x = ctx.input.mouse_released_pos.x - cached.rect.x - opts.padding[3] + per_id.scroll_x;
                 per_id.selection.updateDrag(text_edit.hitTest(text_layout, local_x));
                 per_id.selection.dragging = false;
@@ -607,7 +611,8 @@ pub fn textInputId(
 
     const focused = ctx.focusedId() == id;
     // If another input receives mouse press in the same frame, the old focused field must not consume composition / keys.
-    const input_owner = focused and (!ctx.input.mouse_pressed.left or claimed_here);
+    const input_owner = ctx.current_layer_scope.keyboard_enabled and focused and
+        (!ctx.input.mouse_pressed.left or claimed_here);
     // Only the focused (and `input_owner`) TextInput consumes composition.
     const composing = input_owner and ctx.composition.active;
 
@@ -1244,7 +1249,9 @@ fn sliderCore(ctx: *Context, id: Id, label: []const u8, cur: f64, spec: SliderSp
         // Arrow keys nudge the focused slider by one step, in the reading direction: right and up
         // raise the value, left and down lower it. Suppressed on the same terms as Space and Enter,
         // so a drag in progress is never fought over.
-        if (ctx.state.focused_id == id and ctx.popup_state == null and ctx.popup_stack.len == 0 and !ctx.pointerEngaged()) {
+        if (ctx.current_layer_scope.keyboard_enabled and ctx.state.focused_id == id and
+            ctx.popup_state == null and ctx.popup_stack.len == 0 and !ctx.pointerEngaged())
+        {
             const all = input_mod.mod.all;
             var delta: f64 = 0;
             if (ctx.input.pressedPlain(input_mod.key.right, 0, all) or
@@ -2168,6 +2175,7 @@ pub fn beginScrollArea(ctx: *Context, id: Id, scroll: *Vec2f, opts: ScrollAreaOp
 /// Hit-test uses the cursor sealed with the wheel chain, not a later `mouse_pos`.
 /// A missing previous-frame viewport (first frame of this id) is not a wheel target.
 fn applyScrollAreaWheel(ctx: *Context, st: *context_mod.ScrollState) void {
+    if (!ctx.current_layer_scope.wheel_enabled) return;
     ctx.ensureWheelChain();
     if (!ctx.wheel_remaining_seeded) {
         ctx.wheel_remaining = ctx.input.scroll_delta;
@@ -2227,10 +2235,12 @@ pub fn endScrollArea(ctx: *Context) void {
     const depth: u16 = std.math.cast(u16, ctx.scroll_stack.items.len) orelse std.math.maxInt(u16);
     ctx.scroll_areas_cur.append(ctx.gpa, .{
         .id = st.viewport_id,
-        .rect = st.viewport_rect orelse .{ .x = 0, .y = 0, .w = 0, .h = 0 },
+        .rect = .{ .x = 0, .y = 0, .w = 0, .h = 0 },
         .depth = depth,
         .serial = serial,
     }) catch @panic("endScrollArea: OOM");
+    ctx.scroll_area_layers_cur.append(ctx.gpa, ctx.current_layer_scope.layer_key) catch
+        @panic("endScrollArea: OOM");
     ctx.endBox(); // viewport
 
     // Horizontal scrollbar (inside leftCol, below viewport)
@@ -2595,7 +2605,9 @@ pub const ListNav = enum { none, prev, next };
 /// passed as a widget id) holds the keyboard focus, so a list nothing has ever selected
 /// reports `.none` rather than reacting to a keypress meant for something else on screen.
 pub fn pollListNav(ctx: *const Context, active_row_id: Id) ListNav {
-    if (active_row_id == 0 or ctx.state.focused_id != active_row_id) return .none;
+    if (active_row_id == 0 or ctx.state.focused_id != active_row_id or
+        !ctx.current_layer_scope.keyboard_enabled)
+        return .none;
     if (ctx.popup_state != null or ctx.pointerEngaged()) return .none;
     const all = input_mod.mod.all;
     if (ctx.input.pressedPlain(input_mod.key.down, 0, all)) return .next;
@@ -7437,6 +7449,110 @@ test "wantsTextInput: false with no text field, and false when a button holds th
     // IME must not be driven from.
     try std.testing.expect(ctx.wantsKeyboard());
     try std.testing.expect(!ctx.wantsTextInput());
+}
+
+test "layer: modal scope absorbs text input while main fields remain untouched" {
+    var ctx = testCtx();
+    defer ctx.deinit();
+    var main_buffer = try TextBuffer.init(std.testing.allocator, "main");
+    defer main_buffer.deinit();
+    var layer_buffer = try TextBuffer.init(std.testing.allocator, "layer");
+    defer layer_buffer.deinit();
+    const main_id: Id = 0xB001;
+    const layer_id: Id = 0xB002;
+    const spec: context_mod.LayerSpec = .{
+        .key = .{ .value = 0xB003 },
+        .input = .modal,
+        .placement = .{ .source = .{ .point = .{ .x = 100, .y = 40 } }, .flip = .none },
+    };
+
+    ctx.beginFrame(400, 200);
+    _ = ctx.textInputId(main_id, &main_buffer, .{ .width = .{ .fixed = 80 } });
+    ctx.beginBox(.{ .layer = &spec, .width = .{ .fixed = 140 }, .height = .{ .fixed = 32 } });
+    _ = ctx.textInputId(layer_id, &layer_buffer, .{ .width = .{ .fixed = 80 } });
+    ctx.endBox();
+    ctx.endFrame();
+    const layer_rect = ctx.getNodeRect(layer_id).?;
+
+    ctx.beginFrame(400, 200);
+    clickAt(&ctx, layer_rect.x + 8, layer_rect.y + 8);
+    _ = ctx.textInputId(main_id, &main_buffer, .{ .width = .{ .fixed = 80 } });
+    ctx.beginBox(.{ .layer = &spec, .width = .{ .fixed = 140 }, .height = .{ .fixed = 32 } });
+    _ = ctx.textInputId(layer_id, &layer_buffer, .{ .width = .{ .fixed = 80 } });
+    ctx.endBox();
+    ctx.endFrame();
+    try std.testing.expectEqual(layer_id, ctx.focusedId());
+
+    ctx.pushEvent(.{ .char_input = .{ .codepoint = 'X', .modifiers = 0 } });
+    ctx.beginFrame(400, 200);
+    _ = ctx.textInputId(main_id, &main_buffer, .{ .width = .{ .fixed = 80 } });
+    ctx.beginBox(.{ .layer = &spec, .width = .{ .fixed = 140 }, .height = .{ .fixed = 32 } });
+    _ = ctx.textInputId(layer_id, &layer_buffer, .{ .width = .{ .fixed = 80 } });
+    ctx.endBox();
+    ctx.endFrame();
+    try std.testing.expectEqualStrings("main", main_buffer.slice());
+    try std.testing.expectEqualStrings("Xlayer", layer_buffer.slice());
+}
+
+test "layer: modal keyboard paths keep sliders and list rows inside the route" {
+    var ctx = testCtx();
+    defer ctx.deinit();
+    const spec: context_mod.LayerSpec = .{
+        .key = .{ .value = 0xB103 },
+        .input = .modal,
+        .placement = .{ .source = .{ .point = .{ .x = 100, .y = 40 } }, .flip = .none },
+    };
+    const main_slider_id: Id = 0xB101;
+    const layer_slider_id: Id = 0xB102;
+    var main_value: i32 = 5;
+    var layer_value: i32 = 5;
+
+    // Seed previous-frame geometry for both non-button controls.
+    ctx.beginFrame(400, 200);
+    _ = sliderI32Id(&ctx, main_slider_id, "main slider", &main_value, .{ .min = 0, .max = 10 });
+    ctx.beginBox(.{ .layer = &spec, .width = .{ .fixed = 140 }, .height = .{ .fixed = 32 } });
+    _ = sliderI32Id(&ctx, layer_slider_id, "layer slider", &layer_value, .{ .min = 0, .max = 10 });
+    ctx.endBox();
+    ctx.endFrame();
+
+    // Keyboard input is delivered to the modal slider even though the main slider is submitted
+    // first. The main value is the negative oracle for a scope gate that was accidentally omitted.
+    ctx.beginFrame(400, 200);
+    ctx.pushEvent(.{ .key_down = .{ .code = input_mod.key.right, .modifiers = 0, .repeat = false } });
+    _ = sliderI32Id(&ctx, main_slider_id, "main slider", &main_value, .{ .min = 0, .max = 10 });
+    ctx.beginBox(.{ .layer = &spec, .width = .{ .fixed = 140 }, .height = .{ .fixed = 32 } });
+    _ = ctx.claimFocus(layer_slider_id);
+    _ = sliderI32Id(&ctx, layer_slider_id, "layer slider", &layer_value, .{ .min = 0, .max = 10 });
+    ctx.endBox();
+    ctx.endFrame();
+    try std.testing.expectEqual(@as(i32, 5), main_value);
+    try std.testing.expectEqual(@as(i32, 6), layer_value);
+
+    const main_row_id: Id = 0xB104;
+    const layer_row_id: Id = 0xB105;
+
+    // The same route gate applies to a roving listbox row's keyboard activation.
+    ctx.beginFrame(400, 200);
+    _ = beginListboxRow(&ctx, main_row_id, true, .{});
+    endListboxRow(&ctx);
+    ctx.beginBox(.{ .layer = &spec, .width = .{ .fixed = 140 }, .height = .{ .fixed = 32 } });
+    _ = ctx.claimFocus(layer_row_id);
+    _ = beginListboxRow(&ctx, layer_row_id, true, .{});
+    endListboxRow(&ctx);
+    ctx.endBox();
+    ctx.endFrame();
+
+    ctx.beginFrame(400, 200);
+    ctx.pushEvent(.{ .key_down = .{ .code = input_mod.key.enter, .modifiers = 0, .repeat = false } });
+    const main_row = beginListboxRow(&ctx, main_row_id, true, .{});
+    endListboxRow(&ctx);
+    ctx.beginBox(.{ .layer = &spec, .width = .{ .fixed = 140 }, .height = .{ .fixed = 32 } });
+    const layer_row = beginListboxRow(&ctx, layer_row_id, true, .{});
+    endListboxRow(&ctx);
+    ctx.endBox();
+    ctx.endFrame();
+    try std.testing.expect(!main_row.activated);
+    try std.testing.expect(layer_row.activated);
 }
 
 test "wantsTextInput: true once a text field holds the focus, and false again after an outside click" {
