@@ -1,0 +1,148 @@
+# The initial frame has no marker, so no previous-frame placement or modal route exists.
+step 2
+digest dropdown
+expect dropdown placed=0
+expect dropdown root_rect=none
+expect dropdown selected=none
+expect dropdown hit_rows=0
+expect dropdown focus_row=none
+expect dropdown wants_keyboard=0
+expect dropdown main_escape_count=0
+snapshot fb
+
+# The trigger opens the marker and draws it in this frame. Input ownership starts on the next
+# frame because the route is selected from the previous completed frame.
+inject mouse_move 1000 650
+step 1
+inject mouse_down left
+step 1
+inject mouse_up left
+step 1
+digest dropdown
+expect dropdown placed=1
+expect dropdown root_rect=820,386,280,246
+expect dropdown selected=none
+expect dropdown hit_rows=0
+expect dropdown focus_row=none
+expect dropdown wants_keyboard=0
+expect dropdown main_escape_count=0
+snapshot fb
+
+step 1
+digest dropdown
+expect dropdown placed=1
+expect dropdown wants_keyboard=1
+
+# Tab first lands on the search field, which proves focus stays in the modal scope. Text input
+# is then delivered to that field rather than to the main tree.
+inject key_down TAB
+step 1
+inject key_up TAB
+step 1
+digest dropdown
+expect dropdown focus_row=none
+expect dropdown wants_keyboard=1
+inject char R
+step 1
+digest dropdown
+expect dropdown wants_keyboard=1
+snapshot fb
+
+# The next Tab reaches only the highlighted listbox row; Enter selects it and closes the marker.
+inject key_down TAB
+step 1
+inject key_up TAB
+step 1
+digest dropdown
+expect dropdown focus_row=0
+inject key_down ENTER
+step 1
+inject key_up ENTER
+step 1
+digest dropdown
+expect dropdown selected=0
+expect dropdown placed=0
+expect dropdown wants_keyboard=1
+snapshot fb
+step 1
+digest dropdown
+expect dropdown placed=0
+step 1
+digest dropdown
+expect dropdown wants_keyboard=0
+
+# A pointer row activation produces a non-zero hit count and closes the same presence-only
+# marker. The next frame is still the synchronization frame; the following one is free.
+inject mouse_move 1000 650
+step 1
+inject mouse_down left
+step 1
+inject mouse_up left
+step 1
+inject mouse_move 850 522
+step 1
+inject mouse_down left
+step 1
+inject mouse_up left
+step 1
+digest dropdown
+expect dropdown selected=1
+expect dropdown hit_rows=1
+expect dropdown placed=1
+expect dropdown wants_keyboard=1
+snapshot fb
+step 1
+digest dropdown
+expect dropdown placed=0
+step 1
+digest dropdown
+expect dropdown wants_keyboard=0
+
+# Reopen and close with Escape. The modal consumes raw Escape; the main shortcut count stays put.
+inject mouse_move 1000 650
+step 1
+inject mouse_down left
+step 1
+inject mouse_up left
+step 1
+step 1
+inject key_down ESCAPE
+step 1
+digest dropdown
+expect dropdown placed=0
+expect dropdown wants_keyboard=1
+expect dropdown main_escape_count=0
+inject key_up ESCAPE
+step 1
+digest dropdown
+expect dropdown wants_keyboard=0
+
+# Once closed, the same raw Escape reaches the main gate.
+inject key_down ESCAPE
+step 1
+inject key_up ESCAPE
+step 1
+digest dropdown
+expect dropdown main_escape_count=1
+snapshot fb
+
+# Reopen, then press outside on the upper-left edge. The press is absorbed and the consumer
+# closes the marker through layerDismissed; main never receives the outside operation.
+inject mouse_move 1000 650
+step 1
+inject mouse_down left
+step 1
+inject mouse_up left
+step 1
+inject mouse_move 20 20
+inject mouse_down left
+step 1
+digest dropdown
+expect dropdown placed=0
+expect dropdown hit_rows=0
+expect dropdown wants_keyboard=1
+step 1
+digest dropdown
+expect dropdown wants_keyboard=0
+
+quit

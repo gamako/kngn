@@ -1,0 +1,19 @@
+.{
+    .name = .example_48_layer_dropdown,
+    .version = "0.0.0",
+    .fingerprint = 0xb47ebaa34bfc8cdf,
+    .minimum_zig_version = "0.16.0",
+    .dependencies = .{
+        .kngn = .{
+            .path = "../..",
+        },
+    },
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "main.zig",
+        "sample.zon",
+        "e2e.txt",
+        "e2e.sh",
+    },
+}

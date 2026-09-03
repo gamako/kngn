@@ -491,6 +491,7 @@ const standalone_examples = [_][]const u8{
     "45_path_drawing",
     "46_style_gallery",
     "47_screen_layout",
+    "48_layer_dropdown",
 };
 
 fn addCheckedChildBuild(
@@ -895,6 +896,7 @@ pub fn build(b: *std.Build) void {
             .{ .name = "example_45", .path = "examples/45_path_drawing/main.zig", .decl_zon = "examples/45_path_drawing/sample.zon" },
             .{ .name = "example_46", .path = "examples/46_style_gallery/main.zig", .decl_zon = "examples/46_style_gallery/sample.zon" },
             .{ .name = "example_47", .path = "examples/47_screen_layout/main.zig", .decl_zon = "examples/47_screen_layout/sample.zon" },
+            .{ .name = "example_48", .path = "examples/48_layer_dropdown/main.zig", .decl_zon = "examples/48_layer_dropdown/sample.zon" },
         }) |example| {
             // A sample with its own build.zig states everything in `sample.zon`, and both builds
             // read that one file.
