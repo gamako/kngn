@@ -362,7 +362,7 @@ fn buildLayers(ctx: *gui.Context, n: u32) void {
     i = 0;
     while (i < n) : (i += 1) {
         ctx.beginBox(.{
-            .layer = .{
+            .layer = &.{
                 .key = .{ .value = 0x9000 + i },
                 .z = @intCast(i),
                 .placement = .{ .source = .{ .id = 0x5000 + i } },

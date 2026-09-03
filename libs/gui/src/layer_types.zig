@@ -20,7 +20,7 @@ pub const Rect = geom.Rect;
 pub const Vec2 = geom.Vec2;
 pub const Id = @import("id.zig").Id;
 
-/// The name of a layer slot: what `openLayer` opens and `closeLayer` closes.
+/// The stable identity of a declarative layer marker.
 ///
 /// Distinct from `Id`, which names a widget's box for the rect cache, focus and input. The
 /// two may hold the same number and mean different things, so this is a struct rather than
@@ -32,6 +32,14 @@ pub const LayerKey = struct {
     pub fn eql(a: LayerKey, b: LayerKey) bool {
         return a.value == b.value;
     }
+};
+
+/// Which input routes a layer may own after it has been placed in a previous frame.
+pub const LayerInputPolicy = enum {
+    /// Draw the layer without taking input from the main tree or another layer.
+    none,
+    /// Own pointer and keyboard routing while this layer is the previous-frame frontmost layer.
+    modal,
 };
 
 /// What a layer is placed against.
@@ -86,6 +94,10 @@ pub const LayerSpec = struct {
     /// and so what an `.id` anchor can point at. A layer that is only ever looked at — a
     /// tooltip — says false and stays out of all three.
     cache: bool = true,
+    /// Input ownership is resolved from the previous frame's placed marker.
+    input: LayerInputPolicy = .none,
+    /// Request an outside-press event for the consumer; the framework does not close the layer.
+    dismiss_on_outside: bool = false,
 };
 
 test "LayerKey is not interchangeable with Id" {

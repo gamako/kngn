@@ -74,11 +74,12 @@ pub const Vec2 = geom.Vec2;
 pub const Vec2f = input_mod.Vec2f;
 const layer_types = @import("layer_types.zig");
 pub const LayerKey = layer_types.LayerKey;
+pub const LayerInputPolicy = layer_types.LayerInputPolicy;
 pub const LayerSpec = layer_types.LayerSpec;
 pub const LayerPlacement = layer_types.LayerPlacement;
 pub const AnchorSource = layer_types.AnchorSource;
 
-/// The most layers that may be open, or registered in one frame. Small and fixed: a screen
+/// The most layers that may be registered in one frame. Small and fixed: a screen
 /// showing more than a handful of menus, dialogs and tooltips at once has a different problem
 /// than a capacity limit. Overflow is a contract failure, not a silent drop — a menu that just
 /// does not appear is far harder to diagnose than one that says why.
@@ -112,6 +113,8 @@ pub const LayerRecord = struct {
     /// Index in `layers` of the layer this one anchors into, when its anchor id belongs to
     /// one. Null for a `.point` anchor or an anchor in the main tree.
     depends_on: ?usize,
+    input: LayerInputPolicy,
+    dismiss_on_outside: bool,
 };
 
 /// What survives between frames for one layer. A `LayerRecord` describes a frame; this
@@ -119,8 +122,29 @@ pub const LayerRecord = struct {
 /// the question first-visible suppression and outside-press dismissal are both built on.
 pub const LayerSlot = struct {
     key: LayerKey,
+    z: i32 = 0,
+    serial: u32 = 0,
+    input: LayerInputPolicy = .none,
+    dismiss_on_outside: bool = false,
     prev_root_rect: Rect = .{ .x = 0, .y = 0, .w = 0, .h = 0 },
     was_placed: bool = false,
+};
+
+/// The previous-frame route selected at beginFrame. A null slot means that main owns input.
+const LayerRoute = struct {
+    frontmost_slot: ?usize = null,
+};
+
+/// O(1) input permissions for the current marker scope. Widget code reads these flags rather
+/// than searching the layer tree or comparing z values for every widget.
+const LayerScope = struct {
+    layer_key: ?LayerKey = null,
+    pointer_enabled: bool = true,
+    keyboard_enabled: bool = true,
+    focus_enabled: bool = true,
+    wheel_enabled: bool = true,
+    previous_geometry_available: bool = true,
+    route_active: bool = false,
 };
 pub const Color = color_mod.Color;
 pub const Id = id_mod.Id;
@@ -240,6 +264,8 @@ pub const ScrollAreaRecord = struct {
     id: Id,
     rect: Rect = .{ .x = 0, .y = 0, .w = 0, .h = 0 },
     depth: u16 = 0,
+    /// Root order: 0 for main, increasing with the visual layer root order.
+    root_order: u16 = 0,
     serial: u16 = 0,
 };
 
@@ -359,6 +385,15 @@ pub const Context = struct {
     layers_len: usize = 0,
     layer_slots: [max_layers]LayerSlot = undefined,
     layer_slots_len: usize = 0,
+    /// Input route latched from the previous frame's placed layer slots.
+    layer_route: LayerRoute = .{},
+    /// Outside dismissal is an edge result, not a close side effect. It is stable for the frame.
+    dismissed_layer_key: ?LayerKey = null,
+    /// Scope stack only changes at layer markers; ordinary boxes and widgets read one current
+    /// scope without a tree walk or allocation.
+    layer_scope_stack: [max_layers]LayerScope = undefined,
+    layer_scope_depth: usize = 0,
+    current_layer_scope: LayerScope = .{},
     /// beginBox / endBox cursor (current parent)
     layout_current: ?*layout.Node = null,
     /// Layout sanity is opt-in; the result is copied out of the frame arena after the tree scan.
@@ -733,6 +768,9 @@ pub const Context = struct {
         // cleared the previous frame's edges, before any widget reads input — so that a caller
         // may forward events either side of beginFrame and see the same result.
         if (self.staged_input.drain(&self.input)) |staged| self.composition = staged;
+        self.latchLayerRoute();
+        self.current_layer_scope = self.mainLayerScope();
+        self.layer_scope_depth = 0;
     }
 
     /// Fail on a broken lifecycle contract, in every optimisation mode.
@@ -811,6 +849,7 @@ pub const Context = struct {
         const root = self.layout_root.?;
         // Detect beginBox / endBox mismatches
         requireContract(self.layout_current == root, "endFrame with a box still open");
+        requireContract(self.layer_scope_depth == 0, "endFrame with a layer scope still open");
         // Frames that never use the layout API (empty root) skip layout / emit / cache update
         // entirely: compatible with manual DrawList use (examples 08/09). rect_cache keeps the previous values.
         const screen_rect = Rect{ .x = 0, .y = 0, .w = self.screen_w, .h = self.screen_h };
@@ -836,6 +875,7 @@ pub const Context = struct {
             self.draw_holder.phase = .layer_emit;
             self.emitLayers();
         }
+        if (self.layers_len != 0 or self.layer_slots_len != 0) self.sealLayerSlots();
         if (self.layout_sanity_enabled) {
             self.layout_sanity_result = layout_sanity_probe.scan(root, self.font, self.allocator());
             // Each placed layer is a root of its own, scanned separately and summed in. A
@@ -1441,6 +1481,89 @@ pub const Context = struct {
         return a.x == b.x and a.y == b.y and a.w == b.w and a.h == b.h;
     }
 
+    /// Runs once per frame over the retained layer slots, never over the current tree. It fixes
+    /// the input owner before the current frame's marker submission can affect it.
+    fn latchLayerRoute(self: *Context) void {
+        self.layer_route = .{};
+        self.dismissed_layer_key = null;
+        if (self.layer_slots_len == 0) return;
+
+        var i: usize = 0;
+        while (i < self.layer_slots_len) : (i += 1) {
+            const slot = self.layer_slots[i];
+            if (!slot.was_placed or slot.input != .modal) continue;
+            if (self.layer_route.frontmost_slot) |frontmost| {
+                if (!layerSlotIsFrontmost(slot, self.layer_slots[frontmost])) continue;
+            }
+            self.layer_route.frontmost_slot = i;
+        }
+
+        const frontmost = self.layer_route.frontmost_slot orelse return;
+        const slot = self.layer_slots[frontmost];
+        const any_mouse_press = self.input.mouse_pressed.left or
+            self.input.mouse_pressed.right or self.input.mouse_pressed.middle;
+        if (slot.dismiss_on_outside and any_mouse_press) {
+            const screen = Rect{ .x = 0, .y = 0, .w = self.screen_w, .h = self.screen_h };
+            if (!pointHitsVisible(slot.prev_root_rect, screen, self.input.mouse_pressed_pos)) {
+                self.dismissed_layer_key = slot.key;
+            }
+        }
+    }
+
+    fn mainLayerScope(self: *const Context) LayerScope {
+        const blocked = self.layer_route.frontmost_slot != null;
+        return .{
+            .pointer_enabled = !blocked,
+            .keyboard_enabled = !blocked,
+            .focus_enabled = !blocked,
+            .wheel_enabled = !blocked,
+            .previous_geometry_available = true,
+            .route_active = !blocked,
+        };
+    }
+
+    /// Resolve a marker once at scope entry. Widgets below it then use the copied flags in O(1).
+    fn layerScopeFor(self: *const Context, layer_key: LayerKey, input_policy: LayerInputPolicy) LayerScope {
+        var i: usize = 0;
+        while (i < self.layer_slots_len) : (i += 1) {
+            const slot = self.layer_slots[i];
+            if (!slot.key.eql(layer_key)) continue;
+            const owns_route = input_policy == .modal and slot.was_placed and
+                self.layer_route.frontmost_slot == i;
+            return .{
+                .layer_key = layer_key,
+                .pointer_enabled = owns_route,
+                .keyboard_enabled = owns_route,
+                .focus_enabled = owns_route,
+                .wheel_enabled = owns_route,
+                .previous_geometry_available = slot.was_placed,
+                .route_active = owns_route,
+            };
+        }
+        return .{
+            .layer_key = layer_key,
+            .pointer_enabled = false,
+            .keyboard_enabled = false,
+            .focus_enabled = false,
+            .wheel_enabled = false,
+            .previous_geometry_available = false,
+            .route_active = false,
+        };
+    }
+
+    fn pushLayerScope(self: *Context, layer_key: LayerKey, input_policy: LayerInputPolicy) void {
+        requireContract(self.layer_scope_depth < max_layers, "layer scope nesting exceeds the maximum");
+        self.layer_scope_stack[self.layer_scope_depth] = self.current_layer_scope;
+        self.layer_scope_depth += 1;
+        self.current_layer_scope = self.layerScopeFor(layer_key, input_policy);
+    }
+
+    fn popLayerScope(self: *Context) void {
+        requireContract(self.layer_scope_depth > 0, "layer scope stack underflow");
+        self.layer_scope_depth -= 1;
+        self.current_layer_scope = self.layer_scope_stack[self.layer_scope_depth];
+    }
+
     // ──────────────────────────────────────────────
     // Layout-tree build API
     // ──────────────────────────────────────────────
@@ -1458,9 +1581,11 @@ pub const Context = struct {
             .id = if (cfg.id != 0) cfg.id else id_mod.hashInt(parent.id, parent.child_count),
             .cfg = cfg,
         };
-        if (cfg.layer) |spec| {
+        if (cfg.layer) |spec_ptr| {
+            const spec = spec_ptr.*;
             self.registerLayer(spec, node, parent);
             layout.attachDetached(parent, node);
+            self.pushLayerScope(spec.key, spec.input);
             // Layers do not take input yet: nothing arbitrates between a layer and what is
             // under it, so a button inside one would be a button the box beneath it also
             // gets. The existing display-only guard is what says so, and it is lifted when
@@ -1504,12 +1629,14 @@ pub const Context = struct {
             .status = .waiting,
             .cache = spec.cache,
             .depends_on = null,
+            .input = spec.input,
+            .dismiss_on_outside = spec.dismiss_on_outside,
         };
         self.layers_len += 1;
     }
 
     /// The slot for `key`, created on first use. Slots outlive frames, so this is where a
-    /// layer's previous geometry comes from.
+    /// layer's previous geometry and route metadata come from.
     fn layerSlot(self: *Context, layer_key: LayerKey) *LayerSlot {
         var i: usize = 0;
         while (i < self.layer_slots_len) : (i += 1) {
@@ -1530,6 +1657,12 @@ pub const Context = struct {
             if (slot.key.eql(layer_key)) return if (slot.was_placed) slot.prev_root_rect else null;
         }
         return null;
+    }
+
+    /// Whether the previous-frame frontmost modal layer received an outside press this frame.
+    /// This is a stable event result; reading it never closes or consumes the layer.
+    pub fn layerDismissed(self: *const Context, layer_key: LayerKey) bool {
+        return if (self.dismissed_layer_key) |dismissed| dismissed.eql(layer_key) else false;
     }
 
     /// The key the tooltip layer occupies. Reserved rather than derived, because there is
@@ -1645,7 +1778,6 @@ pub const Context = struct {
             }
             if (!progressed) requireContract(false, "a cycle among layer anchors");
         }
-        self.sealLayerSlots();
     }
 
     const AnchorResolve = union(enum) {
@@ -1704,15 +1836,42 @@ pub const Context = struct {
         for (order[0..n]) |i| self.emitNode(self.layers[i].root, &self.draw_holder.list);
     }
 
-    /// Carry this frame's result into the slots, so the next frame can ask where a layer was
-    /// and whether it was on screen at all.
+    /// Carry placed current markers into the one-frame history and release every absent or
+    /// unresolved marker after the frame has been sealed. The compact prefix is the free list.
     fn sealLayerSlots(self: *Context) void {
         var i: usize = 0;
-        while (i < self.layers_len) : (i += 1) {
-            const rec = self.layers[i];
+        while (i < self.layer_slots_len) {
+            var present = false;
+            for (self.layers[0..self.layers_len]) |rec| {
+                if (rec.key.eql(self.layer_slots[i].key)) {
+                    present = true;
+                    break;
+                }
+            }
+            if (!present) {
+                self.releaseLayerSlotAt(i);
+                continue;
+            }
+            i += 1;
+        }
+
+        var j: usize = 0;
+        while (j < self.layers_len) : (j += 1) {
+            const rec = self.layers[j];
+            if (rec.status != .placed) {
+                self.releaseLayerSlot(rec.key);
+                continue;
+            }
             const slot = self.layerSlot(rec.key);
-            slot.was_placed = rec.status == .placed;
-            if (slot.was_placed) slot.prev_root_rect = rec.root.rect;
+            slot.* = .{
+                .key = rec.key,
+                .z = rec.z,
+                .serial = rec.serial,
+                .input = rec.input,
+                .dismiss_on_outside = rec.dismiss_on_outside,
+                .prev_root_rect = rec.root.rect,
+                .was_placed = true,
+            };
         }
     }
 
@@ -1726,15 +1885,19 @@ pub const Context = struct {
         return false;
     }
 
-    /// Release a layer's slot. The public open/close API calls this.
-    pub fn releaseLayerSlot(self: *Context, layer_key: LayerKey) void {
+    fn releaseLayerSlot(self: *Context, layer_key: LayerKey) void {
         var i: usize = 0;
         while (i < self.layer_slots_len) : (i += 1) {
             if (!self.layer_slots[i].key.eql(layer_key)) continue;
-            self.layer_slots[i] = self.layer_slots[self.layer_slots_len - 1];
-            self.layer_slots_len -= 1;
+            self.releaseLayerSlotAt(i);
             return;
         }
+    }
+
+    fn releaseLayerSlotAt(self: *Context, index: usize) void {
+        requireContract(index < self.layer_slots_len, "layer slot index out of bounds");
+        self.layer_slots[index] = self.layer_slots[self.layer_slots_len - 1];
+        self.layer_slots_len -= 1;
     }
 
     /// The layout node of the innermost box still open (the last `beginBox` whose `endBox` has not
@@ -1760,6 +1923,7 @@ pub const Context = struct {
         // cannot pick up the parent's clip, scroll or extent by accident.
         if (cur.is_layer_root) {
             cur.parent = null;
+            self.popLayerScope();
             requireContract(self.draw_holder.display_only_depth > 0, "layer closed without a display-only scope");
             self.draw_holder.display_only_depth -= 1;
             if (self.draw_holder.display_only_depth == 0) {
@@ -2062,6 +2226,11 @@ pub const ButtonResult = struct {
 /// - Partial clips (ScrollArea etc.) are true only inside the viewport clip
 ///
 /// Single source of truth shared by buttonBehavior, TextInput, and SelectableLabel.
+fn layerSlotIsFrontmost(candidate: LayerSlot, current: LayerSlot) bool {
+    if (candidate.z != current.z) return candidate.z > current.z;
+    return candidate.serial > current.serial;
+}
+
 fn layerBefore(a: LayerRecord, b: LayerRecord) bool {
     if (a.z != b.z) return a.z < b.z;
     return a.serial < b.serial;
@@ -3170,7 +3339,7 @@ const LayerFixture = struct {
 
     fn build(self: LayerFixture, ctx: *Context) void {
         ctx.beginBox(.{
-            .layer = .{
+            .layer = &.{
                 .key = .{ .value = self.key },
                 .z = self.z,
                 .placement = .{
@@ -3185,6 +3354,139 @@ const LayerFixture = struct {
         ctx.endBox();
     }
 };
+
+test "layer: the marker specification is copied during beginBox" {
+    var ctx = testCtx();
+    defer ctx.deinit();
+
+    var spec: LayerSpec = .{
+        .key = .{ .value = 901 },
+        .z = 4,
+        .placement = .{ .source = .{ .point = .{ .x = 11, .y = 13 } }, .flip = .none },
+    };
+    ctx.beginFrameAt(400, 300, 0.0);
+    ctx.beginBox(.{
+        .layer = &spec,
+        .id = 9010,
+        .width = .{ .fixed = 20 },
+        .height = .{ .fixed = 10 },
+    });
+    // The caller may reuse or rewrite the temporary after beginBox. Later phases must use the
+    // copy in the frame record, not the pointer retained in Node.cfg.
+    spec.key = .{ .value = 902 };
+    spec.z = 99;
+    spec.placement.source = .{ .point = .{ .x = 101, .y = 103 } };
+    ctx.endBox();
+    ctx.endFrame();
+
+    try std.testing.expectEqual(@as(u64, 901), ctx.layers[0].key.value);
+    try std.testing.expectEqual(@as(i32, 4), ctx.layers[0].z);
+    try std.testing.expectEqual(@as(i32, 11), ctx.getNodeRect(9010).?.x);
+    try std.testing.expectEqual(@as(i32, 13), ctx.getNodeRect(9010).?.y);
+    try std.testing.expect(@sizeOf(?*const LayerSpec) < @sizeOf(?LayerSpec));
+    try std.testing.expect(@sizeOf(BoxConfig) <= 176);
+}
+
+test "layer: a previous modal route is selected before current markers" {
+    var ctx = testCtx();
+    defer ctx.deinit();
+
+    ctx.beginFrameAt(400, 300, 0.0);
+    const first_spec: LayerSpec = .{
+        .key = .{ .value = 903 },
+        .input = .modal,
+        .dismiss_on_outside = true,
+        .placement = .{ .source = .{ .point = .{ .x = 10, .y = 10 } }, .flip = .none },
+    };
+    try std.testing.expectEqual(ctx.current_layer_scope.pointer_enabled, ctx.current_layer_scope.route_active);
+    ctx.beginBox(.{ .layer = &first_spec, .width = .{ .fixed = 40 }, .height = .{ .fixed = 20 } });
+    try std.testing.expectEqual(ctx.current_layer_scope.pointer_enabled, ctx.current_layer_scope.route_active);
+    ctx.endBox();
+    try std.testing.expectEqual(ctx.current_layer_scope.pointer_enabled, ctx.current_layer_scope.route_active);
+    ctx.endFrame();
+
+    ctx.pushEvent(.{ .mouse_down = .{ .x = 100, .y = 100, .button = 0, .modifiers = 0 } });
+    ctx.beginFrameAt(400, 300, 0.1);
+    try std.testing.expect(ctx.layer_route.frontmost_slot != null);
+    try std.testing.expect(!ctx.current_layer_scope.pointer_enabled);
+    try std.testing.expectEqual(ctx.current_layer_scope.pointer_enabled, ctx.current_layer_scope.route_active);
+    try std.testing.expect(ctx.layerDismissed(.{ .value = 903 }));
+
+    const second_spec: LayerSpec = .{
+        .key = .{ .value = 903 },
+        .input = .modal,
+        .dismiss_on_outside = true,
+        .placement = .{ .source = .{ .point = .{ .x = 10, .y = 10 } }, .flip = .none },
+    };
+    ctx.beginBox(.{ .layer = &second_spec, .width = .{ .fixed = 40 }, .height = .{ .fixed = 20 } });
+    try std.testing.expect(ctx.current_layer_scope.pointer_enabled);
+    try std.testing.expectEqual(ctx.current_layer_scope.pointer_enabled, ctx.current_layer_scope.route_active);
+    ctx.endBox();
+    try std.testing.expect(!ctx.current_layer_scope.pointer_enabled);
+    try std.testing.expectEqual(ctx.current_layer_scope.pointer_enabled, ctx.current_layer_scope.route_active);
+    ctx.endFrame();
+}
+
+test "layer: outside dismissal covers every mouse button and edge position" {
+    var ctx = testCtx();
+    defer ctx.deinit();
+
+    const spec: LayerSpec = .{
+        .key = .{ .value = 904 },
+        .input = .modal,
+        .dismiss_on_outside = true,
+        .placement = .{ .source = .{ .point = .{ .x = 10, .y = 10 } }, .flip = .none },
+    };
+    ctx.beginFrameAt(400, 300, 0.0);
+    ctx.beginBox(.{ .layer = &spec, .width = .{ .fixed = 40 }, .height = .{ .fixed = 20 } });
+    ctx.endBox();
+    ctx.endFrame();
+
+    const buttons = [_]u8{ 0, 1, 2 };
+    const outside_points = [_]Vec2{
+        .{ .x = 30, .y = 9 },
+        .{ .x = 30, .y = 30 },
+        .{ .x = 9, .y = 20 },
+        .{ .x = 50, .y = 20 },
+        .{ .x = 9, .y = 9 },
+        .{ .x = 50, .y = 9 },
+        .{ .x = 9, .y = 30 },
+        .{ .x = 50, .y = 30 },
+    };
+    for (buttons) |button| {
+        for (outside_points) |point| {
+            ctx.pushEvent(.{ .mouse_down = .{
+                .x = point.x,
+                .y = point.y,
+                .button = button,
+                .modifiers = 0,
+            } });
+            ctx.beginFrameAt(400, 300, 0.1);
+            try std.testing.expect(ctx.layerDismissed(.{ .value = 904 }));
+            ctx.beginBox(.{ .layer = &spec, .width = .{ .fixed = 40 }, .height = .{ .fixed = 20 } });
+            try std.testing.expect(ctx.current_layer_scope.pointer_enabled);
+            ctx.endBox();
+            ctx.endFrame();
+        }
+    }
+}
+
+test "layer: transient marker slots are reusable" {
+    var ctx = testCtx();
+    defer ctx.deinit();
+
+    var frame: usize = 0;
+    while (frame < 40) : (frame += 1) {
+        ctx.beginFrameAt(400, 300, @as(f64, @floatFromInt(frame * 2)) / 10.0);
+        (LayerFixture{ .key = @intCast(frame + 100), .box_id = @intCast(frame + 1000), .point = .{ .x = 3, .y = 4 } }).build(&ctx);
+        ctx.endFrame();
+        try std.testing.expect(ctx.layer_slots_len <= 1);
+
+        ctx.beginFrameAt(400, 300, @as(f64, @floatFromInt(frame * 2 + 1)) / 10.0);
+        ctx.endFrame();
+        try std.testing.expectEqual(@as(usize, 0), ctx.layer_slots_len);
+    }
+}
 
 test "tooltip: a one-line tooltip keeps the popup item height and centres its text" {
     var ctx = testCtx();
@@ -3342,11 +3644,10 @@ test "layer: the slot remembers where a layer was, and that it has gone" {
     try std.testing.expectEqual(@as(i32, 11), prev.x);
     try std.testing.expectEqual(@as(i32, 13), prev.y);
 
-    // A frame without it leaves the slot saying it was not on screen.
+    // A frame without it seals and releases the slot, so stale geometry cannot become an
+    // input route on the following frame.
     ctx.beginFrameAt(400, 300, 0.1);
     ctx.endFrame();
-    try std.testing.expect(ctx.layerPrevRect(.{ .value = 7 }) != null); // the frame did not touch it
-    ctx.releaseLayerSlot(.{ .value = 7 });
     try std.testing.expect(ctx.layerPrevRect(.{ .value = 7 }) == null);
 }
 
@@ -3390,7 +3691,7 @@ test "layer: a marker and the box written after it do not share an auto id" {
     // did not advance the ordinal, the next box would take the same one — two boxes with one
     // auto id, and one per-id state between them.
     ctx.beginBox(.{
-        .layer = .{ .key = .{ .value = 1 }, .placement = .{ .source = .{ .point = .{ .x = 0, .y = 0 } } } },
+        .layer = &.{ .key = .{ .value = 1 }, .placement = .{ .source = .{ .point = .{ .x = 0, .y = 0 } } } },
         .width = .{ .fixed = 10 },
         .height = .{ .fixed = 10 },
     });
@@ -3415,14 +3716,14 @@ test "layer: emission puts every layer after the main tree, in z order" {
     ctx.endBox();
     // Registered high-z first, so registration order alone would emit it first.
     ctx.beginBox(.{
-        .layer = .{ .key = .{ .value = 1 }, .z = 10, .placement = .{ .source = .{ .point = .{ .x = 0, .y = 0 } } } },
+        .layer = &.{ .key = .{ .value = 1 }, .z = 10, .placement = .{ .source = .{ .point = .{ .x = 0, .y = 0 } } } },
         .width = .{ .fixed = 10 },
         .height = .{ .fixed = 10 },
         .bg = bg_high,
     });
     ctx.endBox();
     ctx.beginBox(.{
-        .layer = .{ .key = .{ .value = 2 }, .z = 1, .placement = .{ .source = .{ .point = .{ .x = 0, .y = 0 } } } },
+        .layer = &.{ .key = .{ .value = 2 }, .z = 1, .placement = .{ .source = .{ .point = .{ .x = 0, .y = 0 } } } },
         .width = .{ .fixed = 10 },
         .height = .{ .fixed = 10 },
         .bg = bg_low,
@@ -3467,7 +3768,7 @@ test "layer: custom leaves emit into one list in tree then layer order" {
     ctx.custom(.{ .x = 40, .y = 20 }, Capture.drawFn, &main_cap);
     ctx.endBox();
     ctx.beginBox(.{
-        .layer = .{ .key = .{ .value = 1 }, .placement = .{ .source = .{ .point = .{ .x = 0, .y = 0 } } } },
+        .layer = &.{ .key = .{ .value = 1 }, .placement = .{ .source = .{ .point = .{ .x = 0, .y = 0 } } } },
         .width = .{ .fixed = 40 },
         .height = .{ .fixed = 20 },
     });
@@ -3488,7 +3789,7 @@ test "layer: a root sizes against the boundary, not against a parent it does not
     defer ctx.deinit();
     ctx.beginFrameAt(400, 300, 0.0);
     ctx.beginBox(.{
-        .layer = .{ .key = .{ .value = 1 }, .placement = .{ .source = .{ .point = .{ .x = 0, .y = 0 } }, .flip = .none } },
+        .layer = &.{ .key = .{ .value = 1 }, .placement = .{ .source = .{ .point = .{ .x = 0, .y = 0 } }, .flip = .none } },
         .id = 1200,
         .width = .{ .percent = 0.25 },
         .height = .{ .fixed = 30 },
@@ -3507,7 +3808,7 @@ test "layer: a marker subtree may not take input" {
     defer ctx.deinit();
     ctx.beginFrameAt(400, 300, 0.0);
     ctx.beginBox(.{
-        .layer = .{ .key = .{ .value = 1 }, .placement = .{ .source = .{ .point = .{ .x = 0, .y = 0 } } } },
+        .layer = &.{ .key = .{ .value = 1 }, .placement = .{ .source = .{ .point = .{ .x = 0, .y = 0 } } } },
     });
     ctx.endBox();
     _ = ctx.mainDrawList();

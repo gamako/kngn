@@ -129,7 +129,7 @@ fn runDisplayOnly(ctx: *gui.Context, build_fn: gui.TooltipBuildFn) void {
 fn runMarkerMainDrawList(ctx: *gui.Context) void {
     ctx.beginFrame(320, 240);
     ctx.beginBox(.{
-        .layer = .{ .key = .{ .value = 1 }, .placement = .{ .source = .{ .point = .{ .x = 0, .y = 0 } } } },
+        .layer = &.{ .key = .{ .value = 1 }, .placement = .{ .source = .{ .point = .{ .x = 0, .y = 0 } } } },
     });
     _ = ctx.mainDrawList();
 }
@@ -137,7 +137,7 @@ fn runMarkerMainDrawList(ctx: *gui.Context) void {
 fn runMarkerPostFrameDrawList(ctx: *gui.Context) void {
     ctx.beginFrame(320, 240);
     ctx.beginBox(.{
-        .layer = .{ .key = .{ .value = 1 }, .placement = .{ .source = .{ .point = .{ .x = 0, .y = 0 } } } },
+        .layer = &.{ .key = .{ .value = 1 }, .placement = .{ .source = .{ .point = .{ .x = 0, .y = 0 } } } },
     });
     _ = ctx.postFrameDrawList();
 }

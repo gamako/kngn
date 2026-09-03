@@ -192,7 +192,10 @@ pub const BoxConfig = struct {
     /// clip and scroll. This takes it out of the parent altogether — which is what a dropdown,
     /// a context menu or a tooltip needs, and why the two are separate fields rather than one
     /// with a mode. A box may not carry both.
-    layer: ?LayerSpec = null,
+    ///
+    /// The pointer is borrowed only during `Context.beginBox`, which copies the specification
+    /// into the frame's layer record. No later layout phase may dereference it.
+    layer: ?*const LayerSpec = null,
 };
 
 /// Draw callback for a custom leaf. Called with the final rect after endFrame finalizes layout.
@@ -267,7 +270,7 @@ pub const Node = struct {
 /// the marker's scope closes, so no layout walk can reach upward from a layer root.
 pub fn attachDetached(parent: *Node, child: *Node) void {
     std.debug.assert(child.parent == null);
-    std.debug.assert(child.cfg.layer != null);
+    std.debug.assert(!child.is_layer_root);
     child.parent = parent;
     child.is_layer_root = true;
     // The ordinal advances even though the chain does not. It is what auto-generated ids are
