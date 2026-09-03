@@ -721,11 +721,12 @@ pub const Context = struct {
     ///
     /// Interactive widgets, focus / scroll / popup / drag mutation, per-id store
     /// touches, nested tooltips, and input injection are lifecycle violations
-    /// inside a custom-tooltip builder. Checked at each public API entry, before
+    /// inside a display-only subtree — a custom-tooltip builder, or a layer, which does not
+    /// arbitrate against what is under it yet. Checked at each public API entry, before
     /// any caller-owned write, so a first-frame (empty rect cache) call still
     /// fails. Panics in every optimisation mode (same class as `requireContract`).
     pub inline fn requireInteractiveAllowed(self: *const Context, comptime what: []const u8) void {
-        requireContract(self.display_only_depth == 0, what ++ " is not allowed in a display-only tooltip builder");
+        requireContract(self.display_only_depth == 0, what ++ " is not allowed in a display-only subtree");
     }
 
     pub fn endFrame(self: *Context) void {
@@ -737,7 +738,7 @@ pub const Context = struct {
         // written back there, so an unclosed group would leave its rows at zero-width columns.
         requireContract(self.slider_group == null, "endFrame with a slider group still open");
         requireContract(self.table == null, "endFrame with a table still open");
-        requireContract(self.display_only_depth == 0, "endFrame with a display-only tooltip builder still open");
+        requireContract(self.display_only_depth == 0, "endFrame with a display-only subtree still open");
         const root = self.layout_root.?;
         // Detect beginBox / endBox mismatches
         requireContract(self.layout_current == root, "endFrame with a box still open");
