@@ -3335,17 +3335,19 @@ test "position: pinning both edges takes the size from the gap between them" {
         .width = .{ .fixed = 200 },
         .height = .{ .fixed = 100 },
     } };
-    var bar: Node = .{ .cfg = .{
-        .position = .{
-            .left = .{ .length = .{ .px = 12 } },
-            .right = .{ .length = .{ .px = 12 } },
-            .top = .{ .length = .{ .px = 0 } },
-            // A pivot that would shift the box if the axis were not pinned on both sides.
-            .pivot = .{ .x = 0.5, .y = 0 },
+    var bar: Node = .{
+        .cfg = .{
+            .position = .{
+                .left = .{ .length = .{ .px = 12 } },
+                .right = .{ .length = .{ .px = 12 } },
+                .top = .{ .length = .{ .px = 0 } },
+                // A pivot that would shift the box if the axis were not pinned on both sides.
+                .pivot = .{ .x = 0.5, .y = 0 },
+            },
+            .width = .fit,
+            .height = .{ .fixed = 20 },
         },
-        .width = .fit,
-        .height = .{ .fixed = 20 },
-    } };
+    };
     appendChild(&root, &bar);
     layoutOnce(&root, 200, 100);
     try std.testing.expectEqual(@as(i32, 12), bar.rect.x);
