@@ -3,7 +3,7 @@
 //! A grid-based item inventory: click/keyboard/gamepad move a 2D cursor, drag and drop swaps
 //! items between slots, hovering a filled slot shows a tooltip, and a rotary "Min Rarity" knob
 //! dims low-rarity items. Right-click opens a Lock/Discard context menu (`ctx.popupMenuEx` with
-//! `PopupItem.checked` + `keep_open_on_select`); the detail panel's Discard button is disabled
+//! `PopupItem.check` + `keep_open_on_select`); the detail panel's Discard button is disabled
 //! (`ctx.beginDisabled`/`endDisabled`) while the cursor sits on an empty slot.
 //!
 //! Item drag-and-drop between slots goes through libs/gui's `gui.dragSource`/`dropTarget`/

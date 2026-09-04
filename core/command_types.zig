@@ -45,6 +45,24 @@ pub const CommandKind = enum(u8) {
     separator,
 };
 
+/// Whether a menu entry carries a check mark, and if so which way it is set.
+///
+/// The three states are distinct on purpose. `none` says the entry is a plain action that never
+/// shows a check; `off` says it is a toggle that happens to be off right now. A menu reserves the
+/// column its check marks are drawn in when **any** of its entries is `off` or `on`, so a toggle
+/// menu keeps its labels in one place instead of shifting them as the user toggles an entry.
+/// Choosing `none` for a toggle that is merely off would make the column come and go.
+///
+/// A native menu carries a single on/off bit, so `none` and `off` reach it alike as "no check".
+pub const CheckState = enum(u8) {
+    /// A plain action. It takes no part in the check column.
+    none,
+    /// A toggle that is currently off: no mark, but it holds the check column open.
+    off,
+    /// A toggle that is currently on.
+    on,
+};
+
 /// The command definition registered with a native menu.
 ///
 /// The `label`, `menu.title` and `shortcut` slices need only stay valid for the duration of the registration call.
@@ -56,7 +74,8 @@ pub const Command = struct {
     kind: CommandKind = .item,
     shortcut: ?Shortcut = null,
     enabled: bool = true,
-    checked: bool = false,
+    /// Whether this entry shows a check mark. See `CheckState`: a plain action is `none`, not `off`.
+    check: CheckState = .none,
     execution_policy: ExecutionPolicy = .normal,
 
     /// A separator holds no ID, and only ordinary items use the range of application command IDs.

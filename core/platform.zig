@@ -138,6 +138,7 @@ pub const FILE_DROP_PATH_BYTES = types.FILE_DROP_PATH_BYTES;
 pub const FILE_DROP_MAX_PATHS = types.FILE_DROP_MAX_PATHS;
 pub const makeFileDropEventFromPath = types.makeFileDropEventFromPath;
 pub const CommandId = command_types.CommandId;
+pub const CheckState = command_types.CheckState;
 pub const Command = command_types.Command;
 pub const CommandKind = command_types.CommandKind;
 pub const ExecutionPolicy = command_types.ExecutionPolicy;

@@ -228,7 +228,7 @@ const commands = [_]gui.Command{
     .{ .id = 1, .label = "Open", .menu = .{ .title = "File", .order = 0 }, .shortcut = .{ .key = .O, .modifiers = .{ .cmd = true } } },
     .{ .id = 2, .label = "Save (disabled)", .menu = .{ .title = "File", .order = 1 }, .enabled = false },
     .{ .id = 0, .menu = .{ .title = "File", .order = 2 }, .kind = .separator },
-    .{ .id = 3, .label = "Show grid", .menu = .{ .title = "View", .order = 0 }, .checked = true },
+    .{ .id = 3, .label = "Show grid", .menu = .{ .title = "View", .order = 0 }, .check = .on },
 };
 
 const App = struct {

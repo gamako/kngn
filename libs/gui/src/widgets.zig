@@ -165,9 +165,12 @@ pub fn buttonId(ctx: *Context, id: Id, label: []const u8, opts: ButtonOpts) Butt
     return buttonIdWithRoute(ctx, id, label, opts, null);
 }
 
-/// Explicit-ID button whose label is preceded by a fixed-width checkbox glyph.
-/// The glyph is display-only; activation remains the button's click result.
-pub fn buttonIdWithCheckGlyph(ctx: *Context, id: Id, label: []const u8, checked: bool, opts: ButtonOpts) ButtonResult {
+/// Explicit-ID button whose label is preceded by a fixed-width check column.
+///
+/// The column is reserved whether or not `checked` is set, so every row of one menu puts its label
+/// in the same place and toggling a row never moves the text. The mark is display-only;
+/// activation remains the button's click result.
+pub fn buttonIdWithCheckMark(ctx: *Context, id: Id, label: []const u8, checked: bool, opts: ButtonOpts) ButtonResult {
     ctx.requireInteractiveAllowed("button");
     const result = behaviorFromCacheWithRoute(ctx, id, null);
     const style = ctx.style;
@@ -225,19 +228,9 @@ pub fn buttonIdWithCheckGlyph(ctx: *Context, id: Id, label: []const u8, checked:
         .border = makeBorder(colors.border, thickness),
         .radius = style.control_radius,
     });
-    const widget = opts.style orelse WidgetStyle{};
-    const glyph_border = colors.border;
-    const glyph_fill = widget.selected orelse widget.active orelse style.accent.primary;
-    const data = ctx.allocator().create(CheckGlyph) catch @panic("buttonIdWithCheckGlyph: OOM");
-    data.* = .{
-        .size = glyph_size,
-        .radius = style.checkbox_radius,
-        .checked = checked,
-        .border = glyph_border,
-        .bg = colors.bg,
-        .fill = if (disabled) style.disabledColor(glyph_fill) else glyph_fill,
-    };
-    ctx.custom(.{ .x = glyph_size, .y = glyph_size }, CheckGlyph.draw, data);
+    const data = ctx.allocator().create(CheckMark) catch @panic("buttonIdWithCheckMark: OOM");
+    data.* = .{ .checked = checked, .color = colors.text };
+    ctx.custom(.{ .x = glyph_size, .y = glyph_size }, CheckMark.draw, data);
     ctx.labelEx(label, colors.text);
     ctx.endBox();
     return result;
@@ -1752,6 +1745,28 @@ pub fn checkboxIdEx(ctx: *Context, id: Id, label: []const u8, value: *bool, opts
     ctx.endBox();
     return result.clicked;
 }
+
+/// The check mark a menu row draws in its check column: two strokes meeting at the low corner.
+/// It is a fixed-size vector drawing rather than a font glyph, so it does not follow the text
+/// metrics. An unchecked row still occupies the column, and simply draws nothing.
+const CheckMark = struct {
+    checked: bool,
+    color: Color,
+
+    fn draw(ctx_ptr: *anyopaque, dl: *DrawList, rect: Rect) void {
+        const self: *const CheckMark = @ptrCast(@alignCast(ctx_ptr));
+        if (!self.checked) return;
+        const w: i32 = @intCast(rect.w);
+        const h: i32 = @intCast(rect.h);
+        // Proportions of the box, so the mark scales with `checkbox_size`.
+        const corner: geom.Vec2 = .{ .x = rect.x + @divTrunc(w * 42, 100), .y = rect.y + @divTrunc(h * 72, 100) };
+        const start: geom.Vec2 = .{ .x = rect.x + @divTrunc(w * 20, 100), .y = rect.y + @divTrunc(h * 50, 100) };
+        const end: geom.Vec2 = .{ .x = rect.x + @divTrunc(w * 80, 100), .y = rect.y + @divTrunc(h * 26, 100) };
+        const thickness: u32 = 2;
+        dl.line(start, corner, self.color, thickness) catch @panic("check mark: OOM");
+        dl.line(corner, end, self.color, thickness) catch @panic("check mark: OOM");
+    }
+};
 
 const CheckGlyph = struct {
     size: i32,

@@ -265,7 +265,7 @@ libs/gui itself was not changed. Gaps are recorded as example-side custom/hack o
    **Measured** (`zig build bench-gui-list-menu`, ReleaseFast, 1024×768, warmup 100, 1000 iterations, Apple M1 Max, zig 0.16.0, 2026-08-02, 3 runs): avg 448–471µs, min 427–448µs, p95 459–524µs. For comparison, `bench-gui-frame` at the same row count and scale (bare `buttonId` rows, no toolbar/menu/filter) measures avg ≈263µs at 500 rows and avg ≈416µs at 1000 rows — a different-shaped benchmark, not a per-row multiplier of the list+menu figure above. Both are well inside a 16.67ms (60fps) frame budget.
 2. **No dedicated Listbox semantics beyond what now exists** — Row select / highlight is app state (`selected_row` / `active_row`) layered on top of `gui.beginListboxRow`/`endListboxRow` (added after this section was first written; see §5's correction note). The library gives roving-tab-stop navigation and a selected-row background; multi-select, drag-select and column/tree semantics are still app-side or absent (items 8 and 10 below).
 3. **No list keyboard navigation API** — Up/down active-row movement is a custom app handler for `key_down UP/DOWN`. List nav is suppressed while a popup is open.
-4. **No checkbox-backed persistent multi-select popup** — `PopupItem` has no checked state. Filters rebuild `[on]`/`[off]` labels and, after item selection closes the popup, the app reopens to simulate multi-select (`filter_reopen_count`).
+4. **Checked state on a persistent popup** — `PopupItem.check` plus `keep_open_on_select` carry multi-select directly: the filter menu derives each item's checked flag from `filter_mask` and stays open across toggles, so neither a rebuilt `[on]`/`[off]` label nor a reopen to simulate persistence is needed.
 5. **Shared layer registry** — menuBar, context and filter consumers can be present together. Their `PopupState` keys are registered in one layer registry; explicit `z` values and registration serial define which overlapping item receives input. E2E scenario 7 now checks the menu/context simultaneous composition instead of a single-popup limit.
 6. **No standard ellipsis API** — Long filenames are truncated by the app with `font.measure` then `...`. No custom rasterizer / direct `DrawList` use.
 7. **No virtualization API** — All 500 rows are built and laid out every frame. Scrolling is `beginScrollArea` only.
@@ -301,9 +301,9 @@ all in one screen: `ctx.tabId` (pattern
 switch, selection follows focus), `beginListboxRow`/`endListboxRow`/`gui.pollListNav` (track list, roving
 tab stop), `ctx.labelEllipsis` (track names) and `ctx.beginFormRow`/`endFormRow` (detail-panel rows, one
 using only `description` with no `label`), `ctx.beginDisabled`/`endDisabled` (a muted track's own
-Volume/Pan controls), and `ctx.popupMenuEx` with `PopupItem.checked` plus `keep_open_on_select` (the
-right-click track context menu: Mute / Solo / Clear Pattern, checked marks reflecting current state,
-staying open across toggles). `popupMenuStacked` uses the same consumer-owned state and registry path;
+Volume/Pan controls), and `ctx.popupMenuEx` with `PopupItem.check` plus `keep_open_on_select` (the
+right-click track context menu: Mute and Solo are toggles carrying their current state, Clear Pattern
+is a plain action, and the check column stays put as the menu is toggled open). `popupMenuStacked` uses the same consumer-owned state and registry path;
 the list+menu shell (§15) remains the evidence for simultaneous popup layers.
 
 ### 16.1 Resolved: stepgrid now consults the disabled scope

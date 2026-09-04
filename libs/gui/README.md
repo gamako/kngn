@@ -221,8 +221,12 @@ later frame is the only presence transition.
 
 The classic and stacked entry points use the same layer registry. `z` and registration serial
 define their order, so a menu-bar dropdown and a context menu can coexist without a second popup
-channel. Menu rows and dialog actions use ordinary buttons, including checked, disabled,
-selection, keep-open and Tab semantics. A modal menu does not receive a framework backdrop; a
+channel. Menu rows and dialog actions use ordinary buttons, including check, disabled,
+selection, keep-open and Tab semantics. A row's `check` is a `CheckState`, not a bool: `none` is
+a plain action, `off` a toggle that is off, `on` a toggle that is set. The menu reserves its
+check column when any row is `off` or `on`, so toggling a row swaps the mark without moving a
+label. A menu-bar dropdown reaches the same column: `Command.check` is forwarded to the row, and
+the label carries text only. A modal menu does not receive a framework backdrop; a
 dialog's scrim is an ordinary background on its viewport-sized root.
 
 `gui.menuBar` builds the title buttons and registers their explicit Ids as pointer-only command

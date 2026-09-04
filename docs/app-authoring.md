@@ -504,11 +504,18 @@ if (file_button.clicked) file_menu.open = !file_menu.open;
 const result = gui.popupMenu(ctx, &file_menu, &.{
     .{ .label = "Open" },
     .{ .label = "Save", .enabled = can_save },
+    .{ .label = "Word wrap", .check = if (wrapping) .on else .off },
 });
 if (result.selected) |index| dispatchFileItem(index);
 if (result.dismissed) file_menu.open = false;
 ctx.endFrame();
 ```
+
+`check` is a `CheckState`, not a bool. A toggle that is currently off is `off`, not `none`: the
+menu reserves the column it draws check marks in whenever any row is `off` or `on`, so writing
+`off` is what keeps every label still while the user toggles the row. Leave `check` out entirely
+for a plain action such as `Open`. A menu-bar dropdown uses the same column through
+`Command.check`, so an application does not spell a check into a label.
 
 The marker is visible in its first submitted frame but owns input from the next frame, just like
 all declarative layers. `layerDismissed` is an event result; the consumer decides whether to set

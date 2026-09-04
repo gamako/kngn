@@ -133,9 +133,9 @@ pub fn hitTestTrack(app: *const App, p: gui.Vec2) ?i32 {
 fn buildContextItems(app: *App) void {
     const t = &app.tracks[clampTrack(app.context_track)];
     app.context_items = .{
-        .{ .label = "Mute", .checked = t.muted },
-        .{ .label = "Solo", .checked = t.solo },
-        .{ .label = "Clear Pattern", .checked = false },
+        .{ .label = "Mute", .check = if (t.muted) .on else .off },
+        .{ .label = "Solo", .check = if (t.solo) .on else .off },
+        .{ .label = "Clear Pattern" },
     };
 }
 

@@ -3357,12 +3357,12 @@ const App = struct {
             .enabled = !platform.netsyncActive(),
         });
 
-        put(self, &n, .{ .id = CmdId.toggle_history, .label = "History", .menu = .{ .title = "View", .order = 300 }, .checked = self.isPanelVisible(PanelNames.history), .shortcut = .{ .key = .H, .modifiers = accel_shift } });
-        put(self, &n, .{ .id = CmdId.toggle_color, .label = "Color", .menu = .{ .title = "View", .order = 301 }, .checked = self.isPanelVisible(PanelNames.color), .shortcut = .{ .key = .C, .modifiers = accel_shift } });
-        put(self, &n, .{ .id = CmdId.toggle_palette, .label = "Palette", .menu = .{ .title = "View", .order = 302 }, .checked = self.isPanelVisible(PanelNames.palette), .shortcut = .{ .key = .P, .modifiers = accel_shift } });
-        put(self, &n, .{ .id = CmdId.toggle_tool_options, .label = "Tool Options", .menu = .{ .title = "View", .order = 303 }, .checked = self.isPanelVisible(PanelNames.tool_options), .shortcut = .{ .key = .O, .modifiers = accel_shift } });
-        put(self, &n, .{ .id = CmdId.toggle_layers, .label = "Layers", .menu = .{ .title = "View", .order = 304 }, .checked = self.isPanelVisible(PanelNames.layers), .shortcut = .{ .key = .L, .modifiers = accel_shift } });
-        put(self, &n, .{ .id = CmdId.toggle_timeline, .label = "Timeline", .menu = .{ .title = "View", .order = 305 }, .checked = self.isPanelVisible(PanelNames.timeline), .shortcut = .{ .key = .T, .modifiers = accel_shift } });
+        put(self, &n, .{ .id = CmdId.toggle_history, .label = "History", .menu = .{ .title = "View", .order = 300 }, .check = if (self.isPanelVisible(PanelNames.history)) .on else .off, .shortcut = .{ .key = .H, .modifiers = accel_shift } });
+        put(self, &n, .{ .id = CmdId.toggle_color, .label = "Color", .menu = .{ .title = "View", .order = 301 }, .check = if (self.isPanelVisible(PanelNames.color)) .on else .off, .shortcut = .{ .key = .C, .modifiers = accel_shift } });
+        put(self, &n, .{ .id = CmdId.toggle_palette, .label = "Palette", .menu = .{ .title = "View", .order = 302 }, .check = if (self.isPanelVisible(PanelNames.palette)) .on else .off, .shortcut = .{ .key = .P, .modifiers = accel_shift } });
+        put(self, &n, .{ .id = CmdId.toggle_tool_options, .label = "Tool Options", .menu = .{ .title = "View", .order = 303 }, .check = if (self.isPanelVisible(PanelNames.tool_options)) .on else .off, .shortcut = .{ .key = .O, .modifiers = accel_shift } });
+        put(self, &n, .{ .id = CmdId.toggle_layers, .label = "Layers", .menu = .{ .title = "View", .order = 304 }, .check = if (self.isPanelVisible(PanelNames.layers)) .on else .off, .shortcut = .{ .key = .L, .modifiers = accel_shift } });
+        put(self, &n, .{ .id = CmdId.toggle_timeline, .label = "Timeline", .menu = .{ .title = "View", .order = 305 }, .check = if (self.isPanelVisible(PanelNames.timeline)) .on else .off, .shortcut = .{ .key = .T, .modifiers = accel_shift } });
 
         self.menu_command_count = n;
     }
@@ -3378,7 +3378,7 @@ const App = struct {
             var snap: NativeMenuSnap = .{
                 .id = cmd.id,
                 .enabled = cmd.enabled,
-                .checked = cmd.checked,
+                .checked = cmd.check == .on,
                 .kind = cmd.kind,
                 .label_hash = hashMenuStr(cmd.label),
                 .label_len = cmd.label.len,
@@ -3416,7 +3416,7 @@ const App = struct {
         const cmds = self.menu_commands[0..self.menu_command_count];
         if (cmds.len != self.native_menu_snap_count) return true;
         for (cmds, self.native_menu_snap[0..cmds.len]) |cmd, snap| {
-            if (cmd.enabled != snap.enabled or cmd.checked != snap.checked) return true;
+            if (cmd.enabled != snap.enabled or (cmd.check == .on) != snap.checked) return true;
         }
         return false;
     }
@@ -3735,7 +3735,7 @@ fn menuDigest(ctx: *anyopaque, buf: []u8) []const u8 {
         if (items >= 32) break;
         const bit: u32 = @as(u32, 1) << @intCast(items);
         if (cmd.enabled) enabled_mask |= bit;
-        if (cmd.checked) checked_mask |= bit;
+        if (cmd.check == .on) checked_mask |= bit;
         items += 1;
     }
     // pending = FileOp actually still unconsumed (prefer in-flight dialog; the true state).

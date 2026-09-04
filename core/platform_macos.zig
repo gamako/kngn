@@ -917,7 +917,9 @@ const MenuScratch = struct {
                 .shortcut_key = if (cmd.shortcut) |sc| @intFromEnum(sc.key) else -1,
                 .shortcut_mods = if (cmd.shortcut) |sc| sc.modifiers.toC() else 0,
                 .enabled = if (cmd.enabled) 1 else 0,
-                .checked = if (cmd.checked) 1 else 0,
+                // The native menu carries one on/off bit, so `none` and `off` both reach it
+                // as "no check"; only the GUI distinguishes the two.
+                .checked = if (cmd.check == .on) 1 else 0,
             };
         }
         return self.items[0..n];

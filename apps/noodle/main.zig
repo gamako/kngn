@@ -1218,7 +1218,7 @@ const App = struct {
             .label = "History",
             .menu = .{ .title = "View", .order = 100 },
             .shortcut = .{ .key = .H, .modifiers = hist_mod },
-            .checked = hist_checked,
+            .check = if (hist_checked) .on else .off,
         });
         self.menu_command_count = n;
     }
@@ -1234,7 +1234,7 @@ const App = struct {
         for (self.menu_commands[0..self.menu_command_count]) |cmd| {
             if (cmd.kind == .separator) continue;
             if (n >= flags.len) break;
-            flags[n] = .{ .enabled = cmd.enabled, .checked = cmd.checked };
+            flags[n] = .{ .enabled = cmd.enabled, .checked = cmd.check == .on };
             n += 1;
         }
         return menu_sig.signatureOf(flags[0..n]);
@@ -3891,7 +3891,7 @@ fn menuDigest(ctx: *anyopaque, buf: []u8) []const u8 {
         if (items >= 32) break;
         const bit: u32 = @as(u32, 1) << @intCast(items);
         if (cmd.enabled) enabled_mask |= bit;
-        if (cmd.checked) checked_mask |= bit;
+        if (cmd.check == .on) checked_mask |= bit;
         items += 1;
     }
     const pending = if (app.pending_menu_op) |op| @tagName(op) else "none";

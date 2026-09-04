@@ -26,6 +26,7 @@ pub const Color = context_mod.Color;
 pub const LayerKey = layer_types.LayerKey;
 pub const LayerSpec = layer_types.LayerSpec;
 pub const LayerPlacement = layer_types.LayerPlacement;
+pub const CheckState = @import("command_types").CheckState;
 
 pub const DialogAction = struct {
     label: []const u8,
@@ -66,7 +67,9 @@ pub const DialogState = struct {
 pub const PopupItem = struct {
     label: []const u8,
     enabled: bool = true,
-    checked: bool = false,
+    /// Whether this row shows a check mark. A plain action is `none`; a toggle that is off is
+    /// `off`, which keeps the check column open so the labels do not move when it is toggled.
+    check: CheckState = .none,
 };
 
 pub const PopupResult = struct {
@@ -104,9 +107,12 @@ fn dialogActionId(key: LayerKey, index: usize) Id {
     return id_mod.hashInt(key.value, @as(u64, @intCast(index + 0x1001)));
 }
 
-fn hasCheckedItem(items: []const PopupItem) bool {
+/// Whether this menu draws a check column at all. It asks whether any row *can* be checked, not
+/// whether one is checked right now, so toggling a row never makes the column appear or vanish
+/// underneath the labels.
+fn hasCheckableItem(items: []const PopupItem) bool {
     for (items) |item| {
-        if (item.checked) return true;
+        if (item.check != .none) return true;
     }
     return false;
 }
@@ -155,11 +161,11 @@ pub fn popupMenuEx(ctx: *Context, state: *PopupState, items: []const PopupItem, 
 
     var selected: ?usize = null;
     const row_style = itemStyle(ctx);
-    const show_check_gutter = hasCheckedItem(items);
+    const show_check_gutter = hasCheckableItem(items);
     for (items, 0..) |item, index| {
         const result = if (item.enabled)
             if (show_check_gutter)
-                ctx.buttonIdWithCheckGlyph(popupItemId(state.key, index), item.label, item.checked, .{
+                ctx.buttonIdWithCheckMark(popupItemId(state.key, index), item.label, item.check == .on, .{
                     .min_h = ctx.style.spacing.popup_item_height,
                     .padding = .{ 0, ctx.style.spacing.popup_inset, 0, ctx.style.spacing.popup_inset },
                     .style = row_style,
@@ -173,7 +179,7 @@ pub fn popupMenuEx(ctx: *Context, state: *PopupState, items: []const PopupItem, 
         else blk: {
             ctx.beginDisabled();
             const disabled_result = if (show_check_gutter)
-                ctx.buttonIdWithCheckGlyph(popupItemId(state.key, index), item.label, item.checked, .{
+                ctx.buttonIdWithCheckMark(popupItemId(state.key, index), item.label, item.check == .on, .{
                     .min_h = ctx.style.spacing.popup_item_height,
                     .padding = .{ 0, ctx.style.spacing.popup_inset, 0, ctx.style.spacing.popup_inset },
                     .style = row_style,
@@ -429,7 +435,7 @@ fn testCtx() Context {
     return Context.init(std.testing.allocator, font_mod.default_font);
 }
 
-fn popupNaturalWidth(label: []const u8, checked_index: ?usize) u32 {
+fn popupNaturalWidth(label: []const u8, checks: [3]CheckState) u32 {
     var ctx = testCtx();
     defer ctx.deinit();
     var state: PopupState = .{
@@ -437,12 +443,31 @@ fn popupNaturalWidth(label: []const u8, checked_index: ?usize) u32 {
         .open = true,
         .placement = .{ .source = .{ .point = .{ .x = 10, .y = 10 } }, .flip = .none, .shift = .none },
     };
-    var items: [3]PopupItem = .{ .{ .label = label }, .{ .label = label }, .{ .label = label } };
-    if (checked_index) |index| items[index].checked = true;
+    var items: [3]PopupItem = undefined;
+    for (&items, checks) |*item, check| item.* = .{ .label = label, .check = check };
     ctx.beginFrameAt(320, 200, 0.0);
     _ = popupMenu(&ctx, &state, &items);
     ctx.endFrame();
     return ctx.getNodeRect(state.key.value).?.w;
+}
+
+/// The check mark is two connected strokes, so a drawn mark is exactly two line commands whose
+/// ends meet. Counting them is what separates "the column is reserved" from "the mark is drawn".
+fn countCheckMarkStrokes(ctx: *Context) usize {
+    var count: usize = 0;
+    for (ctx.postFrameDrawList().cmds.items) |cmd| switch (cmd) {
+        .line => count += 1,
+        else => {},
+    };
+    return count;
+}
+
+fn checkMarkStrokeColor(ctx: *Context) ?Color {
+    for (ctx.postFrameDrawList().cmds.items) |cmd| switch (cmd) {
+        .line => |l| return l.color,
+        else => {},
+    };
+    return null;
 }
 
 test "popupMenu: a closed consumer is a no-op" {
@@ -664,17 +689,102 @@ test "popup paths: only the frontmost modal popup receives outside dismissal" {
     try std.testing.expect(!ctx.layerWasPlaced(upper.key));
 }
 
-test "popupMenu: checked indicators contribute to natural width at every item position" {
+test "popupMenu: the check column costs one glyph plus one gap, wherever the checkable row sits" {
     const labels = [_][]const u8{ "A", "A much longer menu item label" };
-    const checked_positions = [_]usize{ 0, 1, 2 };
+    const positions = [_]usize{ 0, 1, 2 };
 
     for (labels) |label| {
-        for (checked_positions) |checked_index| {
-            const unchecked_width = popupNaturalWidth(label, null);
-            const checked_width = popupNaturalWidth(label, checked_index);
-            try std.testing.expect(checked_width > unchecked_width);
+        var plain_ctx = testCtx();
+        const reserve: u32 = @intCast(plain_ctx.style.checkbox_size + plain_ctx.style.spacing.control_gap);
+        plain_ctx.deinit();
+
+        const plain_width = popupNaturalWidth(label, .{ .none, .none, .none });
+        for (positions) |index| {
+            var off_checks: [3]CheckState = .{ .none, .none, .none };
+            off_checks[index] = .off;
+            var on_checks: [3]CheckState = .{ .none, .none, .none };
+            on_checks[index] = .on;
+
+            // A row that merely *can* be checked already opens the column, by exactly one glyph
+            // plus one gap. Being on costs nothing beyond that, which is why toggling cannot
+            // move the labels.
+            try std.testing.expectEqual(plain_width + reserve, popupNaturalWidth(label, off_checks));
+            try std.testing.expectEqual(
+                popupNaturalWidth(label, off_checks),
+                popupNaturalWidth(label, on_checks),
+            );
         }
     }
+}
+
+test "popupMenu: a menu of plain actions reserves no check column and draws no mark" {
+    const labels = [_][]const u8{ "A", "A much longer menu item label" };
+    for (labels) |label| {
+        var ctx = testCtx();
+        defer ctx.deinit();
+        var state: PopupState = .{
+            .key = .{ .value = 0x90B7 },
+            .open = true,
+            .placement = .{ .source = .{ .point = .{ .x = 10, .y = 10 } }, .flip = .none, .shift = .none },
+        };
+        const items = [_]PopupItem{ .{ .label = label }, .{ .label = label } };
+        ctx.beginFrameAt(320, 200, 0.0);
+        _ = popupMenu(&ctx, &state, &items);
+        ctx.endFrame();
+
+        try std.testing.expectEqual(@as(usize, 0), countCheckMarkStrokes(&ctx));
+        const row = ctx.getNodeRect(popupItemId(state.key, 0)).?;
+        try std.testing.expectEqual(row.x + ctx.style.spacing.popup_inset, try textX(&ctx, label));
+    }
+}
+
+test "popupMenu: toggling a row changes the mark, never the label positions" {
+    const labels = [_][]const u8{ "A", "A much longer menu item label" };
+    for (labels) |label| {
+        // The same menu, once with its checkable row off and once on. Everything except the
+        // strokes must be identical: this is the contract the check column exists for.
+        var label_x_off: i32 = undefined;
+        var label_x_on: i32 = undefined;
+        for ([_]CheckState{ .off, .on }, 0..) |check, pass| {
+            var ctx = testCtx();
+            defer ctx.deinit();
+            var state: PopupState = .{
+                .key = .{ .value = 0x90B8 },
+                .open = true,
+                .placement = .{ .source = .{ .point = .{ .x = 10, .y = 10 } }, .flip = .none, .shift = .none },
+            };
+            const items = [_]PopupItem{ .{ .label = label, .check = check }, .{ .label = "Plain" } };
+            ctx.beginFrameAt(320, 200, 0.0);
+            _ = popupMenu(&ctx, &state, &items);
+            ctx.endFrame();
+
+            const expected_strokes: usize = if (check == .on) 2 else 0;
+            try std.testing.expectEqual(expected_strokes, countCheckMarkStrokes(&ctx));
+            // The plain row sits in the same column as the checkable one, so the menu reads as
+            // one list rather than two indents.
+            try std.testing.expectEqual(try textX(&ctx, label), try textX(&ctx, "Plain"));
+            if (pass == 0) label_x_off = try textX(&ctx, label) else label_x_on = try textX(&ctx, label);
+        }
+        try std.testing.expectEqual(label_x_off, label_x_on);
+    }
+}
+
+test "popupMenu: a disabled checked row draws its mark in the disabled text colour" {
+    var ctx = testCtx();
+    defer ctx.deinit();
+    var state: PopupState = .{
+        .key = .{ .value = 0x90B9 },
+        .open = true,
+        .placement = .{ .source = .{ .point = .{ .x = 10, .y = 10 } }, .flip = .none, .shift = .none },
+    };
+    const items = [_]PopupItem{.{ .label = "Locked", .check = .on, .enabled = false }};
+    ctx.beginFrameAt(320, 200, 0.0);
+    _ = popupMenu(&ctx, &state, &items);
+    ctx.endFrame();
+
+    try std.testing.expectEqual(@as(usize, 2), countCheckMarkStrokes(&ctx));
+    const expected = ctx.style.disabledColor(ctx.style.text_tokens.primary);
+    try std.testing.expectEqual(expected, checkMarkStrokeColor(&ctx).?);
 }
 
 fn textX(ctx: *Context, label: []const u8) !i32 {
@@ -688,17 +798,6 @@ fn textX(ctx: *Context, label: []const u8) !i32 {
     unreachable;
 }
 
-fn countCheckGlyphSquares(ctx: *Context, size: i32) usize {
-    var count: usize = 0;
-    for (ctx.postFrameDrawList().cmds.items) |cmd| switch (cmd) {
-        .rect_filled => |filled| {
-            if (filled.rect.w == @as(u32, @intCast(size)) and filled.rect.h == @as(u32, @intCast(size))) count += 1;
-        },
-        else => {},
-    };
-    return count;
-}
-
 fn expectCheckGutterLayout(checked_index: usize, labels: [3][]const u8) !void {
     var ctx = testCtx();
     defer ctx.deinit();
@@ -707,38 +806,40 @@ fn expectCheckGutterLayout(checked_index: usize, labels: [3][]const u8) !void {
         .open = true,
         .placement = .{ .source = .{ .point = .{ .x = 10, .y = 10 } }, .flip = .none },
     };
-    const items = [_]PopupItem{
-        .{ .label = labels[0] },
-        .{ .label = labels[1] },
-        .{ .label = "Disabled", .enabled = false },
+    // Every row is checkable and only one is on, so the column is what all three share and the
+    // mark is what one of them adds.
+    var items = [_]PopupItem{
+        .{ .label = labels[0], .check = .off },
+        .{ .label = labels[1], .check = .off },
+        .{ .label = "Disabled", .enabled = false, .check = .off },
     };
-    var mutable_items = items;
-    mutable_items[checked_index].checked = true;
+    items[checked_index].check = .on;
 
     ctx.beginFrameAt(320, 200, 0.0);
-    _ = popupMenu(&ctx, &state, &mutable_items);
+    _ = popupMenu(&ctx, &state, &items);
     ctx.endFrame();
 
-    const size = ctx.style.checkbox_size;
-    try std.testing.expectEqual(@as(usize, mutable_items.len), countCheckGlyphSquares(&ctx, size));
-    const label_x = try textX(&ctx, mutable_items[0].label);
-    try std.testing.expectEqual(label_x, try textX(&ctx, mutable_items[1].label));
-    try std.testing.expectEqual(label_x, try textX(&ctx, mutable_items[2].label));
+    try std.testing.expectEqual(@as(usize, 2), countCheckMarkStrokes(&ctx));
+    const label_x = try textX(&ctx, items[0].label);
+    try std.testing.expectEqual(label_x, try textX(&ctx, items[1].label));
+    try std.testing.expectEqual(label_x, try textX(&ctx, items[2].label));
 
+    const size = ctx.style.checkbox_size;
     const first_row = ctx.getNodeRect(popupItemId(state.key, 0)).?;
-    const expected_glyph_x = first_row.x + ctx.style.spacing.popup_inset;
-    try std.testing.expectEqual(expected_glyph_x + size + ctx.style.spacing.control_gap, label_x);
+    const column_x = first_row.x + ctx.style.spacing.popup_inset;
+    try std.testing.expectEqual(column_x + size + ctx.style.spacing.control_gap, label_x);
+
+    // Both strokes stay inside the column they were given.
     for (ctx.postFrameDrawList().cmds.items) |cmd| switch (cmd) {
-        .rect_filled => |filled| {
-            if (filled.rect.w == @as(u32, @intCast(size)) and filled.rect.h == @as(u32, @intCast(size))) {
-                try std.testing.expectEqual(expected_glyph_x, filled.rect.x);
-            }
+        .line => |l| {
+            try std.testing.expect(l.p0.x >= column_x and l.p0.x <= column_x + size);
+            try std.testing.expect(l.p1.x >= column_x and l.p1.x <= column_x + size);
         },
         else => {},
     };
 }
 
-test "popupMenu: checked and unchecked rows share a token-sized check gutter" {
+test "popupMenu: the mark moves between rows while the check column does not" {
     const labels = [3][]const u8{ "A", "A longer menu label", "Disabled" };
     for ([_]usize{ 0, 1, 2 }) |checked_index| {
         try expectCheckGutterLayout(checked_index, labels);
@@ -754,7 +855,7 @@ test "popupMenu: checked rows keep ordinary button chrome" {
         .placement = .{ .source = .{ .point = .{ .x = 10, .y = 10 } }, .flip = .none },
     };
     const items = [_]PopupItem{
-        .{ .label = "Checked", .checked = true },
+        .{ .label = "Checked", .check = .on },
         .{ .label = "Other" },
     };
 

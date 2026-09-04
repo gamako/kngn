@@ -6,7 +6,7 @@
 //! `gui.beginListboxRow`/`gui.pollListNav`; the step grid is `gui.stepgrid.widgetRow`; muting a
 //! track goes through `ctx.beginDisabled`/`endDisabled` around both its grid row and its own
 //! volume/pan controls; the
-//! right-click context menu is `ctx.popupMenuEx` with `PopupItem.checked` and
+//! right-click context menu is `ctx.popupMenuEx` with `PopupItem.check` and
 //! `keep_open_on_select`. The context-menu open/draw glue and the track list's Up/Down handler
 //! remain example-side (see ui.zig's doc comment for the exact count).
 //!

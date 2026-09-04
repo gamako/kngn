@@ -383,7 +383,7 @@ fn buildFilterItems(app: *App) void {
         app.filter_items[i] = .{
             .label = s.name,
             .enabled = true,
-            .checked = (app.filter_mask & s.bit) != 0,
+            .check = if ((app.filter_mask & s.bit) != 0) .on else .off,
         };
     }
 }

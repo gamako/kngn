@@ -557,7 +557,7 @@ pub const Context = struct {
     pub const button = widgets.button;
     pub const buttonEx = widgets.buttonEx;
     pub const buttonId = widgets.buttonId;
-    pub const buttonIdWithCheckGlyph = widgets.buttonIdWithCheckGlyph;
+    pub const buttonIdWithCheckMark = widgets.buttonIdWithCheckMark;
     pub const commandButtonId = widgets.commandButtonId;
     pub const colorSwatch = widgets.colorSwatch;
     pub const colorSwatchEx = widgets.colorSwatchEx;
@@ -1317,7 +1317,13 @@ pub const Context = struct {
         if (!entry.enabled) return false;
         const frontmost = self.layer_route.frontmost_key orelse return entry.layer_key == null;
         const owner = entry.layer_key orelse return false;
-        return owner.eql(frontmost);
+        // `layerScopeFor` owns this decision: it enables focus only for the frontmost layer's
+        // scope, and `registerFocusable` copies that into `entry.enabled`, which the first line
+        // already tested. The order is cleared every `beginFrame` and the route is latched there,
+        // so an enabled layer entry is the frontmost layer's by construction. Comparing again
+        // would put one contract in two places; assert the invariant instead.
+        std.debug.assert(owner.eql(frontmost));
+        return true;
     }
 
     fn focusOwnerForId(self: *const Context, id: Id) ?LayerKey {
@@ -3847,33 +3853,195 @@ test "layer: command target exclusively consumes an outside retarget press in ei
     for (orders) |order| try expectCommandTargetRetarget(order);
 }
 
-test "layer: command target does not bypass a different modal route owner" {
+/// The menu-bar pointer exception is enabled only while the menu bar's own layer owns the route.
+///
+/// Both layers must be placed in the previous frame for this to test what it says. Leave the menu
+/// layer unplaced and `commandTargetOutsideRoute` stops at its `layerPrevRect` lookup instead of
+/// at the ownership comparison, and the test passes while proving nothing.
+fn expectCommandTargetYieldsToFrontmostOwner(order: LayerEventOrder) !void {
     var ctx = testCtx();
     defer ctx.deinit();
     const title_id: Id = 9071;
-    const owner_key: LayerKey = .{ .value = 9072 };
     const menu_key: LayerKey = .{ .value = 9073 };
-    const spec: LayerSpec = .{
-        .key = owner_key,
+    const context_key: LayerKey = .{ .value = 9072 };
+    const menu_spec: LayerSpec = .{
+        .key = menu_key,
+        .z = 0,
         .input = .modal,
+        .dismiss_on_outside = true,
         .placement = .{ .source = .{ .point = .{ .x = 120, .y = 120 } }, .flip = .none },
+    };
+    // Higher z, so this one is frontmost and owns the route.
+    const context_spec: LayerSpec = .{
+        .key = context_key,
+        .z = 10,
+        .input = .modal,
+        .placement = .{ .source = .{ .point = .{ .x = 220, .y = 180 } }, .flip = .none },
     };
 
     ctx.beginFrameAt(400, 300, 0.0);
     _ = ctx.buttonId(title_id, "File", .{});
-    ctx.beginBox(.{ .layer = &spec, .width = .{ .fixed = 80 }, .height = .{ .fixed = 40 } });
+    ctx.beginBox(.{ .layer = &menu_spec, .width = .{ .fixed = 80 }, .height = .{ .fixed = 40 } });
+    ctx.endBox();
+    ctx.beginBox(.{ .layer = &context_spec, .width = .{ .fixed = 80 }, .height = .{ .fixed = 40 } });
     ctx.endBox();
     ctx.endFrame();
 
+    // Both roots exist, so neither lookup can be what stops the exception.
+    try std.testing.expect(ctx.layerPrevRect(menu_key) != null);
+    try std.testing.expect(ctx.layerPrevRect(context_key) != null);
+
     const title = ctx.getNodeRect(title_id).?;
-    ctx.pushEvent(.{ .mouse_down = .{ .x = title.x + 8, .y = title.y + 8, .button = 0, .modifiers = 0 } });
+    const press: InputEvent = .{ .mouse_down = .{ .x = title.x + 8, .y = title.y + 8, .button = 0, .modifiers = 0 } };
+    // The press is outside both roots, so no modal subtree claims it first.
+    try std.testing.expect(!pointHitsVisible(ctx.layerPrevRect(menu_key).?, Rect{ .x = 0, .y = 0, .w = 400, .h = 300 }, .{ .x = title.x + 8, .y = title.y + 8 }));
+    try std.testing.expect(!pointHitsVisible(ctx.layerPrevRect(context_key).?, Rect{ .x = 0, .y = 0, .w = 400, .h = 300 }, .{ .x = title.x + 8, .y = title.y + 8 }));
+
+    if (order == .before_begin_frame) ctx.pushEvent(press);
     ctx.beginFrameAt(400, 300, 0.1);
+    if (order == .during_frame) ctx.pushEvent(press);
     ctx.registerCommandTarget(title_id, menu_key);
     const command = commandButtonBehavior(&ctx, title_id, title, Rect{ .x = 0, .y = 0, .w = 400, .h = 300 }, menu_key);
     try std.testing.expect(!command.hovered and !command.held and !command.clicked);
-    ctx.beginBox(.{ .layer = &spec, .width = .{ .fixed = 80 }, .height = .{ .fixed = 40 } });
+    ctx.beginBox(.{ .layer = &menu_spec, .width = .{ .fixed = 80 }, .height = .{ .fixed = 40 } });
+    ctx.endBox();
+    ctx.beginBox(.{ .layer = &context_spec, .width = .{ .fixed = 80 }, .height = .{ .fixed = 40 } });
     ctx.endBox();
     ctx.endFrame();
+}
+
+test "layer: command target does not bypass a different modal route owner" {
+    const orders = [_]LayerEventOrder{ .before_begin_frame, .during_frame };
+    for (orders) |order| try expectCommandTargetYieldsToFrontmostOwner(order);
+}
+
+/// Only the frontmost of the previously placed modal layers owns input. `layerScopeFor` drives
+/// pointer, keyboard, focus and wheel from one `owns_route`, so all four are asserted on both
+/// layers: checking the lower one alone would still pass if a fault disabled both.
+fn expectFrontmostOwnsRouteAlone(build_lower_first: bool) !void {
+    var ctx = testCtx();
+    defer ctx.deinit();
+    const lower_key: LayerKey = .{ .value = 9081 };
+    const upper_key: LayerKey = .{ .value = 9082 };
+    const lower_spec: LayerSpec = .{
+        .key = lower_key,
+        .z = 0,
+        .input = .modal,
+        .placement = .{ .source = .{ .point = .{ .x = 20, .y = 20 } }, .flip = .none },
+    };
+    const upper_spec: LayerSpec = .{
+        .key = upper_key,
+        .z = 10,
+        .input = .modal,
+        .placement = .{ .source = .{ .point = .{ .x = 200, .y = 160 } }, .flip = .none },
+    };
+
+    // Build order is varied against z order on purpose: the route follows z and registration
+    // serial, never the order the current frame happens to submit the markers in.
+    ctx.beginFrameAt(400, 300, 0.0);
+    const first = if (build_lower_first) &lower_spec else &upper_spec;
+    const second = if (build_lower_first) &upper_spec else &lower_spec;
+    ctx.beginBox(.{ .layer = first, .width = .{ .fixed = 80 }, .height = .{ .fixed = 40 } });
+    ctx.endBox();
+    ctx.beginBox(.{ .layer = second, .width = .{ .fixed = 80 }, .height = .{ .fixed = 40 } });
+    ctx.endBox();
+    ctx.endFrame();
+
+    // Both were placed, so neither is excluded for want of previous geometry.
+    try std.testing.expect(ctx.layerWasPlaced(lower_key));
+    try std.testing.expect(ctx.layerWasPlaced(upper_key));
+
+    ctx.beginFrameAt(400, 300, 0.1);
+    const upper_scope = ctx.layerScopeFor(upper_key, .modal);
+    const lower_scope = ctx.layerScopeFor(lower_key, .modal);
+
+    try std.testing.expect(upper_scope.pointer_enabled);
+    try std.testing.expect(upper_scope.keyboard_enabled);
+    try std.testing.expect(upper_scope.focus_enabled);
+    try std.testing.expect(upper_scope.wheel_enabled);
+    try std.testing.expect(upper_scope.route_active);
+
+    try std.testing.expect(!lower_scope.pointer_enabled);
+    try std.testing.expect(!lower_scope.keyboard_enabled);
+    try std.testing.expect(!lower_scope.focus_enabled);
+    try std.testing.expect(!lower_scope.wheel_enabled);
+    try std.testing.expect(!lower_scope.route_active);
+
+    ctx.beginBox(.{ .layer = &lower_spec, .width = .{ .fixed = 80 }, .height = .{ .fixed = 40 } });
+    ctx.endBox();
+    ctx.beginBox(.{ .layer = &upper_spec, .width = .{ .fixed = 80 }, .height = .{ .fixed = 40 } });
+    ctx.endBox();
+    ctx.endFrame();
+}
+
+test "layer: the frontmost placed modal layer owns input alone, whatever the build order" {
+    try expectFrontmostOwnsRouteAlone(true);
+    try expectFrontmostOwnsRouteAlone(false);
+}
+
+test "layer: a click reaches the frontmost modal layer and not the one below it" {
+    var ctx = testCtx();
+    defer ctx.deinit();
+    const lower_key: LayerKey = .{ .value = 9083 };
+    const upper_key: LayerKey = .{ .value = 9084 };
+    const lower_button: Id = 9085;
+    const upper_button: Id = 9086;
+    const lower_spec: LayerSpec = .{
+        .key = lower_key,
+        .z = 0,
+        .input = .modal,
+        .placement = .{ .source = .{ .point = .{ .x = 20, .y = 20 } }, .flip = .none },
+    };
+    const upper_spec: LayerSpec = .{
+        .key = upper_key,
+        .z = 10,
+        .input = .modal,
+        .placement = .{ .source = .{ .point = .{ .x = 200, .y = 160 } }, .flip = .none },
+    };
+
+    ctx.beginFrameAt(400, 300, 0.0);
+    ctx.beginBox(.{ .layer = &lower_spec, .width = .fit, .height = .fit });
+    _ = ctx.buttonId(lower_button, "Lower", .{});
+    ctx.endBox();
+    ctx.beginBox(.{ .layer = &upper_spec, .width = .fit, .height = .fit });
+    _ = ctx.buttonId(upper_button, "Upper", .{});
+    ctx.endBox();
+    ctx.endFrame();
+
+    const lower_rect = ctx.getNodeRect(lower_button).?;
+    const upper_rect = ctx.getNodeRect(upper_button).?;
+    // The two buttons do not overlap, so what separates them is ownership, not geometry.
+    const disjoint = lower_rect.x + @as(i32, @intCast(lower_rect.w)) <= upper_rect.x or
+        upper_rect.x + @as(i32, @intCast(upper_rect.w)) <= lower_rect.x or
+        lower_rect.y + @as(i32, @intCast(lower_rect.h)) <= upper_rect.y or
+        upper_rect.y + @as(i32, @intCast(upper_rect.h)) <= lower_rect.y;
+    try std.testing.expect(disjoint);
+
+    // Press the lower layer's own button: it is visible and unobstructed, and still must not
+    // respond, because the layer above it holds the route.
+    ctx.pushEvent(.{ .mouse_down = .{ .x = lower_rect.x + 4, .y = lower_rect.y + 4, .button = 0, .modifiers = 0 } });
+    ctx.beginFrameAt(400, 300, 0.1);
+    ctx.beginBox(.{ .layer = &lower_spec, .width = .fit, .height = .fit });
+    const lower_result = ctx.buttonId(lower_button, "Lower", .{});
+    ctx.endBox();
+    ctx.beginBox(.{ .layer = &upper_spec, .width = .fit, .height = .fit });
+    _ = ctx.buttonId(upper_button, "Upper", .{});
+    ctx.endBox();
+    ctx.endFrame();
+    try std.testing.expect(!lower_result.hovered and !lower_result.held);
+
+    // The same press on the frontmost layer's button does respond.
+    ctx.pushEvent(.{ .mouse_up = .{ .x = lower_rect.x + 4, .y = lower_rect.y + 4, .button = 0, .modifiers = 0 } });
+    ctx.pushEvent(.{ .mouse_down = .{ .x = upper_rect.x + 4, .y = upper_rect.y + 4, .button = 0, .modifiers = 0 } });
+    ctx.beginFrameAt(400, 300, 0.2);
+    ctx.beginBox(.{ .layer = &lower_spec, .width = .fit, .height = .fit });
+    _ = ctx.buttonId(lower_button, "Lower", .{});
+    ctx.endBox();
+    ctx.beginBox(.{ .layer = &upper_spec, .width = .fit, .height = .fit });
+    const upper_result = ctx.buttonId(upper_button, "Upper", .{});
+    ctx.endBox();
+    ctx.endFrame();
+    try std.testing.expect(upper_result.held);
 }
 
 test "layer: the latched route does not retain a compacted slot index" {
@@ -3969,8 +4137,6 @@ test "tooltip: a one-line tooltip keeps the popup item height and centres its te
         if (cmd == .text and std.mem.eql(u8, cmd.text.text, "tip")) text_y = cmd.text.pos.y;
     }
     const row_y = bg.y + pad;
-    const ink = font_mod.fontInkHeight(ctx.font);
-    _ = ink;
     try std.testing.expect(text_y.? > row_y);
     try std.testing.expect(text_y.? < row_y + item_h);
 }
@@ -4100,8 +4266,6 @@ test "layer: an anchor that is not in this frame is not drawn at the old place" 
 
     // The anchor is gone this frame. The layer keeps being built — an application asking for
     // it does not know its anchor vanished — and must simply not appear.
-    const before = ctx.postFrameDrawList().cmds.items.len;
-    _ = before;
     ctx.beginFrameAt(400, 300, 0.1);
     (LayerFixture{ .key = 1, .anchor_id = 300, .box_id = 310 }).build(&ctx);
     ctx.endFrame();

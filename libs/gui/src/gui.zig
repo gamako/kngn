@@ -300,6 +300,7 @@ pub const stepgrid = @import("context.zig").stepgrid;
 // Menu definitions come from core's type-only module directly. gui does not execute Command;
 // it only exposes the same definitions to the UI side as the platform facade (ADR-007 R2).
 pub const Command = @import("command_types").Command;
+pub const CheckState = @import("command_types").CheckState;
 pub const CommandId = @import("command_types").CommandId;
 pub const CommandKind = @import("command_types").CommandKind;
 pub const ExecutionPolicy = @import("command_types").ExecutionPolicy;

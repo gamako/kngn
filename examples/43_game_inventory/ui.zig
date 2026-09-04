@@ -215,8 +215,8 @@ pub fn activateCursor(app: *App) void {
 fn buildContextItems(app: *App) void {
     const item = app.slots[clampSlot(app.context_slot)] orelse return;
     app.context_items = .{
-        .{ .label = "Lock", .checked = item.locked },
-        .{ .label = "Discard", .checked = false },
+        .{ .label = "Lock", .check = if (item.locked) .on else .off },
+        .{ .label = "Discard" },
     };
 }
 

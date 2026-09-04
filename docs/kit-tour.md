@@ -327,7 +327,11 @@ the determinism convention are in
 
 ### `kit.command_types`
 
-The `Command` definition that ties a menu entry to an application operation.
+The `Command` definition that ties a menu entry to an application operation, and `CheckState`,
+the three states a menu entry's check can be in: `none` for a plain action, `off` for a toggle
+that is currently off, `on` for one that is set. A menu opens the column it draws check marks in
+when any of its entries is `off` or `on`, so choosing `off` rather than `none` for a toggle is
+what keeps the labels still as the user toggles it.
 Source [`core/command_types.zig`](../core/command_types.zig), reference application
 [`apps/editor/apps/pixie`](../apps/editor/apps/pixie).
 

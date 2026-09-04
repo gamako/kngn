@@ -196,22 +196,20 @@ pub fn collectMenuCommands(commands: []const Command, title: []const u8, out: []
     return n;
 }
 
-/// Allocate and return an item label (checked mark + label + shortcut) from the allocator.
+/// Allocate and return an item label (label + shortcut) from the allocator.
+///
+/// A check does not appear here. It is drawn in the row's check column by the popup, the same way
+/// every other menu draws one, so the label carries only text the reader is meant to see.
 pub fn formatItemLabel(allocator: std.mem.Allocator, cmd: Command) ![]const u8 {
     if (cmd.kind == .separator) return try allocator.dupe(u8, "────────");
 
     var sc_buf: [32]u8 = undefined;
     const sc = if (cmd.shortcut) |s| formatShortcut(s, &sc_buf) else "";
 
-    if (cmd.checked and sc.len > 0) {
-        return try std.fmt.allocPrint(allocator, "* {s}    {s}", .{ cmd.label, sc });
-    } else if (cmd.checked) {
-        return try std.fmt.allocPrint(allocator, "* {s}", .{cmd.label});
-    } else if (sc.len > 0) {
+    if (sc.len > 0) {
         return try std.fmt.allocPrint(allocator, "{s}    {s}", .{ cmd.label, sc });
-    } else {
-        return try allocator.dupe(u8, cmd.label);
     }
+    return try allocator.dupe(u8, cmd.label);
 }
 
 /// Inside `beginFrame`…`endFrame`: top-menu button row. Click toggles `state.open_title`.
@@ -269,6 +267,7 @@ pub fn menuBarPopup(ctx: *Context, commands: []const Command, state: *MenuBarSta
         items[item_n] = .{
             .label = label,
             .enabled = c.kind != .separator and c.enabled,
+            .check = if (c.kind == .separator) .none else c.check,
         };
     }
 
@@ -329,11 +328,11 @@ test "collectMenuTitles: unique titles in ascending order" {
     try std.testing.expectEqualStrings("View", titles[2]);
 }
 
-test "collectMenuCommands: ascending order and keeps enabled/checked/shortcut" {
+test "collectMenuCommands: ascending order and keeps enabled/check/shortcut" {
     const cmds = [_]Command{
         .{ .id = 2, .label = "Save", .menu = .{ .title = "File", .order = 20 }, .shortcut = .{ .key = .S, .modifiers = .{ .cmd = true } } },
         .{ .id = 1, .label = "Open", .menu = .{ .title = "File", .order = 10 }, .enabled = false },
-        .{ .id = 3, .label = "Panel", .menu = .{ .title = "View", .order = 1 }, .checked = true },
+        .{ .id = 3, .label = "Panel", .menu = .{ .title = "View", .order = 1 }, .check = .on },
     };
     var out: [8]*const Command = undefined;
     const n = collectMenuCommands(&cmds, "File", &out);
@@ -344,20 +343,70 @@ test "collectMenuCommands: ascending order and keeps enabled/checked/shortcut" {
     try std.testing.expect(out[1].shortcut != null);
 }
 
-test "formatItemLabel: includes checked mark and shortcut text" {
-    const cmd: Command = .{
-        .id = 1,
-        .label = "Panel",
-        .menu = .{ .title = "View", .order = 1 },
-        .checked = true,
-        .shortcut = .{ .key = .P, .modifiers = .{ .cmd = true } },
+test "formatItemLabel: carries the text and shortcut, and leaves the check to the row" {
+    for ([_]command_types.CheckState{ .none, .off, .on }) |check| {
+        const cmd: Command = .{
+            .id = 1,
+            .label = "Panel",
+            .menu = .{ .title = "View", .order = 1 },
+            .check = check,
+            .shortcut = .{ .key = .P, .modifiers = .{ .cmd = true } },
+        };
+        const label = try formatItemLabel(std.testing.allocator, cmd);
+        defer std.testing.allocator.free(label);
+        try std.testing.expect(std.mem.indexOf(u8, label, "Panel") != null);
+        const primary = if (builtin.os.tag == .macos) "Cmd+P" else "Ctrl+P";
+        try std.testing.expect(std.mem.indexOf(u8, label, primary) != null);
+        // The label is the same string whatever the check state: the mark is drawn, not spelled.
+        try std.testing.expect(std.mem.indexOf(u8, label, "*") == null);
+    }
+}
+
+/// A menu-bar dropdown must reach the same check column every other menu uses. Asserting on the
+/// label string cannot show that, because the label no longer carries the check either way — only
+/// the drawn row does.
+fn expectMenuBarCheckColumn(check: command_types.CheckState, expected_strokes: usize) !void {
+    var ctx = Context.init(std.testing.allocator, font_mod.default_font);
+    defer ctx.deinit();
+
+    const cmds = [_]Command{
+        .{ .id = 1, .label = "Grid", .menu = .{ .title = "View", .order = 1 }, .check = check },
+        .{ .id = 2, .label = "Reset", .menu = .{ .title = "View", .order = 2 } },
     };
-    const label = try formatItemLabel(std.testing.allocator, cmd);
-    defer std.testing.allocator.free(label);
-    try std.testing.expect(std.mem.indexOf(u8, label, "*") != null);
-    try std.testing.expect(std.mem.indexOf(u8, label, "Panel") != null);
-    const primary = if (builtin.os.tag == .macos) "Cmd+P" else "Ctrl+P";
-    try std.testing.expect(std.mem.indexOf(u8, label, primary) != null);
+    var state: MenuBarState = .{ .open_title = "View" };
+
+    ctx.beginFrame(400, 300);
+    menuBar(&ctx, &cmds, &state);
+    _ = menuBarPopup(&ctx, &cmds, &state);
+    ctx.endFrame();
+
+    var strokes: usize = 0;
+    for (ctx.postFrameDrawList().cmds.items) |cmd| switch (cmd) {
+        .line => strokes += 1,
+        else => {},
+    };
+    try std.testing.expectEqual(expected_strokes, strokes);
+
+    // Both rows share one column whenever the menu has a checkable entry, so the plain "Reset"
+    // row lines up with "Grid" rather than sitting further left.
+    var grid_x: ?i32 = null;
+    var reset_x: ?i32 = null;
+    for (ctx.postFrameDrawList().cmds.items) |cmd| switch (cmd) {
+        .text => |t| {
+            if (std.mem.startsWith(u8, t.text, "Grid")) grid_x = t.pos.x;
+            if (std.mem.startsWith(u8, t.text, "Reset")) reset_x = t.pos.x;
+        },
+        else => {},
+    };
+    try std.testing.expectEqual(grid_x.?, reset_x.?);
+}
+
+test "menuBarPopup: a checkable command reaches the shared check column" {
+    // `off` opens the column without drawing; `on` draws the two strokes in it. `none`
+    // throughout leaves no column at all, which is the File-menu case.
+    try expectMenuBarCheckColumn(.off, 0);
+    try expectMenuBarCheckColumn(.on, 2);
+    try expectMenuBarCheckColumn(.none, 0);
 }
 
 test "menuBarPopup: disabled items do not return selected (popup enabled contract)" {
