@@ -365,7 +365,7 @@ test "formatItemLabel: carries the text and shortcut, and leaves the check to th
 /// A menu-bar dropdown must reach the same check column every other menu uses. Asserting on the
 /// label string cannot show that, because the label no longer carries the check either way — only
 /// the drawn row does.
-fn expectMenuBarCheckColumn(check: command_types.CheckState, expected_strokes: usize) !void {
+fn expectMenuBarCheckColumn(check: command_types.CheckState, expected_strokes: usize, column_reserved: bool) !void {
     var ctx = Context.init(std.testing.allocator, font_mod.default_font);
     defer ctx.deinit();
 
@@ -387,8 +387,6 @@ fn expectMenuBarCheckColumn(check: command_types.CheckState, expected_strokes: u
     };
     try std.testing.expectEqual(expected_strokes, strokes);
 
-    // Both rows share one column whenever the menu has a checkable entry, so the plain "Reset"
-    // row lines up with "Grid" rather than sitting further left.
     var grid_x: ?i32 = null;
     var reset_x: ?i32 = null;
     for (ctx.postFrameDrawList().cmds.items) |cmd| switch (cmd) {
@@ -398,15 +396,28 @@ fn expectMenuBarCheckColumn(check: command_types.CheckState, expected_strokes: u
         },
         else => {},
     };
+    // Both rows share one column whenever the menu has a checkable entry, so the plain "Reset"
+    // row lines up with "Grid" rather than sitting further left.
     try std.testing.expectEqual(grid_x.?, reset_x.?);
+
+    // Alignment alone would hold even if no column existed, so say where the column is: a menu
+    // with a checkable row indents its labels by one glyph plus one gap, and a menu without one
+    // puts them against the row's own inset.
+    const first_row = ctx.getNodeRect(id_mod.hashInt(MENU_BAR_LAYER_KEY.value, 1)).?;
+    const inset_x = first_row.x + ctx.style.spacing.popup_inset;
+    const expected_x = if (column_reserved)
+        inset_x + ctx.style.checkbox_size + ctx.style.spacing.control_gap
+    else
+        inset_x;
+    try std.testing.expectEqual(expected_x, grid_x.?);
 }
 
 test "menuBarPopup: a checkable command reaches the shared check column" {
     // `off` opens the column without drawing; `on` draws the two strokes in it. `none`
     // throughout leaves no column at all, which is the File-menu case.
-    try expectMenuBarCheckColumn(.off, 0);
-    try expectMenuBarCheckColumn(.on, 2);
-    try expectMenuBarCheckColumn(.none, 0);
+    try expectMenuBarCheckColumn(.off, 0, true);
+    try expectMenuBarCheckColumn(.on, 2, true);
+    try expectMenuBarCheckColumn(.none, 0, false);
 }
 
 test "menuBarPopup: disabled items do not return selected (popup enabled contract)" {

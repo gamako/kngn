@@ -1747,8 +1747,10 @@ pub fn checkboxIdEx(ctx: *Context, id: Id, label: []const u8, value: *bool, opts
 }
 
 /// The check mark a menu row draws in its check column: two strokes meeting at the low corner.
-/// It is a fixed-size vector drawing rather than a font glyph, so it does not follow the text
-/// metrics. An unchecked row still occupies the column, and simply draws nothing.
+/// It is a vector drawing rather than a font glyph, so it does not follow the text metrics; every
+/// coordinate is a proportion of the cell, and the stroke scales with it, so the mark stays inside
+/// the cell at any `checkbox_size` down to one pixel. An unchecked row still occupies the column,
+/// and simply draws nothing.
 const CheckMark = struct {
     checked: bool,
     color: Color,
@@ -1762,7 +1764,9 @@ const CheckMark = struct {
         const corner: geom.Vec2 = .{ .x = rect.x + @divTrunc(w * 42, 100), .y = rect.y + @divTrunc(h * 72, 100) };
         const start: geom.Vec2 = .{ .x = rect.x + @divTrunc(w * 20, 100), .y = rect.y + @divTrunc(h * 50, 100) };
         const end: geom.Vec2 = .{ .x = rect.x + @divTrunc(w * 80, 100), .y = rect.y + @divTrunc(h * 26, 100) };
-        const thickness: u32 = 2;
+        // A fixed thickness would spill out of a small cell, so scale it and keep at least one
+        // pixel of line.
+        const thickness: u32 = @max(1, @as(u32, @intCast(@divTrunc(@min(w, h), 8))));
         dl.line(start, corner, self.color, thickness) catch @panic("check mark: OOM");
         dl.line(corner, end, self.color, thickness) catch @panic("check mark: OOM");
     }

@@ -5,8 +5,10 @@
 // route. This keeps popup geometry, focus and input on the same path as every other layer.
 //
 // Hot-path note: layer-root layout and emission run once per visible layer, with work proportional
-// to the number of boxes/items/actions. There is no framebuffer loop, per-item division or
-// post-frame popup allocation. A frame without a popup does not enter these builders.
+// to the number of boxes/items/actions. There is no framebuffer loop and no post-frame popup
+// allocation. A checked row divides a handful of times to place its mark inside the check column,
+// which is per checked row rather than per pixel. A frame without a popup does not enter these
+// builders.
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
@@ -17,6 +19,7 @@ const font_mod = @import("font.zig");
 const layout = @import("layout.zig");
 const input_mod = @import("input.zig");
 const layer_types = @import("layer_types.zig");
+const draw_mod = @import("draw.zig");
 
 pub const Context = context_mod.Context;
 pub const Rect = geom.Rect;
@@ -829,14 +832,111 @@ fn expectCheckGutterLayout(checked_index: usize, labels: [3][]const u8) !void {
     const column_x = first_row.x + ctx.style.spacing.popup_inset;
     try std.testing.expectEqual(column_x + size + ctx.style.spacing.control_gap, label_x);
 
-    // Both strokes stay inside the column they were given.
+    // Both strokes stay inside the column they were given, and inside the row that is on: a
+    // mark drawn on the wrong row would still be two strokes in the right column.
+    const checked_row = ctx.getNodeRect(popupItemId(state.key, checked_index)).?;
+    var strokes: [2]StrokeCmd = undefined;
+    var seen: usize = 0;
     for (ctx.postFrameDrawList().cmds.items) |cmd| switch (cmd) {
         .line => |l| {
             try std.testing.expect(l.p0.x >= column_x and l.p0.x <= column_x + size);
             try std.testing.expect(l.p1.x >= column_x and l.p1.x <= column_x + size);
+            for ([_]i32{ l.p0.y, l.p1.y }) |y| {
+                try std.testing.expect(y >= checked_row.y);
+                try std.testing.expect(y <= checked_row.y + @as(i32, @intCast(checked_row.h)));
+            }
+            strokes[seen] = l;
+            seen += 1;
         },
         else => {},
     };
+    try std.testing.expectEqual(@as(usize, 2), seen);
+
+    // The two strokes are one mark, so they meet at a point, and that point is the lowest of the
+    // shape: that is what makes it a tick rather than a caret. Which stroke is emitted first and
+    // which way round each is passed are not part of the contract, so the shared point is found
+    // rather than assumed.
+    const joint = sharedEndpoint(strokes[0], strokes[1]) orelse
+        return error.CheckMarkStrokesDoNotMeet;
+    const free_a = freeEndpoint(strokes[0], joint);
+    const free_b = freeEndpoint(strokes[1], joint);
+    // Two strokes running to the same place would meet the y condition below while drawing one
+    // line, so the free ends have to be somewhere different from each other.
+    try std.testing.expect(!samePoint(free_a, free_b));
+    for ([_]Vec2{ free_a, free_b }) |free| {
+        try std.testing.expect(free.y < joint.y);
+    }
+}
+
+test "popupMenu: the check mark stays inside its cell at every glyph size" {
+    // `CheckMark` claims it fits its cell down to a one-pixel glyph. Stated as an absolute, that
+    // is prose until a test states it in the form that fails: a fixed two-pixel stroke passes at
+    // the default size and spills at the small ones.
+    for ([_]i32{ 1, 2, 3, 5, 8, 16, 32 }) |size| {
+        var ctx = testCtx();
+        defer ctx.deinit();
+        ctx.style.checkbox_size = size;
+        var state: PopupState = .{
+            .key = .{ .value = 0x90BA },
+            .open = true,
+            .placement = .{ .source = .{ .point = .{ .x = 10, .y = 10 } }, .flip = .none, .shift = .none },
+        };
+        const items = [_]PopupItem{.{ .label = "On", .check = .on }};
+        ctx.beginFrameAt(320, 200, 0.0);
+        _ = popupMenu(&ctx, &state, &items);
+        ctx.endFrame();
+
+        const row = ctx.getNodeRect(popupItemId(state.key, 0)).?;
+        const cell_x = row.x + ctx.style.spacing.popup_inset;
+        const cell_y = row.y + @divTrunc(@as(i32, @intCast(row.h)) - size, 2);
+
+        var seen: usize = 0;
+        for (ctx.postFrameDrawList().cmds.items) |cmd| switch (cmd) {
+            .line => |l| {
+                seen += 1;
+                // A stroke is drawn about its path, so half its thickness reaches past each
+                // endpoint. That half has to fit too, which is the part a fixed thickness breaks.
+                const half: i32 = @intCast(l.thickness / 2);
+                try std.testing.expect(l.thickness >= 1);
+                for ([_]Vec2{ l.p0, l.p1 }) |pt| {
+                    try std.testing.expect(pt.x - half >= cell_x);
+                    try std.testing.expect(pt.x + half <= cell_x + size);
+                    try std.testing.expect(pt.y - half >= cell_y);
+                    try std.testing.expect(pt.y + half <= cell_y + size);
+                }
+            },
+            else => {},
+        };
+        try std.testing.expectEqual(@as(usize, 2), seen);
+    }
+}
+
+const StrokeCmd = @TypeOf(@as(draw_mod.DrawCmd, undefined).line);
+
+fn samePoint(a: Vec2, b: Vec2) bool {
+    return a.x == b.x and a.y == b.y;
+}
+
+/// The one endpoint two strokes have in common, or null if they do not meet in exactly one.
+///
+/// "Exactly one" is the part that matters: two strokes drawn on top of each other share both
+/// their ends, and taking the first match would read that as a tick. A zero-length stroke is
+/// rejected for the same reason — it shares its only point and draws nothing.
+fn sharedEndpoint(a: StrokeCmd, b: StrokeCmd) ?Vec2 {
+    if (samePoint(a.p0, a.p1) or samePoint(b.p0, b.p1)) return null;
+    var found: ?Vec2 = null;
+    for ([_]Vec2{ a.p0, a.p1 }) |pa| {
+        for ([_]Vec2{ b.p0, b.p1 }) |pb| {
+            if (!samePoint(pa, pb)) continue;
+            if (found != null) return null;
+            found = pa;
+        }
+    }
+    return found;
+}
+
+fn freeEndpoint(stroke: StrokeCmd, joint: Vec2) Vec2 {
+    return if (samePoint(stroke.p0, joint)) stroke.p1 else stroke.p0;
 }
 
 test "popupMenu: the mark moves between rows while the check column does not" {
