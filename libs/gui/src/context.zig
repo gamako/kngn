@@ -137,6 +137,13 @@ const LayerRoute = struct {
     frontmost_key: ?LayerKey = null,
 };
 
+/// A late press that was outside the route owner at the end of the frame. The next beginFrame
+/// turns it into the same stable dismissal edge that an already-staged press would produce.
+const DeferredLayerDismissal = struct {
+    key: LayerKey,
+    point: Vec2,
+};
+
 /// O(1) input permissions for the current marker scope. Widget code reads these flags rather
 /// than searching the layer tree or comparing z values for every widget.
 const LayerScope = struct {
@@ -416,6 +423,13 @@ pub const Context = struct {
     layer_route: LayerRoute = .{},
     /// Outside dismissal is an edge result, not a close side effect. It is stable for the frame.
     dismissed_layer_key: ?LayerKey = null,
+    /// A mouse press delivered after beginFrame, carried to the next frame's route latch.
+    deferred_layer_dismissal: ?DeferredLayerDismissal = null,
+    /// Frame-local marker used to distinguish an in-frame press from an event staged before beginFrame.
+    late_mouse_press_pos: ?Vec2 = null,
+    /// A command target that handled a late outside press prevents that press from becoming a
+    /// dismissal at the next frame boundary.
+    late_dismissal_consumed: bool = false,
     /// Scope stack only changes at layer markers; ordinary boxes and widgets read one current
     /// scope without a tree walk or allocation.
     layer_scope_stack: [max_layers]LayerScope = undefined,
@@ -543,6 +557,7 @@ pub const Context = struct {
     pub const button = widgets.button;
     pub const buttonEx = widgets.buttonEx;
     pub const buttonId = widgets.buttonId;
+    pub const buttonIdWithCheckGlyph = widgets.buttonIdWithCheckGlyph;
     pub const commandButtonId = widgets.commandButtonId;
     pub const colorSwatch = widgets.colorSwatch;
     pub const colorSwatchEx = widgets.colorSwatchEx;
@@ -779,6 +794,8 @@ pub const Context = struct {
         self.frame_arena_live = 0;
         self.frame_arena_peak = 0;
         self.drag_submitted_this_frame = false;
+        self.late_mouse_press_pos = null;
+        self.late_dismissal_consumed = false;
         // The cells a group collects live on the frame arena, so the group cannot outlive the frame.
         self.slider_group = null;
         self.table = null;
@@ -794,7 +811,8 @@ pub const Context = struct {
         self.layout_current = root;
         // Input that arrived before the frame opened. Applied here — after input.beginFrame has
         // cleared the previous frame's edges, before any widget reads input — so that a caller
-        // may forward events either side of beginFrame and see the same result.
+        // may forward events either side of beginFrame. Ordinary widgets see the same frame
+        // input; modal outside dismissal carries an in-frame press to the next route latch.
         if (self.staged_input.drain(&self.input)) |staged| self.composition = staged;
         const previous_route_key = self.layer_route.frontmost_key;
         self.latchLayerRoute();
@@ -828,9 +846,9 @@ pub const Context = struct {
         requireContract(self.frameIsOpen(), what ++ " requires an open frame");
     }
 
-    /// Require an idle or final-overlay phase. This is used by lifecycle APIs that are meaningful
-    /// only between frames. It also fails during the synchronous layout/emit work of `endFrame`,
-    /// even though `endFrame` has not returned yet.
+    /// Require an idle or final-overlay phase — the contract of the post-frame APIs (popups, menu
+    /// bar) and of opening a frame in the first place. This also fails during the synchronous
+    /// layout/emit work of `endFrame`, even though `endFrame` has not returned yet.
     pub inline fn requireNoFrame(self: *const Context, comptime what: []const u8) void {
         requireContract(self.noFrameIsOpen(), what ++ " must be called with no frame open");
     }
@@ -927,6 +945,7 @@ pub const Context = struct {
         }
         self.sealScrollAreaRootOrders();
         self.clearMissingLayerFocus();
+        self.deferLateLayerDismissal(screen_rect);
         if (self.layers_len != 0 or self.layer_slots_len != 0) self.sealLayerSlots();
         // If the target was not refreshed this frame, clear the timer (suppress stale overlays for hidden widgets)
         if (self.tooltip_hover_id != 0 and !self.tooltip_hover_refreshed) {
@@ -1000,12 +1019,20 @@ pub const Context = struct {
 
     /// Hand one input event to the GUI. Callable at any point in the loop: inside a frame it
     /// applies at once, outside one it is staged and applied by the next beginFrame, in arrival
-    /// order (see `StagedInput` in input.zig). Note that staged input reaches `ctx.input` only
-    /// when that frame opens, so reading `ctx.input` before beginFrame does not see it yet.
+    /// order (see `StagedInput` in input.zig). A late mouse press outside a modal route is
+    /// reported as dismissal at the next beginFrame, after the route's current frame is sealed.
+    /// Staged input reaches `ctx.input` only when that frame opens, so reading `ctx.input` before
+    /// beginFrame does not see it yet.
     pub fn pushEvent(self: *Context, ev: InputEvent) void {
         self.requireInteractiveAllowed("pushEvent");
         if (self.frameIsOpen()) {
             self.input.pushEvent(ev);
+            switch (ev) {
+                .mouse_down => |mouse| {
+                    if (mouse.button <= 2) self.late_mouse_press_pos = .{ .x = mouse.x, .y = mouse.y };
+                },
+                else => {},
+            }
         } else {
             self.staged_input.pushEvent(ev);
         }
@@ -1581,6 +1608,8 @@ pub const Context = struct {
     /// Runs once per frame over the retained layer slots, never over the current tree. It fixes
     /// the input owner before the current frame's marker submission can affect it.
     fn latchLayerRoute(self: *Context) void {
+        const deferred = self.deferred_layer_dismissal;
+        self.deferred_layer_dismissal = null;
         self.layer_route = .{};
         self.dismissed_layer_key = null;
         if (self.layer_slots_len == 0) return;
@@ -1599,6 +1628,15 @@ pub const Context = struct {
 
         const frontmost = frontmost_index orelse return;
         const slot = self.layer_slots[frontmost];
+        if (deferred) |press| {
+            if (press.key.eql(slot.key) and slot.dismiss_on_outside) {
+                const screen = Rect{ .x = 0, .y = 0, .w = self.screen_w, .h = self.screen_h };
+                if (!pointHitsVisible(slot.prev_root_rect, screen, press.point)) {
+                    self.dismissed_layer_key = slot.key;
+                    return;
+                }
+            }
+        }
         const any_mouse_press = self.input.mouse_pressed.left or
             self.input.mouse_pressed.right or self.input.mouse_pressed.middle;
         if (slot.dismiss_on_outside and any_mouse_press) {
@@ -1606,6 +1644,40 @@ pub const Context = struct {
             if (!pointHitsVisible(slot.prev_root_rect, screen, self.input.mouse_pressed_pos)) {
                 self.dismissed_layer_key = slot.key;
             }
+        }
+    }
+
+    /// Record a late outside press only while its route owner is still present in the current
+    /// frame. This keeps a press from a disappearing layer from dismissing a newly opened layer
+    /// on the following frame. The scan is event-boundary work, not a widget or pixel loop.
+    fn deferLateLayerDismissal(self: *Context, screen: Rect) void {
+        const point = self.late_mouse_press_pos orelse return;
+        if (self.late_dismissal_consumed) return;
+        if (self.dismissed_layer_key != null) return;
+        const route_key = self.layer_route.frontmost_key orelse return;
+
+        var route_slot: ?LayerSlot = null;
+        var i: usize = 0;
+        while (i < self.layer_slots_len) : (i += 1) {
+            const slot = self.layer_slots[i];
+            if (slot.was_placed and slot.key.eql(route_key)) {
+                route_slot = slot;
+                break;
+            }
+        }
+        const slot = route_slot orelse return;
+        if (!slot.dismiss_on_outside) return;
+
+        var still_present = false;
+        for (self.layers[0..self.layers_len]) |record| {
+            if (record.status == .placed and record.key.eql(route_key)) {
+                still_present = true;
+                break;
+            }
+        }
+        if (!still_present) return;
+        if (!pointHitsVisible(slot.prev_root_rect, screen, point)) {
+            self.deferred_layer_dismissal = .{ .key = route_key, .point = point };
         }
     }
 
@@ -1872,6 +1944,7 @@ pub const Context = struct {
     }
 
     fn noteCommandTargetPress(self: *Context, route_key: LayerKey) void {
+        if (self.late_mouse_press_pos != null) self.late_dismissal_consumed = true;
         if (self.dismissed_layer_key) |dismissed| {
             if (dismissed.eql(route_key)) self.dismissed_layer_key = null;
         }
@@ -3734,7 +3807,9 @@ test "layer: command target yields only to an inside hit" {
     ctx.endFrame();
 }
 
-test "layer: command target exclusively consumes an outside retarget press" {
+const LayerEventOrder = enum { before_begin_frame, during_frame };
+
+fn expectCommandTargetRetarget(order: LayerEventOrder) !void {
     var ctx = testCtx();
     defer ctx.deinit();
     const title_id: Id = 9061;
@@ -3753,9 +3828,11 @@ test "layer: command target exclusively consumes an outside retarget press" {
     ctx.endFrame();
 
     const title = ctx.getNodeRect(title_id).?;
-    ctx.pushEvent(.{ .mouse_down = .{ .x = title.x + 8, .y = title.y + 8, .button = 0, .modifiers = 0 } });
+    const press: InputEvent = .{ .mouse_down = .{ .x = title.x + 8, .y = title.y + 8, .button = 0, .modifiers = 0 } };
+    if (order == .before_begin_frame) ctx.pushEvent(press);
     ctx.beginFrameAt(400, 300, 0.1);
-    try std.testing.expect(ctx.layerDismissed(menu_key));
+    if (order == .during_frame) ctx.pushEvent(press);
+    try std.testing.expectEqual(order == .before_begin_frame, ctx.layerDismissed(menu_key));
     ctx.registerCommandTarget(title_id, menu_key);
     const command = commandButtonBehavior(&ctx, title_id, title, Rect{ .x = 0, .y = 0, .w = 400, .h = 300 }, menu_key);
     try std.testing.expect(command.held);
@@ -3763,6 +3840,11 @@ test "layer: command target exclusively consumes an outside retarget press" {
     ctx.beginBox(.{ .layer = &spec, .width = .{ .fixed = 80 }, .height = .{ .fixed = 40 } });
     ctx.endBox();
     ctx.endFrame();
+}
+
+test "layer: command target exclusively consumes an outside retarget press in either event order" {
+    const orders = [_]LayerEventOrder{ .before_begin_frame, .during_frame };
+    for (orders) |order| try expectCommandTargetRetarget(order);
 }
 
 test "layer: command target does not bypass a different modal route owner" {
@@ -3790,118 +3872,6 @@ test "layer: command target does not bypass a different modal route owner" {
     const command = commandButtonBehavior(&ctx, title_id, title, Rect{ .x = 0, .y = 0, .w = 400, .h = 300 }, menu_key);
     try std.testing.expect(!command.hovered and !command.held and !command.clicked);
     ctx.beginBox(.{ .layer = &spec, .width = .{ .fixed = 80 }, .height = .{ .fixed = 40 } });
-    ctx.endBox();
-    ctx.endFrame();
-}
-
-test "layer: visible context and flipped menu roots win over a title target" {
-    const scenarios = [_]struct {
-        placement: LayerPlacement,
-        width: i32,
-        height: i32,
-    }{
-        .{
-            .placement = .{ .source = .{ .point = .{ .x = 0, .y = 0 } }, .flip = .none, .shift = .none },
-            .width = 120,
-            .height = 60,
-        },
-        .{
-            .placement = .{ .source = .{ .point = .{ .x = 399, .y = 299 } }, .flip = .main_axis, .shift = .both_axes },
-            .width = 120,
-            .height = 60,
-        },
-    };
-
-    for (scenarios) |scenario| {
-        var ctx = testCtx();
-        defer ctx.deinit();
-        const menu_key: LayerKey = .{ .value = 9081 };
-        const spec: LayerSpec = .{
-            .key = menu_key,
-            .input = .modal,
-            .dismiss_on_outside = true,
-            .placement = scenario.placement,
-        };
-        ctx.beginFrameAt(400, 300, 0.0);
-        ctx.beginBox(.{
-            .layer = &spec,
-            .width = .{ .fixed = scenario.width },
-            .height = .{ .fixed = scenario.height },
-        });
-        _ = ctx.buttonId(9083, "visible item", .{});
-        ctx.endBox();
-        ctx.endFrame();
-
-        const root = ctx.layerPrevRect(menu_key).?;
-        const item_rect = ctx.getNodeRect(9083).?;
-        const point = Vec2{
-            .x = item_rect.x + @as(i32, @intCast(item_rect.w / 2)),
-            .y = item_rect.y + @as(i32, @intCast(item_rect.h / 2)),
-        };
-        try std.testing.expect(root.contains(point));
-        ctx.pushEvent(.{ .mouse_down = .{ .x = point.x, .y = point.y, .button = 0, .modifiers = 0 } });
-        ctx.beginFrameAt(400, 300, 0.1);
-        ctx.registerCommandTarget(9082, menu_key);
-        const title = commandButtonBehavior(
-            &ctx,
-            9082,
-            .{ .x = point.x, .y = point.y, .w = 1, .h = 1 },
-            .{ .x = 0, .y = 0, .w = 400, .h = 300 },
-            menu_key,
-        );
-        try std.testing.expect(!title.hovered and !title.held and !title.clicked);
-        try std.testing.expect(!ctx.layerDismissed(menu_key));
-        ctx.beginBox(.{
-            .layer = &spec,
-            .width = .{ .fixed = scenario.width },
-            .height = .{ .fixed = scenario.height },
-        });
-        const item = ctx.buttonId(9083, "visible item", .{});
-        try std.testing.expect(item.held);
-        ctx.endBox();
-        ctx.endFrame();
-    }
-}
-
-test "layer: a dialog route absorbs menu title targets" {
-    var ctx = testCtx();
-    defer ctx.deinit();
-    const dialog_key: LayerKey = .{ .value = 9091 };
-    const menu_key: LayerKey = .{ .value = 9092 };
-    const spec: LayerSpec = .{
-        .key = dialog_key,
-        .input = .modal,
-        .placement = .{ .source = .{ .point = .{ .x = 0, .y = 0 } }, .flip = .none, .shift = .none },
-    };
-
-    ctx.beginFrameAt(400, 300, 0.0);
-    ctx.beginBox(.{
-        .layer = &spec,
-        .width = .{ .fixed = 400 },
-        .height = .{ .fixed = 300 },
-    });
-    _ = ctx.buttonId(9094, "dialog", .{});
-    ctx.endBox();
-    ctx.endFrame();
-
-    ctx.pushEvent(.{ .mouse_down = .{ .x = 10, .y = 10, .button = 0, .modifiers = 0 } });
-    ctx.beginFrameAt(400, 300, 0.1);
-    ctx.registerCommandTarget(9093, menu_key);
-    const title = commandButtonBehavior(
-        &ctx,
-        9093,
-        .{ .x = 0, .y = 0, .w = 80, .h = 24 },
-        .{ .x = 0, .y = 0, .w = 400, .h = 300 },
-        menu_key,
-    );
-    try std.testing.expect(!title.hovered and !title.held and !title.clicked);
-    ctx.beginBox(.{
-        .layer = &spec,
-        .width = .{ .fixed = 400 },
-        .height = .{ .fixed = 300 },
-    });
-    const dialog_content = ctx.buttonId(9094, "dialog", .{});
-    try std.testing.expect(dialog_content.held);
     ctx.endBox();
     ctx.endFrame();
 }

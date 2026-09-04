@@ -104,9 +104,11 @@ fn dialogActionId(key: LayerKey, index: usize) Id {
     return id_mod.hashInt(key.value, @as(u64, @intCast(index + 0x1001)));
 }
 
-fn itemLabel(ctx: *Context, item: PopupItem) []const u8 {
-    if (!item.checked) return item.label;
-    return std.fmt.allocPrint(ctx.allocator(), "* {s}", .{item.label}) catch @panic("popupMenu: OOM");
+fn hasCheckedItem(items: []const PopupItem) bool {
+    for (items) |item| {
+        if (item.checked) return true;
+    }
+    return false;
 }
 
 fn itemStyle(ctx: *const Context) context_mod.WidgetStyle {
@@ -153,22 +155,35 @@ pub fn popupMenuEx(ctx: *Context, state: *PopupState, items: []const PopupItem, 
 
     var selected: ?usize = null;
     const row_style = itemStyle(ctx);
+    const show_check_gutter = hasCheckedItem(items);
     for (items, 0..) |item, index| {
-        const label = itemLabel(ctx, item);
         const result = if (item.enabled)
-            ctx.buttonId(popupItemId(state.key, index), label, .{
-                .selected = item.checked,
-                .min_h = ctx.style.spacing.popup_item_height,
-                .padding = .{ 0, ctx.style.spacing.popup_inset, 0, ctx.style.spacing.popup_inset },
-                .style = row_style,
-            })
+            if (show_check_gutter)
+                ctx.buttonIdWithCheckGlyph(popupItemId(state.key, index), item.label, item.checked, .{
+                    .min_h = ctx.style.spacing.popup_item_height,
+                    .padding = .{ 0, ctx.style.spacing.popup_inset, 0, ctx.style.spacing.popup_inset },
+                    .style = row_style,
+                })
+            else
+                ctx.buttonId(popupItemId(state.key, index), item.label, .{
+                    .min_h = ctx.style.spacing.popup_item_height,
+                    .padding = .{ 0, ctx.style.spacing.popup_inset, 0, ctx.style.spacing.popup_inset },
+                    .style = row_style,
+                })
         else blk: {
             ctx.beginDisabled();
-            const disabled_result = ctx.buttonId(popupItemId(state.key, index), label, .{
-                .min_h = ctx.style.spacing.popup_item_height,
-                .padding = .{ 0, ctx.style.spacing.popup_inset, 0, ctx.style.spacing.popup_inset },
-                .style = row_style,
-            });
+            const disabled_result = if (show_check_gutter)
+                ctx.buttonIdWithCheckGlyph(popupItemId(state.key, index), item.label, item.checked, .{
+                    .min_h = ctx.style.spacing.popup_item_height,
+                    .padding = .{ 0, ctx.style.spacing.popup_inset, 0, ctx.style.spacing.popup_inset },
+                    .style = row_style,
+                })
+            else
+                ctx.buttonId(popupItemId(state.key, index), item.label, .{
+                    .min_h = ctx.style.spacing.popup_item_height,
+                    .padding = .{ 0, ctx.style.spacing.popup_inset, 0, ctx.style.spacing.popup_inset },
+                    .style = row_style,
+                });
             ctx.endDisabled();
             break :blk disabled_result;
         };
@@ -414,6 +429,22 @@ fn testCtx() Context {
     return Context.init(std.testing.allocator, font_mod.default_font);
 }
 
+fn popupNaturalWidth(label: []const u8, checked_index: ?usize) u32 {
+    var ctx = testCtx();
+    defer ctx.deinit();
+    var state: PopupState = .{
+        .key = .{ .value = 0x90B1 },
+        .open = true,
+        .placement = .{ .source = .{ .point = .{ .x = 10, .y = 10 } }, .flip = .none, .shift = .none },
+    };
+    var items: [3]PopupItem = .{ .{ .label = label }, .{ .label = label }, .{ .label = label } };
+    if (checked_index) |index| items[index].checked = true;
+    ctx.beginFrameAt(320, 200, 0.0);
+    _ = popupMenu(&ctx, &state, &items);
+    ctx.endFrame();
+    return ctx.getNodeRect(state.key.value).?.w;
+}
+
 test "popupMenu: a closed consumer is a no-op" {
     var ctx = testCtx();
     defer ctx.deinit();
@@ -441,6 +472,320 @@ test "popupMenu: an open consumer builds a modal marker and natural-width row" {
     ctx.endFrame();
     try std.testing.expect(ctx.layerWasPlaced(state.key));
     try std.testing.expect(ctx.getNodeRect(popupItemId(state.key, 0)) != null);
+}
+
+test "popupMenu: an outside press is returned as dismissal before the marker is rebuilt" {
+    var ctx = testCtx();
+    defer ctx.deinit();
+    var state: PopupState = .{
+        .key = .{ .value = 0xA341 },
+        .open = true,
+        .placement = .{ .source = .{ .point = .{ .x = 40, .y = 40 } }, .flip = .none },
+    };
+    const items = [_]PopupItem{.{ .label = "Dismiss" }};
+
+    ctx.beginFrameAt(320, 200, 0.0);
+    _ = popupMenu(&ctx, &state, &items);
+    ctx.endFrame();
+    try std.testing.expect(ctx.layerWasPlaced(state.key));
+
+    ctx.pushEvent(.{ .mouse_down = .{ .x = 5, .y = 5, .button = 0, .modifiers = 0 } });
+    ctx.beginFrameAt(320, 200, 0.1);
+    const result = popupMenu(&ctx, &state, &items);
+    try std.testing.expect(result.dismissed);
+    try std.testing.expect(!result.open);
+    ctx.endFrame();
+    try std.testing.expect(!ctx.layerWasPlaced(state.key));
+}
+
+const PopupPath = enum { menu, stacked, extended };
+const EventOrder = enum { before_begin_frame, during_frame };
+
+fn buildPopupPath(ctx: *Context, state: *PopupState, items: []const PopupItem, path: PopupPath) PopupResult {
+    return switch (path) {
+        .menu => popupMenu(ctx, state, items),
+        .stacked => popupMenuStacked(ctx, state, items, .{}),
+        .extended => popupMenuEx(ctx, state, items, .{ .keep_open_on_select = true }),
+    };
+}
+
+fn expectPopupPathDismissed(path: PopupPath) !void {
+    var ctx = testCtx();
+    defer ctx.deinit();
+    var state: PopupState = .{
+        .key = .{ .value = 0xA342 },
+        .open = true,
+        .placement = .{ .source = .{ .point = .{ .x = 40, .y = 40 } }, .flip = .none },
+    };
+    const items = [_]PopupItem{.{ .label = "Dismiss" }};
+
+    ctx.beginFrameAt(320, 200, 0.0);
+    _ = buildPopupPath(&ctx, &state, &items, path);
+    ctx.endFrame();
+
+    ctx.pushEvent(.{ .mouse_down = .{ .x = 5, .y = 5, .button = 0, .modifiers = 0 } });
+    ctx.beginFrameAt(320, 200, 0.1);
+    const result = buildPopupPath(&ctx, &state, &items, path);
+    try std.testing.expect(result.dismissed);
+    try std.testing.expect(!result.open);
+    ctx.endFrame();
+    try std.testing.expect(!ctx.layerWasPlaced(state.key));
+}
+
+fn expectPopupPathDismissalOrder(path: PopupPath, order: EventOrder) !void {
+    var ctx = testCtx();
+    defer ctx.deinit();
+    var state: PopupState = .{
+        .key = .{ .value = 0xA347 },
+        .open = true,
+        .placement = .{ .source = .{ .point = .{ .x = 40, .y = 40 } }, .flip = .none },
+    };
+    const items = [_]PopupItem{.{ .label = "Dismiss" }};
+    const outside: input_mod.InputEvent = .{ .mouse_down = .{ .x = 5, .y = 5, .button = 0, .modifiers = 0 } };
+
+    ctx.beginFrameAt(320, 200, 0.0);
+    _ = buildPopupPath(&ctx, &state, &items, path);
+    ctx.endFrame();
+
+    if (order == .before_begin_frame) {
+        ctx.pushEvent(outside);
+    }
+    ctx.beginFrameAt(320, 200, 0.1);
+    if (order == .during_frame) {
+        ctx.pushEvent(outside);
+    }
+    const first = buildPopupPath(&ctx, &state, &items, path);
+    if (order == .before_begin_frame) {
+        try std.testing.expect(first.dismissed);
+        try std.testing.expect(!first.open);
+        state.open = false;
+    } else {
+        try std.testing.expect(!first.dismissed);
+        try std.testing.expect(first.open);
+    }
+    ctx.endFrame();
+
+    if (order == .during_frame) {
+        ctx.beginFrameAt(320, 200, 0.2);
+        const second = buildPopupPath(&ctx, &state, &items, path);
+        try std.testing.expect(second.dismissed);
+        try std.testing.expect(!second.open);
+        state.open = false;
+        ctx.endFrame();
+    }
+    try std.testing.expect(!ctx.layerWasPlaced(state.key));
+}
+
+test "popupMenu, popupMenuStacked, and popupMenuEx: outside press dismisses every entry point" {
+    const paths = [_]PopupPath{ .menu, .stacked, .extended };
+    for (paths) |path| try expectPopupPathDismissed(path);
+}
+
+test "popup paths: outside dismissal is stable across event delivery order" {
+    const paths = [_]PopupPath{ .menu, .stacked, .extended };
+    const orders = [_]EventOrder{ .before_begin_frame, .during_frame };
+    for (paths) |path| {
+        for (orders) |order| try expectPopupPathDismissalOrder(path, order);
+    }
+}
+
+fn expectOutsideDismissalDisabled(order: EventOrder) !void {
+    var ctx = testCtx();
+    defer ctx.deinit();
+    var state: PopupState = .{
+        .key = .{ .value = 0xA343 },
+        .open = true,
+        .dismiss_on_outside = false,
+        .placement = .{ .source = .{ .point = .{ .x = 40, .y = 40 } }, .flip = .none },
+    };
+    const items = [_]PopupItem{.{ .label = "Stay open" }};
+
+    ctx.beginFrameAt(320, 200, 0.0);
+    _ = popupMenu(&ctx, &state, &items);
+    ctx.endFrame();
+
+    const outside: input_mod.InputEvent = .{ .mouse_down = .{ .x = 5, .y = 5, .button = 0, .modifiers = 0 } };
+    if (order == .before_begin_frame) ctx.pushEvent(outside);
+    ctx.beginFrameAt(320, 200, 0.1);
+    if (order == .during_frame) ctx.pushEvent(outside);
+    const result = popupMenu(&ctx, &state, &items);
+    try std.testing.expect(!result.dismissed);
+    try std.testing.expect(result.open);
+    ctx.endFrame();
+    try std.testing.expect(ctx.layerWasPlaced(state.key));
+}
+
+test "popupMenu: outside dismissal can be disabled without losing the modal marker" {
+    const orders = [_]EventOrder{ .before_begin_frame, .during_frame };
+    for (orders) |order| try expectOutsideDismissalDisabled(order);
+}
+
+test "popup paths: only the frontmost modal popup receives outside dismissal" {
+    var ctx = testCtx();
+    defer ctx.deinit();
+    var lower: PopupState = .{
+        .key = .{ .value = 0xA344 },
+        .open = true,
+        .z = 10,
+        .placement = .{ .source = .{ .point = .{ .x = 20, .y = 20 } }, .flip = .none },
+    };
+    var middle: PopupState = .{
+        .key = .{ .value = 0xA345 },
+        .open = true,
+        .z = 20,
+        .placement = .{ .source = .{ .point = .{ .x = 40, .y = 40 } }, .flip = .none },
+    };
+    var upper: PopupState = .{
+        .key = .{ .value = 0xA346 },
+        .open = true,
+        .z = 30,
+        .placement = .{ .source = .{ .point = .{ .x = 60, .y = 60 } }, .flip = .none },
+    };
+    const items = [_]PopupItem{.{ .label = "Layer" }};
+
+    ctx.beginFrameAt(320, 200, 0.0);
+    _ = popupMenu(&ctx, &lower, &items);
+    _ = popupMenuStacked(&ctx, &middle, &items, .{});
+    _ = popupMenuEx(&ctx, &upper, &items, .{ .keep_open_on_select = true });
+    ctx.endFrame();
+
+    ctx.pushEvent(.{ .mouse_down = .{ .x = 5, .y = 5, .button = 0, .modifiers = 0 } });
+    ctx.beginFrameAt(320, 200, 0.1);
+    const lower_result = popupMenu(&ctx, &lower, &items);
+    const middle_result = popupMenuStacked(&ctx, &middle, &items, .{});
+    const upper_result = popupMenuEx(&ctx, &upper, &items, .{ .keep_open_on_select = true });
+    try std.testing.expect(!lower_result.dismissed);
+    try std.testing.expect(!middle_result.dismissed);
+    try std.testing.expect(upper_result.dismissed);
+    ctx.endFrame();
+
+    try std.testing.expect(ctx.layerWasPlaced(lower.key));
+    try std.testing.expect(ctx.layerWasPlaced(middle.key));
+    try std.testing.expect(!ctx.layerWasPlaced(upper.key));
+}
+
+test "popupMenu: checked indicators contribute to natural width at every item position" {
+    const labels = [_][]const u8{ "A", "A much longer menu item label" };
+    const checked_positions = [_]usize{ 0, 1, 2 };
+
+    for (labels) |label| {
+        for (checked_positions) |checked_index| {
+            const unchecked_width = popupNaturalWidth(label, null);
+            const checked_width = popupNaturalWidth(label, checked_index);
+            try std.testing.expect(checked_width > unchecked_width);
+        }
+    }
+}
+
+fn textX(ctx: *Context, label: []const u8) !i32 {
+    for (ctx.postFrameDrawList().cmds.items) |cmd| switch (cmd) {
+        .text => |text| if (std.mem.eql(u8, text.text, label)) {
+            try std.testing.expectEqual(label.len, text.text.len);
+            return text.pos.x;
+        },
+        else => {},
+    };
+    unreachable;
+}
+
+fn countCheckGlyphSquares(ctx: *Context, size: i32) usize {
+    var count: usize = 0;
+    for (ctx.postFrameDrawList().cmds.items) |cmd| switch (cmd) {
+        .rect_filled => |filled| {
+            if (filled.rect.w == @as(u32, @intCast(size)) and filled.rect.h == @as(u32, @intCast(size))) count += 1;
+        },
+        else => {},
+    };
+    return count;
+}
+
+fn expectCheckGutterLayout(checked_index: usize, labels: [3][]const u8) !void {
+    var ctx = testCtx();
+    defer ctx.deinit();
+    var state: PopupState = .{
+        .key = .{ .value = 0x90B2 + @as(u64, @intCast(checked_index)) },
+        .open = true,
+        .placement = .{ .source = .{ .point = .{ .x = 10, .y = 10 } }, .flip = .none },
+    };
+    const items = [_]PopupItem{
+        .{ .label = labels[0] },
+        .{ .label = labels[1] },
+        .{ .label = "Disabled", .enabled = false },
+    };
+    var mutable_items = items;
+    mutable_items[checked_index].checked = true;
+
+    ctx.beginFrameAt(320, 200, 0.0);
+    _ = popupMenu(&ctx, &state, &mutable_items);
+    ctx.endFrame();
+
+    const size = ctx.style.checkbox_size;
+    try std.testing.expectEqual(@as(usize, mutable_items.len), countCheckGlyphSquares(&ctx, size));
+    const label_x = try textX(&ctx, mutable_items[0].label);
+    try std.testing.expectEqual(label_x, try textX(&ctx, mutable_items[1].label));
+    try std.testing.expectEqual(label_x, try textX(&ctx, mutable_items[2].label));
+
+    const first_row = ctx.getNodeRect(popupItemId(state.key, 0)).?;
+    const expected_glyph_x = first_row.x + ctx.style.spacing.popup_inset;
+    try std.testing.expectEqual(expected_glyph_x + size + ctx.style.spacing.control_gap, label_x);
+    for (ctx.postFrameDrawList().cmds.items) |cmd| switch (cmd) {
+        .rect_filled => |filled| {
+            if (filled.rect.w == @as(u32, @intCast(size)) and filled.rect.h == @as(u32, @intCast(size))) {
+                try std.testing.expectEqual(expected_glyph_x, filled.rect.x);
+            }
+        },
+        else => {},
+    };
+}
+
+test "popupMenu: checked and unchecked rows share a token-sized check gutter" {
+    const labels = [3][]const u8{ "A", "A longer menu label", "Disabled" };
+    for ([_]usize{ 0, 1, 2 }) |checked_index| {
+        try expectCheckGutterLayout(checked_index, labels);
+    }
+}
+
+test "popupMenu: checked rows keep ordinary button chrome" {
+    var ctx = testCtx();
+    defer ctx.deinit();
+    var state: PopupState = .{
+        .key = .{ .value = 0x90B3 },
+        .open = true,
+        .placement = .{ .source = .{ .point = .{ .x = 10, .y = 10 } }, .flip = .none },
+    };
+    const items = [_]PopupItem{
+        .{ .label = "Checked", .checked = true },
+        .{ .label = "Other" },
+    };
+
+    ctx.beginFrameAt(320, 200, 0.0);
+    _ = popupMenu(&ctx, &state, &items);
+    ctx.endFrame();
+
+    const row = ctx.getNodeRect(popupItemId(state.key, 0)).?;
+    var row_fill: ?Color = null;
+    var row_border: ?Color = null;
+    var row_border_thickness: ?u32 = null;
+    for (ctx.postFrameDrawList().cmds.items) |cmd| switch (cmd) {
+        .rect_filled => |filled| {
+            if (std.meta.eql(filled.rect, row)) {
+                row_fill = switch (filled.paint) {
+                    .solid => |color| color,
+                    else => null,
+                };
+            }
+        },
+        .rect_outline => |outline| {
+            if (std.meta.eql(outline.rect, row)) {
+                row_border = outline.color;
+                row_border_thickness = outline.thickness;
+            }
+        },
+        else => {},
+    };
+    try std.testing.expectEqual(ctx.style.surface.control, row_fill.?);
+    try std.testing.expectEqual(ctx.style.surface.control, row_border.?);
+    try std.testing.expectEqual(@as(u32, @intCast(ctx.style.button_border)), row_border_thickness.?);
 }
 
 test "dialog: actions use the generic focus scope" {

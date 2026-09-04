@@ -251,7 +251,9 @@ called inside a frame apply to that frame; called outside one they are staged an
 the next `beginFrame`, in arrival order, before any widget reads input
 ([ADR-028](adr/028_gui-input-staging-outside-a-frame.md)). Draining the window's event queue
 before opening the frame — the order a native loop makes natural — is therefore correct, and so
-is draining it after. What follows from that:
+is draining it after. Ordinary widgets see either order in the frame that receives the event;
+an outside press for a modal layer that arrives after `beginFrame` is reported at the next
+`beginFrame`, after the current route has been sealed. What follows from that:
 
 - An event forwarded after `endFrame` is not lost; it takes effect on the next frame, which is
   the earliest frame that could have shown a response to it anyway.
@@ -302,9 +304,9 @@ error as a screen grows, while a declared size is either correct or wrong on its
 
 ### 5.0 Which call to reach for
 
-Sorted by **when in the frame they are called**. Everything above the last row must be called
-inside a frame and the last row must be called outside one, and getting either wrong panics
-rather than misbehaving quietly.
+Sorted by **when in the frame they are called**. Layout and widget calls, including layer
+consumers, must be made while a frame is open; calls outside that phase panic rather than
+misbehave quietly.
 
 | When | Calls | In the layout tree | Hit-tested | Who decides the position |
 |---|---|---|---|---|
@@ -312,16 +314,16 @@ rather than misbehaving quietly.
 | Inside the frame (required) | `beginBox` / `endBox` | yes | not itself; the widgets inside it are | the layout engine |
 | Inside the frame (required) | `ctx.custom` | yes | no — no id, no hit-test, no focus | the layout engine |
 | Inside the frame | `ctx.mainDrawList().*` directly | no | no | you |
-| After `endFrame` (required) | `popupMenu*`, `dialog*`, `menuBarPopup` | a separate layer | yes | the library |
+| Inside the frame (required) | `popupMenu*`, `dialog*`, `menuBarPopup` | a separate layer | yes | the layout engine |
 
-Only the *drawing* half of a popup or dialog is in that last group, and only that half is what
-the frame boundary constrains. Opening one (`openPopup`, `openDialog`) sets state and needs no
-frame of its own, and building a menu bar's button row (`menuBar`) is an ordinary in-frame call;
-the matching `popupMenu` / `dialog` / `menuBarPopup` paints it after the frame is closed.
+Popup and dialog state is owned by the application. A consumer submits its marker and ordinary
+child widgets in the same open frame; omitting the marker on a later frame closes the layer.
+`menuBar` and `menuBarPopup` are both in-frame calls, so the menu anchor and its dropdown share
+the normal layout and previous-frame input contracts.
 
 Draw order follows the same order: whatever you pushed onto `mainDrawList()` during the frame
 is already in the list when `endFrame` appends the interface's own commands, so widgets paint
-**over** a hand-drawn background; the post-`endFrame` layers paint over everything.
+**over** a hand-drawn background; layer roots emitted by `endFrame` paint over everything.
 
 Which one a thing is:
 
@@ -470,7 +472,7 @@ list rows take the current state as a plain argument rather than storing it.
 | `iconButton` | a button drawn from a 16×16 bitmap instead of a label | the same as `button` |
 | `tooltip` / `tooltipBox` | attach a tooltip to the widget just built | nothing |
 | `beginDisabled` / `endDisabled` | a nestable scope: everything inside rejects input and leaves the Tab order | nothing |
-| `openPopup` / `openDialog` / `closePopup` | **opening or closing** a popup or dialog only sets state, so it needs no frame; the ordinary place for it is inside one, next to the control that triggers it | nothing |
+| `PopupState` / `DialogState` | caller-owned `open`, `key` and `placement` state; update it beside the widget that triggers it | nothing |
 | `gui.menuBar` | `gui.menuBar(ctx, commands, &menu_state);` (`menu_state` is a `gui.MenuBarState` you own) — the top row of buttons built from `Command` definitions. A free function, not a `Context` method | nothing; the chosen `CommandId` comes from `menuBarPopup` below |
 
 **`tabId` returns two different things and they answer different questions.** `focused` is
@@ -479,15 +481,40 @@ both a click and a Tab — the convention the library is built around, and what
 `examples/47_screen_layout` follows. `activated` is true only on a click or Space/Enter, so
 following it keeps the selection put while Tab walks past. Pick one deliberately; `selected` itself is always display-only.
 
-Only the **drawing** half of a popup, dialog or menu happens after `endFrame`, because it
-paints over the finished frame. The opening calls above are state updates, ordinarily made
-inside the frame next to the control that triggers them:
+Popup, dialog and menu consumers are built in the frame. They are detached layer roots, so the
+layout engine emits them above the main tree after resolving their anchor and z order:
 
 | Call | Minimal use |
 |---|---|
-| `popupMenu` / `popupMenuEx` / `popupMenuStacked` | `ctx.openPopup(id, pos)` as a state update; `ctx.popupMenu(id, items)` after `endFrame` |
-| `dialog` / `dialogStacked` | `ctx.openDialog(id, .{ ... })` as a state update; `const r = ctx.dialog(id)` after `endFrame` (§6 has the options and the result) |
-| `gui.menuBarPopup` | the dropdown half of the menu bar whose button row `gui.menuBar` built inside the frame. Its `MenuBarResult.selected` is the chosen `CommandId` |
+| `popupMenu` / `popupMenuEx` / `popupMenuStacked` | `const r = gui.popupMenu(ctx, &state, items);` while the frame is open |
+| `dialog` / `dialogStacked` | `const r = gui.dialog(ctx, &state);` while the frame is open (§6 has the options and result) |
+| `gui.menuBarPopup` | the in-frame dropdown half of the menu bar. Its `MenuBarResult.selected` is the chosen `CommandId` |
+
+The simplest anchored menu keeps the state in the consumer and names the anchor by explicit Id:
+
+```zig
+var file_menu: gui.PopupState = .{
+    .key = .{ .value = 0x4001 },
+    .placement = .{ .source = .{ .id = file_button_id }, .side = .below },
+};
+
+ctx.beginFrame(width, height);
+const file_button = ctx.buttonId(file_button_id, "File", .{});
+if (file_button.clicked) file_menu.open = !file_menu.open;
+const result = gui.popupMenu(ctx, &file_menu, &.{
+    .{ .label = "Open" },
+    .{ .label = "Save", .enabled = can_save },
+});
+if (result.selected) |index| dispatchFileItem(index);
+if (result.dismissed) file_menu.open = false;
+ctx.endFrame();
+```
+
+The marker is visible in its first submitted frame but owns input from the next frame, just like
+all declarative layers. `layerDismissed` is an event result; the consumer decides whether to set
+`open = false`. A modal menu absorbs the main tree, while a dialog may draw a scrim as its own
+viewport-sized declarative root. `PopupState` does not contain an item stack or framework-owned
+open state.
 
 Four rules that apply across both tables:
 
@@ -822,30 +849,35 @@ combinations.
 
 ### Modal dialogs
 
-A dialog uses the same popup mechanism as a popup menu, and the drawing and hit-testing happen
-through the post-`endFrame` overlay call. `openDialog` takes the single classic modal slot and
-absorbs background interaction; `openDialogStacked` / `openDialogStackedAt` put the dialog on
-the independent popup stack instead, which holds more than one. The order is the contract:
+A dialog uses the same modal layer route as a popup menu. The consumer owns a `DialogState`,
+submits it while the frame is open, and receives a synchronous `DialogResult`:
 
-| When | Call |
-|---|---|
-| Any time state can be set | `ctx.openDialog(id, opts)`, which centres it, or `ctx.openDialogAt(id, pos, opts)`. These only set state, so a frame is not required; the natural place is inside one, next to the control that opens the dialog |
-| After `endFrame` (required) | `const r = ctx.dialog(id)`, which draws it, hit-tests it and reports what happened |
+```zig
+var confirm: gui.DialogState = .{
+    .popup = .{
+        .key = .{ .value = 0x5001 },
+        .placement = .{ .source = .{ .point = .{ .x = 0, .y = 0 } } },
+    },
+    .options = .{
+        .title = "Delete file",
+        .body = "This cannot be undone.",
+        .actions = &.{ .{ .label = "Cancel" }, .{ .label = "Delete" } },
+    },
+};
 
-`DialogOptions` carries `title`, `body`, `actions` (a `[]const gui.DialogAction`, each
-`.{ .label, .enabled }`), `width` (360 by default) and `dismiss_on_escape` (`true` by default).
-`DialogResult` reports `open`, `selected: ?usize` (the action index) and `dismissed`. While the
-dialog is open, Tab and Shift+Tab cycle the enabled actions and Enter or Space activates the
-focused one.
+ctx.beginFrame(width, height);
+const result = gui.dialog(ctx, &confirm);
+if (result.selected == 1 or result.dismissed) confirm.popup.open = false;
+ctx.endFrame();
+```
 
-**The options are borrowed, not copied.** `openDialog` stores the `DialogOptions` value, and
-`title`, `body`, the `actions` slice **and each action's `label`** still point at your memory —
-which the dialog reads on every frame it stays open, not just the frame that opened it. A local
-array or a frame-arena string is therefore not enough: all of them have to live as long as the
-dialog does.
-
-`openDialogStacked` / `openDialogStackedAt` / `dialogStacked` are the same calls on that
-stacked channel.
+`DialogOptions` carries `title`, `body`, `actions`, `width`, `height` and
+`dismiss_on_escape`. Actions are ordinary focusable buttons: disabled actions do not enter Tab
+order, and enabled actions respond to pointer, Enter and Space. The dialog root may draw a
+declarative viewport-sized scrim; this is a consumer visual choice, while modal routing always
+absorbs the main tree. `dialogStacked` is the same descriptor and registry path, not a second
+popup storage channel. Option strings and action slices must remain valid for every frame the
+consumer keeps the dialog open.
 [`examples/35_gui_gallery/main.zig`](../examples/35_gui_gallery/main.zig) is the worked
 dialog.
 

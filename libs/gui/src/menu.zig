@@ -388,3 +388,66 @@ test "menuBarPopup: disabled items do not return selected (popup enabled contrac
     ctx.endFrame();
     try std.testing.expect(res.selected == null);
 }
+
+const MenuEventOrder = enum { before_begin_frame, during_frame };
+
+fn expectMenuBarSwitch(order: MenuEventOrder) !void {
+    var ctx = Context.init(std.testing.allocator, font_mod.default_font);
+    defer ctx.deinit();
+
+    const cmds = [_]Command{
+        .{ .id = 1, .label = "Open", .menu = .{ .title = "File", .order = 1 } },
+        .{ .id = 2, .label = "Undo", .menu = .{ .title = "Edit", .order = 1 } },
+    };
+    var state: MenuBarState = .{};
+
+    ctx.beginFrameAt(400, 300, 0.0);
+    ctx.beginBox(.{ .direction = .row, .width = .fit, .height = .fit });
+    menuBar(&ctx, &cmds, &state);
+    ctx.endBox();
+    _ = menuBarPopup(&ctx, &cmds, &state);
+    ctx.endFrame();
+
+    state.open_title = "File";
+    ctx.beginFrameAt(400, 300, 0.1);
+    ctx.beginBox(.{ .direction = .row, .width = .fit, .height = .fit });
+    menuBar(&ctx, &cmds, &state);
+    ctx.endBox();
+    _ = menuBarPopup(&ctx, &cmds, &state);
+    ctx.endFrame();
+
+    const edit = ctx.getNodeRect(ctx.id_stack.make("Edit")).?;
+    const down: context_mod.InputEvent = .{ .mouse_down = .{
+        .x = edit.x + 8,
+        .y = edit.y + 8,
+        .button = 0,
+        .modifiers = 0,
+    } };
+    const up: context_mod.InputEvent = .{ .mouse_up = .{
+        .x = edit.x + 8,
+        .y = edit.y + 8,
+        .button = 0,
+        .modifiers = 0,
+    } };
+    if (order == .before_begin_frame) {
+        ctx.pushEvent(down);
+        ctx.pushEvent(up);
+    }
+    ctx.beginFrameAt(400, 300, 0.1);
+    if (order == .during_frame) {
+        ctx.pushEvent(down);
+        ctx.pushEvent(up);
+    }
+    ctx.beginBox(.{ .direction = .row, .width = .fit, .height = .fit });
+    menuBar(&ctx, &cmds, &state);
+    ctx.endBox();
+    const result = menuBarPopup(&ctx, &cmds, &state);
+    try std.testing.expect(state.open_title != null and std.mem.eql(u8, state.open_title.?, "Edit"));
+    try std.testing.expect(result.open);
+    ctx.endFrame();
+}
+
+test "menuBar: switching menus is stable across event delivery order" {
+    const orders = [_]MenuEventOrder{ .before_begin_frame, .during_frame };
+    for (orders) |order| try expectMenuBarSwitch(order);
+}

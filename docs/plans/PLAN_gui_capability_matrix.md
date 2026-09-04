@@ -57,7 +57,7 @@ Basic, Trees, Collapsing Headers, Text, Images, Combo, List boxes, Selectables, 
 | Table | Tables | `beginTable` / `endTable` / `tableHeaderRow` / `beginTableRow` / `beginTableCell` (sticky header, shared column widths) | list+menu shell |
 | Tabs | Tabs | `ctx.tabId` (selection follows focus, radioId's caller-owns-selection convention) | settings shell / tracker shell |
 | Toolbar | Basic / Layout | row + button; no dedicated API | settings shell / list+menu shell |
-| Tooltip | — | `ctx.tooltip(text)` (500ms hover delay, virtual-clock deterministic, screen-edge clamp via `popupContentWidth`'s clamp rules) | game inventory shell |
+| Tooltip | — | `ctx.tooltip(text)` (500ms hover delay, virtual-clock deterministic, screen-edge clamp via generic layer placement) | game inventory shell |
 | Tree View / Treegrid | Trees / Tables | Unsupported | list+menu shell / deferred |
 | Window Splitter | Layout & Scrolling | splitter | settings shell |
 
@@ -84,7 +84,7 @@ lands or a gap closes; nothing technical ties the two together.
 | Selection | Context.tabId, Context.beginListboxRow/endListboxRow + gui.pollListNav |
 | Table | Context.beginTable/endTable, Context.tableHeaderRow, Context.beginTableRow/endTableRow, Context.beginTableCell/endTableCell |
 | State | Context.beginDisabled/endDisabled/isDisabled |
-| Popup / Menu | Context.popupMenu / popupMenuEx (PopupItem.checked, keep_open_on_select), gui.openPopupStacked/popupMenuStacked, gui.menuBar, gui.menuBarPopup, Context.tooltip |
+| Popup / Menu | gui.PopupState / DialogState, Context.popupMenu / popupMenuEx / popupMenuStacked, gui.dialog, gui.menuBar, gui.menuBarPopup, Context.tooltip |
 | Step grid | gui.stepgrid.widgetRow |
 
 Use only Id-bearing variants that actually exist in libs/gui, and avoid collisions within a section. Do not change libs/gui itself for this matrix work.
@@ -266,7 +266,7 @@ libs/gui itself was not changed. Gaps are recorded as example-side custom/hack o
 2. **No dedicated Listbox semantics beyond what now exists** — Row select / highlight is app state (`selected_row` / `active_row`) layered on top of `gui.beginListboxRow`/`endListboxRow` (added after this section was first written; see §5's correction note). The library gives roving-tab-stop navigation and a selected-row background; multi-select, drag-select and column/tree semantics are still app-side or absent (items 8 and 10 below).
 3. **No list keyboard navigation API** — Up/down active-row movement is a custom app handler for `key_down UP/DOWN`. List nav is suppressed while a popup is open.
 4. **No checkbox-backed persistent multi-select popup** — `PopupItem` has no checked state. Filters rebuild `[on]`/`[off]` labels and, after item selection closes the popup, the app reopens to simulate multi-select (`filter_reopen_count`).
-5. **At most one popup at a time** — `PopupState` holds only one. menuBar and context/filter cannot be held together. E2E scenario 7: right-clicking a row while the File menu is open still yields `popup_count=1` (observed: after right-click the menu keeps the popup / context does not fully replace it, or the menu reclaims on the next frame). Overlaying menu and context is impossible.
+5. **Shared layer registry** — menuBar, context and filter consumers can be present together. Their `PopupState` keys are registered in one layer registry; explicit `z` values and registration serial define which overlapping item receives input. E2E scenario 7 now checks the menu/context simultaneous composition instead of a single-popup limit.
 6. **No standard ellipsis API** — Long filenames are truncated by the app with `font.measure` then `...`. No custom rasterizer / direct `DrawList` use.
 7. **No virtualization API** — All 500 rows are built and laid out every frame. Scrolling is `beginScrollArea` only.
 8. **No multi-row select / drag select** — This screen is single-select only. The probe explicitly reports `multi_select=0` / `drag_select=0`.
@@ -281,7 +281,7 @@ libs/gui itself was not changed. Gaps are recorded as example-side custom/hack o
 | filter popup reopen | 1 | After selection, `filter_open_request` reopens next frame |
 | keyboard up/down nav | 1 | `UP`/`DOWN` → `navigateRows` |
 | ellipsis string build | 1 | `ellipsize` + frame arena |
-| menu/context switch control | 1 | Apply context-open request after menuBarPopup; do not forward right-press to gui |
+| menu/context switch control | 0 | Both consumers are built in the same frame; the shared modal route and explicit z order arbitrate overlap |
 | custom draw | 0 | No `ctx.custom` / direct DrawList / custom rasterizer |
 
 ### 15.3 Size checks
@@ -303,8 +303,8 @@ tab stop), `ctx.labelEllipsis` (track names) and `ctx.beginFormRow`/`endFormRow`
 using only `description` with no `label`), `ctx.beginDisabled`/`endDisabled` (a muted track's own
 Volume/Pan controls), and `ctx.popupMenuEx` with `PopupItem.checked` plus `keep_open_on_select` (the
 right-click track context menu: Mute / Solo / Clear Pattern, checked marks reflecting current state,
-staying open across toggles). It does not exercise `openPopupStacked`/`popupMenuStacked` — only one popup
-is ever open here, so the list+menu shell (§15) remains the evidence for simultaneous popups.
+staying open across toggles). `popupMenuStacked` uses the same consumer-owned state and registry path;
+the list+menu shell (§15) remains the evidence for simultaneous popup layers.
 
 ### 16.1 Resolved: stepgrid now consults the disabled scope
 
@@ -332,8 +332,8 @@ scope.
 | Ergonomics | 4 | 2 hacks (§16.2), 0 custom draw |
 
 Missing (priority): 1) no dedicated Grid/Table APG widget — the step grid is still `stepgrid` plus a
-hand-wrapped row box, not a general grid/table widget 2) `openPopupStacked`/`popupMenuStacked` not
-exercised here (single popup only; see §15 for that evidence).
+hand-wrapped row box, not a general grid/table widget 2) this shell does not exercise two popup
+consumers overlapping; the list+menu shell (§15) remains the evidence for that registry case.
 
 ### 16.4 Size checks
 

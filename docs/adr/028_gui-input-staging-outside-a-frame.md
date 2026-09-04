@@ -34,7 +34,10 @@ edges and before any widget reads input.
 The restriction is removed rather than enforced: the only reason it existed was that
 `Input.beginFrame` clears edges, which is an implementation detail of this library and not
 something a caller should have to work around. Ordering input relative to the frame is now a
-free choice, and both orders produce the same result — a property a test pins directly.
+free choice for ordinary widget input. Modal outside dismissal has one explicit timing detail:
+a press staged before `beginFrame` is reported in that frame, while a press pushed after
+`beginFrame` is recorded at `endFrame` and reported at the next route latch. Both orders converge
+to the same consumer state without losing the press.
 
 `pushEvent` keeps returning `void`. Calling it outside a frame is not a failure, so there is
 nothing for a caller to handle; the one way the call can still fail is exceeding the staging
@@ -106,7 +109,7 @@ settled in [ADR-029](029_gui-lifecycle-violations-fail-in-every-build.md).
 | Property | How it is checked |
 |---|---|
 | Staged input arrives, in order, with its edges intact | unit test in `input.zig`, running in every optimisation mode |
-| Staging before the frame equals pushing inside it | unit test comparing two `Input` instances event for event |
+| Staging before the frame and pushing inside it converge for layers and widgets | GUI tests compare popup dismissal, command targets and menu switching in both delivery orders |
 | Motion and wheel coalesce without losing the total | unit tests filling the buffer past capacity |
 | Discrete events are never merged away | unit test asserting a full buffer of presses frees nothing |
 | Preedit is copied, clamped on a codepoint boundary, latest-wins | unit test that overwrites the caller's buffer after the call |
@@ -138,7 +141,6 @@ partial compile-time check at the cost of an API that still has to do the whole 
 
 **Split `Context` into a persistent half and a frame half, moving the widget API onto the frame
 half.** This is the complete form of the token idea and inherits the same run-time check. It
-also mismodels the library as it stands: `endFrame` is not the end of GUI work. The pixel
-editor draws its overlay and its menu-bar popup after `endFrame`, and the menu API is a
-post-frame contract by design. A two-way "inside the frame / outside the frame" split cannot
-express an API that is legitimately used after the frame closes.
+also mismodels the retained GUI API: `endFrame` performs layout and emission, while consumers
+still need the same context to submit layer markers before that work. A two-way split would add
+an ownership seam without improving the frame-latched input contract.

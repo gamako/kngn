@@ -95,9 +95,6 @@ pub fn main(init: std.process.Init) !void {
         @memset(fb.pixels, 0xFF_18_1C_24);
         app.screen_w = fb.width;
         app.screen_h = fb.height;
-        ctx.beginFrame(fb.width, fb.height);
-
-        ui.applyOpenRequests(&app);
 
         var swallow_right_for_context = false;
         while (window.nextEvent()) |ev| {
@@ -196,6 +193,10 @@ pub fn main(init: std.process.Init) !void {
             }
         }
 
+        // Stage platform events before beginFrame so the frame-latched layer route sees outside
+        // presses.
+        ctx.beginFrame(fb.width, fb.height);
+        ui.applyOpenRequests(&app);
         ui.buildUi(&app);
         ui.handleOverlays(&app);
         ctx.endFrame();

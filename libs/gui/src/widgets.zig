@@ -165,6 +165,84 @@ pub fn buttonId(ctx: *Context, id: Id, label: []const u8, opts: ButtonOpts) Butt
     return buttonIdWithRoute(ctx, id, label, opts, null);
 }
 
+/// Explicit-ID button whose label is preceded by a fixed-width checkbox glyph.
+/// The glyph is display-only; activation remains the button's click result.
+pub fn buttonIdWithCheckGlyph(ctx: *Context, id: Id, label: []const u8, checked: bool, opts: ButtonOpts) ButtonResult {
+    ctx.requireInteractiveAllowed("button");
+    const result = behaviorFromCacheWithRoute(ctx, id, null);
+    const style = ctx.style;
+    const disabled = ctx.isDisabled();
+    const hot = ctx.state.hot_id == id;
+    const base_bg = if (opts.selected) style.accent.selected else style.surface.control;
+    const colors: Context.ButtonColors = if (!style.animation.enabled)
+        if (opts.style) |override|
+            ctx.resolveButtonColorsWithStyle(id, base_bg, opts.selected, result.held, disabled, override)
+        else
+            .{
+                .bg = if (disabled)
+                    style.disabledColor(base_bg)
+                else if (result.held)
+                    style.accent.primary
+                else if (hot)
+                    style.surface.control_hover
+                else
+                    base_bg,
+                .border = if (disabled)
+                    style.disabledColor(style.border_tokens.normal)
+                else if (hot or opts.selected)
+                    style.border_tokens.hover
+                else
+                    style.border_tokens.normal,
+                .text = if (disabled) style.disabledColor(style.text_tokens.primary) else style.text_tokens.primary,
+            }
+    else
+        ctx.resolveButtonColorsWithStyle(id, base_bg, opts.selected, result.held, disabled, opts.style);
+    const thickness = if (opts.selected) style.button_border_selected else style.button_border;
+    const pad = opts.padding orelse style.spacing.control_padding;
+    const glyph_size = style.checkbox_size;
+    std.debug.assert(glyph_size > 0);
+    const gap = style.spacing.control_gap;
+    const label_width: i32 = @intCast(ctx.font.measure(label));
+    const natural_width = glyph_size + gap + label_width + pad[3] + pad[1];
+    const width: layout.Sizing = if (opts.min_w > 0)
+        .{ .fixed = @max(opts.min_w, natural_width) }
+    else
+        .fit;
+    const natural_height = @max(font_mod.fontInkHeight(ctx.font), glyph_size) + pad[0] + pad[2];
+    const height: layout.Sizing = if (opts.min_h > 0)
+        .{ .fixed = @max(opts.min_h, natural_height) }
+    else
+        .fit;
+    ctx.beginBox(.{
+        .id = id,
+        .direction = .row,
+        .width = width,
+        .height = height,
+        .padding = pad,
+        .gap = gap,
+        .align_cross = .center,
+        .bg = colors.bg,
+        .border = makeBorder(colors.border, thickness),
+        .radius = style.control_radius,
+    });
+    const widget = opts.style orelse WidgetStyle{};
+    const glyph_border = colors.border;
+    const glyph_fill = widget.selected orelse widget.active orelse style.accent.primary;
+    const data = ctx.allocator().create(CheckGlyph) catch @panic("buttonIdWithCheckGlyph: OOM");
+    data.* = .{
+        .size = glyph_size,
+        .radius = style.checkbox_radius,
+        .checked = checked,
+        .border = glyph_border,
+        .bg = colors.bg,
+        .fill = if (disabled) style.disabledColor(glyph_fill) else glyph_fill,
+    };
+    ctx.custom(.{ .x = glyph_size, .y = glyph_size }, CheckGlyph.draw, data);
+    ctx.labelEx(label, colors.text);
+    ctx.endBox();
+    return result;
+}
+
 /// Explicit-ID menu title form. The title remains an ordinary main-tree button when no menu
 /// route owns input. While its named menu owns the route, only its pointer command exception is
 /// enabled; keyboard, focus and wheel continue to follow the modal layer scope.

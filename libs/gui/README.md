@@ -76,23 +76,25 @@ are rasterized in bounded visible bands instead of allocating a full mask.
 |---|---|---|---|
 | `pushEvent`, `setComposition` | yes — staged | yes — applies now | yes — staged |
 | Widgets, `ctx.custom`, `beginBox`/`endBox`, `beginDisabled`, `tooltip`, `tooltipBox`, `claimFocus`, `endFrame` | no | yes | no |
-| `popupMenu`, `popupMenuStacked`, `menuBarPopup` | no — nothing to draw over yet | no | yes |
+| `popupMenu`, `popupMenuStacked`, `menuBarPopup` | yes — detached layer root | no | yes |
 | `beginFrame` | yes | no | yes |
 
 **Input may be handed over at any point in the loop.** Outside a frame it is staged and applied
 by the next `beginFrame`, in arrival order, before any widget reads it — so draining the
 window's events before opening the frame is as correct as draining them after
-([ADR-028](../../docs/adr/028_gui-input-staging-outside-a-frame.md)). Staging is bounded rather
-than unlimited: a full buffer collapses redundant events first, and it panics only if collapsing
-cannot free a slot. Collapsing keeps what applying the events one by one would have produced —
-consecutive motion becomes the latest position, consecutive wheel events keep the latest position
-while their deltas add up — and it only merges neighbours, so presses and keystrokes never
-disappear into it.
+([ADR-028](../../docs/adr/028_gui-input-staging-outside-a-frame.md)). Ordinary widget results
+converge in the receiving frame. An outside press for a modal layer delivered after `beginFrame`
+is reported at the following route latch, because the current route cannot be changed
+retroactively. Staging is bounded rather than unlimited: a full buffer collapses redundant events
+first, and it panics only if collapsing cannot free a slot. Collapsing keeps what applying the
+events one by one would have produced — consecutive motion becomes the latest position,
+consecutive wheel events keep the latest position while their deltas add up — and it only merges
+neighbours, so presses and keystrokes never disappear into it.
 
 **Everything else in that table is a contract, and breaking one panics in every build** —
 `Debug`, `ReleaseFast` and `ReleaseSmall` alike — with a message naming what broke
 (`gui: endBox requires an open frame`, `gui: endFrame with a box still open`,
-`gui: menuBarPopup must be called with no frame open`); see
+`gui: menuBarPopup requires an open frame`); see
 [ADR-029](../../docs/adr/029_gui-lifecycle-violations-fail-in-every-build.md). So every
 `beginFrame` needs its `endFrame`, and every begin/end scope — `beginBox`, `beginDisabled`,
 `beginSliderGroup`, `beginCollapsible`, `beginScrollArea` and the rest — needs its closing call
@@ -210,26 +212,25 @@ which are per-item flags on a popup or menu row, not a scope over ordinary widge
 
 ## Popups and menus (`src/popup.zig`, `src/menu.zig`)
 
-`ctx.openPopup(id, pos)` / `ctx.closePopup()` / `ctx.popupMenu(id, items)` are the classic
-mechanism: exactly one popup open at a time, closing on an item click or an outside click (call
-`popupMenu` after `ctx.endFrame()`, not inside the frame — see the doc comment at the top of
-`popup.zig`). A `PopupItem` can be `.checked = true` to draw a check mark before its label; pass
-`ctx.popupMenuEx(id, items, .{ .keep_open_on_select = true })` instead of `popupMenu` for a
-persistent, checkbox-backed multi-select popup that stays open when an item is chosen (the
-caller flips the item's own `checked` field and rebuilds the list; the popup does not close
-itself).
+Popup and dialog state belongs to the consumer. `PopupState` carries a stable `LayerKey`,
+placement and `open`; `DialogState` adds its title/body/actions. While a frame is open, call
+`gui.popupMenu`, `gui.popupMenuEx`, `gui.popupMenuStacked`, `gui.dialog` or `gui.dialogStacked`.
+Each call builds a normal detached layer subtree and returns its selection synchronously. The
+consumer closes the state after observing `selected` or `dismissed`; omitting the marker on a
+later frame is the only presence transition.
 
-A second, independent side channel — `ctx.openPopupStacked` / `ctx.closePopupStacked` /
-`ctx.popupMenuStacked` / `ctx.isPopupOpenStacked` — lets a handful of popups (up to
-`gui.max_stacked_popups`) stay open **at once**, alongside the classic slot: a menu-bar dropdown
-and a right-click context menu, say. `ctx.openPopupCount()` / `ctx.isPopupOpenAny(id)` /
-`ctx.popupPos(id)` read across both mechanisms. Each open popup dismisses on an outside click
-independently, judged against its own rect alone — a click that lands inside a *different* open
-popup still counts as "outside" for this one and closes it, the same rule a single open popup
-already followed.
+The classic and stacked entry points use the same layer registry. `z` and registration serial
+define their order, so a menu-bar dropdown and a context menu can coexist without a second popup
+channel. Menu rows and dialog actions use ordinary buttons, including checked, disabled,
+selection, keep-open and Tab semantics. A modal menu does not receive a framework backdrop; a
+dialog's scrim is an ordinary background on its viewport-sized root.
 
-`gui.menuBar` / `gui.menuBarPopup` (a top menu row built from `Command` definitions) use the
-classic slot under the hood and are unaffected by any of the above.
+`gui.menuBar` builds the title buttons and registers their explicit Ids as pointer-only command
+targets. `gui.menuBarPopup` builds the dropdown in the same frame, anchored with
+`LayerPlacement.source = .id`; it does not read a rectangle and manufacture a point. A command
+target is eligible only when the menu-bar layer owns the previous-frame route and the press is
+outside that layer's previous root. An inside hit in any modal layer wins first, and a context or
+dialog route disables the title exception.
 
 ## Rows of data (`src/table.zig`, the virtual list in `src/widgets.zig`)
 
@@ -356,8 +357,8 @@ pushed through `mainDrawList()` during the frame, so the interface draws over a 
 custom leaf sits where the layout puts it, inside its parent's emit order of background →
 children → border: the parent's background is under it and the parent's border is drawn over it.
 An ancestor's clip applies where that ancestor sets `clip_children = true`.
-The popup and menu-bar overlays are emitted after `endFrame` and land on top of everything
-(`src/popup.zig`, `src/menu.zig`).
+Popup and menu-bar layer roots are emitted by `endFrame` after the main tree and land on top of
+everything (`src/popup.zig`, `src/menu.zig`).
 
 ## Frame order and hit-test timing
 

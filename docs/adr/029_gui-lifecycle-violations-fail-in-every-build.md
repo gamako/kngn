@@ -9,8 +9,8 @@ over outside a frame: it is accepted and staged. It deliberately left the other 
 the structural contracts of a frame — and named the reason they could not be answered the same
 way: input can be *accepted*, structure can only be *rejected*.
 
-Those contracts are: a frame is opened once and closed once; widgets are built only while one is
-open; the post-frame APIs (popups, the menu bar dropdown) are called only while none is; and
+Those contracts are: a frame is opened once and closed once; widgets and layer consumers are
+built only while one is open; and
 every `beginBox`, `beginDisabled`, `beginSliderGroup` and collapsible body is closed before the
 frame ends.
 
@@ -34,8 +34,9 @@ reader meets them:
 
 | Kind | Where the predicate lives | Example message |
 |---|---|---|
+| Phase: no frame may be open | `Context.requireNoFrame` | `gui: beginFrame requires no open frame` |
 | Phase: a frame must be open | `Context.requireFrame` | `gui: endBox requires an open frame` |
-| Phase: no frame may be open | `Context.requireNoFrame` | `gui: menuBarPopup must be called with no frame open` |
+| Phase: a frame must be open | `Context.requireFrame` | `gui: menuBarPopup requires an open frame` |
 | State: a scope must be closed | the call site | `gui: endFrame with a box still open` |
 
 This deliberately does not aggregate the state predicates: `disabled_depth == 0` and

@@ -868,7 +868,6 @@ pub fn main(init: std.process.Init) !void {
         @memset(fb.pixels, 0xFF_18_1C_24);
         app.screen_w = fb.width;
         app.screen_h = fb.height;
-        ctx.beginFrame(fb.width, fb.height);
 
         while (window.nextEvent()) |ev| {
             switch (ev) {
@@ -924,6 +923,9 @@ pub fn main(init: std.process.Init) !void {
             if (kit.toGuiEvent(ev)) |ge| ctx.pushEvent(ge);
         }
 
+        // Stage platform events before beginFrame so a previous-frame modal layer can see an
+        // outside press in its latched route.
+        ctx.beginFrame(fb.width, fb.height);
         renderFrame(&ctx, &app);
 
         // Read the generic layer root after layout has been finalized.

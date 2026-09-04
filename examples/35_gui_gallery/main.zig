@@ -860,7 +860,6 @@ pub fn main(init: std.process.Init) !void {
         const fb = window.lockFramebuffer() orelse continue :main_loop;
         defer fb.unlock();
         @memset(fb.pixels, 0xFF_18_1C_24);
-        ctx.beginFrame(fb.width, fb.height);
 
         app.paste_text = null;
         while (window.nextEvent()) |ev| {
@@ -892,6 +891,9 @@ pub fn main(init: std.process.Init) !void {
             if (kit.toGuiEvent(ev)) |ge| ctx.pushEvent(ge);
         }
 
+        // Stage platform events before beginFrame so a previous-frame modal layer can see an
+        // outside press in its latched route.
+        ctx.beginFrame(fb.width, fb.height);
         renderFrame(&ctx, &app);
         _ = gui.menuBarPopup(&ctx, &commands, &app.menu);
         const popup_result = gui.popupMenu(&ctx, &app.popup, &popup_items);

@@ -490,7 +490,7 @@ pub fn main(init: std.process.Init) !void {
                         .placement = .{ .source = .{ .point = .{ .x = 0, .y = 0 } } },
                         .open = true,
                     },
-                    .options = .{ .title = "title", .body = "body", .actions = &.{.{ .label = "OK" }}},
+                    .options = .{ .title = "title", .body = "body", .actions = &.{.{ .label = "OK" }} },
                 };
                 _ = c.dialog(&state);
             }

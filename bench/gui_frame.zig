@@ -168,7 +168,7 @@ fn runScenario(io: std.Io, tracker: *peak_allocator.PeakTrackingAllocator, rows:
     const p95 = percentile95(samples[0..]);
     const raster_after = family.coverage.rasterization_count;
 
-    std.debug.print("gui.frame animation=off rows={d:<4} scale={d:.1} phys={d}x{d} warmup={d} iters={d}  avg={d:>9} ns  min={d:>9} ns  p95={d:>9} ns  peak_bytes={d}  raster_warmup={d}  raster_steady={d}\n", .{
+    std.debug.print("gui.frame animation=off rows={d:<4} scale={d:.1} phys={d}x{d} warmup={d} iters={d}  avg={d:>9} ns  min={d:>9} ns  p95={d:>9} ns  alloc_calls={d:<8} peak_bytes={d}  raster_warmup={d}  raster_steady={d}\n", .{
         rows,
         scale,
         pw,
@@ -178,6 +178,7 @@ fn runScenario(io: std.Io, tracker: *peak_allocator.PeakTrackingAllocator, rows:
         avg,
         min_ns,
         p95,
+        tracker.alloc_calls / ITERS,
         tracker.peak_bytes,
         raster_after_warmup - raster_before,
         raster_after - raster_after_warmup,
@@ -219,8 +220,22 @@ pub fn main(init: std.process.Init) !void {
     try runFlowScenario(io, &tracker, 100, "flow-100");
     try runLayerScenario(io, &tracker, 0, "layer-0");
     try runLayerScenario(io, &tracker, 1, "layer-1");
+    try runLayerScenario(io, &tracker, 2, "layer-2");
+    try runLayerScenario(io, &tracker, 8, "layer-8");
     try runLayerScenario(io, &tracker, 4, "layer-4");
     try runLayerScenario(io, &tracker, 32, "layer-32");
+    std.debug.print("\n=== GUI visible popup/menu/dialog scenarios (scale 1.0) ===\n", .{});
+    try runPopupScenario(io, &tracker, 0, "popup-0");
+    try runPopupScenario(io, &tracker, 1, "popup-1");
+    try runPopupScenario(io, &tracker, 8, "popup-8");
+    try runPopupScenario(io, &tracker, 32, "popup-32");
+    try runMenuScenario(io, &tracker, 0, "menu-0");
+    try runMenuScenario(io, &tracker, 1, "menu-1");
+    try runMenuScenario(io, &tracker, 8, "menu-8");
+    try runMenuScenario(io, &tracker, 32, "menu-32");
+    try runDialogScenario(io, &tracker, 0, "dialog-0");
+    try runDialogScenario(io, &tracker, 1, "dialog-1");
+    try runDialogScenario(io, &tracker, 8, "dialog-8");
     try runIndentScenario(io, &tracker, 500, 0, "indent-d0-500");
     try runIndentScenario(io, &tracker, 1000, 0, "indent-d0-1000");
     try runIndentScenario(io, &tracker, 500, 3, "indent-d3-500");
@@ -511,6 +526,86 @@ fn runLayerScenario(io: std.Io, tracker: *peak_allocator.PeakTrackingAllocator, 
         }
     };
     Gen.n_layers = n;
+    try runCountedScenario(io, tracker, name, Gen.build);
+}
+
+fn buildPopup(ctx: *gui.Context, item_count: usize) void {
+    var state: gui.PopupState = .{
+        .key = .{ .value = 0xA000 },
+        .placement = .{ .source = .{ .point = .{ .x = 180, .y = 120 } } },
+        .open = item_count > 0,
+    };
+    var items: [32]gui.PopupItem = undefined;
+    for (items[0..item_count], 0..) |*item, i| {
+        item.* = .{ .label = if (i % 2 == 0) "Popup item" else "Longer popup item label" };
+    }
+    _ = gui.popupMenu(ctx, &state, items[0..item_count]);
+}
+
+fn runPopupScenario(io: std.Io, tracker: *peak_allocator.PeakTrackingAllocator, item_count: usize, name: []const u8) !void {
+    const Gen = struct {
+        var n: usize = 0;
+        fn build(ctx: *gui.Context) void {
+            buildPopup(ctx, n);
+        }
+    };
+    Gen.n = item_count;
+    try runCountedScenario(io, tracker, name, Gen.build);
+}
+
+fn buildMenu(ctx: *gui.Context, item_count: usize) void {
+    var commands: [32]gui.Command = undefined;
+    for (commands[0..item_count], 0..) |*command, i| {
+        command.* = .{
+            .id = @intCast(i + 1),
+            .label = if (i % 2 == 0) "Menu item" else "Longer menu item label",
+            .menu = .{ .title = "File", .order = @intCast(i) },
+        };
+    }
+    var state: gui.MenuBarState = .{ .open_title = "File" };
+    gui.menuBar(ctx, commands[0..item_count], &state);
+    _ = gui.menuBarPopup(ctx, commands[0..item_count], &state);
+}
+
+fn runMenuScenario(io: std.Io, tracker: *peak_allocator.PeakTrackingAllocator, item_count: usize, name: []const u8) !void {
+    const Gen = struct {
+        var n: usize = 0;
+        fn build(ctx: *gui.Context) void {
+            buildMenu(ctx, n);
+        }
+    };
+    Gen.n = item_count;
+    try runCountedScenario(io, tracker, name, Gen.build);
+}
+
+fn buildDialog(ctx: *gui.Context, action_count: usize) void {
+    var actions: [8]gui.DialogAction = undefined;
+    for (actions[0..action_count], 0..) |*action, i| {
+        action.* = .{ .label = if (i % 2 == 0) "Dialog action" else "Longer dialog action label" };
+    }
+    var state: gui.DialogState = .{
+        .popup = .{
+            .key = .{ .value = 0xA100 },
+            .placement = .{ .source = .{ .point = .{ .x = 0, .y = 0 } } },
+            .open = true,
+        },
+        .options = .{
+            .title = "Dialog title",
+            .body = "Dialog body text",
+            .actions = actions[0..action_count],
+        },
+    };
+    _ = gui.dialog(ctx, &state);
+}
+
+fn runDialogScenario(io: std.Io, tracker: *peak_allocator.PeakTrackingAllocator, action_count: usize, name: []const u8) !void {
+    const Gen = struct {
+        var n: usize = 0;
+        fn build(ctx: *gui.Context) void {
+            buildDialog(ctx, n);
+        }
+    };
+    Gen.n = action_count;
     try runCountedScenario(io, tracker, name, Gen.build);
 }
 

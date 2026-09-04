@@ -81,8 +81,9 @@ pub const Ids = struct {
     pub const list_scroll: gui.Id = 0x4030;
     pub const empty_label: gui.Id = 0x4031;
     pub const row_base: gui.Id = 0x5000;
-    pub const context_popup: gui.Id = 0x5100;
-    pub const filter_popup: gui.Id = 0x5101;
+    // Keep layer roots outside the row-id range (row_base + index) and the widget-id range.
+    pub const context_popup: gui.Id = 0x610000;
+    pub const filter_popup: gui.Id = 0x610001;
 };
 
 // Command IDs for menuBar
@@ -343,10 +344,19 @@ pub fn selectRow(app: *App, index: i32, source: ActiveSource) void {
 
 /// The frontmost open consumer, using the same z/registration order as layer routing.
 pub fn currentPopupKind(app: *const App) PopupKind {
-    if (app.context_popup.open) return .context;
-    if (app.filter_popup.open) return .filter;
-    if (app.menu.popup.open) return .menu;
-    return .none;
+    const Candidate = struct { open: bool, z: i32, serial: u8, kind: PopupKind };
+    const candidates = [_]Candidate{
+        .{ .open = app.menu.popup.open, .z = app.menu.popup.z, .serial = 0, .kind = .menu },
+        .{ .open = app.context_popup.open, .z = app.context_popup.z, .serial = 1, .kind = .context },
+        .{ .open = app.filter_popup.open, .z = app.filter_popup.z, .serial = 2, .kind = .filter },
+    };
+    var best: ?Candidate = null;
+    for (candidates) |candidate| {
+        if (!candidate.open) continue;
+        if (best == null or candidate.z > best.?.z or
+            (candidate.z == best.?.z and candidate.serial > best.?.serial)) best = candidate;
+    }
+    return if (best) |candidate| candidate.kind else .none;
 }
 
 pub fn popupCount(app: *const App) u32 {

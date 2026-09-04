@@ -96,11 +96,8 @@ pub fn main(init: std.process.Init) !void {
         @memset(fb.pixels, 0xFF_18_1C_24);
         app.screen_w = fb.width;
         app.screen_h = fb.height;
-        ctx.beginFrame(fb.width, fb.height);
 
-        // reopen filter popup from previous selection (custom multi-select)
-        ui.applyOpenRequests(&app);
-
+        var context_focus_id: ?gui.Id = null;
         var swallow_right_for_context = false;
         while (window.nextEvent()) |ev| {
             switch (ev) {
@@ -140,7 +137,7 @@ pub fn main(init: std.process.Init) !void {
                             ui.selectRow(&app, row, .mouse);
                             // Keep keyboard nav primed from a right-click selection the same way
                             // a left-click on a row already will be.
-                            _ = ctx.claimFocus(ui.Ids.row_base + @as(gui.Id, @intCast(row)));
+                            context_focus_id = ui.Ids.row_base + @as(gui.Id, @intCast(row));
                             app.context_open_pos = p;
                             app.context_open_request = true;
                             swallow_right_for_context = true;
@@ -160,6 +157,13 @@ pub fn main(init: std.process.Init) !void {
             if (kit.toGuiEvent(ev)) |ge| ctx.pushEvent(ge);
         }
 
+        // Stage platform events before beginFrame so the frame-latched layer route sees outside
+        // presses. Focus claims that belong to app-level event handling wait until the frame is
+        // open; widget input still reads the same staged events below.
+        ctx.beginFrame(fb.width, fb.height);
+        // Reopen the filter popup from a previous selection (custom multi-select).
+        ui.applyOpenRequests(&app);
+        if (context_focus_id) |id| _ = ctx.claimFocus(id);
         ui.buildUi(&app);
         ui.handleOverlays(&app);
         ctx.endFrame();

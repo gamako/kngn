@@ -337,17 +337,14 @@ right_click_xy "$cx" "$cy"
 drive "step 1" >>"$LOG" 2>&1
 STATE1=$(digest_state)
 log "[e2e] scenario7 after right-click: $STATE1"
-# The context menu opens through openPopupStacked, a side channel independent of the menu-bar
-# dropdown's classic slot, so both are open at once: popup_count=2 (currentPopupKind still
-# reports "menu" as the primary readout; popup_count is what shows the second one).
+# The context menu is a second consumer in the shared layer registry, so both are open at once:
+# popup_count=2 (the state digest keeps the menu as its primary readout).
 expect_state "popup_count=2"
 expect_state "menu=File"
-expect_state "popup=menu"
+expect_state "popup=context"
 drive "snapshot fb" >>"$LOG" 2>&1
-# Clicking the context-menu item selects it, and -- because the click lands outside the
-# menu-bar dropdown's own rect -- also dismisses that dropdown as an "outside click" for it
-# (each open popup's dismissal is evaluated against its own geometry independently; see
-# popupMenuStacked's doc comment). Both close; this does not undo the popup_count=2 proof above.
+# Clicking the frontmost context-menu item selects it and closes that consumer. The lower menu
+# remains present because one previous-frame route owner supplies the dismissal result.
 LAYOUT=$(digest_layout)
 read -r ix iy iw ih <<<"$(layout_rect context_item0 "$LAYOUT")"
 read -r cx cy <<<"$(rect_center "$ix" "$iy" "$iw" "$ih")"
@@ -355,11 +352,11 @@ click_xy "$cx" "$cy"
 drive "step 2" >>"$LOG" 2>&1
 digest_state >/dev/null
 expect_state "last_context_action=open"
-expect_state "popup=none"
-expect_state "popup_count=0"
-expect_state "menu=none"
+expect_state "popup=menu"
+expect_state "popup_count=1"
+expect_state "menu=File"
 drive "snapshot fb" >>"$LOG" 2>&1
-log "[e2e] scenario 7 PASS (menu and context menu held open at once; popup_count=2)"
+log "[e2e] scenario 7 PASS (shared layer registry; context frontmost over menu)"
 
 log "[e2e] quit"
 drive "quit" >>"$LOG" 2>&1 || true

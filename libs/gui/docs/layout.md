@@ -174,6 +174,20 @@ frame set: a newly submitted layer is drawn in its first visible frame, but star
 from the following frame. This keeps routing independent of the order in which the current tree
 is built. A layer marker is presence-only; omitting it is how the application closes the layer.
 
+`.none` markers never join the route or focus scope. A previous-frame frontmost `.modal` marker
+owns pointer, wheel, keyboard and focus, and absorbs the main tree and lower layers. Its enabled
+focusable children are the only Tab targets; its focused text input is the only source for
+`wantsTextInput`. `wantsMouse` and `wantsKeyboard` report the latched route, so a host can gate
+raw input forwarding without depending on where a consumer is built in the frame.
+
+Outside dismissal is a frame result from `ctx.layerDismissed(key)`. Reading it does not close the
+consumer and not reading it is valid. A menu may use a modal route without drawing a backdrop;
+a dialog draws its own scrim as a declarative viewport-sized root. These are consumer choices,
+not additional input policies. A press staged before `beginFrame` is reported in that frame. A
+press pushed after `beginFrame` cannot change the latched route retroactively, so it is recorded
+at `endFrame` and reported at the next `beginFrame`; both delivery orders converge without
+dropping the press.
+
 The previous-frame rule creates two visible synchronization cases. If a submitted layer loses its
 anchor, the old modal route remains for that frame even though the layer is not drawn. It absorbs
 pointer and keyboard input from the main tree, so the main tree can be unresponsive for one frame

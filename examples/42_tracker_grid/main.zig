@@ -84,10 +84,8 @@ pub fn main(init: std.process.Init) !void {
         @memset(fb.pixels, 0xFF_18_1C_24);
         app.screen_w = fb.width;
         app.screen_h = fb.height;
-        ctx.beginFrame(fb.width, fb.height);
 
-        ui.applyOpenRequests(&app);
-
+        var context_focus_id: ?gui.Id = null;
         var swallow_right_for_context = false;
         while (window.nextEvent()) |ev| {
             switch (ev) {
@@ -119,7 +117,7 @@ pub fn main(init: std.process.Init) !void {
                             app.context_track = track_idx;
                             app.selected_track = track_idx;
                             app.select_source = .mouse;
-                            _ = ctx.claimFocus(ui.Ids.track_row_base + @as(gui.Id, @intCast(track_idx)));
+                            context_focus_id = ui.Ids.track_row_base + @as(gui.Id, @intCast(track_idx));
                             app.context_open_pos = p;
                             app.context_open_request = true;
                             swallow_right_for_context = true;
@@ -139,6 +137,11 @@ pub fn main(init: std.process.Init) !void {
             if (kit.toGuiEvent(ev)) |ge| ctx.pushEvent(ge);
         }
 
+        // Stage platform events before beginFrame so the frame-latched layer route sees outside
+        // presses. The focus claim from the context-menu request waits until the frame is open.
+        ctx.beginFrame(fb.width, fb.height);
+        ui.applyOpenRequests(&app);
+        if (context_focus_id) |id| _ = ctx.claimFocus(id);
         ui.buildUi(&app);
         ui.handleOverlays(&app);
         ctx.endFrame();

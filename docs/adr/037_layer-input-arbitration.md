@@ -38,10 +38,22 @@ owned by a layer whose submitted marker is unplaceable is cleared at that frame'
 restored if the layer later reappears.
 
 `wantsMouse`, `wantsKeyboard` and `wantsTextInput` use the begin-frame generic-layer latch and
-therefore have the same answer everywhere in the frame. The legacy popup contribution remains
-the existing frame-local predicate until the popup migration unifies the two systems. Raw
-`ctx.input` is intentionally not filtered; hosts that handle raw shortcuts gate them with the
-corresponding `wants*` result.
+therefore have the same answer everywhere in the frame. Popup menus and dialogs are ordinary
+modal layer consumers, so they do not contribute a second frame-local predicate. Raw `ctx.input`
+is intentionally not filtered; hosts that handle raw shortcuts gate them with the corresponding
+`wants*` result.
+
+Menu bars have one named exception to modal pointer absorption. While the menu-bar layer owns the
+previous-frame route, `menuBar` registers each title button's explicit Id as a pointer-only
+command target. The target is eligible only for a press outside the route owner's previous root;
+an inside hit in the modal subtree wins first. A context-menu or dialog owner does not enable the
+exception, and a command-target press exclusively consumes the outside-dismiss result.
+
+Outside dismissal follows the same frame-latched route without depending on event delivery order.
+A press already staged before `beginFrame` is checked by that frame's latch. A press pushed after
+`beginFrame` is checked at `endFrame` against the route owner's previous geometry and carried to
+the next latch. A command target that handles the late press consumes that pending dismissal, so
+switching menus does not close the newly selected menu on the following frame.
 
 ## Synchronization-frame consequences
 
@@ -57,10 +69,10 @@ If the marker is omitted because the application closed it, the previous route r
 frame, then the slot is released at that frame's seal. The main tree owns the following frame.
 This is the result of marker presence and previous-frame routing; no pending close state is added.
 
-The legacy popup route has higher priority than a generic layer when both are present. Popups are
-emitted in the final-overlay phase after layer emission, so the input winner follows visual order.
-The eventual popup migration will replace the separate popup predicates and route storage with
-this single ordered route rather than add another arbitration rule.
+Popup menus, dialogs and menu-bar dropdowns now use this same ordered layer route. Their consumer
+state determines whether a marker is submitted; the registry determines placement, z/serial
+order and the one previous-frame route owner. No popup-specific route or final-overlay hit-test
+is consulted.
 
 ## Rejected alternatives
 
@@ -77,4 +89,3 @@ this single ordered route rather than add another arbitration rule.
 - [ADR-021: Keyboard focus traversal and the focus ring](021_gui-keyboard-focus-traversal.md)
 - [ADR-028: Input staging outside a frame](028_gui-input-staging-outside-a-frame.md)
 - `libs/gui/docs/layout.md`, "Layer input timing"
-

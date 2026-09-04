@@ -829,6 +829,59 @@ The benchmark itself prints the current `BoxConfig` size; the historical inline 
 the same benchmark at `yxovuyrx`, and the optional payload values come from the current diagnostic
 run.
 
+### Popup, menu and dialog layer scenarios
+
+This measurement checks the cost boundary of the layer-backed popup migration. The before revision
+was vmulprot, the last revision before the migration; the after revision was the current workspace.
+Both were measured on an Apple Silicon Mac (Darwin arm64) with Zig 0.16.0, ReleaseFast, no
+display, a logical 1024x768 target, 100 warm-up frames and 1000 measured frames. Each point below
+is the median of three independent runs of bench-gui-frame; the parenthesized values are the
+minimum and maximum of the three printed per-run averages. The benchmark reports frame time as a
+diagnostic only: these runs are noisy, so a difference smaller than the run range is reported as
+no regression detected, not as a speedup or slowdown claim.
+
+The load-bearing no-marker control is layer-0, a host with 32 ordinary boxes and no layer marker.
+Its exact zero alloc_calls and peak_bytes after warm-up are stronger evidence than its frame-time
+median. The timed allocator counters cover external GPA allocations; arena_cap is the separate
+frame-arena capacity and is shown to make the allocation boundary visible.
+
+| scenario | before median (range, ns) | after median (range, ns) | commands | arena_cap | alloc_calls | peak_bytes |
+|---|---:|---:|---:|---:|---:|---:|
+| layer-0 | 60227 (49859–62132) | 56139 (51419–59254) | 33 | 13326 | 0 | 0 |
+| layer-1 | 61091 (49192–109625) | 61717 (55141–112587) | 34 | 25242 | 0 | 0 |
+| layer-2 | — | 64301 (55987–108748) | 35 | 25242 | 0 | 0 |
+| layer-8 | — | 57535 (52794–57892) | 41 | 25242 | 0 | 0 |
+
+The layer-0 after median is below the before median, and the before range is wider than that
+difference. The result therefore supports no regression detected for a tree that submits no
+marker. The layer-count points show the expected increase in command count while retaining zero
+steady-state external allocation.
+
+The following cases use the current layer consumers. popup-0 and menu-0 are closed/empty
+controls; the remaining popup and menu cases are visible. Dialog roots remain visible at every
+action count, including zero actions.
+
+| scenario | median (range, ns) | commands | arena_cap | alloc_calls | peak_bytes |
+|---|---:|---:|---:|---:|---:|
+| popup-0 | 63 (63–66) | 0 | 564 | 0 | 0 |
+| popup-1 | 3912 (3869–4006) | 5 | 1974 | 0 | 0 |
+| popup-8 | 30834 (30766–31710) | 26 | 12286 | 0 | 0 |
+| popup-32 | 119430 (119339–125266) | 98 | 25934 | 0 | 0 |
+| menu-0 | 71 (70–73) | 0 | 564 | 0 | 0 |
+| menu-1 | 5680 (5616–6101) | 8 | 4654 | 0 | 0 |
+| menu-8 | 31760 (31431–33349) | 29 | 12772 | 0 | 0 |
+| menu-32 | 118014 (117122–118035) | 101 | 26328 | 0 | 0 |
+| dialog-0 | 1401685 (1377348–1431225) | 5 | 4654 | 0 | 0 |
+| dialog-1 | 1378168 (1377307–1380401) | 8 | 4654 | 0 | 0 |
+| dialog-8 | 1401685 (1374007–1462060) | 29 | 12288 | 0 | 0 |
+
+The extra layer-count points requested for the migration are layer-1, layer-2 and layer-8; the
+visible consumer points cover popup/menu item counts 1/8/32 and dialog action counts 0/1/8.
+The exact zero allocator counters show that these builders reuse the warmed frame arena during the
+timed interval; the arena capacity, command count and frame time show the work that scales with the
+visible subtree. The dialog rows are dominated by the declarative scrim and rasterization, so their
+time range is not evidence for an action-count slope.
+
 ### `bench-path` (one run, ns and scratch peak)
 
 Scratch is area(f32)+cover(f32)+8bpp = 9 bytes/px, capped at 4 MiB
