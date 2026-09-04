@@ -229,6 +229,40 @@ const SIZE_DIALOG_W_ID: gui.Id = SIZE_DIALOG_ID_BASE + 1;
 const SIZE_DIALOG_H_ID: gui.Id = SIZE_DIALOG_ID_BASE + 2;
 const SIZE_DIALOG_OK_ID: gui.Id = SIZE_DIALOG_ID_BASE + 3;
 const SIZE_DIALOG_CANCEL_ID: gui.Id = SIZE_DIALOG_ID_BASE + 4;
+const SIZE_DIALOG_ACTIONS = [_]gui.DialogAction{
+    .{ .label = "OK" },
+    .{ .label = "Cancel" },
+};
+const RECOVERY_DIALOG_ACTIONS = [_]gui.DialogAction{
+    .{ .label = "Recover" },
+    .{ .label = "Discard" },
+};
+const CONFIRM_DIALOG_ACTIONS = [_]gui.DialogAction{
+    .{ .label = "Save" },
+    .{ .label = "Discard" },
+    .{ .label = "Cancel" },
+};
+const SIZE_DIALOG_LAYER_KEY: gui.LayerKey = .{ .value = 0xA450_00FF };
+const APPSHELL_DIALOG_LAYER_KEY: gui.LayerKey = .{ .value = 0xA450_00FE };
+
+fn buildSizeDialogContent(ctx: *gui.Context, user_data: *anyopaque) void {
+    const dlg: *SizeDialogState = @ptrCast(@alignCast(user_data));
+    ctx.beginBox(.{ .direction = .row, .gap = 8, .align_cross = .center });
+    ctx.label("W");
+    _ = ctx.textInputId(SIZE_DIALOG_W_ID, &dlg.width_buf, .{
+        .width = .{ .fixed = 100 },
+        .max_len = 10,
+        .placeholder = "width",
+    });
+    ctx.label("H");
+    _ = ctx.textInputId(SIZE_DIALOG_H_ID, &dlg.height_buf, .{
+        .width = .{ .fixed = 100 },
+        .max_len = 10,
+        .placeholder = "height",
+    });
+    ctx.endBox();
+    if (dlg.errorMsg()) |err| ctx.labelEx(err, gui.Color.rgba(0xFF, 0x80, 0x80, 0xFF));
+}
 /// Status-bar zoom%/cursor variable slots. Explicit IDs reserved for layout.
 /// Live text is drawn by drawStatusBarLive after updateViewport.
 const STATUS_BAR_ID_BASE: gui.Id = 0xA451_0000;
@@ -751,6 +785,22 @@ const App = struct {
     size_dialog_storage: SizeDialogState = undefined,
     /// null=closed. While open, `&size_dialog_storage` (not rebuilt every frame).
     size_dialog: ?*SizeDialogState = null,
+    size_dialog_layer: gui.DialogState = .{
+        .popup = .{
+            .key = SIZE_DIALOG_LAYER_KEY,
+            .z = 1000,
+            .placement = .{ .source = .{ .point = .{ .x = 0, .y = 0 } } },
+        },
+        .options = .{ .actions = &SIZE_DIALOG_ACTIONS, .build = buildSizeDialogContent, .height = 248 },
+    },
+    appshell_dialog: gui.DialogState = .{
+        .popup = .{
+            .key = APPSHELL_DIALOG_LAYER_KEY,
+            .z = 1000,
+            .placement = .{ .source = .{ .point = .{ .x = 0, .y = 0 } } },
+        },
+        .options = .{ .actions = &CONFIRM_DIALOG_ACTIONS },
+    },
     title_cache: [std.fs.max_path_bytes + 64]u8 = undefined,
     title_cache_len: usize = 0,
     /// Palette .gpl save path (gpa-owned; managed separately from PNG current_path).
@@ -764,6 +814,12 @@ const App = struct {
     menu_pending_probe: ?FileOp = null,
     /// Open/closed state of the GUI-fallback menu bar.
     menu_bar_state: gui.MenuBarState = .{},
+    /// Consumer-owned state for the layers-panel context menu.
+    layer_ctx_popup: gui.PopupState = .{
+        .key = .{ .value = LAYER_CTX_MENU_ID },
+        .z = 200,
+        .placement = .{ .source = .{ .point = .{ .x = 0, .y = 0 } } },
+    },
     /// Command table rebuilt every frame (enabled/checked; same role as native updateMenu).
     menu_commands: [MENU_CMD_CAP]platform.Command = undefined,
     menu_command_count: usize = 0,
@@ -1118,10 +1174,26 @@ const App = struct {
         self.size_dialog_storage.mode = mode;
         self.size_dialog_storage.clearError();
         self.size_dialog = &self.size_dialog_storage;
+        self.size_dialog_layer.options = .{
+            .title = if (mode == .new_size) "New Canvas Size" else "Resize Canvas",
+            .actions = &SIZE_DIALOG_ACTIONS,
+            .height = 248,
+            .build = buildSizeDialogContent,
+            .user_data = self.size_dialog.?,
+        };
+        self.size_dialog_layer.popup.open = true;
     }
 
     fn closeSizeDialog(self: *App) void {
         self.size_dialog = null;
+        self.size_dialog_layer.popup.open = false;
+    }
+
+    fn guiModalOpen(self: *const App) bool {
+        return self.menu_bar_state.open_title != null or
+            self.layer_ctx_popup.open or
+            self.size_dialog_layer.popup.open or
+            self.appshell_dialog.popup.open;
     }
 
     /// OK: parse → validate → doResize/doNew (confirmation path). On failure keep the dialog open.
@@ -3401,34 +3473,6 @@ const App = struct {
         }
     }
 
-    fn handleConfirmationClick(self: *App, x: i32, y: i32) void {
-        if (self.recovery != null) {
-            if (x >= 100 and x < 210 and y >= 480 and y < 520) recoverAutosave(self) catch |err| self.setSaveMsg("Recover failed: {s}", .{@errorName(err)}) else if (x >= 245 and x < 355 and y >= 480 and y < 520) discardRecovery(self) catch |err| self.setSaveMsg("Discard recovery failed: {s}", .{@errorName(err)});
-            return;
-        }
-        if (x < 100 or x >= 500 or y < 480 or y >= 520) return;
-        if (x < 210) {
-            if (self.host.nameState() == .untitled) {
-                self.pending_file_op = .confirm_save_as;
-                self.dialog_op = null;
-            } else {
-                const result = self.host.confirmSave(null) catch |err| {
-                    self.setSaveMsg("Project save failed: {s}", .{@errorName(err)});
-                    return;
-                };
-                finishHostResult(self, result);
-            }
-        } else if (x < 355) {
-            const result = self.host.confirmDiscard() catch |err| {
-                self.setSaveMsg("Discard failed: {s}", .{@errorName(err)});
-                return;
-            };
-            finishHostResult(self, result);
-        } else {
-            finishHostResult(self, self.host.confirmCancel());
-        }
-    }
-
     fn handleKey(self: *App, k: platform.KeyEvent) void {
         // Space is the pan modifier (track held state; release in handleKeyUp). Do not route elsewhere.
         if (k.key == .SPACE) {
@@ -5640,7 +5684,7 @@ fn updateMinimapInput(app: *App, ctx: *const gui.Context) bool {
         app.minimap_drag_active = false;
         return false;
     };
-    const popup_open = ctx.hasOpenPopup();
+    const popup_open = app.guiModalOpen();
     const cw = app.doc.width;
     const ch = app.doc.height;
 
@@ -5711,7 +5755,7 @@ fn updateViewport(app: *App, ctx: *const gui.Context) bool {
     // While a popup is open (layer context menu etc.), suppress **starting** a new zoom/pan
     // (block input punch-through to the canvas; same intent as the stroke-start gate). An already in-progress
     // pan runs through to release (the `if (app.pan_active)` below does not look at popup_open).
-    const popup_open = ctx.hasOpenPopup();
+    const popup_open = app.guiModalOpen();
 
     // Is the mouse inside the canvas area? (used to decide zoom/pan start)
     const in_area = blk: {
@@ -6081,7 +6125,8 @@ fn buildLayerPanel(ctx: *gui.Context, app: *App) !void {
                 const p = ctx.input.mouse_pressed_pos;
                 if (cached.clip.contains(p) and cached.rect.contains(p)) {
                     app.doSelectLayer(idx) catch {};
-                    ctx.openPopup(LAYER_CTX_MENU_ID, p);
+                    app.layer_ctx_popup.placement = .{ .source = .{ .point = p } };
+                    app.layer_ctx_popup.open = true;
                 }
             }
         }
@@ -6645,6 +6690,102 @@ fn panelBuildTimeline(ctx: *gui.Context, user_data: *anyopaque) anyerror!void {
     try buildTimelinePanel(ctx, app);
 }
 
+fn buildLayerContextPopup(app: *App) void {
+    const selected = app.canvas.selected_layer;
+    const sel_is_text = app.selectedLayerIsText();
+    const items = [_]gui.PopupItem{
+        .{ .label = "Add Layer" },
+        .{ .label = "Add Text Layer" },
+        .{ .label = "Delete Layer", .enabled = app.canvas.layers.items.len > 1 },
+        .{ .label = "Move Up", .enabled = selected + 1 < app.canvas.layers.items.len },
+        .{ .label = "Move Down", .enabled = selected > 0 },
+        .{ .label = if (app.canvas.layers.items[selected].visible) "Hide" else "Show" },
+        .{ .label = "Duplicate" },
+        .{ .label = "Merge Down", .enabled = selected > 0 and !sel_is_text and
+            app.canvas.layers.items[selected - 1].kind != .text },
+        .{ .label = "Rename..." },
+        .{ .label = "Edit Text...", .enabled = sel_is_text },
+        .{ .label = "Rasterize", .enabled = sel_is_text },
+    };
+    const result = gui.popupMenu(&app.ctx, &app.layer_ctx_popup, items[0..]);
+    if (result.selected) |index| {
+        const synced = platform.netsyncActive();
+        switch (index) {
+            0 => {
+                if (synced) app.routeUi("add_layer", "") else _ = app.doAddLayer() catch {};
+            },
+            1 => app.doAddTextLayer() catch {},
+            2 => if (synced) app.routeUiLayerOp("delete_layer", selected) else app.doDeleteLayer(selected) catch {},
+            3 => if (synced) app.routeUiLayerMove(selected, 1) else app.doMoveLayer(selected, 1) catch {},
+            4 => if (synced) app.routeUiLayerMove(selected, -1) else app.doMoveLayer(selected, -1) catch {},
+            5 => if (synced)
+                app.routeUiLayerVisible(selected, !app.canvas.layers.items[selected].visible)
+            else
+                app.doToggleLayerVisible(selected),
+            6 => {
+                if (synced) app.routeUiLayerOp("duplicate_layer", selected) else _ = app.doDuplicateLayer(selected) catch {};
+            },
+            7 => if (synced) app.routeUiLayerOp("merge_down", selected) else app.doMergeDown(selected) catch {},
+            8 => app.beginRenameLayer(selected),
+            9 => app.beginTextEdit(selected),
+            10 => app.doRasterizeLayer(selected) catch {},
+            else => {},
+        }
+        app.layer_ctx_popup.open = false;
+    }
+    if (result.dismissed) app.layer_ctx_popup.open = false;
+}
+
+fn buildAppshellDialog(app: *App) void {
+    const recovery = app.recovery != null;
+    if (recovery) {
+        app.appshell_dialog.options = .{
+            .title = "Recover Autosaved Changes",
+            .body = "An autosaved document is available.",
+            .actions = &RECOVERY_DIALOG_ACTIONS,
+            .dismiss_on_escape = false,
+        };
+    } else if (app.host.confirmation() != .none) {
+        app.appshell_dialog.options = .{
+            .title = "Unsaved Changes",
+            .body = "Save before continuing?",
+            .actions = &CONFIRM_DIALOG_ACTIONS,
+        };
+    } else {
+        app.appshell_dialog.popup.open = false;
+        return;
+    }
+    app.appshell_dialog.popup.open = true;
+    const result = gui.dialog(&app.ctx, &app.appshell_dialog);
+    if (result.selected) |index| {
+        if (recovery) {
+            switch (index) {
+                0 => recoverAutosave(app) catch |err| app.setSaveMsg("Recover failed: {s}", .{@errorName(err)}),
+                1 => discardRecovery(app) catch |err| app.setSaveMsg("Discard recovery failed: {s}", .{@errorName(err)}),
+                else => {},
+            }
+        } else {
+            const host_result = switch (index) {
+                0 => app.host.confirmSave(null) catch |err| {
+                    app.setSaveMsg("Project save failed: {s}", .{@errorName(err)});
+                    return;
+                },
+                1 => app.host.confirmDiscard() catch |err| {
+                    app.setSaveMsg("Discard failed: {s}", .{@errorName(err)});
+                    return;
+                },
+                2 => app.host.confirmCancel(),
+                else => return,
+            };
+            finishHostResult(app, host_result);
+        }
+        app.appshell_dialog.popup.open = app.recovery != null or app.host.confirmation() != .none;
+    } else if (result.dismissed) {
+        if (!recovery) finishHostResult(app, app.host.confirmCancel());
+        app.appshell_dialog.popup.open = false;
+    }
+}
+
 /// Build the UI tree (widget sync hit-tests also run here)
 fn buildUi(ctx: *gui.Context, app: *App, canvas_rect: ?core.Rect) !void {
     // canvas_rect used to feed the status-bar cursor; that moved to drawStatusBarLive.
@@ -6749,54 +6890,24 @@ fn buildUi(ctx: *gui.Context, app: *App, canvas_rect: ?core.Rect) !void {
     if (app.saveMsg()) |msg| ctx.label(msg);
     ctx.endBox();
 
-    // ── Size dialog (end of root = laid out after normal UI = on top) ──
-    // absolute is unsupported, so instead of stacking dim+panel in a canvas-sized grow box,
-    // place a full-width modal band at the end of root and center the panel (simultaneous display with the
-    // confirmation overlay is guarded in openSizeDialog).
-    if (app.size_dialog) |dlg| {
-        ctx.beginBox(.{
-            .direction = .column,
-            .width = .{ .grow = 1 },
-            .padding = .{ 24, 24, 24, 24 },
-            .gap = 12,
-            .align_cross = .center,
-            .bg = gui.Color.rgba(0x10, 0x12, 0x18, 0xE0),
-            .border = .{ .color = gui.Color.rgba(0xFF, 0xD0, 0x80, 0xFF), .thickness = 2 },
-        });
-        const title: []const u8 = switch (dlg.mode) {
-            .new_size => "New Canvas Size",
-            .resize => "Resize Canvas",
-        };
-        ctx.label(title);
-        ctx.beginBox(.{ .direction = .row, .gap = 8, .align_cross = .center });
-        ctx.label("W");
-        _ = ctx.textInputId(SIZE_DIALOG_W_ID, &dlg.width_buf, .{
-            .width = .{ .fixed = 100 },
-            .max_len = 10,
-            .placeholder = "width",
-        });
-        ctx.label("H");
-        _ = ctx.textInputId(SIZE_DIALOG_H_ID, &dlg.height_buf, .{
-            .width = .{ .fixed = 100 },
-            .max_len = 10,
-            .placeholder = "height",
-        });
-        ctx.endBox();
-        if (dlg.errorMsg()) |err| {
-            ctx.labelEx(err, gui.Color.rgba(0xFF, 0x80, 0x80, 0xFF));
-        }
-        ctx.beginBox(.{ .direction = .row, .gap = 12 });
-        if (ctx.buttonId(SIZE_DIALOG_OK_ID, "OK", .{ .min_w = 72 }).clicked) {
-            app.confirmSizeDialog();
-        }
-        if (ctx.buttonId(SIZE_DIALOG_CANCEL_ID, "Cancel", .{ .min_w = 72 }).clicked) {
-            app.closeSizeDialog();
-        }
-        ctx.endBox();
-        ctx.endBox();
-    }
-
     ctx.endBox(); // root
+
+    if (!app.native_menu_active and app.size_dialog == null and app.recovery == null and app.host.confirmation() == .none) {
+        const menu_result = gui.menuBarPopup(ctx, app.menuCommandsSlice(), &app.menu_bar_state);
+        if (menu_result.selected) |id| app.dispatchCommand(id);
+        if (menu_result.selected != null) app.rebuildMenuCommands();
+    }
+    buildLayerContextPopup(app);
+    if (app.size_dialog != null) {
+        const result = gui.dialog(ctx, &app.size_dialog_layer);
+        if (result.selected) |index| switch (index) {
+            0 => app.confirmSizeDialog(),
+            1 => app.closeSizeDialog(),
+            else => {},
+        };
+        if (result.dismissed) app.closeSizeDialog();
+    }
+    buildAppshellDialog(app);
 }
 
 fn wasmLogFn(
@@ -7029,33 +7140,6 @@ fn drawStatusBarLive(ctx: *gui.Context, app: *const App, canvas_rect: ?core.Rect
         const dl = ctx.postFrameDrawList();
         try dl.rectFilled(r, STATUS_BAR_BG);
         try dl.text(.{ .x = r.x, .y = r.y }, txt, col);
-    }
-}
-
-fn drawAppshellOverlay(ctx: *gui.Context, app: *const App) !void {
-    if (app.recovery != null) {
-        const dl = ctx.postFrameDrawList();
-        try dl.rectFilled(.{ .x = 75, .y = 420, .w = 460, .h = 120 }, gui.Color.rgba(0x20, 0x24, 0x30, 0xF8));
-        try dl.rectOutline(.{ .x = 75, .y = 420, .w = 460, .h = 120 }, gui.Color.rgba(0xFF, 0xD0, 0x80, 0xFF), 2);
-        try dl.text(.{ .x = 100, .y = 438 }, "Recover autosaved changes?", gui.Color.rgba(0xFF, 0xFF, 0xFF, 0xFF));
-        try dl.rectFilled(.{ .x = 100, .y = 480, .w = 110, .h = 30 }, gui.Color.rgba(0x40, 0x80, 0xC0, 0xFF));
-        try dl.rectFilled(.{ .x = 245, .y = 480, .w = 110, .h = 30 }, gui.Color.rgba(0x80, 0x60, 0x40, 0xFF));
-        try dl.text(.{ .x = 120, .y = 489 }, "Recover", gui.Color.rgba(0xFF, 0xFF, 0xFF, 0xFF));
-        try dl.text(.{ .x = 262, .y = 489 }, "Discard", gui.Color.rgba(0xFF, 0xFF, 0xFF, 0xFF));
-        return;
-    }
-    if (app.host.confirmation() != .none) {
-        const dl = ctx.postFrameDrawList();
-        try dl.rectFilled(.{ .x = 75, .y = 420, .w = 460, .h = 120 }, gui.Color.rgba(0x20, 0x24, 0x30, 0xF8));
-        try dl.rectOutline(.{ .x = 75, .y = 420, .w = 460, .h = 120 }, gui.Color.rgba(0xFF, 0xD0, 0x80, 0xFF), 2);
-        try dl.text(.{ .x = 100, .y = 438 }, "Unsaved changes", gui.Color.rgba(0xFF, 0xFF, 0xFF, 0xFF));
-        try dl.text(.{ .x = 100, .y = 458 }, "Save before continuing?", gui.Color.rgba(0xC0, 0xC8, 0xD8, 0xFF));
-        try dl.rectFilled(.{ .x = 100, .y = 480, .w = 110, .h = 30 }, gui.Color.rgba(0x40, 0x80, 0xC0, 0xFF));
-        try dl.rectFilled(.{ .x = 245, .y = 480, .w = 110, .h = 30 }, gui.Color.rgba(0x80, 0x60, 0x40, 0xFF));
-        try dl.rectFilled(.{ .x = 390, .y = 480, .w = 110, .h = 30 }, gui.Color.rgba(0x50, 0x58, 0x68, 0xFF));
-        try dl.text(.{ .x = 120, .y = 489 }, "Save", gui.Color.rgba(0xFF, 0xFF, 0xFF, 0xFF));
-        try dl.text(.{ .x = 262, .y = 489 }, "Discard", gui.Color.rgba(0xFF, 0xFF, 0xFF, 0xFF));
-        try dl.text(.{ .x = 410, .y = 489 }, "Cancel", gui.Color.rgba(0xFF, 0xFF, 0xFF, 0xFF));
     }
 }
 
@@ -7445,29 +7529,20 @@ fn appFrameInner(self: *App, win: *platform.Window) !void {
 
         while (win.nextEvent()) |ev| {
             if (self.recovery != null or self.host.confirmation() != .none) {
-                switch (ev) {
-                    .mouse_down => |m| self.handleConfirmationClick(m.x, m.y),
-                    .key_down => |k| if (k.key == .ESCAPE) finishHostResult(self, self.host.confirmCancel()),
-                    .quit => win.cancelQuit(),
-                    else => {},
-                }
-                continue;
-            }
-            switch (ev) {
+                if (ev == .quit) win.cancelQuit();
+            } else switch (ev) {
                 .quit => self.requestClose(win), // Window close uses the same path
                 // While inline layer-name edit or text-layer content edit
                 // (`text_in`; symmetric with rename_in; never both active) is in progress,
                 // route key_down to the dedicated handlers and append committed chars from char_input
                 // (first consumer of char_input). Always pass key_up through (so Space-pan modifiers etc. are not
                 // dropped from held state during edit).
-                // During size_dialog: do not run shortcuts; Esc=cancel / Enter=OK.
+                // During size_dialog: do not run shortcuts; the generic dialog owns its keys.
                 .key_down => |k| if (self.rename_in.active)
                     self.handleRenameKey(k)
                 else if (self.text_in.active)
                     self.handleTextEditKey(k)
-                else if (self.size_dialog != null) {
-                    if (k.key == .ESCAPE) self.closeSizeDialog() else if (k.key == .ENTER or k.key == .KP_ENTER) self.confirmSizeDialog();
-                } else self.handleKey(k),
+                else if (self.size_dialog != null) {} else self.handleKey(k),
                 .key_up => |k| self.handleKeyUp(k),
                 .char_input => |c| if (self.rename_in.active)
                     self.rename_in.appendCodepoint(c.codepoint)
@@ -7481,16 +7556,10 @@ fn appFrameInner(self: *App, win: *platform.Window) !void {
             // While renaming/text-editing, also stop forwarding mouse/key events to gui (avoid interference from
             // clicking other rows etc. rename_in/text_in are not discarded here, so a right-click on another row that
             // starts a new edit simply overwrites — no crash).
-            // During size_dialog, pass char_input to GUI; Enter/Esc were already consumed above so do not re-send.
+            // During size_dialog, pass text input and dialog keys to the generic layer consumer.
             if (!self.rename_in.active and !self.text_in.active) {
                 const pass_char = self.size_dialog != null;
-                const skip_dialog_confirm_keys = if (self.size_dialog != null) switch (ev) {
-                    .key_down => |k| k.key == .ESCAPE or k.key == .ENTER or k.key == .KP_ENTER,
-                    else => false,
-                } else false;
-                if (!skip_dialog_confirm_keys) {
-                    if (toGuiEventEx(ev, pass_char)) |ge| self.ctx.pushEvent(ge);
-                }
+                if (toGuiEventEx(ev, pass_char)) |ge| self.ctx.pushEvent(ge);
             }
         }
 
@@ -7507,17 +7576,7 @@ fn appFrameInner(self: *App, win: *platform.Window) !void {
         self.ctx.endFrame();
         Prof.mark(.ui_build);
         self.cachePanelsProbe();
-        // After endFrame has finalized GUI draw commands, append so the confirmation UI sits on top.
-        try drawAppshellOverlay(&self.ctx, self);
-
-        // GUI-fallback dropdown (post-endFrame contract; same shape as popup.zig).
-        // Skip when native is active (OS menu bar owns it).
-        if (!self.native_menu_active) {
-            const menu_res = gui.menuBarPopup(&self.ctx, self.menuCommandsSlice(), &self.menu_bar_state);
-            if (menu_res.selected) |id| self.dispatchCommand(id);
-            // Reflect checked immediately after a View toggle (for same-frame probes)
-            if (menu_res.selected != null) self.rebuildMenuCommands();
-        } else {
+        if (self.native_menu_active) {
             // When View toggles etc. change checked, updateMenu via the dirty-gate
             self.rebuildMenuCommands();
             self.syncNativeMenu(win);
@@ -7601,10 +7660,8 @@ fn appFrameInner(self: *App, win: *platform.Window) !void {
                     false;
                 // active_id==0 = no widget/splitter took the press (hover-only wantsMouse does not
                 // suppress = a canvas press that moves onto UI in the same frame can still start a stroke).
-                // !hasOpenPopup() = do not start a new stroke while the layer context menu is open
-                // (popup keeps active_id at 0, so the condition above alone cannot stop it.
-                // Same reason popup.zig's wantsMouse() ORs popup_state).
-                break :gate in_area and !on_minimap and self.ctx.state.active_id == 0 and !self.ctx.hasOpenPopup();
+                // Do not start a new stroke while a GUI modal layer owns the route.
+                break :gate in_area and !on_minimap and self.ctx.state.active_id == 0 and !self.guiModalOpen();
             };
             if (self.active_kind == .bezier and !self.input.capturing) {
                 const frame: bezier_input.BezierInput.Frame = .{
@@ -7877,64 +7934,6 @@ fn appFrameInner(self: *App, win: *platform.Window) !void {
                 const clip_area: gui.Rect = .{ .x = area.x, .y = area.y, .w = @intCast(area.w), .h = @intCast(area.h) };
                 loupe_overlay.draw(&self.ctx, hs, hc, self.loupe_source_composite, self.doc.width, self.doc.height, clip_area);
             };
-        }
-        // Layer right-click context menu. popup.zig's post-endFrame contract
-        // + calling after other overlays (bezier/selection/cursor) puts it on top.
-        // Unconditional every-frame calls are fine (returns immediately as a no-op when the target popup is closed;
-        // see popup.zig's doc comment). items are derived each time from the current selected_layer
-        // (doSelectLayer already ran on right-click, so every later item acts on selected_layer).
-        {
-            const sel_is_text = self.selectedLayerIsText();
-            const items = [_]gui.PopupItem{
-                .{ .label = "Add Layer" },
-                .{ .label = "Add Text Layer" }, // text-layer path
-                .{ .label = "Delete Layer", .enabled = self.canvas.layers.items.len > 1 },
-                .{ .label = "Move Up", .enabled = self.canvas.selected_layer + 1 < self.canvas.layers.items.len },
-                .{ .label = "Move Down", .enabled = self.canvas.selected_layer > 0 },
-                .{ .label = if (self.canvas.layers.items[self.canvas.selected_layer].visible) "Hide" else "Show" },
-                .{ .label = "Duplicate" },
-                .{ .label = "Merge Down", .enabled = self.canvas.selected_layer > 0 and !sel_is_text and
-                    self.canvas.layers.items[self.canvas.selected_layer - 1].kind != .text },
-                .{ .label = "Rename..." }, // layer-name rename path
-                .{ .label = "Edit Text...", .enabled = sel_is_text }, // text-layer path
-                .{ .label = "Rasterize", .enabled = sel_is_text }, // text-layer path
-            };
-            const ctx_menu_result = self.ctx.popupMenu(LAYER_CTX_MENU_ID, &items);
-            if (ctx_menu_result.selected) |sel| {
-                const sel_idx = self.canvas.selected_layer;
-                const synced = platform.netsyncActive();
-                switch (sel) {
-                    0 => {
-                        if (synced) self.routeUi("add_layer", "") else _ = self.doAddLayer() catch {};
-                    },
-                    1 => self.doAddTextLayer() catch {}, // action not registered / not a relay target
-                    2 => {
-                        if (synced) self.routeUiLayerOp("delete_layer", sel_idx) else self.doDeleteLayer(sel_idx) catch {};
-                    },
-                    3 => {
-                        if (synced) self.routeUiLayerMove(sel_idx, 1) else self.doMoveLayer(sel_idx, 1) catch {};
-                    },
-                    4 => {
-                        if (synced) self.routeUiLayerMove(sel_idx, -1) else self.doMoveLayer(sel_idx, -1) catch {};
-                    },
-                    5 => {
-                        if (synced)
-                            self.routeUiLayerVisible(sel_idx, !self.canvas.layers.items[sel_idx].visible)
-                        else
-                            self.doToggleLayerVisible(sel_idx);
-                    },
-                    6 => {
-                        if (synced) self.routeUiLayerOp("duplicate_layer", sel_idx) else _ = self.doDuplicateLayer(sel_idx) catch {};
-                    },
-                    7 => {
-                        if (synced) self.routeUiLayerOp("merge_down", sel_idx) else self.doMergeDown(sel_idx) catch {};
-                    },
-                    8 => self.beginRenameLayer(sel_idx),
-                    9 => self.beginTextEdit(sel_idx),
-                    10 => self.doRasterizeLayer(sel_idx) catch {},
-                    else => {},
-                }
-            }
         }
         Prof.mark(.overlays_post);
         // GUI DrawList stays in logical coords. Inject scale at the render exit.

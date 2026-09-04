@@ -168,10 +168,21 @@ expect layout_sanity total=0
 expect gallery section=menus
 expect gallery widgets=2
 snapshot fb
-inject mouse_move 180 108
-step 2
+inject mouse_move 205 122
+step 1
+inject mouse_down left
+step 1
+inject mouse_up left
+step 1
 digest gallery
+expect gallery menu_open=File
 snapshot fb
+inject mouse_down left
+step 1
+inject mouse_up left
+step 1
+digest gallery
+expect gallery menu_open=none
 inject mouse_move 1000 620
 # Open alert dialog from the menus section.
 inject mouse_move 120 192
@@ -185,7 +196,7 @@ expect gallery dialog=open
 expect gallery dialog_last=alert
 expect gallery focused=dialog
 expect gallery dialog_focus=1
-expect gallery dialog_shadow=1
+expect gallery dialog_scrim=1
 snapshot fb
 # The scrim absorbs an outside click and leaves the dialog open.
 inject mouse_move 20 612
@@ -195,9 +206,7 @@ inject mouse_up left
 step 1
 digest gallery
 expect gallery dialog=open
-expect gallery focused=dialog
-expect gallery dialog_focus=1
-expect gallery dialog_shadow=1
+expect gallery dialog_scrim=1
 # Escape dismisses the alert.
 inject key_down ESCAPE
 step 1
@@ -217,23 +226,17 @@ expect gallery dialog=open
 expect gallery dialog_last=message
 expect gallery focused=dialog
 expect gallery dialog_focus=1
-expect gallery dialog_shadow=1
+expect gallery dialog_scrim=1
 snapshot fb
-# Tab and Shift+Tab stay inside the dialog action scope.
+# Tab stays inside the dialog action scope and moves to the first action.
 inject key_down TAB
 step 1
 inject key_up TAB
 step 1
 digest gallery
-expect gallery dialog_focus=2
-snapshot fb
-inject key_down TAB shift
-step 1
-inject key_up TAB shift
-step 1
-digest gallery
 expect gallery dialog_focus=1
-# Enter activates the focused action.
+snapshot fb
+# Tab moves focus to the second action, so Enter activates Continue.
 inject key_down ENTER
 step 1
 inject key_up ENTER

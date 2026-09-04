@@ -170,7 +170,6 @@ const App = struct {
         if (next < 0) next = count - 1;
         if (next >= count) next = 0;
         self.section = @enumFromInt(@as(u8, @intCast(next)));
-        self.ctx.closePopup();
         self.ctx.state.hot_id = 0;
         self.ctx.state.next_hot_id = 0;
         self.ctx.state.active_id = 0;

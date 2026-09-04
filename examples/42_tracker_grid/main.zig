@@ -93,11 +93,11 @@ pub fn main(init: std.process.Init) !void {
             switch (ev) {
                 .quit => running = false,
                 .key_down => |k| {
-                    const popup_open = ctx.hasOpenPopup();
+                    const popup_open = app.context_popup.open;
                     switch (k.key) {
                         .ESCAPE => {
                             if (popup_open) {
-                                ctx.closePopup();
+                                app.context_popup.open = false;
                             } else {
                                 running = false;
                             }
@@ -140,8 +140,9 @@ pub fn main(init: std.process.Init) !void {
         }
 
         ui.buildUi(&app);
-        ctx.endFrame();
         ui.handleOverlays(&app);
+        ctx.endFrame();
+        ui.finalizeOverlayRects(&app);
 
         const target: gui.RenderTarget = .{ .pixels = fb.pixels, .width = fb.width, .height = fb.height };
         gui.render(target, ctx.postFrameDrawList(), ctx.font, 1.0);

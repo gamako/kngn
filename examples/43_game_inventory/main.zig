@@ -104,11 +104,11 @@ pub fn main(init: std.process.Init) !void {
             switch (ev) {
                 .quit => running = false,
                 .key_down => |k| {
-                    const popup_open = ctx.hasOpenPopup();
+                    const popup_open = app.context_popup.open;
                     switch (k.key) {
                         .ESCAPE => {
                             if (popup_open) {
-                                ctx.closePopup();
+                                app.context_popup.open = false;
                             } else {
                                 running = false;
                             }
@@ -183,7 +183,7 @@ pub fn main(init: std.process.Init) !void {
         // Gamepad: dpad moves the cursor, A picks up / drops (mirrors keyboard Enter/Space).
         // Polled once per frame (see the hot path declaration), gated on no popup being open the
         // same way the keyboard nav above is.
-        if (!ctx.hasOpenPopup()) {
+        if (!app.context_popup.open) {
             if (window.getGamepadState(0)) |state| {
                 if (gamepad.justPressed(prev_gamepad_buttons, state.buttons, .dpad_left)) ui.moveCursor(&app, 0, -1, .gamepad);
                 if (gamepad.justPressed(prev_gamepad_buttons, state.buttons, .dpad_right)) ui.moveCursor(&app, 0, 1, .gamepad);
@@ -197,8 +197,10 @@ pub fn main(init: std.process.Init) !void {
         }
 
         ui.buildUi(&app);
-        ctx.endFrame();
         ui.handleOverlays(&app);
+        ctx.endFrame();
+        ui.finalizeOverlayRects(&app);
+        ui.renderOverlays(&app);
 
         const target: gui.RenderTarget = .{ .pixels = fb.pixels, .width = fb.width, .height = fb.height };
         gui.render(target, ctx.postFrameDrawList(), ctx.font, 1.0);

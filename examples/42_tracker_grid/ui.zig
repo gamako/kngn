@@ -98,6 +98,11 @@ pub const App = struct {
     context_track: i32 = -1,
     context_open_request: bool = false,
     context_open_pos: gui.Vec2 = .{ .x = 0, .y = 0 },
+    context_popup: gui.PopupState = .{
+        .key = .{ .value = Ids.context_popup },
+        .z = 200,
+        .placement = .{ .source = .{ .point = .{ .x = 0, .y = 0 } } },
+    },
     context_outer: gui.Rect = .{ .x = 0, .y = 0, .w = 0, .h = 0 },
     context_item_rects: [3]gui.Rect = .{
         .{ .x = 0, .y = 0, .w = 0, .h = 0 },
@@ -139,7 +144,8 @@ pub fn applyOpenRequests(app: *App) void {
     if (app.context_open_request) {
         app.context_open_request = false;
         buildContextItems(app);
-        app.ctx.openPopup(Ids.context_popup, app.context_open_pos);
+        app.context_popup.placement = .{ .source = .{ .point = app.context_open_pos } };
+        app.context_popup.open = true;
     }
 }
 
@@ -339,31 +345,33 @@ pub fn buildUi(app: *App) void {
     ctx.endBox(); // outer
 }
 
-/// Recomputes the geometry the context popup is actually drawn at, for probe/e2e coordinate
-/// reporting (the same technique the list+menu shell's `updatePopupGeo` uses).
-fn updatePopupGeo(app: *App) void {
-    const ctx = app.ctx;
-    const pos = ctx.popupPos(Ids.context_popup) orelse {
-        app.context_outer = .{ .x = 0, .y = 0, .w = 0, .h = 0 };
-        for (&app.context_item_rects) |*r| r.* = .{ .x = 0, .y = 0, .w = 0, .h = 0 };
-        return;
-    };
-    const content_w = gui.popupContentWidth(ctx.font, &app.context_items);
-    const style = ctx.style;
-    const geo = gui.layoutPopup(pos, app.context_items.len, content_w, style.spacing.popup_item_height, style.spacing.popup_inset, ctx.screen_w, ctx.screen_h);
-    app.context_outer = geo.outer;
-    for (&app.context_item_rects, 0..) |*r, i| r.* = gui.itemRect(geo, i);
+fn clearContextRects(app: *App) void {
+    app.context_outer = .{ .x = 0, .y = 0, .w = 0, .h = 0 };
+    for (&app.context_item_rects) |*r| r.* = .{ .x = 0, .y = 0, .w = 0, .h = 0 };
 }
 
-/// After endFrame: the track context menu (Mute / Solo / Clear Pattern).
+fn recordContextRects(app: *App) void {
+    const ctx = app.ctx;
+    app.context_outer = ctx.getNodeRect(app.context_popup.key.value) orelse {
+        clearContextRects(app);
+        return;
+    };
+    for (&app.context_item_rects, 0..) |*r, i| {
+        r.* = ctx.getNodeRect(gui.popupItemId(app.context_popup.key, i)) orelse
+            .{ .x = 0, .y = 0, .w = 0, .h = 0 };
+    }
+}
+
+/// Build the track context menu in the current frame.
 pub fn handleOverlays(app: *App) void {
     const ctx = app.ctx;
     if (app.context_open_request) {
         app.context_open_request = false;
-        ctx.openPopup(Ids.context_popup, app.context_open_pos);
+        app.context_popup.placement = .{ .source = .{ .point = app.context_open_pos } };
+        app.context_popup.open = true;
     }
-    if (ctx.isPopupOpen(Ids.context_popup)) buildContextItems(app);
-    const res = ctx.popupMenuEx(Ids.context_popup, &app.context_items, .{ .keep_open_on_select = true });
+    if (app.context_popup.open) buildContextItems(app);
+    const res = gui.popupMenuEx(ctx, &app.context_popup, app.context_items[0..], .{ .keep_open_on_select = true });
     if (res.selected) |idx| {
         const t = &app.tracks[clampTrack(app.context_track)];
         switch (idx) {
@@ -374,11 +382,11 @@ pub fn handleOverlays(app: *App) void {
         }
         buildContextItems(app); // refresh checked marks for the frame the popup redraws in
     }
-    if (ctx.isPopupOpen(Ids.context_popup)) {
-        updatePopupGeo(app);
-    } else if (res.dismissed) {
-        app.context_outer = .{ .x = 0, .y = 0, .w = 0, .h = 0 };
-    }
+    if (res.dismissed) app.context_popup.open = false;
+}
+
+pub fn finalizeOverlayRects(app: *App) void {
+    if (app.context_popup.open) recordContextRects(app) else clearContextRects(app);
 }
 
 fn appendFmt(buf: []u8, off: *usize, comptime fmt: []const u8, args: anytype) void {
@@ -432,7 +440,7 @@ pub fn stateDigest(ctx_ptr: *anyopaque, buf: []u8) []const u8 {
         maskBit(u8, &muted), maskBit(u8, &solo), app.context_track,
     });
     appendFmt(buf, &off, " popup={s} ellipsis_used={d}", .{
-        if (app.ctx.isPopupOpen(Ids.context_popup)) "context" else "none",
+        if (app.context_popup.open) "context" else "none",
         @as(u32, if (app.ellipsis_used) 1 else 0),
     });
     appendFmt(buf, &off, " volume={d:.2} pan={d:.2} step_t0={d}", .{
@@ -455,7 +463,7 @@ pub fn layoutDigest(ctx_ptr: *anyopaque, buf: []u8) []const u8 {
     rectCsv(app, Ids.volume_slider, "volume_slider", buf, &off);
     rectCsv(app, Ids.pan_slider, "pan_slider", buf, &off);
 
-    if (app.ctx.isPopupOpen(Ids.context_popup)) {
+    if (app.context_popup.open) {
         rectCsvRaw(app.context_outer, "context", buf, &off);
         rectCsvRaw(app.context_item_rects[0], "context_item0", buf, &off);
         rectCsvRaw(app.context_item_rects[1], "context_item1", buf, &off);

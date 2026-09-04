@@ -253,6 +253,24 @@ const App = struct {
     table_selected: usize = 0,
     table_on: [8]bool = .{ true, false, true, false, true, false, true, false },
     menu: gui.MenuBarState = .{},
+    popup: gui.PopupState = .{
+        .key = .{ .value = Ids.popup },
+        .placement = .{ .source = .{ .point = .{ .x = 160, .y = 128 } } },
+    },
+    alert_dialog: gui.DialogState = .{
+        .popup = .{
+            .key = .{ .value = Ids.alert_dialog },
+            .placement = .{ .source = .{ .point = .{ .x = 0, .y = 0 } } },
+        },
+        .options = .{ .actions = &alert_actions },
+    },
+    message_dialog: gui.DialogState = .{
+        .popup = .{
+            .key = .{ .value = Ids.message_dialog },
+            .placement = .{ .source = .{ .point = .{ .x = 0, .y = 0 } } },
+        },
+        .options = .{ .actions = &message_actions },
+    },
     text: *gui.TextBuffer,
     // Frame-local paste for Cmd+V (consumer wiring. set in the event loop; clear at frame start)
     paste_buf: [4096]u8 = undefined,
@@ -272,7 +290,9 @@ const App = struct {
         self.section = @intCast(next);
         self.menu.open_title = null;
         self.menu.switch_click = false;
-        self.ctx.closePopup();
+        self.popup.open = false;
+        self.alert_dialog.popup.open = false;
+        self.message_dialog.popup.open = false;
         self.ctx.state.hot_id = 0;
         self.ctx.state.next_hot_id = 0;
         self.ctx.state.active_id = 0;
@@ -280,7 +300,7 @@ const App = struct {
     }
 
     fn widgetName(self: *const App, id: gui.Id) []const u8 {
-        if (self.ctx.hasOpenDialog() and id != 0) return "dialog";
+        if ((self.alert_dialog.popup.open or self.message_dialog.popup.open) and id != 0) return "dialog";
         if (id >= Ids.grid and id < Ids.grid + 16) return "stepgrid";
         return switch (id) {
             0 => "none",
@@ -316,16 +336,23 @@ const App = struct {
 fn galleryDigest(ctx_ptr: *anyopaque, buf: []u8) []const u8 {
     const app: *App = @ptrCast(@alignCast(ctx_ptr));
     const meta = SECTIONS[app.section];
-    const dialog_state = if (app.ctx.hasOpenDialog()) "open" else "closed";
-    var dialog_shadow: u32 = 0;
+    const menu_open = app.menu.open_title orelse "none";
+    const dialog_open = app.alert_dialog.popup.open or app.message_dialog.popup.open;
+    const dialog_state = if (dialog_open) "open" else "closed";
+    var dialog_scrim: u32 = 0;
     var dialog_focus: u32 = 0;
-    if (app.ctx.hasOpenDialog()) {
+    if (dialog_open) {
         for (app.ctx.postFrameDrawList().cmds.items) |cmd| {
-            if (cmd == .shadow) dialog_shadow += 1;
+            if (cmd != .rect_filled) continue;
+            if (cmd.rect_filled.rect.w != app.ctx.screen_w or cmd.rect_filled.rect.h != app.ctx.screen_h) continue;
+            switch (cmd.rect_filled.paint) {
+                .solid => |color| {
+                    if (std.meta.eql(color, gui.Color.rgba(0, 0, 0, 0x88))) dialog_scrim += 1;
+                },
+                else => {},
+            }
         }
-        if (app.ctx.popup_state) |state| if (state.kind == .dialog) if (state.dialog) |dialog_state_data| {
-            if (dialog_state_data.focus_index) |index| dialog_focus = @intCast(index + 1);
-        };
+        if (app.ctx.state.focused_id != 0) dialog_focus = 1;
     }
     // The badge's rect relative to its host: a positioned child is placed by insets from the
     // parent content box, and an inset that lost its sign moves the badge by twice the offset.
@@ -339,7 +366,7 @@ fn galleryDigest(ctx_ptr: *anyopaque, buf: []u8) []const u8 {
             badge_dy = badge.y - host.y;
         }
     }
-    return std.fmt.bufPrint(buf, "section={s} index={d} widgets={d} missing={d} schema={s} hot={s} active={s} focused={s} disabled={d} dialog={s} dialog_last={s} dialog_result={s} dialog_focus={d} dialog_shadow={d} badge_dx={d} badge_dy={d}", .{
+    return std.fmt.bufPrint(buf, "section={s} index={d} widgets={d} missing={d} schema={s} hot={s} active={s} focused={s} disabled={d} menu_open={s} dialog={s} dialog_last={s} dialog_result={s} dialog_focus={d} dialog_scrim={d} badge_dx={d} badge_dy={d}", .{
         meta.name,
         app.section,
         meta.widgets,
@@ -349,11 +376,12 @@ fn galleryDigest(ctx_ptr: *anyopaque, buf: []u8) []const u8 {
         app.widgetName(app.ctx.state.active_id),
         app.widgetName(app.ctx.state.focused_id),
         @as(u32, if (app.disabled_demo) 1 else 0),
+        menu_open,
         dialog_state,
         app.dialog_last,
         app.dialog_result,
         dialog_focus,
-        dialog_shadow,
+        dialog_scrim,
         badge_dx,
         badge_dy,
     }) catch buf[0..0];
@@ -639,26 +667,29 @@ fn renderMenus(ctx: *gui.Context, app: *App) void {
     gui.menuBar(ctx, &commands, &app.menu);
     ctx.endBox();
     if (ctx.buttonId(Ids.popup_trigger, "Open context popup", .{ .min_w = 180 }).clicked) {
-        ctx.openPopup(Ids.popup, .{ .x = 160, .y = 128 });
+        app.popup.placement = .{ .source = .{ .point = .{ .x = 160, .y = 128 } } };
+        app.popup.open = true;
     }
     ctx.beginBox(.{ .direction = .row, .height = .{ .fixed = 32 }, .gap = 8 });
     if (ctx.buttonId(Ids.alert_dialog, "Open alert dialog", .{ .min_w = 180 }).clicked) {
         app.dialog_last = "alert";
         app.dialog_result = "none";
-        ctx.openDialog(Ids.alert_dialog, .{
+        app.alert_dialog.options = .{
             .title = "Alert",
             .body = "The operation needs your attention.",
             .actions = &alert_actions,
-        });
+        };
+        app.alert_dialog.popup.open = true;
     }
     if (ctx.buttonId(Ids.message_dialog, "Open message dialog", .{ .min_w = 180 }).clicked) {
         app.dialog_last = "message";
         app.dialog_result = "none";
-        ctx.openDialog(Ids.message_dialog, .{
+        app.message_dialog.options = .{
             .title = "Message",
             .body = "Continue with the selected action?",
             .actions = &message_actions,
-        });
+        };
+        app.message_dialog.popup.open = true;
     }
     ctx.endBox();
     ctx.label("PopupItem and Command expose enabled / disabled / checked / shortcut / separator.");
@@ -797,7 +828,6 @@ fn renderFrame(ctx: *gui.Context, app: *App) void {
         ctx.endBox();
     }
     ctx.endBox();
-    ctx.endFrame();
 }
 
 pub fn main(init: std.process.Init) !void {
@@ -844,7 +874,7 @@ pub fn main(init: std.process.Init) !void {
                 .quit => running = false,
                 .key_down => |k| switch (k.key) {
                     .ESCAPE => {
-                        if (!ctx.hasOpenDialog()) running = false;
+                        if (!app.alert_dialog.popup.open and !app.message_dialog.popup.open) running = false;
                     },
                     .PAGE_DOWN => app.changeSection(1),
                     .PAGE_UP => app.changeSection(-1),
@@ -864,15 +894,19 @@ pub fn main(init: std.process.Init) !void {
 
         renderFrame(&ctx, &app);
         _ = gui.menuBarPopup(&ctx, &commands, &app.menu);
-        _ = ctx.popupMenu(Ids.popup, &popup_items);
-        const dialog_result = ctx.dialog(Ids.alert_dialog);
-        const message_result = ctx.dialog(Ids.message_dialog);
+        const popup_result = gui.popupMenu(&ctx, &app.popup, &popup_items);
+        if (popup_result.selected != null or popup_result.dismissed) app.popup.open = false;
+        const dialog_result = gui.dialog(&ctx, &app.alert_dialog);
+        if (dialog_result.selected != null or dialog_result.dismissed) app.alert_dialog.popup.open = false;
+        const message_result = gui.dialog(&ctx, &app.message_dialog);
+        if (message_result.selected != null or message_result.dismissed) app.message_dialog.popup.open = false;
         const result = if (dialog_result.selected != null or dialog_result.dismissed) dialog_result else message_result;
         if (result.selected) |index| {
             app.dialog_result = if (app.dialog_last[0] == 'a') "selected_ok" else if (index == 0) "cancel" else "continue";
         } else if (result.dismissed) {
             app.dialog_result = "dismissed_escape";
         }
+        ctx.endFrame();
         const target: gui.RenderTarget = .{ .pixels = fb.pixels, .width = fb.width, .height = fb.height };
         gui.render(target, ctx.postFrameDrawList(), ctx.font, 1.0);
         window.present();

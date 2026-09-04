@@ -105,6 +105,11 @@ pub const App = struct {
     context_slot: i32 = -1,
     context_open_request: bool = false,
     context_open_pos: gui.Vec2 = .{ .x = 0, .y = 0 },
+    context_popup: gui.PopupState = .{
+        .key = .{ .value = Ids.context_popup },
+        .z = 200,
+        .placement = .{ .source = .{ .point = .{ .x = 0, .y = 0 } } },
+    },
     context_outer: gui.Rect = .{ .x = 0, .y = 0, .w = 0, .h = 0 },
     context_item_rects: [2]gui.Rect = .{
         .{ .x = 0, .y = 0, .w = 0, .h = 0 },
@@ -220,7 +225,8 @@ pub fn applyOpenRequests(app: *App) void {
     if (app.context_open_request) {
         app.context_open_request = false;
         buildContextItems(app);
-        app.ctx.openPopup(Ids.context_popup, app.context_open_pos);
+        app.context_popup.placement = .{ .source = .{ .point = app.context_open_pos } };
+        app.context_popup.open = true;
     }
 }
 
@@ -385,54 +391,60 @@ pub fn buildUi(app: *App) void {
     ctx.endBox(); // outer
 }
 
-/// Recomputes the geometry the context popup is actually drawn at, for probe/e2e coordinate
-/// reporting (the same technique the other shells' `updatePopupGeo` uses).
-fn updatePopupGeo(app: *App) void {
-    const ctx = app.ctx;
-    const pos = ctx.popupPos(Ids.context_popup) orelse {
-        app.context_outer = .{ .x = 0, .y = 0, .w = 0, .h = 0 };
-        for (&app.context_item_rects) |*r| r.* = .{ .x = 0, .y = 0, .w = 0, .h = 0 };
-        return;
-    };
-    const content_w = gui.popupContentWidth(ctx.font, &app.context_items);
-    const style = ctx.style;
-    const geo = gui.layoutPopup(pos, app.context_items.len, content_w, style.spacing.popup_item_height, style.spacing.popup_inset, ctx.screen_w, ctx.screen_h);
-    app.context_outer = geo.outer;
-    for (&app.context_item_rects, 0..) |*r, i| r.* = gui.itemRect(geo, i);
+fn clearContextRects(app: *App) void {
+    app.context_outer = .{ .x = 0, .y = 0, .w = 0, .h = 0 };
+    for (&app.context_item_rects) |*r| r.* = .{ .x = 0, .y = 0, .w = 0, .h = 0 };
 }
 
-/// After endFrame: the item context menu (Lock / Discard), the drag ghost, and the knob's radial
-/// indicator (all drawn directly onto `postFrameDrawList()`, the same "overlay after the layout tree"
-/// placement `popup.zig` uses for popups and tooltips -- not a per-pixel custom rasterizer, a
-/// fixed small number of `rectFilled`/`text` calls).
+fn recordContextRects(app: *App) void {
+    const ctx = app.ctx;
+    app.context_outer = ctx.getNodeRect(app.context_popup.key.value) orelse {
+        clearContextRects(app);
+        return;
+    };
+    for (&app.context_item_rects, 0..) |*r, i| {
+        r.* = ctx.getNodeRect(gui.popupItemId(app.context_popup.key, i)) orelse
+            .{ .x = 0, .y = 0, .w = 0, .h = 0 };
+    }
+}
+
+/// Build the item context menu in the current frame.
 pub fn handleOverlays(app: *App) void {
     const ctx = app.ctx;
     if (app.context_open_request) {
         app.context_open_request = false;
-        ctx.openPopup(Ids.context_popup, app.context_open_pos);
+        app.context_popup.placement = .{ .source = .{ .point = app.context_open_pos } };
+        app.context_popup.open = true;
     }
-    if (ctx.isPopupOpen(Ids.context_popup)) buildContextItems(app);
-    const res = ctx.popupMenuEx(Ids.context_popup, &app.context_items, .{ .keep_open_on_select = true });
+    if (app.context_popup.open) buildContextItems(app);
+    const res = gui.popupMenuEx(ctx, &app.context_popup, app.context_items[0..], .{ .keep_open_on_select = true });
     if (res.selected) |idx| {
         const slot = clampSlot(app.context_slot);
         switch (idx) {
-            0 => if (app.slots[slot]) |*it| {
-                it.locked = !it.locked;
+            0 => {
+                if (app.slots[slot]) |*it| it.locked = !it.locked;
             },
             1 => {
                 app.slots[slot] = null;
-                ctx.closePopup(); // Discard is a one-shot action; Lock alone stays open (checked).
+                app.context_popup.open = false;
             },
             else => {},
         }
-        if (ctx.isPopupOpen(Ids.context_popup)) buildContextItems(app);
+        if (app.context_popup.open) buildContextItems(app);
     }
-    if (ctx.isPopupOpen(Ids.context_popup)) {
-        updatePopupGeo(app);
-    } else if (res.dismissed) {
-        app.context_outer = .{ .x = 0, .y = 0, .w = 0, .h = 0 };
-    }
+    if (res.dismissed) app.context_popup.open = false;
+}
 
+pub fn finalizeOverlayRects(app: *App) void {
+    if (app.context_popup.open) recordContextRects(app) else clearContextRects(app);
+}
+
+/// After endFrame: the drag ghost, and the knob's radial
+/// indicator (all drawn directly onto `postFrameDrawList()`, the same "overlay after the layout tree"
+/// placement `popup.zig` uses for popups and tooltips -- not a per-pixel custom rasterizer, a
+/// fixed small number of `rectFilled`/`text` calls).
+pub fn renderOverlays(app: *App) void {
+    const ctx = app.ctx;
     const dl = ctx.postFrameDrawList();
 
     // Rarity dim overlay: a translucent dark rect over every filled, non-empty slot below the
@@ -541,7 +553,7 @@ pub fn stateDigest(ctx_ptr: *anyopaque, buf: []u8) []const u8 {
 }
 
 fn ctx_popupOpen(app: *const App) bool {
-    return app.ctx.isPopupOpen(Ids.context_popup);
+    return app.context_popup.open;
 }
 
 pub fn layoutDigest(ctx_ptr: *anyopaque, buf: []u8) []const u8 {
@@ -553,7 +565,7 @@ pub fn layoutDigest(ctx_ptr: *anyopaque, buf: []u8) []const u8 {
     rectCsv(app, Ids.slot_base + 7, "slot7", buf, &off);
     rectCsv(app, Ids.knob_area, "knob", buf, &off);
 
-    if (app.ctx.isPopupOpen(Ids.context_popup)) {
+    if (app.context_popup.open) {
         rectCsvRaw(app.context_outer, "context", buf, &off);
         rectCsvRaw(app.context_item_rects[0], "context_item0", buf, &off);
         rectCsvRaw(app.context_item_rects[1], "context_item1", buf, &off);

@@ -106,12 +106,13 @@ pub fn main(init: std.process.Init) !void {
             switch (ev) {
                 .quit => running = false,
                 .key_down => |k| {
-                    const popup_open = ctx.hasOpenPopup();
+                    const popup_open = ui.popupCount(&app) != 0;
                     switch (k.key) {
                         .ESCAPE => {
                             if (popup_open) {
-                                ctx.closePopup();
-                                ctx.closePopupStacked(ui.Ids.context_popup);
+                                app.menu.popup.open = false;
+                                app.context_popup.open = false;
+                                app.filter_popup.open = false;
                                 app.menu.open_title = null;
                                 app.menu.switch_click = false;
                             } else {
@@ -160,9 +161,9 @@ pub fn main(init: std.process.Init) !void {
         }
 
         ui.buildUi(&app);
-        ctx.endFrame();
-        // Open context after menuBarPopup (one-at-a-time constraint: context may replace the menu)
         ui.handleOverlays(&app);
+        ctx.endFrame();
+        ui.finalizeOverlayRects(&app);
 
         const target: gui.RenderTarget = .{ .pixels = fb.pixels, .width = fb.width, .height = fb.height };
         gui.render(target, ctx.postFrameDrawList(), ctx.font, 1.0);

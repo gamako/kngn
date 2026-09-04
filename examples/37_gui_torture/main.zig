@@ -99,6 +99,10 @@ const App = struct {
     long_newline: []const u8 = "",
     utf8_boundary_text: []const u8 = "",
     text_popup_items: [1]gui.PopupItem = .{.{ .label = "x", .enabled = true }},
+    text_popup: gui.PopupState = .{
+        .key = .{ .value = Ids.text_popup },
+        .placement = .{ .source = .{ .point = .{ .x = 40, .y = 200 } } },
+    },
 
     // input_state
     slider_val: i32 = 0,
@@ -115,6 +119,10 @@ const App = struct {
         .{ .label = "Item A", .enabled = true },
         .{ .label = "Item B", .enabled = true },
     },
+    input_popup: gui.PopupState = .{
+        .key = .{ .value = Ids.popup },
+        .placement = .{ .source = .{ .point = .{ .x = 200, .y = 180 } } },
+    },
 
     // ids_popup
     clicked_index: i32 = -1,
@@ -126,6 +134,10 @@ const App = struct {
         .{ .label = "Corner A", .enabled = true },
         .{ .label = "Corner B long label", .enabled = true },
         .{ .label = "Corner C", .enabled = true },
+    },
+    corner_popup: gui.PopupState = .{
+        .key = .{ .value = Ids.corner_popup },
+        .placement = .{ .source = .{ .point = .{ .x = 0, .y = 0 } } },
     },
     last_popup_x: i32 = 0,
     last_popup_y: i32 = 0,
@@ -149,7 +161,9 @@ const App = struct {
         if (next < 0) next = count - 1;
         if (next >= count) next = 0;
         self.case = @enumFromInt(next);
-        self.ctx.closePopup();
+        self.text_popup.open = false;
+        self.input_popup.open = false;
+        self.corner_popup.open = false;
         self.ctx.state.hot_id = 0;
         self.ctx.state.next_hot_id = 0;
         self.ctx.state.active_id = 0;
@@ -233,7 +247,7 @@ fn stateDigest(ctx_ptr: *anyopaque, buf: []u8) []const u8 {
         @as(u32, if (ctx.wantsKeyboard()) 1 else 0),
     });
     appendFmt(buf, &off, " popup_open={d} popup_dismissed={d} layout_generation={d}", .{
-        @as(u32, if (ctx.hasOpenPopup()) 1 else 0),
+        @as(u32, if (app.text_popup.open or app.input_popup.open or app.corner_popup.open) 1 else 0),
         app.popup_dismissed,
         app.layout_generation,
     });
@@ -434,9 +448,9 @@ fn buildUtf8Boundary(a: std.mem.Allocator) ![]const u8 {
     return try a.dupe(u8, "Aあ😀Bい");
 }
 
-fn updatePopupGeo(app: *App, items: []const gui.PopupItem) void {
+fn recordPopupRect(app: *App, state: *const gui.PopupState) void {
     const ctx = app.ctx;
-    const state = ctx.popup_state orelse {
+    const rect = ctx.getNodeRect(state.key.value) orelse {
         app.last_popup_x = 0;
         app.last_popup_y = 0;
         app.last_popup_w = 0;
@@ -444,19 +458,15 @@ fn updatePopupGeo(app: *App, items: []const gui.PopupItem) void {
         app.last_popup_clamped = 0;
         return;
     };
-    var max_w: i32 = 0;
-    for (items) |it| max_w = @max(max_w, @as(i32, @intCast(ctx.font.measure(it.label))));
-    const style = ctx.style;
-    const geo = gui.layoutPopup(state.pos, items.len, max_w, style.spacing.popup_item_height, style.spacing.popup_inset, ctx.screen_w, ctx.screen_h);
-    app.last_popup_x = geo.outer.x;
-    app.last_popup_y = geo.outer.y;
-    app.last_popup_w = @intCast(geo.outer.w);
-    app.last_popup_h = @intCast(geo.outer.h);
-    const req_w = max_w + style.spacing.popup_inset * 2;
-    const req_h = @as(i32, @intCast(items.len)) * style.spacing.popup_item_height + style.spacing.popup_inset * 2;
-    const clamped: u32 = if (geo.outer.x != state.pos.x or geo.outer.y != state.pos.y or
-        @as(i32, @intCast(geo.outer.w)) < req_w or @as(i32, @intCast(geo.outer.h)) < req_h) 1 else 0;
-    app.last_popup_clamped = clamped;
+    app.last_popup_x = rect.x;
+    app.last_popup_y = rect.y;
+    app.last_popup_w = @intCast(rect.w);
+    app.last_popup_h = @intCast(rect.h);
+    const requested: gui.Vec2 = switch (state.placement.source) {
+        .point => |point| point,
+        .id => .{ .x = 0, .y = 0 },
+    };
+    app.last_popup_clamped = @as(u32, if (rect.x != requested.x or rect.y != requested.y) 1 else 0);
 }
 
 fn renderLayout(ctx: *gui.Context, app: *App) void {
@@ -615,7 +625,8 @@ fn renderText(ctx: *gui.Context, app: *App) void {
     _ = ctx.textInputId(Ids.text_input, app.text_buf, .{ .width = .{ .fixed = 480 }, .placeholder = "empty" });
     if (ctx.buttonId(Ids.text_popup_trigger, "open text popup", .{ .min_w = 160 }).clicked) {
         app.text_popup_items[0] = .{ .label = app.long_ascii, .enabled = true };
-        ctx.openPopup(Ids.text_popup, .{ .x = 40, .y = 200 });
+        app.text_popup.placement = .{ .source = .{ .point = .{ .x = 40, .y = 200 } } };
+        app.text_popup.open = true;
     }
     ctx.endBox();
 }
@@ -650,7 +661,8 @@ fn renderInputState(ctx: *gui.Context, app: *App) void {
         app.behind_clicks +%= 1;
     }
     if (ctx.buttonId(Ids.popup_trigger, "open popup", .{ .min_w = 160 }).clicked) {
-        ctx.openPopup(Ids.popup, .{ .x = 200, .y = 180 });
+        app.input_popup.placement = .{ .source = .{ .point = .{ .x = 200, .y = 180 } } };
+        app.input_popup.open = true;
     }
     ctx.endBox();
     ctx.endBox();
@@ -700,7 +712,8 @@ fn renderIdsPopup(ctx: *gui.Context, app: *App) void {
         // request position near bottom-right (will clamp)
         const x: i32 = @intCast(if (app.screen_w > 20) app.screen_w - 20 else 0);
         const y: i32 = @intCast(if (app.screen_h > 20) app.screen_h - 20 else 0);
-        ctx.openPopup(Ids.corner_popup, .{ .x = x, .y = y });
+        app.corner_popup.placement = .{ .source = .{ .point = .{ .x = x, .y = y } } };
+        app.corner_popup.open = true;
     }
     ctx.endBox();
 }
@@ -765,6 +778,24 @@ fn renderFrame(ctx: *gui.Context, app: *App) void {
         .ids_popup => renderIdsPopup(ctx, app),
         .volume => renderVolume(ctx, app),
         .negative_auto_id => renderNegativeAutoId(ctx, app),
+    }
+    switch (app.case) {
+        .text => {
+            const result = gui.popupMenu(ctx, &app.text_popup, app.text_popup_items[0..]);
+            if (result.dismissed) app.popup_dismissed +%= 1;
+            if (result.selected != null or result.dismissed) app.text_popup.open = false;
+        },
+        .input_state => {
+            const result = gui.popupMenu(ctx, &app.input_popup, app.input_popup_items[0..]);
+            if (result.dismissed) app.popup_dismissed +%= 1;
+            if (result.selected != null or result.dismissed) app.input_popup.open = false;
+        },
+        .ids_popup => {
+            const result = gui.popupMenu(ctx, &app.corner_popup, app.corner_popup_items[0..]);
+            if (result.dismissed) app.popup_dismissed +%= 1;
+            if (result.selected != null or result.dismissed) app.corner_popup.open = false;
+        },
+        else => {},
     }
     ctx.endFrame();
     app.layout_completed = 1;
@@ -895,29 +926,18 @@ pub fn main(init: std.process.Init) !void {
 
         renderFrame(&ctx, &app);
 
-        // popup draw (post-endFrame contract)
+        // Read the generic layer root after layout has been finalized.
         switch (app.case) {
             .text => {
-                const pr = ctx.popupMenu(Ids.text_popup, &app.text_popup_items);
-                if (pr.dismissed) app.popup_dismissed = 1;
-                if (pr.open) updatePopupGeo(&app, &app.text_popup_items) else if (!pr.open and pr.selected == null and !pr.dismissed) {
-                    // closed / never open
-                } else if (!pr.open) {
-                    // closed this frame; keep last geo
-                }
-                if (ctx.hasOpenPopup()) updatePopupGeo(&app, &app.text_popup_items);
+                if (app.text_popup.open) recordPopupRect(&app, &app.text_popup);
             },
             .input_state => {
-                const pr = ctx.popupMenu(Ids.popup, &app.input_popup_items);
-                if (pr.dismissed) app.popup_dismissed = 1;
-                if (ctx.hasOpenPopup()) updatePopupGeo(&app, &app.input_popup_items);
-                app.last_popup_open = if (ctx.hasOpenPopup()) 1 else 0;
+                if (app.input_popup.open) recordPopupRect(&app, &app.input_popup);
+                app.last_popup_open = @as(u32, if (app.input_popup.open) 1 else 0);
                 app.last_wants_mouse = if (ctx.wantsMouse()) 1 else 0;
             },
             .ids_popup => {
-                const pr = ctx.popupMenu(Ids.corner_popup, &app.corner_popup_items);
-                if (pr.dismissed) app.popup_dismissed = 1;
-                if (ctx.hasOpenPopup()) updatePopupGeo(&app, &app.corner_popup_items);
+                if (app.corner_popup.open) recordPopupRect(&app, &app.corner_popup);
             },
             else => {},
         }
