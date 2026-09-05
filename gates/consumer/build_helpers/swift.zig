@@ -94,9 +94,14 @@ fn swiftRuntimeLibExists(b: *std.Build, sdk_paths: macos.MacOSSDKPaths, lib_name
         pathExists(b, b.fmt("{s}/usr/lib/swift/lib{s}.tbd", .{ sdk_paths.sdk_path, lib_name }));
 }
 
+/// Whether `path` exists, following symlinks. No read, write, or execute access is
+/// requested, and a relative path resolves against the build runner's working directory.
+///
+/// This reaches the filesystem directly and never spawns a child process: build
+/// configuration repeats the check for every executable it declares. `accessAbsolute` is
+/// not an option here, because a path taken from a build option may be relative and it
+/// asserts otherwise.
 fn pathExists(b: *std.Build, path: []const u8) bool {
-    var exit_code: u8 = 0;
-    const stdout = b.runAllowFail(&.{ "test", "-e", path }, &exit_code, .ignore) catch return false;
-    b.allocator.free(stdout);
-    return exit_code == 0;
+    std.Io.Dir.cwd().access(b.graph.io, path, .{}) catch return false;
+    return true;
 }
