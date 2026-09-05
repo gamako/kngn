@@ -3,7 +3,8 @@
 How to use OpenType variable fonts in `libs/font` (TrueType glyf + CFF2). The axis API is local
 to an `OutlineFont` instance. Standalone fonts own their coverage cache; variants produced by
 `OutlineFontFamily` share the family's bounded coverage cache. Advance data is invalidated and
-rebuilt when axes change.
+rebuilt when axes change. [`docs/adr/032`](adr/032_default-outline-font-and-glyph-cache.md) records
+how that cache is bounded and why the default outline font is chosen the way it is.
 
 ## Overview
 

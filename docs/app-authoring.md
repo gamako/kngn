@@ -54,7 +54,8 @@ The marker is drawn in the frame in which it is submitted. Generic pointer, keyb
 wheel routing is selected at `beginFrame` from modal layers that were placed in the previous
 completed frame. Thus a newly visible modal layer draws immediately but begins owning framework
 input on the following frame. The frontmost layer is the highest `z`, with declaration order as
-the tie-breaker, among that previous-frame set.
+the tie-breaker, among that previous-frame set. [`docs/adr/037`](adr/037_layer-input-arbitration.md)
+records why routing is latched from the previous frame rather than resolved as layers are declared.
 
 `BoxConfig.layer` is a call-time handle. `beginBox` copies the pointed-to `LayerSpec` before it
 returns; the specification only needs to remain alive for that call. This is valid for a local
@@ -445,6 +446,11 @@ otherwise (a few are free functions taking the context as their first argument).
 the minimal uses below is the application's own state struct. Each call returns what happened
 this frame; **the selection or value is yours to own**, which is why radio buttons, tabs and
 list rows take the current state as a plain argument rather than storing it.
+
+A widget that turns a held pointer into a value — a slider, a colour picker, a splitter —
+settles on the position the gesture ended at rather than the last position of that frame;
+[`docs/adr/025`](adr/025_gui-drag-position-on-the-release-frame.md) has the rule and what it
+costs a widget that reads the pointer itself.
 
 | Call | Minimal use | Returns |
 |---|---|---|
@@ -933,7 +939,9 @@ animation setting explicit.
 ### Verifying your own app's layout
 
 The opt-in `layout_sanity` probe reports structural layout problems without changing the draw
-list or framebuffer. Register it after creating the context and before entering the main loop:
+list or framebuffer. [`docs/adr/033`](adr/033_layout-sanity-probe-semantics.md) defines what each
+counter does and does not claim, which is worth reading before acting on a non-zero one. Register
+the probe after creating the context and before entering the main loop:
 
 ```zig
 ctx.setLayoutSanityEnabled(kit.layout_sanity.isEnabled());

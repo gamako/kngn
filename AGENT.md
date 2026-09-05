@@ -47,7 +47,8 @@ repository, or the author's notes. **The rules below are binding for every
 change; they are the source of truth for what to do.** The self-check
 procedure that verifies them lives in
 [docs/comment-policy.md](docs/comment-policy.md) — a how-to, not a second copy
-of the rules.
+of the rules — and [`docs/adr/012`](docs/adr/012_source-language-and-comment-policy.md)
+records why a public repository is held to them.
 
 **Two independent axes.** "Write in English" (rule 1) and "carry no task-tracker
 id" (rule 3) are separate requirements, and each has its own exemptions:
@@ -238,7 +239,8 @@ The macOS backend's Swift runtime autolinking (`build_helpers/swift.zig`) has be
 checked against SDK major versions 15–26 (`macos.checked_sdk_major_range`). An SDK
 outside that range prints a build-time warning naming the exact range; if the build
 then fails with an undefined `__swift_FORCE_LOAD_$_<name>` symbol, add `<name>` to
-`optional_libs` in that file.
+`optional_libs` in that file. [`docs/adr/026`](docs/adr/026_swift-runtime-overlay-checked-range.md)
+records why that list is a checked range rather than something discovered at build time.
 
 ```bash
 direnv allow                     # once, to allow .envrc
