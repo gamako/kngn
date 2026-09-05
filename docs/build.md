@@ -121,6 +121,11 @@ zig build test-gui      # one suite
 The individual suites are listed in [`../AGENT.md`](../AGENT.md) under "Common
 commands". None of them needs a display.
 
+The gates that build each sample and the editor as their own package run a child
+`zig build` per sample, each with its own cache directory and install prefix.
+[`docs/adr/038`](adr/038_child-gate-cache-and-prefix.md) records why they are kept
+apart, and what sharing one cache between them was measured to be worth.
+
 ## The macOS SDK and Swift toolchain
 
 Both paths are detected through `xcrun` and `xcode-select`, so updating Xcode

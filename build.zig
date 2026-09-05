@@ -503,7 +503,14 @@ fn addCheckedChildBuild(
     explicit_optimize: ?[]const u8,
 ) *std.Build.Step.Run {
     // Absolute paths so the child (cwd=child_dir) does not create a cache inside it.
-    // Each child gets its own cache_subdir, so their build graphs never share state.
+    //
+    // The prefix has to be per invocation: the representative gate and the full sweep
+    // build three of the same samples, and a shared prefix would have them overwrite
+    // each other's install output. The cache is separate by choice rather than for
+    // correctness: sharing one was measured to buy little against tying every child into
+    // a single cache namespace. docs/adr/038 has the measurements, and what is and is
+    // not known about sharing a cache between these children.
+    //
     // cache_root.path is often relative (".zig-cache"); resolve against the process cwd.
     const child_cache = b.pathResolve(&.{
         b.graph.cache.cwd,
