@@ -4515,7 +4515,11 @@ fn addRunStep(
     // as a side effect. A run only needs that exe compiled, so stay with the exe-build dependency
     // that addRunArtifact attaches automatically (run straight from cache).
     if (args) |a| run_cmd.addArgs(a);
-    const run_step = b.step(name, description);
+    // The marker is appended here, in one place, so that every run step carries it in
+    // `zig build --help`. A run step launches the application, so the step finishes only
+    // when the application exits; a caller that reads the list as a set of build steps
+    // otherwise has nothing telling it that this one waits.
+    const run_step = b.step(name, b.fmt("{s} [does not return until the app exits]", .{description}));
     run_step.dependOn(&run_cmd.step);
 }
 

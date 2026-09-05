@@ -94,6 +94,11 @@ zig build --release=fast         # a release build
 zig build -Dinstall-all=true     # every backend and example — the build regression check
 ```
 
+Every `run` and `run-*` step **launches** the application and returns only when it exits,
+so a command chained after one never runs unless the application stops on its own; see
+[What ends a run](harness.md#what-ends-a-run). Use `zig build` to compile without
+launching.
+
 `run-pixie` and friends default to Debug. On a retina display at `.physical` 2x
 that feels slow (27.9 fps measured), so use
 `zig build run-pixie -Doptimize=ReleaseFast` to judge smoothness or to measure.
@@ -103,6 +108,8 @@ An example also builds on its own:
 ```bash
 cd examples/01_timed_window && zig build run
 ```
+
+A standalone `run` behaves the same way: it launches the sample and waits for it to exit.
 
 Each example directory is its own package: a `build.zig.zon` naming this repository
 as a `.path` dependency, and a build script that asks it for the modules the sample

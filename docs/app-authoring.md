@@ -1240,6 +1240,17 @@ invocation). They do **not** guarantee that the template builds for every cross-
 target. `check-template-web` depends on the native gate as well, so a web-only re-check still
 runs the native compile and unit tests.
 
+**`zig build run` launches your app; it is not a build step.** It returns only when the
+app exits, so `zig build run && …` reaches the second half only if the app stops on its
+own. Give a non-interactive run something that ends it: a replay script ending in `quit`
+(`KNGN_HARNESS_SCRIPT`), a listener you send `quit` to (`KNGN_HARNESS_LISTEN`, then
+`kngn ctl … 'quit'`), or an exit condition in the app itself. Under `KNGN_HEADLESS=1` with
+neither transport there is no window to close and no harness `quit` to receive, so an app
+without its own exit condition keeps running — consuming CPU, possibly outliving the shell
+that started it, and distorting concurrent measurements without reporting an error.
+`zig build build-native` compiles without launching. The full contract is
+[What ends a run](harness.md#what-ends-a-run).
+
 Harness: `digest` / `action` / `snapshot fb` with `KNGN_HEADLESS=1` and
 `KNGN_HARNESS_SCRIPT`. Browser validation is **not** “exit 0 from package-web alone”:
 serve the multi-file package and confirm the static server access log shows a successful

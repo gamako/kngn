@@ -264,6 +264,10 @@ zig build run-pixie           # ピクセルエディタ。ほかに run / run-s
 zig build test                # 全テスト
 ```
 
+`run` / `run-*` はアプリを**起動**するステップで、アプリが終了するまで返りません（後ろに `&&` で
+繋いだコマンドはそれまで走りません）。何が実行を終わらせるかは
+[What ends a run](docs/harness.md#what-ends-a-run) にあります。
+
 nix なしのセットアップ（OS ごとの必要パッケージ）、バックエンドの切り替え、クロスコンパイル、
 テストの個別実行は [`docs/build.md`](docs/build.md) にあります。
 Windows ターゲットだけはどのホストからでもクロスビルドできます。

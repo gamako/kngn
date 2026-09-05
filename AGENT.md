@@ -263,6 +263,12 @@ zig build run-metal              # the same, named explicitly (Linux has run-x11
 An unimplemented value is a build error naming the OS and the valid set, so a stale
 `-Dplatform=objc` in a script fails loudly rather than silently building something else.
 
+**A `run` or `run-*` step launches the application and returns only when it exits** — the
+standalone `run` of a sample included. A command chained after one waits for the
+application, so a non-interactive run has to supply something that ends it (a harness
+transport, or an exit condition in the application):
+[What ends a run](docs/harness.md#what-ends-a-run).
+
 An example can also be built on its own:
 
 ```bash

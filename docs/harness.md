@@ -19,8 +19,9 @@ Phases, all implemented:
   probe".
 - **Fully display-less** operation: `KNGN_HEADLESS=1` makes `platform.init()` skip
   the native `backend.init()` entirely and select `platform_null` at runtime. A
-  script or a listener is optional, so a display-less run needs neither. See
-  "Fully display-less" below.
+  script or a listener is optional — start-up succeeds without one, though nothing can
+  then inject a command or ask the run to `quit`. See "Fully display-less" below and
+  [What ends a run](#what-ends-a-run).
   - The `fb` probe captures **the CPU framebuffer of the manual drawing API**, so it is
     backend-independent: every backend, macOS Metal included, supplies the same CPU
     buffer, and `snapshot fb` reads it before the backend presents.
@@ -699,6 +700,32 @@ KNGN_HARNESS_SCRIPT=/tmp/script.txt KNGN_HARNESS_OUT=/tmp zig build run         
 zig build test-harness   # unit tests (parser, execution model, virtual clock, audio analysis, WAV, stats). No display needed, backend independent
 ```
 
+### What ends a run
+
+What ends a run depends on how it was started:
+
+| What ends it | When it exists |
+|---|---|
+| `quit` in the script, or the end of the script (EOF) | only with `KNGN_HARNESS_SCRIPT` |
+| `quit` sent over the socket | only with `KNGN_HARNESS_LISTEN` |
+| a person closing the window | only with a native window, never under `KNGN_HEADLESS=1` |
+| the application's own exit condition | whatever the application decides — `examples/01_timed_window` stops after two seconds, some applications run until told to stop |
+
+`quit` and EOF belong to the script transport. Start an application with neither
+`KNGN_HARNESS_SCRIPT` nor `KNGN_HARNESS_LISTEN` and that route does not exist at all;
+what is left is a person, and the application itself.
+
+**`zig build run` — and every `run` or `run-*` step — launches the application. It is not
+a build step: once the application has started, the step waits until it exits.** So
+`zig build run && <something else>` reaches `<something else>` only if the application
+stops on its own. To compile without launching, use `zig build`.
+
+In a non-interactive run — CI, or an agent — there is no person to close a window, so an
+application that does not stop on its own needs a transport. Without one it keeps running
+with nobody watching, and it may outlive the shell that launched it, consuming CPU and
+distorting concurrent measurements. Nothing announces this: the step is waiting rather
+than failing, and no warning is printed about the missing transport.
+
 ## Using it: live (TCP loopback plus the driver CLI)
 
 Start the application in the background and use `kngn ctl` for one connection
@@ -743,7 +770,7 @@ through TIME_WAIT.
 | `KNGN_HARNESS_PORT_FILE=<file>` | where the chosen port is written (default `$KNGN_HARNESS_OUT/harness.port`) |
 | `KNGN_HARNESS_RECORD=<file>` | append the commands received while listening (replayable via `KNGN_HARNESS_SCRIPT`) |
 | `KNGN_HARNESS_OUT=<dir>` | the default directory for an omitted snapshot path and for the port file |
-| `KNGN_HEADLESS=1` | **fully display-less**: `platform.init` selects the null backend. A script or listener is optional (it can run alone). See below |
+| `KNGN_HEADLESS=1` | **fully display-less**: `platform.init` selects the null backend. A script or listener is optional (it can run alone), though with neither there is no window to close and no way to send `quit` ([What ends a run](#what-ends-a-run)). See below |
 
 ### App-data isolation for unattended runs
 
@@ -807,7 +834,9 @@ all (no X11 or Wayland display connection, and no macOS WindowServer connection)
 selects `core/platform_null.zig` at runtime, where the `Window` owns a primary CPU
 framebuffer (a `w*h` buffer of `u32`). The harness merely takes an observation copy in
 `onLock` and `onPresent` (it holds no primary buffer). A script or listener is
-optional, so a display-less run with no transport at all is possible.
+optional, so a display-less run with no transport at all is possible — with the caveat
+that nothing can drive or stop it except the application itself, because there is no
+window to close either ([What ends a run](#what-ends-a-run)).
 **No per-backend offscreen implementation (an X11 Pixmap and the like) is used.**
 
 - **Replay and listening work as they are over plain SSH** (with no `DISPLAY` and no

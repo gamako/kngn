@@ -359,6 +359,10 @@ zig build test                # unit tests + template native gate + external con
 zig build -Dinstall-all=true  # all backends + root wasm packages + template native/web + consumer gates
 ```
 
+A `run` or `run-*` step launches the application and returns only when it exits, so
+nothing chained after it runs until then —
+[What ends a run](docs/harness.md#what-ends-a-run) says what can end one.
+
 Setting up without nix (the per-OS prerequisites), switching backends, cross-compiling and
 running individual tests are in [`docs/build.md`](docs/build.md). A Windows target is the
 one that cross-builds from any host. Wasm deploy details:
