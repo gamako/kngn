@@ -869,33 +869,113 @@ complete linear/radial paint arrangement.
 
 ### Raised panels and shadows
 
-A raised card is one call. `box` paints an outer shadow, a background and a uniform border over
-the same rectangle, in that order, and every part is optional:
+**A box in the layout says how high it sits, not what its shadow looks like.**
+
+```zig
+ctx.beginBox(.{
+    .bg = ctx.style.surface.raised,
+    .border = .{ .color = ctx.style.border_tokens.normal, .thickness = 1 },
+    .radius = 8,
+    .elevation = .raised,
+});
+```
+
+The scale is `none`, `raised` (a card that stays in the tree), `elevated` (a surface that opens
+over the content — a dropdown, a menu, a tooltip) and `overlay` (a modal). The theme owns what
+each one looks like, so the same step is the same shadow everywhere and follows a theme change;
+the step itself changes nothing else — not the draw order, not the layer route, not the
+hit-test. Like `radius`, it does not touch measure, placement or hit-testing.
+
+The shadow is painted on the rect the layout settled, which is the point: **a shadow is the one
+part of a card that used to force an application back out to absolute coordinates**, because
+the box could paint a surface, a border and a corner radius but not an elevation.
+[`examples/47_screen_layout/main.zig`](../examples/47_screen_layout/main.zig) is the worked
+screen, and its cards are raised without a coordinate anywhere in the file.
+
+A shadow reaches outside the box's rect, so an ancestor with `clip_children` cuts it. The box's
+own `clip_children` does not: that clip opens after the background. And because draw order is
+tree order, a shadow falls on whatever was painted before it — a later sibling shadows an earlier
+one, exactly as its background would cover it. Between two surfaces at the same step that is a
+pixel or two and invisible; it is worth knowing before putting a tall step on a row of adjacent
+boxes, which is not what the tall steps are for.
+
+**A tall step is much cheaper on a rounded box.** The renderer skips the middle of a shadow that
+an opaque background is about to cover, and a shadow displaced further down than the corner
+radius pokes out below the box, so its middle is visible and has to be painted. On a 1280x700
+panel that is 168,128 blitted pixels for `raised` against 1,190,208 for `overlay` at radius 8 —
+and 350,528 against 508,032 at radius 32, where the offset fits inside the corner.
+[`docs/adr/036`](adr/036_box-painting-is-one-drawlist-operation.md) has the table. If a large
+surface needs `elevated` or `overlay`, giving it a corner radius at least as big as the step's
+offset is most of the cost back.
+
+#### Bringing your own scale
+
+An application with its own design tokens replaces the table:
+
+```zig
+const app_levels: gui.ElevationLevels = .{
+    .{},                                     // none
+    .{ .layers = &.{                         // raised
+        .{ .color = card_far,  .offset = .{ .x = 0, .y = 8 }, .blur = 24 },
+        .{ .color = card_near, .offset = .{ .x = 0, .y = 1 }, .blur = 2 },
+    } },
+    .{ .layers = &.{ ... } },                // elevated
+    .{ .layers = &.{ ... } },                // overlay
+};
+
+ctx.style.elevation.levels = &app_levels;    // once, at start-up
+```
+
+Two layers per step is the usual shape — a tight dark one for the contact edge, a wide faint one
+for the height — because a real penumbra does not fall off at one blur radius. **CSS lists
+shadows front-to-back; this slice is in paint order, index 0 furthest back, so a `box-shadow`
+value is reversed when you transcribe it.**
+
+`levels` is borrowed: the table, and the `layers` array of every level in it, must outlive the
+frames drawn with that style, and must not be rewritten while a frame is open. A `const` at file
+scope satisfies both, and so does a field on your application struct. Replace nothing and you get
+the built-in tables, which are static.
+
+**Do not build the table inside the function that installs it.** Nothing diagnoses it: the first
+frame is correct, and the frame after the stack is reused draws from whatever is there now — which
+looks like the shadow flickering out on the first mouse move, and then a crash.
+
+#### Drawing a box yourself
+
+For a shadow the scale cannot express — a coloured glow, a one-off silhouette — paint the box
+directly. `box` paints the shadow layers, a background and a uniform border over the same
+rectangle, in that order, and every part is optional:
 
 ```zig
 try draw_list.box(panel_rect, .{
     .background = .{ .solid = theme.surface },
     .border = .{ .color = theme.border, .thickness = 1 },
     .radius = 10,
-    .shadow = .{ .color = gui.Color.rgba(0, 0, 0, 0xB0), .offset = .{ .x = 0, .y = 6 }, .blur = 8 },
+    .shadows = &.{.{ .color = gui.Color.rgba(0, 0, 0, 0xB0), .offset = .{ .x = 0, .y = 6 }, .blur = 8 }},
 });
 ```
 
-`radius` applies to all three parts, the way `border-radius` does. `BoxShadow.radius_override`
-is there for a shadow whose silhouette is deliberately a different shape from the box casting it.
+The cost is that **you own the rectangle**: nothing hands you where the layout put the box, which
+is what `elevation` exists to avoid. If what you want is the theme's shadow on a box you are
+painting by hand, ask for it rather than reading the table:
+`.shadows = ctx.style.shadowsFor(.elevated)`.
+
+`radius` applies to every part, the way `border-radius` does. `BoxShadow.radius_override` is
+there for a shadow whose silhouette is deliberately a different shape from the box casting it.
 A `thickness` of zero is one physical pixel, so "no border" is `null`, not `0`.
 
-**Prefer `box` over the three calls written out.** When the background is opaque it hides the
-middle of the shadow, and `box` is what lets the renderer skip painting it — on a dashboard of
+**Prefer `box` over the calls written out.** When the background is opaque it hides the middle of
+every shadow layer, and `box` is what lets the renderer skip painting them — on a dashboard of
 seven panels that was 41% of the frame's rasterisation, with a byte-identical result.
 [`docs/adr/036`](adr/036_box-painting-is-one-drawlist-operation.md) has the rule and the
 measurements; nothing about the drawing changes, only what is not drawn.
 
-`draw_list.shadow` remains for a shadow with nothing over it. `ShadowOptions.radius` and `.blur`
-are logical pixels; `.offset` is applied after physicalisation. Shadow masks are cached by
-`DrawList`, so a warm frame does not rerun the blur calculation every frame. The shadow section of
+`draw_list.shadow` remains for a shadow with nothing over it, and always paints its centre —
+only `box` knows a background is coming. `ShadowOptions.radius` and `.blur` are logical pixels;
+`.offset` is applied after physicalisation. Shadow masks are cached by `DrawList`, so a warm
+frame does not rerun the blur calculation every frame. The shadow section of
 [`examples/46_style_gallery/main.zig`](../examples/46_style_gallery/main.zig) shows the option
-combinations.
+combinations, and the panel next to them takes its layers from `shadowsFor`.
 
 ### Modal dialogs
 

@@ -116,8 +116,26 @@ Splitter / ScrollArea, plus bool toggles:
 their meaning distinct from the legacy flat `Style.border` and `Style.text` mirrors. The surface
 tokens cover canvas, panel, raised, elevated, control, hover control, input, subtle control, and
 status surfaces. Accent tokens cover primary, selected, selection, danger, and focus colors;
-text tokens cover primary and subtle ink; elevation supplies the shadow color. Text tier sizes and
-weights, dimensions, radii, and animation timing remain part of `Style`.
+text tokens cover primary and subtle ink; elevation holds the shadow of each step of the
+elevation scale. Text tier sizes and weights, dimensions, radii, and animation timing remain
+part of `Style`.
+
+**The elevation scale** is `none`, `raised`, `elevated`, `overlay`: a box says how high it
+sits (`BoxConfig.elevation`) and the theme says what that looks like, the way a surface says
+`panel` rather than a hex colour. Each step is a `[]const BoxShadow` in paint order — index 0
+furthest back — because a raised surface reads as one only when a tight contact shadow and a
+wide ambient one are both present. **CSS lists shadows front-to-back, so a `box-shadow` value
+transcribed into a step is reversed.** The step changes nothing but the shadow: not the draw
+order, not the layer route, not the hit-test.
+
+`ElevationTokens.levels` is a borrowed pointer to an `ElevationLevels`, an array with one
+entry per step of the scale. An application with
+its own design tokens writes the whole table once and points the style at it; the table, and
+the `layers` array of every level in it, must outlive the frames drawn with that style and
+must not be rewritten while a frame is open. Both built-in tables are static data, so a caller
+that replaces nothing satisfies that by construction. A box painted by hand asks
+`Style.shadowsFor(step)` rather than reading the table, so the number of layers and their
+order stay the theme's business.
 
 `gui.defaultStyle()` is the canonical dark style and preserves the existing drawing colors.
 `gui.lightStyle()` returns a complete light style with the same geometry and animation defaults.
@@ -342,8 +360,11 @@ ctx.custom(.{ .x = 120, .y = 12 }, Meter.draw, meter);
 
 **Draw order.** Layout draw commands are appended to the list *after* anything the caller
 pushed through `mainDrawList()` during the frame, so the interface draws over a hand-drawn background. A
-custom leaf sits where the layout puts it, inside its parent's emit order of background →
-children → border: the parent's background is under it and the parent's border is drawn over it.
+custom leaf sits where the layout puts it, inside its parent's emit order of elevation shadows →
+background → children → border: the parent's background is under it and the parent's border is
+drawn over it. A box's shadows reach outside its rect and are painted under the clip in force
+where the box sits, so an ancestor's `clip_children` cuts them while the box's own does not —
+that clip opens after the background.
 An ancestor's clip applies where that ancestor sets `clip_children = true`.
 Popup and menu-bar layer roots are emitted by `endFrame` after the main tree and land on top of
 everything (`src/popup.zig`, `src/menu.zig`).

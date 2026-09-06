@@ -15,6 +15,9 @@ const Subsystem = struct {
 const subsystems = [_]Subsystem{
     .{ .name = "gate-audio", .source = "src/audio.zig", .features = .{ .enable_audio = true } },
     .{ .name = "gate-midi", .source = "src/midi.zig", .features = .{ .enable_midi = true } },
+    // No system library to resolve: this one guards names that only a consumer writes.
+    // See src/gui_surface.zig.
+    .{ .name = "gate-gui-surface", .source = "src/gui_surface.zig", .features = .{} },
 };
 
 pub fn build(b: *std.Build) void {

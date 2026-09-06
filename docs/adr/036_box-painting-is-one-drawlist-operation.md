@@ -1,6 +1,7 @@
 # ADR-036: Box painting is one DrawList operation
 
-- Status: Accepted
+- Status: Accepted (revised 2026-09-06: a box carries several shadow layers, and a
+  layout box reaches them through an elevation step)
 - Date: 2026-09-02
 - Scope: the background, uniform border, corner radius and outer shadow of a box in
   `libs/gui`, and the elision of a shadow's covered center
@@ -44,7 +45,7 @@ renderer's nine-slice, and not after the optimization that motivated it.
 
 ## Decision
 
-`DrawList.box(rect, BoxOptions)` paints, in this order, an optional outer shadow, an
+`DrawList.box(rect, BoxOptions)` paints, in this order, the outer shadow layers, an
 optional background, and an optional uniform border, over one rectangle:
 
 ```zig
@@ -52,7 +53,7 @@ pub const BoxOptions = struct {
     background: ?Paint = null,
     border: ?Border = null,
     radius: u32 = 0,
-    shadow: ?BoxShadow = null,
+    shadows: []const BoxShadow = &.{},
     aa: bool = true,
 };
 ```
@@ -66,14 +67,20 @@ pub const BoxOptions = struct {
   this operation introduces no per-side border.
 - **Everything is optional.** All-null appends nothing. A background alone is a filled
   rect; a border alone is an outline; a shadow alone behaves exactly as before.
-- **Out of scope**: `spread`, inset shadows, and multiple shadows. They exist in the
-  vocabulary this API borrows, but publishing a name is one-way (ADR-020) and none of
-  them is implemented.
+- **Several shadow layers, in paint order.** `shadows[0]` is painted first and sits
+  furthest back. Two layers is the ordinary shape of a raised surface, and the reason
+  is not decoration: a real penumbra is sharper near the contact point and softer
+  further out, which one blur radius cannot express. A single tight layer reads as
+  glued down, a single wide one as a smudge. CSS lists shadows front-to-back, so a
+  `box-shadow` value is reversed when transcribed into this slice — stated in the doc
+  comment, because a list order is only a contract if it is written down.
+- **Out of scope**: `spread` and inset shadows. They exist in the vocabulary this API
+  borrows, but publishing a name is one-way (ADR-020) and neither is implemented.
 
 ## Lowering, and what it costs a caller who does not use it
 
-`box` appends the existing `shadow`, `rect_filled` and `rect_outline` commands. There is
-no `.box` payload and no side table:
+`box` appends the existing `shadow` commands (one per layer), `rect_filled` and
+`rect_outline`. There is no `.box` payload and no side table:
 
 - A payload holding a `Paint`, a `Border` and a `BoxShadow` would very likely be the
   widest variant of `DrawCmd`, which is a per-command cost paid by every command in
@@ -82,12 +89,15 @@ no `.box` payload and no side table:
   resolve in the dump, the parser and the overlay — again for lists that never call
   `box`.
 
-The three commands are reserved first and appended together, so running out of memory
-leaves the list exactly as it was rather than a shadow with nothing over it.
+Every command a box needs is reserved first and appended together, so running out of
+memory leaves the list exactly as it was rather than a shadow with nothing over it — the
+same rule with two shadow layers as with one.
 
 What the shadow command gains is one `u32`, `opaque_cover_radius`: the corner radius of
 an opaque background that `box` has already queued over the same rectangle and clip, or
-a sentinel meaning there is none. It fits inside the existing padding of a payload that
+a sentinel meaning there is none. **Every layer of a multi-layer shadow gets it**, since
+the one background covers them all; the geometry test still runs per layer, because it
+reads that layer's own radius and offset. It fits inside the existing padding of a payload that
 is not the widest, so a list with no shadows is byte for byte what it was. The render
 buckets are unchanged, which also means before-and-after profiles compare directly.
 
@@ -170,9 +180,75 @@ disappears with no visible change, which is the hardest kind of regression to no
 optional and is one part of three. An author who needs a background, a border, a corner
 radius and an elevation together is looking for a box.
 
+## Revision, 2026-09-06: the layout box carries an elevation
+
+The decision above gave the operation to `DrawList`, where a caller owns the rectangle.
+That left the layout box — which paints a background, a border and a corner radius — with
+no way to say it is raised. The consequences were larger than the missing convenience:
+
+- **The optimization above was unreachable from the layout.** A card built from boxes had
+  to paint its shadow through `mainDrawList` while its background came from the layout's
+  emit, so `opaque_cover_radius` was always the sentinel and the center was always
+  painted. The 41.7% below was not available to the path most screens are built on.
+- **It had no users.** At the time of this revision the only caller of `box` outside the
+  tests was the style gallery sample, and the library's own dialog, popup menu, menu bar
+  and tooltip — every surface that floats over content — carried no shadow at all. The
+  Consequences section below claimed the dialog was written with `box`; it was not, and
+  the claim is corrected here rather than left standing.
+- **Authors did the thing the API made available.** An outside author asked to reproduce
+  a dashboard laid the cards out with boxes and then recomputed the card rectangles by
+  hand — `content_x + i * (width + gap)` — to place two shadow layers under them. A
+  second coordinate system that silently disagrees with the first the moment the tree
+  changes.
+
+### What a box says
+
+`BoxConfig.elevation` is a step of a scale — `none`, `raised`, `elevated`, `overlay` —
+and the theme (`Style.elevation.levels`) says what each step looks like. The box states a
+height; it does not describe a shadow. That is the Android and Material shape rather than
+the CSS one, chosen over `shadow: ?BoxShadow` for reasons that are measurable:
+
+- **It costs the trees that do not use it nothing measurable.** `?BoxShadow` grows
+  `BoxConfig` from 176 to 208 bytes and `layout.Node` from 344 to 376, paid by every box
+  in every frame. An `enum(u8)` fits the existing padding: both stay at 176 and 344.
+  `Style` grows by the one pointer, 600 to 608 bytes. Measured with `bench-gui-frame`
+  across 500/1000 rows at scale 1.0/1.5/2.0, the six no-shadow rows move between -0.2%
+  and -2.5% on the minimum, which is the run-to-run spread.
+- **The number of layers stays out of the published names.** A step is a slice, so the
+  theme decides whether a raised surface is one shadow or three without any application
+  changing a line. Publishing `shadow: ?BoxShadow` would have fixed that at one, and the
+  design system the sample was reproducing asks for two.
+- **The lowering stays internal.** Dropping a covered center is a fact about a CPU
+  rasterizer. Keeping the public surface at "how high is this box" leaves that free to
+  change — including to nothing at all, on a GPU where an analytic shadow shader makes
+  the whole question moot.
+- **The same shadow for a step, everywhere.** The values live in one table per theme,
+  and light and dark differ in tint and not only in alpha. How a step is built up — two
+  layers here — is the table's business, so it can change without an application saying
+  anything different.
+
+`emitNode` keeps the rest-state path exactly as it was: a box at `.none` reads no table
+and assembles no `box`, so what the feature costs a tree that never uses it is one field
+load and one branch. `Style.shadowsFor` is the only reader of the table, so the number of
+layers, their order and which one is the contact edge stay the theme's business — a box
+painted by hand asks for a step rather than indexing.
+
+**Rejected on the way there.** A pointer on `BoxConfig` (`?*const BoxShadow`) does not fit
+the padding either — 184 bytes — so it buys a per-frame, per-box lifetime hazard for
+nothing. `LayerSpec.shadow`, which would have cost ordinary boxes nothing, reaches the
+popup menu (whose layer root is its visible surface) but not the dialog, whose layer root
+is the full-screen scrim and whose panel is an ordinary child; and it never reaches a card
+that does not float. A table stored in `Style` by value grows a 600-byte struct that
+eighteen call sites copy wholesale, fourteen of them per widget per frame.
+
+**What it does not do.** The scale cannot express an arbitrary shadow — a coloured glow, a
+one-off silhouette. That case paints with `DrawList.box` and owns its rectangle, which is
+the same two-tier arrangement Android and Flutter settled on. `Style.shadowsFor` exists so
+that a hand-painted box can still take the theme's shadow without reading the table.
+
 ## Consequences
 
-- The common panel is one call, and the library's own dialog is written that way.
+- The common panel is one call, and a layout box says how high it sits.
 - A standalone shadow and a translucent background keep their center, unchanged.
 - The dump reports `cover_radius` so a probe can see that a box lowered as intended; the
   parser ignores it, so a text list cannot claim a background that was never queued.
@@ -180,5 +256,26 @@ radius and an elevation together is looking for a box.
   opaque background also hides are left for later: the center alone accounts for the
   measured 79%, and taking more requires splitting slices while preserving their source
   coordinates.
+- A two-layer box costs about two elided shadows rather than one elided and one whole.
+  Measured with `bench-rounded-primitives` on a 1280x700 panel, radius 8: one opaque
+  layer blits 95,808 pixels, two blit 168,128, and the same box with nothing covering it
+  blits 960,384. Hinting only the layer nearest the surface would land near 1,056,000,
+  and the benchmark fails if it does.
+- **What an elevation step costs is decided by its offset against the box's corner
+  radius**, not by how far up the scale it is. A shadow displaced further down than the
+  radius shows below the box, so its center is not covered and is painted whole — the
+  correct answer, and an expensive one. Blitted pixels for the same 1280x700 panel:
+
+  | corner radius | `raised` | `elevated` | `overlay` | one uncovered shadow |
+  |---|---|---|---|---|
+  | 8 | 168,128 | 1,128,736 | 1,190,208 | 960,384 |
+  | 32 | 350,528 | 446,560 | 508,032 | 960,384 |
+
+  `raised` (1px and 8px down) stays elided at both. The wide layer of `elevated` (16px)
+  and `overlay` (24px) is elided at radius 32 and painted whole at radius 8, which is why
+  the two tall steps cost roughly seven times as much there. A surface that wants a tall
+  step cheaply wants a corner radius at least as large as the offset; the alternative is
+  a flatter scale. `bench-rounded-primitives` asserts this relationship in both
+  directions, so neither the values nor the cover rule can drift without it failing.
 - A change to how a rounded fill paints its interior changes what counts as cover. The
   rule names `drawRoundedFilledDevice` for that reason.

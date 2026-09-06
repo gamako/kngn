@@ -3045,7 +3045,8 @@ fn center(rect: Rect) struct { x: i32, y: i32 } {
 
 // ── separator ───────────────────────────────────────────────────────────────
 
-/// Every solid-filled rectangle in the frame. `emitNode` emits bg → children → border, so a
+/// Every solid-filled rectangle in the frame. `emitNode` emits shadows → bg → children →
+/// border, so a
 /// fixed command index moves as soon as a box in the fixture gains a background; asserting on
 /// the set instead also catches an implementation that paints one rectangle too many.
 fn solidFills(ctx: *Context, out: *std.ArrayList(Rect), colors: *std.ArrayList(Color)) !void {

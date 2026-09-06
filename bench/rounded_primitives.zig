@@ -29,11 +29,38 @@ const Shape = enum {
     /// The same box displaced further than its corner radius, which also puts the
     /// center outside the background.
     box_shadow_offset,
+    /// The shape a themed surface actually takes: two shadow layers under one opaque
+    /// background. The elision has to reach every layer, not the one nearest the
+    /// surface, or half of what the single-layer case saves comes back. One per step
+    /// of the elevation scale, because the wide layer of `overlay` is the largest
+    /// shadow the theme ever asks for and the cheapest case says nothing about it.
+    box_elevation_raised,
+    box_elevation_elevated,
+    box_elevation_overlay,
 };
+
+/// The theme's own steps, so the benchmark measures the shadows applications get
+/// rather than a shape invented here.
+fn elevationLayers(shape: Shape) []const gui.BoxShadow {
+    const style = gui.defaultStyle();
+    return switch (shape) {
+        .box_elevation_raised => style.shadowsFor(.raised),
+        .box_elevation_elevated => style.shadowsFor(.elevated),
+        .box_elevation_overlay => style.shadowsFor(.overlay),
+        else => unreachable,
+    };
+}
 
 fn hasShadow(shape: Shape) bool {
     return switch (shape) {
-        .shadow, .box_shadow_opaque, .box_shadow_translucent, .box_shadow_offset => true,
+        .shadow,
+        .box_shadow_opaque,
+        .box_shadow_translucent,
+        .box_shadow_offset,
+        .box_elevation_raised,
+        .box_elevation_elevated,
+        .box_elevation_overlay,
+        => true,
         else => false,
     };
 }
@@ -89,19 +116,28 @@ fn buildScene(dl: *gui.DrawList, shape: Shape, panel: Panel, radius: u32) !void 
             .background = .{ .solid = color },
             .border = .{ .color = gui.Color.rgba(0xFF, 0xFF, 0xFF, 0x60), .thickness = 1 },
             .radius = radius,
-            .shadow = .{ .color = gui.Color.rgba(0, 0, 0, 0xA0), .offset = .{ .x = 0, .y = 2 }, .blur = 16 },
+            .shadows = &.{.{ .color = gui.Color.rgba(0, 0, 0, 0xA0), .offset = .{ .x = 0, .y = 2 }, .blur = 16 }},
         }),
         .box_shadow_translucent => try dl.box(rect, .{
             .background = .{ .solid = gui.Color.rgba(0x48, 0xA8, 0xF0, 0xF0) },
             .border = .{ .color = gui.Color.rgba(0xFF, 0xFF, 0xFF, 0x60), .thickness = 1 },
             .radius = radius,
-            .shadow = .{ .color = gui.Color.rgba(0, 0, 0, 0xA0), .offset = .{ .x = 0, .y = 2 }, .blur = 16 },
+            .shadows = &.{.{ .color = gui.Color.rgba(0, 0, 0, 0xA0), .offset = .{ .x = 0, .y = 2 }, .blur = 16 }},
         }),
         .box_shadow_offset => try dl.box(rect, .{
             .background = .{ .solid = color },
             .border = .{ .color = gui.Color.rgba(0xFF, 0xFF, 0xFF, 0x60), .thickness = 1 },
             .radius = radius,
-            .shadow = .{ .color = gui.Color.rgba(0, 0, 0, 0xA0), .offset = .{ .x = 6, .y = 8 }, .blur = 16 },
+            .shadows = &.{.{ .color = gui.Color.rgba(0, 0, 0, 0xA0), .offset = .{ .x = 6, .y = 8 }, .blur = 16 }},
+        }),
+        .box_elevation_raised,
+        .box_elevation_elevated,
+        .box_elevation_overlay,
+        => try dl.box(rect, .{
+            .background = .{ .solid = color },
+            .border = .{ .color = gui.Color.rgba(0xFF, 0xFF, 0xFF, 0x60), .thickness = 1 },
+            .radius = radius,
+            .shadows = elevationLayers(shape),
         }),
     }
 }
@@ -265,23 +301,50 @@ pub fn main(init: std.process.Init) !void {
         const opaque_cover = try runCase(io, &tracker, .box_shadow_opaque, .large, radius);
         const translucent = try runCase(io, &tracker, .box_shadow_translucent, .large, radius);
         const offset = try runCase(io, &tracker, .box_shadow_offset, .large, radius);
+        const raised = try runCase(io, &tracker, .box_elevation_raised, .large, radius);
+        const elevated = try runCase(io, &tracker, .box_elevation_elevated, .large, radius);
+        const overlay = try runCase(io, &tracker, .box_elevation_overlay, .large, radius);
         printResult(no_shadow);
         printResult(opaque_cover);
         printResult(translucent);
         printResult(offset);
+        printResult(raised);
+        printResult(elevated);
+        printResult(overlay);
         try requireWarmCache(no_shadow);
         try requireWarmCache(opaque_cover);
         try requireWarmCache(translucent);
         try requireWarmCache(offset);
+        try requireWarmCache(raised);
+        try requireWarmCache(elevated);
+        try requireWarmCache(overlay);
         // Without these the timings above could be measuring nothing: a workload that
         // never drops a center, or one that drops every center, reports a difference
         // that has no cause.
         if (no_shadow.shadow_pixels != 0) return error.BoxWithoutShadowBlitGuardFailed;
         if (opaque_cover.shadow_pixels >= translucent.shadow_pixels) return error.CoveredCenterNotDroppedGuardFailed;
         if (offset.shadow_pixels <= opaque_cover.shadow_pixels) return error.OffsetCenterWronglyDroppedGuardFailed;
+        // What a step costs is decided by whether its layers keep their centers, and
+        // that is geometry: a shadow displaced further down than the box's corner
+        // radius shows below the box, so its center is not covered and has to be
+        // painted. Both layers of `raised` sit within any radius used here, so it is
+        // two elided layers; the wide layer of `elevated` (16px down) and of
+        // `overlay` (24px down) is elided at radius 32 and painted whole at radius 8.
+        //
+        // The guard is that relationship rather than a flat "cheaper than uncovered",
+        // because the expensive answer is the correct one — and stating it here is what
+        // keeps the cost visible instead of surprising an application later.
+        if (raised.shadow_pixels >= translucent.shadow_pixels) return error.RaisedCenterNotDroppedGuardFailed;
+        if (elevated.shadow_pixels <= raised.shadow_pixels) return error.ElevationScaleNotOrderedGuardFailed;
+        if (overlay.shadow_pixels <= elevated.shadow_pixels) return error.ElevationScaleNotOrderedGuardFailed;
+        const tall_steps_elided = radius >= 24;
+        for ([_]Result{ elevated, overlay }) |step| {
+            const elided = step.shadow_pixels < translucent.shadow_pixels;
+            if (elided != tall_steps_elided) return error.TallStepCoverGuardFailed;
+        }
         std.debug.print(
-            "box_center_drop radius={d} opaque={d} translucent={d} offset={d} dropped={d}\n",
-            .{ radius, opaque_cover.shadow_pixels, translucent.shadow_pixels, offset.shadow_pixels, translucent.shadow_pixels - opaque_cover.shadow_pixels },
+            "box_center_drop radius={d} opaque={d} translucent={d} offset={d} raised={d} elevated={d} overlay={d} dropped={d}\n",
+            .{ radius, opaque_cover.shadow_pixels, translucent.shadow_pixels, offset.shadow_pixels, raised.shadow_pixels, elevated.shadow_pixels, overlay.shadow_pixels, translucent.shadow_pixels - opaque_cover.shadow_pixels },
         );
     }
     std.debug.print("guards=ok corner_work=panel_invariant warm_allocs=0 checksums=different\n\n", .{});

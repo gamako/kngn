@@ -26,6 +26,19 @@ Two rules follow from how the failure appears, and both have to be kept:
   framework on macOS only — everywhere else `kit.midi` is the null backend, so building it
   there shows that the facade still compiles for a consumer, not that a framework was found.
 
+## The second kind of gap
+
+`gate-gui-surface` guards something else: **a name that only an external package ever
+writes**. An application that brings its own design tokens replaces the theme's elevation
+table, which means writing `Elevation`, `ElevationLevel` and `ElevationLevels` — types the
+library itself reaches by file rather than through the umbrella module. Dropping one of
+them from `kit` therefore breaks nothing inside this repository, and every build here
+stays green while no application outside can be written.
+
+The "call it for real" rule holds in its own form: a name that resolves is not a name that
+works, so that source builds a table, installs it, reads it back through the accessor,
+paints with the result, and checks what came out.
+
 `build_helpers/` is a real copy of `kngn/build_helpers/`, not a symlink: a symlink does not
 survive a Windows checkout, which would make this gate unbuildable exactly where `ole32` is
 the thing being guarded. The parent fails configuration if a copy drifts by one byte, so

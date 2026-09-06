@@ -875,14 +875,16 @@ fn containsRect(outer: Rect, inner: Rect) bool {
         inner_right <= outer_right and inner_bottom <= outer_bottom;
 }
 
-/// Whether the background that `DrawList.box` queued right after this shadow will
+/// Whether the background `DrawList.box` queued for the same box as this shadow will
 /// overwrite every pixel of the shadow's center slice, which makes painting that
 /// slice invisible work. `cover_radius` is the background's logical corner radius,
 /// or `no_opaque_cover` when no opaque background follows.
 ///
 /// The background is known to be opaque and to share this shadow's rectangle and
-/// clip, because `DrawList.box` is the only writer of `cover_radius` and appends
-/// the pair together. What remains is geometry, and only one shape of it counts:
+/// clip, because `DrawList.box` is the only writer of `cover_radius` and appends the
+/// box's parts together. A box may carry several shadow layers, in which case the one
+/// background follows all of them and each carries the same hint — the answer here is
+/// per layer, because the geometry below reads that layer's own radius and offset. What remains is geometry, and only one shape of it counts:
 /// the two strips that cross at the middle of a rounded fill, which
 /// `drawRoundedFilledDevice` paints with a plain fill and no coverage mask. A
 /// pixel inside a corner mask may happen to be fully opaque; this answers "not
@@ -5005,7 +5007,7 @@ fn expectBoxCover(case: BoxCoverCase) !void {
     }
 }
 
-test "box: lowering paints what the three commands painted by hand" {
+test "box: lowering paints what a one-shadow box painted by hand" {
     // The test above holds the commands fixed and varies only the cover hint, so it
     // cannot see a part routed to the wrong place — a blur handed to the background,
     // a border thickness lost. This one builds the same picture the long way and
@@ -5033,12 +5035,12 @@ test "box: lowering paints what the three commands painted by hand" {
         .background = background,
         .border = .{ .color = border_color, .thickness = thickness },
         .radius = radius,
-        .shadow = .{
+        .shadows = &.{.{
             .color = shadow_color,
             .offset = shadow_options.offset,
             .blur = shadow_options.blur,
             .radius_override = shadow_options.radius,
-        },
+        }},
         .aa = aa,
     });
 
@@ -5098,20 +5100,37 @@ test "box: dropping a covered shadow center leaves the framebuffer identical" {
             .rect = rect,
             .options = .{
                 .background = opaque_solid,
-                .shadow = .{ .color = shadow_color, .blur = 8 },
+                .shadows = &.{.{ .color = shadow_color, .blur = 8 }},
             },
             .dropped = true,
         },
         .{
             .name = "sharp corners, offset downward",
             .rect = rect,
-            .options = .{ .background = opaque_solid, .shadow = soft },
+            .options = .{ .background = opaque_solid, .shadows = &.{soft} },
             .dropped = false,
+        },
+        // Two layers is the ordinary shape of a raised surface, and the background
+        // covers the middle of both. This is the case that says the elision reaches
+        // every layer rather than the one nearest the surface: the framebuffer stays
+        // identical, and the blit count still falls.
+        .{
+            .name = "two shadow layers under an opaque background",
+            .rect = rect,
+            .options = .{
+                .background = opaque_solid,
+                .radius = 10,
+                .shadows = &.{
+                    .{ .color = shadow_color, .offset = .{ .x = 0, .y = 3 }, .blur = 12 },
+                    .{ .color = shadow_color, .offset = .{ .x = 0, .y = 1 }, .blur = 2 },
+                },
+            },
+            .dropped = true,
         },
         .{
             .name = "opaque solid background, rounded corners",
             .rect = rect,
-            .options = .{ .background = opaque_solid, .radius = 10, .shadow = soft },
+            .options = .{ .background = opaque_solid, .radius = 10, .shadows = &.{soft} },
             .dropped = true,
         },
         .{
@@ -5121,7 +5140,7 @@ test "box: dropping a covered shadow center leaves the framebuffer identical" {
                 .background = opaque_solid,
                 .border = .{ .color = Color.rgba(0x90, 0x90, 0x90, 0xFF), .thickness = 1 },
                 .radius = 10,
-                .shadow = soft,
+                .shadows = &.{soft},
             },
             .dropped = true,
         },
@@ -5132,7 +5151,7 @@ test "box: dropping a covered shadow center leaves the framebuffer identical" {
                 .background = opaque_solid,
                 .border = .{ .color = Color.rgba(0x90, 0x90, 0x90, 0x40), .thickness = 3 },
                 .radius = 10,
-                .shadow = soft,
+                .shadows = &.{soft},
             },
             .dropped = true,
         },
@@ -5147,7 +5166,7 @@ test "box: dropping a covered shadow center leaves the framebuffer identical" {
                     .end_color = Color.rgba(0x60, 0x70, 0x80, 0xFF),
                 } },
                 .radius = 6,
-                .shadow = soft,
+                .shadows = &.{soft},
             },
             .dropped = true,
         },
@@ -5162,7 +5181,7 @@ test "box: dropping a covered shadow center leaves the framebuffer identical" {
                     .outer_color = Color.rgba(0x10, 0x20, 0x30, 0xFF),
                 } },
                 .radius = 6,
-                .shadow = soft,
+                .shadows = &.{soft},
             },
             .dropped = true,
         },
@@ -5172,7 +5191,7 @@ test "box: dropping a covered shadow center leaves the framebuffer identical" {
             .options = .{
                 .background = .{ .solid = Color.rgba(0x30, 0x40, 0x50, 0xFE) },
                 .radius = 10,
-                .shadow = soft,
+                .shadows = &.{soft},
             },
             .dropped = false,
         },
@@ -5187,14 +5206,14 @@ test "box: dropping a covered shadow center leaves the framebuffer identical" {
                     .end_color = Color.rgba(0x60, 0x70, 0x80, 0xFE),
                 } },
                 .radius = 6,
-                .shadow = soft,
+                .shadows = &.{soft},
             },
             .dropped = false,
         },
         .{
             .name = "no background at all",
             .rect = rect,
-            .options = .{ .shadow = soft },
+            .options = .{ .shadows = &.{soft} },
             .dropped = false,
         },
         .{
@@ -5203,7 +5222,7 @@ test "box: dropping a covered shadow center leaves the framebuffer identical" {
             .options = .{
                 .border = .{ .color = Color.rgba(0x90, 0x90, 0x90, 0xFF), .thickness = 4 },
                 .radius = 10,
-                .shadow = soft,
+                .shadows = &.{soft},
             },
             .dropped = false,
         },
@@ -5212,7 +5231,7 @@ test "box: dropping a covered shadow center leaves the framebuffer identical" {
             .rect = rect,
             .options = .{
                 .background = opaque_solid,
-                .shadow = .{ .color = shadow_color },
+                .shadows = &.{.{ .color = shadow_color }},
             },
             .dropped = true,
         },
@@ -5222,7 +5241,7 @@ test "box: dropping a covered shadow center leaves the framebuffer identical" {
             .options = .{
                 .background = opaque_solid,
                 .radius = 8,
-                .shadow = .{ .color = shadow_color, .blur = 8, .offset = .{ .x = 0, .y = 3 }, .radius_override = 14 },
+                .shadows = &.{.{ .color = shadow_color, .blur = 8, .offset = .{ .x = 0, .y = 3 }, .radius_override = 14 }},
             },
             .dropped = true,
         },
@@ -5232,27 +5251,27 @@ test "box: dropping a covered shadow center leaves the framebuffer identical" {
             .options = .{
                 .background = opaque_solid,
                 .radius = 4,
-                .shadow = .{ .color = shadow_color, .blur = 4, .offset = .{ .x = 20, .y = 0 } },
+                .shadows = &.{.{ .color = shadow_color, .blur = 4, .offset = .{ .x = 20, .y = 0 } }},
             },
             .dropped = false,
         },
         .{
             .name = "a clip that cuts the box in half",
             .rect = rect,
-            .options = .{ .background = opaque_solid, .radius = 8, .shadow = soft },
+            .options = .{ .background = opaque_solid, .radius = 8, .shadows = &.{soft} },
             .clip = .{ .x = 0, .y = 0, .w = 36, .h = 60 },
             .dropped = true,
         },
         .{
             .name = "a large radius leaves only the crossing strips opaque",
             .rect = .{ .x = 14, .y = 12, .w = 40, .h = 40 },
-            .options = .{ .background = opaque_solid, .radius = 16, .shadow = soft },
+            .options = .{ .background = opaque_solid, .radius = 16, .shadows = &.{soft} },
             .dropped = true,
         },
         .{
             .name = "antialiasing off",
             .rect = rect,
-            .options = .{ .background = opaque_solid, .radius = 10, .aa = false, .shadow = soft },
+            .options = .{ .background = opaque_solid, .radius = 10, .aa = false, .shadows = &.{soft} },
             .dropped = true,
         },
     };
@@ -5269,7 +5288,7 @@ test "box: dropping a covered shadow center leaves the framebuffer identical" {
         .options = .{
             .background = opaque_solid,
             .radius = 6,
-            .shadow = .{ .color = shadow_color, .blur = 8, .radius_override = 4 },
+            .shadows = &.{.{ .color = shadow_color, .blur = 8, .radius_override = 4 }},
         },
         .scale = 2.0,
         .dropped = false,
@@ -5280,7 +5299,7 @@ test "box: dropping a covered shadow center leaves the framebuffer identical" {
         try expectBoxCover(.{
             .name = "opaque background across scales",
             .rect = rect,
-            .options = .{ .background = opaque_solid, .radius = 10, .shadow = soft },
+            .options = .{ .background = opaque_solid, .radius = 10, .shadows = &.{soft} },
             .scale = scale,
             .dropped = true,
         });

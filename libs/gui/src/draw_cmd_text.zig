@@ -1732,7 +1732,7 @@ test "draw_cmd_text: a box reports its cover radius, and the parser does not tak
     try dl.box(.{ .x = 6, .y = 8, .w = 32, .h = 24 }, .{
         .background = .{ .solid = Color.rgba(0x20, 0x30, 0x40, 0xFF) },
         .radius = 10,
-        .shadow = .{ .color = Color.rgba(0, 0, 0, 0xA0), .blur = 6 },
+        .shadows = &.{.{ .color = Color.rgba(0, 0, 0, 0xA0), .blur = 6 }},
     });
     var dumped: std.ArrayList(u8) = .empty;
     defer dumped.deinit(testing.allocator);
@@ -1748,7 +1748,7 @@ test "draw_cmd_text: a box reports its cover radius, and the parser does not tak
     dl.reset(64, 64);
     try dl.box(.{ .x = 6, .y = 8, .w = 32, .h = 24 }, .{
         .radius = 10,
-        .shadow = .{ .color = Color.rgba(0, 0, 0, 0xA0), .blur = 6 },
+        .shadows = &.{.{ .color = Color.rgba(0, 0, 0, 0xA0), .blur = 6 }},
     });
     var bare: std.ArrayList(u8) = .empty;
     defer bare.deinit(testing.allocator);

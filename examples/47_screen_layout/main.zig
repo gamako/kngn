@@ -352,6 +352,10 @@ const App = struct {
     /// One card. Three of these share a row, each `grow = 1`, so the row's width is split
     /// evenly whatever the window does — no card knows its own width or position.
     /// `fraction` adds a bar under the value; no widget draws one, so it is a custom leaf.
+    ///
+    /// `elevation` is what keeps that true of the shadow as well: the card says how high
+    /// it sits and the theme paints it on the rect the layout settled, so nothing here
+    /// has to compute where the shadow goes.
     fn card(self: *App, ctx: *gui.Context, title: []const u8, value: []const u8, fraction: ?f32) void {
         ctx.beginBox(.{
             .direction = .column,
@@ -361,6 +365,7 @@ const App = struct {
             .gap = 6,
             .bg = ctx.style.surface.raised,
             .radius = 8,
+            .elevation = .raised,
             .border = .{ .color = ctx.style.border_tokens.normal, .thickness = 1 },
         });
         ctx.labelStyled(title, .label);
@@ -522,6 +527,16 @@ fn cell(ctx: *gui.Context, str: []const u8, width: i32, tier: gui.TextTier) void
 
 // ── Harness wiring ────────────────────────────────────────────────────────────
 
+fn drawlistDigest(ctx_ptr: *anyopaque, buf: []u8) []const u8 {
+    const draw_list: *const gui.DrawList = @ptrCast(@alignCast(ctx_ptr));
+    return gui.drawlistDigest(draw_list, buf);
+}
+
+fn drawlistDumpAlloc(ctx_ptr: *anyopaque, allocator: std.mem.Allocator) anyerror![]u8 {
+    const draw_list: *const gui.DrawList = @ptrCast(@alignCast(ctx_ptr));
+    return gui.drawlistDumpAlloc(allocator, draw_list);
+}
+
 fn registerHarness(app: *App) void {
     platform.registerProbe(.{
         .name = gui.layout_sanity_probe_name,
@@ -536,6 +551,17 @@ fn registerHarness(app: *App) void {
         .ext = "txt",
         .digest = digestScreen,
         .desc = "screen selection state and the rows the virtual list actually built",
+    });
+    // The cards' shadows are the one part of the screen the counters above cannot see:
+    // a card with its elevation dropped still lays out, still measures, still passes
+    // every sanity check, and only looks flatter. The command count is what notices.
+    platform.registerProbe(.{
+        .name = "drawlist",
+        .ctx = app.ctx.postFrameDrawList(),
+        .ext = "txt",
+        .digest = drawlistDigest,
+        .snapshot = drawlistDumpAlloc,
+        .desc = "screen DrawList command digest and structure dump",
     });
     platform.registerAction(.{
         .name = "reveal",

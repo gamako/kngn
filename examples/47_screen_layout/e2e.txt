@@ -22,6 +22,11 @@ expect screen cards=3
 expect screen table_rows=4
 expect screen selected=-1
 expect screen tab=all
+# Three cards at the `raised` step, two shadow layers each. The sanity counters and the
+# framebuffer hash both stay green if a card loses its elevation, so the count is what
+# says the shadows are still being emitted — on the rects the layout settled.
+digest drawlist
+expect drawlist shadow=6
 snapshot fb
 
 # The header is live: clicking the second tab moves the selection, which follows the focus.

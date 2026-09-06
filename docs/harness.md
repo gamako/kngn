@@ -332,7 +332,7 @@ command's line, not just as a pixel difference a human has to spot.
   table for both paints.
 - `digest drawlist` hashes the same per-command dump text (plus the path-wire schema
   version) into one line:
-  `hash=#XXXXXXXX rect_filled=N rect_outline=N line=N text=N image=N path=N circle_filled=N circle_outline=N offclip=N`.
+  `hash=#XXXXXXXX rect_filled=N rect_outline=N line=N text=N image=N path=N circle_filled=N circle_outline=N shadow=N offclip=N`.
   `hash` changes whenever anything the dump would show changes; the counts and
   `offclip` are the coarser, more stable half. The schema version folded into the
   hash belongs only to the binary path-verb stream in `drawlist_wire.zig`;

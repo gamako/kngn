@@ -60,6 +60,7 @@ const font_mod = @import("font.zig");
 const id_mod = @import("id.zig");
 const text_wrap = @import("text_wrap.zig");
 const layer_types = @import("layer_types.zig");
+const style_mod = @import("style.zig");
 
 pub const Rect = geom.Rect;
 pub const Vec2 = geom.Vec2;
@@ -115,7 +116,12 @@ pub const Position = struct {
     pivot: Vec2f = .{},
 };
 
-/// Box border. Emit order is bg → children → border (border draws on top of children).
+/// How high a box sits, and what that costs it in shadow. The scale and the shadows it
+/// names live with the theme; `style.zig` holds the type and the tables.
+pub const Elevation = style_mod.Elevation;
+
+/// Box border. Emit order is shadows → bg → children → border (border draws on top of
+/// children).
 /// The border is drawn inside the rect and does not affect layout math.
 ///
 /// The same type a `DrawList` box takes, so a layout box and a directly painted one
@@ -163,8 +169,26 @@ pub const BoxConfig = struct {
     align_main: Align = .start,
     align_cross: Align = .start,
     bg: ?Color = null,
-    /// Border (null = none). Emitted bg → children → border
+    /// Border (null = none). Emitted after the children; the full order is
+    /// elevation shadows → bg → children → border
     border: ?Border = null,
+    /// How far this box sits above what is behind it. The theme owns what that looks
+    /// like (`Style.elevation`), so a box states a height rather than a shadow: the
+    /// same step is the same shadow everywhere, and follows a theme change.
+    ///
+    /// Like `radius`, it changes nothing about measure, placement, or hit-testing. The
+    /// shadow is painted before this box's background and reaches outside its rect, so
+    /// an ancestor with `clip_children` cuts it; this box's own clip does not, because
+    /// that clip opens after the background. It also falls on whatever was painted
+    /// before it: draw order is tree order, so a later sibling shadows an earlier one,
+    /// the same way its background would cover it. A leaf (`text`, `custom`) never carries
+    /// one — its config is the engine's, not the caller's — so a label is raised by
+    /// the box around it, the same way it is given a background.
+    ///
+    /// For a shadow the scale cannot express, paint the box with `DrawList.box` and
+    /// `Style.shadowsFor` — at the cost of owning its rectangle, which is what this
+    /// field exists to avoid.
+    elevation: Elevation = .none,
     /// Visual corner radius for this box. Does not affect measure, placement, or hit-testing.
     radius: u32 = 0,
     /// If true, bake a clip from the content box (rect minus padding) into

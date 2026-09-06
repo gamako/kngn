@@ -2429,8 +2429,10 @@ pub const Context = struct {
         while (it) |c| : (it = c.next_sibling) self.updateRectCache(c, child_clip);
     }
 
-    /// Emit draw cmds (pre-order DFS): bg → (pushClip(content box) if clip_children) → children / leaf →
-    /// popClip → border.
+    /// Emit draw cmds (pre-order DFS): elevation shadows → bg → (pushClip(content box) if
+    /// clip_children) → children / leaf → popClip → border.
+    /// The shadows go down before the clip opens, so a box's own `clip_children` never cuts
+    /// them; an ancestor's does, because that clip is already in force here.
     /// `pushClip` uses the content box (rect minus padding), matching `updateRectCache`.
     /// border is emitted after popClip (= ancestor clip) so the frame sits on top of children.
     fn emitNode(self: *Context, node: *const layout.Node, dl: *DrawList) void {
@@ -2464,9 +2466,24 @@ pub const Context = struct {
             }
             return;
         }
-        if (node.cfg.bg) |bg| {
-            dl.rectFilledEx(node.rect, bg, .{ .radius = node.cfg.radius }) catch
-                @panic("Context.endFrame: OOM");
+        // A box at rest takes the path it always took: no elevation table is read and
+        // no `box` is assembled, so a tree that uses no elevation pays one field load
+        // and one branch for the feature and nothing else.
+        if (node.cfg.elevation == .none) {
+            if (node.cfg.bg) |bg| {
+                dl.rectFilledEx(node.rect, bg, .{ .radius = node.cfg.radius }) catch
+                    @panic("Context.endFrame: OOM");
+            }
+        } else {
+            // The shadow and the surface that hides its middle have to arrive as one
+            // statement for the renderer to drop what the background overwrites, which
+            // is why this is `box` and not a shadow call followed by a fill. The border
+            // stays behind, because children come between it and the background.
+            dl.box(node.rect, .{
+                .shadows = self.style.shadowsFor(node.cfg.elevation),
+                .background = if (node.cfg.bg) |bg| .{ .solid = bg } else null,
+                .radius = node.cfg.radius,
+            }) catch @panic("Context.endFrame: OOM");
         }
         if (node.cfg.clip_children) {
             dl.pushClip(layout.contentBox(node.rect, node.cfg.padding)) catch
@@ -3591,6 +3608,287 @@ test "layout: border emits in order bg → children → border" {
     const outline = ctx.postFrameDrawList().cmds.items[2].rect_outline;
     try std.testing.expectEqual(@as(u32, 2), outline.thickness);
     try std.testing.expectEqual(@as(u32, 100), outline.rect.w);
+}
+
+test "elevation: a raised box emits its shadows under its own background" {
+    var ctx = testCtx();
+    defer ctx.deinit();
+
+    // Two layers whose colors say which is which, so the order is readable.
+    const far = Color.rgba(0x11, 0x11, 0x11, 0x40);
+    const near = Color.rgba(0x22, 0x22, 0x22, 0x80);
+    const levels: style_mod.ElevationLevels = .{
+        .{},
+        .{ .layers = &.{
+            .{ .color = far, .offset = .{ .x = 0, .y = 8 }, .blur = 24 },
+            .{ .color = near, .offset = .{ .x = 0, .y = 1 }, .blur = 2 },
+        } },
+        .{},
+        .{},
+    };
+    ctx.style.elevation.levels = &levels;
+
+    ctx.beginFrame(800, 600);
+    ctx.beginBox(.{
+        .width = .{ .fixed = 100 },
+        .height = .{ .fixed = 40 },
+        .bg = Color.rgba(0x20, 0x20, 0x20, 0xFF),
+        .border = .{ .color = Color.rgba(0xA0, 0xA0, 0xB0, 0xFF), .thickness = 2 },
+        .radius = 6,
+        .elevation = .raised,
+    });
+    ctx.label("x");
+    ctx.endBox();
+    ctx.endFrame();
+
+    const cmds = ctx.postFrameDrawList().cmds.items;
+    try std.testing.expectEqual(@as(usize, 5), cmds.len);
+    // shadows (back to front) -> background -> children -> border
+    try std.testing.expectEqual(far, cmds[0].shadow.color);
+    try std.testing.expectEqual(near, cmds[1].shadow.color);
+    try std.testing.expect(cmds[2] == .rect_filled);
+    try std.testing.expect(cmds[3] == .text);
+    try std.testing.expect(cmds[4] == .rect_outline);
+
+    // The shadow sits on the rect the layout settled, which is the whole point: no
+    // caller had to know where the box landed.
+    const rect = ctx.getNodeRect(0) orelse cmds[2].rect_filled.rect;
+    try std.testing.expectEqual(rect, cmds[0].shadow.rect);
+    try std.testing.expectEqual(rect, cmds[1].shadow.rect);
+    try std.testing.expectEqual(@as(u32, 100), cmds[0].shadow.rect.w);
+
+    // The box radius reaches both silhouettes, and the opaque background claims to
+    // cover both centers — not only the layer nearest to it.
+    try std.testing.expectEqual(@as(u32, 6), cmds[0].shadow.options.radius);
+    try std.testing.expectEqual(@as(u32, 6), cmds[1].shadow.options.radius);
+    try std.testing.expectEqual(@as(u32, 6), cmds[0].shadow.opaque_cover_radius);
+    try std.testing.expectEqual(@as(u32, 6), cmds[1].shadow.opaque_cover_radius);
+}
+
+test "elevation: none draws exactly what it drew before, whatever the table holds" {
+    // The claim is that a tree using no elevation is unchanged. What a test can hold
+    // is that the table cannot reach the output: an implementation that reads it and
+    // discards the answer passes this too, and the fast path in `emitNode` is what
+    // rules that out.
+    const loud: style_mod.ElevationLevels = .{
+        .{ .layers = &.{.{ .color = Color.rgba(0xFF, 0x00, 0xFF, 0xFF), .blur = 40 }} },
+        .{ .layers = &.{.{ .color = Color.rgba(0xFF, 0x00, 0xFF, 0xFF), .blur = 40 }} },
+        .{ .layers = &.{.{ .color = Color.rgba(0xFF, 0x00, 0xFF, 0xFF), .blur = 40 }} },
+        .{ .layers = &.{.{ .color = Color.rgba(0xFF, 0x00, 0xFF, 0xFF), .blur = 40 }} },
+    };
+    var ctx = testCtx();
+    defer ctx.deinit();
+    ctx.style.elevation.levels = &loud;
+
+    ctx.beginFrame(800, 600);
+    ctx.beginBox(.{
+        .width = .{ .fixed = 100 },
+        .height = .{ .fixed = 40 },
+        .bg = Color.rgba(0x20, 0x20, 0x20, 0xFF),
+        .radius = 6,
+    });
+    ctx.endBox();
+    ctx.endFrame();
+
+    const cmds = ctx.postFrameDrawList().cmds.items;
+    try std.testing.expectEqual(@as(usize, 1), cmds.len);
+    const fill = cmds[0].rect_filled;
+    try std.testing.expectEqual(Color.rgba(0x20, 0x20, 0x20, 0xFF), fill.paint.solid);
+    try std.testing.expectEqual(@as(u32, 6), fill.radius);
+    try std.testing.expect(fill.aa);
+    try std.testing.expectEqual(@as(u32, 100), fill.rect.w);
+}
+
+test "elevation: each step is its own shadow, so a swapped index shows" {
+    var ctx = testCtx();
+    defer ctx.deinit();
+
+    ctx.beginFrame(800, 600);
+    ctx.beginBox(.{ .width = .{ .fixed = 40 }, .height = .{ .fixed = 20 }, .elevation = .raised });
+    ctx.endBox();
+    ctx.beginBox(.{ .width = .{ .fixed = 40 }, .height = .{ .fixed = 20 }, .elevation = .elevated });
+    ctx.endBox();
+    ctx.beginBox(.{ .width = .{ .fixed = 40 }, .height = .{ .fixed = 20 }, .elevation = .overlay });
+    ctx.endBox();
+    ctx.endFrame();
+
+    const cmds = ctx.postFrameDrawList().cmds.items;
+    try std.testing.expectEqual(@as(usize, 6), cmds.len);
+    const raised_far = cmds[0].shadow.options.blur;
+    const elevated_far = cmds[2].shadow.options.blur;
+    const overlay_far = cmds[4].shadow.options.blur;
+    try std.testing.expect(raised_far < elevated_far);
+    try std.testing.expect(elevated_far < overlay_far);
+    // With no background there is nothing to cover the centers.
+    for (cmds) |cmd| try std.testing.expectEqual(draw.no_opaque_cover, cmd.shadow.opaque_cover_radius);
+}
+
+test "elevation: an ancestor clip cuts the shadow, the box's own clip does not" {
+    var ctx = testCtx();
+    defer ctx.deinit();
+
+    ctx.beginFrame(800, 600);
+    ctx.beginBox(.{
+        .width = .{ .fixed = 200 },
+        .height = .{ .fixed = 100 },
+        .padding = .{ 10, 10, 10, 10 },
+        .clip_children = true,
+    });
+    ctx.beginBox(.{
+        .width = .{ .fixed = 50 },
+        .height = .{ .fixed = 30 },
+        .bg = Color.rgba(0x20, 0x20, 0x20, 0xFF),
+        .clip_children = true,
+        .elevation = .raised,
+    });
+    ctx.endBox();
+    ctx.endBox();
+    ctx.endFrame();
+
+    const cmds = ctx.postFrameDrawList().cmds.items;
+    // The child's shadows carry the parent's content box, not the child's own clip:
+    // the child's clip opens after its background, so it never reaches its own shadow.
+    const content = layout.contentBox(.{ .x = 0, .y = 0, .w = 200, .h = 100 }, .{ 10, 10, 10, 10 });
+    var shadows: usize = 0;
+    for (cmds) |cmd| switch (cmd) {
+        .shadow => |sh| {
+            shadows += 1;
+            try std.testing.expectEqual(content, sh.clip);
+        },
+        else => {},
+    };
+    try std.testing.expectEqual(@as(usize, 2), shadows);
+}
+
+test "elevation: a positioned box shadows its settled rect, and scroll moves it" {
+    var ctx = testCtx();
+    defer ctx.deinit();
+
+    ctx.beginFrame(800, 600);
+    ctx.beginBox(.{
+        .width = .{ .fixed = 200 },
+        .height = .{ .fixed = 100 },
+        .scroll_y = 7,
+    });
+    ctx.beginBox(.{
+        .width = .{ .fixed = 40 },
+        .height = .{ .fixed = 20 },
+        .elevation = .raised,
+        .position = .{ .left = .{ .length = .{ .px = 30 } }, .top = .{ .length = .{ .px = 50 } } },
+    });
+    ctx.endBox();
+    ctx.beginBox(.{ .width = .{ .fixed = 40 }, .height = .{ .fixed = 20 }, .elevation = .raised });
+    ctx.endBox();
+    ctx.endBox();
+    ctx.endFrame();
+
+    const cmds = ctx.postFrameDrawList().cmds.items;
+    // Four shadows: two layers each for the positioned box and the in-flow one. Both
+    // layers of a box sit on the same rect, which is the rect the layout settled.
+    try std.testing.expectEqual(@as(usize, 4), cmds.len);
+
+    // Positioned: placed by its own insets, and the parent's scroll shifts it like any
+    // other child. Both axes, so an implementation that carries only x through fails.
+    const positioned = cmds[0].shadow.rect;
+    try std.testing.expectEqual(@as(i32, 30), positioned.x);
+    try std.testing.expectEqual(@as(i32, 50 - 7), positioned.y);
+    try std.testing.expectEqual(positioned, cmds[1].shadow.rect);
+
+    // In flow, under the same scroll: the box moved up and its shadow moved with it.
+    const in_flow = cmds[2].shadow.rect;
+    try std.testing.expectEqual(@as(i32, 0), in_flow.x);
+    try std.testing.expectEqual(@as(i32, -7), in_flow.y);
+    try std.testing.expectEqual(in_flow, cmds[3].shadow.rect);
+}
+
+test "elevation: the focus ring still draws over the border, which draws over the shadows" {
+    var ctx = testCtx();
+    defer ctx.deinit();
+
+    ctx.state.focused_id = 0x901;
+    ctx.state.focus_visible = true;
+
+    ctx.beginFrame(800, 600);
+    ctx.beginBox(.{
+        .id = 0x901,
+        .width = .{ .fixed = 60 },
+        .height = .{ .fixed = 30 },
+        .bg = Color.rgba(0x20, 0x20, 0x20, 0xFF),
+        .border = .{ .color = Color.rgba(0xA0, 0xA0, 0xB0, 0xFF), .thickness = 2 },
+        .elevation = .raised,
+    });
+    ctx.endBox();
+    ctx.endFrame();
+
+    const cmds = ctx.postFrameDrawList().cmds.items;
+    // shadows, background, border, focus ring — the ring last, so raising a box does not
+    // put its shadow over the ring that says where the keyboard is.
+    try std.testing.expectEqual(@as(usize, 5), cmds.len);
+    try std.testing.expect(cmds[0] == .shadow);
+    try std.testing.expect(cmds[1] == .shadow);
+    try std.testing.expect(cmds[2] == .rect_filled);
+    try std.testing.expectEqual(@as(u32, 2), cmds[3].rect_outline.thickness);
+    try std.testing.expectEqual(ctx.style.accent.focus, cmds[4].rect_outline.color);
+}
+
+test "elevation: a layer root and a box inside it each shadow their own rect" {
+    var ctx = testCtx();
+    defer ctx.deinit();
+
+    const spec: LayerSpec = .{
+        .key = .{ .value = 0x910 },
+        .placement = .{ .source = .{ .point = .{ .x = 40, .y = 60 } } },
+    };
+
+    ctx.beginFrame(800, 600);
+    // An ordinary box first, so the layer's commands can be told apart by position.
+    ctx.beginBox(.{ .width = .{ .fixed = 20 }, .height = .{ .fixed = 10 }, .bg = Color.rgba(1, 1, 1, 0xFF) });
+    ctx.endBox();
+    ctx.beginBox(.{
+        .layer = &spec,
+        .width = .{ .fixed = 100 },
+        .height = .{ .fixed = 80 },
+        .bg = Color.rgba(0x30, 0x30, 0x30, 0xFF),
+        .elevation = .elevated,
+        .clip_children = true,
+    });
+    ctx.beginBox(.{
+        .width = .{ .fixed = 40 },
+        .height = .{ .fixed = 20 },
+        .bg = Color.rgba(0x40, 0x40, 0x40, 0xFF),
+        .elevation = .raised,
+    });
+    ctx.endBox();
+    ctx.endBox();
+    ctx.endFrame();
+
+    const cmds = ctx.postFrameDrawList().cmds.items;
+    // The layer is emitted after the main tree, so everything belonging to it comes
+    // after the ordinary box's fill.
+    try std.testing.expect(cmds[0] == .rect_filled);
+
+    var shadows: [4]@FieldType(draw.DrawCmd, "shadow") = undefined;
+    var n: usize = 0;
+    for (cmds[1..]) |cmd| switch (cmd) {
+        .shadow => |sh| {
+            shadows[n] = sh;
+            n += 1;
+        },
+        else => {},
+    };
+    try std.testing.expectEqual(@as(usize, 4), n);
+
+    // The root's own shadows sit on the root's rect, placed against the layer's anchor,
+    // and are not cut by the root's own clip.
+    try std.testing.expectEqual(@as(i32, 40), shadows[0].rect.x);
+    try std.testing.expectEqual(@as(i32, 60), shadows[0].rect.y);
+    try std.testing.expectEqual(@as(u32, 100), shadows[0].rect.w);
+    try std.testing.expectEqual(shadows[0].rect, shadows[1].rect);
+
+    // The child's are on the child's rect and are cut by the root's clip.
+    try std.testing.expectEqual(@as(u32, 40), shadows[2].rect.w);
+    try std.testing.expectEqual(@as(u32, 100), shadows[2].clip.w);
+    try std.testing.expect(shadows[0].clip.w != shadows[2].clip.w);
 }
 
 test "label: default color follows the primary text token" {

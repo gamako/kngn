@@ -5,9 +5,11 @@
 
 const color_mod = @import("color.zig");
 const font_mod = @import("font.zig");
+const draw_mod = @import("draw.zig");
 
 pub const Color = color_mod.Color;
 pub const Font = font_mod.Font;
+pub const BoxShadow = draw_mod.BoxShadow;
 
 /// Color, size, weight, and optional explicit font for one text tier. `font = null` lets Context
 /// resolve the size/weight through its default family; an explicit font always wins and ignores
@@ -114,8 +116,104 @@ pub const TextTokens = struct {
     subtle: Color,
 };
 
+/// How far a surface sits above the one behind it. A box states its height and the
+/// theme decides what the shadow looks like, the way a surface states `panel` or
+/// `raised` rather than a hex colour.
+///
+/// This is a scale of roles, not the millimetre scale of Material Design. `raised`
+/// is a card that stays in the tree; `elevated` is a surface that opens over the
+/// content, such as a dropdown, a menu or a tooltip; `overlay` is a modal. **The
+/// step changes nothing but the shadow** — not the draw order, not the layer route,
+/// not the hit-test.
+pub const Elevation = enum(u8) {
+    none = 0,
+    raised,
+    elevated,
+    overlay,
+};
+
+/// The shadow of one step, in paint order: `layers[0]` goes down first and sits
+/// furthest back. Two layers is the usual shape — a tight dark one for the contact
+/// edge, a wide faint one for the height — because a real penumbra does not fall
+/// off at one blur radius.
+///
+/// **CSS lists shadows front-to-back**, so a `box-shadow` value transcribed into
+/// this slice is reversed.
+pub const ElevationLevel = struct { layers: []const BoxShadow = &.{} };
+
+/// One `ElevationLevel` per `Elevation`, indexed by the enum's value. Adding a step
+/// to the enum makes this array wider, which is what keeps the two from drifting
+/// apart. The `.none` entry is never read.
+pub const ElevationLevels = [@typeInfo(Elevation).@"enum".fields.len]ElevationLevel;
+
+comptime {
+    // `Style.shadowsFor` indexes `levels` with `@intFromEnum`, so the values have to
+    // be the array's indices: `.none` first, no gaps, nothing past the end. The array
+    // length alone does not say that — an enum with a gap still fits the length and
+    // then reads out of bounds.
+    const fields = @typeInfo(Elevation).@"enum".fields;
+    if (@intFromEnum(Elevation.none) != 0) @compileError("Elevation.none must be 0");
+    for (fields, 0..) |field, i| {
+        if (field.value != i) @compileError("Elevation values must be the indices of ElevationLevels");
+    }
+}
+
 pub const ElevationTokens = struct {
-    shadow: Color,
+    /// The one source for what a shadow looks like. A caller drawing a box by hand
+    /// asks `Style.shadowsFor` rather than indexing this table, so how a step is
+    /// built up — how many layers, which one is the contact edge — is the theme's to
+    /// change. What is fixed is that the slice comes back in paint order, because a
+    /// `DrawList` paints commands in the order they were appended.
+    ///
+    /// The pointer is borrowed: this table, and the `layers` array of every level in
+    /// it, must outlive every frame drawn with the style holding it, and must not be
+    /// rewritten while a frame is open. Both defaults are static data, so a caller
+    /// that replaces nothing satisfies that by construction.
+    ///
+    /// **A table built inside the function that installs it is the mistake this rule
+    /// is about.** It is not diagnosed: the first frame draws correctly, and the frame
+    /// after the stack is reused draws from whatever is there now. Declare the table at
+    /// file scope, or store it in the application's own state, so it lives as long as
+    /// the style pointing at it.
+    levels: *const ElevationLevels,
+};
+
+/// The dark theme's steps. Each is a wide faint layer for the height and a tight
+/// dark one for the contact edge, in that (paint) order.
+pub const dark_elevation_levels: ElevationLevels = .{
+    .{},
+    .{ .layers = &.{
+        .{ .color = Color.rgba(0x00, 0x00, 0x00, 0x47), .offset = .{ .x = 0, .y = 8 }, .blur = 24 },
+        .{ .color = Color.rgba(0x00, 0x00, 0x00, 0x73), .offset = .{ .x = 0, .y = 1 }, .blur = 2 },
+    } },
+    .{ .layers = &.{
+        .{ .color = Color.rgba(0x00, 0x00, 0x00, 0x73), .offset = .{ .x = 0, .y = 16 }, .blur = 48 },
+        .{ .color = Color.rgba(0x00, 0x00, 0x00, 0x80), .offset = .{ .x = 0, .y = 4 }, .blur = 8 },
+    } },
+    // A modal is read against a scrim that has already darkened everything behind it,
+    // so the step that reads as frontmost has to be stronger than the one below it.
+    .{ .layers = &.{
+        .{ .color = Color.rgba(0x00, 0x00, 0x00, 0x80), .offset = .{ .x = 0, .y = 24 }, .blur = 64 },
+        .{ .color = Color.rgba(0x00, 0x00, 0x00, 0x8C), .offset = .{ .x = 0, .y = 8 }, .blur = 16 },
+    } },
+};
+
+/// The light theme's steps. A light ground needs a tinted, far weaker shadow than a
+/// dark one: the same alpha over white reads as dirt rather than depth.
+pub const light_elevation_levels: ElevationLevels = .{
+    .{},
+    .{ .layers = &.{
+        .{ .color = Color.rgba(0x10, 0x10, 0x1C, 0x0F), .offset = .{ .x = 0, .y = 8 }, .blur = 24 },
+        .{ .color = Color.rgba(0x10, 0x10, 0x1C, 0x0F), .offset = .{ .x = 0, .y = 1 }, .blur = 2 },
+    } },
+    .{ .layers = &.{
+        .{ .color = Color.rgba(0x10, 0x10, 0x1C, 0x24), .offset = .{ .x = 0, .y = 16 }, .blur = 48 },
+        .{ .color = Color.rgba(0x10, 0x10, 0x1C, 0x1A), .offset = .{ .x = 0, .y = 4 }, .blur = 8 },
+    } },
+    .{ .layers = &.{
+        .{ .color = Color.rgba(0x10, 0x10, 0x1C, 0x2E), .offset = .{ .x = 0, .y = 24 }, .blur = 64 },
+        .{ .color = Color.rgba(0x10, 0x10, 0x1C, 0x24), .offset = .{ .x = 0, .y = 8 }, .blur = 16 },
+    } },
 };
 
 /// Partial color override for button-like widgets. A null field keeps the active theme token.
@@ -237,6 +335,18 @@ pub const Style = struct {
     pub fn textStyle(self: Style, tier: TextTier) TextStyle {
         return self.text_styles[tierIndex(tier)];
     }
+
+    /// The shadow layers of one step, **in paint order**: index 0 is painted first and
+    /// sits furthest back. This is the only way to read the table, so a caller painting
+    /// a box by hand gets the same shadow a layout box at that step gets, without
+    /// depending on how many layers there are or which one is the contact edge.
+    ///
+    /// Takes a pointer because `Style` is large enough that copying it to read a
+    /// slice would be the expensive half of the call.
+    pub fn shadowsFor(self: *const Style, e: Elevation) []const BoxShadow {
+        if (e == .none) return &.{};
+        return self.elevation.levels[@intFromEnum(e)].layers;
+    }
 };
 
 /// The one place the size and weight of every tier is written. `primary` colours the tiers
@@ -321,7 +431,7 @@ pub fn defaultStyle() Style {
         },
         .{ .normal = Color.rgba(0x60, 0x60, 0x6C, 0xFF), .hover = Color.rgba(0xA0, 0xA0, 0xB0, 0xFF) },
         .{ .primary = Color.rgba(0xFF, 0xFF, 0xFF, 0xFF), .subtle = Color.rgba(0x90, 0x98, 0xA0, 0xFF) },
-        .{ .shadow = Color.rgba(0x00, 0x00, 0x00, 0xB0) },
+        .{ .levels = &dark_elevation_levels },
     );
 }
 
@@ -353,7 +463,7 @@ pub fn lightStyle() Style {
         },
         .{ .normal = Color.rgba(0xAA, 0xB6, 0xC6, 0xFF), .hover = Color.rgba(0x63, 0x73, 0x8A, 0xFF) },
         .{ .primary = Color.rgba(0x17, 0x20, 0x33, 0xFF), .subtle = Color.rgba(0x52, 0x61, 0x76, 0xFF) },
-        .{ .shadow = Color.rgba(0x00, 0x00, 0x00, 0x38) },
+        .{ .levels = &light_elevation_levels },
     );
 }
 
@@ -564,7 +674,7 @@ test "defaultStyle: semantic dark accent border text and elevation tokens are ex
     try std.testing.expectEqual(Color.rgba(0xA0, 0xA0, 0xB0, 0xFF), s.border_tokens.hover);
     try std.testing.expectEqual(Color.rgba(0xFF, 0xFF, 0xFF, 0xFF), s.text_tokens.primary);
     try std.testing.expectEqual(Color.rgba(0x90, 0x98, 0xA0, 0xFF), s.text_tokens.subtle);
-    try std.testing.expectEqual(Color.rgba(0x00, 0x00, 0x00, 0xB0), s.elevation.shadow);
+    try std.testing.expectEqual(&dark_elevation_levels, s.elevation.levels);
     try std.testing.expectEqual(Color.rgba(0x24, 0x24, 0x2C, 0xFF), s.input_background);
     try std.testing.expectEqual(Color.rgba(0x30, 0x60, 0xC0, 0xFF), s.selection_background);
     try std.testing.expectEqual(Color.rgba(0x30, 0x30, 0x38, 0xFF), s.slider_track_bg);
@@ -593,7 +703,7 @@ test "lightStyle: values and derived colors are theme-local" {
     try std.testing.expectEqual(Color.rgba(0x52, 0x61, 0x76, 0xFF), s.text_tokens.subtle);
     try std.testing.expectEqual(Color.rgba(0x25, 0x63, 0xEB, 0xFF), s.accent.focus);
     try std.testing.expectEqual(Color.rgba(0xC0, 0x39, 0x2B, 0xFF), s.accent.danger);
-    try std.testing.expectEqual(Color.rgba(0x00, 0x00, 0x00, 0x38), s.elevation.shadow);
+    try std.testing.expectEqual(&light_elevation_levels, s.elevation.levels);
     try std.testing.expectEqual(Color.rgba(0xEA, 0xEC, 0xEF, 0xFF), s.disabledColor(s.surface.control));
     try std.testing.expectEqual(Color.rgba(0x9D, 0xA7, 0xB4, 0xFF), s.mutedFromSubtle());
     try std.testing.expectEqual(s.text_tokens.primary, s.textStyle(.title).color);
@@ -609,4 +719,97 @@ test "WidgetStyle: every override is optional" {
     try std.testing.expect(empty.border == null);
     try std.testing.expect(empty.hover_border == null);
     try std.testing.expect(empty.text == null);
+}
+
+test "elevation: none's answer does not depend on the table's contents" {
+    // A style whose table is a level of one absurd layer: if `.none` read the table,
+    // the empty answer below would be that layer instead.
+    const loud: ElevationLevels = .{
+        .{ .layers = &.{.{ .color = Color.rgba(0xFF, 0x00, 0xFF, 0xFF), .blur = 99 }} },
+        .{},
+        .{},
+        .{},
+    };
+    var s = defaultStyle();
+    s.elevation.levels = &loud;
+    try std.testing.expectEqual(@as(usize, 0), s.shadowsFor(.none).len);
+}
+
+test "elevation: every step is two layers, painted back to front" {
+    for ([_]Style{ defaultStyle(), lightStyle() }) |s| {
+        for ([_]Elevation{ .raised, .elevated, .overlay }) |e| {
+            const layers = s.shadowsFor(e);
+            try std.testing.expectEqual(@as(usize, 2), layers.len);
+            // The far layer goes down first: blurrier and further from the box than
+            // the contact layer that paints over it.
+            try std.testing.expect(layers[0].blur > layers[1].blur);
+            try std.testing.expect(layers[0].offset.y > layers[1].offset.y);
+        }
+    }
+}
+
+test "elevation: the steps are ordered, and each theme has its own values" {
+    const dark = defaultStyle();
+    const light = lightStyle();
+    // A step further from the page casts a wider shadow than the one below it.
+    try std.testing.expect(dark.shadowsFor(.elevated)[0].blur > dark.shadowsFor(.raised)[0].blur);
+    try std.testing.expect(dark.shadowsFor(.overlay)[0].blur > dark.shadowsFor(.elevated)[0].blur);
+    // A light ground takes a tinted, far weaker shadow than a dark one.
+    try std.testing.expect(light.shadowsFor(.raised)[0].color.a < dark.shadowsFor(.raised)[0].color.a);
+    try std.testing.expect(light.shadowsFor(.raised)[0].color.r != 0);
+    // The two steps are not the same shadow under different names.
+    try std.testing.expect(dark.shadowsFor(.raised)[0].blur != dark.shadowsFor(.elevated)[0].blur);
+}
+
+test "elevation: the dark steps are exactly these shadows" {
+    // The relative tests below say the scale is ordered and themed. They stay green if
+    // every value drifts together, which is how a shadow quietly becomes something else,
+    // so the design values are written out once here.
+    const s = defaultStyle();
+    try std.testing.expectEqualSlices(BoxShadow, &.{
+        .{ .color = Color.rgba(0x00, 0x00, 0x00, 0x47), .offset = .{ .x = 0, .y = 8 }, .blur = 24 },
+        .{ .color = Color.rgba(0x00, 0x00, 0x00, 0x73), .offset = .{ .x = 0, .y = 1 }, .blur = 2 },
+    }, s.shadowsFor(.raised));
+    try std.testing.expectEqualSlices(BoxShadow, &.{
+        .{ .color = Color.rgba(0x00, 0x00, 0x00, 0x73), .offset = .{ .x = 0, .y = 16 }, .blur = 48 },
+        .{ .color = Color.rgba(0x00, 0x00, 0x00, 0x80), .offset = .{ .x = 0, .y = 4 }, .blur = 8 },
+    }, s.shadowsFor(.elevated));
+    try std.testing.expectEqualSlices(BoxShadow, &.{
+        .{ .color = Color.rgba(0x00, 0x00, 0x00, 0x80), .offset = .{ .x = 0, .y = 24 }, .blur = 64 },
+        .{ .color = Color.rgba(0x00, 0x00, 0x00, 0x8C), .offset = .{ .x = 0, .y = 8 }, .blur = 16 },
+    }, s.shadowsFor(.overlay));
+}
+
+test "elevation: the light steps are exactly these shadows" {
+    const s = lightStyle();
+    try std.testing.expectEqualSlices(BoxShadow, &.{
+        .{ .color = Color.rgba(0x10, 0x10, 0x1C, 0x0F), .offset = .{ .x = 0, .y = 8 }, .blur = 24 },
+        .{ .color = Color.rgba(0x10, 0x10, 0x1C, 0x0F), .offset = .{ .x = 0, .y = 1 }, .blur = 2 },
+    }, s.shadowsFor(.raised));
+    try std.testing.expectEqualSlices(BoxShadow, &.{
+        .{ .color = Color.rgba(0x10, 0x10, 0x1C, 0x24), .offset = .{ .x = 0, .y = 16 }, .blur = 48 },
+        .{ .color = Color.rgba(0x10, 0x10, 0x1C, 0x1A), .offset = .{ .x = 0, .y = 4 }, .blur = 8 },
+    }, s.shadowsFor(.elevated));
+    try std.testing.expectEqualSlices(BoxShadow, &.{
+        .{ .color = Color.rgba(0x10, 0x10, 0x1C, 0x2E), .offset = .{ .x = 0, .y = 24 }, .blur = 64 },
+        .{ .color = Color.rgba(0x10, 0x10, 0x1C, 0x24), .offset = .{ .x = 0, .y = 8 }, .blur = 16 },
+    }, s.shadowsFor(.overlay));
+}
+
+test "elevation: a consumer can replace the whole table" {
+    const spec: ElevationLevels = .{
+        .{},
+        .{ .layers = &.{
+            .{ .color = Color.rgba(0x10, 0x10, 0x1C, 0x0F), .offset = .{ .x = 0, .y = 8 }, .blur = 24 },
+            .{ .color = Color.rgba(0x10, 0x10, 0x1C, 0x0F), .offset = .{ .x = 0, .y = 1 }, .blur = 2 },
+        } },
+        .{},
+        .{},
+    };
+    var s = defaultStyle();
+    s.elevation.levels = &spec;
+    const layers = s.shadowsFor(.raised);
+    try std.testing.expectEqual(@as(usize, 2), layers.len);
+    try std.testing.expectEqual(@as(u32, 24), layers[0].blur);
+    try std.testing.expectEqual(Color.rgba(0x10, 0x10, 0x1C, 0x0F), layers[1].color);
 }

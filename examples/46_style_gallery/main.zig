@@ -445,6 +445,10 @@ fn appendGradients(app: *App) !void {
     } });
 }
 
+/// The showcase's own shadow ink. The panels below are about the option combinations,
+/// not about the theme, so the colour is theirs.
+const showcase_shadow = gui.Color.rgba(0x00, 0x00, 0x00, 0xB0);
+
 fn appendShadows(app: *App) !void {
     const draw_list = app.ctx.postFrameDrawList();
     app.fill_count = 0;
@@ -467,20 +471,39 @@ fn appendShadows(app: *App) !void {
         .{ .rect = .{ .x = 248, .y = 360, .w = 300, .h = 128 }, .radius = 6, .blur = 24, .offset = .{ .x = 4, .y = 4 }, .color = gui.Color.rgba(0x40, 0xD8, 0xC0, 0xFF) },
     };
     for (panels) |panel| {
+        // These panels vary one option at a time, so each owns its shadow outright
+        // rather than asking the theme — which is the case `shadows` is for when the
+        // elevation scale does not have the step you mean.
         try draw_list.box(panel.rect, .{
             .background = .{ .solid = panel.color },
             .border = .{ .color = gui.Color.rgba(0xFF, 0xFF, 0xFF, 0x60), .thickness = 1 },
             .radius = panel.radius,
-            .shadow = .{
-                .color = app.ctx.style.elevation.shadow,
+            .shadows = &.{.{
+                .color = showcase_shadow,
                 .offset = panel.offset,
                 .blur = panel.blur,
-            },
+            }},
         });
         app.shadow_count += 1;
         app.fill_count += 1;
         app.stroke_count += 1;
     }
+
+    // And the other way round: a panel painted by hand that still wants the theme's
+    // idea of how high it sits. `shadowsFor` is how a hand-drawn box gets the same
+    // shadow a laid-out box at that step gets — two layers here, without this file
+    // knowing that.
+    const themed = gui.Rect{ .x = 612, .y = 360, .w = 252, .h = 128 };
+    const themed_shadows = app.ctx.style.shadowsFor(.elevated);
+    try draw_list.box(themed, .{
+        .background = .{ .solid = app.ctx.style.surface.elevated },
+        .border = .{ .color = gui.Color.rgba(0xFF, 0xFF, 0xFF, 0x60), .thickness = 1 },
+        .radius = 12,
+        .shadows = themed_shadows,
+    });
+    app.shadow_count += @intCast(themed_shadows.len);
+    app.fill_count += 1;
+    app.stroke_count += 1;
 }
 
 /// Appends the fixed path scene once per frame; all shapes are inside the framebuffer.

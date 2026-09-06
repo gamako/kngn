@@ -104,7 +104,9 @@ the Context draw-list accessors hold**, so here is the index — the source is
 - rectangles: `rectFilled`, `rectOutline`, and the `…Ex` forms taking a corner radius
 - paint (gradients): `rectFilledPaint`, `rectFilledPaintEx`
 - circles and lines: `circleFilled`, `circleOutline`, `line`
-- shadow: `shadow` for a standalone one, `box` when a background sits on top of it
+- shadow: `shadow` for a standalone one, `box` when a background sits on top of it —
+  `BoxOptions.shadows` takes as many layers as the look needs, in paint order, and
+  `Style.shadowsFor(step)` hands you the theme's set for one step of the elevation scale
 - text: `text`, and `textEx` when you want a font other than the context's
 - images: `image`
 - paths: `beginPath`

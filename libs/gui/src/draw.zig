@@ -261,9 +261,9 @@ pub const no_opaque_cover: u32 = std.math.maxInt(u32);
 /// means no border; a thickness of zero is one physical pixel, not "none".
 pub const Border = struct { color: Color, thickness: u32 };
 
-/// A box's outer shadow. The radius follows `BoxOptions.radius`, which is what a
-/// caller wants unless the shadow's silhouette is deliberately a different shape
-/// from the box that casts it.
+/// One layer of a box's outer shadow. The radius follows `BoxOptions.radius`,
+/// which is what a caller wants unless the shadow's silhouette is deliberately a
+/// different shape from the box that casts it.
 pub const BoxShadow = struct {
     color: Color,
     offset: Vec2 = .{ .x = 0, .y = 0 },
@@ -277,9 +277,19 @@ pub const BoxOptions = struct {
     background: ?Paint = null,
     border: ?Border = null,
     /// The corner radius of the background, the border, and — unless
-    /// `BoxShadow.radius_override` says otherwise — the shadow.
+    /// `BoxShadow.radius_override` says otherwise — every shadow.
     radius: u32 = 0,
-    shadow: ?BoxShadow = null,
+    /// Outer shadow layers, **in paint order**: `shadows[0]` is painted first and
+    /// therefore sits furthest back, and each later layer paints over it. All of
+    /// them sit under the background.
+    ///
+    /// Two layers is the usual shape of a raised surface — a tight, dark one for
+    /// the contact edge and a wide, faint one for the height — because the falloff
+    /// of a real penumbra is not one blur radius.
+    ///
+    /// **CSS lists shadows front-to-back**, so a `box-shadow` value transcribed
+    /// into this slice is reversed.
+    shadows: []const BoxShadow = &.{},
     /// Antialiasing for the background and the border. A shadow's coverage comes
     /// from its mask and does not read this.
     aa: bool = true,
@@ -630,28 +640,28 @@ pub const DrawList = struct {
         } });
     }
 
-    /// Paint one box: an outer shadow, a background, and a uniform border, in that
-    /// order, over the same rectangle. Any part may be absent.
+    /// Paint one box: its outer shadow layers, a background, and a uniform border,
+    /// in that order, over the same rectangle. Any part may be absent.
     ///
     /// This is where a shadow and the surface that covers it become one statement.
-    /// Because the pair arrives together, the renderer can drop the part of the
+    /// Because the pair arrives together, the renderer can drop the part of each
     /// shadow that the background overwrites — roughly three quarters of its area
     /// for a typical panel — without a caller flag or a guess about what the next
-    /// command will be.
+    /// command will be. Every layer of a multi-layer shadow gets that treatment,
+    /// because the background covers them all alike.
     ///
-    /// The three commands share one clip and are appended together or not at all:
+    /// The commands share one clip and are appended together or not at all:
     /// running out of memory leaves the list exactly as it was.
     pub fn box(self: *DrawList, rect: Rect, options: BoxOptions) Allocator.Error!void {
-        var needed: usize = 0;
-        if (options.shadow != null) needed += 1;
+        var needed: usize = options.shadows.len;
         if (options.background != null) needed += 1;
         if (options.border != null) needed += 1;
         if (needed == 0) return;
 
         try self.cmds.ensureUnusedCapacity(self.alloc, needed);
         const clip = self.currentClip();
-        if (options.shadow) |s| {
-            const covers = if (options.background) |paint| paintIsOpaque(paint) else false;
+        const covers = if (options.background) |paint| paintIsOpaque(paint) else false;
+        for (options.shadows) |s| {
             self.cmds.appendAssumeCapacity(.{ .shadow = .{
                 .rect = rect,
                 .color = s.color,
@@ -687,6 +697,8 @@ pub const DrawList = struct {
 
     /// Append an independent box-shadow command. The shadow is composited before
     /// later commands, so a panel can cover its center without a second pass.
+    /// A shadow queued this way always paints its center: only `box` knows that a
+    /// background is coming.
     pub fn shadow(self: *DrawList, rect: Rect, col: Color, options: ShadowOptions) Allocator.Error!void {
         try self.cmds.append(self.alloc, .{ .shadow = .{
             .rect = rect,
@@ -1163,7 +1175,7 @@ test "box: each part appends its own command, shadow then background then border
         .background = .{ .solid = Color.rgba(1, 2, 3, 0xFF) },
         .border = .{ .color = Color.rgba(4, 5, 6, 0xFF), .thickness = 2 },
         .radius = 7,
-        .shadow = .{ .color = Color.rgba(0, 0, 0, 0x80), .blur = 5 },
+        .shadows = &.{.{ .color = Color.rgba(0, 0, 0, 0x80), .blur = 5 }},
     });
     try std.testing.expectEqual(@as(usize, 3), dl.cmds.items.len);
     try std.testing.expect(dl.cmds.items[0] == .shadow);
@@ -1209,14 +1221,14 @@ test "box: the shadow follows the box radius until an override says otherwise" {
     defer dl.deinit();
     dl.reset(64, 48);
     const rect = Rect{ .x = 4, .y = 6, .w = 30, .h = 18 };
-    try dl.box(rect, .{ .radius = 9, .shadow = .{ .color = Color.rgba(0, 0, 0, 0x80) } });
+    try dl.box(rect, .{ .radius = 9, .shadows = &.{.{ .color = Color.rgba(0, 0, 0, 0x80) }} });
     try std.testing.expectEqual(@as(u32, 9), dl.cmds.items[0].shadow.options.radius);
 
     dl.reset(64, 48);
     try dl.box(rect, .{
         .background = .{ .solid = Color.rgba(1, 2, 3, 0xFF) },
         .radius = 9,
-        .shadow = .{ .color = Color.rgba(0, 0, 0, 0x80), .radius_override = 3 },
+        .shadows = &.{.{ .color = Color.rgba(0, 0, 0, 0x80), .radius_override = 3 }},
     });
     try std.testing.expectEqual(@as(u32, 3), dl.cmds.items[0].shadow.options.radius);
     // The override moves the shadow's silhouette, never the background's.
@@ -1262,7 +1274,7 @@ test "box: only an opaque background claims to cover the shadow" {
         try dl.box(rect, .{
             .background = case.paint,
             .radius = 5,
-            .shadow = .{ .color = Color.rgba(0, 0, 0, 0x80) },
+            .shadows = &.{.{ .color = Color.rgba(0, 0, 0, 0x80) }},
         });
         const expected: u32 = if (case.covers) 5 else no_opaque_cover;
         try std.testing.expectEqual(expected, dl.cmds.items[0].shadow.opaque_cover_radius);
@@ -1280,7 +1292,74 @@ test "box: running out of memory leaves the command list as it was" {
     const err = dl.box(.{ .x = 4, .y = 6, .w = 30, .h = 18 }, .{
         .background = .{ .solid = Color.rgba(1, 2, 3, 0xFF) },
         .border = .{ .color = Color.rgba(4, 5, 6, 0xFF), .thickness = 1 },
-        .shadow = .{ .color = Color.rgba(0, 0, 0, 0x80) },
+        .shadows = &.{.{ .color = Color.rgba(0, 0, 0, 0x80) }},
+    });
+    try std.testing.expectError(error.OutOfMemory, err);
+    try std.testing.expectEqual(@as(usize, 0), dl.cmds.items.len);
+}
+
+test "box: shadow layers paint back to front and every one claims the same cover" {
+    var dl = DrawList.init(std.testing.allocator);
+    defer dl.deinit();
+    dl.reset(64, 48);
+    const rect = Rect{ .x = 4, .y = 6, .w = 30, .h = 18 };
+    const far = Color.rgba(0x11, 0x11, 0x11, 0x40);
+    const near = Color.rgba(0x22, 0x22, 0x22, 0x80);
+    try dl.box(rect, .{
+        .background = .{ .solid = Color.rgba(1, 2, 3, 0xFF) },
+        .border = .{ .color = Color.rgba(4, 5, 6, 0xFF), .thickness = 1 },
+        .radius = 6,
+        .shadows = &.{
+            .{ .color = far, .offset = .{ .x = 0, .y = 8 }, .blur = 24 },
+            .{ .color = near, .offset = .{ .x = 0, .y = 1 }, .blur = 2 },
+        },
+    });
+    try std.testing.expectEqual(@as(usize, 4), dl.cmds.items.len);
+
+    // Slice order is paint order: index 0 goes down first and sits furthest back.
+    try std.testing.expectEqual(far, dl.cmds.items[0].shadow.color);
+    try std.testing.expectEqual(near, dl.cmds.items[1].shadow.color);
+    try std.testing.expect(dl.cmds.items[2] == .rect_filled);
+    try std.testing.expect(dl.cmds.items[3] == .rect_outline);
+
+    // The background covers every layer alike, so each one carries the hint.
+    try std.testing.expectEqual(@as(u32, 6), dl.cmds.items[0].shadow.opaque_cover_radius);
+    try std.testing.expectEqual(@as(u32, 6), dl.cmds.items[1].shadow.opaque_cover_radius);
+    // ... and the box radius still reaches each silhouette.
+    try std.testing.expectEqual(@as(u32, 6), dl.cmds.items[0].shadow.options.radius);
+    try std.testing.expectEqual(@as(u32, 6), dl.cmds.items[1].shadow.options.radius);
+}
+
+test "box: a translucent background leaves every shadow layer its center" {
+    var dl = DrawList.init(std.testing.allocator);
+    defer dl.deinit();
+    dl.reset(64, 48);
+    try dl.box(.{ .x = 4, .y = 6, .w = 30, .h = 18 }, .{
+        .background = .{ .solid = Color.rgba(1, 2, 3, 0xFE) },
+        .radius = 6,
+        .shadows = &.{
+            .{ .color = Color.rgba(0, 0, 0, 0x40), .blur = 24 },
+            .{ .color = Color.rgba(0, 0, 0, 0x80), .blur = 2 },
+        },
+    });
+    try std.testing.expectEqual(no_opaque_cover, dl.cmds.items[0].shadow.opaque_cover_radius);
+    try std.testing.expectEqual(no_opaque_cover, dl.cmds.items[1].shadow.opaque_cover_radius);
+}
+
+test "box: running out of memory on a multi-layer shadow leaves the list as it was" {
+    // The whole box is one reservation, so a two-layer shadow cannot land half
+    // painted: a shadow with nothing over it is the failure this rules out.
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 1 });
+    var dl = DrawList.init(failing.allocator());
+    defer dl.deinit();
+    dl.reset(64, 48);
+
+    const err = dl.box(.{ .x = 4, .y = 6, .w = 30, .h = 18 }, .{
+        .background = .{ .solid = Color.rgba(1, 2, 3, 0xFF) },
+        .shadows = &.{
+            .{ .color = Color.rgba(0, 0, 0, 0x40), .blur = 24 },
+            .{ .color = Color.rgba(0, 0, 0, 0x80), .blur = 2 },
+        },
     });
     try std.testing.expectError(error.OutOfMemory, err);
     try std.testing.expectEqual(@as(usize, 0), dl.cmds.items.len);

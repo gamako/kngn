@@ -264,19 +264,23 @@ digest layout_sanity
 expect layout_sanity total=0
 expect showcase section=shadow
 expect showcase index=5
-expect showcase shadow=5
-expect showcase fill=5
-expect showcase stroke=5
+# Six panels: five that own their shadow outright, and one that takes the theme's two
+# layers for the `elevated` step through `shadowsFor` — so the shadow count is one more
+# than the panel count, which is what a themed step looks like from outside.
+expect showcase shadow=7
+expect showcase fill=6
+expect showcase stroke=6
 snapshot fb
 digest drawlist
 # The hash covers the dump text, which reports a shadow's cover_radius when a box
-# queues an opaque background over it. Two of the five panels here are covered, so
-# this value moves if the box lowering changes even when the pixels do not.
-expect drawlist hash=F2D79EE1
-expect drawlist rect_filled=8
-expect drawlist rect_outline=5
+# queues an opaque background over it. Every panel here does, so all seven shadows
+# carry the key and this value moves if the box lowering changes even when the pixels
+# do not.
+expect drawlist hash=11C1D7E0
+expect drawlist rect_filled=9
+expect drawlist rect_outline=6
 expect drawlist path=0
-expect drawlist shadow=5
+expect drawlist shadow=7
 expect drawlist offclip=0
 snapshot drawlist
 digest frameprof
