@@ -587,6 +587,13 @@ reference; the option structs in the source are authoritative.
 
 ### 5.4 Rows of data: a table, or a virtual list
 
+What follows is the choice between the two widgets, the order their calls must come in, and the
+traps that are easy to walk into. It is not the whole contract: the complete one — every rule
+about column sizing, scrolling, cell heights, row identity and the scroll settle order — lives in
+the source comments of [`table.zig`](../libs/gui/src/table.zig) and
+[`widgets.zig`](../libs/gui/src/widgets.zig). Read those before doing something these two widgets
+were not obviously built for.
+
 Two different widgets, and the row count decides which:
 
 | Situation | Use |
@@ -615,20 +622,16 @@ the cost of measuring every cell subtree per row; with it on, a row's `height` m
 builds and the widths are written back before layout runs, so the columns settle in the same
 frame — there is no one-frame lag on column width.
 
-**A `.grow` column is only as sensible as the container that bounds it.** In a narrow
-container — an inspector column, a card — a growing value column means "fill the container",
-which is what you want. Put the same table across a whole pane and that column stretches to the
-far edge instead, stranding every column after it and leaving a canyon down the middle of each
-row. If a table really must span the pane, size the data columns and give the slack a
-**trailing `.grow` column of its own** — header-less, content-less, one empty cell per row —
-rather than letting a column that holds data absorb it.
+**A data-bearing `.grow` column in a full-width table strands the columns after it** and
+leaves a canyon down the middle of each row. Size the data columns and put the slack in a
+trailing empty `.grow` column instead. (In a narrow container — an inspector column, a card —
+a growing column is right, because there "fill the container" is the intent.)
 
-Its constraints: passing `opts.scroll` (a `*gui.Vec2f` you own) turns the body into a scroll
-region, with a sticky header when a header row was built, and such a table cannot be `.fit` on either axis; `h_scroll`
-requires that `scroll` and rejects `.grow` / `.percent` columns, which by definition cannot
-exceed the viewport. **`beginTable` does not virtualize**: every row you build is built, and
-a `.fit` column measures every cell in the table each frame. That is fine for tens of rows
-and wrong for thousands.
+Two constraints decide whether a table can scroll at all: `opts.scroll` (a `*gui.Vec2f` you own)
+turns the body into a scroll region with a sticky header, and such a table cannot be `.fit` on
+either axis; `h_scroll` needs that `scroll` and rejects `.grow` / `.percent` columns.
+**`beginTable` does not virtualize**: every row you build is built, and a `.fit` column measures
+every cell in the table each frame. That is fine for tens of rows and wrong for thousands.
 
 **`beginVirtualList` is the answer for a long list.** It opens a scroll area whose content
 height is the full list, and returns the half-open index window you should actually build:
@@ -649,9 +652,8 @@ rather than appearance, and getting one wrong is silent:
   rows are not.
 - **`gap` is part of that arithmetic, not decoration** (asserted `>= 0`). The row pitch is
   `row_height + gap`, and both the scroll range and the returned window are computed from it.
-- **`padding` is why the top and bottom entries must be zero.** The content height is declared
-  rather than measured, so a vertical pad would shift the first row and under-size the scroll
-  range. Put that space on an outer box.
+- **`padding`'s top and bottom entries must be zero** (debug-asserted). A vertical pad shifts the
+  first row and under-sizes the scroll range; put that space on an outer box instead.
 - **Set `border`.** The viewport cuts its last row in half, and with no edge to cut against that
   reads as a drawing error rather than as a list continuing.
 

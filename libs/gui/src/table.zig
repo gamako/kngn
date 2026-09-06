@@ -53,6 +53,14 @@
 // use those too: a fit max taken only from the visible window would change
 // column widths as the user scrolls.
 //
+// Choosing grow for a column that holds data is only as sensible as the container
+// that bounds it. In a narrow one — an inspector column, a card — growing means
+// "fill the container", which is the intent. Across a whole pane it means "reach
+// the far edge", which strands every column after it and leaves a canyon down the
+// middle of each row. A table that must span a pane sizes its data columns and
+// gives the slack a trailing grow column of its own: header-less, content-less,
+// one empty cell per row.
+//
 // Tables do not nest (same contract as a slider group).
 //
 // Do not derive a row id from a display name: two rows with the same label would

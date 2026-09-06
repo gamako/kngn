@@ -243,34 +243,20 @@ target is eligible only when the menu-bar layer owns the previous-frame route an
 outside that layer's previous root. An inside hit in any modal layer wins first, and a context or
 dialog route disables the title exception.
 
-## Rows of data (`src/table.zig`, the virtual list in `src/widgets.zig`)
+## Rows of data ([`src/table.zig`](src/table.zig), the virtual list in [`src/widgets.zig`](src/widgets.zig))
 
-Two widgets for repeated rows, split by row count rather than by appearance.
+Two widgets for repeated rows, split by row count rather than by appearance. **The contracts of
+each — what a column spec may say, when a table may be `.fit`, how the scroll offset settles, why
+a row's height is what it is — are the source comments in those two files.** This
+section is the choice between the widgets and the shape of the calls, not a second copy of that.
 
-**`beginTable` / `tableHeaderRow` / `beginTableRow` / `beginTableCell` / `endTable`** share
-one column spec across every row. `TableCol.width` is a `Sizing`, so a column is content-sized
-(`.fit`), fixed, grow or percent. Cell nodes are collected as the table builds and `endTable`
-writes the resolved widths back before layout runs, the same model as a slider group — so the
-columns settle in the frame they are built, with no previous-frame lag. The contracts:
+**`beginTable` / `tableHeaderRow` / `beginTableRow` / `beginTableCell` / `endTable`** is a
+table whose columns line up because every row shares one `[]const TableCol`. Reach for it at
+tens of rows. It does not virtualize: every row you build is built, and a `.fit` column measures
+every cell in the table each frame.
 
-- **It does not virtualize.** Every row built is built, and a `.fit` column runs
-  `layout.measure` over every cell subtree each frame. Tens of rows, not thousands; a
-  virtualized table must use fixed / grow / percent columns, because a `.fit` max taken from
-  the visible window alone would change the column widths as the user scrolls.
-- `opts.scroll` (a caller-owned `*Vec2f`) turns the body into a `ScrollArea` with a sticky
-  header strip outside the viewport. Such a table rejects `.fit` on either axis: the body is
-  grow, and grow-in-fit measures as 0, so the viewport would have no size.
-- `h_scroll` requires `opts.scroll` and rejects grow / percent columns, whose meaning is
-  "fill what is left of the viewport" and so cannot exceed it.
-- A row is `height = .fit` and each cell keeps its intrinsic height; `TableCol.align_cross`
-  aligns a cell's own content inside its box. `opts.stretch_cells` is the opt-in that
-  equalises cell heights (legal only when the row height is `.fit` or `.fixed`).
-- Tables do not nest. An **interactive** row (`TableRowOpts.interactive`) takes an id from
-  the data's identity, never from a display name — two rows sharing a label would collide.
-  A display-only row needs no id of its own.
-
-**`beginVirtualList` / `endVirtualList`** wrap a `ScrollArea` whose content height is the
-whole list, and return the half-open `VirtualRange` the caller materializes:
+**`beginVirtualList` / `endVirtualList`** is the answer past that, and it inverts who decides
+what exists: it returns the half-open window and the caller materializes only that.
 
 ```zig
 const range = ctx.beginVirtualList(id, &scroll, .{ .row_height = 28, .row_count = 10_000 });
@@ -279,18 +265,9 @@ while (i < range.end) : (i += 1) { ... }  // build only this window
 ctx.endVirtualList();
 ```
 
-- Rows are a **fixed** `row_height` (plus `gap`); that pitch is what makes the index
-  arithmetic possible. `overscan` adds rows on each side of the visible window.
-- A leading spacer box stands in for the rows above `range.first`, so scroll geometry matches
-  the full list.
-- `scroll` is caller-owned. `virtualScrollToRow` moves it and must be called **before**
-  `beginVirtualList` in the same frame — step (1) of the scroll settle order (caller → thumb
-  → wheel → clamp).
-- A column header belongs **outside** the list, as a sibling box; inside it, it scrolls away.
-- `beginListboxRow` inside the loop gives single selection with a roving Tab stop, so a
-  ten-thousand-row list costs Tab one stop.
-- The first frame has no previous-frame viewport rect, so a non-`.fixed` height falls back to
-  the logical screen height and over-builds that one frame.
+The two compose the way a list usually wants: `beginListboxRow` inside the loop gives single
+selection with a roving Tab stop, and a column header belongs **outside** the list as a sibling
+box — inside it, it scrolls away with the rows.
 
 ## Layout engine limits
 

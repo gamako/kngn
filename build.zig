@@ -2543,6 +2543,7 @@ pub fn build(b: *std.Build) void {
     kit_doc_coverage_mod.addAnonymousImport("kit_source", .{ .root_source_file = b.path("kit/kit.zig") });
     kit_doc_coverage_mod.addAnonymousImport("kit_tour", .{ .root_source_file = b.path("docs/kit-tour.md") });
     kit_doc_coverage_mod.addAnonymousImport("app_authoring", .{ .root_source_file = b.path("docs/app-authoring.md") });
+    kit_doc_coverage_mod.addAnonymousImport("gui_readme", .{ .root_source_file = b.path("libs/gui/README.md") });
     kit_doc_coverage_mod.addAnonymousImport("manifest", .{ .root_source_file = b.path("build.zig.zon") });
     const kit_doc_coverage_test = b.addTest(.{ .root_module = kit_doc_coverage_mod });
     const run_kit_doc_coverage_test = b.addRunArtifact(kit_doc_coverage_test);
