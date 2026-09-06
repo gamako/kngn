@@ -350,7 +350,7 @@ opt out of that and place a box by coordinates instead.) The fields a screen nor
 | `gap` | space between children on the main axis |
 | `align_cross` | `.start` / `.center` / `.end` — where children sit on the cross axis |
 | `align_main` | `.start` / `.center` / `.end` — where children sit on the **main** axis (CSS `justify-content`). A weight>0 `.grow` child normally takes the space `align_main` would place, so it has no effect next to one — unless every such child is frozen by its own min/max clamp ([layout.md](../libs/gui/docs/layout.md)) |
-| `bg`, `border`, `radius` | the box's own painting. `bg` is a `?gui.Color`, `border` a `?.{ .color, .thickness }`, `radius` a uniform logical radius. Take the colours from the active theme rather than writing literals: `ctx.style.surface.canvas` / `.panel` / `.raised` / `.control` / `.control_subtle`, `ctx.style.accent.primary`, `ctx.style.border_tokens.normal` (§6) |
+| `bg`, `border`, `radius` | the box's own painting. `bg` is a `?gui.Color`, `border` a `?.{ .color, .thickness }`, `radius` a uniform logical radius. **Colours**: a screen meant to look like the library's own takes them from the active theme — `ctx.style.surface.canvas` / `.panel` / `.raised` / `.control` / `.control_subtle`, `ctx.style.accent.primary`, `ctx.style.border_tokens.normal` (§6) — while a screen implementing its own design passes that design's values, which is what the field is for. **`radius` has no such token**: `style.control_radius` and `style.checkbox_radius` are the radii of the library's own controls, not a source for a box you size yourself, so this one comes from your layout either way |
 | `clip_children` | clip drawing and hit-testing to the content box |
 | `min_width` / `max_width` / `min_height` / `max_height` | a clamp applied on top of whatever `Sizing` says |
 | `id` | an explicit id. Needed to read the box's settled rectangle back (`ctx.getNodeRect`), which is also what a custom interactive widget runs its behavior against |
@@ -452,11 +452,39 @@ settles on the position the gesture ended at rather than the last position of th
 [`docs/adr/025`](adr/025_gui-drag-position-on-the-release-frame.md) has the rule and what it
 costs a widget that reads the pointer itself.
 
+**The table below is a catalogue of minimal uses, not a field reference.** Where a call takes an
+options struct — most of them do, and a short form such as `ctx.button` is the no-options
+spelling of one that does — that struct, with its doc comments, is the authority on what the call
+can be asked to do. A field the table does not mention is a field the table left out, never a
+thing the widget cannot do. Read the struct before concluding that something is impossible.
+
+**The theme is a default, not a limit.** Where an options struct says a field is `?Color` and
+`null` means a theme token, that is the fallback talking, not a restriction: the same field takes
+any colour you pass it. `ctx.text` takes both a `color` and a `font`, so a text leaf can carry the
+size, weight and colour a design asks for; the button-like widgets take a `WidgetStyle` that
+overrides only the colours you name and leaves the rest to the theme
+([Themes and overrides](#themes-and-overrides)). An application implementing its own design —
+its own palette, its own type scale — should pass **its own values or tokens**; the theme tokens
+are the right source only for a screen meant to look like the library's own. To take the default
+family at a size or weight the tiers do not cover, use
+`try gui.defaultFontFamily().variant(size, weight)` ([The default look](#the-default-look)).
+
+**Where the structs are.** They ship with the package, so they are next to you whether the
+dependency is a `.path` or a fetched one:
+[`context.zig`](../libs/gui/src/context.zig) (`TextOptions` and the other `Context` types),
+[`widgets.zig`](../libs/gui/src/widgets.zig) (the per-widget `*Opts`),
+[`style.zig`](../libs/gui/src/style.zig) (`Style`, the tokens, and `WidgetStyle`),
+[`table.zig`](../libs/gui/src/table.zig) (`TableOpts`, `TableCol`, `TableRowOpts`),
+[`popup.zig`](../libs/gui/src/popup.zig) (`PopupMenuOpts`, `DialogOptions`),
+[`font.zig`](../libs/gui/src/font.zig) (the font entry points) and
+[`gui.zig`](../libs/gui/src/gui.zig) (what the module re-exports, which is the list of names you
+can reach). An editor with ZLS jumps from a call to its definition, which is the fastest way in.
+
 | Call | Minimal use | Returns |
 |---|---|---|
 | `label` / `labelEx` | `ctx.label("Collections");` — one line, no wrapping | nothing |
 | `labelStyled` | `ctx.labelStyled("Asset library", .headline);` — `.headline` / `.title` / `.subtitle` / `.body` / `.label` / `.caption` / `.muted` (§6) | nothing |
-| `text` | `ctx.text(name, .{ .overflow = .ellipsis });` — declarative: `wrap`, `max_lines`, `.visible`/`.clip`/`.ellipsis` | nothing |
+| `text` | `ctx.text(name, .{ .overflow = .ellipsis });` — a declarative leaf. [`TextOptions`](../libs/gui/src/context.zig) carries its colour and font as well as its wrapping and overflow | nothing |
 | `button` / `buttonId` | `if (ctx.buttonId(id, "Rescan", .{}).clicked) { ... }` | `ButtonResult{ clicked, hovered, held }`; `ctx.button("Rescan")` is the `clicked` bool alone |
 | `checkbox` / `checkboxId` | `_ = ctx.checkboxId(id, "Tagged only", &self.only_tagged);` | `bool`: true on the frame the value changed. The new value is written through the pointer |
 | `toggle` / `toggleId` | `_ = ctx.toggleId(id, "Previews", &self.preview);` | the same, drawn as a switch |
@@ -552,8 +580,10 @@ along with the pointer and the keys, so `if (kit.toGuiEvent(ev)) |ge| ctx.pushEv
 whole event loop. Text still being composed is the exception: `composition_changed` arrives as a
 platform event but has no `gui.InputEvent` form, so it is handed over separately — see §4.
 
-The full contract for each widget — the option structs, the results, the interaction
-priorities — is [`libs/gui/README.md`](../libs/gui/README.md).
+[`libs/gui/README.md`](../libs/gui/README.md) covers how the widgets relate to one another and
+the contracts that span several calls — focus traversal, the caller-owned selection convention,
+what an interaction priority means. It is illustrative rather than an exhaustive field
+reference; the option structs in the source are authoritative.
 
 ### 5.4 Rows of data: a table, or a virtual list
 
@@ -680,8 +710,9 @@ Five things to get right:
   adds none either: interaction means an **explicit-id** box whose previous-frame rectangle you
   run a behavior against (`libs/gui/README.md` has the two worked custom widgets).
 
-The full contract, and two worked custom-drawn widgets to copy, are in
-[`libs/gui/README.md`](../libs/gui/README.md).
+Two worked custom-drawn widgets to copy are in
+[`libs/gui/README.md`](../libs/gui/README.md); the signatures they are built from are in
+[`context.zig`](../libs/gui/src/context.zig).
 
 ### 5.6 Drawing outside the layout: Context draw-list accessors
 
@@ -793,7 +824,8 @@ font section of [`libs/gui/README.md`](../libs/gui/README.md) and the font behav
 [`examples/46_style_gallery/main.zig`](../examples/46_style_gallery/main.zig).
 
 To take the default family at another size or weight, the entry point is
-`gui.defaultFontFamily().variant(size, weight)`. A similarly named `defaultFontVariant` is
+`gui.defaultFontFamily().variant(size, weight)`, which returns `Error!Font` and so is written
+`try ...` (or with a `catch` of your own). A similarly named `defaultFontVariant` is
 `pub` in the font source but is not re-exported, so it cannot be reached through `kit`; §2 of
 [`docs/kit-tour.md`](kit-tour.md) has the details.
 

@@ -230,8 +230,11 @@ fn pickContentLen(declared: i32, extent: i32, measured: i32) i32 {
     return measured;
 }
 
-/// Options for `Context.text`. `color = null` uses `style.text`. `max_lines = 0`
-/// means unlimited for `.visible` / `.clip`, and 1 for `.ellipsis`.
+/// Options for `Context.text`. `color = null` uses `style.text`, and any other colour is drawn
+/// as given — a leaf is not confined to the theme. `font = null` uses the context font; for the
+/// default family at a size and weight the text tiers do not cover, pass
+/// `try gui.defaultFontFamily().variant(size, weight)`. `max_lines = 0` means unlimited for
+/// `.visible` / `.clip`, and 1 for `.ellipsis`.
 pub const TextOptions = struct {
     color: ?Color = null,
     font: ?Font = null,

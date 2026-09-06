@@ -1,7 +1,7 @@
 //! Verifies that the public surface of `kit` is reachable from the author-facing
 //! documentation, and that the index does not rot.
 //!
-//! Four properties:
+//! Five properties:
 //!
 //! 1. **Coverage** — every public name of `kit/kit.zig` appears in `docs/kit-tour.md`
 //!    written as `kit.<name>`. Adding a name to the umbrella without documenting it
@@ -9,11 +9,15 @@
 //! 2. **Reachability** — `docs/app-authoring.md` links to the tour. An index nobody can
 //!    find is not an index, and the defect this document set exists to close is exactly
 //!    "the feature was there, the reader never found it".
-//! 3. **Live references** — the paths the tour links to exist on disk, so the samples and
-//!    sources it points at cannot silently move away from it.
+//! 3. **Live references** — the paths both documents link to exist on disk, so the samples
+//!    and sources they point at cannot silently move away from them.
 //! 4. **Packaged references** — those paths are also inside `build.zig.zon`'s `.paths`. A
 //!    checkout contains the whole tree, so existence alone would pass for a file the package
 //!    does not ship, and the link would break only for someone who fetched it.
+//! 5. **The way to the source** — section 5.3 of `docs/app-authoring.md` tells the reader
+//!    that the option structs, not its own table, are the authority on what a widget call
+//!    accepts. That sentence is only true if the section also shows the way there, so each
+//!    named source file is required to be linked from inside it.
 //!
 //! ## Why `kit.<name>` and not the bare name
 //!
@@ -54,8 +58,8 @@ const kit_tour = @embedFile("kit_tour");
 const app_authoring = @embedFile("app_authoring");
 const manifest = @embedFile("manifest");
 
-/// The tour's own directory, which every relative link in it resolves against.
-const tour_dir = "docs";
+/// The directory both documents live in, which every relative link in them resolves against.
+const docs_dir = "docs";
 
 /// A public declaration of the umbrella module.
 const PublicName = []const u8;
@@ -198,30 +202,38 @@ test "app-authoring links to the tour" {
     return error.TourNotLinked;
 }
 
-test "every path the tour points at exists" {
-    const gpa = std.testing.allocator;
-    const links = try localLinks(gpa, kit_tour);
+/// Every local link in `doc` resolves to a file that is on disk.
+///
+/// `min_links` pins the shape before the loop runs: a document that stopped stating its
+/// references as links would otherwise satisfy an empty loop and report nothing wrong.
+fn assertLinksExist(gpa: std.mem.Allocator, doc: []const u8, doc_name: []const u8, min_links: usize) !void {
+    const links = try localLinks(gpa, doc);
     defer gpa.free(links);
-
-    // The tour states its sources and samples as links so that they are checkable at all.
-    // A tour that stopped doing so would pass this test while checking nothing.
-    try std.testing.expect(links.len >= 40);
+    try std.testing.expect(links.len >= min_links);
 
     const io = std.testing.io;
     const cwd = std.Io.Dir.cwd();
     var broken: usize = 0;
     for (links) |dest| {
         var buf: [std.fs.max_path_bytes]u8 = undefined;
-        const joined = std.fmt.bufPrint(&buf, tour_dir ++ "/{s}", .{dest}) catch {
+        const joined = std.fmt.bufPrint(&buf, docs_dir ++ "/{s}", .{dest}) catch {
             broken += 1;
             continue;
         };
         cwd.access(io, joined, .{}) catch {
-            std.debug.print("docs/kit-tour.md points at a path that does not exist: {s}\n", .{dest});
+            std.debug.print("{s} points at a path that does not exist: {s}\n", .{ doc_name, dest });
             broken += 1;
         };
     }
-    if (broken != 0) return error.TourReferenceMissing;
+    if (broken != 0) return error.DocumentReferenceMissing;
+}
+
+test "every path the tour points at exists" {
+    try assertLinksExist(std.testing.allocator, kit_tour, "docs/kit-tour.md", 40);
+}
+
+test "every path app-authoring points at exists" {
+    try assertLinksExist(std.testing.allocator, app_authoring, "docs/app-authoring.md", 20);
 }
 
 /// The entries of the manifest's top-level `.paths`.
@@ -242,8 +254,12 @@ fn manifestPaths(gpa: std.mem.Allocator, zon: [:0]const u8) ![]const []const u8 
     return parsed.paths;
 }
 
-test "every path the tour points at is shipped in the package" {
-    const gpa = std.testing.allocator;
+/// Every local link in `doc` lands inside `build.zig.zon`'s `.paths`.
+///
+/// A checkout holds the whole tree, so existence alone passes for a file the package does not
+/// ship — and the link then breaks only for the reader who fetched it, which is the reader
+/// these documents are written for.
+fn assertLinksPackaged(gpa: std.mem.Allocator, doc: []const u8, doc_name: []const u8) !void {
     const paths = try manifestPaths(gpa, manifest);
     defer {
         for (paths) |entry| gpa.free(entry);
@@ -251,13 +267,13 @@ test "every path the tour points at is shipped in the package" {
     }
     try std.testing.expect(paths.len > 0);
 
-    const links = try localLinks(gpa, kit_tour);
+    const links = try localLinks(gpa, doc);
     defer gpa.free(links);
 
     var outside: usize = 0;
     for (links) |dest| {
         var buf: [std.fs.max_path_bytes]u8 = undefined;
-        const joined = std.fmt.bufPrint(&buf, tour_dir ++ "/{s}", .{dest}) catch {
+        const joined = std.fmt.bufPrint(&buf, docs_dir ++ "/{s}", .{dest}) catch {
             outside += 1;
             continue;
         };
@@ -278,27 +294,35 @@ test "every path the tour points at is shipped in the package" {
         }
         if (!covered) {
             std.debug.print(
-                "docs/kit-tour.md links {s}, which build.zig.zon's .paths does not ship\n",
-                .{root_relative},
+                "{s} links {s}, which build.zig.zon's .paths does not ship\n",
+                .{ doc_name, root_relative },
             );
             outside += 1;
         }
     }
-    if (outside != 0) return error.TourReferenceNotPackaged;
+    if (outside != 0) return error.DocumentReferenceNotPackaged;
+}
+
+test "every path the tour points at is shipped in the package" {
+    try assertLinksPackaged(std.testing.allocator, kit_tour, "docs/kit-tour.md");
+}
+
+test "every path app-authoring points at is shipped in the package" {
+    try assertLinksPackaged(std.testing.allocator, app_authoring, "docs/app-authoring.md");
 }
 
 /// Fail on a reference-style link definition (`[label]: dest`).
 ///
 /// `localLinks` only sees inline links, so a reference-style one would be invisible to every
 /// check built on it — present in the document, pointing anywhere, and never examined. Rather
-/// than let the coverage quietly shrink, the tour is held to inline links.
+/// than let the coverage quietly shrink, both documents are held to inline links.
 ///
 /// **What this catches**: a definition on one line, including inside a blockquote or a list
 /// item. **What it does not**: the form CommonMark also permits where the label is split
 /// across lines. Matching that needs a real Markdown parser, and hand-rolling one here would
 /// repeat the mistake this file is built to avoid — so the limit is stated rather than
 /// implied. The convention is enforced against ordinary authoring, not against effort.
-fn rejectReferenceLinks(doc: []const u8) !void {
+fn rejectReferenceLinks(doc: []const u8, doc_name: []const u8) !void {
     var line_it = std.mem.splitScalar(u8, doc, '\n');
     while (line_it.next()) |line| {
         // A definition stays a definition inside a blockquote or a list item, so strip those
@@ -313,14 +337,126 @@ fn rejectReferenceLinks(doc: []const u8) !void {
         const close = std.mem.indexOfScalar(u8, trimmed, ']') orelse continue;
         if (close + 1 < trimmed.len and trimmed[close + 1] == ':') {
             std.debug.print(
-                "docs/kit-tour.md uses a reference-style link, which the checks do not see: {s}\n",
-                .{trimmed},
+                "{s} uses a reference-style link, which the checks do not see: {s}\n",
+                .{ doc_name, trimmed },
             );
             return error.ReferenceStyleLink;
         }
     }
 }
 
+/// The offset of the sole heading line that begins with `marker`.
+///
+/// A heading is a line **outside** a fenced code block, and all three qualifiers matter. Matching
+/// `marker` anywhere would also match it mid-sentence; matching any line would also match a line
+/// of a sample; and either wrong start yields a span that the check then passes over happily.
+/// Uniqueness closes the rest: a second candidate is exactly the ambiguity that would otherwise
+/// pick a region silently.
+fn soleHeadingOffset(doc: []const u8, marker: []const u8) !usize {
+    var found: ?usize = null;
+    var fenced = false;
+    var offset: usize = 0;
+    var line_it = std.mem.splitScalar(u8, doc, '\n');
+    while (line_it.next()) |line| {
+        defer offset += line.len + 1;
+        if (std.mem.startsWith(u8, std.mem.trimStart(u8, line, " \t"), "```")) {
+            fenced = !fenced;
+            continue;
+        }
+        if (fenced) continue;
+        if (!std.mem.startsWith(u8, line, marker)) continue;
+        if (found != null) return error.AmbiguousSectionMarker;
+        found = offset;
+    }
+    return found orelse error.SectionMarkerNotFound;
+}
+
+/// The span of `doc` between two headings, each of which must occur exactly once at the start
+/// of a line. A renamed or duplicated heading fails rather than yielding a span that quietly
+/// covers the wrong text — the failure mode this file exists to prevent.
+fn sectionSlice(doc: []const u8, begin: []const u8, end: []const u8) ![]const u8 {
+    const from = try soleHeadingOffset(doc, begin);
+    const to = try soleHeadingOffset(doc, end);
+    if (to <= from) return error.SectionMarkersOutOfOrder;
+    return doc[from + begin.len .. to];
+}
+
+test "sectionSlice refuses a marker that is absent, duplicated, or out of order" {
+    const doc = "### 5.3 A\nbody\n### 5.4 B\n";
+    try std.testing.expectEqualStrings("A\nbody\n", try sectionSlice(doc, "### 5.3 ", "### 5.4 "));
+    try std.testing.expectError(error.SectionMarkerNotFound, sectionSlice(doc, "### 9.9 ", "### 5.4 "));
+    try std.testing.expectError(error.SectionMarkersOutOfOrder, sectionSlice(doc, "### 5.4 ", "### 5.3 "));
+
+    const duplicated = "### 5.3 A\n### 5.4 B\n### 5.3 again\n";
+    try std.testing.expectError(error.AmbiguousSectionMarker, sectionSlice(duplicated, "### 5.3 ", "### 5.4 "));
+
+    // A marker that does not begin a line is prose, not a heading.
+    const inline_mention = "see ### 5.3 for this\n### 5.4 B\n";
+    try std.testing.expectError(error.SectionMarkerNotFound, sectionSlice(inline_mention, "### 5.3 ", "### 5.4 "));
+
+    // A heading-shaped line inside a fence is a sample, not the section. Without this the check
+    // would adopt the sample as the section start once the real heading was renamed away, and
+    // report nothing wrong.
+    const fenced_only = "```\n### 5.3 Fake\n```\n### 5.4 B\n";
+    try std.testing.expectError(error.SectionMarkerNotFound, sectionSlice(fenced_only, "### 5.3 ", "### 5.4 "));
+
+    const fenced_plus_real = "```\n### 5.3 Fake\n```\n### 5.3 Real\nbody\n### 5.4 B\n";
+    try std.testing.expectEqualStrings("Real\nbody\n", try sectionSlice(fenced_plus_real, "### 5.3 ", "### 5.4 "));
+}
+
+/// The source files §5.3 sends the reader to. They are the answer to "what can this call be
+/// asked to do?", which the widget table deliberately does not try to answer.
+const widget_section_sources = [_][]const u8{
+    "libs/gui/src/context.zig",
+    "libs/gui/src/widgets.zig",
+    "libs/gui/src/style.zig",
+    "libs/gui/src/table.zig",
+    "libs/gui/src/popup.zig",
+    "libs/gui/src/font.zig",
+    "libs/gui/src/gui.zig",
+};
+
+test "the widget section links every option-struct source it names as the authority" {
+    const gpa = std.testing.allocator;
+    const section = try sectionSlice(app_authoring, "### 5.3 ", "### 5.4 ");
+
+    const links = try localLinks(gpa, section);
+    defer gpa.free(links);
+
+    // Counting links would pass for a section that gained unrelated ones and lost the
+    // relevant ones, so each file is required by name.
+    var missing: std.ArrayList([]const u8) = .empty;
+    defer missing.deinit(gpa);
+    for (widget_section_sources) |want| {
+        var found = false;
+        for (links) |dest| {
+            var buf: [std.fs.max_path_bytes]u8 = undefined;
+            const joined = std.fmt.bufPrint(&buf, docs_dir ++ "/{s}", .{dest}) catch continue;
+            const rel = std.fs.path.resolvePosix(gpa, &.{joined}) catch continue;
+            defer gpa.free(rel);
+            if (std.mem.eql(u8, std.mem.trimStart(u8, rel, "/"), want)) found = true;
+        }
+        if (!found) try missing.append(gpa, want);
+    }
+
+    if (missing.items.len != 0) {
+        std.debug.print(
+            \\
+            \\docs/app-authoring.md section 5.3 tells the reader the option structs are the
+            \\authority, but does not link {d} of them. A reader who is not shown the way
+            \\to the source reads the table as the whole story, which is the defect this
+            \\section was written to close:
+            \\
+        , .{missing.items.len});
+        for (missing.items) |name| std.debug.print("  {s}\n", .{name});
+        return error.WidgetSectionSourceNotLinked;
+    }
+}
+
 test "the tour uses only inline links, which are the ones the checks can see" {
-    try rejectReferenceLinks(kit_tour);
+    try rejectReferenceLinks(kit_tour, "docs/kit-tour.md");
+}
+
+test "app-authoring uses only inline links, which are the ones the checks can see" {
+    try rejectReferenceLinks(app_authoring, "docs/app-authoring.md");
 }

@@ -166,11 +166,15 @@ scope to avoid that.
 
 Two smaller helpers round out a settings-style form:
 
-- `ctx.text(str, TextOptions)` — declarative text leaf. `wrap` folds each paragraph at the
-  placed width; `overflow` is `.visible` / `.clip` / `.ellipsis` (`.ellipsis` with
-  `max_lines = 0` is one line plus a marker). Use this when the leaf should simply fit
-  its box. `label` / `labelEx` stay the terse path: no auto-wrap, but explicit paragraph
-  breaks still become multiple lines.
+- `ctx.text(str, TextOptions)` — declarative text leaf. `color` and `font` are the leaf's own,
+  so a text run is not confined to the theme colour or the tier sizes: `color = null` falls back
+  to `style.text`, `font = null` to the context font, and
+  `try gui.defaultFontFamily().variant(size, weight)` produces the default family at any size and
+  weight. `wrap` folds each paragraph at the placed width; `overflow` is `.visible` / `.clip` /
+  `.ellipsis` (`.ellipsis` with `max_lines = 0` is one line plus a marker). Use this when the
+  leaf should simply fit its box. `label` / `labelEx` stay the terse path: no auto-wrap, but
+  explicit paragraph breaks still become multiple lines (and `labelEx` takes the colour as its
+  second argument).
 - `ctx.labelStyled(str, tier)` — seven role-named tiers, largest to smallest: `headline` 24/700
   (screen title), `title` 20/700 (card or window title), `subtitle` 18/600 (section heading),
   `body` 16/400 (prose and values), `label` 14/600 (column header, field name — a short name the
