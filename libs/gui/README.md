@@ -205,10 +205,13 @@ Two smaller helpers round out a settings-style form:
   nothing establishes that size the rule is zero length and silently invisible.
   `docs/adr/034` records why `BoxConfig.border` stays four-sided.
 
-**Disabling a widget:** `ctx.beginDisabled()` / `ctx.endDisabled()` open a nestable scope
-(not a per-call option, since checkbox/toggle/radio/`textInputId` take no options struct
-today). Every ordinary widget built inside — button, checkbox, toggle, radio, slider,
-`textInputId`, and (interaction-only, undecorated) colorSwatch/iconButton/beginCollapsible/tabId
+**Disabling a widget:** `ctx.beginDisabled()` / `ctx.endDisabled()` open a nestable scope rather
+than a per-call option, because disabling applies to a whole subtree: one scope covers every
+widget built inside it, including ones a caller composes out of several. (Most of these widgets
+do take options — `checkbox` / `toggle` / `radio` are the no-options short forms of
+`checkboxEx` / `toggleEx` / `radioEx`, and `textInputId` takes `TextInputOpts` as a required
+argument — so the scope is a design choice, not a gap.) Every ordinary widget built inside —
+button, checkbox, toggle, radio, slider, `textInputId`, and (interaction-only, undecorated) colorSwatch/iconButton/beginCollapsible/tabId
 — rejects pointer and keyboard input, leaves the Tab order, and releases any focus/hover/press
 it held from before it became disabled. `ctx.isDisabled()` answers whether a widget built right
 now is inside such a scope. This is unrelated to `PopupItem.enabled` / `Command.enabled` below,

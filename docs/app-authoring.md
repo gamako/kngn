@@ -493,7 +493,7 @@ can reach). An editor with ZLS jumps from a call to its definition, which is the
 | `textInputId` | `const r = ctx.textInputId(id, &self.search, .{ .width = .{ .fixed = 160 }, .placeholder = "name" });` | `TextInputResult{ changed, focused, selection, copy_request, caret_rect }`. The text lives in a `gui.TextBuffer` you own. Single-line only, and the IME and clipboard seams around it are [docs/text-input.md](text-input.md) |
 | `selectableLabel` / `selectableLabelId` | `_ = ctx.selectableLabelId(id, "Read-only text", .{ .focusable = true });` | `SelectableLabelResult{ selection, copy_request }` — text the user drags across and copies. Out of the Tab order unless `.focusable` |
 | `tabId` | `if (ctx.tabId(id, "All", self.tab == .all, .{}).focused) self.tab = .all;` | `TabResult{ activated, focused }` — see the note below on which to use |
-| `beginListboxRow` / `endListboxRow` | `const row = ctx.beginListboxRow(id, self.selected == i, .{ .height = .{ .fixed = 28 } });` — one row of a single-select list; wrap any content between the two, and take `ListboxRowOpts` for its height, padding, gap, `align_cross` and `idle_bg` (§5.4) | `ListboxRowResult{ activated }` — a click, or Space/Enter on the focused row |
+| `beginListboxRow` / `endListboxRow` | `const row = ctx.beginListboxRow(id, self.selected == i, .{ .height = .{ .fixed = 28 } });` — one row of a single-select list; wrap any content between the two. Its shape, background and indent guide are [`ListboxRowOpts`](../libs/gui/src/widgets.zig) (§5.4) | `ListboxRowResult{ activated }` — a click, or Space/Enter on the focused row |
 | `beginCollapsible` / `endCollapsible` | `if (ctx.beginCollapsible(id, "Filters", &self.filters_open)) { ...; ctx.endCollapsible(); }` | `bool`: whether the body is open. **Close it only when this was true** |
 | `beginScrollArea` / `endScrollArea` | a scroll viewport around content you build | nothing; you own the `gui.Vec2f` offset |
 | `beginFormRow` / `endFormRow` | an optional label and description above the control(s) built between them | nothing |
@@ -506,7 +506,7 @@ can reach). An editor with ZLS jumps from a call to its definition, which is the
 | `iconButton` | a button drawn from a 16×16 bitmap instead of a label | the same as `button` |
 | `tooltip` / `tooltipBox` | attach a tooltip to the widget just built | nothing |
 | `beginDisabled` / `endDisabled` | a nestable scope: everything inside rejects input and leaves the Tab order | nothing |
-| `PopupState` / `DialogState` | caller-owned `open`, `key` and `placement` state; update it beside the widget that triggers it | nothing |
+| `PopupState` / `DialogState` | caller-owned state ([`popup.zig`](../libs/gui/src/popup.zig)); update it beside the widget that triggers it. `PopupState` has no default for `key` (a stable `LayerKey`) or `placement`, so both are yours to supply | nothing |
 | `gui.menuBar` | `gui.menuBar(ctx, commands, &menu_state);` (`menu_state` is a `gui.MenuBarState` you own) — the top row of buttons built from `Command` definitions. A free function, not a `Context` method | nothing; the chosen `CommandId` comes from `menuBarPopup` below |
 
 **`tabId` returns two different things and they answer different questions.** `focused` is
@@ -598,19 +598,18 @@ A table is built one call per level, and the order is the contract:
 
 | Order | Call | What it is |
 |---|---|---|
-| 1 | `ctx.beginTable(id, cols, opts)` | `cols` is a `[]const gui.TableCol`: `.{ .width: Sizing, .header: ?[]const u8, .align_cross }`, where `align_cross` aligns the cell's own content inside the cell box |
+| 1 | `ctx.beginTable(id, cols, opts)` | `cols` is a `[]const gui.TableCol`, one per column, shared by every row ([`table.zig`](../libs/gui/src/table.zig)). Each has a required `width` (a `Sizing`), and its `align_cross` aligns the cell's own content inside the cell box rather than stretching siblings to match |
 | 2 | `ctx.tableHeaderRow()` | optional, **at most once, before any body row**; draws the `header` strings of `cols` |
-| 3 | `ctx.beginTableRow(opts)` | once per row. `TableRowOpts` is `.{ .interactive: ?TableRowInteractive, .idle_bg, .height }`; a row that responds to a click needs `interactive` with a non-zero id taken from the data's identity, never from a display name |
+| 3 | `ctx.beginTableRow(opts)` | once per row. A row that responds to a click needs `TableRowOpts.interactive` with a non-zero id taken from the data's identity, never from a display name |
 | 4 | `ctx.beginTableCell()` … build the cell … `ctx.endTableCell()` | **exactly once per column**, in column order |
 | 5 | `_ = ctx.endTableRow()` | after the last cell is closed; returns `TableRowResult{ activated }`, which the caller applies to its own selection |
 | 6 | `ctx.endTable()` | |
 
-`TableOpts` is `width` / `height` (`Sizing`, both `.{ .grow = 1 }`), `column_gap`, `row_gap`,
-`scroll`, `h_scroll`, `stretch_cells`, `header_bg`, `bg`, `border`, `wheel_px` and
-`bar_thickness`. `stretch_cells` makes `endTableRow` write a shared cell height so cell
-backgrounds line up, at the cost of measuring every cell subtree per row; with it on, a row's
-`height` must be `.fit` or `.fixed`, and `.grow` / `.percent` is a contract violation that
-fails the frame.
+The table's own sizing, gaps, scrolling and colours are [`TableOpts`](../libs/gui/src/table.zig).
+One of its fields is worth stating here because it changes what a *row* may declare:
+`stretch_cells` makes `endTableRow` write a shared cell height so cell backgrounds line up, at
+the cost of measuring every cell subtree per row; with it on, a row's `height` must be `.fit` or
+`.fixed`, and `.grow` / `.percent` is a contract violation that fails the frame.
 
 **`beginTable` shares one column spec across its rows.** Cells are collected as the table
 builds and the widths are written back before layout runs, so the columns settle in the same
@@ -640,17 +639,21 @@ height is the full list, and returns the half-open index window you should actua
 | `ctx.endVirtualList()` | closes it |
 | `ctx.virtualScrollToRow(id, scroll, opts, index)` | moves the offset to a row; must be called **before** `beginVirtualList` in the same frame, and **with the same `opts` value** — it computes the same geometry, so declare the options once and pass that one value to both |
 
-`VirtualListOpts`:
+The options are [`VirtualListOpts`](../libs/gui/src/widgets.zig). Four of them are arithmetic
+rather than appearance, and getting one wrong is silent:
 
-| Field | Meaning |
-|---|---|
-| `row_height` | required, `> 0` (asserted). Fixed, and every row must be built at exactly this height — that is what makes the index arithmetic possible. A list of variably tall rows is not this widget |
-| `row_count` | required. The full list length; the scroll range is computed from it, not measured |
-| `overscan` | extra rows built on each side of the visible window (default 2) |
-| `width` / `height` | `Sizing`, both `.{ .grow = 1 }` by default |
-| `padding` | `.{ top, right, bottom, left }` — **top and bottom must be `0`** (debug-asserted). The content height is declared rather than measured, so a vertical pad would shift the first row and under-size the scroll range; put that space on an outer box |
-| `gap` | between rows, `>= 0`. It is part of the arithmetic, not decoration: the row pitch is `row_height + gap`, and both the scroll range and the returned window are computed from it |
-| `align_cross`, `bg`, `border`, `wheel_px`, `bar_thickness` | appearance and the wheel step. Setting `border` is worth it: the viewport cuts its last row in half, and with no edge to cut against that reads as a drawing error |
+- **`row_height` and `row_count` are the arithmetic**, and neither has a default. Every row must
+  be built at exactly `row_height` (asserted `> 0`), which is what makes an index computable from
+  a scroll offset — a list of variably tall rows is not this widget. The scroll range comes from
+  `row_count`, computed rather than measured, so it is the full list length even though the built
+  rows are not.
+- **`gap` is part of that arithmetic, not decoration** (asserted `>= 0`). The row pitch is
+  `row_height + gap`, and both the scroll range and the returned window are computed from it.
+- **`padding` is why the top and bottom entries must be zero.** The content height is declared
+  rather than measured, so a vertical pad would shift the first row and under-size the scroll
+  range. Put that space on an outer box.
+- **Set `border`.** The viewport cuts its last row in half, and with no edge to cut against that
+  reads as a drawing error rather than as a list continuing.
 
 Rows are usually `beginListboxRow` / `endListboxRow`, one per index in the range, with the row's
 own cells between them. What that buys, and what it asks for:
