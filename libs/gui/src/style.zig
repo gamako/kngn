@@ -96,6 +96,13 @@ pub const SurfaceTokens = struct {
     danger_subtle: Color,
     danger: Color,
     danger_strong: Color,
+    /// The sheet a modal lays over everything behind it. `dialog` fills its
+    /// viewport-sized root with this, so it is the theme's value rather than the
+    /// consumer's, and both canonical themes make it a translucent black.
+    ///
+    /// An alpha of zero is a legitimate choice and means "no dimming"; it does not
+    /// change the modal route, which absorbs the main tree either way.
+    scrim: Color,
 };
 
 pub const AccentTokens = struct {
@@ -421,6 +428,7 @@ pub fn defaultStyle() Style {
             .danger_subtle = Color.rgba(0x30, 0x24, 0x2C, 0xFF),
             .danger = Color.rgba(0x40, 0x30, 0x38, 0xFF),
             .danger_strong = Color.rgba(0x50, 0x20, 0x20, 0xFF),
+            .scrim = Color.rgba(0x00, 0x00, 0x00, 0x88),
         },
         .{
             .primary = Color.rgba(0x30, 0x60, 0xC0, 0xFF),
@@ -453,6 +461,7 @@ pub fn lightStyle() Style {
             .danger_subtle = Color.rgba(0xFE, 0xE2, 0xE2, 0xFF),
             .danger = Color.rgba(0xC0, 0x39, 0x2B, 0xFF),
             .danger_strong = Color.rgba(0x99, 0x1B, 0x1B, 0xFF),
+            .scrim = Color.rgba(0x00, 0x00, 0x00, 0x52),
         },
         .{
             .primary = Color.rgba(0x25, 0x63, 0xEB, 0xFF),
@@ -639,6 +648,24 @@ test "mutedFromSubtle: halfway from text_subtle toward bg" {
     try std.testing.expectEqual(@as(u8, 0xFF), m.a);
 }
 
+test "scrim: both canonical themes dim, and light dims less than dark" {
+    const dark = defaultStyle();
+    const light = lightStyle();
+    // A theme that shipped a fully transparent scrim would leave a modal reading as part
+    // of the tree behind it. Consumers may still choose zero; the canonical themes do not.
+    try std.testing.expect(dark.surface.scrim.a > 0);
+    try std.testing.expect(light.surface.scrim.a > 0);
+    // A light ground needs less dimming than a dark one: the same sheet that separates a
+    // modal over a dark canvas swallows the contrast the light shadows rely on.
+    try std.testing.expect(light.surface.scrim.a < dark.surface.scrim.a);
+    // Both are black, so the sheet darkens rather than tinting.
+    inline for (.{ dark, light }) |s| {
+        try std.testing.expectEqual(@as(u8, 0), s.surface.scrim.r);
+        try std.testing.expectEqual(@as(u8, 0), s.surface.scrim.g);
+        try std.testing.expectEqual(@as(u8, 0), s.surface.scrim.b);
+    }
+}
+
 test "defaultStyle: widget radii use the compact control defaults" {
     const s = defaultStyle();
     try std.testing.expectEqual(@as(u32, 6), s.control_radius);
@@ -661,6 +688,7 @@ test "defaultStyle: semantic dark tokens preserve every canonical surface color"
     try std.testing.expectEqual(Color.rgba(0x30, 0x24, 0x2C, 0xFF), s.surface.danger_subtle);
     try std.testing.expectEqual(Color.rgba(0x40, 0x30, 0x38, 0xFF), s.surface.danger);
     try std.testing.expectEqual(Color.rgba(0x50, 0x20, 0x20, 0xFF), s.surface.danger_strong);
+    try std.testing.expectEqual(Color.rgba(0x00, 0x00, 0x00, 0x88), s.surface.scrim);
 }
 
 test "defaultStyle: semantic dark accent border text and elevation tokens are exact" {
@@ -694,6 +722,7 @@ test "lightStyle: values and derived colors are theme-local" {
     try std.testing.expectEqual(Color.rgba(0xD7, 0xE0, 0xEB, 0xFF), s.surface.control_hover);
     try std.testing.expectEqual(Color.rgba(0xFF, 0xFF, 0xFF, 0xFF), s.surface.input);
     try std.testing.expectEqual(Color.rgba(0xC7, 0xD0, 0xDC, 0xFF), s.surface.control_subtle);
+    try std.testing.expectEqual(Color.rgba(0x00, 0x00, 0x00, 0x52), s.surface.scrim);
     try std.testing.expectEqual(Color.rgba(0x25, 0x63, 0xEB, 0xFF), s.accent.primary);
     try std.testing.expectEqual(Color.rgba(0x1D, 0x4E, 0xD8, 0xFF), s.accent.selected);
     try std.testing.expectEqual(Color.rgba(0xBB, 0xD3, 0xFF, 0xFF), s.accent.selection);

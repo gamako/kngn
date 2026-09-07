@@ -1,0 +1,106 @@
+# gallery replay, light theme: the library's own floating surfaces on a light ground.
+# 1024x640 / Debug / gui.default_font / section=overview initially
+#
+# A shadow tuned against a dark canvas says nothing about a light one — the light steps are
+# far weaker on purpose, and the scrim behind a modal is what they have to stay readable
+# against. This script exists to put menu, tooltip and dialog on that ground and snapshot them.
+#
+# The theme is swapped first, while nothing holds focus: `T` is ignored whenever a text field
+# has it, the same guard `Q` / `N` / `P` use.
+inject key_down T
+step 1
+inject key_up T
+step 1
+digest gallery
+expect gallery theme=light
+expect gallery section=overview
+snapshot fb
+
+# overview -> layout (basic, text, values, color, layout)
+inject key_down PAGE_DOWN
+step 1
+inject key_up PAGE_DOWN
+inject key_down PAGE_DOWN
+step 1
+inject key_up PAGE_DOWN
+inject key_down PAGE_DOWN
+step 1
+inject key_up PAGE_DOWN
+inject key_down PAGE_DOWN
+step 1
+inject key_up PAGE_DOWN
+inject key_down PAGE_DOWN
+step 1
+inject key_up PAGE_DOWN
+step 1
+digest gallery
+digest layout_sanity
+expect layout_sanity total=0
+expect gallery section=layout
+expect gallery theme=light
+
+# The text tooltip, one step above the content (coordinates as in the dark replay).
+inject mouse_move 144 136
+step 32
+digest gallery
+expect gallery hot=iconButton
+snapshot fb
+
+# The custom tooltipBox subtree, whose root takes the same step.
+inject mouse_move 208 136
+step 32
+digest gallery
+expect gallery hot=tooltipBox
+snapshot fb
+inject mouse_move 1000 620
+step 2
+
+# layout -> menus
+inject key_down PAGE_DOWN
+step 1
+inject key_up PAGE_DOWN
+step 1
+digest gallery
+expect gallery section=menus
+expect gallery theme=light
+
+# The menu-bar dropdown.
+inject mouse_move 205 122
+step 1
+inject mouse_down left
+step 1
+inject mouse_up left
+step 1
+digest gallery
+expect gallery menu_open=File
+snapshot fb
+inject mouse_down left
+step 1
+inject mouse_up left
+step 1
+digest gallery
+expect gallery menu_open=none
+inject mouse_move 1000 620
+
+# The modal: a scrim from the theme's token plus a panel at the frontmost step.
+inject mouse_move 120 192
+step 2
+inject mouse_down left
+step 1
+inject mouse_up left
+step 1
+digest gallery
+expect gallery dialog=open
+expect gallery dialog_last=alert
+expect gallery dialog_focus=1
+# The count comes from the token, so it holds in both themes and fails if the sheet is gone.
+expect gallery dialog_scrim=1
+snapshot fb
+inject key_down ESCAPE
+step 1
+inject key_up ESCAPE
+step 1
+digest gallery
+expect gallery dialog=closed
+expect gallery theme=light
+quit

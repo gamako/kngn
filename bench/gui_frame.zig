@@ -236,6 +236,10 @@ pub fn main(init: std.process.Init) !void {
     try runDialogScenario(io, &tracker, 0, "dialog-0");
     try runDialogScenario(io, &tracker, 1, "dialog-1");
     try runDialogScenario(io, &tracker, 8, "dialog-8");
+    // A shadow blit is per device pixel, and the mask is keyed by scale, so the retina case is
+    // its own measurement rather than four times the logical one.
+    try runDialogScenarioScaled(io, &tracker, 1, "dialog-1@2x", 2.0);
+    try runPopupScenarioScaled(io, &tracker, 8, "popup-8@2x", 2.0);
     try runIndentScenario(io, &tracker, 500, 0, "indent-d0-500");
     try runIndentScenario(io, &tracker, 1000, 0, "indent-d0-1000");
     try runIndentScenario(io, &tracker, 500, 3, "indent-d3-500");
@@ -444,22 +448,41 @@ fn runCountedScenario(
     name: []const u8,
     build: *const fn (*gui.Context) void,
 ) !void {
+    try runCountedScenarioScaled(io, tracker, name, build, 1.0);
+}
+
+/// The logical frame stays `W x H`; only the render scale changes, which is what decides how
+/// many pixels a shadow blit touches and which mask a step asks the cache for.
+///
+/// The shadow-mask counters on the draw list are cumulative for the life of the list, so a
+/// reading taken straight after the loop would include the warmup's misses. Both are sampled
+/// after warmup and reported as the difference.
+fn runCountedScenarioScaled(
+    io: std.Io,
+    tracker: *peak_allocator.PeakTrackingAllocator,
+    name: []const u8,
+    build: *const fn (*gui.Context) void,
+    scale: f32,
+) !void {
     const gpa = tracker.allocator();
     tracker.reset();
     var ctx = gui.Context.init(gpa, gui.default_font);
     defer ctx.deinit();
-    const pixels = try gpa.alloc(u32, W * H);
+    const pw: u32 = @intFromFloat(@as(f32, @floatFromInt(W)) * scale);
+    const ph: u32 = @intFromFloat(@as(f32, @floatFromInt(H)) * scale);
+    const pixels = try gpa.alloc(u32, pw * ph);
     defer gpa.free(pixels);
     @memset(pixels, 0);
-    const target = gui.RenderTarget{ .pixels = pixels, .width = W, .height = H };
+    const target = gui.RenderTarget{ .pixels = pixels, .width = pw, .height = ph };
 
     var w: usize = 0;
     while (w < WARMUP) : (w += 1) {
         ctx.beginFrame(W, H);
         build(&ctx);
         ctx.endFrame();
-        gui.render(target, ctx.postFrameDrawList(), ctx.font, 1.0);
+        gui.render(target, ctx.postFrameDrawList(), ctx.font, scale);
     }
+    const shadow_before = ctx.postFrameDrawList().shadowMaskDiagnostics();
 
     tracker.reset();
     var samples: [ITERS]u64 = undefined;
@@ -472,7 +495,7 @@ fn runCountedScenario(
         ctx.beginFrame(W, H);
         build(&ctx);
         ctx.endFrame();
-        gui.render(target, ctx.postFrameDrawList(), ctx.font, 1.0);
+        gui.render(target, ctx.postFrameDrawList(), ctx.font, scale);
         const ns: u64 = @intCast(start.untilNow(io).raw.nanoseconds);
         samples[i] = ns;
         arena_peak = @max(arena_peak, ctx.arena.queryCapacity());
@@ -484,8 +507,10 @@ fn runCountedScenario(
     std.mem.sort(u64, samples[0..], {}, std.sort.asc(u64));
     var sum: u64 = 0;
     for (samples) |s| sum += s;
-    std.debug.print("gui.outflow {s:<16} arena_cap={d:<10} alloc_calls={d:<8} cmds={d:<6} avg={d:>9} ns  min={d:>9} ns  p95={d:>9} ns  peak_bytes={d}\n", .{
+    const shadow_after = ctx.postFrameDrawList().shadowMaskDiagnostics();
+    std.debug.print("gui.outflow {s:<16} scale={d:.1} arena_cap={d:<10} alloc_calls={d:<8} cmds={d:<6} avg={d:>9} ns  min={d:>9} ns  p95={d:>9} ns  peak_bytes={d:<9} shadow_px={d:<9} sh_hit={d:<6} sh_miss={d:<4} sh_alloc={d}\n", .{
         name,
+        scale,
         arena_peak,
         tracker.alloc_calls / ITERS,
         cmds,
@@ -493,6 +518,10 @@ fn runCountedScenario(
         samples[0],
         percentile95(samples[0..]),
         tracker.peak_bytes,
+        (shadow_after.blit_pixels - shadow_before.blit_pixels) / ITERS,
+        (shadow_after.hits - shadow_before.hits) / ITERS,
+        shadow_after.misses - shadow_before.misses,
+        shadow_after.allocations - shadow_before.allocations,
     });
 }
 
@@ -596,6 +625,28 @@ fn buildDialog(ctx: *gui.Context, action_count: usize) void {
         },
     };
     _ = gui.dialog(ctx, &state);
+}
+
+fn runPopupScenarioScaled(io: std.Io, tracker: *peak_allocator.PeakTrackingAllocator, item_count: usize, name: []const u8, scale: f32) !void {
+    const Gen = struct {
+        var n: usize = 0;
+        fn build(ctx: *gui.Context) void {
+            buildPopup(ctx, n);
+        }
+    };
+    Gen.n = item_count;
+    try runCountedScenarioScaled(io, tracker, name, Gen.build, scale);
+}
+
+fn runDialogScenarioScaled(io: std.Io, tracker: *peak_allocator.PeakTrackingAllocator, action_count: usize, name: []const u8, scale: f32) !void {
+    const Gen = struct {
+        var n: usize = 0;
+        fn build(ctx: *gui.Context) void {
+            buildDialog(ctx, n);
+        }
+    };
+    Gen.n = action_count;
+    try runCountedScenarioScaled(io, tracker, name, Gen.build, scale);
 }
 
 fn runDialogScenario(io: std.Io, tracker: *peak_allocator.PeakTrackingAllocator, action_count: usize, name: []const u8) !void {

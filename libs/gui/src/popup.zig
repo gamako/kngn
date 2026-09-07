@@ -20,6 +20,7 @@ const layout = @import("layout.zig");
 const input_mod = @import("input.zig");
 const layer_types = @import("layer_types.zig");
 const draw_mod = @import("draw.zig");
+const style_mod = @import("style.zig");
 
 pub const Context = context_mod.Context;
 pub const Rect = geom.Rect;
@@ -134,10 +135,15 @@ fn itemStyle(ctx: *const Context) context_mod.WidgetStyle {
 
 /// Build a menu marker and its rows in the current frame. The result is synchronous; closing is
 /// the consumer's state transition after it observes `selected` or `dismissed`.
+///
+/// The menu is a surface that opens over the content, so it carries `Elevation.elevated`.
+/// A consumer does not add a shadow of its own; the theme's `Style.elevation` decides what
+/// the step looks like.
 pub fn popupMenu(ctx: *Context, state: *PopupState, items: []const PopupItem) PopupResult {
     return popupMenuEx(ctx, state, items, .{});
 }
 
+/// `popupMenu` with its options. Carries the same `Elevation.elevated` surface.
 pub fn popupMenuEx(ctx: *Context, state: *PopupState, items: []const PopupItem, opts: PopupMenuOpts) PopupResult {
     ctx.requireFrame("popupMenu");
     ctx.requireInteractiveAllowed("popupMenu");
@@ -159,6 +165,9 @@ pub fn popupMenuEx(ctx: *Context, state: *PopupState, items: []const PopupItem, 
         .bg = ctx.style.surface.control,
         .border = .{ .color = ctx.style.border_tokens.normal, .thickness = 1 },
         .radius = ctx.style.control_radius,
+        // A menu opens over the content, so it sits a step above it. The box's own clip does
+        // not cut the shadow, which is painted before the background.
+        .elevation = .elevated,
         .clip_children = true,
     });
 
@@ -204,6 +213,7 @@ pub fn popupMenuEx(ctx: *Context, state: *PopupState, items: []const PopupItem, 
 
 /// The former stacked entry point now has the same consumer-owned descriptor as every other
 /// popup. Registration order and `z` in the shared layer registry define its position.
+/// Delegates to `popupMenuEx`, elevation included.
 pub fn popupMenuStacked(ctx: *Context, state: *PopupState, items: []const PopupItem, opts: PopupMenuOpts) PopupResult {
     return popupMenuEx(ctx, state, items, opts);
 }
@@ -218,6 +228,11 @@ fn dialogActionIdForIndex(key: LayerKey, index: usize) Id {
 
 /// Build a full-viewport modal root with a declarative scrim and an ordinary focusable action row.
 /// No action rectangle or focus index is retained by the framework.
+///
+/// The root is filled with `Style.surface.scrim`, and the panel inside it carries
+/// `Elevation.overlay` — the frontmost step, because a modal is read against a sheet that has
+/// already darkened what is behind it. The scrim itself carries no step: a shadow under a
+/// full-viewport sheet would fall outside the screen. A consumer adds neither.
 pub fn dialog(ctx: *Context, state: *DialogState) DialogResult {
     ctx.requireFrame("dialog");
     ctx.requireInteractiveAllowed("dialog");
@@ -234,7 +249,7 @@ pub fn dialog(ctx: *Context, state: *DialogState) DialogResult {
         .height = .{ .fixed = @intCast(ctx.screen_h) },
         .align_main = .center,
         .align_cross = .center,
-        .bg = Color.rgba(0, 0, 0, 0x88),
+        .bg = ctx.style.surface.scrim,
         .clip_children = true,
     });
     ctx.beginBox(.{
@@ -246,6 +261,9 @@ pub fn dialog(ctx: *Context, state: *DialogState) DialogResult {
         .bg = ctx.style.surface.control,
         .border = .{ .color = ctx.style.border_tokens.normal, .thickness = 1 },
         .radius = 8,
+        // The frontmost step. The shadow falls on the scrim painted just before it, and the
+        // scrim's clip is the viewport, so it is cut only where the panel reaches the edge.
+        .elevation = .overlay,
         .clip_children = true,
     });
     ctx.labelEx(state.options.title, ctx.style.text_tokens.primary);
@@ -279,7 +297,7 @@ pub fn dialog(ctx: *Context, state: *DialogState) DialogResult {
 }
 
 /// Dialogs use the same descriptor and route as menus; the name is retained to make call sites
-/// read naturally when several modal consumers coexist.
+/// read naturally when several modal consumers coexist. Delegates to `dialog`, elevation included.
 pub fn dialogStacked(ctx: *Context, state: *DialogState) DialogResult {
     return dialog(ctx, state);
 }
@@ -1007,6 +1025,175 @@ test "dialog: actions use the generic focus scope" {
     ctx.endFrame();
     try std.testing.expect(ctx.layerWasPlaced(state.popup.key));
     try std.testing.expect(ctx.getNodeRect(dialogActionId(state.popup.key, 0)) != null);
+}
+
+// ── elevation of the library's own floating surfaces ────────────────────────
+
+/// A table whose steps share nothing: a different colour, blur and offset each. A test that
+/// reads one of these back has proven which step the surface asked for, which counting the
+/// shadows cannot — a menu wired to `overlay`, or a shadow put on the scrim instead of the
+/// panel, emits the same number of commands as the correct code.
+const step_sentinels: style_mod.ElevationLevels = .{
+    .{},
+    .{ .layers = &.{
+        .{ .color = Color.rgba(0x11, 0x00, 0x00, 0x40), .offset = .{ .x = 0, .y = 1 }, .blur = 3 },
+        .{ .color = Color.rgba(0x12, 0x00, 0x00, 0x40), .offset = .{ .x = 0, .y = 2 }, .blur = 4 },
+    } },
+    .{ .layers = &.{
+        .{ .color = Color.rgba(0x21, 0x00, 0x00, 0x40), .offset = .{ .x = 0, .y = 5 }, .blur = 11 },
+        .{ .color = Color.rgba(0x22, 0x00, 0x00, 0x40), .offset = .{ .x = 0, .y = 6 }, .blur = 12 },
+    } },
+    .{ .layers = &.{
+        .{ .color = Color.rgba(0x31, 0x00, 0x00, 0x40), .offset = .{ .x = 0, .y = 9 }, .blur = 21 },
+        .{ .color = Color.rgba(0x32, 0x00, 0x00, 0x40), .offset = .{ .x = 0, .y = 10 }, .blur = 22 },
+    } },
+};
+
+fn collectShadows(ctx: *Context, out: *std.ArrayList(draw_mod.DrawCmd)) !void {
+    for (ctx.postFrameDrawList().cmds.items) |cmd| {
+        if (cmd == .shadow) try out.append(std.testing.allocator, cmd);
+    }
+}
+
+test "elevation: a popup menu's surface takes the elevated step at its own rect" {
+    var ctx = testCtx();
+    defer ctx.deinit();
+    ctx.style.elevation.levels = &step_sentinels;
+    var state: PopupState = .{
+        .key = .{ .value = 0x9E01 },
+        .open = true,
+        .placement = .{ .source = .{ .point = .{ .x = 30, .y = 40 } }, .flip = .none, .shift = .none },
+    };
+    const items = [_]PopupItem{ .{ .label = "Cut" }, .{ .label = "Copy" } };
+
+    ctx.beginFrameAt(320, 200, 0.0);
+    _ = popupMenu(&ctx, &state, &items);
+    ctx.endFrame();
+
+    var shadows: std.ArrayList(draw_mod.DrawCmd) = .empty;
+    defer shadows.deinit(std.testing.allocator);
+    try collectShadows(&ctx, &shadows);
+
+    const expected = ctx.style.shadowsFor(.elevated);
+    try std.testing.expectEqual(expected.len, shadows.items.len);
+    const surface = ctx.getNodeRect(state.key.value).?;
+    for (shadows.items, expected) |cmd, layer| {
+        try std.testing.expectEqual(layer.color, cmd.shadow.color);
+        try std.testing.expectEqual(layer.blur, cmd.shadow.options.blur);
+        // The settled rect of the placed layer, not the rect it was measured at.
+        try std.testing.expectEqual(surface, cmd.shadow.rect);
+    }
+}
+
+/// One dialog frame, asserting that the panel — and only the panel — is shadowed.
+///
+/// `requested_height` goes in as given so the caller can drive the minimum-height clamp: the
+/// expected rect is computed from the same rule the implementation states, not from the draw
+/// list, because a rect read back out of the commands came from the same `box` call as the
+/// shadow and would agree with it however wrong both were.
+fn expectDialogPanelShadowed(requested_height: u32) !void {
+    var ctx = testCtx();
+    defer ctx.deinit();
+    ctx.style.elevation.levels = &step_sentinels;
+    const actions = [_]DialogAction{.{ .label = "OK" }};
+    var state: DialogState = .{
+        .popup = .{
+            .key = .{ .value = 0x9E02 },
+            .open = true,
+            .placement = .{ .source = .{ .point = .{ .x = 0, .y = 0 } }, .flip = .none, .shift = .none },
+        },
+        .options = .{
+            .title = "Confirm",
+            .body = "Continue?",
+            .actions = &actions,
+            .height = requested_height,
+        },
+    };
+
+    ctx.beginFrame(640, 480);
+    _ = dialog(&ctx, &state);
+    ctx.endFrame();
+
+    var shadows: std.ArrayList(draw_mod.DrawCmd) = .empty;
+    defer shadows.deinit(std.testing.allocator);
+    try collectShadows(&ctx, &shadows);
+
+    const expected = ctx.style.shadowsFor(.overlay);
+    try std.testing.expectEqual(expected.len, shadows.items.len);
+    const w: i32 = dialogWidth(state.options);
+    const h: i32 = @max(@as(i32, @intCast(requested_height)), 96);
+    const panel: Rect = .{
+        .x = @divTrunc(@as(i32, @intCast(ctx.screen_w)) - w, 2),
+        .y = @divTrunc(@as(i32, @intCast(ctx.screen_h)) - h, 2),
+        .w = @intCast(w),
+        .h = @intCast(h),
+    };
+    try std.testing.expect(panel.w != ctx.screen_w or panel.h != ctx.screen_h);
+    const viewport: Rect = .{ .x = 0, .y = 0, .w = ctx.screen_w, .h = ctx.screen_h };
+    for (shadows.items, expected) |cmd, layer| {
+        try std.testing.expectEqual(layer.color, cmd.shadow.color);
+        // Size and origin both: a step put on the scrim fails on the size, and a shadow
+        // displaced from the surface it belongs to fails on the origin.
+        try std.testing.expectEqual(panel, cmd.shadow.rect);
+        // The scrim opens its clip after painting itself, so what bounds the panel's shadow is
+        // the viewport rather than the scrim's content box. They are the same rectangle here,
+        // and the assertion says which of the two the shadow is allowed to depend on.
+        try std.testing.expectEqual(viewport, cmd.shadow.clip);
+    }
+}
+
+test "elevation: a dialog shadows its panel and leaves the scrim flat" {
+    try expectDialogPanelShadowed(168);
+    // A panel shorter than the floor is laid out at the floor, so the shadow follows the
+    // clamped height. Without this case the expected rect and the implementation agree only
+    // because neither exercised the clamp.
+    try expectDialogPanelShadowed(40);
+}
+
+test "elevation: the scrim is the theme's, and a transparent one still absorbs the click behind it" {
+    var ctx = testCtx();
+    defer ctx.deinit();
+    // A consumer theme that wants no dimming. The scrim is still built, still routes, and the
+    // panel still carries its step: only the sheet's colour changes.
+    ctx.style.surface.scrim = Color.rgba(0, 0, 0, 0);
+    const actions = [_]DialogAction{.{ .label = "OK" }};
+    var state: DialogState = .{
+        .popup = .{
+            .key = .{ .value = 0x9E03 },
+            .open = true,
+            .placement = .{ .source = .{ .point = .{ .x = 0, .y = 0 } }, .flip = .none, .shift = .none },
+        },
+        .options = .{ .title = "Confirm", .body = "Continue?", .actions = &actions },
+    };
+
+    ctx.beginFrame(640, 480);
+    _ = dialog(&ctx, &state);
+    ctx.endFrame();
+    try std.testing.expect(ctx.layerWasPlaced(state.popup.key));
+
+    // The viewport-sized fill carries the token, whatever the token says.
+    var scrim_fill: ?Color = null;
+    for (ctx.postFrameDrawList().cmds.items) |cmd| switch (cmd) {
+        .rect_filled => |r| {
+            if (r.rect.w != ctx.screen_w or r.rect.h != ctx.screen_h) continue;
+            switch (r.paint) {
+                .solid => |c| scrim_fill = c,
+                else => {},
+            }
+        },
+        else => {},
+    };
+    try std.testing.expectEqual(Color.rgba(0, 0, 0, 0), scrim_fill.?);
+
+    // A press outside the panel is still taken by the modal route rather than reaching the
+    // main tree: an invisible scrim is a visual choice, not a routing one.
+    var probe_clicked = false;
+    ctx.pushEvent(.{ .mouse_down = .{ .x = 4, .y = 4, .button = 0, .modifiers = 0 } });
+    ctx.beginFrame(640, 480);
+    probe_clicked = ctx.buttonId(0x9E04, "Behind", .{}).clicked;
+    _ = dialog(&ctx, &state);
+    ctx.endFrame();
+    try std.testing.expect(!probe_clicked);
 }
 
 test "popup surface: imperative geometry and stack declarations stay absent" {

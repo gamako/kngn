@@ -1357,6 +1357,9 @@ pub const Context = struct {
     /// No-op if not hovered this frame. When the same id+rect has been continuous for >= `tooltip_delay_s`,
     /// raise an overlay candidate at the end of endFrame. text is duped onto the frame arena.
     /// Same-frame last writer wins against `tooltipBox`.
+    ///
+    /// The tip's surface carries `Elevation.elevated`, the step of anything that opens over the
+    /// content; the theme owns what that shadow looks like.
     pub fn tooltip(self: *Context, tip: []const u8) void {
         self.requireFrame("tooltip");
         self.requireInteractiveAllowed("tooltip");
@@ -1388,6 +1391,10 @@ pub const Context = struct {
     /// after `endFrame`. Use application-owned memory or a frame-arena copy
     /// (`dupePixels` / `allocator().dupe`). A caller-stack temporary is not valid.
     /// Same-frame last writer wins against `tooltip`.
+    ///
+    /// The root the builder's subtree is placed in carries `Elevation.elevated`, the same step
+    /// a text tip takes. A box inside the subtree may state its own step; it shadows its own
+    /// rect, on top of the root's surface.
     pub fn tooltipBox(self: *Context, build_fn: TooltipBuildFn, build_ctx: *anyopaque) void {
         self.requireFrame("tooltipBox");
         self.requireInteractiveAllowed("tooltipBox");
@@ -2010,6 +2017,10 @@ pub const Context = struct {
         };
         root.cfg.bg = style.surface.control;
         root.cfg.border = .{ .color = style.border_tokens.normal, .thickness = 1 };
+        // A tooltip opens over the content, the same as a menu, so it takes the same step.
+        // Setting it here covers both candidate kinds: a text tip and a builder's subtree
+        // reach the screen through this one root.
+        root.cfg.elevation = .elevated;
         self.registerLayer(.{
             .key = tooltip_layer_key,
             // Above ordinary layers: a tooltip explains what is already on screen, so nothing
@@ -3910,6 +3921,14 @@ test "label: default color follows the primary text token" {
 // tooltip
 // ──────────────────────────────────────────────
 
+fn countShadows(ctx: *Context) usize {
+    var n: usize = 0;
+    for (ctx.postFrameDrawList().cmds.items) |cmd| {
+        if (cmd == .shadow) n += 1;
+    }
+    return n;
+}
+
 fn tooltipHasText(ctx: *Context, expected: []const u8) bool {
     for (ctx.postFrameDrawList().cmds.items) |cmd| {
         // Path commands are not tooltip labels; only `.text` is inspected.
@@ -5524,6 +5543,18 @@ fn simpleBoxTip(_: *anyopaque, c: *Context) void {
     c.label("box tip");
 }
 
+/// A builder whose own box asks for a step of its own. The root the tooltip is placed in has
+/// one too, so a test that only counted shadows could not tell the two apart.
+fn raisedBoxTip(_: *anyopaque, c: *Context) void {
+    c.beginBox(.{
+        .width = .{ .fixed = 40 },
+        .height = .{ .fixed = 12 },
+        .bg = Color.rgba(0x30, 0x30, 0x30, 0xFF),
+        .elevation = .raised,
+    });
+    c.endBox();
+}
+
 const CountingTip = struct {
     calls: u32 = 0,
     fn build(ptr: *anyopaque, c: *Context) void {
@@ -5551,6 +5582,75 @@ fn hoverButtonWithBox(ctx: *Context, id: Id, label: []const u8, build_fn: Toolti
     _ = ctx.buttonId(id, label, .{});
     ctx.tooltipBox(build_fn, build_ctx);
     ctx.endFrame();
+}
+
+test "elevation: a text tooltip's surface takes the elevated step at its own rect" {
+    var ctx = testCtx();
+    defer ctx.deinit();
+
+    ctx.beginFrameAt(800, 600, 0.0);
+    _ = ctx.buttonId(1, "Btn", .{});
+    ctx.endFrame();
+
+    hoverButtonWithTip(&ctx, 1, "Btn", "tip", 0.0);
+    // Before the delay nothing is shown, so nothing is shadowed. Without this the test would
+    // pass on a build that shadowed a tooltip that is not up yet.
+    try std.testing.expectEqual(@as(usize, 0), countShadows(&ctx));
+
+    hoverButtonWithTip(&ctx, 1, "Btn", "tip", 0.5);
+    try std.testing.expect(tooltipHasText(&ctx, "tip"));
+
+    const expected = ctx.style.shadowsFor(.elevated);
+    const surface = tooltipOverlayBgRect(&ctx, "tip").?;
+    var seen: usize = 0;
+    for (ctx.postFrameDrawList().cmds.items) |cmd| switch (cmd) {
+        .shadow => |sh| {
+            try std.testing.expectEqual(expected[seen].color, sh.color);
+            try std.testing.expectEqual(surface, sh.rect);
+            seen += 1;
+        },
+        else => {},
+    };
+    try std.testing.expectEqual(expected.len, seen);
+}
+
+test "elevation: a custom tooltip's root is elevated, and a box inside it keeps its own step" {
+    var ctx = testCtx();
+    defer ctx.deinit();
+    var dummy: u8 = 0;
+
+    ctx.beginFrameAt(800, 600, 0.0);
+    _ = ctx.buttonId(1, "Btn", .{});
+    ctx.endFrame();
+
+    hoverButtonWithBox(&ctx, 1, "Btn", raisedBoxTip, &dummy, 0.0);
+    hoverButtonWithBox(&ctx, 1, "Btn", raisedBoxTip, &dummy, 0.5);
+
+    const root_layers = ctx.style.shadowsFor(.elevated);
+    const child_layers = ctx.style.shadowsFor(.raised);
+    // The root is emitted before its children, so the first group belongs to the tooltip's own
+    // surface and the second to the box the builder made. Telling them apart by rect is the
+    // point: both groups exist either way, and only the rects say which step landed where.
+    var root_rect: ?Rect = null;
+    var child_rect: ?Rect = null;
+    var seen: usize = 0;
+    for (ctx.postFrameDrawList().cmds.items) |cmd| switch (cmd) {
+        .shadow => |sh| {
+            if (seen < root_layers.len) {
+                try std.testing.expectEqual(root_layers[seen].color, sh.color);
+                root_rect = sh.rect;
+            } else {
+                try std.testing.expectEqual(child_layers[seen - root_layers.len].color, sh.color);
+                child_rect = sh.rect;
+            }
+            seen += 1;
+        },
+        else => {},
+    };
+    try std.testing.expectEqual(root_layers.len + child_layers.len, seen);
+    // The builder's box is inside the tooltip, so its rect is strictly smaller.
+    try std.testing.expect(child_rect.?.w < root_rect.?.w);
+    try std.testing.expect(child_rect.?.h < root_rect.?.h);
 }
 
 test "tooltipBox: hidden on the first hover frame and before the delay" {

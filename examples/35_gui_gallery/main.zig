@@ -277,6 +277,19 @@ const App = struct {
     paste_text: ?[]const u8 = null,
     dialog_last: []const u8 = "none",
     dialog_result: []const u8 = "none",
+    theme: Theme = .dark,
+
+    fn themeName(self: *const App) []const u8 {
+        return @tagName(self.theme);
+    }
+
+    /// Swap the whole style. The gallery is where the library's own floating surfaces are
+    /// reviewed, and a shadow tuned for a dark ground says nothing about a light one, so both
+    /// themes have to be reachable from one replay.
+    fn toggleTheme(self: *App) void {
+        self.theme = if (self.theme == .dark) .light else .dark;
+        self.ctx.style = if (self.theme == .light) gui.lightStyle() else gui.defaultStyle();
+    }
 
     fn current(self: *const App) Section {
         return @enumFromInt(self.section);
@@ -347,7 +360,7 @@ fn galleryDigest(ctx_ptr: *anyopaque, buf: []u8) []const u8 {
             if (cmd.rect_filled.rect.w != app.ctx.screen_w or cmd.rect_filled.rect.h != app.ctx.screen_h) continue;
             switch (cmd.rect_filled.paint) {
                 .solid => |color| {
-                    if (std.meta.eql(color, gui.Color.rgba(0, 0, 0, 0x88))) dialog_scrim += 1;
+                    if (std.meta.eql(color, app.ctx.style.surface.scrim)) dialog_scrim += 1;
                 },
                 else => {},
             }
@@ -366,7 +379,7 @@ fn galleryDigest(ctx_ptr: *anyopaque, buf: []u8) []const u8 {
             badge_dy = badge.y - host.y;
         }
     }
-    return std.fmt.bufPrint(buf, "section={s} index={d} widgets={d} missing={d} schema={s} hot={s} active={s} focused={s} disabled={d} menu_open={s} dialog={s} dialog_last={s} dialog_result={s} dialog_focus={d} dialog_scrim={d} badge_dx={d} badge_dy={d}", .{
+    return std.fmt.bufPrint(buf, "section={s} index={d} widgets={d} missing={d} schema={s} hot={s} active={s} focused={s} disabled={d} menu_open={s} dialog={s} dialog_last={s} dialog_result={s} dialog_focus={d} dialog_scrim={d} badge_dx={d} badge_dy={d} theme={s}", .{
         meta.name,
         app.section,
         meta.widgets,
@@ -384,8 +397,11 @@ fn galleryDigest(ctx_ptr: *anyopaque, buf: []u8) []const u8 {
         dialog_scrim,
         badge_dx,
         badge_dy,
+        app.themeName(),
     }) catch buf[0..0];
 }
+
+const Theme = enum { dark, light };
 
 fn matrixFor(section: Section) []const MatrixRow {
     return switch (section) {
@@ -859,7 +875,7 @@ pub fn main(init: std.process.Init) !void {
     main_loop: while (running and window.pollEvents()) {
         const fb = window.lockFramebuffer() orelse continue :main_loop;
         defer fb.unlock();
-        @memset(fb.pixels, 0xFF_18_1C_24);
+        kit.pixelops.fill32(fb.pixels, @bitCast(ctx.style.surface.canvas));
 
         app.paste_text = null;
         while (window.nextEvent()) |ev| {
@@ -884,6 +900,7 @@ pub fn main(init: std.process.Init) !void {
                     },
                     .N => if (ctx.state.focused_id == 0) app.changeSection(1),
                     .P => if (ctx.state.focused_id == 0) app.changeSection(-1),
+                    .T => if (ctx.state.focused_id == 0) app.toggleTheme(),
                     else => {},
                 },
                 else => {},

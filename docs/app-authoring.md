@@ -553,8 +553,9 @@ for a plain action such as `Open`. A menu-bar dropdown uses the same column thro
 
 The marker is visible in its first submitted frame but owns input from the next frame, just like
 all declarative layers. `layerDismissed` is an event result; the consumer decides whether to set
-`open = false`. A modal menu absorbs the main tree, while a dialog may draw a scrim as its own
-viewport-sized declarative root. `PopupState` does not contain an item stack or framework-owned
+`open = false`. A modal menu absorbs the main tree, and a dialog's own
+viewport-sized root is the scrim, filled from `style.surface.scrim` — an application does not
+draw one of its own over it. `PopupState` does not contain an item stack or framework-owned
 open state.
 
 Four rules that apply across both tables:
@@ -892,6 +893,12 @@ the box could paint a surface, a border and a corner radius but not an elevation
 [`examples/47_screen_layout/main.zig`](../examples/47_screen_layout/main.zig) is the worked
 screen, and its cards are raised without a coordinate anywhere in the file.
 
+**The library's own floating surfaces already carry a step**, so do not put a shadow under one:
+a popup menu and a tooltip are `elevated`, and a dialog's panel is `overlay` (its scrim carries
+none — a shadow under a full-viewport sheet falls off the screen). `Elevation.none` says "no
+shadow", never "no scrim". The doc comments on `popupMenu`, `dialog` and `tooltip` state which
+step each surface takes.
+
 A shadow reaches outside the box's rect, so an ancestor with `clip_children` cuts it. The box's
 own `clip_children` does not: that clip opens after the background. And because draw order is
 tree order, a shadow falls on whatever was painted before it — a later sibling shadows an earlier
@@ -1003,9 +1010,10 @@ ctx.endFrame();
 
 `DialogOptions` carries `title`, `body`, `actions`, `width`, `height` and
 `dismiss_on_escape`. Actions are ordinary focusable buttons: disabled actions do not enter Tab
-order, and enabled actions respond to pointer, Enter and Space. The dialog root may draw a
-declarative viewport-sized scrim; this is a consumer visual choice, while modal routing always
-absorbs the main tree. `dialogStacked` is the same descriptor and registry path, not a second
+order, and enabled actions respond to pointer, Enter and Space. The dialog root is a
+viewport-sized scrim filled with `style.surface.scrim`, and modal routing absorbs the main tree
+whatever that colour is — a theme that sets its alpha to zero loses the dimming and keeps the
+routing. `dialogStacked` is the same descriptor and registry path, not a second
 popup storage channel. Option strings and action slices must remain valid for every frame the
 consumer keeps the dialog open.
 [`examples/35_gui_gallery/main.zig`](../examples/35_gui_gallery/main.zig) is the worked

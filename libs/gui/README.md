@@ -114,8 +114,8 @@ Splitter / ScrollArea, plus bool toggles:
 `Context.style` is a complete `Style` value. Its semantic color groups are `surface`, `accent`,
 `border_tokens`, `text_tokens`, and `elevation`. The `border_tokens` and `text_tokens` names keep
 their meaning distinct from the legacy flat `Style.border` and `Style.text` mirrors. The surface
-tokens cover canvas, panel, raised, elevated, control, hover control, input, subtle control, and
-status surfaces. Accent tokens cover primary, selected, selection, danger, and focus colors;
+tokens cover canvas, panel, raised, elevated, control, hover control, input, subtle control,
+status surfaces, and the scrim a modal lays over what is behind it. Accent tokens cover primary, selected, selection, danger, and focus colors;
 text tokens cover primary and subtle ink; elevation holds the shadow of each step of the
 elevation scale. Text tier sizes and weights, dimensions, radii, and animation timing remain
 part of `Style`.
@@ -126,7 +126,9 @@ sits (`BoxConfig.elevation`) and the theme says what that looks like, the way a 
 furthest back — because a raised surface reads as one only when a tight contact shadow and a
 wide ambient one are both present. **CSS lists shadows front-to-back, so a `box-shadow` value
 transcribed into a step is reversed.** The step changes nothing but the shadow: not the draw
-order, not the layer route, not the hit-test.
+order, not the layer route, not the hit-test. The library's own floating surfaces take their
+own steps — see the doc comments on `popupMenu`, `dialog` and `tooltip` — so an application
+does not add a shadow under one.
 
 `ElevationTokens.levels` is a borrowed pointer to an `ElevationLevels`, an array with one
 entry per step of the scale. An application with
@@ -252,7 +254,8 @@ a plain action, `off` a toggle that is off, `on` a toggle that is set. The menu 
 check column when any row is `off` or `on`, so toggling a row swaps the mark without moving a
 label. A menu-bar dropdown reaches the same column: `Command.check` is forwarded to the row, and
 the label carries text only. A modal menu does not receive a framework backdrop; a
-dialog's scrim is an ordinary background on its viewport-sized root.
+dialog's scrim is an ordinary background on its viewport-sized root, taken from
+`surface.scrim`.
 
 `gui.menuBar` builds the title buttons and registers their explicit Ids as pointer-only command
 targets. `gui.menuBarPopup` builds the dropdown in the same frame, anchored with

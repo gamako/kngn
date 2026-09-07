@@ -279,3 +279,83 @@ that a hand-painted box can still take the theme's shadow without reading the ta
   directions, so neither the values nor the cover rule can drift without it failing.
 - A change to how a rounded fill paints its interior changes what counts as cover. The
   rule names `drawRoundedFilledDevice` for that reason.
+
+## Revision, 2026-09-07: the library's own floating surfaces take a step
+
+The revision above gave the layout box an elevation and left every surface this library
+draws itself flat. That was deliberate — the step changes what every application looks
+like, so it wanted its own review — and this revision is that decision.
+
+### The assignment
+
+| Surface | Step | Why |
+|---|---|---|
+| `popupMenu`'s root, and the menu-bar dropdown built on it | `elevated` | opens over the content and is dismissed by clicking away from it |
+| A tooltip's root, both a text tip and a `tooltipBox` subtree | `elevated` | the same relationship to the content; it is read, not operated |
+| `dialog`'s panel | `overlay` | frontmost, and read against a scrim that has already darkened the tree |
+| `dialog`'s scrim | none | a shadow under a full-viewport sheet falls off the screen |
+
+Every one of these is a surface the library owns, so the step is not a parameter. An
+application that wants a flatter look replaces `Style.elevation.levels`, which is the one
+knob for the whole scale; adding a per-call step would put the same contract in two places
+and make each consumer answer a question the theme already answers.
+
+### The scrim became a token, and its two themes are not the same value
+
+`dialog` filled its root with a literal `rgba(0, 0, 0, 0x88)`. That is now
+`Style.surface.scrim`, and the two canonical themes give it different alpha: `0x88` in dark,
+`0x52` in light.
+
+The reason is not symmetry but what each theme's shadow can do. The light steps are far
+weaker than the dark ones — the same alpha over white reads as dirt rather than depth — so
+on a light ground the scrim is what separates a modal, and a sheet at 53% both darkens the
+ground below the panel and leaves the panel's own shadow with nothing to be seen against. On
+a dark ground the shadow does that work, and the sheet stays strong.
+
+Material Design keeps one scrim for both schemes. It can, because its dark surfaces are
+mid-greys; this dark canvas is `0x181C24`, and a sheet weak enough to suit the light theme
+is nearly invisible over it. `SurfaceTokens` is a per-theme structure, so nothing was gained
+by tying the two together.
+
+Rejected: strengthening `light_elevation_levels` so the panel's shadow reads through a 53%
+sheet. The shadow was not the problem — a raised card on a light ground already reads
+correctly, and darkening the steps to fix a modal would darken every card with them.
+
+An alpha of zero is left legal and means "no dimming". It does not change the modal route,
+which absorbs the main tree either way, and a test states that.
+
+### What it costs
+
+Measured with `bench-gui-frame` and `bench-gui-tooltip` (ReleaseFast, 1024x768 logical),
+before against after, per frame:
+
+| Scenario | Before | After | Shadow pixels blitted |
+|---|---|---|---|
+| `popup-8` | 32.5 µs | 132.3 µs | 98,604 |
+| `menu-8` | 33.7 µs | 114.5 µs | 79,760 |
+| `dialog-1` | 1367.8 µs | 1562.9 µs | 170,560 |
+| `popup-8` at scale 2 | 84.9 µs | 467.8 µs | 394,416 |
+| `dialog-1` at scale 2 | 5421 µs | 6259 µs | 682,240 |
+| tooltip `showing` | 15.9 µs | 80.9 µs | — |
+| `layer-0` … `layer-32` (no floating surface) | 49.7 / 55.6 µs | 48.4 / 55.2 µs | 0 |
+| tooltip `baseline` / `hidden` / `pending` | 12.8 / 9.7 / 6.8 µs | 10.2 / 8.3 / 7.4 µs | 0 |
+
+Three things in that table are worth stating plainly.
+
+- **A tree with no floating surface is unchanged**, which is the obligation a feature added
+  to a shared path carries. The two rows at the bottom are the scenarios where the feature
+  is absent, and they are reported against the numbers from before the change rather than
+  measured only afterwards.
+- **The dialog's cost is not its shadow.** It was already 1.37 ms per frame before this
+  change, because the scrim blends a translucent fill over the whole viewport every frame;
+  the shadow adds 14%. A frame with a modal open is expensive for a reason that predates
+  the step and is not addressed here.
+- **The shadow of a step is priced by the offset against the corner radius**, per the table
+  in the revision above, and the dialog panel is the case that table warned about: its
+  radius is 8 against `overlay`'s 24px offset, so the wide layer is painted whole rather
+  than elided. A panel that wanted the step cheaply would want a larger radius.
+
+In the assembled application (`pixie`, ReleaseFast, 780x600, the File menu held open for 309
+frames, `frameprof`) the frame body went from 0.472–0.496 ms to 0.600–0.644 ms — about
++0.14 ms while a menu is open, against a 16.7 ms budget. Two runs each, because the spread
+between runs on one machine is a third of the effect.

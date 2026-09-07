@@ -857,9 +857,16 @@ difference. The result therefore supports no regression detected for a tree that
 marker. The layer-count points show the expected increase in command count while retaining zero
 steady-state external allocation.
 
-The following cases use the current layer consumers. popup-0 and menu-0 are closed/empty
-controls; the remaining popup and menu cases are visible. Dialog roots remain visible at every
-action count, including zero actions.
+The following cases were measured on the layer consumers **as they were before the library's
+own floating surfaces took an elevation step**. Every visible popup, menu and dialog now emits
+two shadow commands more than the count below under either canonical theme (a step is two
+layers in both, and a replaced elevation table sets its own number), and its timing has moved with them; the
+before-and-after numbers for that change are in the revision of
+[ADR-036](adr/036_box-painting-is-one-drawlist-operation.md). The rows are kept as the
+measurement they were, rather than rewritten with numbers taken under a different protocol.
+
+popup-0 and menu-0 are closed/empty controls; the remaining popup and menu cases are visible.
+Dialog roots remain visible at every action count, including zero actions.
 
 | scenario | median (range, ns) | commands | arena_cap | alloc_calls | peak_bytes |
 |---|---:|---:|---:|---:|---:|

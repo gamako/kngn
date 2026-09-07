@@ -237,6 +237,9 @@ pub fn menuBar(ctx: *Context, commands: []const Command, state: *MenuBarState) v
 }
 
 /// In the current frame: build the open dropdown and return the selected CommandId.
+///
+/// The dropdown is a `popupMenu`, so it carries `Elevation.elevated`: the theme's step for a
+/// surface that opens over the content. The bar itself is part of that content and takes none.
 pub fn menuBarPopup(ctx: *Context, commands: []const Command, state: *MenuBarState) MenuBarResult {
     ctx.requireFrame("menuBarPopup");
     ctx.requireInteractiveAllowed("menuBarPopup");
@@ -360,6 +363,42 @@ test "formatItemLabel: carries the text and shortcut, and leaves the check to th
         // The label is the same string whatever the check state: the mark is drawn, not spelled.
         try std.testing.expect(std.mem.indexOf(u8, label, "*") == null);
     }
+}
+
+test "elevation: a menu-bar dropdown takes the same elevated step a popup does" {
+    var ctx = Context.init(std.testing.allocator, font_mod.default_font);
+    defer ctx.deinit();
+
+    const cmds = [_]Command{
+        .{ .id = 1, .label = "Open", .menu = .{ .title = "File", .order = 1 } },
+        .{ .id = 2, .label = "Save", .menu = .{ .title = "File", .order = 2 } },
+    };
+    var state: MenuBarState = .{ .open_title = "File" };
+
+    ctx.beginFrame(400, 300);
+    menuBar(&ctx, &cmds, &state);
+    _ = menuBarPopup(&ctx, &cmds, &state);
+    ctx.endFrame();
+
+    // The dropdown reaches the screen through `popupMenu` today. Asserting here rather than
+    // only on the popup keeps that a property of the menu bar: a dropdown that grows its own
+    // surface has to state its own step, and this fails until it does.
+    var shadows: usize = 0;
+    const expected = ctx.style.shadowsFor(.elevated);
+    const surface = ctx.getNodeRect(MENU_BAR_LAYER_KEY.value).?;
+    for (ctx.postFrameDrawList().cmds.items) |cmd| switch (cmd) {
+        .shadow => |sh| {
+            try std.testing.expectEqual(expected[shadows].color, sh.color);
+            try std.testing.expectEqual(expected[shadows].blur, sh.options.blur);
+            try std.testing.expectEqual(surface, sh.rect);
+            shadows += 1;
+        },
+        else => {},
+    };
+    try std.testing.expectEqual(expected.len, shadows);
+    // The bar itself is part of the tree the dropdown opens over, so it carries no step: a
+    // shadow under every menu title would put a seam across the top of every application.
+    try std.testing.expect(expected.len > 0);
 }
 
 /// A menu-bar dropdown must reach the same check column every other menu uses. Asserting on the
