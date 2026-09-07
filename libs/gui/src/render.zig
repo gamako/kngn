@@ -329,7 +329,7 @@ fn renderImpl(
                     }
                     if (c.paint == .solid) {
                         if (c.radius == 0) {
-                            drawRectFilled(target, c.rect, c.paint.solid, c.clip);
+                            drawRectFilled(target, c.rect, c.paint.solid, c.clip, true);
                         } else {
                             drawRoundedFilled(target, draw_list, c.rect, c.paint.solid, c.radius, c.aa, c.clip, 1.0, true);
                         }
@@ -344,7 +344,7 @@ fn renderImpl(
                 },
                 .rect_outline => |c| if (!c.clip.isEmpty()) {
                     if (c.radius == 0) {
-                        drawRectOutline(target, c.rect, c.color, c.thickness, c.clip);
+                        drawRectOutline(target, c.rect, c.color, c.thickness, c.clip, true);
                     } else {
                         drawRoundedOutline(target, draw_list, c.rect, c.color, c.thickness, c.radius, c.aa, c.clip, 1.0, true);
                     }
@@ -385,7 +385,7 @@ fn renderImpl(
                 if (!phys_clip.isEmpty()) {
                     if (c.paint == .solid) {
                         if (c.radius == 0) {
-                            drawRectFilled(target, scaleRect(c.rect, scale), c.paint.solid, phys_clip);
+                            drawRectFilled(target, scaleRect(c.rect, scale), c.paint.solid, phys_clip, true);
                         } else {
                             drawRoundedFilled(target, draw_list, scaleRect(c.rect, scale), c.paint.solid, c.radius, c.aa, phys_clip, scale, true);
                         }
@@ -409,6 +409,7 @@ fn renderImpl(
                             c.color,
                             scaleThickness(c.thickness, scale),
                             phys_clip,
+                            true,
                         );
                     } else {
                         drawRoundedOutline(
@@ -1013,28 +1014,40 @@ fn drawShadow(
 /// Hot path that runs every frame (full GUI redraw). Clip intersection is outside the loop (clipRect).
 /// Opaque colors (most GUI fills) go through `pixelops.fillRect32`, which fills the first row
 /// and replicates it (`Color.blend(dst, a=255 src) == src`, so bit-identical to the blend path).
-fn drawRectFilled(target: RenderTarget, rect: Rect, col: Color, clip: Rect) void {
+/// A translucent color blends four pixels at a time with `pixelops.srcOverOpaque4` plus a scalar
+/// tail. The source is uniform over the rectangle, so its vector is built once outside both loops.
+/// The 16 bytes move through a `@Vector(16, u8)` pointer; `pixelops.swizzleBgraToRgba` documents
+/// why that form is the contract on wasm rather than a matter of style.
+fn drawRectFilled(target: RenderTarget, rect: Rect, col: Color, clip: Rect, comptime use_simd: bool) void {
     const bounds = clipRect(rect, clip, target);
     if (bounds.isEmpty()) return;
     const x0: u32 = @intCast(bounds.x);
     const y0: u32 = @intCast(bounds.y);
-    const x1: u32 = x0 + bounds.w;
     const y1: u32 = y0 + bounds.h;
+    const src: u32 = @bitCast(col);
     if (col.a == 255) {
-        pixelops.fillRect32(target.pixels, target.width, x0, y0, bounds.w, bounds.h, @bitCast(col));
+        pixelops.fillRect32(target.pixels, target.width, x0, y0, bounds.w, bounds.h, src);
         return;
     }
+    const V = @Vector(16, u8);
+    const src4: V = @bitCast([4]u32{ src, src, src, src });
     var y = y0;
     while (y < y1) : (y += 1) {
-        const row = target.pixels[y * target.width .. y * target.width + target.width];
-        var x = x0;
-        while (x < x1) : (x += 1) {
-            row[x] = blendPixel(row[x], col);
+        const base = y * target.width + x0;
+        var x: u32 = 0;
+        if (comptime use_simd) {
+            while (x + 4 <= bounds.w) : (x += 4) {
+                const slot: *align(4) V = @ptrCast(target.pixels.ptr + base + x);
+                slot.* = pixelops.srcOverOpaque4(slot.*, src4);
+            }
+        }
+        while (x < bounds.w) : (x += 1) {
+            target.pixels[base + x] = blendPixel(target.pixels[base + x], col);
         }
     }
 }
 
-fn drawRectOutline(target: RenderTarget, rect: Rect, col: Color, thickness: u32, clip: Rect) void {
+fn drawRectOutline(target: RenderTarget, rect: Rect, col: Color, thickness: u32, clip: Rect, comptime use_simd: bool) void {
     const t = if (thickness == 0) @as(u32, 1) else thickness;
     const x = rect.x;
     const y = rect.y;
@@ -1043,20 +1056,20 @@ fn drawRectOutline(target: RenderTarget, rect: Rect, col: Color, thickness: u32,
 
     // Top
     const top_h = @min(t, h);
-    drawRectFilled(target, .{ .x = x, .y = y, .w = w, .h = top_h }, col, clip);
+    drawRectFilled(target, .{ .x = x, .y = y, .w = w, .h = top_h }, col, clip, use_simd);
 
     if (h > top_h) {
         // Bottom
         const bot_h = @min(t, h - top_h);
         const bot_y: i32 = y + @as(i32, @intCast(h - bot_h));
-        drawRectFilled(target, .{ .x = x, .y = bot_y, .w = w, .h = bot_h }, col, clip);
+        drawRectFilled(target, .{ .x = x, .y = bot_y, .w = w, .h = bot_h }, col, clip, use_simd);
 
         // Middle: left and right sides only (clamp so left and right do not overlap)
         const mid_y: i32 = y + @as(i32, @intCast(top_h));
         const mid_h = h - top_h - bot_h;
         if (mid_h > 0) {
             const left_w = @min(t, w);
-            drawRectFilled(target, .{ .x = x, .y = mid_y, .w = left_w, .h = mid_h }, col, clip);
+            drawRectFilled(target, .{ .x = x, .y = mid_y, .w = left_w, .h = mid_h }, col, clip, use_simd);
             if (w > t) {
                 // Keep the right band from overlapping past the left band's right edge
                 // (when t < w < 2t, overlapping left/right bands would double-blend a translucent outline)
@@ -1065,7 +1078,7 @@ fn drawRectOutline(target: RenderTarget, rect: Rect, col: Color, thickness: u32,
                 const right_end: i32 = x + @as(i32, @intCast(w));
                 if (right_end > right_start) {
                     const right_w: u32 = @intCast(right_end - right_start);
-                    drawRectFilled(target, .{ .x = right_start, .y = mid_y, .w = right_w, .h = mid_h }, col, clip);
+                    drawRectFilled(target, .{ .x = right_start, .y = mid_y, .w = right_w, .h = mid_h }, col, clip, use_simd);
                 }
             }
         }
@@ -1333,7 +1346,7 @@ fn drawRoundedFilled(
     comptime use_simd: bool,
 ) void {
     const radius = clampedDeviceRadius(rect, logical_radius, scale);
-    if (radius == 0) return drawRectFilled(target, rect, col, clip);
+    if (radius == 0) return drawRectFilled(target, rect, col, clip, use_simd);
     drawRoundedFilledDevice(target, draw_list, rect, col, radius, aa, clip, scale, use_simd);
 }
 
@@ -1355,17 +1368,17 @@ fn drawRoundedFilledDevice(
         .y = rect.y,
         .w = center_w,
         .h = rect.h,
-    }, col, clip);
+    }, col, clip, use_simd);
     const middle_h = rect.h - radius * 2;
     if (middle_h != 0) {
         const middle_y = rect.y + @as(i32, @intCast(radius));
-        drawRectFilled(target, .{ .x = rect.x, .y = middle_y, .w = radius, .h = middle_h }, col, clip);
+        drawRectFilled(target, .{ .x = rect.x, .y = middle_y, .w = radius, .h = middle_h }, col, clip, use_simd);
         drawRectFilled(target, .{
             .x = rect.x + @as(i32, @intCast(rect.w - radius)),
             .y = middle_y,
             .w = radius,
             .h = middle_h,
-        }, col, clip);
+        }, col, clip, use_simd);
     }
     drawCornerSet(target, draw_list, rect, radius, 0, 0, aa, col, clip, scale, use_simd);
 }
@@ -1634,7 +1647,7 @@ fn drawRoundedOutline(
     comptime use_simd: bool,
 ) void {
     const radius = clampedDeviceRadius(rect, logical_radius, scale);
-    if (radius == 0) return drawRectOutline(target, rect, col, thickness, clip);
+    if (radius == 0) return drawRectOutline(target, rect, col, thickness, clip, use_simd);
     drawRoundedOutlineDevice(target, draw_list, rect, col, thickness, radius, aa, clip, scale, use_simd);
 }
 
@@ -1659,24 +1672,24 @@ fn drawRoundedOutlineDevice(
     const inner_radius = radius -| t;
     const center_x = rect.x + @as(i32, @intCast(radius));
     const center_w = rect.w - radius * 2;
-    drawRectFilled(target, .{ .x = center_x, .y = rect.y, .w = center_w, .h = t }, col, clip);
+    drawRectFilled(target, .{ .x = center_x, .y = rect.y, .w = center_w, .h = t }, col, clip, use_simd);
     drawRectFilled(target, .{
         .x = center_x,
         .y = rect.y + @as(i32, @intCast(rect.h - t)),
         .w = center_w,
         .h = t,
-    }, col, clip);
+    }, col, clip, use_simd);
 
     const middle_y = rect.y + @as(i32, @intCast(radius));
     const middle_h = rect.h - radius * 2;
     const side_w = @min(t, radius);
-    drawRectFilled(target, .{ .x = rect.x, .y = middle_y, .w = side_w, .h = middle_h }, col, clip);
+    drawRectFilled(target, .{ .x = rect.x, .y = middle_y, .w = side_w, .h = middle_h }, col, clip, use_simd);
     drawRectFilled(target, .{
         .x = rect.x + @as(i32, @intCast(rect.w - side_w)),
         .y = middle_y,
         .w = side_w,
         .h = middle_h,
-    }, col, clip);
+    }, col, clip, use_simd);
 
     if (t > radius) {
         const extra = t - radius;
@@ -1687,13 +1700,13 @@ fn drawRoundedOutlineDevice(
             .y = inner_y,
             .w = extra,
             .h = inner_h,
-        }, col, clip);
+        }, col, clip, use_simd);
         drawRectFilled(target, .{
             .x = rect.x + @as(i32, @intCast(rect.w - t)),
             .y = inner_y,
             .w = extra,
             .h = inner_h,
-        }, col, clip);
+        }, col, clip, use_simd);
     }
     drawCornerSet(target, draw_list, rect, radius, inner_radius, t, aa, col, clip, scale, use_simd);
 }
@@ -2443,7 +2456,7 @@ test "drawRectFilled: opaque fast path is bit-identical to the blend path (inclu
     const rect = Rect{ .x = -2, .y = 3, .w = 8, .h = 20 }; // Including overflow
     const clip = Rect{ .x = 0, .y = 0, .w = 10, .h = 8 };
 
-    drawRectFilled(t_fast, rect, col, clip); // opaque → fast path
+    drawRectFilled(t_fast, rect, col, clip, true); // opaque → fast path
     // Reference: per-pixel blend over the clipped range
     const bounds = clipRect(rect, clip, t_ref);
     var y: u32 = @intCast(bounds.y);
@@ -2454,6 +2467,142 @@ test "drawRectFilled: opaque fast path is bit-identical to the blend path (inclu
         }
     }
     try std.testing.expectEqualSlices(u32, &px_ref, &px_fast);
+}
+
+/// One translucent-fill case: the rectangle, the clip that decides where the drawn region
+/// starts and how wide it is, and the color whose alpha selects the blend path.
+const TranslucentRectCase = struct {
+    name: []const u8,
+    rect: Rect,
+    clip: Rect,
+    col: Color,
+};
+
+/// Cases chosen so the clipped region varies in start alignment and in width and height, not
+/// just in the rectangle's own geometry: clipping at the target's left edge always yields
+/// `bounds.x == 0`, which is four-aligned, and would leave the unaligned starts untested.
+const translucent_rect_cases = [_]TranslucentRectCase{
+    // bounds.x % 4 == 0..3, each wide enough for several four-pixel steps plus a tail
+    .{ .name = "aligned start, w=13", .rect = .{ .x = 0, .y = 1, .w = 30, .h = 5 }, .clip = .{ .x = 0, .y = 0, .w = 13, .h = 12 }, .col = Color.rgba(0x50, 0xB0, 0xF0, 0x91) },
+    .{ .name = "start%4==1, w=13", .rect = .{ .x = 0, .y = 1, .w = 30, .h = 5 }, .clip = .{ .x = 1, .y = 0, .w = 13, .h = 12 }, .col = Color.rgba(0x50, 0xB0, 0xF0, 0x91) },
+    .{ .name = "start%4==2, w=11", .rect = .{ .x = 0, .y = 1, .w = 30, .h = 5 }, .clip = .{ .x = 2, .y = 0, .w = 11, .h = 12 }, .col = Color.rgba(0x10, 0xE0, 0x30, 0x55) },
+    .{ .name = "start%4==3, w=9", .rect = .{ .x = 0, .y = 1, .w = 30, .h = 5 }, .clip = .{ .x = 3, .y = 0, .w = 9, .h = 12 }, .col = Color.rgba(0x10, 0xE0, 0x30, 0x55) },
+    // widths below and around the four-pixel step: 1, 2, 3 never enter the body; 4 leaves no tail
+    .{ .name = "w=1", .rect = .{ .x = 5, .y = 2, .w = 1, .h = 6 }, .clip = .{ .x = 0, .y = 0, .w = 24, .h = 12 }, .col = Color.rgba(0xFF, 0x00, 0x00, 0x80) },
+    .{ .name = "w=2", .rect = .{ .x = 6, .y = 2, .w = 2, .h = 6 }, .clip = .{ .x = 0, .y = 0, .w = 24, .h = 12 }, .col = Color.rgba(0xFF, 0x00, 0x00, 0x80) },
+    .{ .name = "w=3", .rect = .{ .x = 7, .y = 2, .w = 3, .h = 6 }, .clip = .{ .x = 0, .y = 0, .w = 24, .h = 12 }, .col = Color.rgba(0x00, 0xFF, 0x00, 0x01) },
+    .{ .name = "w=4 (no tail)", .rect = .{ .x = 9, .y = 2, .w = 4, .h = 6 }, .clip = .{ .x = 0, .y = 0, .w = 24, .h = 12 }, .col = Color.rgba(0x00, 0xFF, 0x00, 0xFE) },
+    .{ .name = "w=5", .rect = .{ .x = 3, .y = 2, .w = 5, .h = 6 }, .clip = .{ .x = 0, .y = 0, .w = 24, .h = 12 }, .col = Color.rgba(0x00, 0x00, 0xFF, 0x80) },
+    .{ .name = "w=7", .rect = .{ .x = 2, .y = 2, .w = 7, .h = 6 }, .clip = .{ .x = 0, .y = 0, .w = 24, .h = 12 }, .col = Color.rgba(0x80, 0x40, 0x20, 0xC0) },
+    // heights that pin the row stride
+    .{ .name = "h=1", .rect = .{ .x = 1, .y = 4, .w = 21, .h = 1 }, .clip = .{ .x = 0, .y = 0, .w = 24, .h = 12 }, .col = Color.rgba(0x33, 0x99, 0xCC, 0x80) },
+    .{ .name = "h=2", .rect = .{ .x = 1, .y = 4, .w = 21, .h = 2 }, .clip = .{ .x = 0, .y = 0, .w = 24, .h = 12 }, .col = Color.rgba(0x33, 0x99, 0xCC, 0x80) },
+    // clipped on every side, and a rectangle starting outside the target
+    .{ .name = "clipped left and top", .rect = .{ .x = -5, .y = -3, .w = 20, .h = 10 }, .clip = .{ .x = 0, .y = 0, .w = 24, .h = 12 }, .col = Color.rgba(0xA0, 0x20, 0x60, 0x77) },
+    .{ .name = "clipped right and bottom", .rect = .{ .x = 14, .y = 6, .w = 20, .h = 20 }, .clip = .{ .x = 0, .y = 0, .w = 24, .h = 12 }, .col = Color.rgba(0xA0, 0x20, 0x60, 0x77) },
+    .{ .name = "clip narrower than rect on both sides", .rect = .{ .x = -2, .y = 1, .w = 30, .h = 9 }, .clip = .{ .x = 6, .y = 3, .w = 11, .h = 5 }, .col = Color.rgba(0x0F, 0xF0, 0x0F, 0x2A) },
+};
+
+const translucent_case_w: u32 = 24;
+const translucent_case_h: u32 = 12;
+
+/// Deterministic non-uniform background, so a wrong destination index shows up as a mismatch
+/// rather than being hidden by neighbouring pixels holding the same value.
+fn fillTranslucentCaseBackground(px: []u32) void {
+    for (px, 0..) |*p, i| p.* = 0xFF000000 | (@as(u32, @truncate(i)) *% 0x00050301 ^ 0x00123456);
+}
+
+/// Blend `col` over the clipped region one pixel at a time, without going through the code
+/// under test. This is the oracle for the geometry: the four-pixel body, the scalar tail and
+/// the row stride are all separately observable against it, which the SIMD-versus-scalar
+/// comparison below cannot do (both paths share the same tail, so losing the tail moves them
+/// together and stays invisible there).
+fn referenceTranslucentFill(px: []u32, width: u32, height: u32, rect: Rect, col: Color, clip: Rect) void {
+    const bounds = clipRect(rect, clip, .{ .pixels = px, .width = width, .height = height });
+    if (bounds.isEmpty()) return;
+    var y: u32 = @intCast(bounds.y);
+    while (y < @as(u32, @intCast(bounds.y)) + bounds.h) : (y += 1) {
+        var x: u32 = @intCast(bounds.x);
+        while (x < @as(u32, @intCast(bounds.x)) + bounds.w) : (x += 1) {
+            px[y * width + x] = blendPixel(px[y * width + x], col);
+        }
+    }
+}
+
+/// A case that leaves the framebuffer untouched compares two identical images and proves
+/// nothing, so every case asserts it drew before anything is compared. The name is reported
+/// because which case went silent is the whole content of that failure.
+fn expectCaseDrew(name: []const u8, before: []const u32, after: []const u32) !void {
+    if (std.mem.eql(u32, before, after)) {
+        std.debug.print("case drew nothing: {s}\n", .{name});
+        return error.CaseDrewNothing;
+    }
+}
+
+test "drawRectFilled: translucent fills match a per-pixel reference across start alignments, tails and clips" {
+    const w = translucent_case_w;
+    const h = translucent_case_h;
+    for (translucent_rect_cases) |case| {
+        var px_simd = [_]u32{0} ** (translucent_case_w * translucent_case_h);
+        var px_ref = px_simd;
+        fillTranslucentCaseBackground(&px_simd);
+        fillTranslucentCaseBackground(&px_ref);
+        const before = px_simd;
+
+        drawRectFilled(.{ .pixels = &px_simd, .width = w, .height = h }, case.rect, case.col, case.clip, true);
+        referenceTranslucentFill(&px_ref, w, h, case.rect, case.col, case.clip);
+
+        // The case has to actually draw, or the comparison below proves nothing.
+        expectCaseDrew(case.name, &before, &px_ref) catch |err| return err;
+        std.testing.expectEqualSlices(u32, &px_ref, &px_simd) catch |err| {
+            std.debug.print("case: {s}\n", .{case.name});
+            return err;
+        };
+    }
+}
+
+test "rect render: SIMD and scalar translucent fills are framebuffer-identical" {
+    const w = translucent_case_w;
+    const h = translucent_case_h;
+    for (translucent_rect_cases) |case| {
+        var px_simd = [_]u32{0} ** (translucent_case_w * translucent_case_h);
+        var px_scalar = px_simd;
+        fillTranslucentCaseBackground(&px_simd);
+        fillTranslucentCaseBackground(&px_scalar);
+        const before = px_simd;
+
+        drawRectFilled(.{ .pixels = &px_simd, .width = w, .height = h }, case.rect, case.col, case.clip, true);
+        drawRectFilled(.{ .pixels = &px_scalar, .width = w, .height = h }, case.rect, case.col, case.clip, false);
+
+        expectCaseDrew(case.name, &before, &px_simd) catch |err| return err;
+        std.testing.expectEqualSlices(u32, &px_scalar, &px_simd) catch |err| {
+            std.debug.print("case: {s}\n", .{case.name});
+            return err;
+        };
+    }
+}
+
+test "rect render: SIMD and scalar translucent outlines are framebuffer-identical" {
+    // An outline's left and right bands are the thickness wide, so a thin one is drawn by the
+    // scalar tail alone; its top and bottom bands span the full width and do enter the body.
+    const w = translucent_case_w;
+    const h = translucent_case_h;
+    const col = Color.rgba(0x20, 0xC0, 0xFF, 0x9C);
+    const clip = Rect{ .x = 0, .y = 0, .w = translucent_case_w, .h = translucent_case_h };
+    for ([_]u32{ 1, 2, 3, 5 }) |thickness| {
+        var px_simd = [_]u32{0} ** (translucent_case_w * translucent_case_h);
+        var px_scalar = px_simd;
+        fillTranslucentCaseBackground(&px_simd);
+        fillTranslucentCaseBackground(&px_scalar);
+        const before = px_simd;
+        const rect = Rect{ .x = 2, .y = 1, .w = 19, .h = 9 };
+
+        drawRectOutline(.{ .pixels = &px_simd, .width = w, .height = h }, rect, col, thickness, clip, true);
+        drawRectOutline(.{ .pixels = &px_scalar, .width = w, .height = h }, rect, col, thickness, clip, false);
+
+        try expectCaseDrew("outline", &before, &px_simd);
+        try std.testing.expectEqualSlices(u32, &px_scalar, &px_simd);
+    }
 }
 
 test "drawImage: SIMD path is bit-identical to the per-pixel reference (full alpha range, partial clip, spanning tails)" {
