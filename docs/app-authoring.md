@@ -271,7 +271,9 @@ discarded clicks. Opening a frame each time round the loop is all it takes to st
 
 **The runnable reference** is [`template/src/main.zig`](../template/src/main.zig), which wires
 this exact order end to end and is compiled and unit-tested by `zig build gate` in `template/`
-(part of this repository's own `-Dinstall-all=true`). Read it rather than keeping a second copy
+(part of this repository's own `-Dinstall-all=true`). The screen it builds lives beside it in
+[`template/src/screen.zig`](../template/src/screen.zig), so the widget-call placeholder in this
+section has a file of its own. Read it rather than keeping a second copy
 here — a doc-only example drifts the moment either side changes, while a compiled one is caught
 by the gate.
 
@@ -377,6 +379,8 @@ their fixed or measured sizes and it absorbs every pixel a resize adds or remove
 [`examples/47_screen_layout/main.zig`](../examples/47_screen_layout/main.zig) is that screen
 assembled: `buildScreen` is the outer frame, `card` the repeated panel, and `buildContent` the
 column holding the cards, the header and the list.
+[`template/src/screen.zig`](../template/src/screen.zig) is the smallest form of the same idea —
+a fixed title bar over a growing body — and is the file to start editing.
 
 **The GUI stores no application state.** Every value a widget shows or writes — a selection, a
 text buffer, a scroll offset, an open/closed flag — lives in your own struct, which is why the

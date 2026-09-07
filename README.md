@@ -163,7 +163,9 @@ distribution size and headless determinism, not compositing throughput.
 ## Hello, window
 
 External apps use `Runtime(App)` from `kit` (native and wasm share the same shape). Full
-source: [`template/src/main.zig`](template/src/main.zig).
+source: [`template/src/main.zig`](template/src/main.zig) for the wiring below, and
+[`template/src/screen.zig`](template/src/screen.zig) for the box tree it draws — the
+template splits the two so that the file an app grows in is the declarative one.
 
 ```zig
 const std = @import("std");
@@ -210,6 +212,11 @@ pub fn main(init: std.process.Init) !void {
 `window` / `init` / `frame` / `deinit` are the contract. The runtime owns the native pull
 loop and wasm exports. The framebuffer is still a bare `[]u32`;
 `lockFramebuffer()` returning `null` means no slot this frame, not a fatal error.
+
+The example above is the runtime contract alone, which is why it fills the framebuffer
+directly. A screen is not built that way: widgets go in a box tree that states how each
+part is sized, and the template builds one in
+[`template/src/screen.zig`](template/src/screen.zig).
 
 ## Building your own app
 

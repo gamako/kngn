@@ -1,23 +1,20 @@
-//! Minimal external app template for kngn.
+//! Minimal external app template for kngn. This file is the wiring; the screen it
+//! draws is `screen.zig`, which is where an app of your own takes shape.
 //!
-//! Demonstrates kit-only imports, Runtime(App), a GUI widget wired through the full
-//! event-forwarding path (`pollEvents` → `beginFrame` → `pushEvent` → widget →
+//! Demonstrates kit-only imports, Runtime(App), a GUI screen wired through the full
+//! event-forwarding path (`pollEvents` → `beginFrame` → `pushEvent` → widgets →
 //! `endFrame` → `render`), one harness probe, one action, and a pure unit test.
-//! Hot path: per-frame full-framebuffer fill via kit.pixelops.fill32 (never @memset),
-//! plus the GUI's own per-frame `beginFrame`/`endFrame`/`render` on a single button —
-//! a constant-size DrawList, not a new all-pixel loop, so the SIMD/div255/clip-hoist
-//! rules for a new all-pixel loop do not apply here. Probe/action are event-time only.
+//! Hot path: per-frame full-framebuffer fill via kit.pixelops.fill32 (never @memset).
+//! The GUI's own per-frame work is a constant-size DrawList, not a second all-pixel
+//! loop, so the SIMD/div255/clip-hoist rules for a new all-pixel loop do not apply
+//! here. Probe/action are event-time only.
 
 const std = @import("std");
 const kit = @import("kit");
 const platform = kit.platform;
 const app_runtime = kit.app_runtime;
 const gui = kit.gui;
-
-/// Default solid fill (opaque dark slate, 0xAARRGGBB).
-const default_color: u32 = 0xFF2E3440;
-/// Fill the "Toggle color" button switches to (opaque light blue, 0xAARRGGBB).
-const alt_color: u32 = 0xFF88C0D0;
+const screen = @import("screen.zig");
 
 const App = struct {
     pub const window = .{
@@ -27,7 +24,7 @@ const App = struct {
     };
 
     gpa: std.mem.Allocator,
-    color: u32,
+    state: screen.State,
     frame_count: u64,
     ctx: gui.Context,
 
@@ -36,7 +33,7 @@ const App = struct {
         const app = try gpa.create(App);
         app.* = .{
             .gpa = gpa,
-            .color = default_color,
+            .state = .{},
             .frame_count = 0,
             .ctx = gui.Context.init(gpa, gui.default_font),
         };
@@ -73,13 +70,11 @@ const App = struct {
             if (kit.toGuiEvent(ev)) |ge| self.ctx.pushEvent(ge);
         }
 
-        if (self.ctx.button("Toggle color")) {
-            self.color = if (self.color == default_color) alt_color else default_color;
-        }
+        screen.build(&self.ctx, &self.state);
         self.ctx.endFrame();
 
         // Per-frame full-pixel fill: use kit.pixelops.fill32 (Performance rules).
-        kit.pixelops.fill32(fb.pixels, self.color);
+        kit.pixelops.fill32(fb.pixels, self.state.color);
         const target: gui.RenderTarget = .{ .pixels = fb.pixels, .width = fb.width, .height = fb.height };
         gui.render(target, self.ctx.postFrameDrawList(), self.ctx.font, 1.0);
         win.present();
@@ -108,7 +103,7 @@ fn registerHarness(app: *App) void {
 fn digestState(ctx: *anyopaque, buf: []u8) []const u8 {
     const app: *App = @ptrCast(@alignCast(ctx));
     return std.fmt.bufPrint(buf, "color=#{X:0>6} frames={d}", .{
-        app.color & 0xFF_FFFF,
+        app.state.color & 0xFF_FFFF,
         app.frame_count,
     }) catch buf[0..0];
 }
@@ -124,7 +119,7 @@ fn parseColorHex(args: []const u8) !u32 {
 fn runSetColor(ctx: *anyopaque, args: []const u8, buf: []u8) ![]const u8 {
     const app: *App = @ptrCast(@alignCast(ctx));
     const color = try parseColorHex(args);
-    app.color = color;
+    app.state.color = color;
     return std.fmt.bufPrint(buf, "ok color=#{X:0>6}", .{color & 0xFF_FFFF}) catch error.BufferTooSmall;
 }
 
@@ -147,12 +142,12 @@ test "set_color updates application state" {
     // ctx is untouched by runSetColor, so the GUI context is left undefined here.
     var app: App = .{
         .gpa = undefined,
-        .color = default_color,
+        .state = .{},
         .frame_count = 0,
         .ctx = undefined,
     };
     var out: [64]u8 = undefined;
     const result = try runSetColor(&app, "FF3366", &out);
-    try std.testing.expectEqual(@as(u32, 0xFFFF3366), app.color);
+    try std.testing.expectEqual(@as(u32, 0xFFFF3366), app.state.color);
     try std.testing.expectEqualStrings("ok color=#FF3366", result);
 }
