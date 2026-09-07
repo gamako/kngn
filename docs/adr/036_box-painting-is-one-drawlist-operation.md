@@ -359,3 +359,94 @@ In the assembled application (`pixie`, ReleaseFast, 780x600, the File menu held 
 frames, `frameprof`) the frame body went from 0.472–0.496 ms to 0.600–0.644 ms — about
 +0.14 ms while a menu is open, against a 16.7 ms budget. Two runs each, because the spread
 between runs on one machine is a third of the effect.
+
+## Revision, 2026-09-07: the penumbra is smooth at both of its ends
+
+The mask's coverage profile was a straight ramp, `1 - distance / blur`. A straight ramp has
+the right values and the wrong shape: its slope is at full size where the shadow meets full
+coverage and again where it meets the ground, and a slope that stops abruptly is read as a
+line. Both ends of every shadow in this repository had one.
+
+The light theme is what made it visible. Measured down the centre of a light modal (a 360x168
+panel on a 1024x640 viewport, the column below its bottom edge), the profile was:
+
+| distance below the panel | value | slope |
+|---|---|---|
+| 0–8 px | 122, flat | 0 |
+| 8–24 px | 122 → 139 | +1.1 / px |
+| 24–32 px | 139 → 142 | +0.38 / px |
+| 32–88 px | 142 → 166 | +0.4 / px |
+| 88 px | 166, the ground | **still +0.5 / px when it arrived** |
+
+Two artefacts are in that table. The slope change at 24 px is the near layer of the step
+ending while the wide one continues — two layers of different widths always produce a
+shoulder. The one at 88 px is the ramp itself stopping, and that is the one worth removing.
+
+`coverage` is now `t * t * (3 - 2t)` over the same `t = 1 - distance / blur`, so its slope
+reaches zero at both ends. The profile's steps then widen out as it approaches the ground
+instead of continuing at full size and halting: the last levels of a light modal's shadow now
+hold for five pixels each, where before they were two apart and then gone.
+
+**This is free at frame time.** A mask is generated once per `(radius, blur, scale)` and
+retained, so the curve costs nothing per frame, and it changes no geometry: the blitted pixel
+counts in the table of the previous revision — 168,128 / 1,128,736 / 1,190,208 at radius 8 and
+350,528 / 446,560 / 508,032 at radius 32 — came back bit-identical from
+`bench-rounded-primitives` after the change, because a profile's shape does not move the
+extent it covers or what an opaque background hides. `bench-gui-frame` likewise reproduced its
+popup, menu and dialog timings.
+
+A curve cannot add levels, though, and the light theme's problem was partly that it has so
+few. Measured on the rendered frame, a light modal's shadow runs from 122 to a ground of 166 —
+**about forty levels in total** — because a shadow read against a light ground has to stay
+faint to avoid looking like dirt. Spreading forty levels over the dark theme's 64px of blur
+puts a band every other pixel.
+
+The light steps that float over content are therefore **drawn shorter than the same step in
+the dark table**, and given a higher peak *than they had before* to keep their contrast:
+`overlay` is 40px of blur at 18px of offset against the dark table's 64 at 24, and `elevated`
+is 28 at 12 against 48 at 16. Both remain far fainter than their dark counterparts in absolute
+terms — `0x3A` against `0x80` — since fainter is the whole reason they have few levels to
+spend. The light modal's bands now sit about 1.2px apart instead of 1.9px, and it reads as one
+shadow rather than a smudge.
+
+**Shortening one step of a theme is not a local edit.** Tightening `overlay` alone left the
+light table with a modal that spread less than the menu below it, inverting what the scale
+means, and the ordering test did not catch it because it only ever looked at the dark table.
+It now runs over every theme, and `elevated` was brought in with `overlay` for that reason as
+much as for its own banding.
+
+`raised` keeps the dark distance. It is fifteen levels deep in total, so it has no band in it
+to remove, and no sample in this repository renders it on a light ground — a change there
+could not have been reviewed by looking at anything. The dark table is untouched: its ground
+gives a shadow room the light one does not, and its values were chosen with that in mind.
+
+Rejected:
+
+- **The curve alone.** It removes the line at the end of the ramp and nothing else; the light
+  modal still banded every other pixel.
+- **Tightening the dark steps to match.** Nothing was wrong with them: a dark ground reads a
+  wide, faint shadow correctly, and the measurement that motivated the change does not exist
+  there.
+- **Dithering the mask.** It would trade a band for noise, break the nine-slice's position
+  independence — a mask is blitted at four corners and four edges, so a dither pattern baked
+  into it repeats visibly — and it addresses a symptom of the token values rather than the
+  values.
+
+What the curve has to keep is stated as tests rather than as this paragraph, in two parts.
+
+The shape: along the edge strip and the corner diagonal alike, the profile's first and last
+steps are each less than half its steepest step, and it never falls as it goes from the
+outside in. A straight ramp fails the first part because all of its steps are equal, and a
+curve smooth at one end only fails it too; a wobble fails the second. Two details of that test
+were wrong before they were right, and both are the same mistake — measuring next to the thing
+rather than the thing. The span has to end at the first fully covered sample, because the array
+continues into the flat interior, and a test reading the array's last element measures that
+interior instead of the knee where the ramp meets full coverage. And the comparison has to be
+against the steepest step rather than the middle sample, because the sample grid does not land
+on the steepest point: a 32px penumbra peaks at 12 levels per sample two entries before its
+midpoint, which reads as 11.
+
+The identity: three points of the curve itself (`0.25 → 40`, `0.5 → 128`, `0.75 → 215`). Every
+relative property above is satisfied by other smooth monotone curves — a cosine ease among
+them — so without these the profile could be replaced by a different shape and nothing would
+say so.

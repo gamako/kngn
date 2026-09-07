@@ -207,6 +207,12 @@ pub const dark_elevation_levels: ElevationLevels = .{
 
 /// The light theme's steps. A light ground needs a tinted, far weaker shadow than a
 /// dark one: the same alpha over white reads as dirt rather than depth.
+///
+/// **No light step spreads further than the dark step for the same role**, and the two that
+/// float over content are drawn distinctly shorter. A weak shadow over a light ground has few
+/// levels between its darkest point and the page, and spreading those few levels over the dark
+/// theme's distance puts a visible band every other pixel. The scale stays ordered within the
+/// theme; only its distances are shorter than the dark table's.
 pub const light_elevation_levels: ElevationLevels = .{
     .{},
     .{ .layers = &.{
@@ -214,12 +220,12 @@ pub const light_elevation_levels: ElevationLevels = .{
         .{ .color = Color.rgba(0x10, 0x10, 0x1C, 0x0F), .offset = .{ .x = 0, .y = 1 }, .blur = 2 },
     } },
     .{ .layers = &.{
-        .{ .color = Color.rgba(0x10, 0x10, 0x1C, 0x24), .offset = .{ .x = 0, .y = 16 }, .blur = 48 },
-        .{ .color = Color.rgba(0x10, 0x10, 0x1C, 0x1A), .offset = .{ .x = 0, .y = 4 }, .blur = 8 },
+        .{ .color = Color.rgba(0x10, 0x10, 0x1C, 0x2E), .offset = .{ .x = 0, .y = 12 }, .blur = 28 },
+        .{ .color = Color.rgba(0x10, 0x10, 0x1C, 0x22), .offset = .{ .x = 0, .y = 4 }, .blur = 8 },
     } },
     .{ .layers = &.{
-        .{ .color = Color.rgba(0x10, 0x10, 0x1C, 0x2E), .offset = .{ .x = 0, .y = 24 }, .blur = 64 },
-        .{ .color = Color.rgba(0x10, 0x10, 0x1C, 0x24), .offset = .{ .x = 0, .y = 8 }, .blur = 16 },
+        .{ .color = Color.rgba(0x10, 0x10, 0x1C, 0x3A), .offset = .{ .x = 0, .y = 18 }, .blur = 40 },
+        .{ .color = Color.rgba(0x10, 0x10, 0x1C, 0x2A), .offset = .{ .x = 0, .y = 6 }, .blur = 12 },
     } },
 };
 
@@ -780,9 +786,15 @@ test "elevation: every step is two layers, painted back to front" {
 test "elevation: the steps are ordered, and each theme has its own values" {
     const dark = defaultStyle();
     const light = lightStyle();
-    // A step further from the page casts a wider shadow than the one below it.
-    try std.testing.expect(dark.shadowsFor(.elevated)[0].blur > dark.shadowsFor(.raised)[0].blur);
-    try std.testing.expect(dark.shadowsFor(.overlay)[0].blur > dark.shadowsFor(.elevated)[0].blur);
+    // A step further from the page casts a wider shadow, and drops it further, than the step
+    // below it. This holds **within every theme**: a theme may draw the whole scale tighter
+    // than another, but a modal that spreads less than a menu inverts what the scale means.
+    inline for (.{ dark, light }) |s| {
+        for ([_]Elevation{ .elevated, .overlay }, [_]Elevation{ .raised, .elevated }) |higher, lower| {
+            try std.testing.expect(s.shadowsFor(higher)[0].blur > s.shadowsFor(lower)[0].blur);
+            try std.testing.expect(s.shadowsFor(higher)[0].offset.y > s.shadowsFor(lower)[0].offset.y);
+        }
+    }
     // A light ground takes a tinted, far weaker shadow than a dark one.
     try std.testing.expect(light.shadowsFor(.raised)[0].color.a < dark.shadowsFor(.raised)[0].color.a);
     try std.testing.expect(light.shadowsFor(.raised)[0].color.r != 0);
@@ -816,13 +828,36 @@ test "elevation: the light steps are exactly these shadows" {
         .{ .color = Color.rgba(0x10, 0x10, 0x1C, 0x0F), .offset = .{ .x = 0, .y = 1 }, .blur = 2 },
     }, s.shadowsFor(.raised));
     try std.testing.expectEqualSlices(BoxShadow, &.{
-        .{ .color = Color.rgba(0x10, 0x10, 0x1C, 0x24), .offset = .{ .x = 0, .y = 16 }, .blur = 48 },
-        .{ .color = Color.rgba(0x10, 0x10, 0x1C, 0x1A), .offset = .{ .x = 0, .y = 4 }, .blur = 8 },
+        .{ .color = Color.rgba(0x10, 0x10, 0x1C, 0x2E), .offset = .{ .x = 0, .y = 12 }, .blur = 28 },
+        .{ .color = Color.rgba(0x10, 0x10, 0x1C, 0x22), .offset = .{ .x = 0, .y = 4 }, .blur = 8 },
     }, s.shadowsFor(.elevated));
     try std.testing.expectEqualSlices(BoxShadow, &.{
-        .{ .color = Color.rgba(0x10, 0x10, 0x1C, 0x2E), .offset = .{ .x = 0, .y = 24 }, .blur = 64 },
-        .{ .color = Color.rgba(0x10, 0x10, 0x1C, 0x24), .offset = .{ .x = 0, .y = 8 }, .blur = 16 },
+        .{ .color = Color.rgba(0x10, 0x10, 0x1C, 0x3A), .offset = .{ .x = 0, .y = 18 }, .blur = 40 },
+        .{ .color = Color.rgba(0x10, 0x10, 0x1C, 0x2A), .offset = .{ .x = 0, .y = 6 }, .blur = 12 },
     }, s.shadowsFor(.overlay));
+}
+
+test "elevation: no light step spreads further than its dark counterpart, and each is fainter" {
+    const dark = defaultStyle();
+    const light = lightStyle();
+    // The relationship, not the values: a light ground gives the ramp so few levels that
+    // spreading it as far as the dark theme does puts a band every other pixel. Stating it
+    // here means a later edit that widens a light step has to face the reason it is narrow.
+    for ([_]Elevation{ .raised, .elevated, .overlay }) |step| {
+        const l = light.shadowsFor(step);
+        const d = dark.shadowsFor(step);
+        try std.testing.expect(l[0].blur <= d[0].blur);
+        try std.testing.expect(l[0].offset.y <= d[0].offset.y);
+        // Fainter in absolute terms, because it is read against a light ground: shorter is
+        // about distance, and does not make a light shadow darker than a dark one.
+        try std.testing.expect(l[0].color.a < d[0].color.a);
+    }
+    // The two steps that float over content are strictly shorter, which is where the banding
+    // was measured. `raised` keeps the dark distance: it is fifteen levels deep in total, so
+    // there is no band in it to remove.
+    for ([_]Elevation{ .elevated, .overlay }) |step| {
+        try std.testing.expect(light.shadowsFor(step)[0].blur < dark.shadowsFor(step)[0].blur);
+    }
 }
 
 test "elevation: a consumer can replace the whole table" {
