@@ -2137,8 +2137,13 @@ pub fn splitter(ctx: *Context, id: Id, orient: Orient, size: *i32, opts: Splitte
 // Structure: outer(row) → [ leftCol(column) → [ viewport(clip,scroll) → content(fit) , hbar ] , vbar ]
 // viewport uses previous-frame rect; content size is declared fixed → recorded
 // extent → measured, from the previous-frame rect_cache.
-// Clamp of scroll, whether bars show, and thumb geometry use **previous-frame** values (same sync contract as splitter.
-// Frames where content or viewport size changes are transitional for one frame, then self-correct).
+// Whether bars show, thumb geometry, and the *upper* bound of the scroll clamp use
+// **previous-frame** values (same sync contract as splitter. Frames where content or
+// viewport size changes are transitional for one frame, then self-correct).
+// A frame with no previous-frame geometry — the area's first, or the one where it
+// becomes visible again — has no range to clamp against, so it clamps only from below
+// and is not a wheel target; the caller's amount survives to be clamped next frame
+// (`docs/adr/039`).
 // Caller holds scroll in `*Vec2f` (keeps trackpad fractions). layout gets rounded i32.
 
 const SCROLL_MIN_THUMB: i32 = 16;
@@ -2174,6 +2179,24 @@ fn scrollThumbLen(viewport_len: i32, content_len: i32) i32 {
     return std.math.clamp(raw, min_thumb, viewport_len);
 }
 
+/// Settles one scroll axis. The lower bound always applies; the upper bound applies
+/// only where `max` came from a frame that was actually laid out, because zero is what
+/// an absent range looks like and clamping to it discards the caller's amount.
+fn clampScrollAxis(v: f32, max: i32, geometry_known: bool) f32 {
+    const lower = @max(v, 0); // Also maps NaN to 0: `@max` returns the operand that is not NaN.
+    if (!geometry_known) return lower;
+    return @min(lower, @as(f32, @floatFromInt(max)));
+}
+
+/// Converts a scroll amount into the offset the layout box carries, picking the bound
+/// that fits what settled it: `geom.scrollOffsetToLayout` once a clamp has bounded the
+/// amount by real content, and `geom.unsettledScrollOffsetToLayout` on a frame with no
+/// range, where the amount is a one-frame guess. Both are documented in `geom`.
+fn scrollToLayout(v: f32, geometry_known: bool) i32 {
+    if (geometry_known) return geom.scrollOffsetToLayout(v);
+    return geom.unsettledScrollOffsetToLayout(v);
+}
+
 fn scrollThumbColor(ctx: *Context, st: context_mod.ScrollState, thumb_id: Id) Color {
     return if (ctx.state.active_id == thumb_id)
         st.thumb_active
@@ -2190,18 +2213,28 @@ fn scrollThumbColor(ctx: *Context, st: context_mod.ScrollState, thumb_id: Id) Co
 /// (1) caller writes (`virtualScrollToRow` and similar, before begin) → (2) thumb drag →
 /// (3) wheel, only if this area is the chain head → (4) clamp. Areas that are not the
 /// chain head leave leftover wheel for `endScrollArea`.
+///
+/// Steps (2)–(4) need the previous frame's geometry. Without it — the area's first frame,
+/// or the frame it becomes visible again — step (4) applies its lower bound only, and
+/// steps (2) and (3) do not run, so `scroll` keeps the value the caller holds instead of
+/// being clamped to an absent range.
 pub fn beginScrollArea(ctx: *Context, id: Id, scroll: *Vec2f, opts: ScrollAreaOpts) void {
     ctx.requireInteractiveAllowed("beginScrollArea");
-    const content_id = id_mod.hashInt(id, 1);
+    const content_id = context_mod.scrollAreaContentId(id);
     const vthumb_id = id_mod.hashInt(id, 2);
     const hthumb_id = id_mod.hashInt(id, 3);
 
-    // Previous-frame viewport rect / content size (declared fixed → extent → measured)
+    // Previous-frame viewport rect / content size (declared fixed → extent → measured).
+    // Both come from the same subtree, so an area that was not built last frame has
+    // neither. `geometry_known` is that condition, and every value below derived from
+    // the previous frame is zero without it — including the content size, so which side
+    // is missing never matters.
     const vp = ctx.getNodeRect(id);
     const cached = ctx.getNodeCachedRect(content_id);
-    const cs = if (cached) |c| c.scrollContentSize() else geom.Vec2{ .x = 0, .y = 0 };
-    const vp_w: i32 = if (vp) |r| @intCast(r.w) else 0;
-    const vp_h: i32 = if (vp) |r| @intCast(r.h) else 0;
+    const geometry_known = vp != null and cached != null;
+    const cs = if (geometry_known) cached.?.scrollContentSize() else geom.Vec2{ .x = 0, .y = 0 };
+    const vp_w: i32 = if (geometry_known) @intCast(vp.?.w) else 0;
+    const vp_h: i32 = if (geometry_known) @intCast(vp.?.h) else 0;
     const content_w: i32 = cs.x;
     const content_h: i32 = cs.y;
     const max_x: i32 = @max(0, content_w - vp_w);
@@ -2234,9 +2267,13 @@ pub fn beginScrollArea(ctx: *Context, id: Id, scroll: *Vec2f, opts: ScrollAreaOp
     }
 
     // Clamp thumb (and any caller write) before wheel so the chain head applies
-    // wheel on top of the already-settled thumb position.
-    scroll.x = std.math.clamp(scroll.x, 0, @as(f32, @floatFromInt(max_x)));
-    scroll.y = std.math.clamp(scroll.y, 0, @as(f32, @floatFromInt(max_y)));
+    // wheel on top of the already-settled thumb position. The upper bound is the
+    // previous frame's range, so a frame that has none does not apply one: it would
+    // read as "nowhere to scroll" and overwrite the caller's amount with zero. The
+    // lower bound holds always — it is what keeps a negative or NaN amount out of the
+    // row arithmetic downstream.
+    scroll.x = clampScrollAxis(scroll.x, max_x, geometry_known);
+    scroll.y = clampScrollAxis(scroll.y, max_y, geometry_known);
 
     // Thumb geometry (px) from the clamped scroll
     var st: context_mod.ScrollState = .{
@@ -2256,6 +2293,7 @@ pub fn beginScrollArea(ctx: *Context, id: Id, scroll: *Vec2f, opts: ScrollAreaOp
         .viewport_id = id,
         .scroll = scroll,
         .viewport_rect = vp,
+        .geometry_known = geometry_known,
         .max_x = max_x,
         .max_y = max_y,
         .wheel_px = opts.wheel_px,
@@ -2283,12 +2321,12 @@ pub fn beginScrollArea(ctx: *Context, id: Id, scroll: *Vec2f, opts: ScrollAreaOp
     // scroll.y before it builds rows. Non-head areas leave the remainder for end.
     if (ctx.wheel_chain_head == id) {
         applyScrollAreaWheel(ctx, &st);
-        scroll.x = std.math.clamp(scroll.x, 0, @as(f32, @floatFromInt(max_x)));
-        scroll.y = std.math.clamp(scroll.y, 0, @as(f32, @floatFromInt(max_y)));
+        scroll.x = clampScrollAxis(scroll.x, max_x, geometry_known);
+        scroll.y = clampScrollAxis(scroll.y, max_y, geometry_known);
     }
 
-    const sx: i32 = @intFromFloat(@round(scroll.x));
-    const sy: i32 = @intFromFloat(@round(scroll.y));
+    const sx: i32 = scrollToLayout(scroll.x, geometry_known);
+    const sy: i32 = scrollToLayout(scroll.y, geometry_known);
 
     // outer(row) → leftCol(column) → viewport(clip,scroll) → inner content(fit)
     ctx.beginBox(.{ .direction = .row, .width = opts.width, .height = opts.height, .bg = opts.bg, .border = opts.border });
@@ -2302,8 +2340,11 @@ pub fn beginScrollArea(ctx: *Context, id: Id, scroll: *Vec2f, opts: ScrollAreaOp
 /// Apply unconsumed wheel to scroll; consume only the delta that actually moved.
 /// Remainder that could not move at an edge stays in `ctx.wheel_remaining` for outer ScrollAreas.
 /// Hit-test uses the cursor sealed with the wheel chain, not a later `mouse_pos`.
-/// A missing previous-frame viewport (first frame of this id) is not a wheel target.
+/// An area without previous-frame geometry (its first frame, or the frame it becomes
+/// visible again) is not a wheel target: the amounts here are bounded by that geometry,
+/// so applying them would clamp the caller's scroll to zero.
 fn applyScrollAreaWheel(ctx: *Context, st: *context_mod.ScrollState) void {
+    if (!st.geometry_known) return;
     if (!ctx.current_layer_scope.wheel_enabled) return;
     ctx.ensureWheelChain();
     if (!ctx.wheel_remaining_seeded) {
@@ -2339,8 +2380,8 @@ fn applyScrollAreaWheel(ctx: *Context, st: *context_mod.ScrollState) void {
     rem.y -= -act_y / wp;
 
     if (st.viewport_node) |node| {
-        node.cfg.scroll_x = @intFromFloat(@round(scroll.x));
-        node.cfg.scroll_y = @intFromFloat(@round(scroll.y));
+        node.cfg.scroll_x = geom.scrollOffsetToLayout(scroll.x);
+        node.cfg.scroll_y = geom.scrollOffsetToLayout(scroll.y);
     }
     if (st.need_v and st.max_y > 0) {
         const travel = st.vp_h - st.v_len;
@@ -7811,4 +7852,325 @@ test "wantsTextInput: a field that goes disabled, or is not submitted at all, ta
     ctx.beginFrameAt(240, 120, 0.3);
     ctx.endFrame();
     try std.testing.expect(!ctx.wantsTextInput());
+}
+
+// ── ScrollArea on a frame with no previous-frame geometry ──
+
+/// A frame that lays out something other than the scroll area, which is what makes the
+/// area lose its cached geometry. An *empty* root would not: `endFrame` skips the cache
+/// rebuild entirely for a frame that never touched the layout API, so the area would keep
+/// last frame's rect and a test written that way would pass while exercising nothing.
+fn frameWithoutScrollArea(ctx: *Context) void {
+    ctx.beginFrame(300, 300);
+    ctx.beginBox(.{ .width = .{ .fixed = 10 }, .height = .{ .fixed = 10 } });
+    ctx.endBox();
+    ctx.endFrame();
+}
+
+fn scrollAreaFrame(ctx: *Context, sid: Id, child: Id, scroll: *Vec2f, opts: ScrollAreaOpts, cw: i32, ch: i32) void {
+    ctx.beginFrame(300, 300);
+    ctx.beginScrollArea(sid, scroll, opts);
+    buildFixedContent(ctx, child, cw, ch);
+    ctx.endScrollArea();
+    ctx.endFrame();
+}
+
+/// Content that emits draw commands, so `render`'s domain check has something to check.
+fn buildPaintedContent(ctx: *Context, child_id: Id, w: i32, h: i32) void {
+    ctx.beginBox(.{
+        .id = child_id,
+        .width = .{ .fixed = w },
+        .height = .{ .fixed = h },
+        .bg = Color.rgba(0x20, 0x30, 0x40, 0xFF),
+    });
+    ctx.text("row", .{});
+    ctx.endBox();
+}
+
+test "scrollArea: an area that becomes visible again keeps the caller's scroll" {
+    var ctx = testCtx();
+    defer ctx.deinit();
+    const SID: Id = 0x5C0341;
+    const CHILD: Id = 0xC0FFEE41;
+    var scroll: Vec2f = .{};
+    const opts: ScrollAreaOpts = .{ .width = .{ .fixed = 100 }, .height = .{ .fixed = 60 } };
+
+    // Settle geometry (content 200 - viewport 60 = a range of 140), then scroll inside it.
+    scrollAreaFrame(&ctx, SID, CHILD, &scroll, opts, 80, 200);
+    scroll.y = 100;
+    scrollAreaFrame(&ctx, SID, CHILD, &scroll, opts, 80, 200);
+    try std.testing.expectApproxEqAbs(@as(f32, 100), scroll.y, 0.5);
+
+    frameWithoutScrollArea(&ctx);
+    try std.testing.expectApproxEqAbs(@as(f32, 100), scroll.y, 0.5); // Held while hidden
+
+    scrollAreaFrame(&ctx, SID, CHILD, &scroll, opts, 80, 200);
+    try std.testing.expectApproxEqAbs(@as(f32, 100), scroll.y, 0.5);
+    // And the amount reaches this frame's placement, not just the caller's variable.
+    const vp = ctx.getNodeRect(SID).?;
+    try std.testing.expectEqual(vp.y - 100, ctx.getNodeRect(CHILD).?.y);
+}
+
+test "scrollArea: an area that becomes visible again keeps horizontal scroll too" {
+    var ctx = testCtx();
+    defer ctx.deinit();
+    const SID: Id = 0x5C0342;
+    const CHILD: Id = 0xC0FFEE42;
+    var scroll: Vec2f = .{};
+    const opts: ScrollAreaOpts = .{ .width = .{ .fixed = 100 }, .height = .{ .fixed = 60 }, .content_width = .fit };
+
+    scrollAreaFrame(&ctx, SID, CHILD, &scroll, opts, 300, 40);
+    scroll.x = 120;
+    scrollAreaFrame(&ctx, SID, CHILD, &scroll, opts, 300, 40);
+    try std.testing.expectApproxEqAbs(@as(f32, 120), scroll.x, 0.5);
+
+    frameWithoutScrollArea(&ctx);
+    scrollAreaFrame(&ctx, SID, CHILD, &scroll, opts, 300, 40);
+
+    try std.testing.expectApproxEqAbs(@as(f32, 120), scroll.x, 0.5);
+    const vp = ctx.getNodeRect(SID).?;
+    try std.testing.expectEqual(vp.x - 120, ctx.getNodeRect(CHILD).?.x);
+}
+
+test "scrollArea: a hidden area loses its viewport rect and its content size together" {
+    var ctx = testCtx();
+    defer ctx.deinit();
+    const SID: Id = 0x5C0343;
+    const CHILD: Id = 0xC0FFEE43;
+    const content_id = id_mod.hashInt(SID, 1);
+    var scroll: Vec2f = .{};
+    const opts: ScrollAreaOpts = .{ .width = .{ .fixed = 100 }, .height = .{ .fixed = 60 } };
+
+    scrollAreaFrame(&ctx, SID, CHILD, &scroll, opts, 80, 200);
+    try std.testing.expect(ctx.getNodeRect(SID) != null);
+    try std.testing.expect(ctx.getNodeCachedRect(content_id) != null);
+
+    frameWithoutScrollArea(&ctx);
+    // Both sides come from the same subtree, which is why one flag can stand for both.
+    try std.testing.expect(ctx.getNodeRect(SID) == null);
+    try std.testing.expect(ctx.getNodeCachedRect(content_id) == null);
+}
+
+test "scrollArea: a cached content size without a viewport rect settles no range" {
+    var ctx = testCtx();
+    defer ctx.deinit();
+    const SID: Id = 0x5C0344;
+    const CHILD: Id = 0xC0FFEE44;
+    const content_id = id_mod.hashInt(SID, 1);
+    var scroll: Vec2f = .{ .x = 70, .y = 70 };
+    const opts: ScrollAreaOpts = .{ .width = .{ .fixed = 100 }, .height = .{ .fixed = 100 } };
+
+    // Only the content box carries an entry, and it is larger than the viewport. Reading
+    // it without a viewport rect would compute a range out of a zero viewport and show bars.
+    try ctx.rect_cache.put(ctx.gpa, content_id, .{
+        .rect = .{ .x = 0, .y = 0, .w = 200, .h = 200 },
+        .clip = .{ .x = 0, .y = 0, .w = 300, .h = 300 },
+        .measured_w = 200,
+        .measured_h = 200,
+    });
+
+    ctx.beginFrame(300, 300);
+    ctx.beginScrollArea(SID, &scroll, opts);
+    buildFixedContent(&ctx, CHILD, 200, 200);
+    ctx.endScrollArea();
+    ctx.endFrame();
+
+    try std.testing.expect(ctx.rect_cache.get(id_mod.hashInt(SID, 2)) == null); // No vertical bar
+    try std.testing.expect(ctx.rect_cache.get(id_mod.hashInt(SID, 3)) == null); // No horizontal bar
+    try std.testing.expectApproxEqAbs(@as(f32, 70), scroll.x, 0.5);
+    try std.testing.expectApproxEqAbs(@as(f32, 70), scroll.y, 0.5);
+}
+
+test "scrollArea: a viewport rect without a cached content size settles no range" {
+    var ctx = testCtx();
+    defer ctx.deinit();
+    const SID: Id = 0x5C0345;
+    const CHILD: Id = 0xC0FFEE45;
+    var scroll: Vec2f = .{ .x = 70, .y = 70 };
+    const opts: ScrollAreaOpts = .{ .width = .{ .fixed = 100 }, .height = .{ .fixed = 100 } };
+
+    // The mirror case: a viewport with no content size would compute a range of zero and
+    // clamp the caller's amount to it.
+    try ctx.rect_cache.put(ctx.gpa, SID, .{
+        .rect = .{ .x = 0, .y = 0, .w = 100, .h = 100 },
+        .clip = .{ .x = 0, .y = 0, .w = 300, .h = 300 },
+        .measured_w = 100,
+        .measured_h = 100,
+    });
+
+    ctx.beginFrame(300, 300);
+    ctx.beginScrollArea(SID, &scroll, opts);
+    buildFixedContent(&ctx, CHILD, 200, 200);
+    ctx.endScrollArea();
+    ctx.endFrame();
+
+    try std.testing.expectApproxEqAbs(@as(f32, 70), scroll.x, 0.5);
+    try std.testing.expectApproxEqAbs(@as(f32, 70), scroll.y, 0.5);
+}
+
+test "scrollArea: without a range the scroll still clamps from below" {
+    var ctx = testCtx();
+    defer ctx.deinit();
+    const SID: Id = 0x5C0346;
+    const CHILD: Id = 0xC0FFEE46;
+    var scroll: Vec2f = .{};
+    const opts: ScrollAreaOpts = .{ .width = .{ .fixed = 100 }, .height = .{ .fixed = 60 } };
+
+    scrollAreaFrame(&ctx, SID, CHILD, &scroll, opts, 80, 200);
+    frameWithoutScrollArea(&ctx);
+    scroll.y = -50;
+    scrollAreaFrame(&ctx, SID, CHILD, &scroll, opts, 80, 200);
+    try std.testing.expectApproxEqAbs(@as(f32, 0), scroll.y, 0.001);
+
+    frameWithoutScrollArea(&ctx);
+    scroll.y = std.math.nan(f32);
+    scrollAreaFrame(&ctx, SID, CHILD, &scroll, opts, 80, 200);
+    try std.testing.expect(!std.math.isNan(scroll.y));
+    try std.testing.expectApproxEqAbs(@as(f32, 0), scroll.y, 0.001);
+}
+
+test "scrollArea: a wheel notch on the frame an area returns leaves the scroll alone" {
+    // Behaviour-level cover of the wheel path. It does not discriminate the
+    // `geometry_known` gate on its own: with no previous-frame rect the appliers also
+    // return on `viewport_rect`, so the gate has its own test below.
+    var ctx = testCtx();
+    defer ctx.deinit();
+    const SID: Id = 0x5C0347;
+    const CHILD: Id = 0xC0FFEE47;
+    var scroll: Vec2f = .{};
+    const opts: ScrollAreaOpts = .{ .width = .{ .fixed = 100 }, .height = .{ .fixed = 60 } };
+
+    scrollAreaFrame(&ctx, SID, CHILD, &scroll, opts, 80, 200);
+    scroll.y = 100;
+    scrollAreaFrame(&ctx, SID, CHILD, &scroll, opts, 80, 200);
+    const inside = center(ctx.getNodeRect(SID).?);
+    frameWithoutScrollArea(&ctx);
+
+    ctx.beginFrame(300, 300);
+    moveTo(&ctx, inside.x, inside.y);
+    ctx.pushEvent(.{ .mouse_scroll = .{ .x = inside.x, .y = inside.y, .dx = 0, .dy = -3, .modifiers = 0 } });
+    ctx.beginScrollArea(SID, &scroll, opts);
+    buildFixedContent(&ctx, CHILD, 80, 200);
+    ctx.endScrollArea();
+    ctx.endFrame();
+
+    try std.testing.expectApproxEqAbs(@as(f32, 100), scroll.y, 0.5);
+}
+
+test "applyScrollAreaWheel: an area without settled geometry is not a wheel target" {
+    var ctx = testCtx();
+    defer ctx.deinit();
+    // A non-zero amount is what makes this test able to fail: clamping to a zero range
+    // lands on zero, so an amount of zero would look correct either way.
+    var scroll: Vec2f = .{ .x = 140, .y = 140 };
+
+    ctx.beginFrame(300, 300);
+    moveTo(&ctx, 50, 50);
+    ctx.pushEvent(.{ .mouse_scroll = .{ .x = 50, .y = 50, .dx = -2, .dy = -3, .modifiers = 0 } });
+    // A viewport rect the cursor is inside, but no settled geometry: exactly the state
+    // the frame an area returns on produces, minus the second guard.
+    var st: context_mod.ScrollState = .{
+        .bar_thickness = 8,
+        .track_col = ctx.style.surface.control_subtle,
+        .thumb_col = ctx.style.border_tokens.hover,
+        .thumb_hot = ctx.style.text_tokens.subtle,
+        .thumb_active = ctx.style.accent.primary,
+        .need_v = false,
+        .need_h = false,
+        .v_off = 0,
+        .v_len = 0,
+        .h_off = 0,
+        .h_len = 0,
+        .vthumb_id = 0,
+        .hthumb_id = 0,
+        .viewport_id = 0x5C0348,
+        .scroll = &scroll,
+        .viewport_rect = .{ .x = 0, .y = 0, .w = 100, .h = 100 },
+        .geometry_known = false,
+    };
+    applyScrollAreaWheel(&ctx, &st);
+    ctx.endFrame();
+
+    try std.testing.expectApproxEqAbs(@as(f32, 140), scroll.x, 0.5);
+    try std.testing.expectApproxEqAbs(@as(f32, 140), scroll.y, 0.5);
+}
+
+test "scrollArea: a non-finite scroll on the frame an area returns converts, then settles" {
+    var ctx = testCtx();
+    defer ctx.deinit();
+    const SID: Id = 0x5C0349;
+    const CHILD: Id = 0xC0FFEE49;
+    var scroll: Vec2f = .{};
+    const opts: ScrollAreaOpts = .{ .width = .{ .fixed = 100 }, .height = .{ .fixed = 60 } };
+
+    scrollAreaFrame(&ctx, SID, CHILD, &scroll, opts, 80, 200);
+    frameWithoutScrollArea(&ctx);
+
+    // No range to clamp against, so the amount reaches the layout conversion as it is.
+    scroll.y = std.math.inf(f32);
+    scrollAreaFrame(&ctx, SID, CHILD, &scroll, opts, 80, 200);
+
+    // The next frame has a range again and brings it back in.
+    scrollAreaFrame(&ctx, SID, CHILD, &scroll, opts, 80, 200);
+    try std.testing.expectApproxEqAbs(@as(f32, 140), scroll.y, 0.5);
+
+    frameWithoutScrollArea(&ctx);
+    scroll.y = 1e30;
+    scrollAreaFrame(&ctx, SID, CHILD, &scroll, opts, 80, 200);
+    scrollAreaFrame(&ctx, SID, CHILD, &scroll, opts, 80, 200);
+    try std.testing.expectApproxEqAbs(@as(f32, 140), scroll.y, 0.5);
+}
+
+test "scrollArea: an out-of-domain scroll on the frame an area returns still renders" {
+    var ctx = testCtx();
+    defer ctx.deinit();
+    const SID: Id = 0x5C034A;
+    const CHILD: Id = 0xC0FFEE4A;
+    var scroll: Vec2f = .{};
+    const opts: ScrollAreaOpts = .{ .width = .{ .fixed = 100 }, .height = .{ .fixed = 60 } };
+
+    ctx.beginFrame(300, 300);
+    ctx.beginScrollArea(SID, &scroll, opts);
+    buildPaintedContent(&ctx, CHILD, 80, 200);
+    ctx.endScrollArea();
+    ctx.endFrame();
+    frameWithoutScrollArea(&ctx);
+
+    // Finite and representable as an i32, but one past the coordinate domain a DrawCmd
+    // may carry. Unheld, it reaches `render` and trips the domain check before any clip.
+    scroll.y = @as(f32, @floatFromInt(geom.MAX_COORD)) + 1;
+    ctx.beginFrame(300, 300);
+    ctx.beginScrollArea(SID, &scroll, opts);
+    buildPaintedContent(&ctx, CHILD, 80, 200);
+    ctx.endScrollArea();
+    ctx.endFrame();
+
+    // The check only runs at scale != 1, and only over commands that exist.
+    const dl = ctx.postFrameDrawList();
+    try std.testing.expect(dl.cmds.items.len > 0);
+    var pixels = [_]u32{0xFF000000} ** (32 * 32);
+    const target = geom.RenderTarget{ .pixels = &pixels, .width = 32, .height = 32 };
+    render_mod.render(target, dl, ctx.font, 2.0);
+}
+
+test "scrollArea: a settled range larger than the coordinate domain is not clipped" {
+    var ctx = testCtx();
+    defer ctx.deinit();
+    const SID: Id = 0x5C034B;
+    const CHILD: Id = 0xC0FFEE4B;
+    var scroll: Vec2f = .{};
+    const opts: ScrollAreaOpts = .{ .width = .{ .fixed = 100 }, .height = .{ .fixed = 100 } };
+    // Past `MAX_COORD`: a fixed size is not bounded by the coordinate domain, so an
+    // amount beyond it is a legitimate position and must reach layout as it is.
+    const CONTENT_H: i32 = 2_000_000;
+    const AMOUNT: i32 = 1_200_000;
+    try std.testing.expect(AMOUNT > geom.MAX_COORD);
+
+    scrollAreaFrame(&ctx, SID, CHILD, &scroll, opts, 80, CONTENT_H);
+    scroll.y = @floatFromInt(AMOUNT);
+    scrollAreaFrame(&ctx, SID, CHILD, &scroll, opts, 80, CONTENT_H);
+
+    try std.testing.expectApproxEqAbs(@as(f32, @floatFromInt(AMOUNT)), scroll.y, 0.5);
+    const vp = ctx.getNodeRect(SID).?;
+    try std.testing.expectEqual(vp.y - AMOUNT, ctx.getNodeRect(CHILD).?.y);
 }

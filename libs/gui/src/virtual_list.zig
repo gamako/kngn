@@ -867,3 +867,49 @@ test "virtualList: empty begin/end pair is well-formed" {
     widgets.endVirtualList(&ctx);
     ctx.endFrame();
 }
+
+test "virtualList: a total height past the coordinate domain still places the visible rows" {
+    var ctx = testCtx();
+    defer ctx.deinit();
+    const LIST: Id = 0xA344;
+    const ROW: Id = 0xA345;
+    var scroll: Vec2f = .{};
+    // 100k rows of 20 px is ~2M tall, past `geom.MAX_COORD`, and a scroll amount inside
+    // that range is legitimate: holding the offset to the coordinate domain would place
+    // the rows somewhere else entirely.
+    const opts = VirtualListOpts{
+        .row_height = 20,
+        .row_count = 100_000,
+        .width = .{ .fixed = 200 },
+        .height = .{ .fixed = 200 },
+        .overscan = 0,
+    };
+    const target_row: usize = 60_000;
+
+    // Settle the viewport rect first, so the range comes from real geometry.
+    ctx.beginFrame(400, 400);
+    _ = widgets.beginVirtualList(&ctx, LIST, &scroll, opts);
+    widgets.endVirtualList(&ctx);
+    ctx.endFrame();
+
+    scroll.y = @floatFromInt(target_row * opts.row_height);
+    try std.testing.expect(scroll.y > @as(f32, @floatFromInt(geom.MAX_COORD)));
+
+    ctx.beginFrame(400, 400);
+    const range = widgets.beginVirtualList(&ctx, LIST, &scroll, opts);
+    try std.testing.expect(range.first <= target_row and target_row < range.end);
+    var i = range.first;
+    while (i < range.end) : (i += 1) {
+        const id = if (i == target_row) ROW else 0;
+        ctx.beginBox(.{ .id = id, .width = .{ .grow = 1 }, .height = .{ .fixed = opts.row_height } });
+        ctx.endBox();
+    }
+    widgets.endVirtualList(&ctx);
+    ctx.endFrame();
+
+    // The row is not merely in the range: it lands inside the viewport.
+    const vp = ctx.getNodeRect(LIST).?;
+    const row = ctx.getNodeRect(ROW).?;
+    try std.testing.expect(row.y >= vp.y);
+    try std.testing.expect(row.y + @as(i32, @intCast(row.h)) <= vp.y + @as(i32, @intCast(vp.h)));
+}

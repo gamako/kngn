@@ -197,7 +197,9 @@ pub const BoxConfig = struct {
     /// Child placement offset for scrolling (px). Shifts final rects of children (and descendants)
     /// left by scroll_x and up by scroll_y. Does not affect child size, measured, or cursor math (placement only).
     /// Intended with clip_children to cut content outside the viewport. Caller clamps scroll_x/y to
-    /// [0, content_natural - viewport] before passing.
+    /// [0, content_natural - viewport] before passing — except on a frame where the caller
+    /// cannot know that range yet (a scroll area's first frame, or the one where it becomes
+    /// visible again), when the offset it passes is bounded only by the coordinate domain.
     scroll_x: i32 = 0,
     scroll_y: i32 = 0,
     /// When set, this box is out of its parent's flow: it does not take part in the

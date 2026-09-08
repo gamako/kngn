@@ -27,3 +27,57 @@ pub const MAX_EXTENT: u32 = 1 << 20;
 /// stroke. Together with `MAX_COORD`, `coord + thickness + thickness / 2` stays
 /// inside i32 before scale is applied.
 pub const MAX_THICKNESS: u32 = 4096;
+
+/// Rounds a caller-owned scroll amount into an `i32` the conversion can represent.
+///
+/// Unconditional, and lossless for every amount a scroll can legitimately hold: the
+/// upper bound is the largest `f32` that converts into `i32`, so no reachable value is
+/// clipped. It exists because `@intFromFloat` is undefined for a value outside the
+/// destination range or for a non-finite one, and a scroll amount belongs to the
+/// caller, so `+inf` or a huge magnitude can arrive here. Clamping against zero also
+/// maps NaN to zero, because `@max` returns the operand that is not NaN.
+///
+/// What upper bound a scroll amount is *allowed* to hold is a separate question about
+/// the scroll input domain; this only makes the conversion defined.
+pub fn scrollOffsetToLayout(v: f32) i32 {
+    // 2^31 - 128 is the largest f32 below 2^31, hence the largest one an i32 can hold:
+    // f32 steps by 128 in this range, so the next value up is exactly 2^31.
+    const max_representable: f32 = 2147483520.0;
+    return @intFromFloat(@round(@min(@max(v, 0), max_representable)));
+}
+
+/// Same conversion, for an amount no clamp has settled: a scroll area's first frame, or
+/// the frame it becomes visible again, where the range it would be clamped against does
+/// not exist yet.
+///
+/// Such an amount is additionally held inside `MAX_COORD`, because a placement offset
+/// reaches draw commands and `render` rejects one outside the coordinate domain before
+/// any clip would cut it. Nothing real is lost: on that frame the amount is a one-frame
+/// guess. This bounds one area's own offset; what nested areas accumulate between them is
+/// a question about the scroll input domain, which this does not answer.
+///
+/// Where the amount *has* been settled, use `scrollOffsetToLayout`: `MAX_COORD` bounds a
+/// draw command's coordinates, not how far a caller may scroll, and a fixed size or a
+/// virtual list's total height may legitimately exceed it.
+pub fn unsettledScrollOffsetToLayout(v: f32) i32 {
+    return scrollOffsetToLayout(@min(v, @as(f32, @floatFromInt(MAX_COORD))));
+}
+
+test "scrollOffsetToLayout: every f32 a caller can hold converts" {
+    const std = @import("std");
+    // The integrated cases that reach this with an out-of-range value are hard to build:
+    // a range near the i32 maximum needs a box that tall, whose own placement arithmetic
+    // overflows first. The contract belongs to this function, so it is stated here.
+    try std.testing.expectEqual(@as(i32, 2147483520), scrollOffsetToLayout(std.math.inf(f32)));
+    try std.testing.expectEqual(@as(i32, 2147483520), scrollOffsetToLayout(1e30));
+    // A range read out of an i32 maximum rounds *up* through f32, past what i32 holds.
+    try std.testing.expectEqual(@as(i32, 2147483520), scrollOffsetToLayout(@floatFromInt(std.math.maxInt(i32))));
+    try std.testing.expectEqual(@as(i32, 0), scrollOffsetToLayout(-std.math.inf(f32)));
+    try std.testing.expectEqual(@as(i32, 0), scrollOffsetToLayout(std.math.nan(f32)));
+    try std.testing.expectEqual(@as(i32, 0), scrollOffsetToLayout(-50));
+    // Everything a scroll legitimately holds passes through, rounded.
+    try std.testing.expectEqual(@as(i32, 100), scrollOffsetToLayout(100.4));
+    try std.testing.expectEqual(@as(i32, 101), scrollOffsetToLayout(100.6));
+    try std.testing.expectEqual(@as(i32, 400_000), scrollOffsetToLayout(400_000));
+    try std.testing.expectEqual(@as(i32, 2_000_000), scrollOffsetToLayout(2_000_000));
+}

@@ -63,6 +63,9 @@ frame late; scroll offset settles the same frame.
 - `libs/gui/README.md`, "Frame order and hit-test timing"
 - `examples/37_gui_torture/README.md` (the `input_state` case, and the nested-
   scroll unit tests in `libs/gui/src/widgets.zig`)
+- [`ADR-039`](039_scroll-without-previous-frame-geometry.md) answers what a frame
+  does when there is no previous frame to read geometry from — the case this record
+  left to zero
 
 ## Revision history
 

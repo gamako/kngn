@@ -79,6 +79,7 @@ const id_mod = @import("id.zig");
 const input_mod = @import("input.zig");
 const font_mod = @import("font.zig");
 const geom = @import("geom.zig");
+const render_mod = @import("render.zig");
 
 const Context = context_mod.Context;
 const Color = color_mod.Color;
@@ -421,7 +422,11 @@ pub fn tableHeaderRow(ctx: *Context) void {
     t.header_built = true;
 
     if (t.scroll) |scroll| {
-        const sx: i32 = @intFromFloat(@round(scroll.x));
+        // The body's ScrollArea has not opened yet, so nothing has settled this amount.
+        // `endTable` writes the strip's final offset once the body has settled, so this
+        // one only has to be a defined conversion — the bound that keeps the placement
+        // inside the coordinate domain is applied there.
+        const sx: i32 = geom.scrollOffsetToLayout(scroll.x);
         ctx.beginBox(.{
             .id = id_mod.hashInt(t.id, header_strip_salt),
             .direction = .column,
@@ -618,7 +623,12 @@ pub fn endTableCell(ctx: *Context) void {
     t.cell_open = false;
 }
 
+/// Wheel over the header strip drives the body's scroll amount, bounded by the body
+/// area's previous-frame range. An area without that geometry is not a wheel target,
+/// for the same reason as `beginScrollArea`'s clamp: the range reads as zero and the
+/// caller's amount would be overwritten with it.
 fn applyHeaderWheel(ctx: *Context, header_rect: Rect, st: *context_mod.ScrollState) void {
+    if (!st.geometry_known) return;
     if (!ctx.current_layer_scope.wheel_enabled) return;
     ctx.ensureWheelChain();
     if (!ctx.wheel_remaining_seeded) {
@@ -651,8 +661,8 @@ fn applyHeaderWheel(ctx: *Context, header_rect: Rect, st: *context_mod.ScrollSta
     rem.y -= -act_y / st.wheel_px;
 
     if (st.viewport_node) |node| {
-        node.cfg.scroll_x = @intFromFloat(@round(scroll.x));
-        node.cfg.scroll_y = @intFromFloat(@round(scroll.y));
+        node.cfg.scroll_x = geom.scrollOffsetToLayout(scroll.x);
+        node.cfg.scroll_y = geom.scrollOffsetToLayout(scroll.y);
     }
     if (st.need_v and st.max_y > 0) {
         const travel = st.vp_h - st.v_len;
@@ -706,9 +716,15 @@ pub fn endTable(ctx: *Context) void {
         const need_v = st.need_v;
         const bar_thickness = st.bar_thickness;
         const scroll = st.scroll;
+        const body_known = st.geometry_known;
         ctx.endScrollArea();
         if (t.header_strip_node) |strip| {
-            strip.cfg.scroll_x = @intFromFloat(@round(scroll.x));
+            // Same bound the body used this frame: the header shares the amount, so it
+            // must share how far that amount is allowed to shift a box.
+            strip.cfg.scroll_x = if (body_known)
+                geom.scrollOffsetToLayout(scroll.x)
+            else
+                geom.unsettledScrollOffsetToLayout(scroll.x);
             // Match the body viewport: a vertical bar steals `bar_thickness` from
             // the content width. `clip_children` clips to the content box (inside
             // this padding), so header ink does not draw over the gutter.
@@ -2076,4 +2092,110 @@ test "table fixed columns: no fit or stretch bookkeeping on the frame arena" {
     _ = ctx.endTableRow();
     ctx.endTable();
     ctx.endFrame();
+}
+
+// ── A table body without previous-frame geometry ──
+
+/// A frame that lays out something other than the table, which is what makes the body
+/// area lose its cached geometry. An empty root would not: `endFrame` keeps the previous
+/// rect cache for a frame that never touched the layout API.
+fn frameWithoutTable(ctx: *Context) void {
+    ctx.beginFrame(300, 300);
+    ctx.beginBox(.{ .width = .{ .fixed = 10 }, .height = .{ .fixed = 10 } });
+    ctx.endBox();
+    ctx.endFrame();
+}
+
+test "applyHeaderWheel: a body without settled geometry is not a wheel target" {
+    var ctx = testCtx();
+    defer ctx.deinit();
+    // Non-zero: clamping to a zero range lands on zero, so a zero amount would look
+    // correct whether the gate is there or not.
+    var scroll: Vec2f = .{ .x = 140, .y = 140 };
+
+    ctx.beginFrame(300, 300);
+    wheelAt(&ctx, 50, 50, -2, -3);
+    var st: context_mod.ScrollState = .{
+        .bar_thickness = 8,
+        .track_col = ctx.style.surface.control_subtle,
+        .thumb_col = ctx.style.border_tokens.hover,
+        .thumb_hot = ctx.style.text_tokens.subtle,
+        .thumb_active = ctx.style.accent.primary,
+        .need_v = false,
+        .need_h = false,
+        .v_off = 0,
+        .v_len = 0,
+        .h_off = 0,
+        .h_len = 0,
+        .vthumb_id = 0,
+        .hthumb_id = 0,
+        .viewport_id = 0xA0344,
+        .scroll = &scroll,
+        .viewport_rect = .{ .x = 0, .y = 0, .w = 100, .h = 100 },
+        .geometry_known = false,
+        .wheel_px = 16,
+    };
+    applyHeaderWheel(&ctx, .{ .x = 0, .y = 0, .w = 100, .h = 100 }, &st);
+    ctx.endFrame();
+
+    try std.testing.expectApproxEqAbs(@as(f32, 140), scroll.x, 0.5);
+    try std.testing.expectApproxEqAbs(@as(f32, 140), scroll.y, 0.5);
+}
+
+test "table horizontal scroll: an out-of-domain amount on the frame the table returns still renders" {
+    var ctx = testCtx();
+    defer ctx.deinit();
+    const TID: Id = 0xA0346;
+    var scroll: Vec2f = .{};
+
+    var warm: usize = 0;
+    while (warm < 2) : (warm += 1) {
+        ctx.beginFrame(300, 300);
+        buildHScrollTable(&ctx, TID, &scroll, 3);
+        ctx.endFrame();
+    }
+    frameWithoutTable(&ctx);
+
+    // The sticky header takes the same amount as the body and places itself with it, so
+    // it needs the same domain bound. Finite and representable, one past the domain a
+    // DrawCmd may carry: unheld, the header's cells land outside it.
+    scroll.x = @as(f32, @floatFromInt(geom.MAX_COORD)) + 1;
+    ctx.beginFrame(300, 300);
+    buildHScrollTable(&ctx, TID, &scroll, 3);
+    ctx.endFrame();
+
+    const dl = ctx.postFrameDrawList();
+    try std.testing.expect(dl.cmds.items.len > 0); // The check only sees commands that exist
+    var pixels = [_]u32{0xFF000000} ** (32 * 32);
+    const target = geom.RenderTarget{ .pixels = &pixels, .width = 32, .height = 32 };
+    render_mod.render(target, dl, ctx.font, 2.0); // Domain check runs only at scale != 1
+}
+
+test "table horizontal scroll: an out-of-range amount converts on the frame the table returns" {
+    var ctx = testCtx();
+    defer ctx.deinit();
+    const TID: Id = 0xA0345;
+    var scroll: Vec2f = .{};
+
+    var warm: usize = 0;
+    while (warm < 2) : (warm += 1) {
+        ctx.beginFrame(300, 300);
+        buildHScrollTable(&ctx, TID, &scroll, 3);
+        ctx.endFrame();
+    }
+    frameWithoutTable(&ctx);
+
+    // `tableHeaderRow` converts this amount before the body area opens, so nothing has
+    // settled it — a header strip offset is taken straight from the caller's f32.
+    scroll.x = std.math.inf(f32);
+    ctx.beginFrame(300, 300);
+    buildHScrollTable(&ctx, TID, &scroll, 3);
+    ctx.endFrame();
+
+    // A range exists again, so the amount comes back in without the caller acting.
+    ctx.beginFrame(300, 300);
+    buildHScrollTable(&ctx, TID, &scroll, 3);
+    ctx.endFrame();
+    try std.testing.expect(std.math.isFinite(scroll.x));
+    try std.testing.expect(scroll.x > 0);
 }

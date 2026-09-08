@@ -255,6 +255,16 @@ pub const TextOptions = struct {
 /// on the next frame. Amounts are always computed from the area's current
 /// `scroll` and content size; the registry never stores a previous-frame max.
 /// Hit-testing uses the cursor sealed with the chain, not a later `mouse_pos`.
+///
+/// `geometry_known` is the single gate for everything derived from the previous
+/// frame. When it is false the area has no previous-frame geometry at all, so
+/// `max_x` / `max_y` are zero, `need_v` / `need_h` are false, **the clamp in
+/// `beginScrollArea` applies its lower bound only**, and the wheel appliers return
+/// early without touching the caller's `scroll`. The lower bound still applies
+/// because it does not come from the range: it keeps a negative amount, and NaN,
+/// out of the arithmetic downstream. Zeroing rather than guessing is what makes the
+/// upper bound's absence safe to reason about; `docs/adr/039` records why a frame
+/// without geometry declines to judge instead of judging from zeros.
 pub const ScrollState = struct {
     bar_thickness: i32,
     track_col: Color,
@@ -276,6 +286,11 @@ pub const ScrollState = struct {
     scroll: *Vec2f = undefined,
     /// Previous-frame viewport rect (for hit-testing; null if unsettled)
     viewport_rect: ?Rect = null,
+    /// Whether this area has previous-frame geometry (viewport rect *and* content
+    /// size). False on its first frame and on the frame it becomes visible again.
+    /// Set it explicitly at every construction site: defaulting to false silently
+    /// disables every wheel path.
+    geometry_known: bool = false,
     max_x: i32 = 0,
     max_y: i32 = 0,
     wheel_px: f32 = 32.0,
@@ -284,6 +299,13 @@ pub const ScrollState = struct {
     /// This frame's viewport layout node (scroll_x/y applied after wheel)
     viewport_node: ?*layout.Node = null,
 };
+
+/// The id of the content box `beginScrollArea` builds inside the viewport box `id`.
+/// One definition, so a caller reading a scroll area's cached content size does not
+/// restate the derivation.
+pub fn scrollAreaContentId(id: Id) Id {
+    return id_mod.hashInt(id, 1);
+}
 
 /// Previous-frame ScrollArea entry used only to decide wheel order (never amount).
 /// `rect` is the viewport settled at the previous `endFrame`. `serial` is the
