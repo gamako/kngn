@@ -132,6 +132,134 @@ make_script "$discard_script" 'expect appshell recovery=pending' 'action discard
 run_case recovery-discard "$recovery_app" "$discard_script"
 test -z "$(find "$recovery_app/autosave" -name '*.autosave' -print -quit 2>/dev/null || true)"
 
+# Failure injection into the document-preparation phase (Debug-only action
+# `fault_document_prepare <n>`): every armed preparation must fail and leave the open document,
+# the host path and the working buffers untouched. The action reports the injected failure as
+# an `injected_fault=` success line, so the run exits 0 and the leak check at teardown runs.
+FAULT_SWEEP=${KNGN_E2E_FAULT_SWEEP:-48}
+
+# fault_blocks <file> <action line> <expect lines...>: append FAULT_SWEEP arm/fail/check blocks.
+fault_blocks() {
+    local file=$1 action=$2
+    shift 2
+    local i
+    for i in $(seq 0 $((FAULT_SWEEP - 1))); do
+        printf '%s\n' "action fault_document_prepare $i" "$action" "$@" 'digest appshell' >> "$file"
+    done
+}
+
+# assert_fault_log <log> <action name> <steps...>: every armed attempt was reported as an
+# injected failure, nothing leaked at teardown, and the sweep reached each named preparation
+# step plus the not-triggered end.
+assert_fault_log() {
+    local log=$1 action=$2
+    shift 2
+    local injected
+    injected=$(grep -c "\[harness\] action $action ok ok $action injected_fault=" "$log" || true)
+    test "$injected" -eq "$FAULT_SWEEP"
+    test "$(grep -c "\[harness\] action $action FAILED" "$log" || true)" -eq 0
+    test "$(grep -c 'leaked' "$log" || true)" -eq 0
+    local step
+    for step in "$@" not_triggered; do
+        grep -q "prepare_fault=$step " "$log"
+    done
+    # No expect inside the sweep may have failed: the document state must be untouched.
+    test "$(grep -c '\[harness\] expect FAILED' "$log" || true)" -eq 0
+}
+
+# canvas_crcs <log>: the crc values of every `digest canvas` line, in order.
+canvas_crcs() {
+    sed -n 's/.*\[harness\] digest canvas [0-9x]* layers=[0-9]* selected=[0-9]* comp=\([0-9A-Fa-f]*\).*/\1/p' "$1"
+}
+
+fault_app="$APPS/fault"
+fault_a="$PROJ/fault-a.pix"
+fault_b="$PROJ/fault-b.pix"
+seed_fault_a="$OUT/fault-seed-a.txt"
+make_script "$seed_fault_a" 'action stroke 10 10 20 10' 'action stroke 12 30 40 30' 'action request_close' "action confirm_save $fault_a"
+run_case fault-seed-a "$fault_app" "$seed_fault_a"
+seed_fault_b="$OUT/fault-seed-b.txt"
+make_script "$seed_fault_b" 'action stroke 50 50 60 50' 'action request_close' "action confirm_save $fault_b"
+run_case fault-seed-b "$fault_app" "$seed_fault_b"
+
+# open_project: the open document A survives every failed open of B.
+fault_open="$OUT/fault-open.txt"
+make_script "$fault_open" "action open_project $fault_a" 'digest canvas'
+fault_blocks "$fault_open" "action open_project $fault_b" "expect appshell path=$fault_a" 'expect appshell dirty=0'
+printf '%s\n' 'digest canvas' 'action stroke 5 5 15 5' 'expect appshell dirty=1' 'action request_close' 'action confirm_discard' >> "$fault_open"
+run_case fault-open "$fault_app" "$fault_open"
+assert_fault_log "$OUT/fault-open/app.log" open_project read_file decode runtime autosave_path
+test "$(canvas_crcs "$OUT/fault-open/app.log" | sed -n 1p)" = "$(canvas_crcs "$OUT/fault-open/app.log" | sed -n 2p)"
+
+# new <w> <h>: the open document survives every failed replacement by a blank one.
+fault_new="$OUT/fault-new.txt"
+make_script "$fault_new" "action open_project $fault_a" 'digest canvas'
+fault_blocks "$fault_new" 'action new 16 16' "expect appshell path=$fault_a" 'expect appshell confirm=none'
+printf '%s\n' 'digest canvas' 'action new 16 16' 'expect appshell path=none' 'action request_close' >> "$fault_new"
+run_case fault-new "$fault_app" "$fault_new"
+assert_fault_log "$OUT/fault-new/app.log" new document runtime
+test "$(canvas_crcs "$OUT/fault-new/app.log" | sed -n 1p)" = "$(canvas_crcs "$OUT/fault-new/app.log" | sed -n 2p)"
+
+# recover: a named document crashes; every failed recovery keeps the candidate on disk and in
+# memory, and the real recovery afterwards restores the crashed canvas.
+fault_recovery_app="$APPS/fault-recovery"
+fault_crash="$OUT/fault-crash.txt"
+make_script "$fault_crash" "action open_project $fault_a" 'step 3' 'action stroke 30 30 80 80' 'digest canvas' 'step 1000000000'
+mkdir -p "$fault_recovery_app" "$OUT/fault-crash"
+KNGN_APPSHELL_DIR="$fault_recovery_app" KNGN_HEADLESS=1 KNGN_HARNESS_SCRIPT="$fault_crash" KNGN_HARNESS_OUT="$OUT/fault-crash" "$APP" >"$OUT/fault-crash/app.log" 2>&1 &
+crash_pid=$!
+autosave_file=
+for _ in $(seq 1 200); do
+    autosave_file=$(find "$fault_recovery_app/autosave" -type f -name '*.autosave' -print -quit 2>/dev/null || true)
+    test -n "$autosave_file" && break
+    sleep 0.05
+done
+test -n "$autosave_file"
+kill -KILL "$crash_pid"
+set +e
+wait "$crash_pid"
+set -e
+# First launch: every recovery attempt fails; the candidate must still be on disk afterwards.
+fault_recover_sweep="$OUT/fault-recover-sweep.txt"
+make_script "$fault_recover_sweep" 'expect appshell recovery=pending'
+fault_blocks "$fault_recover_sweep" 'action recover' 'expect appshell recovery=pending' 'expect appshell path=none'
+printf '%s\n' 'action request_close' >> "$fault_recover_sweep"
+run_case fault-recover-sweep "$fault_recovery_app" "$fault_recover_sweep"
+assert_fault_log "$OUT/fault-recover-sweep/app.log" recover decode runtime recovery_paths
+test -f "$autosave_file"
+# Second launch: the same candidate is offered again and recovers the crashed canvas.
+fault_recover="$OUT/fault-recover.txt"
+make_script "$fault_recover" 'expect appshell recovery=pending' 'action recover' 'expect appshell recovery=none' "expect appshell path=$fault_a" 'expect appshell dirty=1' 'digest canvas' 'action request_close' 'action confirm_discard'
+run_case fault-recover "$fault_recovery_app" "$fault_recover"
+test "$(canvas_crcs "$OUT/fault-crash/app.log" | head -1)" = "$(canvas_crcs "$OUT/fault-recover/app.log" | tail -1)"
+test -z "$(find "$fault_recovery_app/autosave" -name '*.autosave' -print -quit 2>/dev/null || true)"
+
+# confirm_save on an untitled document: the save succeeds and is recorded even though the
+# pending open then fails; the confirmation stays so the user can cancel or retry.
+fault_confirm="$OUT/fault-confirm.txt"
+fault_saved="$PROJ/fault-saved.pix"
+make_script "$fault_confirm" 'action stroke 10 10 20 10' "action open_project $fault_b" 'expect appshell confirm=open' 'action fault_document_prepare 0' "action confirm_save $fault_saved" "expect appshell path=$fault_saved" 'expect appshell dirty=0' 'expect appshell confirm=open' 'expect appshell prepare_fault=read_file' 'action confirm_cancel' 'expect appshell confirm=none' 'action confirm_discard' 'action request_close' 'action confirm_discard'
+run_case fault-confirm "$fault_app" "$fault_confirm"
+test -f "$fault_saved"
+test "$(grep -c '\[harness\] action confirm_save ok ok confirm_save injected_fault=PendingOperationFailed fired_in=read_file' "$OUT/fault-confirm/app.log" || true)" -eq 1
+test "$(grep -c '\[harness\] expect FAILED' "$OUT/fault-confirm/app.log" || true)" -eq 0
+test "$(grep -c 'leaked' "$OUT/fault-confirm/app.log" || true)" -eq 0
+
+# A fault consumed by a non-reporting operation (confirm_discard) must not be attributed to
+# the next reporting action: `recover` with no candidate stays a genuine failure. The run
+# exits non-zero on purpose, so the check is on the log lines.
+fault_carry="$OUT/fault-carry.txt"
+make_script "$fault_carry" 'action stroke 10 10 20 10' 'action new 16 16' 'expect appshell confirm=new' 'action fault_document_prepare 0' 'action confirm_discard' 'expect appshell confirm=new' 'action confirm_cancel' 'action recover' 'action request_close' 'action confirm_discard'
+mkdir -p "$OUT/fault-carry"
+set +e
+KNGN_APPSHELL_DIR="$APPS/fault-carry" KNGN_HEADLESS=1 KNGN_HARNESS_SCRIPT="$fault_carry" KNGN_HARNESS_OUT="$OUT/fault-carry" "$APP" >"$OUT/fault-carry/app.log" 2>&1
+carry_status=$?
+set -e
+test "$carry_status" -ne 0
+grep -q '\[harness\] action confirm_discard FAILED OutOfMemory' "$OUT/fault-carry/app.log"
+grep -q '\[harness\] action recover FAILED NoRecoveryPending' "$OUT/fault-carry/app.log"
+test "$(grep -c 'injected_fault=' "$OUT/fault-carry/app.log" || true)" -eq 0
+
 # Netsync: bind failure is an allowed sandbox skip; successful runs use kngn ctl quit.
 netsync_status=skipped
 if test "${KNGN_E2E_NETSYNC:-1}" = 1; then

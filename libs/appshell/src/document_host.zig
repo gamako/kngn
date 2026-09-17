@@ -68,16 +68,13 @@ pub const DocumentHost = struct {
         return self.current_path;
     }
 
-    /// Adopt decode-ready document metadata from autosave.
-    /// Caller does document-bytes decode/swap; this function performs no callback/I/O.
-    pub fn adoptRecovered(self: *DocumentHost, path: ?[]const u8) !void {
-        if (self.pending_kind != .none) return error.PendingConfirmation;
-        if (path) |value| {
-            if (value.len == 0) return error.InvalidPath;
-            try self.setCurrentPath(value);
-        } else {
-            self.clearCurrentPath();
-        }
+    /// Adopt the metadata of a recovered document: `owned` (allocated with this host's
+    /// allocator; null for untitled) becomes the current path and the document is dirty.
+    /// No callback, I/O or allocation. Precondition: no confirmation is pending.
+    pub fn adoptRecoveredOwned(self: *DocumentHost, owned: ?[]u8) void {
+        std.debug.assert(self.pending_kind == .none);
+        self.freePath(&self.current_path);
+        self.current_path = owned;
         self.dirty = true;
     }
 
@@ -117,8 +114,13 @@ pub const DocumentHost = struct {
             self.pending_kind = .open;
             return .confirmation_required;
         }
-        try self.callbacks.openDocument(self.callbacks.ctx, path);
-        try self.setCurrentPath(path);
+        // Copied before the callback so that nothing after a successful open can fail.
+        const owned = try self.allocator.dupe(u8, path);
+        self.callbacks.openDocument(self.callbacks.ctx, path) catch |err| {
+            self.allocator.free(owned);
+            return err;
+        };
+        self.takeCurrentPath(owned);
         self.dirty = false;
         return .applied;
     }
@@ -133,8 +135,12 @@ pub const DocumentHost = struct {
 
     pub fn saveAs(self: *DocumentHost, path: []const u8) !Result {
         if (self.pending_kind != .none or path.len == 0) return .rejected;
-        try self.callbacks.saveDocument(self.callbacks.ctx, path);
-        try self.setCurrentPath(path);
+        const owned = try self.allocator.dupe(u8, path);
+        self.callbacks.saveDocument(self.callbacks.ctx, path) catch |err| {
+            self.allocator.free(owned);
+            return err;
+        };
+        self.takeCurrentPath(owned);
         self.dirty = false;
         return .applied;
     }
@@ -148,14 +154,22 @@ pub const DocumentHost = struct {
 
     /// Run the save confirmation. Named documents use the current path; untitled require a path.
     /// Pending new/open continues to the target callback after a successful save.
+    ///
+    /// The two halves are recorded separately: once the save has succeeded the host holds the
+    /// saved path and a clean document even when the pending open or new then fails, and the
+    /// confirmation stays pending behind `error.PendingOperationFailed`.
     pub fn confirmSave(self: *DocumentHost, save_path: ?[]const u8) !Result {
         const pending = self.pending_kind;
         if (pending == .none) return .rejected;
 
         const was_untitled = self.current_path == null;
         const path = self.current_path orelse save_path orelse return .needs_save_as;
-        try self.callbacks.saveDocument(self.callbacks.ctx, path);
-        if (was_untitled) try self.setCurrentPath(path);
+        const owned_save_path: ?[]u8 = if (was_untitled) try self.allocator.dupe(u8, path) else null;
+        self.callbacks.saveDocument(self.callbacks.ctx, path) catch |err| {
+            if (owned_save_path) |owned| self.allocator.free(owned);
+            return err;
+        };
+        if (owned_save_path) |owned| self.takeCurrentPath(owned);
         self.dirty = false;
 
         switch (pending) {
@@ -171,8 +185,7 @@ pub const DocumentHost = struct {
             },
             .open => {
                 self.callbacks.openDocument(self.callbacks.ctx, self.pending_path.?) catch return error.PendingOperationFailed;
-                try self.setCurrentPath(self.pending_path.?);
-                self.clearPending();
+                self.adoptPendingPath();
                 return .applied;
             },
             .none => unreachable,
@@ -198,9 +211,8 @@ pub const DocumentHost = struct {
             },
             .open => {
                 try self.callbacks.openDocument(self.callbacks.ctx, self.pending_path.?);
-                try self.setCurrentPath(self.pending_path.?);
+                self.adoptPendingPath();
                 self.dirty = false;
-                self.clearPending();
                 return .applied;
             },
             .none => unreachable,
@@ -226,10 +238,18 @@ pub const DocumentHost = struct {
         return self.allocator.dupe(u8, self.title(&buf));
     }
 
-    fn setCurrentPath(self: *DocumentHost, path: []const u8) !void {
-        const owned = try self.allocator.dupe(u8, path);
+    /// Make an already-owned copy the current path.
+    fn takeCurrentPath(self: *DocumentHost, owned: []u8) void {
         self.freePath(&self.current_path);
         self.current_path = owned;
+    }
+
+    /// Move the pending path into the current path and clear the confirmation.
+    fn adoptPendingPath(self: *DocumentHost) void {
+        self.freePath(&self.current_path);
+        self.current_path = self.pending_path;
+        self.pending_path = null;
+        self.clearPending();
     }
 
     fn setPendingPath(self: *DocumentHost, path: []const u8) !void {
@@ -265,26 +285,34 @@ fn basename(path: []const u8) []const u8 {
 const CallbackState = struct {
     calls: usize = 0,
     fail: bool = false,
+    /// When set, every callback after this many successful calls fails.
+    fail_after: ?usize = null,
     last_path: []const u8 = "",
+
+    fn shouldFail(self: *CallbackState) bool {
+        if (self.fail) return true;
+        if (self.fail_after) |n| return self.calls > n;
+        return false;
+    }
 };
 
 fn cbNew(ctx: *anyopaque) !void {
     const state: *CallbackState = @ptrCast(@alignCast(ctx));
     state.calls += 1;
-    if (state.fail) return error.CallbackFailed;
+    if (state.shouldFail()) return error.CallbackFailed;
 }
 
 fn cbOpen(ctx: *anyopaque, path: []const u8) !void {
     const state: *CallbackState = @ptrCast(@alignCast(ctx));
     state.calls += 1;
-    if (state.fail) return error.CallbackFailed;
+    if (state.shouldFail()) return error.CallbackFailed;
     state.last_path = path;
 }
 
 fn cbSave(ctx: *anyopaque, path: []const u8) !void {
     const state: *CallbackState = @ptrCast(@alignCast(ctx));
     state.calls += 1;
-    if (state.fail) return error.CallbackFailed;
+    if (state.shouldFail()) return error.CallbackFailed;
     state.last_path = path;
 }
 
@@ -388,13 +416,63 @@ test "DocumentHost recovery adoption sets named or untitled dirty metadata" {
     var host = testHost(&state);
     defer host.deinit();
 
-    try host.adoptRecovered("recovered.pix");
+    host.adoptRecoveredOwned(try std.testing.allocator.dupe(u8, "recovered.pix"));
     try std.testing.expectEqual(NameState.named, host.nameState());
     try std.testing.expectEqual(EditState.dirty, host.editState());
     try std.testing.expectEqualStrings("recovered.pix", host.currentPath().?);
 
-    try host.adoptRecovered(null);
+    host.adoptRecoveredOwned(null);
     try std.testing.expectEqual(NameState.untitled, host.nameState());
     try std.testing.expect(host.isDirty());
-    try std.testing.expectError(error.InvalidPath, host.adoptRecovered(""));
+}
+
+test "DocumentHost open and saveAs copy the path before the callback and keep the old path on failure" {
+    var state: CallbackState = .{};
+    // fail_index 0: the very first allocation fails, so the callback must not have run.
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
+    var host: DocumentHost = .init(failing.allocator(), .{
+        .ctx = &state,
+        .newDocument = cbNew,
+        .openDocument = cbOpen,
+        .saveDocument = cbSave,
+    });
+    defer host.deinit();
+    try std.testing.expectError(error.OutOfMemory, host.open("a.pix"));
+    try std.testing.expectError(error.OutOfMemory, host.saveAs("a.pix"));
+    try std.testing.expectEqual(@as(usize, 0), state.calls);
+    try std.testing.expectEqual(@as(?[]const u8, null), host.currentPath());
+
+    var plain_state: CallbackState = .{};
+    var plain = testHost(&plain_state);
+    defer plain.deinit();
+    try std.testing.expectEqual(Result.applied, try plain.open("first.pix"));
+    plain_state.fail = true;
+    try std.testing.expectError(error.CallbackFailed, plain.open("second.pix"));
+    try std.testing.expectError(error.CallbackFailed, plain.saveAs("third.pix"));
+    try std.testing.expectEqualStrings("first.pix", plain.currentPath().?);
+}
+
+test "DocumentHost confirmSave keeps the saved path when the pending open then fails" {
+    var state: CallbackState = .{};
+    var host = testHost(&state);
+    defer host.deinit();
+
+    host.markDirty();
+    try std.testing.expectEqual(Result.confirmation_required, try host.open("b.pix"));
+    // Save succeeds, then the open of the pending document fails: the host records the saved
+    // document and keeps the confirmation so the user can retry or cancel.
+    state.fail_after = 1;
+    try std.testing.expectError(error.PendingOperationFailed, host.confirmSave("a.pix"));
+    try std.testing.expectEqualStrings("a.pix", host.currentPath().?);
+    try std.testing.expect(!host.isDirty());
+    try std.testing.expectEqual(Confirmation.open, host.confirmation());
+    try std.testing.expectEqualStrings("b.pix", host.pendingPath().?);
+
+    // Retrying the discard branch moves the pending path into place without another copy.
+    state.fail = false;
+    state.fail_after = null;
+    try std.testing.expectEqual(Result.applied, try host.confirmDiscard());
+    try std.testing.expectEqualStrings("b.pix", host.currentPath().?);
+    try std.testing.expectEqual(@as(?[]const u8, null), host.pendingPath());
+    try std.testing.expectEqual(Confirmation.none, host.confirmation());
 }

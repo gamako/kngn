@@ -23,6 +23,7 @@ const core = @import("paint");
 const pixelops = kit.pixelops;
 const png = kit.png;
 const canvas_input = @import("canvas_input.zig");
+const document_swap = @import("document_swap.zig");
 const actions = @import("actions.zig");
 const icons = @import("icons.zig");
 const diff = @import("diff.zig");
@@ -760,15 +761,15 @@ const App = struct {
     os_window: ?*platform.Window = null,
     /// Current PNG save path (gpa-owned). Cmd+S overwrites here; updated on successful save/open dialogs.
     current_path: ?[]u8 = null,
-    /// Current .pix project save path (gpa-owned; managed separately from PNG current_path).
-    current_project_path: ?[]u8 = null,
-    /// DocumentHost is authoritative for .pix lifecycle. Legacy fields sync existing UI/action.
+    /// DocumentHost is authoritative for the .pix lifecycle and owns the project path.
     host: appshell.document_host.DocumentHost = undefined,
     data_dir: std.Io.Dir = undefined,
     autosave_dir: std.Io.Dir = undefined,
     recent: appshell.recent_files.RecentFiles = undefined,
     autosave: appshell.autosave.Controller = undefined,
     recovery: ?appshell.autosave.Candidate = null,
+    /// Failure injection for the document-preparation phase (Debug builds only; see `PrepareScope`).
+    prepare_fault: PrepareFault = .{},
     /// History-journal directory inside the application data directory (native only).
     history_dir: std.Io.Dir = undefined,
     /// Journal for the document currently open; null while the document is unsaved.
@@ -1030,15 +1031,9 @@ const App = struct {
         if (self.os_window) |win| win.setTitle(title);
     }
 
-    fn setProjectPath(self: *App, path: ?[]const u8) !void {
-        const owned = if (path) |value| try self.gpa.dupe(u8, value) else null;
-        if (self.current_project_path) |old| self.gpa.free(old);
-        self.current_project_path = owned;
-    }
-
-    /// Event boundary that syncs DocumentHost path and autosave ID with the legacy pixie fields.
+    /// Event boundary after a DocumentHost transition: align the autosave ID with the host path
+    /// and refresh the title.
     fn syncProjectState(self: *App) void {
-        self.setProjectPath(self.host.currentPath()) catch @panic("syncProjectState: OOM");
         self.autosave.setPath(self.host.currentPath()) catch @panic("syncProjectState: OOM");
         if (self.host.isDirty()) self.autosave.markDirty(platform.getTime());
         self.refreshTitle();
@@ -1068,46 +1063,51 @@ const App = struct {
         return self.input.capturing or self.bezier_editor.isEditing() or self.sel_in.state != .idle or self.shape_in.state != .idle;
     }
 
-    /// After a Document size change, rebuild recorder / preview / onion / diff_base for the new size.
-    /// Shared by loadProjectPath / netsyncImport / doResize / doNew (prevents dangling pointers).
-    fn rebuildRuntimeForDocSize(self: *App) !void {
-        const w = self.doc.width;
-        const h = self.doc.height;
-        const n = @as(usize, w) * @as(usize, h);
+    /// The recorder settings a replacement document inherits from the current one.
+    fn recorderSettings(self: *const App) document_swap.RecorderSettings {
+        return .{ .pixel_perfect = self.recorder.pixel_perfect, .symmetry = self.recorder.symmetry };
+    }
 
-        var new_recorder = try core.StrokeRecorder.init(self.gpa, w, h);
-        errdefer new_recorder.deinit(self.gpa);
-        new_recorder.pixel_perfect = self.recorder.pixel_perfect;
-        new_recorder.symmetry = self.recorder.symmetry;
-
-        var new_preview = try core.Canvas.init(self.gpa, w, h);
-        errdefer new_preview.deinit();
-
-        var new_preview_rec = try core.StrokeRecorder.init(self.gpa, w, h);
-        errdefer new_preview_rec.deinit(self.gpa);
-
-        const new_onion = try self.gpa.alloc(u32, n);
-        errdefer self.gpa.free(new_onion);
-        const new_scratch = try self.gpa.alloc(u32, n);
-        errdefer self.gpa.free(new_scratch);
-
+    /// Swap in working buffers built for the document's current size; drops what referred to
+    /// the old geometry (diff base, minimap).
+    fn replaceRuntime(self: *App, runtime: document_swap.Runtime) void {
         self.recorder.deinit(self.gpa);
-        self.recorder = new_recorder;
+        self.recorder = runtime.recorder;
         self.preview_canvas.deinit();
-        self.preview_canvas = new_preview;
+        self.preview_canvas = runtime.preview_canvas;
         self.preview_rec.deinit(self.gpa);
-        self.preview_rec = new_preview_rec;
-
+        self.preview_rec = runtime.preview_rec;
         self.gpa.free(self.onion_buf);
-        self.onion_buf = new_onion;
+        self.onion_buf = runtime.onion_buf;
         self.gpa.free(self.onion_scratch);
-        self.onion_scratch = new_scratch;
-
+        self.onion_scratch = runtime.onion_scratch;
         if (self.diff_base) |b| {
             self.gpa.free(b);
             self.diff_base = null;
         }
         self.minimap.invalidate();
+    }
+
+    /// Adopt a prepared document as the open document: the single adoption point of the four
+    /// replacement paths (new, open, sync import, recovery). Returns no error; the only
+    /// allocation is the palette copy, whose out-of-memory policy is a panic. The history
+    /// journal is left to the caller.
+    fn commitDocument(self: *App, prepared: document_swap.Prepared) void {
+        const preserved_next_handle = self.doc.undo.next_handle;
+        self.doc.deinit();
+        self.doc = prepared.doc;
+        self.replaceRuntime(prepared.runtime);
+        self.doc.undo.next_handle = preserved_next_handle;
+        self.invalidateHistoryAfterDocReset();
+        // Both syncs below find matching layer counts and allocate nothing.
+        self.doc.resyncActiveView(self.gpa);
+        self.canvas = self.doc.activeCanvas();
+        self.clampTimelineTarget();
+        self.applySystemFont();
+        self.canvas.clearSelection();
+        self.sel_in.discardFloat(self.gpa);
+        self.loadPaletteFromDoc();
+        self.syncPreviewCanvas();
     }
 
     /// Content-preserving resize. Sole entry for GUI/action.
@@ -1118,10 +1118,12 @@ const App = struct {
         if (self.doc.layers.items[self.doc.selected_layer].kind != .text) {
             self.doc.commitActiveLayerToCel(self.gpa, self.doc.selected_layer);
         }
+        var runtime = try document_swap.Runtime.init(self.gpa, new_w, new_h, self.doc.layers.items.len, self.recorderSettings());
+        errdefer runtime.deinit(self.gpa);
         try self.doc.resize(self.gpa, new_w, new_h);
         self.invalidateHistoryAfterDocReset();
         self.canvas = self.doc.activeCanvas();
-        try self.rebuildRuntimeForDocSize();
+        self.replaceRuntime(runtime);
         self.doc.resyncActiveView(self.gpa);
         self.clampTimelineTarget();
         self.canvas.clearSelection();
@@ -1130,28 +1132,28 @@ const App = struct {
         self.markProjectDirty();
     }
 
-    /// Replace with a blank Document of the given size. Sole entry for GUI/action.
-    /// Clearing project path / PNG / autosave follows hostNewDocument rules.
-    fn doNew(self: *App, new_w: u32, new_h: u32) !void {
+    /// Build a blank document of the given size together with its working buffers.
+    fn prepareNew(self: *App, scope: *PrepareScope, new_w: u32, new_h: u32) !document_swap.Prepared {
         if (self.editingBlocked()) return error.EditingBlocked;
         if (platform.netsyncActive()) return error.RejectedWhileSynced;
         try actions.validateCanvasSize(new_w, new_h);
-        var new_doc = try core.Document.init(self.gpa, new_w, new_h);
-        errdefer new_doc.deinit();
-        const preserved_next_handle = self.doc.undo.next_handle;
-        self.doc.deinit();
-        self.doc = new_doc;
-        self.doc.undo.next_handle = preserved_next_handle;
-        self.invalidateHistoryAfterDocReset();
-        self.canvas = self.doc.activeCanvas();
-        try self.rebuildRuntimeForDocSize();
-        self.doc.resyncActiveView(self.gpa);
-        self.clampTimelineTarget();
-        self.applySystemFont();
-        self.canvas.clearSelection();
-        self.sel_in.discardFloat(self.gpa);
-        self.loadPaletteFromDoc();
-        self.syncPreviewCanvas();
+        const gpa = scope.allocator();
+        scope.enter("document");
+        const doc = try core.Document.init(gpa, new_w, new_h);
+        scope.enter("runtime");
+        return document_swap.Prepared.init(gpa, doc, self.recorderSettings());
+    }
+
+    /// Replace the open document with a blank one of the given size. Sole entry for GUI/action.
+    /// Clearing project path / PNG / autosave follows hostNewDocument rules.
+    fn doNew(self: *App, new_w: u32, new_h: u32) !void {
+        var scope = PrepareScope.init(self);
+        defer scope.deinit();
+        var prepared = try self.prepareNew(&scope, new_w, new_h);
+        errdefer prepared.deinit(scope.allocator());
+        try scope.verify();
+        closeHistoryStore(self);
+        self.commitDocument(prepared);
     }
 
     fn replaceSizeDialogBuf(buf: *gui.TextBuffer, text: []const u8) !void {
@@ -2210,11 +2212,11 @@ const App = struct {
         };
         if (result == .needs_save_as) return self.doSaveAsProject();
         finishHostResult(self, result);
-        self.setSaveMsg("Project saved: {s}", .{std.fs.path.basename(self.current_project_path orelse "untitled.pix")});
+        self.setSaveMsg("Project saved: {s}", .{std.fs.path.basename(self.host.currentPath() orelse "untitled.pix")});
         return .done;
     }
 
-    /// Pick a .pix save path via dialog and save. On success hand the dialog path to current_project_path.
+    /// Pick a .pix save path via dialog and save. On success the host records the dialog path.
     fn doSaveAsProject(self: *App) FileOpResult {
         const maybe = platform.saveFileDialog(self.gpa, self.io, .{
             .default_name = "untitled.pix",
@@ -2258,7 +2260,7 @@ const App = struct {
     }
 
     /// Load a .pix project and replace the document (preserves layer structure).
-    /// Discard in-flight stroke/edit. Clear undo/redo, discard selection/float, update current_project_path.
+    /// Discard in-flight stroke/edit. Clear undo/redo, discard selection/float; the host records the path.
     /// Size is checked with peekCanvasSize + the shared limit validator (edge ≤ MAX_CANVAS_EDGE, pixels ≤ MAX_CANVAS_PIXELS).
     fn doOpenProject(self: *App) FileOpResult {
         if (self.editingBlocked()) return .done;
@@ -3779,7 +3781,7 @@ fn appshellDigest(ctx: *anyopaque, buf: []u8) []const u8 {
     // History-journal observability: whether a journal is bound, how the last restore went,
     // and how many records it holds (so a replay can assert persistence without a file path).
     const journal_stats = if (app.history_store) |*store| store.store().stats() else null;
-    return std.fmt.bufPrint(buf, "dirty={d} path={s} confirm={s} recent={d} recent0={s} recovery={s} modal={s} autosave={d} netsync={d} history_journal={d} history_restore={s} history_undo={d} history_records={d} title={s} geom={d}x{d} pos={s}", .{
+    return std.fmt.bufPrint(buf, "dirty={d} path={s} confirm={s} recent={d} recent0={s} recovery={s} modal={s} autosave={d} netsync={d} history_journal={d} history_restore={s} history_undo={d} history_records={d} prepare_fault={s} title={s} geom={d}x{d} pos={s}", .{
         @intFromBool(app.host.isDirty()),
         path,
         @tagName(app.host.confirmation()),
@@ -3793,6 +3795,7 @@ fn appshellDigest(ctx: *anyopaque, buf: []u8) []const u8 {
         @tagName(app.history_restore.status),
         app.history_restore.undo_records,
         if (journal_stats) |st| st.live_count else 0,
+        app.prepare_fault.fired_in,
         title,
         geo.size.width,
         geo.size.height,
@@ -5157,6 +5160,9 @@ const pixie_args_canvas_size: @FieldType(platform.Action, "args") = &.{
     .{ .name = "width", .kind = "int", .min = 1, .max = @floatFromInt(actions.MAX_CANVAS_EDGE) },
     .{ .name = "height", .kind = "int", .min = 1, .max = @floatFromInt(actions.MAX_CANVAS_EDGE) },
 };
+const pixie_args_fault_index: @FieldType(platform.Action, "args") = &.{
+    .{ .name = "fail_index", .kind = "int", .min = 0 },
+};
 const pixie_args_new: @FieldType(platform.Action, "args") = &.{
     .{ .name = "width", .kind = "int", .min = 1, .max = @floatFromInt(actions.MAX_CANVAS_EDGE), .optional = true },
     .{ .name = "height", .kind = "int", .min = 1, .max = @floatFromInt(actions.MAX_CANVAS_EDGE), .optional = true },
@@ -5240,10 +5246,11 @@ fn actionNewDocument(ctx: *anyopaque, args: []const u8, buf: []u8) anyerror![]co
         },
         .sized => |sz| {
             try actions.validateCanvasSize(sz.w, sz.h);
+            beginReportedAction(app);
             app.pending_new_size = .{ .w = sz.w, .h = sz.h };
             const result = app.requestNewDocument() catch |err| {
                 app.pending_new_size = null;
-                return err;
+                return reportUnlessInjected(app, "new", err, buf);
             };
             if (result == .canceled) app.pending_new_size = null;
             return std.fmt.bufPrint(buf, "ok new={s} size={d}x{d}", .{ @tagName(result), sz.w, sz.h }) catch error.BufferTooSmall;
@@ -5262,7 +5269,8 @@ fn actionResize(ctx: *anyopaque, args: []const u8, buf: []u8) anyerror![]const u
 fn actionOpenProject(ctx: *anyopaque, args: []const u8, buf: []u8) anyerror![]const u8 {
     const app = actionApp(ctx);
     if (args.len == 0) return error.InvalidArgument;
-    const result = try app.requestProjectOpen(args);
+    beginReportedAction(app);
+    const result = app.requestProjectOpen(args) catch |err| return reportUnlessInjected(app, "open_project", err, buf);
     return std.fmt.bufPrint(buf, "ok open_project={s}", .{@tagName(result)}) catch error.BufferTooSmall;
 }
 
@@ -5281,7 +5289,8 @@ fn actionSaveProject(ctx: *anyopaque, args: []const u8, buf: []u8) anyerror![]co
 
 fn actionConfirmSave(ctx: *anyopaque, args: []const u8, buf: []u8) anyerror![]const u8 {
     const app = actionApp(ctx);
-    const result = try app.host.confirmSave(if (args.len == 0) null else args);
+    beginReportedAction(app);
+    const result = app.host.confirmSave(if (args.len == 0) null else args) catch |err| return reportUnlessInjected(app, "confirm_save", err, buf);
     finishHostResult(app, result);
     return std.fmt.bufPrint(buf, "ok confirm_save={s}", .{@tagName(result)}) catch error.BufferTooSmall;
 }
@@ -5303,9 +5312,10 @@ fn actionConfirmCancel(ctx: *anyopaque, args: []const u8, buf: []u8) anyerror![]
 }
 
 fn actionRecover(ctx: *anyopaque, args: []const u8, buf: []u8) anyerror![]const u8 {
-    _ = buf;
     try actions.parseNoArgs(args);
-    try recoverAutosave(actionApp(ctx));
+    const app = actionApp(ctx);
+    beginReportedAction(app);
+    recoverAutosave(app) catch |err| return reportUnlessInjected(app, "recover", err, buf);
     return "ok recover";
 }
 
@@ -5314,6 +5324,16 @@ fn actionDiscardRecovery(ctx: *anyopaque, args: []const u8, buf: []u8) anyerror!
     try actions.parseNoArgs(args);
     try discardRecovery(actionApp(ctx));
     return "ok discard_recovery";
+}
+
+/// `fault_document_prepare <n>`: arm a failure of the n-th allocation in the next document
+/// preparation. Debug builds only; see `PrepareScope`.
+fn actionFaultDocumentPrepare(ctx: *anyopaque, args: []const u8, buf: []u8) anyerror![]const u8 {
+    const app = actionApp(ctx);
+    const index = try actions.parseUsize(args);
+    app.prepare_fault.armed_index = index;
+    app.prepare_fault.fired_in = "none";
+    return std.fmt.bufPrint(buf, "ok fault_document_prepare={d}", .{index}) catch error.BufferTooSmall;
 }
 
 fn panelNameFromToggle(name: actions.PanelToggleName) []const u8 {
@@ -5404,6 +5424,9 @@ fn registerActions(app: *App) void {
     platform.registerAction(.{ .name = "confirm_cancel", .ctx = app, .run = actionConfirmCancel, .network_policy = .local_only, .args = pixie_args_none });
     platform.registerAction(.{ .name = "recover", .ctx = app, .run = actionRecover, .network_policy = .local_only, .args = pixie_args_none });
     platform.registerAction(.{ .name = "discard_recovery", .ctx = app, .run = actionDiscardRecovery, .network_policy = .local_only, .args = pixie_args_none });
+    if (builtin.mode == .Debug) {
+        platform.registerAction(.{ .name = "fault_document_prepare", .ctx = app, .run = actionFaultDocumentPrepare, .network_policy = .local_only, .desc = "make the n-th allocation of the next document preparation (new / open_project / recover) fail", .args = pixie_args_fault_index });
+    }
     // recipe: meta-ops → bypass executor, not recorded in CommandLog, local_only.
     platform.registerAction(.{ .name = "recipe_save", .ctx = app, .run = actionRecipeSave, .network_policy = .local_only, .args = pixie_args_path });
     platform.registerAction(.{ .name = "recipe_replay", .ctx = app, .run = actionRecipeReplay, .network_policy = .local_only, .args = pixie_args_path });
@@ -5455,29 +5478,26 @@ fn netsyncExport(ctx: *anyopaque, allocator: std.mem.Allocator) anyerror![]u8 {
     return core.document_io.encodeDocument(&app.doc, allocator);
 }
 
+/// Decode `bytes` into a document with its working buffers.
+fn prepareDecodedDocument(app: *App, scope: *PrepareScope, bytes: []const u8) !document_swap.Prepared {
+    const sz = try core.document_io.peekCanvasSize(bytes);
+    try actions.validateCanvasSize(sz.w, sz.h);
+    const gpa = scope.allocator();
+    scope.enter("decode");
+    const doc = try core.document_io.decodeDocument(bytes, gpa);
+    scope.enter("runtime");
+    return document_swap.Prepared.init(gpa, doc, app.recorderSettings());
+}
+
 fn netsyncImport(ctx: *anyopaque, bytes: []const u8) anyerror!void {
     const app: *App = @ptrCast(@alignCast(ctx));
     try app.checkEditingAllowed();
-    const sz = try core.document_io.peekCanvasSize(bytes);
-    try actions.validateCanvasSize(sz.w, sz.h);
-    var new_doc = try core.document_io.decodeDocument(bytes, app.gpa);
-    errdefer new_doc.deinit();
-    try actions.validateCanvasSize(new_doc.width, new_doc.height);
-    const preserved_next_handle = app.doc.undo.next_handle;
-    app.doc.deinit();
-    app.doc = new_doc;
-    new_doc = undefined;
-    app.doc.undo.next_handle = preserved_next_handle;
-    app.invalidateHistoryAfterDocReset();
-    app.doc.resyncActiveView(app.gpa);
-    app.canvas = app.doc.activeCanvas();
-    try app.rebuildRuntimeForDocSize();
-    app.clampTimelineTarget();
-    app.applySystemFont();
-    app.loadPaletteFromDoc();
-    app.canvas.clearSelection();
-    app.sel_in.discardFloat(app.gpa);
-    app.syncPreviewCanvas();
+    var scope = PrepareScope.init(app);
+    defer scope.deinit();
+    var prepared = try prepareDecodedDocument(app, &scope, bytes);
+    errdefer prepared.deinit(scope.allocator());
+    try scope.verify();
+    app.commitDocument(prepared);
     app.markProjectDirty();
 }
 
@@ -6950,6 +6970,104 @@ fn clearAutosave(app: *App) !void {
     if (comptime appshell_dir_supported) try app.autosave.clear();
 }
 
+/// Delete the previous document's autosave and free its path. A failed deletion is reported
+/// in the status line: the document switch is already complete.
+fn releasePreviousAutosave(app: *App, previous_path: ?[]u8) void {
+    defer if (previous_path) |p| app.gpa.free(p);
+    if (comptime appshell_dir_supported) {
+        app.autosave.clearFor(previous_path) catch |err| app.setSaveMsg("Autosave clear failed: {s}", .{@errorName(err)});
+    }
+}
+
+/// State of the failure injection described on `PrepareScope`.
+const PrepareFault = struct {
+    /// Set by the harness action; consumed by the next `PrepareScope.init`.
+    armed_index: ?usize = null,
+    /// The preparation step the last injected fault fired in (`none`, or `not_triggered` when
+    /// the preparation finished before reaching the armed allocation).
+    fired_in: []const u8 = "none",
+    /// Set when an armed preparation ends; cleared by the next reporting action's start.
+    consumed: bool = false,
+};
+
+/// Start of an action that reports injected faults: a fault consumed by an earlier operation
+/// is not attributed to this one.
+fn beginReportedAction(app: *App) void {
+    app.prepare_fault.consumed = false;
+}
+
+/// Debug builds report a failure caused by an armed fault as a success line (`injected_fault=`
+/// plus the step), so a replay sweeping faults terminates normally and the application's
+/// teardown and leak check run. Any other error, and every error in Release, passes through.
+fn reportUnlessInjected(app: *App, name: []const u8, err: anyerror, buf: []u8) anyerror![]const u8 {
+    if (builtin.mode != .Debug or !app.prepare_fault.consumed) return err;
+    app.prepare_fault.consumed = false;
+    return std.fmt.bufPrint(buf, "ok {s} injected_fault={s} fired_in={s}", .{ name, @errorName(err), app.prepare_fault.fired_in }) catch error.BufferTooSmall;
+}
+
+/// Failure injection for the document-preparation phase (harness action
+/// `fault_document_prepare <n>`, Debug builds only): the n-th allocation of the next
+/// preparation fails, and the `appshell` probe reports the step it fired in.
+///
+/// The scope lives in the entry function's frame and hands out the allocator the preparation
+/// uses. With a fault armed that is a `FailingAllocator` over `app.gpa` (frees forward to the
+/// same backing allocator, so mixing them is safe). A `Document` or `Canvas` must never keep
+/// the wrapper as its allocator past this frame, so `verify` fails an armed preparation even
+/// when the fault did not fire.
+const PrepareScope = struct {
+    app: *App,
+    source: union(enum) {
+        plain: std.mem.Allocator,
+        failing: std.testing.FailingAllocator,
+    },
+    step: []const u8 = "start",
+
+    fn init(app: *App) PrepareScope {
+        const armed_index = app.prepare_fault.armed_index;
+        app.prepare_fault.armed_index = null;
+        return .{
+            .app = app,
+            .source = if (armed_index) |index|
+                .{ .failing = std.testing.FailingAllocator.init(app.gpa, .{ .fail_index = index }) }
+            else
+                .{ .plain = app.gpa },
+        };
+    }
+
+    fn allocator(self: *PrepareScope) std.mem.Allocator {
+        return switch (self.source) {
+            .plain => |gpa| gpa,
+            .failing => |*failing| failing.allocator(),
+        };
+    }
+
+    /// Name the step the preparation is entering, for the `fired_in` report.
+    fn enter(self: *PrepareScope, step: []const u8) void {
+        switch (self.source) {
+            .plain => {},
+            .failing => |failing| if (!failing.has_induced_failure) {
+                self.step = step;
+            },
+        }
+    }
+
+    /// Called after a successful preparation, before adoption. Fails in fault mode.
+    fn verify(self: *PrepareScope) !void {
+        if (self.source == .failing) return error.FaultNotTriggered;
+    }
+
+    /// Records where an armed fault fired (or that it did not); runs on every exit.
+    fn deinit(self: *PrepareScope) void {
+        switch (self.source) {
+            .plain => {},
+            .failing => |failing| {
+                self.app.prepare_fault.fired_in = if (failing.has_induced_failure) self.step else "not_triggered";
+                self.app.prepare_fault.consumed = true;
+            },
+        }
+    }
+};
+
 /// Close the journal bound to the previous document, if any.
 ///
 /// Detaching the composition layer first keeps it from holding a `Store` whose backing
@@ -7029,16 +7147,16 @@ fn restoreHistory(app: *App, doc_bytes: []const u8) void {
     }
 }
 
+/// The DocumentHost "new document" callback. The previous journal is closed only once the
+/// replacement has succeeded.
 fn hostNewDocument(ctx: *anyopaque) !void {
     const app: *App = @ptrCast(@alignCast(ctx));
-    closeHistoryStore(app);
     if (app.pending_png_path) |path| {
-        app.doOpenPath(path) catch |err| return err;
+        try app.doOpenPath(path);
+        closeHistoryStore(app);
         app.gpa.free(path);
         app.pending_png_path = null;
-        try app.setProjectPath(null);
-        try clearAutosave(app);
-        try app.autosave.setPath(null);
+        releasePreviousAutosave(app, app.autosave.replacePath(null));
         return;
     }
     if (app.pending_new_size) |sz| {
@@ -7046,20 +7164,25 @@ fn hostNewDocument(ctx: *anyopaque) !void {
         try app.doNew(sz.w, sz.h);
     } else {
         app.resetCanvasToSingleLayer();
+        closeHistoryStore(app);
     }
     if (app.current_path) |old| app.gpa.free(old);
     app.current_path = null;
-    try app.setProjectPath(null);
-    try clearAutosave(app);
-    try app.autosave.setPath(null);
+    releasePreviousAutosave(app, app.autosave.replacePath(null));
 }
 
+/// The DocumentHost "open document" callback. Recent-files and autosave bookkeeping failures
+/// are reported, not returned: the open itself has succeeded.
 fn hostOpenDocument(ctx: *anyopaque, path: []const u8) !void {
     const app: *App = @ptrCast(@alignCast(ctx));
-    try loadProjectPath(app, path);
-    try app.recent.push(path);
-    try clearAutosave(app);
-    try app.autosave.setPath(path);
+    var scope = PrepareScope.init(app);
+    defer scope.deinit();
+    var load = try prepareProjectLoad(app, &scope, path);
+    errdefer load.deinit(scope.allocator());
+    try scope.verify();
+    const previous_autosave_path = commitProjectLoad(app, load, path);
+    releasePreviousAutosave(app, previous_autosave_path);
+    app.recent.push(path) catch |err| app.setSaveMsg("Recent files not updated: {s}", .{@errorName(err)});
 }
 
 fn hostSaveDocument(ctx: *anyopaque, path: []const u8) !void {
@@ -7075,36 +7198,46 @@ fn hostSaveDocument(ctx: *anyopaque, path: []const u8) !void {
     try app.recent.push(path);
     try clearAutosave(app);
     try app.autosave.setPath(path);
-    try app.setProjectPath(path);
 }
 
-fn loadProjectPath(app: *App, path: []const u8) !void {
+/// A .pix project read from disk and ready to adopt: the document with its working buffers,
+/// the file bytes (the history journal is keyed by their digest) and the autosave path copy.
+const PreparedLoad = struct {
+    bytes: []u8,
+    prepared: document_swap.Prepared,
+    autosave_path: []u8,
+
+    fn deinit(self: *PreparedLoad, gpa: std.mem.Allocator) void {
+        gpa.free(self.bytes);
+        self.prepared.deinit(gpa);
+        gpa.free(self.autosave_path);
+        self.* = undefined;
+    }
+};
+
+/// Read and decode a .pix project and allocate everything adopting it will need.
+fn prepareProjectLoad(app: *App, scope: *PrepareScope, path: []const u8) !PreparedLoad {
     if (app.editingBlocked()) return error.EditingBlocked;
-    const bytes = try std.Io.Dir.cwd().readFileAlloc(app.io, path, app.gpa, .unlimited);
-    defer app.gpa.free(bytes);
-    const sz = try core.document_io.peekCanvasSize(bytes);
-    try actions.validateCanvasSize(sz.w, sz.h);
-    var new_doc = try core.document_io.decodeDocument(bytes, app.gpa);
-    errdefer new_doc.deinit();
-    try actions.validateCanvasSize(new_doc.width, new_doc.height);
-    const preserved_next_handle = app.doc.undo.next_handle;
-    app.doc.deinit();
-    app.doc = new_doc;
-    new_doc = undefined;
-    app.doc.undo.next_handle = preserved_next_handle;
-    app.invalidateHistoryAfterDocReset();
-    app.doc.resyncActiveView(app.gpa);
-    app.canvas = app.doc.activeCanvas();
-    try app.rebuildRuntimeForDocSize();
-    app.clampTimelineTarget();
-    app.applySystemFont();
-    app.canvas.clearSelection();
-    app.sel_in.discardFloat(app.gpa);
-    app.loadPaletteFromDoc();
-    app.syncPreviewCanvas();
-    try app.setProjectPath(path);
+    const gpa = scope.allocator();
+    scope.enter("read_file");
+    const bytes = try std.Io.Dir.cwd().readFileAlloc(app.io, path, gpa, .unlimited);
+    errdefer gpa.free(bytes);
+    var prepared = try prepareDecodedDocument(app, scope, bytes);
+    errdefer prepared.deinit(gpa);
+    scope.enter("autosave_path");
+    const autosave_path = try gpa.dupe(u8, path);
+    return .{ .bytes = bytes, .prepared = prepared, .autosave_path = autosave_path };
+}
+
+/// Adopt a prepared project load and bind its history journal (whose own failures mean "no
+/// history for this document"). Hands back the previous autosave path for the caller to
+/// clean up.
+fn commitProjectLoad(app: *App, load: PreparedLoad, path: []const u8) ?[]u8 {
+    defer app.gpa.free(load.bytes);
+    app.commitDocument(load.prepared);
     bindHistoryStore(app, path);
-    restoreHistory(app, bytes);
+    restoreHistory(app, load.bytes);
+    return app.autosave.replacePath(load.autosave_path);
 }
 
 /// Draw status-bar zoom%/cursor directly with post-updateViewport values.
@@ -7162,32 +7295,40 @@ fn finishHostResult(app: *App, result: appshell.document_host.Result) void {
     if (result == .allowed) app.running = false;
 }
 
+/// Recover the autosave candidate. The candidate file is deleted only once the recovered
+/// document is in place, and a failed deletion is reported rather than returned; on failure
+/// the candidate stays on disk and in memory for a retry or a discard.
 fn recoverAutosave(app: *App) !void {
     const candidate = &(app.recovery orelse return error.NoRecoveryPending);
-    var decoded = try core.document_io.decodeDocument(candidate.envelope.snapshot, app.gpa);
-    errdefer decoded.deinit();
-    try actions.validateCanvasSize(decoded.width, decoded.height);
-    try app.host.adoptRecovered(candidate.envelope.original_path);
+    if (app.host.pendingIntent() != null) return error.PendingConfirmation;
+    var scope = PrepareScope.init(app);
+    defer scope.deinit();
+    const gpa = scope.allocator();
+    var prepared = try prepareDecodedDocument(app, &scope, candidate.envelope.snapshot);
+    errdefer prepared.deinit(gpa);
+    scope.enter("recovery_paths");
+    const original = candidate.envelope.original_path;
+    const host_path: ?[]u8 = if (original) |p| try gpa.dupe(u8, p) else null;
+    errdefer if (host_path) |p| gpa.free(p);
+    const autosave_path: ?[]u8 = if (original) |p| try gpa.dupe(u8, p) else null;
+    errdefer if (autosave_path) |p| gpa.free(p);
+    try scope.verify();
+
+    closeHistoryStore(app);
+    app.commitDocument(prepared);
+    app.host.adoptRecoveredOwned(host_path);
+    // The previous autosave path names the untitled slot (or nothing), not the candidate's
+    // file, so only the candidate file is deleted here.
+    const previous_autosave_path = app.autosave.replacePath(autosave_path);
+    if (previous_autosave_path) |p| app.gpa.free(p);
     // Unreachable on wasm (recovery scanning is skipped there, so app.recovery is always null
     // and the early return above already fires); guarded anyway since app.autosave.dir is
     // uninitialized on wasm.
     if (comptime appshell_dir_supported) {
-        try appshell.autosave.discardCandidate(app.io, app.autosave.dir, candidate.file_name);
+        appshell.autosave.discardCandidate(app.io, app.autosave.dir, candidate.file_name) catch |err| {
+            app.setSaveMsg("Recovery file not removed: {s}", .{@errorName(err)});
+        };
     }
-    closeHistoryStore(app);
-    app.doc.deinit();
-    app.doc = decoded;
-    decoded = undefined;
-    app.invalidateHistoryAfterDocReset();
-    app.doc.resyncActiveView(app.gpa);
-    app.canvas = app.doc.activeCanvas();
-    try app.rebuildRuntimeForDocSize();
-    app.clampTimelineTarget();
-    app.applySystemFont();
-    app.canvas.clearSelection();
-    app.sel_in.discardFloat(app.gpa);
-    app.loadPaletteFromDoc();
-    app.syncPreviewCanvas();
     candidate.deinit();
     app.recovery = null;
     app.syncProjectState();
@@ -7471,7 +7612,6 @@ fn appDeinit(self: *App) void {
         self.data_dir.close(self.io);
     }
     if (self.current_path) |p| gpa.free(p);
-    if (self.current_project_path) |p| gpa.free(p);
     if (self.palette_path) |p| gpa.free(p);
     if (self.clipboard) |*cb| cb.deinit(gpa);
     if (self.diff_base) |b| gpa.free(b);

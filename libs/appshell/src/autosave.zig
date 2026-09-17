@@ -63,12 +63,32 @@ pub const Controller = struct {
 
     /// Change the autosave ID after a document switch. Deleting any existing file is the caller's
     /// job, after confirming the switch succeeded, combined with `clear`.
+    /// Setting the path that is already current allocates nothing; the idle timer and
+    /// revision flag are reset either way.
     pub fn setPath(self: *Controller, path: ?[]const u8) !void {
-        const owned = if (path) |value| try self.allocator.dupe(u8, value) else null;
-        if (self.current_path) |old| self.allocator.free(old);
+        if (!samePath(self.current_path, path)) {
+            const owned = if (path) |value| try self.allocator.dupe(u8, value) else null;
+            if (self.current_path) |old| self.allocator.free(old);
+            self.current_path = owned;
+        }
+        self.dirty_since = null;
+        self.saved_revision = false;
+    }
+
+    /// Adopt an already-owned path (allocated with this controller's allocator) and hand the
+    /// previous one back; the caller deletes its file with `clearFor` and frees it.
+    pub fn replacePath(self: *Controller, owned: ?[]u8) ?[]u8 {
+        const old = self.current_path;
         self.current_path = owned;
         self.dirty_since = null;
         self.saved_revision = false;
+        return old;
+    }
+
+    fn samePath(a: ?[]const u8, b: ?[]const u8) bool {
+        if (a == null and b == null) return true;
+        if (a == null or b == null) return false;
+        return std.mem.eql(u8, a.?, b.?);
     }
 
     pub fn markDirty(self: *Controller, now: f64) void {
@@ -94,9 +114,15 @@ pub const Controller = struct {
 
     /// Delete the active document's autosave. Missing or already-deleted is treated as success.
     pub fn clear(self: *Controller) !void {
-        try clearPath(self.io, self.dir, self.allocator, self.current_path);
+        try self.clearFor(self.current_path);
         self.dirty_since = null;
         self.saved_revision = false;
+    }
+
+    /// Delete the autosave file that belongs to `path` (typically the path `replacePath`
+    /// handed back). Missing or already-deleted is treated as success.
+    pub fn clearFor(self: *Controller, path: ?[]const u8) !void {
+        try clearPath(self.io, self.dir, self.allocator, path);
     }
 };
 
@@ -199,6 +225,31 @@ test "idle timer threshold, reset, duplicate suppression, and clear" {
     try std.testing.expectEqual(@as(usize, 1), state);
     try controller.clear();
     try std.testing.expectEqual(@as(?Candidate, null), try scan(std.testing.allocator, std.testing.io, tmp.dir));
+}
+
+test "setPath to the current path allocates nothing; replacePath hands the old path back" {
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    // fail_index 1: the dupe inside init is allocation 0, so every later allocation fails.
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 1 });
+    var controller = try Controller.init(failing.allocator(), std.testing.io, tmp.dir, "a.pix");
+    defer controller.deinit();
+    controller.markDirty(1.0);
+    try controller.setPath("a.pix");
+    try std.testing.expectEqual(@as(?f64, null), controller.dirty_since);
+    try std.testing.expectEqualStrings("a.pix", controller.current_path.?);
+    try std.testing.expectError(error.OutOfMemory, controller.setPath("b.pix"));
+    try std.testing.expectEqualStrings("a.pix", controller.current_path.?);
+
+    const owned = try std.testing.allocator.dupe(u8, "c.pix");
+    const old = controller.replacePath(owned);
+    defer if (old) |p| std.testing.allocator.free(p);
+    try std.testing.expectEqualStrings("a.pix", old.?);
+    try std.testing.expectEqualStrings("c.pix", controller.current_path.?);
+    const none = controller.replacePath(null);
+    defer if (none) |p| std.testing.allocator.free(p);
+    try std.testing.expectEqualStrings("c.pix", none.?);
+    try std.testing.expectEqual(@as(?[]u8, null), controller.current_path);
 }
 
 test "malformed and version-mismatched envelopes are rejected by scan" {

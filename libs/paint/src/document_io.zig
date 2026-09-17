@@ -340,6 +340,7 @@ pub fn decodeDocument(bytes: []const u8, gpa: Allocator) !Document {
             if (p.len != expected_cel_payload) return error.CorruptCel;
             if (p[0] != compression_raw) return error.UnsupportedCompression;
             const pixels = try gpa.alloc(u32, px_len);
+            errdefer gpa.free(pixels);
             @memcpy(std.mem.sliceAsBytes(pixels), p[cel_header_size..]);
             try doc.cel_pool.append(gpa, .{ .pixels = pixels, .refcount = 0 });
             doc.next_cel_id += 1;

@@ -358,18 +358,28 @@ fn discardRecoveryAction(ctx: *anyopaque, args: []const u8, buf: []u8) ![]const 
     return std.fmt.bufPrint(buf, "ok discard_recovery", .{}) catch error.BufferTooSmall;
 }
 
+/// Everything that can fail happens before the document is swapped; a failed candidate
+/// deletion afterwards leaves it to be offered again on the next launch.
 fn recover(app: *App) !void {
     const candidate = &(app.recovery orelse return error.NoRecoveryPending);
+    if (app.host.pendingIntent() != null) return error.PendingConfirmation;
     var decoded = try paint.document_io.decodeDocument(candidate.envelope.snapshot, app.allocator);
     errdefer decoded.deinit();
-    try app.host.adoptRecovered(candidate.envelope.original_path);
-    try appshell.autosave.discardCandidate(app.io, app.autosave.dir, candidate.file_name);
+    const host_path: ?[]u8 = if (candidate.envelope.original_path) |p| try app.allocator.dupe(u8, p) else null;
+    errdefer if (host_path) |p| app.allocator.free(p);
+    const autosave_path: ?[]u8 = if (candidate.envelope.original_path) |p| try app.allocator.dupe(u8, p) else null;
+    errdefer if (autosave_path) |p| app.allocator.free(p);
+
     app.doc.deinit();
     app.doc = decoded;
-    decoded = undefined;
+    app.host.adoptRecoveredOwned(host_path);
+    const old_autosave_path = app.autosave.replacePath(autosave_path);
+    if (old_autosave_path) |p| app.allocator.free(p);
+    appshell.autosave.discardCandidate(app.io, app.autosave.dir, candidate.file_name) catch |err| {
+        std.log.warn("appshell demo: recovery file not removed: {s}", .{@errorName(err)});
+    };
     candidate.deinit();
     app.recovery = null;
-    try app.autosave.setPath(app.host.currentPath());
     app.autosave.markDirty(platform.getTime());
 }
 

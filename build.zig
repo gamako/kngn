@@ -2132,6 +2132,25 @@ pub fn build(b: *std.Build) void {
     const minimap_test = b.addTest(.{ .root_module = minimap_test_mod });
     const run_minimap_test = b.addRunArtifact(minimap_test);
 
+    // pixie document_swap. Prepare-then-adopt document replacement; failure-injection sweep.
+    const document_swap_core = b.createModule(.{
+        .root_source_file = b.path("libs/paint/src/paint.zig"),
+    });
+    document_swap_core.addImport("png", shared_modules.png.mod);
+    document_swap_core.addImport("pixelops", shared_modules.pixelops.mod);
+    document_swap_core.addImport("serde", shared_modules.serde.mod);
+    document_swap_core.addImport("font", shared_modules.font.mod);
+    const document_swap_test_mod = b.createModule(.{
+        .root_source_file = b.path("apps/editor/apps/pixie/document_swap.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    document_swap_test_mod.addImport("paint", document_swap_core);
+    const document_swap_test = b.addTest(.{ .root_module = document_swap_test_mod });
+    const run_document_swap_test = b.addRunArtifact(document_swap_test);
+    const test_document_swap_step = b.step("test-document-swap", "Run pixie document_swap unit tests (prepare-then-adopt, failure-injection sweep)");
+    test_document_swap_step.dependOn(&run_document_swap_test.step);
+
     // history_thumbnail. PixelDiff → 24×24 bbox thumbnail. Named-import paint.
     const history_thumbnail_core = b.createModule(.{
         .root_source_file = b.path("libs/paint/src/paint.zig"),
@@ -2281,6 +2300,7 @@ pub fn build(b: *std.Build) void {
     test_core_step.dependOn(&run_history_thumbnail_test.step);
     test_core_step.dependOn(&run_layer_rename_input_test.step);
     test_core_step.dependOn(&run_text_content_input_test.step);
+    test_core_step.dependOn(&run_document_swap_test.step);
 
     // ========================================
     // PNG decoder format.zig tests
